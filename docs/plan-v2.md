@@ -59,6 +59,46 @@ Agreed 4 November 2026. Supersedes the single-mode fixture as the main example;
 - Full-queue policy selectable: lossless (block, optional timeout then count) or
   count-and-drop.
 
+## Decisions (4 Nov 2026)
+
+- `--wait-name` uses a BUSY WAIT (poll the process list), not an event/WMI
+  subscription. Arm discovery before announcing ready; eligibility by creation
+  time relative to the cutoff; exclude pre-existing instances; PID+creation-time
+  identity against reuse. Real attach via DebugActiveProcess (today only launch).
+- The demo/scenario code moves OUT of src/ into an examples/ tree; src/ keeps the
+  reusable library + backends. Done as part of the session-API consolidation.
+- The scenario is a run-on-demand script (check_scenario.py), NOT a CTest/CI gate.
+  CTest keeps only the fast deterministic policy unit tests.
+- Checkpoint before new layers (logging queues, more backends): record Windows
+  validation, refactor probe_session into reusable session/probe machinery, and
+  build real attach. (Aligned with Codex review.)
+
+## Win32 / WoW64 support (required, 4 Nov 2026)
+
+Must work on BOTH 64-bit and 32-bit. Current blockers, all x64-only:
+- CMakeLists.txt FATAL_ERROR rejects non-x64; needs an x86 (`-A Win32`) config.
+- probe.h `probe_regs` is rax..r15 only; needs an arch-specific register layout
+  (x86: eax..edi, no r8-r15). Fold into the session-API refactor so the ABI and
+  the from_context/to_context adapters are arch-parameterized from the start.
+- MASM fixtures (sites.asm, app_sites.asm, flag.asm) are 64-bit; need x86 variants
+  (ml.exe, __cdecl/__stdcall decoration) selected by target arch.
+- Backends: INT3 (1 byte) and DR hardware slots work on both; SafetyHook has an
+  x86 mid-hook (Context32). External debugger needs the x86 CONTEXT.
+
+Deliverable: build and pass the example as a 32-bit binary. Two cases to keep
+distinct: (a) 32-bit-native (x86 controller + x86 target) first; (b) true WoW64
+(x64 controller debugging a 32-bit target via Wow64Get/SetThreadContext and the
+WOW64 debug events) second. Do not conflate a Windows CONTEXT with a full CPU
+image across the boundary.
+
+## Benchmarking baselines
+
+- Compare our backends against FRIDA doing the same instrumentation (Interceptor
+  for the inline read hook; its equivalent for the config site), same workload,
+  same machine. Frida's Interceptor is the industry-standard inline hook, so it is
+  the reference for per-hit overhead. (Install frida on the VM for the perf bot.)
+- Also keep the internal baseline (uninstrumented) and cross-backend comparison.
+
 ## Order
 
 1. `probe_app` + `configparse.dll` + RVA tooling + check script.

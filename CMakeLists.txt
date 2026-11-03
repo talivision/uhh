@@ -46,6 +46,9 @@ if(WIN32)
 
     add_executable(probe_session src/session.cpp)
     target_include_directories(probe_session PRIVATE include)
+    # The gated scenario is a heavyweight end-to-end demo (debugger launch, several
+    # processes), run on demand via scripts/check_scenario.py — deliberately NOT a
+    # CTest/CI gate. CTest keeps only the fast, deterministic policy unit tests.
 
     foreach(t probe_agent probe_target probe_debugger probe_app configparse probe_session)
         target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)

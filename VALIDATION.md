@@ -68,3 +68,22 @@ desktop CPU with only 3 repeats: a first indication, not a reference figure.
 Not yet covered: new-process-by-name attach, deferred `module+RVA` probes and
 load-triggered activation (handoff milestone), register/flags preservation
 beyond the flag result, SIMD/AVX state, multithreaded targets, longer runs.
+
+# Windows validation, 4 November 2026 (gated scenario)
+
+Same host/toolchain as above. Built and run clean on Windows x64:
+
+- Full CMake build of all targets including the new configparse.dll, probe_app,
+  probe_session.
+- ctest: policy unit test passes (the only CTest gate; the end-to-end scenario is
+  run on demand, deliberately not a CTest/CI gate).
+- scripts/check_scenario.py (threads 4 and 8): shipped config gates the workload
+  off (0 reads); the deferred configparse.dll+RVA probe is pending pre-load,
+  activates on LOAD_DLL before ParseConfig, overrides the parsed flag exactly once,
+  and all reads then run and verify; the on-attach on-disk comparison reports
+  PRE-EXISTING HOOK for --prehook and clean for --clean.
+
+Scope/known gaps (see docs/review-findings.md): the scenario does not yet arm a
+read-path probe, so read interception and the shared callback are not exercised
+by it; record_digest is x64/single-thread only; several multithread and deferred-
+identity cases are enumerated but unbuilt. No benchmarks were run for this commit.
