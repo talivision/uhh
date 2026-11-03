@@ -23,8 +23,12 @@ if(WIN32)
     FetchContent_MakeAvailable(safetyhook)
     add_library(probe_agent SHARED src/agent.cpp)
     target_link_libraries(probe_agent PRIVATE probe_callback safetyhook)
-    add_executable(probe_target src/target.cpp src/sites.asm src/target.def)
+    add_executable(probe_target src/target.cpp src/sites.asm)
     target_link_libraries(probe_target PRIVATE probe_callback safetyhook)
+    # CMake only applies .def sources to DLLs; the external debugger resolves
+    # these exports from the EXE, so pass the module definition explicitly.
+    target_link_options(probe_target PRIVATE "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/src/target.def")
+    set_property(TARGET probe_target APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/target.def")
     add_executable(probe_debugger src/debugger.cpp)
     target_link_libraries(probe_debugger PRIVATE probe_callback)
     foreach(t probe_agent probe_target probe_debugger)

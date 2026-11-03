@@ -29,3 +29,42 @@ provided to establish those results next. The first expected acceptance run is:
 
 Do not treat the source as production instrumentation or reuse the single-thread
 software breakpoint handler in an arbitrary multithreaded target.
+
+# Windows validation, 4 November 2026
+
+Host: Windows 10 Pro 22H2 (10.0.19045) guest on Proxmox VE 8.2 (KVM, `cpu: host`),
+Intel Core i5-6600 @ 3.30 GHz, 4 vCPUs, 8 GB RAM. Native x64, not emulation.
+Toolchain: VS 2022 Build Tools, MSVC 14.44.35207, Windows SDK 10.0.26100,
+CMake 4.4.5 (Visual Studio 17 2022 generator), Python 3.12.10, SafetyHook v0.7.0.
+
+Fix required to pass: CMake ignores `.def` sources on executables, so
+`probe_target.exe` exported nothing and both external debugger modes failed with
+`fixture export (Win32=127)`. The module definition is now passed with `/DEF:`.
+Remaining build noise: MASM warning A4018 for `/wd4201`, which Zycore adds as a
+PUBLIC compile option; harmless.
+
+Executed, all passing:
+
+- `ctest` (portable policy tests) and the four Python oracle tests.
+- `probe_target.exe disabled reads 20 mutate memory 0 prehook`: zero enabled
+  iterations, zero reads, zero existing-hook calls.
+- `bench.py --correctness-only`: 20/20 cases (baseline, inline, veh-sw,
+  debug-sw, debug-hw x register/memory mutation x clean/prehook), including the
+  exactly-once existing-hook count and independent record digests. The prehook
+  read site was classified `relative-jump` (`e9...`) before our probe installed.
+- `bench.py` default run (2000 micro / 200 reads iterations, 3 repeats), all
+  rows re-validated. Raw results: `measurements/2026-11-04-vm103-default/`.
+
+Measured ns per iteration (median of 3, baseline-subtracted). This is a VM on a
+desktop CPU with only 3 repeats: a first indication, not a reference figure.
+
+| Mode | micro noop (1 probe) | reads mutate, clean (2 probes + syscall) | reads mutate, prehook |
+|---|---|---|---|
+| inline (SafetyHook mid-hook) | ~40 | ~260 | ~235 |
+| veh-sw (in-process INT3) | ~9,300 | ~19,700 | ~19,400 |
+| debug-hw (external DR0/DR1) | ~67,000 | ~137,000 | ~133,000 |
+| debug-sw (external INT3 + step) | ~160,000 | ~333,000 | ~323,000 |
+
+Not yet covered: new-process-by-name attach, deferred `module+RVA` probes and
+load-triggered activation (handoff milestone), register/flags preservation
+beyond the flag result, SIMD/AVX state, multithreaded targets, longer runs.
