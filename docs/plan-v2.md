@@ -38,6 +38,26 @@ Agreed 4 November 2026. Supersedes the single-mode fixture as the main example;
   hits across threads).
 - Existing-hook checks stay mandatory for every backend and mix.
 
+## Pre-existing hook policy (finalized 4 Nov 2026)
+
+Supersedes the README's plain "safe-fail". Detection stays two-layer: classify +
+compare_to_disk (any diff from the clean image = modified). On an inline site that
+is already hooked:
+- DEFAULT: fail fast and clean up (remove our hooks; never leave patches behind so
+  re-runs don't see our own as "pre-existing"). Print report_prehooked.
+- Per-probe override flags on probe_add:
+  - PROBE_ALLOW_PREHOOKED: proceed with inline (relocate/chain the foreign jump).
+  - PROBE_FALLBACK_BREAKPOINT: use a breakpoint (HW, no code modified) instead of
+    failing. (HW breakpoint = universal no-clobber fallback, limited to 4 slots.)
+
+report_prehooked is a DISCOVERY tool, not a solver:
+- "detected pre-existing hook at <site>" + Zydis disassembly (offset + mnemonic).
+- For a jmp/call, show the resolved target (addr, and module!off if mappable -
+  often names who hooked it). We do NOT follow the detour, so whether it returns
+  into the original call or returns to the caller is UNANALYZED and stated so.
+- Hedged hint only: "maybe rehook at +0xN?" (next clean boundary past the detour;
+  not verified reachable). Never an automated decision.
+
 ## Two demo probes + handle resolution
 
 - Demo A: software breakpoint on `ParsedFlagSite`, overrides the parsed flag 0->1.
@@ -48,6 +68,14 @@ Agreed 4 November 2026. Supersedes the single-mode fixture as the main example;
 - Reads log only the raw handle (cheap). The reader resolves handle->PID from the
   map and PID->image name once (QueryFullProcessImageName), cached. Name lookup is
   a syscall and must never run in callback context.
+- Join is reader-side and TIMESTAMPED: every record carries a timestamp; the reader
+  replays open/close in ts order keeping handle->pid INTERVALS, so a read resolves
+  to the identity the handle had at the read's ts (survives close+reuse). This is
+  the same per-record timestamp the per-thread log streams merge on.
+- FIXTURE REQUIREMENT: probe_app must obtain its read handle via OpenProcess(pid),
+  not the CreateProcess PROCESS_INFORMATION handle, or NtOpenProcess never fires
+  and the map is empty. The read filter's selected_handle is then that OpenProcess
+  handle, which the map resolves to the selected pid.
 
 ## Logging
 
