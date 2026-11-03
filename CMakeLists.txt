@@ -44,7 +44,10 @@ if(WIN32)
     target_link_libraries(probe_app PRIVATE probe_callback safetyhook)
     target_link_options(probe_app PRIVATE "/MAP:$<TARGET_FILE_DIR:probe_app>/probe_app.map")
 
-    foreach(t probe_agent probe_target probe_debugger probe_app configparse)
+    add_executable(probe_session src/session.cpp)
+    target_include_directories(probe_session PRIVATE include)
+
+    foreach(t probe_agent probe_target probe_debugger probe_app configparse probe_session)
         target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
         target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
     endforeach()

@@ -124,6 +124,9 @@ int main(int argc, char **argv) try {
         require(!!prehook, "install existing hook");
     }
 
+    // Signal that any pre-existing hook is now installed, so a controller that
+    // attaches here sees the realistic already-hooked state before inspecting.
+    OutputDebugStringA("PROBE_APP_READY");
     std::printf("{\"kind\":\"waiting\",\"pid\":%lu,\"selected_handle\":%llu,\"decoy_handle\":%llu,"
                 "\"range_start\":%llu,\"range_size\":%llu}\n",
                 GetCurrentProcessId(), (unsigned long long)(uintptr_t)selected.pi.hProcess,
