@@ -141,8 +141,8 @@ image across the boundary.
   the mix-and-match validation; both backends must interoperate in one session.
 - Codex does bounded implementation chunks (it cannot build Windows; the VM does);
   Codex reviews at the end against this gospel API. Watch Codex token usage.
-- Ship: push to GitHub as `usermode-hook-helper` (UHH), short-and-sweet README,
-  and several VERIFIED examples of the tool working. Confirm before the push.
+- Ship: push to GitHub as `usermode-hook-helper` (UHH), PUBLIC repo, short-and-sweet
+  README, and several VERIFIED examples of the tool working. Confirm before the push.
 
 ## Order
 
