@@ -31,7 +31,20 @@ if(WIN32)
     set_property(TARGET probe_target APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/target.def")
     add_executable(probe_debugger src/debugger.cpp)
     target_link_libraries(probe_debugger PRIVATE probe_callback)
-    foreach(t probe_agent probe_target probe_debugger)
+
+    # --- Plan v2: gated multithreaded scenario ---------------------------------
+    # Late-loaded config library. Its mid-function flag site is found by RVA from
+    # the linker map, so emit one. Never a static dependency of probe_app.
+    add_library(configparse SHARED src/configparse/configparse.c src/configparse/flag.asm)
+    target_include_directories(configparse PUBLIC src)
+    target_link_options(configparse PRIVATE "/MAP:$<TARGET_FILE_DIR:configparse>/configparse.map")
+
+    add_executable(probe_app src/app.cpp src/app_sites.asm)
+    target_include_directories(probe_app PRIVATE src)
+    target_link_libraries(probe_app PRIVATE probe_callback safetyhook)
+    target_link_options(probe_app PRIVATE "/MAP:$<TARGET_FILE_DIR:probe_app>/probe_app.map")
+
+    foreach(t probe_agent probe_target probe_debugger probe_app configparse)
         target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
         target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
     endforeach()
