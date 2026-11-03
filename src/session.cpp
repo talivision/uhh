@@ -16,6 +16,7 @@
 // start, probe fires later when the DLL becomes available. No symbols needed.
 #include "win_common.hpp"
 #include "detect.hpp"
+#include "disasm.hpp"
 #include <string>
 
 struct PendingProbe {
@@ -111,6 +112,8 @@ int main(int argc, char **argv) {
                     !std::strcmp(msg, "PROBE_APP_READY") && app_base && !read_site_checked) {
                     read_site_checked = compare_to_disk(&remote_ops, pi.hProcess, app_base + read_rva,
                                                         exe, read_rva, "ReadSite", read_site_hooked);
+                    if (read_site_checked && read_site_hooked)   // show what was patched vs disk
+                        show_hook_disasm(&remote_ops, pi.hProcess, app_base + read_rva, exe, read_rva);
                 }
                 break;
             }
