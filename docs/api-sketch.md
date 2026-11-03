@@ -1,5 +1,22 @@
 # End-user API sketch (design, not yet implemented)
 
+> CORRECTIONS PENDING from the design review (docs/design-review-codex.md), to
+> apply before implementing. Not yet reflected below:
+> - NtOpenProcess: at ENTRY, RCX is PHANDLE (the out pointer), not the handle; the
+>   handle exists only on RETURN. The handle->pid map needs a RETURN probe (grab
+>   pid from CLIENT_ID at entry, read *PHANDLE on NTSTATUS success). The entry-only
+>   example below is WRONG as written.
+> - Register access is NOT arch-neutral: x86 passes args on the stack, not in
+>   RCX/RDX/R9. Entry probes need a calling-convention-aware probe_arg(c, index);
+>   PROBE_RAX-style ids stay for true register access only.
+> - probe_add should take a versioned descriptor (stable callback identity +
+>   fixed-width config blob copied for ALL backends + declared capabilities +
+>   ordered backend preference) and RETURN a probe handle with async status.
+> - Handle map: reconcile the inline flat-array view here with plan-v2's reader-
+>   side timestamped join (pick one; inline live-resolution is the chosen default).
+> - PROBE_LOG needs a restricted typed schema, not general varargs.
+
+
 What a user writes to instrument the gated scenario. One callback source runs
 unchanged under any backend (inline in the agent, or a breakpoint in the
 controller). This supersedes the hard-coded probe_session.cpp demo.
