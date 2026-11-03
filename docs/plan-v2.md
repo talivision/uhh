@@ -127,6 +127,19 @@ image across the boundary.
   the reference for per-hit overhead. (Install frida on the VM for the perf bot.)
 - Also keep the internal baseline (uninstrumented) and cross-backend comparison.
 
+## Build-out requirements (4 Nov 2026)
+
+- api-sketch.md is GOSPEL. Implement to it exactly.
+- Test the exact gated use case on BOTH x86 and x64 (verified, not assumed).
+- The contrived scenario must ALSO be demonstrated with a `watch_new`-style attach:
+  attach to a newly-launched instance by name, then modify (flag flip) and log the
+  reads - not only the launch-under-debugger path.
+- Fix the catalogued bugs (review-findings.md) and make the hot path performant.
+- Codex does bounded implementation chunks (it cannot build Windows; the VM does);
+  Codex reviews at the end against this gospel API. Watch Codex token usage.
+- Ship: push to GitHub as `usermode-hook-helper` (UHH), short-and-sweet README,
+  and several VERIFIED examples of the tool working. Confirm before the push.
+
 ## Order
 
 1. `probe_app` + `configparse.dll` + RVA tooling + check script.
