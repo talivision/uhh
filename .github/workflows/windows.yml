@@ -1,0 +1,20 @@
+name: Windows prototype gates
+on: [workflow_dispatch]
+jobs:
+  correctness:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: cmake -S . -B build -A x64
+      - run: cmake --build build --config Release
+      - run: ctest --test-dir build -C Release --output-on-failure
+      - run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - run: python scripts/bench.py --bin build/Release --iterations 2000 --reads-iterations 200 --repeats 3 --out results
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-probe-results
+          path: results/

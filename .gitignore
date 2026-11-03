@@ -1,0 +1,6 @@
+build/
+results/
+longer-results/
+__pycache__/
+*.pyc
+policy_tests
