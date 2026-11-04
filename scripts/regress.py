@@ -476,6 +476,58 @@ def check_stream_volume():
             record(name, False, repr(e))
 
 
+def check_stream_live(calls=2_000_000):
+    """Logs arrive LIVE under full load, not in a burst at the end. hitcost_target passes a
+    QueryPerformanceCounter timestamp (ns) as the probed function's argument; send_log logs
+    it; this reader timestamps each chunk of stdout as it arrives with the SAME clock
+    (time.perf_counter_ns) and computes the lag of every 64th log, plus the gaps between
+    arrivals and how many logs arrived before the target printed its final line."""
+    driver, target = exe("hitcost_driver.exe"), exe("hitcost_target.exe")
+    if not driver or not target:
+        return skip("stream-live", "hitcost driver/target missing")
+    import re as _re
+    for backend, n in (("inline", calls), ("hw", 50_000), ("breakpoint", 50_000)):
+        name = f"stream-live-{backend}"
+        try:
+            p = subprocess.Popen([str(driver), "--backend", backend, "--method", "send_log", "--",
+                                  str(target), "--calls", str(n), "--threads", "1", "--no-wait", "--qpc-arg"],
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            lags, gaps, logs, before_exit, exited, last, buf = [], [], 0, 0, False, None, b""
+            rx = _re.compile(rb'"message":"hit (-?\d+)"')
+            while True:
+                chunk = p.stdout.read1(1 << 20)
+                if not chunk:
+                    break
+                now = time.perf_counter_ns()
+                if last is not None:
+                    gaps.append(now - last)
+                last = now
+                buf += chunk
+                lines = buf.split(b"\n"); buf = lines.pop()
+                for k, line in enumerate(lines):
+                    if b'"kind":"probe_log"' in line:
+                        logs += 1
+                        if not exited:
+                            before_exit += 1
+                        if logs % 64 == 0:
+                            m = rx.search(line)
+                            if m:
+                                lags.append((((now // 1000) - int(m.group(1))) & 0x7FFFFFFF) * 1000)   # us, 31-bit wrap
+                    elif b'"kind":"target"' in line:
+                        exited = True
+            p.wait(timeout=600)
+            lags.sort(); ms = lambda v: round(v / 1e6, 1)
+            p50 = ms(lags[len(lags) // 2]) if lags else None
+            p99 = ms(lags[int(len(lags) * 0.99)]) if lags else None
+            gmax = ms(max(gaps)) if gaps else None
+            frac = before_exit / logs if logs else 0
+            ok = (p.returncode == 0 and logs == n and p99 is not None and p99 < 250 and frac >= 0.9)
+            record(name, ok, f"logs={logs:,}/{n:,} lag_p50={p50}ms lag_p99={p99}ms max_gap={gmax}ms "
+                             f"before_target_exit={frac:.1%} rc={p.returncode}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
 def check_stream_sink_speed():
     """Measure the file-backed writer with tailing disabled (NUL) and to a disk file."""
     driver, target = exe("hitcost_driver.exe"), exe("hitcost_target.exe")
@@ -1474,6 +1526,7 @@ def main():
     if want(check_log_throughput): check_log_throughput(args.threads, args.reads)
     if want(check_stream_volume): check_stream_volume()
     if want(check_stream_sink_speed): check_stream_sink_speed()
+    if want(check_stream_live): check_stream_live()
     if want(check_stream_latency): check_stream_latency()
     if want(check_stream_order): check_stream_order()
     if want(check_attach): check_attach(args.threads, args.reads)
