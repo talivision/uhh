@@ -2244,6 +2244,26 @@ static bool inline_unconfirmed(const probe_session *s) {
 // while inline probes exist but the agent's service thread is not up yet: a module
 // with an inline site may load at any moment after entry, and the thread loading it
 // holds the loader lock -- only an already-running service thread can install then.
+// A thread of OUR agent left from an earlier, detached session (its service thread): never
+// hold it -- it may own the agent's install lock or be the one that must do the install.
+static bool agent_thread(probe_session *s, DWORD tid) {
+    if (!s->remote_agent) return false;
+    using QueryFn = LONG(NTAPI *)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    static auto query = reinterpret_cast<QueryFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+    HANDLE t = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
+    if (!t || !query) { if (t) CloseHandle(t); return false; }
+    PVOID start = nullptr;
+    LONG st = query(t, 9 /*ThreadQuerySetWin32StartAddress*/, &start, sizeof(start), nullptr);
+    CloseHandle(t);
+    if (st < 0) return false;
+    IMAGE_DOS_HEADER dos{}; IMAGE_NT_HEADERS nt{}; size_t got = 0;
+    if (!remote_read(s->pi.hProcess, s->remote_agent, &dos, sizeof(dos), &got) || got != sizeof(dos) ||
+        !remote_read(s->pi.hProcess, s->remote_agent + (uint32_t)dos.e_lfanew, &nt, sizeof(nt), &got) || got != sizeof(nt))
+        return false;
+    const uint64_t a = (uint64_t)(uintptr_t)start;
+    return a >= s->remote_agent && a < s->remote_agent + nt.OptionalHeader.SizeOfImage;
+}
+
 static bool inline_hold_needed(const probe_session *s) {
     if (inline_unconfirmed(s)) return true;
     return has_inline(s) && !(s->shared && s->shared->service_ready && s->svc_event);
@@ -2439,9 +2459,15 @@ static void pump(probe_session *s, DWORD ms) {
 }
 
 static void ipc_thaw(probe_session *s);
+static void pump(probe_session *s, DWORD ms);
 static void detach(probe_session *s) {
     s->error.clear();
     release_held(s, "detach");
+    // Agent work in flight (load/init on a remote thread): let it finish first, or its hooks
+    // would land AFTER the agent was told to stop -- live hooks in a detached process.
+    for (ULONGLONG until = GetTickCount64() + 5000;
+         s->remote_work != probe_session::REMOTE_NONE && !s->exited && GetTickCount64() < until; )
+        pump(s, 20);
     if (s->remote_agent && s->local_agent && s->remote_work == probe_session::REMOTE_NONE) {
         auto local_stop = reinterpret_cast<uintptr_t>(GetProcAddress(s->local_agent, "probe_agent_stop"));
         if (local_stop) {
@@ -2732,6 +2758,8 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
             remote_write(s->pi.hProcess, (uint64_t)ex.ExceptionInformation[0] + offsetof(probe_ipc_request, result), &result, sizeof(result), &wrote);
             return true;
         }
+        if (trace_enabled() && n == offsetof(probe_ipc_request, address))
+            std::fprintf(stderr, "  ipc op=%u tid=%lu\n", head.op, (unsigned long)event.dwThreadId);
         if (n == offsetof(probe_ipc_request, address) && head.op == PROBE_IPC_INSTALL_DONE) {
             // Harmless if forged: acceptance re-checks every request status itself.
             if (!accept_agent_install(s)) { std::fprintf(stderr, "probe: %s\n", s->error.c_str()); }
@@ -3126,6 +3154,7 @@ static bool start_remote(probe_session *s, LPTHREAD_START_ROUTINE entry,
                          void *argument, probe_session::RemoteWork work) {
     s->remote_thread = CreateRemoteThread(s->pi.hProcess, nullptr, 0, entry, argument, 0, &s->remote_tid);
     if (!s->remote_thread) { set_error(s, win_error("create agent thread")); return false; }
+    if (trace_enabled()) std::fprintf(stderr, "  remote work=%d tid=%lu\n", (int)work, (unsigned long)s->remote_tid);
     s->remote_work = work; return true;
 }
 
@@ -3210,20 +3239,23 @@ static bool agent_has_pending(const probe_session *s) {
 
 static bool accept_agent_install(probe_session *s) {
     MemoryBarrier();
+    std::string first_failure;      // every probe is accepted or retired, THEN a boot-time failure is reported
     for (auto &p : s->probes) if ((p->flags & PROBE_INLINE) && p->address && !p->active && !p->retired) {
         LONG status = s->shared->requests[p->agent_index].status;
         if (status == PROBE_AGENT_PENDING || status == PROBE_AGENT_INSTALLING) continue;   // next round
         if (status != PROBE_AGENT_INSTALLED) {
             std::string why = "inline agent failed to install " + p->location +
                               " (status=" + std::to_string(status) + ")";
-            if (p->runtime) { std::fprintf(stderr, "probe: %s\n", why.c_str()); p->retired = true; continue; }
-            set_error(s, why);
-            return false;
+            std::fprintf(stderr, "probe: %s\n", why.c_str());
+            p->retired = true;
+            if (!p->runtime && first_failure.empty()) first_failure = why;
+            continue;
         }
         p->active = true;
         std::fprintf(stderr, "probe: active %s -> addr=0x%llx (inline)\n",
                      p->location.c_str(), (unsigned long long)p->address);
     }
+    if (!first_failure.empty()) { set_error(s, first_failure); return false; }
     return release_gate(s);
 }
 
@@ -3451,7 +3483,8 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
             // call slips past a site that is about to be hooked. Released by the install
             // confirmation, or by the install timeout if a held thread blocks the loader.
             s->attach_held = true;
-            for (DWORD tid : s->threads) if (tid != event.dwThreadId) hold_thread(s, tid);
+            for (DWORD tid : s->threads)
+                if (tid != event.dwThreadId && !agent_thread(s, tid)) hold_thread(s, tid);
         }
         if (ok && s->initial_break && has_inline(s) && !s->remote_agent &&
             s->remote_work == probe_session::REMOTE_NONE)
@@ -3573,7 +3606,13 @@ extern "C" void probe_close(probe_session *s) {
         // probe_run is executing on another thread: ask it to detach/stop (it owns the
         // debug object) and wait for it to finish before tearing the session down.
         s->stop_requested = true;
-        for (int i = 0; i < 1500 && s->running; ++i) Sleep(10);
+        // Wait until probe_run has really returned: tearing the session down (or detaching
+        // from this thread, which does not own the debug object) while it still runs would
+        // be a use-after-free. A slow detach is reported, never cut short.
+        for (ULONGLONG start = GetTickCount64(), warned = 0; s->running; Sleep(10)) {
+            ULONGLONG waited = (GetTickCount64() - start) / 15000;
+            if (waited > warned) { warned = waited; std::fprintf(stderr, "probe: close: still waiting for probe_run to stop (%llus)\n", waited * 15); }
+        }
     }
     if (s->detached) {
         // already detached by probe_run
@@ -3689,7 +3728,25 @@ static uint64_t resolve_symbol(probe_session *s, const char *symbol) {
             uint64_t rva = tmp.rva;
             if (!tmp.export_name.empty()) {
                 uint64_t exp = 0;
-                if (!resolve_export(s, kv.second, tmp.export_name, exp)) { s->error = saved; return 0; }
+                if (!resolve_export(s, kv.second, tmp.export_name, exp)) {
+                    // A forwarded export (kernel32!HeapAlloc -> ntdll!RtlAllocateHeap, or into an
+                    // API set): follow it the way the loader does, via this process's copy of the
+                    // same system DLL (same bitness as the target, so the same files), then map
+                    // the final function to the target module of the same name.
+                    const bool forwarded = s->error.find("forwarded") != std::string::npos;
+                    s->error = saved;
+                    if (!forwarded) return 0;
+                    HMODULE m = GetModuleHandleA(tmp.module.c_str());
+                    if (!m) m = LoadLibraryExA(tmp.module.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+                    FARPROC f = m ? GetProcAddress(m, tmp.export_name.c_str()) : nullptr;
+                    HMODULE owner{};
+                    if (!f || !module_of(reinterpret_cast<const void *>(f), owner)) return 0;
+                    std::string owner_name = module_name_from_module(owner);
+                    for (auto &kw : s->module_bases)
+                        if (iequals(kw.first, owner_name))
+                            return kw.second + (uint64_t)((uintptr_t)f - (uintptr_t)owner) + tmp.sym_offset;
+                    return 0;
+                }
                 rva = exp + tmp.sym_offset;
             }
             s->error = saved; return kv.second + rva;

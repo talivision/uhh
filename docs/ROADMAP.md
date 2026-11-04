@@ -70,15 +70,15 @@ identical source under every backend.
 - ✅ (#4) call inside the stolen bytes -> refused / hw fallback
 - ⬜ (#1) in-place step of `pushf` leaks TF into the pushed flags (RtlCaptureContext) -> clear TF in the pushed value
 - ⬜ (#2) in-place fallback (branch/call/rep/pushf sites) not exact under threads: missed hits while lifted, double hit via queued INT3
-- ⬜ (#5) x86 inline send_log_stack / set_mem can raise first-chance AVs the target's VEH sees; t_region cache never invalidated
-- ⬜ (#6) breakpoint/hw call_func: last-error/status, x86 FP, YMM not restored; callee exceptions abort the call
-- ⬜ (#7) call_func on forwarded exports works inline, fails breakpoint/hw
-- ⬜ (#8) set_reg(SP) honoured by breakpoint/hw, silently dropped inline (but counted)
-- ⬜ (#9) detach while agent work in flight leaves inline hooks live
-- ⬜ (#10) inline re-attach to a previously detached process fails (mapping/g_stopping persist)
-- ⬜ (#11) slow install releases holds after 5 s silently; HOOK_FAILED stops accepting later probes
-- ⬜ (#12) tests: attach flag probe only breakpoint; detach/crash logs not counted multi-thread; x87 status word
-- ⬜ probe_close 15 s timeout path: detach on the wrong thread while probe_run still detaching (use-after-free)
+- 🔧 (#5) inline stack walk bounded by the thread's TEB stack limits + code reads range-checked (never faults); writes always re-validated (read cache kept across hits) -- VM verify pending
+- ✗ (#6) breakpoint/hw call_func hardening: deliberately not pursued (see call_func note above)
+- 🔧 (#7) call_func follows forwarded exports on breakpoint/hw (via the controller's copy of the same system DLL); conformance `call_func-forwarded` -- VM verify pending
+- 🔧 (#8) inline set_reg(SP) honoured via SafetyHook trampoline_rsp; conformance `sp_moved` (SpSite asm) on every backend -- VM verify pending
+- 🔧 (#9) detach waits for in-flight agent work; agent install/stop serialized (SRW lock), no install after stop -- VM verify pending
+- 🔧 (#10) re-attach reuses the agent channel; agent re-arms on init -- VM verify pending (ntdll-churn-inline)
+- 🔧 (#11) every inline probe is accepted/retired before a failure is reported; (5 s hold timeout still a warning)
+- 🔧 (#12) uhh_attach --flag-backend, attach test flips the flag on every backend; (detach/crash multi-thread log counts, x87 status word: open)
+- ✅ probe_close waits for probe_run to return (warns every 15 s), never tears down underneath it
 - ⬜ frida_coexist hangs (found again 2026-11-05)
 
 ## Codex workaround audit (2026-11-05) — triaged
@@ -88,8 +88,8 @@ identical source under every backend.
 - 🔧 (C12) runtime inline add holds the calling thread until the hook lands (implemented); drop the 300 ms sleeps in conformance/dynwatch pending
 - 🔧 (C4) uhh_trace: exact backend unless --fallback-hw (done); realworld matrix asserts the effective backend (done); remaining tests audited as they are touched
 - ✅ (C5/C8) docs: logging-plan.md marked superseded with the lossless contract; README/probe_app comments on the ntdll stubs
-- ⬜ (C14/C15) suite: missing binaries FAIL, skips not counted as passes, both-arch aggregate, volume tier in the release run
-- ⬜ (C9) detach test on ntdll stub, synchronized on 'active', no sleep
+- 🔧 (C14/C15) suite: missing binaries FAIL, skips not counted as passes (done); release runs pass --volume-reads; streaming adds 20M-log tests
+- 🔧 (C9) detach test on ntdll stub, synchronized on 'probe: active', no sleep -- VM verify pending
 - ✅ (C13) PROBE_AT_RETURN: deliberately not a feature (user, 2026-11-05) -- return points are hooked naturally: read the return address at entry and probe_add_address it from the callback; documented in probe_api.h. (Optional: delete the flag -- API change, user's call)
 - ⬜ (C16) breakage inline rows gating (preserve or clean refusal)
 - ⬜ (C20) attach_new: all backends, ntdll site, no sleeps/gate
@@ -97,6 +97,7 @@ identical source under every backend.
 - ⬜ (C7) Shared state across backends -- `UHH_SHARED` (user-approved 2026-11-05). Default stays "probes that share state use one backend". Opt-in: globals marked `UHH_SHARED` live in a shared PE section (`/SECTION:uhhshr,RWS`) of the callbacks DLL; the controller runs breakpoint/hw callbacks from ITS copy of that same DLL file and the target runs inline callbacks from its copy, so both see the same physical pages with plain native access. Per-session copy of the DLL (unique path) so separate sessions never share; deleted at close. Rules: no pointers in shared state (bases differ), constant/zero init only, lock-free atomics for sync. Only enabled when the DLL actually has the section (no behaviour change otherwise).
   - ⬜ test: gated_config with MIXED backends (opens on breakpoint, reads on inline and vice versa) builds one handle->pid map; all reads attributed
   - ⬜ benchmark: per-hit cost with UHH_SHARED state vs plain globals, every backend -- must be equal
+- ⬜ Log sink speed (simple): UHH logs/s to NUL vs a plain writer's rate into a file; one manual console run. Bar: UHH is never the bottleneck.
 - ✗ (C10) helpers in probe_app: requested by the user; (C18) asm configparse: deliberate stable symbol+offset (add a PDB-local compiled variant later); (C19) _NT_SYMBOL_PATH is the requested symbol mechanism (tests may clear it)
 
 ## Benchmarks
@@ -120,4 +121,5 @@ identical source under every backend.
 - ⬜ x86 cumulative-session flakiness (possibly the same handle double-close; recheck)
 - ✅ PDB-only symbols (`module!InternalFunc`), Microsoft symbol server via dbghelp+symsrv and `_NT_SYMBOL_PATH`, export/function enumeration (`uhh_trace --list`) — engine by Codex, wired into the library; suite checks added
 - ⬜ Split `src/probe/session.cpp` (debug loop, backends, symbols, attach/call)
+- ⬜ [fan-out] Faster builds (user, 2026-11-05): incremental rebuilds should be seconds -- precompiled headers / unity build for session.cpp, avoid rebuilding every example when the library changes, Ninja instead of MSBuild, ccache-style caching
 - ⬜ Final independent whole-codebase sanity review; README/API docs pass
