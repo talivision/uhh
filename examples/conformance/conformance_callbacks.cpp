@@ -12,6 +12,12 @@ static void check(probe_context *c, bool ok, const char *name) {
     if (ok) send_log(c, "ok %s", name); else send_log(c, "FAIL %s", name);
 }
 
+// set_reg(SP) at conformance_target!SpSite+3: move the stack pointer down 32 bytes; the
+// site returns how far it moved (32 on every backend).
+CONF_EXPORT void conf_move_sp(probe_context *c) {
+    set_reg(c, PROBE_REG_SP, get_reg(c, PROBE_REG_SP) - 32);
+}
+
 struct later_config { uint64_t cookie; };
 CONF_EXPORT void conf_on_later(probe_context *c) {
     const later_config *k = (const later_config *)get_config(c);
@@ -52,6 +58,9 @@ CONF_EXPORT void conf_on_site(probe_context *c) {
     // call_func: a target function with two args
     uint64_t r = 0;
     check(c, call_func(c, "conformance_target.exe!conf_mul", &r, 2, (uint64_t)6, (uint64_t)7) && r == 42, "call_func");
+    // ...and a FORWARDED export (kernel32 -> ntdll), resolved the same way on every backend.
+    uint64_t cpu = ~0ull;
+    check(c, call_func(c, "kernel32.dll!GetCurrentProcessorNumber", &cpu, 0) && cpu < 4096, "call_func-forwarded");
     // send_log_stack: frame 1 must exist (the caller)
     send_log_stack(c, "stack conf_site");
     // control plane from the callback, once

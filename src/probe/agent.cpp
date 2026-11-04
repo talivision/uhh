@@ -35,7 +35,9 @@ static bool range_ok(uintptr_t a, size_t n, bool write) {
     if (a + n < a) return false;
     uintptr_t end = a + n;
     while (a < end) {
-        if (a >= t_region.lo && a < t_region.hi && (!write || t_region.writable)) {
+        // Reads trust the per-thread cache across hits; WRITES re-check every time: the
+        // target may have made the region read-only since (a write fault would be visible).
+        if (!write && a >= t_region.lo && a < t_region.hi) {
             a = t_region.hi; continue;
         }
         MEMORY_BASIC_INFORMATION mbi{};
@@ -164,11 +166,15 @@ static uint32_t capture_stack(probe_context *c, uint64_t *frames, uint32_t cap) 
     w.Rbx = c->regs.rbx; w.Rcx = c->regs.rcx; w.Rdx = c->regs.rdx; w.Rsi = c->regs.rsi; w.Rdi = c->regs.rdi;
     w.R8 = c->regs.r8; w.R9 = c->regs.r9; w.R10 = c->regs.r10; w.R11 = c->regs.r11;
     w.R12 = c->regs.r12; w.R13 = c->regs.r13; w.R14 = c->regs.r14; w.R15 = c->regs.r15;
+    const NT_TIB *tib = reinterpret_cast<const NT_TIB *>(NtCurrentTeb());
+    const DWORD64 stack_lo = (DWORD64)tib->StackLimit, stack_hi = (DWORD64)tib->StackBase;
     __try {
         while (n < cap) {
+            if (w.Rsp < stack_lo || w.Rsp >= stack_hi) break;   // unwound off this thread's stack
             DWORD64 image = 0;
             PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(w.Rip, &image, nullptr);
             if (!fn) {                                   // leaf: return address is at [rsp]
+                if (w.Rsp < stack_lo || w.Rsp + 8 > stack_hi) break;   // never fault (visible to the target)
                 w.Rip = *(DWORD64 *)w.Rsp; w.Rsp += 8;
             } else {
                 void *handler_data = nullptr; DWORD64 establisher = 0;
@@ -179,16 +185,25 @@ static uint32_t capture_stack(probe_context *c, uint64_t *frames, uint32_t cap) 
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 #else
+    // Every read is checked BEFORE it is made (the hit thread's own stack bounds from its
+    // TEB; code bytes via range_ok), so a bogus EBP (FPO code, EBP used as a register) or a
+    // non-address at [esp] stops the walk instead of faulting -- a fault would be visible
+    // to the target's vectored handlers before our __except.
+    const NT_TIB *tib = reinterpret_cast<const NT_TIB *>(NtCurrentTeb());
+    const uint32_t lo = (uint32_t)(uintptr_t)tib->StackLimit, hi = (uint32_t)(uintptr_t)tib->StackBase;
+    auto on_stack = [&](uint32_t a, uint32_t len) { return a >= lo && a <= hi - len && hi >= len; };
     __try {
         // At a function's first instructions EBP is still the CALLER's frame, so the EBP
         // chain would skip the immediate caller. If [esp] is a genuine return address
         // (the bytes before it encode a call), record it first. Mid-function, [esp] is
         // usually a local that fails this test, and a duplicate of [ebp+4] is skipped.
-        uint32_t top = *(uint32_t *)(uintptr_t)c->regs.rsp;
-        uint32_t caller_ret = c->regs.rbp ? *(uint32_t *)(uintptr_t)(c->regs.rbp + 4) : 0;
-        if (n < cap && top && top != caller_ret && looks_like_return(top)) frames[n++] = top;
+        const uint32_t esp = (uint32_t)c->regs.rsp;
+        uint32_t top = on_stack(esp, 4) ? *(uint32_t *)(uintptr_t)esp : 0;
+        uint32_t caller_ret = on_stack((uint32_t)c->regs.rbp, 8) ? *(uint32_t *)(uintptr_t)(c->regs.rbp + 4) : 0;
+        if (n < cap && top > 8 && top != caller_ret && range_ok(top - 8, 8, false) && looks_like_return(top))
+            frames[n++] = top;
         uint32_t ebp = (uint32_t)c->regs.rbp;
-        while (n < cap && ebp) {
+        while (n < cap && ebp && on_stack(ebp, 8)) {
             uint32_t next = *(uint32_t *)(uintptr_t)ebp, ret = *(uint32_t *)(uintptr_t)(ebp + 4);
             if (!ret) break;
             frames[n++] = ret;
@@ -492,6 +507,21 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     native.esi = (uint32_t)c.regs.rsi; native.edi = (uint32_t)c.regs.rdi;
     native.ebp = (uint32_t)c.regs.rbp;
 #endif
+    // set_reg(SP): SafetyHook resumes with sp = trampoline_sp and then `ret`, so put the
+    // resume address (the trampoline) just below the requested sp and point it there --
+    // after the ret the target runs on with exactly the sp the callback asked for (the
+    // same contract the breakpoint/hw backends implement).
+#if defined(_WIN64)
+    if (c.regs.rsp != native.rsp) {
+        auto slot = reinterpret_cast<uintptr_t *>((uintptr_t)c.regs.rsp - sizeof(uintptr_t));
+        *slot = native.rip; native.trampoline_rsp = reinterpret_cast<uintptr_t>(slot);
+    }
+#else
+    if ((uint32_t)c.regs.rsp != native.esp) {
+        auto slot = reinterpret_cast<uintptr_t *>((uintptr_t)(uint32_t)c.regs.rsp - sizeof(uintptr_t));
+        *slot = native.eip; native.trampoline_esp = reinterpret_cast<uintptr_t>(slot);
+    }
+#endif
 }
 
 // Entry point of every inline hit. It runs FIRST, before any C code that might call the
@@ -566,7 +596,16 @@ template <class F> static void frozen(uint64_t enabling_mask, F &&fn) {
     }
 }
 
+// Install rounds and the final unhook never overlap: a round that started before a detach
+// finishes before probe_agent_stop removes hooks, and none starts after it.
+static SRWLOCK g_install_lock = SRWLOCK_INIT;
+static void install_pending_locked();
 static void install_pending() {
+    AcquireSRWLockExclusive(&g_install_lock);
+    if (!g_stopping) install_pending_locked();
+    ReleaseSRWLockExclusive(&g_install_lock);
+}
+static void install_pending_locked() {
     uint32_t count = shared->request_count;
     if (count > PROBE_AGENT_MAX_PROBES) count = PROBE_AGENT_MAX_PROBES;
     uint64_t enabling = 0;
@@ -661,6 +700,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
 // Unhook without pulling code out from under a thread: stop new callbacks, wait for the
 // ones in flight to finish (bounded), then remove the hooks.
 extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_stop(void *) {
+    AcquireSRWLockExclusive(&g_install_lock);            // after any install round in progress
     InterlockedExchange(&g_stopping, 1);
     for (int i = 0; i < 2000 && any_inflight(); ++i) Sleep(1);
     frozen(0, [] {
@@ -673,6 +713,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_stop(void *) {
     // (it then jumps to the original code, which is intact). Deliberate leak, once.
     for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i)
         if (hooks[i]) new SafetyHookMid(std::move(hooks[i]));
+    ReleaseSRWLockExclusive(&g_install_lock);
     return 0;
 }
 

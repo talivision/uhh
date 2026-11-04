@@ -21,6 +21,7 @@ __declspec(dllexport) __declspec(noinline) intptr_t conf_site(intptr_t a0, intpt
 __declspec(dllexport) __declspec(noinline) intptr_t conf_mul(intptr_t a, intptr_t b) { return a * b; }
 // Probed only at runtime (added from inside the callback).
 __declspec(dllexport) __declspec(noinline) void conf_later(int i) { g_later_calls += i ? 1 : 1; }
+intptr_t SpSite(void);   /* asm: returns how far SP moved across the probe at SpSite+3 */
 
 static int wait_gate(void) {
     char b; DWORD n = 0; HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
@@ -43,8 +44,10 @@ int main(int argc, char **argv) {
     }
     // No wait: the callback that added conf_later's inline probe held this thread until it landed.
     for (int i = 0; i < 20; ++i) conf_later(i);
+    int sp_moved = 0;
+    for (int i = 0; i < 10; ++i) if (SpSite() == 32) ++sp_moved;
     g_watch_value = 1; g_watch_value = 2; g_watch_value = 3; // three stores to the watched address
-    printf("{\"kind\":\"target\",\"calls\":%d,\"arg_rewritten\":%d,\"mem_written\":%d,\"later_calls\":%ld}\n",
+    printf("{\"kind\":\"target\",\"sp_moved\":%d,\"calls\":%d,\"arg_rewritten\":%d,\"mem_written\":%d,\"later_calls\":%ld}\n", sp_moved,
            calls, arg_rewritten, mem_written, g_later_calls);
     fflush(stdout);
     return 0;
