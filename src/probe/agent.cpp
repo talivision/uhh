@@ -1,6 +1,7 @@
 #include "win_common.hpp"
 #include "probe_agent_shared.hpp"
 #include <safetyhook.hpp>
+#include <cstdarg>
 
 static HMODULE self_module;
 static HANDLE mapping;
@@ -121,29 +122,48 @@ static uint32_t capture_stack(probe_context *c, uint64_t *frames, uint32_t cap) 
     return n;
 }
 
-static void agent_log(probe_context *c, bool stack, const char *format) {
-    /* The agent records the stable format text only (typed argument capture arrives
-       with the per-thread queues). A stack snapshot rides in the same record. */
+// Format and stack are produced BEFORE claiming a ring slot so a slot is held only
+// for a memcpy; a full ring drops the record (counted) rather than block the thread.
+static void agent_log(probe_context *c, bool stack, const char *format, va_list ap) {
     auto *state = c ? static_cast<AgentState *>(c->controller) : nullptr;
     if (!state || !state->shared || !format) return;
-    LONG slot = InterlockedIncrement(&state->shared->log_reserve) - 1;
-    if (slot < 0 || slot >= (LONG)PROBE_AGENT_LOG_CAP) {
-        InterlockedIncrement(&state->shared->log_dropped); return;
+    char text[PROBE_AGENT_LOG_TEXT_CAP];
+    int n = -1;
+    __try { n = _vsnprintf_s(text, sizeof(text), _TRUNCATE, format, ap); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { n = -1; }
+    if (n < 0 && !text[0]) { text[0] = 0; }
+    text[sizeof(text) - 1] = 0;
+    uint64_t frames[PROBE_STACK_MAX_FRAMES]; uint32_t nframes = 0;
+    if (stack) nframes = capture_stack(c, frames, PROBE_STACK_MAX_FRAMES);
+    auto *sh = state->shared;
+    LONG64 pos = sh->log_head;
+    probe_agent_log *rec = nullptr;
+    for (;;) {
+        rec = &sh->logs[(uint64_t)pos % PROBE_AGENT_LOG_CAP];
+        LONG64 diff = rec->seq - pos;
+        if (diff == 0) {
+            if (InterlockedCompareExchange64(&sh->log_head, pos + 1, pos) == pos) break;
+            pos = sh->log_head;
+        } else if (diff < 0) {
+            InterlockedIncrement(&sh->log_dropped); return;      // full: controller is behind
+        } else {
+            pos = sh->log_head;
+        }
     }
-    auto &record = state->shared->logs[slot];
-    record.probe = state->index; record.tid = c->tid;
-    size_t i = 0;
-    __try {
-        for (; i + 1 < PROBE_AGENT_LOG_TEXT_CAP && format[i]; ++i) record.text[i] = format[i];
-    } __except (EXCEPTION_EXECUTE_HANDLER) { i = 0; }
-    record.text[i] = 0;
-    record.has_stack = stack ? 1 : 0;
-    record.frame_count = stack ? capture_stack(c, record.frames, PROBE_STACK_MAX_FRAMES) : 0;
-    MemoryBarrier(); InterlockedExchange(&record.committed, 1);
+    rec->probe = state->index; rec->tid = c->tid;
+    std::memcpy(rec->text, text, sizeof(text));
+    rec->has_stack = stack ? 1 : 0; rec->frame_count = nframes;
+    if (nframes) std::memcpy(rec->frames, frames, nframes * sizeof(uint64_t));
+    MemoryBarrier();
+    InterlockedExchange64(&rec->seq, pos + 1);                    // publish
 }
 
-extern "C" void send_log(probe_context *c, const char *format, ...) { agent_log(c, false, format); }
-extern "C" void send_log_stack(probe_context *c, const char *format, ...) { agent_log(c, true, format); }
+extern "C" void send_log(probe_context *c, const char *format, ...) {
+    va_list ap; va_start(ap, format); agent_log(c, false, format, ap); va_end(ap);
+}
+extern "C" void send_log_stack(probe_context *c, const char *format, ...) {
+    va_list ap; va_start(ap, format); agent_log(c, true, format, ap); va_end(ap);
+}
 extern "C" const void *get_config(probe_context *c) { return c ? c->config : nullptr; }
 
 /* ---- Control plane from an inline callback: forwarded to the controller. ----

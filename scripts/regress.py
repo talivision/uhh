@@ -13,7 +13,10 @@ Checks:
   - mix matrix: flag x read over {breakpoint, inline, hw}; exactly one override and the
     read probe's hit count equals the reads (flag=inline exercises the HW fallback).
   - multithread exact: each read backend at >cores threads -> hits == threads*reads,
-    the no-dropped-events guarantee.
+    the no-dropped-events guarantee -- and one formatted log per hit, log_dropped == 0
+    (the no-dropped-LOGS guarantee; inline logs cross a shared ring the controller drains).
+  - log-throughput-<backend>: per-log overhead (logging run vs --no-log run) under a
+    ceiling, so logging getting slow fails like any other regression.
   - breakage: the hostile fixtures produce their expected verdicts.
   - frida-parity: the four Interceptor-parity demos all pass.
   - watchpoint: a hardware write-watchpoint fires once per store.
@@ -98,12 +101,19 @@ def check_gated_off():
         record("gated-off", False, repr(e))
 
 
-def gated(flag_bk, read_bk, threads, reads, timeout=200):
+def gated(flag_bk, read_bk, threads, reads, timeout=200, log=True):
     g = exe("gated_config.exe")
     flag = rvas("configparse.map", "ParsedFlagSite")["ParsedFlagSite"]
     read = rvas("probe_app.map", "ReadSite")["ReadSite"]
     return run([g, flag, read, "--flag-backend", flag_bk, "--read-backend", read_bk,
+                *([] if log else ["--no-log"]),
                 "--no-wait", "--threads", threads, "--reads", reads], timeout=timeout)
+
+
+def read_logs(objs):
+    """Logs emitted by log_read (one per read hit) and the report's drop counter."""
+    n = sum(1 for o in objs if o.get("kind") == "probe_log" and str(o.get("message", "")).startswith("read handle="))
+    return n, report(objs).get("log_dropped")
 
 
 def check_mix_matrix(threads, reads):
@@ -134,8 +144,38 @@ def check_multithread_exact(threads, reads):
             r, o = gated("breakpoint", read_bk, threads, reads, timeout=300)
             rd = next((x for x in probes(o) if "probe_app.exe" in x.get("location", "")), {})
             a = app(o)
-            ok = (rd.get("hits") == total and a.get("successful_reads") == total)
-            record(name, ok, f"hits={rd.get('hits')} reads={a.get('successful_reads')} want={total}")
+            logs, dropped = read_logs(o)
+            ok = (rd.get("hits") == total and a.get("successful_reads") == total and
+                  logs == total and dropped == 0)
+            record(name, ok, f"hits={rd.get('hits')} reads={a.get('successful_reads')} logs={logs} "
+                             f"dropped={dropped} want={total}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+# Per-log overhead floors (ns per logged hit, over the same run without logging). Loose
+# on purpose -- they catch a regression of an order of magnitude (e.g. logging going
+# synchronous or quadratic), not run-to-run noise on a VM.
+LOG_OVERHEAD_CEIL_NS = {"inline": 20_000, "hw": 100_000, "breakpoint": 200_000}
+
+
+def check_log_throughput(threads, reads):
+    if not exe("gated_config.exe"):
+        return skip("log-throughput", "gated_config.exe missing")
+    total = int(threads) * int(reads)
+    for read_bk in ("inline", "hw", "breakpoint"):
+        name = f"log-throughput-{read_bk}"
+        try:
+            _, quiet = gated("breakpoint", read_bk, threads, reads, timeout=300, log=False)
+            _, loud = gated("breakpoint", read_bk, threads, reads, timeout=300, log=True)
+            tq, tl = app(quiet).get("elapsed_ns"), app(loud).get("elapsed_ns")
+            logs, dropped = read_logs(loud)
+            per = (tl - tq) / total if (tq is not None and tl is not None) else None
+            ok = (per is not None and per < LOG_OVERHEAD_CEIL_NS[read_bk] and logs == total and dropped == 0
+                  and read_logs(quiet)[0] == 0)
+            rate = total / (tl / 1e9) if tl else 0
+            record(name, ok, f"logs={logs}/{total} dropped={dropped} overhead={per and round(per)}ns/log "
+                             f"(ceil {LOG_OVERHEAD_CEIL_NS[read_bk]}) logged_rate={rate:,.0f}/s")
         except Exception as e:
             record(name, False, repr(e))
 
@@ -155,8 +195,11 @@ def check_volume(volume_reads):
             r, o = gated("breakpoint", read_bk, str(threads), str(volume_reads), timeout=timeout)
             rd = next((x for x in probes(o) if "probe_app.exe" in x.get("location", "")), {})
             a = app(o)
-            ok = (rd.get("hits") == total and a.get("successful_reads") == total)
-            record(name, ok, f"hits={rd.get('hits')} reads={a.get('successful_reads')} want={total}")
+            logs, dropped = read_logs(o)
+            ok = (rd.get("hits") == total and a.get("successful_reads") == total and
+                  logs == total and dropped == 0)
+            record(name, ok, f"hits={rd.get('hits')} reads={a.get('successful_reads')} logs={logs} "
+                             f"dropped={dropped} want={total}")
         except Exception as e:
             record(name, False, repr(e))
 
@@ -208,15 +251,20 @@ def check_watchpoint():
     d = exe("watch_driver.exe")
     if not d or not exe("watch_target.exe"):
         return skip("watchpoint", "watch_driver/watch_target missing")
-    try:
-        rva = rvas("watch_target.map", "g_watched")["g_watched"]
-        _, o = run([d, rva, "--no-wait", "--threads", "4", "--writes", "1000"], timeout=120)
-        rd = next((x for x in probes(o) if x.get("backend") == "hw"), {})
-        hits = next((x.get("callback_hits") for x in o if x.get("kind") == "watch_driver"), None)
-        ok = rd.get("hits") == 4000 and hits == 4000
-        record("watchpoint", ok, f"probe_hits={rd.get('hits')} callback_hits={hits} want=4000")
-    except Exception as e:
-        record("watchpoint", False, repr(e))
+    # Same workload both times: 4 threads x 1000 stores, then 1000 loads each, then main
+    # reads the value once more for its report line. WRITE must count only the 4000
+    # stores; RW must count stores + loads + that final read = 8001.
+    for name, extra, want in (("watchpoint-write", [], 4000), ("watchpoint-rw", ["--rw"], 8001)):
+        try:
+            rva = rvas("watch_target.map", "g_watched")["g_watched"]
+            _, o = run([d, rva, *extra, "--no-wait", "--threads", "4", "--writes", "1000", "--reads", "1000"],
+                       timeout=120)
+            rd = next((x for x in probes(o) if x.get("backend") == "hw"), {})
+            hits = next((x.get("callback_hits") for x in o if x.get("kind") == "watch_driver"), None)
+            ok = rd.get("hits") == want and hits == want
+            record(name, ok, f"probe_hits={rd.get('hits')} callback_hits={hits} want={want}")
+        except Exception as e:
+            record(name, False, repr(e))
 
 
 def check_dynwatch(writes=100):
@@ -233,12 +281,15 @@ def check_dynwatch(writes=100):
             once = [p for p in probes(o) if p.get("location", "").startswith("0x") and p.get("backend") == "breakpoint"]
             stacks = [x.get("stack") for x in o if x.get("kind") == "probe_log" and x.get("stack")]
             sym_ok = bool(stacks) and len(stacks[0]) >= 3 and stacks[0][0].startswith("dynwatch_target")
+            marker = next((p for p in probes(o) if p.get("location", "").endswith("!dynwatch_marker")), {})
+            tgt = next((x for x in o if x.get("kind") == "target"), {})
             ok = (res.get("returns") == 1 and res.get("arms") == 1 and res.get("watch_hits") == want and
                   rep.get("error") is None and len(once) == 1 and once[0].get("active") is False and
-                  once[0].get("hits") == 1 and sym_ok)
+                  once[0].get("hits") == 1 and sym_ok and
+                  marker.get("backend") == "inline" and marker.get("hits") == 50 and tgt.get("marker_calls") == 50)
             record(name, ok, f"returns={res.get('returns')} arms={res.get('arms')} watch_hits={res.get('watch_hits')} "
                              f"want={want} once_retired={bool(once) and once[0].get('active') is False} "
-                             f"stack0={(stacks[0][0] if stacks else None)}")
+                             f"runtime_inline_hits={marker.get('hits')}/50 stack0={(stacks[0][0] if stacks else None)}")
         except Exception as e:
             record(name, False, repr(e))
 
@@ -257,6 +308,7 @@ def main():
     check_gated_off()
     check_mix_matrix(args.threads, args.reads)
     check_multithread_exact(args.threads, args.reads)
+    check_log_throughput(args.threads, args.reads)
     if int(args.volume_reads) > 0:
         check_volume(args.volume_reads)
     check_breakage()

@@ -13,6 +13,11 @@
 #define TRACKED_SIZE 0x1337
 
 static long g_writes = 100;
+static volatile long g_marker_calls;
+
+// Hooked at RUNTIME with an inline probe that a callback adds. The install happens on
+// a fresh agent thread (asynchronously), so main pauses briefly before calling it.
+__declspec(dllexport) __declspec(noinline) void dynwatch_marker(long i) { (void)i; g_marker_calls += 1; }
 static volatile long *g_block;
 
 static int wait_gate(void) {
@@ -45,8 +50,10 @@ int main(int argc, char **argv) {
     HANDLE t = CreateThread(NULL, 0, worker, NULL, 0, NULL);
     if (!t) return 5;
     WaitForSingleObject(t, INFINITE); CloseHandle(t);
-    printf("{\"kind\":\"target\",\"writes_per_thread\":%ld,\"threads\":2,\"expected_watch_hits\":%ld}\n",
-           g_writes, 2 * g_writes);
+    Sleep(300);
+    for (long i = 0; i < 50; ++i) dynwatch_marker(i);
+    printf("{\"kind\":\"target\",\"marker_calls\":%ld,\"writes_per_thread\":%ld,\"threads\":2,\"expected_watch_hits\":%ld}\n",
+           g_marker_calls, g_writes, 2 * g_writes);
     fflush(stdout);
     for (int i = 0; i < 4; ++i) free((void *)noise[i]);
     // The tracked block is deliberately NOT freed: HeapFree writes free-list metadata

@@ -21,6 +21,7 @@ struct Probe {
     uint64_t sym_offset = 0;
     bool retired = false;      // PROBE_ONCE probe that already fired (kept for the report)
     bool internal = false;     // library-owned (not reported)
+    bool runtime = false;      // added after launch: an install failure is reported, not fatal
     uint64_t rva = 0, base = 0, address = 0, hits = 0;
     uint32_t agent_index = UINT32_MAX;
     unsigned char original = 0;
@@ -92,11 +93,18 @@ struct probe_session {
     // and no re-arm race: exact under threads for any instruction, up to 4 slots.
     std::unordered_set<DWORD> threads;
     uint8_t dr_used = 0;
-    uint8_t dr_ever = 0;                       // slots we have ever owned (stale-#DB filter)
+    uint8_t dr_ever = 0;
+    uint8_t dr_next = 0;                       // next DR slot to try (rotation)
+    uint64_t entry_reapply = 0;                // image entry: re-apply DRs on first arrival                       // slots we have ever owned (stale-#DB filter)
     std::unordered_set<uint64_t> retired_bps;  // removed INT3 sites (stale-hit filter)
     int hw_active = 0;
     bool launched = false, ran = false, exited = false, gate_sent = false;
 };
+
+static bool register_runtime_inline(probe_session *s, Probe &p);
+static bool kick_agent(probe_session *s);
+static bool resolve_inline(probe_session *s, Probe &p, uint64_t base);
+static Probe *probe_at(probe_session *s, uint64_t address);
 
 static void set_error(probe_session *s, const std::string &message) {
     if (s && s->error.empty()) s->error = message;
@@ -232,12 +240,19 @@ static bool resolve_export(probe_session *s, uint64_t base, const std::string &n
     }
     auto dir = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
     if (!dir.VirtualAddress || !dir.Size) { set_error(s, "export lookup: module has no exports"); return false; }
+    // Every size below comes from the (possibly hostile) target image: bound them all.
+    if (dir.Size < sizeof(IMAGE_EXPORT_DIRECTORY) || dir.Size > (64u << 20)) {
+        set_error(s, "export lookup: implausible export directory size"); return false;
+    }
     std::vector<unsigned char> blob(dir.Size);
     if (!remote_read(h, base + dir.VirtualAddress, blob.data(), blob.size(), &got) || got != blob.size()) {
         set_error(s, "export lookup: cannot read export directory"); return false;
     }
     auto in_dir = [&](uint32_t r, size_t n) { return r >= dir.VirtualAddress && r - dir.VirtualAddress + n <= dir.Size; };
     auto ex = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY *>(blob.data());
+    if (ex->NumberOfNames > (1u << 20) || ex->NumberOfFunctions > (1u << 20)) {
+        set_error(s, "export lookup: implausible export counts"); return false;
+    }
     // The name/function tables may live outside the directory range: read them separately.
     std::vector<DWORD> names(ex->NumberOfNames), funcs(ex->NumberOfFunctions);
     std::vector<WORD> ords(ex->NumberOfNames);
@@ -363,7 +378,10 @@ static bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
     if (p.rva > UINT64_MAX - base) { set_error(s, "probe address overflow"); return false; }
     uint64_t address = base + p.rva;
     int slot = -1;
-    for (int i = 0; i < 4; ++i) if (!(s->dr_used & (1u << i))) { slot = i; break; }
+    // Rotate through free slots so a just-released slot is reused last: a #DB already in
+    // flight for the old probe is then far less likely to be blamed on a new one.
+    for (int k = 0; k < 4; ++k) { int i = (s->dr_next + k) & 3; if (!(s->dr_used & (1u << i))) { slot = i; break; } }
+    if (slot >= 0) s->dr_next = (uint8_t)((slot + 1) & 3);
     if (slot < 0) { set_error(s, "no free hardware breakpoint slot (max 4)"); return false; }
     uint32_t rw = 0, len = 0; hw_rw_len(p.flags, rw, len);
     size_t tried = 0, set_ok = 0;
@@ -393,6 +411,22 @@ static bool arm_breakpoint(probe_session *s, Probe &p, uint64_t base) {
         set_error(s, win_error("read original probe bytes")); return false;
     }
     if (buf[0] == 0xcc) {
+        Probe *owner = probe_at(s, address);
+        if (owner && owner->internal && !owner->orig_insn.empty()) {
+            // Take over the library's own entry INT3: reuse its saved original bytes; the
+            // re-apply still happens (entry_reapply) when this probe first fires.
+            std::memcpy(buf, owner->orig_insn.data(), owner->orig_insn.size());
+            owner->active = false; owner->retired = true;
+            uint32_t len = 0; bool disp_ok = false; int riprel = -1;
+            if (!decode_site(buf, sizeof(buf), len, disp_ok, riprel) || len == 0 || len > sizeof(buf)) {
+                set_error(s, "could not decode probe site instruction"); return false;
+            }
+            p.original = buf[0]; p.orig_insn.assign(buf, buf + len);
+            p.insn_len = len; p.displaced_ok = disp_ok; p.riprel_disp_off = riprel;
+            p.base = base; p.address = address; p.active = true;
+            s->retired_bps.erase(address);
+            return true;
+        }
         set_error(s, "pre-hooked INT3 sites are unsupported by this breakpoint backend"); return false;
     }
     uint32_t len = 0; bool disp_ok = false; int riprel = -1;
@@ -447,12 +481,26 @@ static bool arm_probe(probe_session *s, Probe &item, uint64_t base) {
                                           : resolve_inline(s, item, base);
 }
 
+// Launch-time probes that fail to arm fail the session (the user asked for them up
+// front). A probe added at runtime -- possibly pending on a module that loads much
+// later -- only reports its failure and retires; the run and other probes continue.
 static bool arm_module(probe_session *s, const std::string &module, uint64_t base) {
-    for (auto &item : s->probes) {
-        if (item->active || item->retired || item->address || !iequals(item->module, module)) continue;
-        if (!arm_probe(s, *item, base)) return false;
+    bool all_ok = true;
+    for (size_t i = 0; i < s->probes.size(); ++i) {
+        Probe &item = *s->probes[i];
+        if (item.active || item.retired || item.address || !iequals(item.module, module)) continue;
+        std::string saved = s->error;
+        bool ok = false;
+        try { ok = arm_probe(s, item, base); }
+        catch (const std::exception &e) { set_error(s, std::string("arm ") + item.location + ": " + e.what()); }
+        if (ok) continue;
+        if (item.runtime) {
+            std::fprintf(stderr, "probe: runtime probe %s failed to arm: %s\n", item.location.c_str(), s->error.c_str());
+            s->error = saved; item.retired = true; continue;
+        }
+        all_ok = false;   // keep arming the module's other probes; the session still fails
     }
-    return true;
+    return all_ok;
 }
 
 static Probe *probe_at(probe_session *s, uint64_t address) {
@@ -471,9 +519,8 @@ static uint32_t probe_index(probe_session *s, const Probe *probe) {
 // hardware probe armed later in loader init (a static import such as ucrtbase loading)
 // is silently wiped there. A library-owned one-shot breakpoint at the image entry point
 // re-applies every active hardware probe to every thread right after that point.
-static void reapply_hw(probe_context *c) {
-    probe_session *s = get_session(c);
-    if (!s) return;
+static void reapply_all_hw(probe_session *s) {
+    s->entry_reapply = 0;
     for (auto &p : s->probes) {
         if (!p->active || !(p->flags & PROBE_HW)) continue;
         uint32_t rw = 0, len = 0; hw_rw_len(p->flags, rw, len);
@@ -484,8 +531,14 @@ static void reapply_hw(probe_context *c) {
     }
 }
 
+static void reapply_hw(probe_context *c) {
+    if (probe_session *s = get_session(c)) reapply_all_hw(s);
+}
+
 static void arm_entry_fixup(probe_session *s, uint64_t entry) {
     if (!entry) return;
+    s->entry_reapply = entry;
+    if (probe_at(s, entry)) return;   // a user breakpoint is already there: it triggers the re-apply
     try {
         auto p = std::make_unique<Probe>();
         p->location = "<entry>"; p->flags = PROBE_BREAKPOINT | PROBE_ONCE; p->callback = reapply_hw;
@@ -538,10 +591,7 @@ static bool check_flags(probe_session *s, uint32_t flags, bool allow_inline) {
         set_error(s, "requested probe type/options are unsupported in this build");
         return false;
     }
-    if (type == PROBE_INLINE && !allow_inline) {
-        set_error(s, "inline probes must be added before launch (use PROBE_BREAKPOINT or PROBE_HW at runtime)");
-        return false;
-    }
+    (void)allow_inline;
     if (type == PROBE_HW && hw_in_use(s) >= 4) {
         set_error(s, "too many hardware probes (max 4 DR slots)"); return false;
     }
@@ -563,7 +613,7 @@ extern "C" int probe_add_symbol_cfg(probe_session *s, const char *location, prob
     try {
         auto p = std::make_unique<Probe>();
         if (!parse_location(s, location, *p)) return scope.done(0);
-        p->callback = callback; p->flags = flags;
+        p->callback = callback; p->flags = flags; p->runtime = s->launched;
         if (type == PROBE_INLINE && !callback_export_name(callback, p->callback_export)) {
             set_error(s, "inline callback is not a named export"); return scope.done(0);
         }
@@ -577,12 +627,16 @@ extern "C" int probe_add_symbol_cfg(probe_session *s, const char *location, prob
         std::fprintf(stderr, "probe: pending %s\n", p->location.c_str());
         Probe *raw = p.get();
         s->probes.push_back(std::move(p));          // heap-stable: callbacks may add mid-iteration
+        if (s->launched && type == PROBE_INLINE && !register_runtime_inline(s, *raw)) {
+            raw->retired = true; return scope.done(0);
+        }
         if (s->launched) {                          // runtime add: arm now if the module is mapped
             for (auto &kv : s->module_bases)
                 if (iequals(kv.first, raw->module)) {
                     if (!arm_probe(s, *raw, kv.second)) { raw->retired = true; return scope.done(0); }
                     break;
                 }
+            if (type == PROBE_INLINE && raw->address && !kick_agent(s)) { raw->retired = true; return scope.done(0); }
         }
         return 1;
     } catch (const std::exception &e) { set_error(s, e.what()); return scope.done(0); }
@@ -603,10 +657,14 @@ static int add_absolute(probe_session *s, uint64_t address, probe_callback cb, u
     try {
         auto p = std::make_unique<Probe>();
         char loc[40]; std::snprintf(loc, sizeof(loc), "0x%llx", (unsigned long long)address);
-        p->location = loc; p->flags = flags; p->callback = cb; p->rva = address;
+        p->location = loc; p->flags = flags; p->callback = cb; p->rva = address; p->runtime = true;
+        if ((flags & PROBE_INLINE) && !callback_export_name(cb, p->callback_export)) {
+            set_error(s, "inline callback is not a named export"); return scope.done(0);
+        }
         Probe *raw = p.get();
         s->probes.push_back(std::move(p));
-        bool ok = (flags & PROBE_HW) ? arm_hw(s, *raw, 0) : arm_breakpoint(s, *raw, 0);
+        bool ok = (flags & PROBE_INLINE) ? register_runtime_inline(s, *raw) && resolve_inline(s, *raw, 0) && kick_agent(s)
+                : (flags & PROBE_HW)     ? arm_hw(s, *raw, 0) : arm_breakpoint(s, *raw, 0);
         if (!ok) raw->retired = true;
         return scope.done(ok ? 1 : 0);
     } catch (const std::exception &e) { set_error(s, e.what()); return scope.done(0); }
@@ -624,14 +682,13 @@ extern "C" int probe_watch(probe_session *s, uint64_t address, probe_callback cb
     if (s && (flags & ~(uint32_t)(PROBE_WATCH_WRITE | PROBE_WATCH_RW | PROBE_ONCE | PROBE_HW))) {
         DynamicScope scope(s); set_error(s, "probe_watch takes PROBE_WATCH_WRITE/RW and PROBE_ONCE only"); return scope.done(0);
     }
+    if (s && (address & 3)) {
+        DynamicScope scope(s); set_error(s, "probe_watch address must be 4-byte aligned (watches one dword)"); return scope.done(0);
+    }
     return add_absolute(s, address, cb, PROBE_HW | (mode ? mode : (uint32_t)PROBE_WATCH_WRITE) | (flags & PROBE_ONCE));
 }
 
-static bool create_agent_channel(probe_session *s) {
-    uint32_t count = 0;
-    for (auto &p : s->probes) if (p->flags & PROBE_INLINE) p->agent_index = count++;
-    if (!count) return true;
-    if (count > PROBE_AGENT_MAX_PROBES) { set_error(s, "too many inline probes"); return false; }
+static bool open_agent_section(probe_session *s, uint32_t count) {
     wchar_t name[64]; probe_agent_mapping_name(s->pi.dwProcessId, name);
     s->mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
                                     (DWORD)sizeof(probe_agent_shared), name);
@@ -644,18 +701,57 @@ static bool create_agent_channel(probe_session *s) {
     std::memset(s->shared, 0, sizeof(*s->shared));
     s->shared->magic = PROBE_AGENT_MAGIC; s->shared->version = PROBE_AGENT_VERSION;
     s->shared->request_count = count;
-    for (const auto &p : s->probes) if (p->flags & PROBE_INLINE) {
-        auto &request = s->shared->requests[p->agent_index]; request.flags = p->flags;
-        request.config_len = (uint32_t)p->config.size();
-        std::memcpy(request.callback, p->callback_export.c_str(), p->callback_export.size() + 1);
-        if (!p->config.empty()) std::memcpy(request.config, p->config.data(), p->config.size());
-    }
+    for (uint32_t i = 0; i < PROBE_AGENT_LOG_CAP; ++i) s->shared->logs[i].seq = i;   // ring: all free
     s->agent_path = sibling_agent_path();
     s->local_agent = LoadLibraryW(s->agent_path.c_str());
     if (!s->local_agent || !GetProcAddress(s->local_agent, "probe_agent_init")) {
         set_error(s, win_error("map probe_api_agent.dll exports")); return false;
     }
     return true;
+}
+
+static void fill_request(probe_session *s, const Probe &p) {
+    auto &request = s->shared->requests[p.agent_index]; request.flags = p.flags;
+    request.config_len = (uint32_t)p.config.size();
+    std::memcpy(request.callback, p.callback_export.c_str(), p.callback_export.size() + 1);
+    if (!p.config.empty()) std::memcpy(request.config, p.config.data(), p.config.size());
+}
+
+static bool create_agent_channel(probe_session *s) {
+    uint32_t count = 0;
+    for (auto &p : s->probes) if (p->flags & PROBE_INLINE) p->agent_index = count++;
+    if (!count) return true;
+    if (count > PROBE_AGENT_MAX_PROBES) { set_error(s, "too many inline probes"); return false; }
+    if (!open_agent_section(s, count)) return false;
+    for (const auto &p : s->probes) if (p->flags & PROBE_INLINE) fill_request(s, *p);
+    return true;
+}
+
+static bool start_agent_load(probe_session *s);
+static bool start_agent_init(probe_session *s);
+
+// An inline probe added while the target runs (from a callback). It gets the next free
+// request slot -- creating the channel on first use -- and is installed by the agent on
+// a FRESH remote thread, never inside the calling callback: the installer freezes other
+// threads, and the caller may hold locks (heap, loader) a frozen thread is waiting on.
+// So it is asynchronous: the hook lands shortly after this returns. Use PROBE_BREAKPOINT
+// or PROBE_HW when it must be live before the target's next instruction.
+static bool register_runtime_inline(probe_session *s, Probe &p) {
+    if (!s->shared && !open_agent_section(s, 0)) return false;
+    uint32_t idx = s->shared->request_count;
+    if (idx >= PROBE_AGENT_MAX_PROBES) { set_error(s, "too many inline probes"); return false; }
+    p.agent_index = idx; p.runtime = true;
+    fill_request(s, p);
+    MemoryBarrier();
+    s->shared->request_count = idx + 1;
+    return true;
+}
+
+// Start (or queue) agent work for pending inline requests.
+static bool kick_agent(probe_session *s) {
+    if (s->remote_work != probe_session::REMOTE_NONE) return true;   // picked up when it finishes
+    if (!s->remote_agent) return start_agent_load(s);
+    return start_agent_init(s);
 }
 
 static bool release_gate(probe_session *s) {
@@ -726,25 +822,30 @@ static void release_hw(probe_session *s, Probe &p) {
 
 // Agent -> controller control-plane call (an inline callback used get_session(c)).
 // The raising thread is stopped; service the request and write the result back.
-static void handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
+// Trust boundary: the target is untrusted. A request is honoured only when an inline
+// agent exists and it names a real inline probe as its origin, and the callback is
+// resolved ONLY among the exports of that probe's controller-side callback module (so
+// keep that module's exports to callbacks). Anything else is not ours: pass it through.
+static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
     auto &ex = event.u.Exception.ExceptionRecord;
-    if (ex.NumberParameters < 1) return;
+    if (!s->shared || ex.NumberParameters < 1) return false;
     uint64_t at = (uint64_t)ex.ExceptionInformation[0];
     probe_ipc_request req{}; size_t got = 0;
-    if (!remote_read(s->pi.hProcess, at, &req, sizeof(req), &got) || got != sizeof(req)) return;
+    if (!remote_read(s->pi.hProcess, at, &req, sizeof(req), &got) || got != sizeof(req)) return false;
     req.callback[sizeof(req.callback) - 1] = 0; req.symbol[sizeof(req.symbol) - 1] = 0;
     // The callback is named; find the controller's copy of the same source. Prefer the
     // module that holds the originating inline probe's callback, then the executable.
-    probe_callback cb = nullptr;
+    probe_callback cb = nullptr; bool origin = false;
     for (auto &p : s->probes)
         if ((p->flags & PROBE_INLINE) && p->agent_index == req.origin_site && p->callback) {
+            origin = true;
             HMODULE m{};
             if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                    reinterpret_cast<LPCSTR>(p->callback), &m))
                 cb = reinterpret_cast<probe_callback>(GetProcAddress(m, req.callback));
             break;
         }
-    if (!cb) cb = reinterpret_cast<probe_callback>(GetProcAddress(GetModuleHandleA(nullptr), req.callback));
+    if (!origin) return false;
     int32_t result = 0;
     if (!cb) {
         std::fprintf(stderr, "probe: dynamic add from inline callback: no controller-side export '%s'\n", req.callback);
@@ -754,6 +855,7 @@ static void handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
     std::fprintf(stderr, "probe: ipc op=%u from inline site %u cb=%s -> %d\n", req.op, req.origin_site, req.callback, result);
     size_t wrote = 0;
     remote_write(s->pi.hProcess, at + offsetof(probe_ipc_request, result), &result, sizeof(result), &wrote);
+    return true;
 }
 
 // Service a hardware-breakpoint #DB (a single-step exception carrying a DR status
@@ -787,6 +889,9 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
 #endif
         // Execute probes: pc == the probe address. Watchpoints trap AFTER the access, so
         // pc is the instruction following the store/load -- the real code location.
+        if (!(probe->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) && hit_pc != probe->address) {
+            any = true; continue;                                    // stale: slot was reassigned
+        }
         probe_context context = from_context(native, probe_index(s, probe), hit_pc, &remote_ops, s->pi.hProcess);
         context.config = probe->config.empty() ? nullptr : probe->config.data();
         context.tid = event.dwThreadId;
@@ -827,7 +932,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     if (code == EXCEPTION_BREAKPOINT && !initial_break) {
         initial_break = true; disposition = DBG_CONTINUE; return true;
     }
-    if (code == PROBE_IPC_CODE) { handle_ipc(s, event); disposition = DBG_CONTINUE; return true; }
+    if (code == PROBE_IPC_CODE && handle_ipc(s, event)) { disposition = DBG_CONTINUE; return true; }
     auto step = stepping.find(event.dwThreadId);
     uint64_t address = (uint64_t)(uintptr_t)ex.ExceptionAddress;
     Probe *probe = code == EXCEPTION_BREAKPOINT ? probe_at(s, address) : nullptr;
@@ -854,7 +959,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         std::fprintf(stderr, "EV code=0x%lx tid=%lu addr=0x%llx step=%d probe=%d\n",
                      (unsigned long)code, (unsigned long)event.dwThreadId,
                      (unsigned long long)address, step != stepping.end(), probe != nullptr);
-    if (code == EXCEPTION_SINGLE_STEP && step == stepping.end() && s->hw_active) {
+    if (code == EXCEPTION_SINGLE_STEP && step == stepping.end() && (s->hw_active || s->dr_ever)) {
         bool handled = false;
         if (!handle_hw(s, event, handled)) return false;
         if (handled) { disposition = DBG_CONTINUE; return true; }   // else fall through (not our DR)
@@ -874,6 +979,16 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     if (!thread) { set_error(s, win_error("open event thread")); return false; }
     CONTEXT native{}; native.ContextFlags = CONTEXT_ALL;
     if (code == EXCEPTION_SINGLE_STEP && step != stepping.end()) {
+        // The stepped instruction (displaced or in place) may itself have touched a
+        // watched address: then this #DB carries B-bits as well as BS. Service those
+        // hardware hits first (their callbacks run, DR6 is cleared), then finish the step.
+        if (s->hw_active || s->dr_ever) {
+            CONTEXT dr{}; dr.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (GetThreadContext(thread, &dr) && (dr.Dr6 & 0xF)) {
+                bool handled = false;
+                if (!handle_hw(s, event, handled)) { CloseHandle(thread); return false; }
+            }
+        }
         bool ok = !!GetThreadContext(thread, &native);
         if (step->second.displaced) {
             // The instruction ran out-of-line; the INT3 was never lifted, so there is
@@ -899,6 +1014,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     if (!GetThreadContext(thread, &native)) {
         CloseHandle(thread); set_error(s, win_error("get breakpoint context")); return false;
     }
+    if (s->entry_reapply && address == s->entry_reapply && !probe->internal) reapply_all_hw(s);
     probe_context context = from_context(native, probe_index(s, probe),
                                          address, &remote_ops, s->pi.hProcess);
     context.config = probe->config.empty() ? nullptr : probe->config.data();
@@ -1051,11 +1167,14 @@ static bool agent_has_pending(const probe_session *s) {
 
 static bool accept_agent_install(probe_session *s) {
     MemoryBarrier();
-    for (auto &p : s->probes) if ((p->flags & PROBE_INLINE) && p->address) {
+    for (auto &p : s->probes) if ((p->flags & PROBE_INLINE) && p->address && !p->active && !p->retired) {
         LONG status = s->shared->requests[p->agent_index].status;
+        if (status == PROBE_AGENT_PENDING || status == PROBE_AGENT_INSTALLING) continue;   // next round
         if (status != PROBE_AGENT_INSTALLED) {
-            set_error(s, "inline agent failed to install " + p->location +
-                         " (status=" + std::to_string(status) + ")");
+            std::string why = "inline agent failed to install " + p->location +
+                              " (status=" + std::to_string(status) + ")";
+            if (p->runtime) { std::fprintf(stderr, "probe: %s\n", why.c_str()); p->retired = true; continue; }
+            set_error(s, why);
             return false;
         }
         p->active = true;
@@ -1080,9 +1199,38 @@ static bool complete_remote_thread(probe_session *s, DWORD result) {
     }
     if (work == probe_session::REMOTE_INIT_AGENT) {
         if (result != 0) { set_error(s, "probe_agent_init failed (code=" + std::to_string(result) + ")"); return false; }
-        return accept_agent_install(s);
+        if (!accept_agent_install(s)) return false;
+        // Requests registered while that round ran (runtime inline adds) go next.
+        if (agent_has_pending(s)) return start_agent_init(s);
+        return true;
     }
     return true;
+}
+
+// Move published inline-log records out of the shared ring (single consumer). Called
+// every debug-loop turn, on idle timeouts, and at report, so the ring never fills
+// just because the run is long.
+static void drain_agent_logs(probe_session *s) {
+    if (!s->shared) return;
+    auto *sh = s->shared;
+    for (;;) {
+        LONG64 tail = sh->log_tail;
+        auto &rec = sh->logs[(uint64_t)tail % PROBE_AGENT_LOG_CAP];
+        if (rec.seq != tail + 1) break;
+        MemoryBarrier();
+        LogRecord r;
+        rec.text[PROBE_AGENT_LOG_TEXT_CAP - 1] = 0;
+        r.text = rec.text; r.tid = rec.tid; r.has_stack = rec.has_stack != 0;
+        r.probe = rec.probe;
+        for (size_t i = 0; i < s->probes.size(); ++i)
+            if ((s->probes[i]->flags & PROBE_INLINE) && s->probes[i]->agent_index == rec.probe) { r.probe = (uint32_t)i; break; }
+        uint32_t n = rec.frame_count > PROBE_STACK_MAX_FRAMES ? PROBE_STACK_MAX_FRAMES : rec.frame_count;
+        r.frames.assign(rec.frames, rec.frames + n);
+        s->logs.push_back(std::move(r));
+        MemoryBarrier();
+        InterlockedExchange64(&rec.seq, tail + PROBE_AGENT_LOG_CAP);    // slot free again
+        sh->log_tail = tail + 1;
+    }
 }
 
 extern "C" int probe_run(probe_session *s) {
@@ -1091,7 +1239,11 @@ extern "C" int probe_run(probe_session *s) {
     s->ran = true; bool initial_break = false; std::unordered_map<DWORD, StepState> stepping;
     DEBUG_EVENT event{};
     while (!s->exited) {
-        if (!WaitForDebugEvent(&event, INFINITE)) { set_error(s, win_error("wait for debug event")); break; }
+        drain_agent_logs(s);
+        if (!WaitForDebugEvent(&event, s->shared ? 20 : INFINITE)) {
+            if (GetLastError() == ERROR_SEM_TIMEOUT) continue;            // idle: drain and wait again
+            set_error(s, win_error("wait for debug event")); break;
+        }
         DWORD disposition = DBG_CONTINUE; bool ok = true;
         switch (event.dwDebugEventCode) {
         case CREATE_PROCESS_DEBUG_EVENT: {
@@ -1207,23 +1359,8 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
         MemoryBarrier();
         for (auto &p : s->probes) if (p->flags & PROBE_INLINE)
             p->hits = (uint64_t)s->shared->requests[p->agent_index].hits;
-        LONG count = s->shared->log_reserve;
-        if (count > (LONG)PROBE_AGENT_LOG_CAP) count = PROBE_AGENT_LOG_CAP;
-        for (LONG i = 0; i < count; ++i) {
-            auto &record = s->shared->logs[i];
-            if (!record.committed) continue;
-            std::fputs("{\"kind\":\"probe_log\",\"probe\":", out);
-            std::fprintf(out, "%u,\"tid\":%u,\"message\":", record.probe, record.tid);
-            json_string(out, record.text);
-            if (record.has_stack) {
-                std::fputs(",\"stack\":[", out);
-                uint32_t n = record.frame_count > 32 ? 32 : record.frame_count;
-                for (uint32_t f = 0; f < n; ++f) { if (f) std::fputc(',', out); json_string(out, symbolize(s, record.frames[f])); }
-                std::fputc(']', out);
-            }
-            std::fputs("}\n", out);
-        }
     }
+    drain_agent_logs(s);
     for (const auto &r : s->logs) {
         std::fprintf(out, "{\"kind\":\"probe_log\",\"probe\":%u,\"tid\":%u,\"message\":", r.probe, r.tid);
         json_string(out, r.text);

@@ -23,7 +23,9 @@ static std::string sibling_target() {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: watch_driver <g_watched_rva> [target args...]\n"); return 2; }
+    if (argc < 2) { std::fprintf(stderr, "usage: watch_driver <g_watched_rva> [--rw] [target args...]\n"); return 2; }
+    int first = 2; uint32_t mode = PROBE_WATCH_WRITE;
+    if (argc > 2 && !std::strcmp(argv[2], "--rw")) { mode = PROBE_WATCH_RW; first = 3; }
     char loc[96];
     std::snprintf(loc, sizeof(loc), "watch_target.exe+0x%llx",
                   (unsigned long long)std::strtoull(argv[1], nullptr, 0));
@@ -31,9 +33,9 @@ int main(int argc, char **argv) {
     if (!s) return 1;
     std::string target = sibling_target();
     std::vector<char *> child; child.push_back(target.data());
-    for (int i = 2; i < argc; ++i) child.push_back(argv[i]);
+    for (int i = first; i < argc; ++i) child.push_back(argv[i]);
     child.push_back(nullptr);
-    int ok = probe_add_symbol(s, loc, on_write, PROBE_HW | PROBE_WATCH_WRITE) &&
+    int ok = probe_add_symbol(s, loc, on_write, PROBE_HW | mode) &&
              probe_launch(s, child.data()) && probe_run(s) && probe_wait_for_exit(s);
     probe_report(s, stdout);
     std::printf("{\"kind\":\"watch_driver\",\"callback_hits\":%ld}\n", g_hits);

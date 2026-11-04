@@ -10,12 +10,12 @@
 #include <cstdio>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 2;
+constexpr uint32_t PROBE_AGENT_VERSION = 3;
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 32;
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
 constexpr uint32_t PROBE_AGENT_CONFIG_CAP = 256;
-constexpr uint32_t PROBE_AGENT_LOG_CAP = 512;
-constexpr uint32_t PROBE_AGENT_LOG_TEXT_CAP = 160;
+constexpr uint32_t PROBE_AGENT_LOG_CAP = 4096;      /* ring slots; the controller drains continuously */
+constexpr uint32_t PROBE_AGENT_LOG_TEXT_CAP = 256;
 
 enum probe_agent_status : LONG {
     PROBE_AGENT_PENDING = 0,
@@ -37,8 +37,13 @@ struct probe_agent_request {
     volatile LONG64 hits;
 };
 
+/* Bounded MPMC ring (Vyukov): slot i starts with seq == i. A producer owns position
+   pos when logs[pos % CAP].seq == pos, claims it by CAS on log_head, fills the slot,
+   then publishes seq = pos + 1. The single consumer (the controller) reads while
+   seq == tail + 1 and frees the slot with seq = tail + CAP. A full ring drops (counted)
+   instead of blocking a hooked thread. */
 struct probe_agent_log {
-    volatile LONG committed;
+    volatile LONG64 seq;
     uint32_t probe;
     uint32_t tid;
     char text[PROBE_AGENT_LOG_TEXT_CAP];
@@ -66,8 +71,10 @@ struct probe_agent_shared {
     uint32_t version;
     uint32_t request_count;
     uint32_t reserved;
-    volatile LONG log_reserve;
+    volatile LONG64 log_head;      /* next position producers claim */
+    volatile LONG64 log_tail;      /* next position the controller consumes */
     volatile LONG log_dropped;
+    LONG log_pad;
     probe_agent_request requests[PROBE_AGENT_MAX_PROBES];
     probe_agent_log logs[PROBE_AGENT_LOG_CAP];
 };

@@ -7,7 +7,7 @@
 #define PROBE_EXAMPLE_EXPORT
 #endif
 
-struct read_log_config { uint64_t cookie; };
+struct read_log_config { uint64_t cookie; uint32_t log; uint32_t reserved; };   /* log=0: count only */
 
 extern "C" {
 PROBE_EXAMPLE_EXPORT void enable_reads(probe_context *);
