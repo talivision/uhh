@@ -33,7 +33,7 @@ int main(int argc, char **argv) {
     std::vector<char *> child; child.push_back(target.data());
     for (int i = 2; i < argc; ++i) child.push_back(argv[i]);
     child.push_back(nullptr);
-    int ok = probe_add(s, loc, on_write, PROBE_HW | PROBE_WATCH_WRITE) &&
+    int ok = probe_add_symbol(s, loc, on_write, PROBE_HW | PROBE_WATCH_WRITE) &&
              probe_launch(s, child.data()) && probe_run(s) && probe_wait_for_exit(s);
     probe_report(s, stdout);
     std::printf("{\"kind\":\"watch_driver\",\"callback_hits\":%ld}\n", g_hits);

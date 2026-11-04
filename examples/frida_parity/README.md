@@ -7,10 +7,10 @@ launches the target, and prints one JSON verdict for each demo.
 
 | Demo | Frida source pattern | UHH pattern | Backend |
 |---|---|---|---|
-| B1: log an argument | [`Interceptor.attach` / `onEnter(args)`](https://frida.re/docs/functions/) | `probe_arg(c, 0)` then `PROBE_LOG` | inline; the 16-NOP entry sled is safely relocatable |
-| B2: read a string | [`args[n].readUtf8String()`](https://frida.re/docs/functions/) | `probe_arg` -> `probe_read` -> `PROBE_LOG` | inline; the same long entry shape |
-| B4: modify an argument | [`args[n] = ptr(...)`](https://frida.re/docs/functions/) | x64: `probe_set_reg(RDX)`; x86: `probe_write(SP+8)` | inline; the callee validates the replacement string |
-| B6: register read/write | [`this.context.rax`](https://frida.re/docs/javascript-api/#interceptor) | `probe_reg(AX)` / `probe_set_reg(AX)` at a mid-site | hardware; exact at the single-NOP site without an inline patch span |
+| B1: log an argument | [`Interceptor.attach` / `onEnter(args)`](https://frida.re/docs/functions/) | `get_func_arg(c, 0)` then `PROBE_LOG` | inline; the 16-NOP entry sled is safely relocatable |
+| B2: read a string | [`args[n].readUtf8String()`](https://frida.re/docs/functions/) | `get_func_arg` -> `get_mem` -> `PROBE_LOG` | inline; the same long entry shape |
+| B4: modify an argument | [`args[n] = ptr(...)`](https://frida.re/docs/functions/) | x64: `set_reg(RDX)`; x86: `set_mem(SP+8)` | inline; the callee validates the replacement string |
+| B6: register read/write | [`this.context.rax`](https://frida.re/docs/javascript-api/#interceptor) | `get_reg(AX)` / `set_reg(AX)` at a mid-site | hardware; exact at the single-NOP site without an inline patch span |
 
 The B4 fixture reuses a target buffer already passed in arg0. That demonstrates
 Frida-style pointer redirection without pretending UHH has a target-memory allocator.

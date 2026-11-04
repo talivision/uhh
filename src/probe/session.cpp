@@ -11,10 +11,16 @@
 #include <unordered_map>
 #include <vector>
 #include <Zydis/Zydis.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
 #include <unordered_set>
 
 struct Probe {
     std::string location, module, callback_export;
+    std::string export_name;   // "module!Export+0xOFF": resolved from the export table at load
+    uint64_t sym_offset = 0;
+    bool retired = false;      // PROBE_ONCE probe that already fired (kept for the report)
+    bool internal = false;     // library-owned (not reported)
     uint64_t rva = 0, base = 0, address = 0, hits = 0;
     uint32_t agent_index = UINT32_MAX;
     unsigned char original = 0;
@@ -51,9 +57,19 @@ struct StepState {
     uint32_t insn_len = 0;
 };
 
+// One log line, optionally with a raw stack snapshot (return addresses only). Frames
+// are symbolized at report time -- never inside the breakpoint.
+struct LogRecord {
+    std::string text;
+    uint32_t tid = 0, probe = 0;
+    bool has_stack = false;
+    std::vector<uint64_t> frames;
+};
+
 struct probe_session {
     std::vector<std::unique_ptr<Probe>> probes;
-    std::vector<std::string> logs;
+    std::vector<LogRecord> logs;
+    bool sym_ready = false;    // dbghelp initialised on the target (stack walk + symbolize)
     std::unordered_map<std::string, uint64_t> module_bases;
     PROCESS_INFORMATION pi{};
     HANDLE stdin_write = nullptr;
@@ -76,6 +92,8 @@ struct probe_session {
     // and no re-arm race: exact under threads for any instruction, up to 4 slots.
     std::unordered_set<DWORD> threads;
     uint8_t dr_used = 0;
+    uint8_t dr_ever = 0;                       // slots we have ever owned (stale-#DB filter)
+    std::unordered_set<uint64_t> retired_bps;  // removed INT3 sites (stale-hit filter)
     int hw_active = 0;
     bool launched = false, ran = false, exited = false, gate_sent = false;
 };
@@ -101,6 +119,33 @@ static std::string module_name_from_handle(HANDLE file) {
     return n && n < MAX_PATH ? basename_of(path) : std::string{};
 }
 
+static std::string module_path_from_handle(HANDLE file) {
+    if (!file) return {};
+    char path[MAX_PATH];
+    DWORD n = GetFinalPathNameByHandleA(file, path, MAX_PATH, FILE_NAME_NORMALIZED);
+    if (!n || n >= MAX_PATH) return {};
+    std::string r(path);
+    if (r.rfind("\\\\?\\", 0) == 0) r = r.substr(4);
+    return r;
+}
+
+// Register a mapped image with dbghelp (deferred: no symbol I/O until a frame is
+// symbolized at report time). Keeps working after the target exits: it reads files.
+static void sym_register(probe_session *s, HANDLE file, uint64_t base) {
+    if (!s->sym_ready) return;
+    std::string path = module_path_from_handle(file);
+    if (path.empty()) return;
+    // Pass the real SizeOfImage: with deferred loads dbghelp does not read the image yet,
+    // so a size of 0 registers only the base address and no frame inside it resolves.
+    DWORD size = 0; size_t got = 0;
+    IMAGE_DOS_HEADER dos{}; IMAGE_NT_HEADERS nt{};
+    if (remote_read(s->pi.hProcess, base, &dos, sizeof(dos), &got) && got == sizeof(dos) && dos.e_magic == IMAGE_DOS_SIGNATURE &&
+        remote_read(s->pi.hProcess, base + (uint32_t)dos.e_lfanew, &nt, sizeof(nt), &got) && got == sizeof(nt) &&
+        nt.Signature == IMAGE_NT_SIGNATURE)
+        size = nt.OptionalHeader.SizeOfImage;
+    SymLoadModuleEx(s->pi.hProcess, nullptr, path.c_str(), nullptr, (DWORD64)base, size, nullptr, 0);
+}
+
 static std::string module_name_from_module(HMODULE module) {
     char path[MAX_PATH]; DWORD n = GetModuleFileNameA(module, path, MAX_PATH);
     return n && n < MAX_PATH ? basename_of(path) : std::string{};
@@ -112,33 +157,6 @@ static bool iequals(const std::string &a, const std::string &b) {
 
 static bool has_inline(const probe_session *s) {
     for (const auto &p : s->probes) if (p->flags & PROBE_INLINE) return true;
-    return false;
-}
-
-static bool callback_export_name(probe_callback callback, std::string &name) {
-    HMODULE module{};
-    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                            reinterpret_cast<LPCSTR>(callback), &module)) return false;
-    auto base = reinterpret_cast<const unsigned char *>(module);
-    auto dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
-    auto nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR_MAGIC)
-        return false;
-    auto dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-    if (!dir.VirtualAddress || !dir.Size) return false;
-    auto exports = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY *>(base + dir.VirtualAddress);
-    auto functions = reinterpret_cast<const DWORD *>(base + exports->AddressOfFunctions);
-    auto names = reinterpret_cast<const DWORD *>(base + exports->AddressOfNames);
-    auto ordinals = reinterpret_cast<const WORD *>(base + exports->AddressOfNameOrdinals);
-    uint64_t callback_rva = reinterpret_cast<const unsigned char *>(callback) - base;
-    for (DWORD i = 0; i < exports->NumberOfNames; ++i) {
-        WORD ordinal = ordinals[i];
-        if (ordinal < exports->NumberOfFunctions && functions[ordinal] == callback_rva) {
-            name = reinterpret_cast<const char *>(base + names[i]); return true;
-        }
-    }
     return false;
 }
 
@@ -159,29 +177,94 @@ static bool patch(HANDLE process, uint64_t address, unsigned char byte) {
     return wrote && done == 1 && flushed && restored;
 }
 
+static bool parse_hex(const char *number, uint64_t &out) {
+    if (!number || !*number) return false;
+    for (const char *d = number; *d; ++d) if (!std::isxdigit((unsigned char)*d)) return false;
+    errno = 0; char *end = nullptr;
+    unsigned long long v = std::strtoull(number, &end, 16);
+    if (errno == ERANGE || !end || *end) return false;
+    out = (uint64_t)v; return true;
+}
+
+// "module+0xRVA" or "module!Export[+0xOFF]".
 static bool parse_location(probe_session *s, const char *text, Probe &p) {
     if (!text || !*text) { set_error(s, "empty probe location"); return false; }
     p.location = text;
-    if (p.location.find('!') != std::string::npos) {
-        set_error(s, "symbol locations are not yet supported in this build"); return false;
+    size_t bang = p.location.find('!');
+    if (bang != std::string::npos) {
+        if (!bang) { set_error(s, "symbol location has an empty module"); return false; }
+        p.module = basename_of(p.location.substr(0, bang));
+        std::string rest = p.location.substr(bang + 1);
+        size_t plus = rest.find('+');
+        p.export_name = rest.substr(0, plus);
+        if (p.export_name.empty()) { set_error(s, "symbol location has an empty export name"); return false; }
+        if (plus != std::string::npos) {
+            std::string off = rest.substr(plus + 1);
+            if (off.size() < 3 || off[0] != '0' || (off[1] != 'x' && off[1] != 'X') ||
+                !parse_hex(off.c_str() + 2, p.sym_offset)) {
+                set_error(s, "symbol offset must be +0xHEX"); return false;
+            }
+        }
+        return true;
     }
     size_t plus = p.location.rfind('+');
     if (!plus || plus == std::string::npos || plus + 3 > p.location.size() ||
         p.location[plus + 1] != '0' || (p.location[plus + 2] != 'x' && p.location[plus + 2] != 'X')) {
-        set_error(s, "location must be module+0xRVA"); return false;
+        set_error(s, "location must be module+0xRVA or module!Export[+0xOFF]"); return false;
     }
     p.module = basename_of(p.location.substr(0, plus));
-    const char *number = p.location.c_str() + plus + 3;
-    if (!*number) { set_error(s, "location has an empty RVA"); return false; }
-    for (const char *digit = number; *digit; ++digit)
-        if (!std::isxdigit((unsigned char)*digit)) {
-            set_error(s, "location has an invalid RVA"); return false;
-        }
-    errno = 0; char *end = nullptr;
-    unsigned long long value = std::strtoull(number, &end, 16);
-    if (errno == ERANGE || !end || *end) { set_error(s, "location has an invalid RVA"); return false; }
-    p.rva = (uint64_t)value;
+    if (!parse_hex(p.location.c_str() + plus + 3, p.rva)) { set_error(s, "location has an invalid RVA"); return false; }
     return true;
+}
+
+// Resolve an export by name from the TARGET's image (read remotely; works before the
+// module has run any code). Forwarded exports are rejected: hook the forward target.
+static bool resolve_export(probe_session *s, uint64_t base, const std::string &name, uint64_t &rva) {
+    HANDLE h = s->pi.hProcess; size_t got = 0;
+    IMAGE_DOS_HEADER dos{};
+    if (!remote_read(h, base, &dos, sizeof(dos), &got) || got != sizeof(dos) || dos.e_magic != IMAGE_DOS_SIGNATURE) {
+        set_error(s, "export lookup: bad DOS header"); return false;
+    }
+    IMAGE_NT_HEADERS nt{};
+    if (!remote_read(h, base + (uint32_t)dos.e_lfanew, &nt, sizeof(nt), &got) || got != sizeof(nt) ||
+        nt.Signature != IMAGE_NT_SIGNATURE || nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR_MAGIC) {
+        set_error(s, "export lookup: bad NT headers"); return false;
+    }
+    auto dir = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dir.VirtualAddress || !dir.Size) { set_error(s, "export lookup: module has no exports"); return false; }
+    std::vector<unsigned char> blob(dir.Size);
+    if (!remote_read(h, base + dir.VirtualAddress, blob.data(), blob.size(), &got) || got != blob.size()) {
+        set_error(s, "export lookup: cannot read export directory"); return false;
+    }
+    auto in_dir = [&](uint32_t r, size_t n) { return r >= dir.VirtualAddress && r - dir.VirtualAddress + n <= dir.Size; };
+    auto ex = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY *>(blob.data());
+    // The name/function tables may live outside the directory range: read them separately.
+    std::vector<DWORD> names(ex->NumberOfNames), funcs(ex->NumberOfFunctions);
+    std::vector<WORD> ords(ex->NumberOfNames);
+    if ((!names.empty() && (!remote_read(h, base + ex->AddressOfNames, names.data(), names.size() * 4, &got) || got != names.size() * 4)) ||
+        (!ords.empty() && (!remote_read(h, base + ex->AddressOfNameOrdinals, ords.data(), ords.size() * 2, &got) || got != ords.size() * 2)) ||
+        (!funcs.empty() && (!remote_read(h, base + ex->AddressOfFunctions, funcs.data(), funcs.size() * 4, &got) || got != funcs.size() * 4))) {
+        set_error(s, "export lookup: cannot read export tables"); return false;
+    }
+    char buf[256];
+    for (size_t i = 0; i < names.size(); ++i) {
+        size_t n = 0;
+        if (in_dir(names[i], 1)) {
+            const char *str = reinterpret_cast<const char *>(blob.data() + (names[i] - dir.VirtualAddress));
+            size_t lim = dir.Size - (names[i] - dir.VirtualAddress);
+            n = strnlen(str, lim); if (n >= sizeof(buf)) continue; std::memcpy(buf, str, n);
+        } else {
+            if (!remote_read(h, base + names[i], buf, sizeof(buf) - 1, &got) || !got) continue;
+            n = strnlen(buf, got);
+        }
+        buf[n] = 0;
+        if (name != buf) continue;
+        if (ords[i] >= funcs.size()) break;
+        uint32_t f = funcs[ords[i]];
+        if (in_dir(f, 0)) { set_error(s, "export '" + name + "' is forwarded; probe the forward target"); return false; }
+        rva = f; return true;
+    }
+    set_error(s, "export '" + name + "' not found"); return false;
 }
 
 static std::string quote_arg(const char *arg) {
@@ -294,7 +377,7 @@ static bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
     if (tried && !set_ok) {   // could not arm the DR on any thread -> the probe would never fire
         set_error(s, win_error("set hardware breakpoint on target threads")); return false;
     }
-    s->dr_used |= (uint8_t)(1u << slot); ++s->hw_active;
+    s->dr_used |= (uint8_t)(1u << slot); s->dr_ever |= (uint8_t)(1u << slot); ++s->hw_active;
     p.dr_slot = slot; p.base = base; p.address = address; p.active = true;
     std::fprintf(stderr, "probe: active %s -> base=0x%llx addr=0x%llx (hw DR%d, %s)\n",
                  p.location.c_str(), (unsigned long long)base, (unsigned long long)address, slot,
@@ -323,6 +406,7 @@ static bool arm_breakpoint(probe_session *s, Probe &p, uint64_t base) {
         set_error(s, win_error("arm software breakpoint")); return false;
     }
     p.base = base; p.address = address; p.active = true;
+    s->retired_bps.erase(address);
     std::fprintf(stderr, "probe: active %s -> base=0x%llx addr=0x%llx (was 0x%02x, len=%u, %s)\n",
                  p.location.c_str(), (unsigned long long)base, (unsigned long long)address,
                  p.original, len, disp_ok ? "displaced" : "in-place");
@@ -342,23 +426,31 @@ static bool resolve_inline(probe_session *s, Probe &p, uint64_t base) {
     return true;
 }
 
+static bool arm_probe(probe_session *s, Probe &item, uint64_t base) {
+    // A late-resolving inline probe (the gate is already released, so the target may
+    // call the site before the async agent install lands) with PROBE_FALLBACK_HW set
+    // becomes a hardware probe: that arms synchronously here (just debug registers —
+    // no in-target code, no loader lock, no race) and is exact. The callback is
+    // backend-agnostic, so it runs controller-side unchanged.
+    if ((item.flags & PROBE_INLINE) && (item.flags & PROBE_FALLBACK_HW) && s->gate_sent) {
+        item.flags = (item.flags & ~(uint32_t)PROBE_INLINE) | PROBE_HW;
+        std::fprintf(stderr, "probe: %s -> hardware fallback (late inline would race the first call)\n",
+                     item.location.c_str());
+    }
+    if (!item.export_name.empty()) {
+        uint64_t exp = 0;
+        if (!resolve_export(s, base, item.export_name, exp)) return false;
+        item.rva = exp + item.sym_offset;
+    }
+    return item.flags & PROBE_BREAKPOINT ? arm_breakpoint(s, item, base)
+         : item.flags & PROBE_HW          ? arm_hw(s, item, base)
+                                          : resolve_inline(s, item, base);
+}
+
 static bool arm_module(probe_session *s, const std::string &module, uint64_t base) {
     for (auto &item : s->probes) {
-        if (item->active || item->address || !iequals(item->module, module)) continue;
-        // A late-resolving inline probe (the gate is already released, so the target may
-        // call the site before the async agent install lands) with PROBE_FALLBACK_HW set
-        // becomes a hardware probe: that arms synchronously here (just debug registers —
-        // no in-target code, no loader lock, no race) and is exact. The callback is
-        // backend-agnostic, so it runs controller-side unchanged.
-        if ((item->flags & PROBE_INLINE) && (item->flags & PROBE_FALLBACK_HW) && s->gate_sent) {
-            item->flags = (item->flags & ~(uint32_t)PROBE_INLINE) | PROBE_HW;
-            std::fprintf(stderr, "probe: %s -> hardware fallback (late inline would race the first call)\n",
-                         item->location.c_str());
-        }
-        bool ok = item->flags & PROBE_BREAKPOINT ? arm_breakpoint(s, *item, base)
-                 : item->flags & PROBE_HW          ? arm_hw(s, *item, base)
-                                                   : resolve_inline(s, *item, base);
-        if (!ok) return false;
+        if (item->active || item->retired || item->address || !iequals(item->module, module)) continue;
+        if (!arm_probe(s, *item, base)) return false;
     }
     return true;
 }
@@ -374,59 +466,165 @@ static uint32_t probe_index(probe_session *s, const Probe *probe) {
     return 0;
 }
 
+// The loader finishes process initialisation with NtContinue on the initial thread's
+// start context, which carries the debug registers captured at thread creation. Any
+// hardware probe armed later in loader init (a static import such as ucrtbase loading)
+// is silently wiped there. A library-owned one-shot breakpoint at the image entry point
+// re-applies every active hardware probe to every thread right after that point.
+static void reapply_hw(probe_context *c) {
+    probe_session *s = get_session(c);
+    if (!s) return;
+    for (auto &p : s->probes) {
+        if (!p->active || !(p->flags & PROBE_HW)) continue;
+        uint32_t rw = 0, len = 0; hw_rw_len(p->flags, rw, len);
+        for (DWORD tid : s->threads) {
+            HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+            if (t) { set_dr_on_thread(t, p->dr_slot, p->address, true, rw, len); CloseHandle(t); }
+        }
+    }
+}
+
+static void arm_entry_fixup(probe_session *s, uint64_t entry) {
+    if (!entry) return;
+    try {
+        auto p = std::make_unique<Probe>();
+        p->location = "<entry>"; p->flags = PROBE_BREAKPOINT | PROBE_ONCE; p->callback = reapply_hw;
+        p->rva = entry; p->internal = true;
+        Probe *raw = p.get(); s->probes.push_back(std::move(p));
+        std::string saved = s->error;
+        if (!arm_breakpoint(s, *raw, 0)) { raw->retired = true; s->error = saved; }
+    } catch (...) {}
+}
+
 extern "C" probe_session *probe_session_create(void) {
     try { return new probe_session; }
     catch (...) { std::fprintf(stderr, "probe: error: session allocation failed\n"); return nullptr; }
 }
 
-extern "C" int probe_add_cfg(probe_session *s, const char *location, probe_callback callback,
-                               uint32_t flags, const void *config, size_t config_len) {
-    if (!s) return 0;
-    if (s->launched) { set_error(s, "probes must be added before launch"); return 0; }
-    if (!callback) { set_error(s, "probe callback is null"); return 0; }
+// Dynamic (post-launch) control-plane calls come from a callback while the target is
+// stopped. A failure there returns 0 to the callback but must not poison the session's
+// end-of-run status, so the error is logged and the previous error state restored.
+struct DynamicScope {
+    probe_session *s; std::string saved; bool dynamic;
+    explicit DynamicScope(probe_session *ss) : s(ss), saved(ss->error), dynamic(ss->launched) {}
+    int done(int ok) {
+        if (dynamic && !ok) {
+            std::fprintf(stderr, "probe: dynamic add failed: %s\n", s->error.c_str());
+            s->error = saved;
+        }
+        return ok;
+    }
+};
+
+static uint32_t hw_in_use(const probe_session *s) {
+    uint32_t n = 0;
+    for (auto &pp : s->probes) if ((pp->flags & PROBE_HW) && !pp->retired) ++n;
+    return n;
+}
+
+static bool check_flags(probe_session *s, uint32_t flags, bool allow_inline) {
     constexpr uint32_t types = PROBE_BREAKPOINT | PROBE_INLINE | PROBE_HW;
     constexpr uint32_t known = types | PROBE_AT_RETURN | PROBE_ALLOW_PREHOOKED | PROBE_FALLBACK_HW
-                             | PROBE_WATCH_WRITE | PROBE_WATCH_RW;
-    if (flags & ~known) { set_error(s, "unknown probe flags"); return 0; }
+                             | PROBE_WATCH_WRITE | PROBE_WATCH_RW | PROBE_ONCE;
+    if (flags & ~known) { set_error(s, "unknown probe flags"); return false; }
     uint32_t type = flags & types;
     uint32_t watch = flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW);
     if ((type != PROBE_BREAKPOINT && type != PROBE_INLINE && type != PROBE_HW) || (flags & PROBE_AT_RETURN) ||
         (flags & PROBE_ALLOW_PREHOOKED) ||                           // chain-through not implemented yet
         ((flags & PROBE_FALLBACK_HW) && type != PROBE_INLINE) ||     // fallback only modifies an inline probe
         (watch && type != PROBE_HW) ||                               // a watchpoint uses the DR/HW backend
-        watch == (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) {             // pick one access mode, not both
+        watch == (PROBE_WATCH_WRITE | PROBE_WATCH_RW) ||             // pick one access mode, not both
+        ((flags & PROBE_ONCE) && type == PROBE_INLINE)) {            // one-shot needs a controller backend
         set_error(s, "requested probe type/options are unsupported in this build");
-        return 0;
+        return false;
     }
-    if (config_len && !config) { set_error(s, "non-empty probe config is null"); return 0; }
+    if (type == PROBE_INLINE && !allow_inline) {
+        set_error(s, "inline probes must be added before launch (use PROBE_BREAKPOINT or PROBE_HW at runtime)");
+        return false;
+    }
+    if (type == PROBE_HW && hw_in_use(s) >= 4) {
+        set_error(s, "too many hardware probes (max 4 DR slots)"); return false;
+    }
+    return true;
+}
+
+extern "C" int probe_add_symbol_cfg(probe_session *s, const char *location, probe_callback callback,
+                                    uint32_t flags, const void *config, size_t config_len) {
+    if (!s) return 0;
+    DynamicScope scope(s);
+    if (s->exited) { set_error(s, "session already exited"); return 0; }
+    if (!callback) { set_error(s, "probe callback is null"); return scope.done(0); }
+    if (!check_flags(s, flags, !s->launched)) return scope.done(0);
+    uint32_t type = flags & (PROBE_BREAKPOINT | PROBE_INLINE | PROBE_HW);
+    if (config_len && !config) { set_error(s, "non-empty probe config is null"); return scope.done(0); }
     if (type == PROBE_INLINE && config_len > PROBE_AGENT_CONFIG_CAP) {
-        set_error(s, "inline probe config exceeds the agent limit"); return 0;
-    }
-    if (type == PROBE_HW) {                        // only 4 debug-register slots exist
-        size_t hw = 0; for (auto &pp : s->probes) if (pp->flags & PROBE_HW) ++hw;
-        if (hw >= 4) { set_error(s, "too many hardware-breakpoint probes (max 4 DR slots)"); return 0; }
+        set_error(s, "inline probe config exceeds the agent limit"); return scope.done(0);
     }
     try {
         auto p = std::make_unique<Probe>();
-        if (!parse_location(s, location, *p)) return 0;
+        if (!parse_location(s, location, *p)) return scope.done(0);
         p->callback = callback; p->flags = flags;
         if (type == PROBE_INLINE && !callback_export_name(callback, p->callback_export)) {
-            set_error(s, "inline callback is not a named export"); return 0;
+            set_error(s, "inline callback is not a named export"); return scope.done(0);
         }
         if (p->callback_export.size() >= PROBE_AGENT_EXPORT_CAP) {
-            set_error(s, "inline callback export name is too long"); return 0;
+            set_error(s, "inline callback export name is too long"); return scope.done(0);
         }
         if (config_len) {
             auto first = static_cast<const unsigned char *>(config);
             p->config.assign(first, first + config_len);
         }
         std::fprintf(stderr, "probe: pending %s\n", p->location.c_str());
-        s->probes.push_back(std::move(p)); return 1;
-    } catch (const std::exception &e) { set_error(s, e.what()); return 0; }
+        Probe *raw = p.get();
+        s->probes.push_back(std::move(p));          // heap-stable: callbacks may add mid-iteration
+        if (s->launched) {                          // runtime add: arm now if the module is mapped
+            for (auto &kv : s->module_bases)
+                if (iequals(kv.first, raw->module)) {
+                    if (!arm_probe(s, *raw, kv.second)) { raw->retired = true; return scope.done(0); }
+                    break;
+                }
+        }
+        return 1;
+    } catch (const std::exception &e) { set_error(s, e.what()); return scope.done(0); }
 }
 
-extern "C" int probe_add(probe_session *s, const char *location, probe_callback callback, uint32_t flags) {
-    return probe_add_cfg(s, location, callback, flags, nullptr, 0);
+extern "C" int probe_add_symbol(probe_session *s, const char *location, probe_callback callback, uint32_t flags) {
+    return probe_add_symbol_cfg(s, location, callback, flags, nullptr, 0);
+}
+
+// Absolute-address probes only make sense once the process exists (ASLR), so they are a
+// runtime operation: typically called from a callback with an address it just read.
+static int add_absolute(probe_session *s, uint64_t address, probe_callback cb, uint32_t flags) {
+    if (!s) return 0;
+    DynamicScope scope(s);
+    if (!s->launched || s->exited) { set_error(s, "absolute-address probes need a running target"); return scope.done(0); }
+    if (!cb) { set_error(s, "probe callback is null"); return scope.done(0); }
+    if (!check_flags(s, flags, false)) return scope.done(0);
+    try {
+        auto p = std::make_unique<Probe>();
+        char loc[40]; std::snprintf(loc, sizeof(loc), "0x%llx", (unsigned long long)address);
+        p->location = loc; p->flags = flags; p->callback = cb; p->rva = address;
+        Probe *raw = p.get();
+        s->probes.push_back(std::move(p));
+        bool ok = (flags & PROBE_HW) ? arm_hw(s, *raw, 0) : arm_breakpoint(s, *raw, 0);
+        if (!ok) raw->retired = true;
+        return scope.done(ok ? 1 : 0);
+    } catch (const std::exception &e) { set_error(s, e.what()); return scope.done(0); }
+}
+
+extern "C" int probe_add_address(probe_session *s, uint64_t address, probe_callback cb, uint32_t flags) {
+    if (s && (flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW))) {
+        DynamicScope scope(s); set_error(s, "use probe_watch for data watchpoints"); return scope.done(0);
+    }
+    return add_absolute(s, address, cb, flags);
+}
+
+extern "C" int probe_watch(probe_session *s, uint64_t address, probe_callback cb, uint32_t flags) {
+    uint32_t mode = flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW);
+    if (s && (flags & ~(uint32_t)(PROBE_WATCH_WRITE | PROBE_WATCH_RW | PROBE_ONCE | PROBE_HW))) {
+        DynamicScope scope(s); set_error(s, "probe_watch takes PROBE_WATCH_WRITE/RW and PROBE_ONCE only"); return scope.done(0);
+    }
+    return add_absolute(s, address, cb, PROBE_HW | (mode ? mode : (uint32_t)PROBE_WATCH_WRITE) | (flags & PROBE_ONCE));
 }
 
 static bool create_agent_channel(probe_session *s) {
@@ -492,6 +690,9 @@ extern "C" int probe_launch(probe_session *s, char *const argv[]) {
             set_error(s, win_error("debug launch")); return 0;
         }
         s->launched = true;
+        SymSetOptions(SymGetOptions() | SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME | SYMOPT_NO_PROMPTS |
+                      SYMOPT_FAIL_CRITICAL_ERRORS);
+        s->sym_ready = !!SymInitialize(s->pi.hProcess, nullptr, FALSE);
         if (!create_agent_channel(s) || (!has_inline(s) && !release_gate(s))) {
             TerminateProcess(s->pi.hProcess, 3); return 0;
         }
@@ -508,6 +709,51 @@ static uint64_t thread_scratch(probe_session *s, DWORD tid) {
     void *mem = VirtualAllocEx(s->pi.hProcess, nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!mem) return 0;
     uint64_t addr = (uint64_t)(uintptr_t)mem; s->scratch[tid] = addr; return addr;
+}
+
+// Fully release a hardware probe: clear its DR on every thread and free the slot.
+static void release_hw(probe_session *s, Probe &p) {
+    if (p.dr_slot < 0) return;
+    for (DWORD tid : s->threads) {
+        HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+        if (t) { set_dr_on_thread(t, p.dr_slot, 0, false); CloseHandle(t); }
+    }
+    s->dr_used &= (uint8_t)~(1u << p.dr_slot);
+    if (s->hw_active > 0) --s->hw_active;
+    p.active = false; p.dr_slot = -1;
+    if (p.flags & PROBE_ONCE) p.retired = true;
+}
+
+// Agent -> controller control-plane call (an inline callback used get_session(c)).
+// The raising thread is stopped; service the request and write the result back.
+static void handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
+    auto &ex = event.u.Exception.ExceptionRecord;
+    if (ex.NumberParameters < 1) return;
+    uint64_t at = (uint64_t)ex.ExceptionInformation[0];
+    probe_ipc_request req{}; size_t got = 0;
+    if (!remote_read(s->pi.hProcess, at, &req, sizeof(req), &got) || got != sizeof(req)) return;
+    req.callback[sizeof(req.callback) - 1] = 0; req.symbol[sizeof(req.symbol) - 1] = 0;
+    // The callback is named; find the controller's copy of the same source. Prefer the
+    // module that holds the originating inline probe's callback, then the executable.
+    probe_callback cb = nullptr;
+    for (auto &p : s->probes)
+        if ((p->flags & PROBE_INLINE) && p->agent_index == req.origin_site && p->callback) {
+            HMODULE m{};
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCSTR>(p->callback), &m))
+                cb = reinterpret_cast<probe_callback>(GetProcAddress(m, req.callback));
+            break;
+        }
+    if (!cb) cb = reinterpret_cast<probe_callback>(GetProcAddress(GetModuleHandleA(nullptr), req.callback));
+    int32_t result = 0;
+    if (!cb) {
+        std::fprintf(stderr, "probe: dynamic add from inline callback: no controller-side export '%s'\n", req.callback);
+    } else if (req.op == PROBE_IPC_ADD_ADDRESS) result = probe_add_address(s, req.address, cb, req.flags);
+    else if (req.op == PROBE_IPC_WATCH)       result = probe_watch(s, req.address, cb, req.flags);
+    else if (req.op == PROBE_IPC_ADD_SYMBOL)  result = probe_add_symbol(s, req.symbol, cb, req.flags);
+    std::fprintf(stderr, "probe: ipc op=%u from inline site %u cb=%s -> %d\n", req.op, req.origin_site, req.callback, result);
+    size_t wrote = 0;
+    remote_write(s->pi.hProcess, at + offsetof(probe_ipc_request, result), &result, sizeof(result), &wrote);
 }
 
 // Service a hardware-breakpoint #DB (a single-step exception carrying a DR status
@@ -527,9 +773,21 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
         if (!(native.Dr6 & (1u << slot))) continue;
         Probe *probe = nullptr;
         for (auto &p : s->probes) if (p->active && (p->flags & PROBE_HW) && p->dr_slot == slot) { probe = p.get(); break; }
-        if (!probe) continue;                                        // a DR we do not own
+        if (!probe) {
+            // A slot we owned but have since released (PROBE_ONCE / unload): a #DB that was
+            // already in flight on another thread. Swallow it rather than crash the app.
+            if (s->dr_ever & (1u << slot)) any = true;
+            continue;
+        }
         any = true;
-        probe_context context = from_context(native, probe_index(s, probe), probe->address, &remote_ops, s->pi.hProcess);
+        #if defined(_WIN64)
+        uint64_t hit_pc = native.Rip;
+#else
+        uint64_t hit_pc = native.Eip;
+#endif
+        // Execute probes: pc == the probe address. Watchpoints trap AFTER the access, so
+        // pc is the instruction following the store/load -- the real code location.
+        probe_context context = from_context(native, probe_index(s, probe), hit_pc, &remote_ops, s->pi.hProcess);
         context.config = probe->config.empty() ? nullptr : probe->config.data();
         context.tid = event.dwThreadId;
         CallbackState state{s, probe}; context.controller = &state;
@@ -537,6 +795,7 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
         catch (const std::exception &e) { CloseHandle(thread); set_error(s, std::string("probe callback: ") + e.what()); return false; }
         catch (...) { CloseHandle(thread); set_error(s, "probe callback threw an unknown exception"); return false; }
         ++probe->hits;
+        if (probe->flags & PROBE_ONCE) release_hw(s, *probe);
         to_context(context, native);                                 // fold each callback's changes forward
 #if defined(_WIN64)
         native.Rsp = context.regs.rsp;
@@ -546,6 +805,15 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
     }
     if (!any) { CloseHandle(thread); return true; }                  // none of our DRs fired
     native.EFlags |= 0x10000u;   // RF: execute the flagged instruction once without re-trapping
+    // Callbacks may have armed/released hardware probes (probe_watch, PROBE_ONCE), which
+    // rewrote THIS thread's debug registers. Take the live DR image, not the stale one
+    // captured before the callbacks, so the write-back below does not undo them.
+    {
+        CONTEXT dr{}; dr.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (GetThreadContext(thread, &dr)) {
+            native.Dr0 = dr.Dr0; native.Dr1 = dr.Dr1; native.Dr2 = dr.Dr2; native.Dr3 = dr.Dr3; native.Dr7 = dr.Dr7;
+        }
+    }
     native.Dr6 = 0;              // clear all debug status bits we consumed
     if (!SetThreadContext(thread, &native)) { CloseHandle(thread); set_error(s, win_error("resume hw breakpoint")); return false; }
     CloseHandle(thread); handled = true; return true;
@@ -559,9 +827,29 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     if (code == EXCEPTION_BREAKPOINT && !initial_break) {
         initial_break = true; disposition = DBG_CONTINUE; return true;
     }
+    if (code == PROBE_IPC_CODE) { handle_ipc(s, event); disposition = DBG_CONTINUE; return true; }
     auto step = stepping.find(event.dwThreadId);
     uint64_t address = (uint64_t)(uintptr_t)ex.ExceptionAddress;
     Probe *probe = code == EXCEPTION_BREAKPOINT ? probe_at(s, address) : nullptr;
+    if (code == EXCEPTION_BREAKPOINT && !probe && s->retired_bps.count(address)) {
+        // Another thread hit a one-shot INT3 that has since been removed: the original
+        // byte is back, so rewind to it and continue as if the breakpoint never existed.
+        unsigned char now = 0; size_t got = 0;
+        if (remote_read(s->pi.hProcess, address, &now, 1, &got) && got == 1 && now != 0xcc) {
+            HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
+            CONTEXT w{}; w.ContextFlags = CONTEXT_CONTROL;
+            bool ok = t && GetThreadContext(t, &w);
+#if defined(_WIN64)
+            w.Rip = address;
+#else
+            w.Eip = (DWORD)address;
+#endif
+            ok = ok && SetThreadContext(t, &w);
+            if (t) CloseHandle(t);
+            if (!ok) { set_error(s, win_error("rewind stale breakpoint")); return false; }
+            disposition = DBG_CONTINUE; return true;
+        }
+    }
     if (trace_enabled())
         std::fprintf(stderr, "EV code=0x%lx tid=%lu addr=0x%llx step=%d probe=%d\n",
                      (unsigned long)code, (unsigned long)event.dwThreadId,
@@ -629,6 +917,25 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
 #else
     native.Esp = (DWORD)context.regs.rsp;
 #endif
+    if (probe->flags & PROBE_ONCE) {
+        // One-shot: put the original byte back for good and resume AT the site -- the
+        // real instruction runs in place, no single-step needed. Stale hits from other
+        // threads are rewound via retired_bps above.
+        if (!patch(s->pi.hProcess, probe->address, probe->original)) {
+            CloseHandle(thread); set_error(s, win_error("retire one-shot breakpoint")); return false;
+        }
+        probe->active = false; probe->retired = true; s->retired_bps.insert(probe->address);
+#if defined(_WIN64)
+        native.Rip = probe->address;
+#else
+        native.Eip = (DWORD)probe->address;
+#endif
+        native.ContextFlags = CONTEXT_FULL;   // keep any DRs the callback armed
+        bool ok = !!SetThreadContext(thread, &native);
+        CloseHandle(thread);
+        if (!ok) { set_error(s, win_error("resume after one-shot")); return false; }
+        disposition = DBG_CONTINUE; return true;
+    }
     // Displaced stepping (default for ordinary instructions): run the original
     // instruction out-of-line with the INT3 left armed, so no other thread can cross
     // this site unobserved (no re-arm race) and no thread is suspended (no deadlock).
@@ -672,6 +979,10 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
 #endif
     }
     native.EFlags |= 0x100u;
+    // Preserve debug registers: the callback may have armed a hardware probe/watchpoint on
+    // THIS thread (probe_watch/probe_add_at); writing CONTEXT_ALL with the pre-callback DR
+    // image would clobber it. CONTEXT_FULL writes control/integer/segment only.
+    native.ContextFlags = CONTEXT_FULL;
     if (!SetThreadContext(thread, &native)) {
         CloseHandle(thread); set_error(s, win_error("apply callback context")); return false;
     }
@@ -788,7 +1099,9 @@ extern "C" int probe_run(probe_session *s) {
             std::string name = module_name_from_handle(event.u.CreateProcessInfo.hFile);
             uint64_t base = (uint64_t)(uintptr_t)event.u.CreateProcessInfo.lpBaseOfImage;
             if (!name.empty()) s->module_bases[name] = base;
+            sym_register(s, event.u.CreateProcessInfo.hFile, base);
             ok = arm_module(s, name, base);
+            if (ok) arm_entry_fixup(s, (uint64_t)(uintptr_t)event.u.CreateProcessInfo.lpStartAddress);
             if (event.u.CreateProcessInfo.hFile) CloseHandle(event.u.CreateProcessInfo.hFile);
             break;
         }
@@ -823,6 +1136,7 @@ extern "C" int probe_run(probe_session *s) {
             std::string name = module_name_from_handle(event.u.LoadDll.hFile);
             uint64_t base = (uint64_t)(uintptr_t)event.u.LoadDll.lpBaseOfDll;
             if (!name.empty()) s->module_bases[name] = base;
+            sym_register(s, event.u.LoadDll.hFile, base);
             ok = arm_module(s, name, base);
             if (iequals(name, "probe_api_agent.dll")) {
                 s->remote_agent = base;
@@ -844,13 +1158,8 @@ extern "C" int probe_run(probe_session *s) {
                     // free the slot, and drop the active count. A half-disarm (just
                     // clearing active/address) leaks the DR slot and strands the physical
                     // breakpoint on the unloaded address -> later slot exhaustion / crash.
-                    for (DWORD tid : s->threads) {
-                        HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
-                        if (t) { set_dr_on_thread(t, p->dr_slot, 0, false); CloseHandle(t); }
-                    }
-                    if (p->dr_slot >= 0) s->dr_used &= (uint8_t)~(1u << p->dr_slot);
-                    if (s->hw_active > 0) --s->hw_active;
-                    p->active = false; p->base = p->address = 0; p->dr_slot = -1;
+                    release_hw(s, *p);
+                    p->base = p->address = 0;
                 } else { p->active = false; p->base = p->address = 0; }
             }
             break;
@@ -890,6 +1199,8 @@ static void json_string(FILE *out, const std::string &value) {
     std::fputc('\"', out);
 }
 
+static std::string symbolize(probe_session *s, uint64_t addr);
+
 extern "C" void probe_report(probe_session *s, FILE *out) {
     if (!s || !out) return;
     if (s->shared) {
@@ -903,23 +1214,42 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
             if (!record.committed) continue;
             std::fputs("{\"kind\":\"probe_log\",\"probe\":", out);
             std::fprintf(out, "%u,\"tid\":%u,\"message\":", record.probe, record.tid);
-            json_string(out, record.text); std::fputs("}\n", out);
+            json_string(out, record.text);
+            if (record.has_stack) {
+                std::fputs(",\"stack\":[", out);
+                uint32_t n = record.frame_count > 32 ? 32 : record.frame_count;
+                for (uint32_t f = 0; f < n; ++f) { if (f) std::fputc(',', out); json_string(out, symbolize(s, record.frames[f])); }
+                std::fputc(']', out);
+            }
+            std::fputs("}\n", out);
         }
     }
-    for (const auto &line : s->logs) {
-        std::fputs("{\"kind\":\"probe_log\",\"message\":", out); json_string(out, line); std::fputs("}\n", out);
+    for (const auto &r : s->logs) {
+        std::fprintf(out, "{\"kind\":\"probe_log\",\"probe\":%u,\"tid\":%u,\"message\":", r.probe, r.tid);
+        json_string(out, r.text);
+        if (r.has_stack) {                       // symbolized here, long after the hit
+            std::fputs(",\"stack\":[", out);
+            for (size_t i = 0; i < r.frames.size(); ++i) {
+                if (i) std::fputc(',', out);
+                json_string(out, symbolize(s, r.frames[i]));
+            }
+            std::fputc(']', out);
+        }
+        std::fputs("}\n", out);
     }
     for (const auto &p : s->probes) {
+        if (p->internal) continue;
         std::fputs("{\"kind\":\"probe\",\"location\":", out); json_string(out, p->location);
         std::fprintf(out, ",\"backend\":\"%s\",\"active\":%s,\"hits\":%llu}\n",
                      p->flags & PROBE_INLINE ? "inline" : p->flags & PROBE_HW ? "hw" : "breakpoint",
                      p->active ? "true" : "false", (unsigned long long)p->hits);
     }
     uint64_t hits = 0, active = 0;
-    for (const auto &p : s->probes) { hits += p->hits; active += p->active; }
+    size_t visible = 0;
+    for (const auto &p : s->probes) if (!p->internal) { hits += p->hits; active += p->active; ++visible; }
     std::fprintf(out, "{\"kind\":\"probe_report\",\"probes\":%llu,\"active\":%llu,"
                  "\"hits\":%llu,\"overrides\":%llu,\"log_dropped\":%ld,\"app_exit\":%lu,\"error\":",
-                 (unsigned long long)s->probes.size(), (unsigned long long)active,
+                 (unsigned long long)visible, (unsigned long long)active,
                  (unsigned long long)hits, (unsigned long long)s->overrides,
                  s->shared ? s->shared->log_dropped : 0, s->exit_code);
     if (s->error.empty()) std::fputs("null", out); else json_string(out, s->error);
@@ -935,6 +1265,7 @@ extern "C" void probe_close(probe_session *s) {
     }
     if (s->pi.hProcess)
         for (auto &kv : s->scratch) VirtualFreeEx(s->pi.hProcess, (void *)(uintptr_t)kv.second, 0, MEM_RELEASE);
+    if (s->sym_ready) SymCleanup(s->pi.hProcess);
     if (s->remote_thread) CloseHandle(s->remote_thread);
     if (s->remote_path && s->pi.hProcess) VirtualFreeEx(s->pi.hProcess, s->remote_path, 0, MEM_RELEASE);
     if (s->shared) UnmapViewOfFile(s->shared);
@@ -963,15 +1294,15 @@ static uint64_t *register_slot(probe_context *c, enum probe_register reg) {
     }
 }
 
-extern "C" uint64_t probe_reg(probe_context *c, enum probe_register reg) {
+extern "C" uint64_t get_reg(probe_context *c, enum probe_register reg) {
     uint64_t *slot = register_slot(c, reg);
     if (!slot) return 0;
-    return reg == PROBE_REG_AX ? (uint32_t)*slot : *slot;
+    return *slot;
 }
 
-extern "C" int probe_set_reg(probe_context *c, enum probe_register reg, uint64_t value) {
+extern "C" int set_reg(probe_context *c, enum probe_register reg, uint64_t value) {
     uint64_t *slot = register_slot(c, reg); if (!slot) return 0;
-    uint64_t next = reg == PROBE_REG_AX ? (uint32_t)value : value;
+    uint64_t next = value;
     if (*slot != next) {
         *slot = next;
         auto *state = static_cast<CallbackState *>(c->controller);
@@ -980,17 +1311,17 @@ extern "C" int probe_set_reg(probe_context *c, enum probe_register reg, uint64_t
     return 1;
 }
 
-extern "C" int probe_read(probe_context *c, uint64_t address, void *buffer, size_t size) {
+extern "C" int get_mem(probe_context *c, uint64_t address, void *buffer, size_t size) {
     if (!c || !c->ops || !c->ops->read || (!buffer && size)) return 0;
     size_t done = 0; return c->ops->read(c->backend, address, buffer, size, &done) && done == size;
 }
 
-extern "C" int probe_write(probe_context *c, uint64_t address, const void *buffer, size_t size) {
+extern "C" int set_mem(probe_context *c, uint64_t address, const void *buffer, size_t size) {
     if (!c || !c->ops || !c->ops->write || (!buffer && size)) return 0;
     size_t done = 0; return c->ops->write(c->backend, address, buffer, size, &done) && done == size;
 }
 
-extern "C" uint64_t probe_arg(probe_context *c, size_t index) {
+extern "C" uint64_t get_func_arg(probe_context *c, size_t index) {
     if (!c) return 0;
 #if defined(_WIN64)
     /* x64 __fastcall: first four args in registers, rest above the shadow space. */
@@ -1000,25 +1331,95 @@ extern "C" uint64_t probe_arg(probe_context *c, size_t index) {
     default: {
         if (c->regs.rsp > UINT64_MAX - 8 || index > (UINT64_MAX - c->regs.rsp - 8) / 8) return 0;
         uint64_t value = 0, address = c->regs.rsp + 8 + 8 * index;
-        return probe_read(c, address, &value, sizeof(value)) ? value : 0;
+        return get_mem(c, address, &value, sizeof(value)) ? value : 0;
     }
     }
 #else
     /* x86 __stdcall: every arg on the stack at [esp+4+4*i], read exactly 4 bytes. */
     if (c->regs.rsp > UINT64_MAX - 4 || index > (UINT64_MAX - c->regs.rsp - 4) / 4) return 0;
     uint32_t value = 0; uint64_t address = c->regs.rsp + 4 + 4 * index;
-    return probe_read(c, address, &value, sizeof(value)) ? value : 0;
+    return get_mem(c, address, &value, sizeof(value)) ? value : 0;
 #endif
 }
 
-extern "C" uint64_t probe_retval(probe_context *c) { return c ? c->regs.rax : 0; }
+extern "C" const void *get_config(probe_context *c) { return c ? c->config : nullptr; }
 
-extern "C" void probe_log(probe_context *c, const char *format, ...) {
-    if (!format) return;
-    char line[2048]; va_list ap; va_start(ap, format);
-    int n = std::vsnprintf(line, sizeof(line), format, ap); va_end(ap);
-    if (n < 0) return; line[sizeof(line) - 1] = 0;
-    std::fprintf(stderr, "probe: %s\n", line);
+extern "C" probe_session *get_session(probe_context *c) {
     auto *state = c ? static_cast<CallbackState *>(c->controller) : nullptr;
-    if (state && state->session) state->session->logs.emplace_back(line);
+    return state ? state->session : nullptr;
+}
+
+// Raw stack snapshot at the hit: return addresses only (StackWalk64 over the stopped
+// target with the hit's register image). No symbol lookup here -- deferred to report.
+static void capture_stack(probe_session *s, probe_context *c, std::vector<uint64_t> &frames) {
+    frames.clear();
+    frames.push_back(c->regs.pc);
+    if (!s->sym_ready) return;
+    CONTEXT w{}; w.ContextFlags = CONTEXT_FULL;
+    to_context(*c, w);
+    STACKFRAME64 f{};
+#if defined(_WIN64)
+    DWORD machine = IMAGE_FILE_MACHINE_AMD64;
+    w.Rip = c->regs.pc; w.Rsp = c->regs.rsp; w.Rbp = c->regs.rbp;
+#else
+    DWORD machine = IMAGE_FILE_MACHINE_I386;
+    w.Eip = (DWORD)c->regs.pc; w.Esp = (DWORD)c->regs.rsp; w.Ebp = (DWORD)c->regs.rbp;
+#endif
+    f.AddrPC.Offset = c->regs.pc;     f.AddrPC.Mode = AddrModeFlat;
+    f.AddrStack.Offset = c->regs.rsp; f.AddrStack.Mode = AddrModeFlat;
+    f.AddrFrame.Offset = c->regs.rbp; f.AddrFrame.Mode = AddrModeFlat;
+    HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, c->tid);
+    for (int i = 0; i < PROBE_STACK_MAX_FRAMES; ++i) {
+        if (!StackWalk64(machine, s->pi.hProcess, thread, &f, &w, nullptr,
+                         SymFunctionTableAccess64, SymGetModuleBase64, nullptr)) break;
+        if (!f.AddrPC.Offset) break;
+        if (i == 0) continue;                          // frame 0 is the site itself (already pushed)
+        frames.push_back(f.AddrPC.Offset);
+    }
+    if (thread) CloseHandle(thread);
+}
+
+static std::string symbolize(probe_session *s, uint64_t addr) {
+    char buf[64]; std::snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)addr);
+    if (!s->sym_ready) return buf;
+    std::string out;
+    IMAGEHLP_MODULE64 mod{}; mod.SizeOfStruct = sizeof(mod);
+    if (SymGetModuleInfo64(s->pi.hProcess, addr, &mod)) out = mod.ModuleName;
+    alignas(SYMBOL_INFO) char sb[sizeof(SYMBOL_INFO) + 256]{};
+    auto *sym = reinterpret_cast<SYMBOL_INFO *>(sb); sym->SizeOfStruct = sizeof(SYMBOL_INFO); sym->MaxNameLen = 255;
+    DWORD64 disp = 0;
+    if (SymFromAddr(s->pi.hProcess, addr, &disp, sym)) {
+        char tmp[300]; std::snprintf(tmp, sizeof(tmp), "!%s+0x%llx", sym->Name, (unsigned long long)disp);
+        out += tmp;
+    } else if (!out.empty()) {
+        char tmp[40]; std::snprintf(tmp, sizeof(tmp), "+0x%llx", (unsigned long long)(addr - mod.BaseOfImage));
+        out += tmp;
+    }
+    IMAGEHLP_LINE64 line{}; line.SizeOfStruct = sizeof(line); DWORD ld = 0;
+    if (SymGetLineFromAddr64(s->pi.hProcess, addr, &ld, &line) && line.FileName) {
+        char tmp[300]; std::snprintf(tmp, sizeof(tmp), " (%s:%lu)", basename_of(line.FileName).c_str(), line.LineNumber);
+        out += tmp;
+    }
+    return out.empty() ? std::string(buf) : out + " [" + buf + "]";
+}
+
+static void log_common(probe_context *c, bool stack, const char *format, va_list ap) {
+    if (!format) return;
+    char line[2048];
+    int n = std::vsnprintf(line, sizeof(line), format, ap);
+    if (n < 0) return; line[sizeof(line) - 1] = 0;
+    auto *state = c ? static_cast<CallbackState *>(c->controller) : nullptr;
+    if (!state || !state->session) { std::fprintf(stderr, "probe: %s\n", line); return; }
+    LogRecord r; r.text = line; r.tid = c->tid; r.probe = c->site; r.has_stack = stack;
+    if (stack) capture_stack(state->session, c, r.frames);
+    std::fprintf(stderr, stack ? "probe: %s [+stack %zu frames]\n" : "probe: %s\n", line, r.frames.size());
+    state->session->logs.push_back(std::move(r));
+}
+
+extern "C" void send_log(probe_context *c, const char *format, ...) {
+    va_list ap; va_start(ap, format); log_common(c, false, format, ap); va_end(ap);
+}
+
+extern "C" void send_log_stack(probe_context *c, const char *format, ...) {
+    va_list ap; va_start(ap, format); log_common(c, true, format, ap); va_end(ap);
 }

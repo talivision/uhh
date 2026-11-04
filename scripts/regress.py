@@ -17,6 +17,10 @@ Checks:
   - breakage: the hostile fixtures produce their expected verdicts.
   - frida-parity: the four Interceptor-parity demos all pass.
   - watchpoint: a hardware write-watchpoint fires once per store.
+  - dynwatch-<entry>: the malloc -> return -> watch chain registered at runtime from
+    inside callbacks (entry probe as breakpoint / hw / inline; inline exercises the
+    agent->controller IPC). Exact hit count across two threads (one created after the
+    watch is armed), one-shot return probe retired, and a symbolized stack in the log.
 Missing binaries (an example not built) are reported as SKIP, not FAIL.
 """
 import argparse
@@ -215,6 +219,30 @@ def check_watchpoint():
         record("watchpoint", False, repr(e))
 
 
+def check_dynwatch(writes=100):
+    d = exe("dynwatch_driver.exe")
+    if not d or not exe("dynwatch_target.exe"):
+        return skip("dynwatch", "dynwatch_driver/dynwatch_target missing")
+    want = 2 * writes
+    for entry in ("breakpoint", "hw", "inline"):
+        name = f"dynwatch-{entry}"
+        try:
+            _, o = run([d, "--entry", entry, "--writes", writes], timeout=120)
+            res = next((x for x in o if x.get("kind") == "dynwatch_result"), {})
+            rep = report(o)
+            once = [p for p in probes(o) if p.get("location", "").startswith("0x") and p.get("backend") == "breakpoint"]
+            stacks = [x.get("stack") for x in o if x.get("kind") == "probe_log" and x.get("stack")]
+            sym_ok = bool(stacks) and len(stacks[0]) >= 3 and stacks[0][0].startswith("dynwatch_target")
+            ok = (res.get("returns") == 1 and res.get("arms") == 1 and res.get("watch_hits") == want and
+                  rep.get("error") is None and len(once) == 1 and once[0].get("active") is False and
+                  once[0].get("hits") == 1 and sym_ok)
+            record(name, ok, f"returns={res.get('returns')} arms={res.get('arms')} watch_hits={res.get('watch_hits')} "
+                             f"want={want} once_retired={bool(once) and once[0].get('active') is False} "
+                             f"stack0={(stacks[0][0] if stacks else None)}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
 def main():
     global BIN
     ap = argparse.ArgumentParser()
@@ -234,6 +262,7 @@ def main():
     check_breakage()
     check_frida_parity()
     check_watchpoint()
+    check_dynwatch()
     print("-" * 72)
     failed = 0
     for name, status, detail in RESULTS:

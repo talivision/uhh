@@ -61,7 +61,7 @@ static RunResult run_case(const Case &c, const uint64_t rvas[SITE_COUNT]) {
         char location[96];
         std::snprintf(location, sizeof(location), "hook_edge.exe+0x%llx",
                       (unsigned long long)rvas[registration.site]);
-        if (!probe_add_cfg(session, location, registration.callback, c.flags, nullptr, 0)) added = false;
+        if (!probe_add_symbol_cfg(session, location, registration.callback, c.flags, nullptr, 0)) added = false;
     }
     std::string target = sibling_target();
     char case_arg[32]; std::snprintf(case_arg, sizeof(case_arg), "%s", c.target_case);

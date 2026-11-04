@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <initializer_list>
-#include "probe_api.h"
+#include "probe_internal.hpp"
 inline void require(bool ok, const char *message) {
     if (!ok) throw std::runtime_error(std::string(message) + " (Win32=" + std::to_string(GetLastError()) + ")");
 }
@@ -51,6 +51,33 @@ inline void to_context(const probe_context &c, CONTEXT &w) {
 #endif
     /* PC/SP and flags are read-only in this first common contract. */
 }
+inline bool callback_export_name(probe_callback callback, std::string &name) {
+    HMODULE module{};
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCSTR>(callback), &module)) return false;
+    auto base = reinterpret_cast<const unsigned char *>(module);
+    auto dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR_MAGIC)
+        return false;
+    auto dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dir.VirtualAddress || !dir.Size) return false;
+    auto exports = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY *>(base + dir.VirtualAddress);
+    auto functions = reinterpret_cast<const DWORD *>(base + exports->AddressOfFunctions);
+    auto names = reinterpret_cast<const DWORD *>(base + exports->AddressOfNames);
+    auto ordinals = reinterpret_cast<const WORD *>(base + exports->AddressOfNameOrdinals);
+    uint64_t callback_rva = reinterpret_cast<const unsigned char *>(callback) - base;
+    for (DWORD i = 0; i < exports->NumberOfNames; ++i) {
+        WORD ordinal = ordinals[i];
+        if (ordinal < exports->NumberOfFunctions && functions[ordinal] == callback_rva) {
+            name = reinterpret_cast<const char *>(base + names[i]); return true;
+        }
+    }
+    return false;
+}
+
 inline std::string exe_directory() {
     char p[MAX_PATH]; DWORD n = GetModuleFileNameA(nullptr,p,MAX_PATH);
     require(n && n < MAX_PATH,"executable path");

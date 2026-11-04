@@ -26,11 +26,14 @@ enum probe_flags {
        The address is a data location (module+RVA of a variable) aligned to the word
        size. Exactly one of WRITE/RW; absent = an ordinary execute breakpoint. */
     PROBE_WATCH_WRITE     = 1u << 6,
-    PROBE_WATCH_RW        = 1u << 7
+    PROBE_WATCH_RW        = 1u << 7,
+    /* Remove the probe after its first hit — e.g. a one-shot return hook, or an
+       alloc-site hook that arms a watchpoint once and retires. */
+    PROBE_ONCE            = 1u << 8
 };
 
-/* AX is the 32-bit EAX view: writes zero-extend into RAX. Other IDs expose the
-   full x64 register named by the corresponding CONTEXT member. */
+/* Every ID is the full native register: RAX..R15 on x64, EAX..EBP/ESP on x86
+   (R8..R15 read 0 and cannot be set on x86). PROBE_REG_AX is the return value. */
 enum probe_register {
     PROBE_REG_AX,
     PROBE_REG_BX,
@@ -50,44 +53,46 @@ enum probe_register {
     PROBE_REG_R15
 };
 
-/* Controller-private fields remain visible so the C context has a fixed ABI.
-   Callbacks use the accessors below; config is the one public data member. */
-typedef struct probe_regs {
-    uint64_t rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp;
-    uint64_t r8, r9, r10, r11, r12, r13, r14, r15, pc, flags;
-} probe_regs;
-typedef struct probe_ops {
-    int (*read)(void *, uint64_t, void *, size_t, size_t *);
-    int (*write)(void *, uint64_t, const void *, size_t, size_t *);
-} probe_ops;
-struct probe_context {
-    void *config;
-    probe_regs regs;
-    const probe_ops *ops;
-    void *backend;
-    void *controller;
-    uint32_t tid, site;
-};
+/* probe_context is OPAQUE: callbacks reach everything through the accessors below,
+   so a context can never be mistaken for a session (distinct incomplete types). */
 
+/* ---- Control plane: take a SESSION. Valid before probe_launch, and from inside any
+   callback via get_session(c) (the target is stopped, so new probes arm immediately). */
 probe_session *probe_session_create(void);
-int probe_add(probe_session *, const char *location, probe_callback, uint32_t flags);
-int probe_add_cfg(probe_session *, const char *location, probe_callback, uint32_t flags,
-                  const void *config, size_t config_len);
+/* "module+0xRVA" or "module!Export[+0xOFF]" -- resolved when the module loads. */
+int probe_add_symbol(probe_session *, const char *symbol, probe_callback, uint32_t flags);
+int probe_add_symbol_cfg(probe_session *, const char *symbol, probe_callback, uint32_t flags,
+                         const void *config, size_t config_len);
+/* An absolute address in the target (e.g. a return address read in a callback). */
+int probe_add_address(probe_session *, uint64_t address, probe_callback, uint32_t flags);
+/* Hardware DATA watchpoint on an absolute address: flags = PROBE_WATCH_WRITE (default)
+   or PROBE_WATCH_RW, optionally | PROBE_ONCE. Max 4 hardware probes in total. */
+int probe_watch(probe_session *, uint64_t address, probe_callback, uint32_t flags);
 int probe_launch(probe_session *, char *const argv[]);
 int probe_run(probe_session *);
 int probe_wait_for_exit(probe_session *);
 void probe_report(probe_session *, FILE *);
 void probe_close(probe_session *);
 
-uint64_t probe_reg(probe_context *, enum probe_register);
-int probe_set_reg(probe_context *, enum probe_register, uint64_t value);
-int probe_read(probe_context *, uint64_t address, void *buffer, size_t size);
-int probe_write(probe_context *, uint64_t address, const void *buffer, size_t size);
-uint64_t probe_arg(probe_context *, size_t index);
-uint64_t probe_retval(probe_context *);
-void probe_log(probe_context *, const char *format, ...);
+/* ---- Data plane: take a CONTEXT (this hit's registers and memory). ---- */
+uint64_t get_reg(probe_context *, enum probe_register);
+int set_reg(probe_context *, enum probe_register, uint64_t value);
+uint64_t get_func_arg(probe_context *, size_t index);
+int get_mem(probe_context *, uint64_t address, void *buffer, size_t size);
+int set_mem(probe_context *, uint64_t address, const void *buffer, size_t size);
+void send_log(probe_context *, const char *format, ...);
+/* Same as send_log, plus a snapshot of the call stack at the hit, emitted as ONE log
+   record. Only raw return addresses are captured at the hit; module!symbol+off (and
+   file:line when PDBs are present) is resolved later, when the log is reported. */
+void send_log_stack(probe_context *, const char *format, ...);
+const void *get_config(probe_context *);
+/* The session this callback belongs to, for control-plane calls from a callback. In a
+   breakpoint/hardware callback it is the real session; in an inline callback (running
+   inside the target) it is an agent-side proxy whose control calls are forwarded to the
+   controller synchronously. Same callback source works in every backend. */
+probe_session *get_session(probe_context *);
 
-#define PROBE_LOG(c, ...) probe_log((c), __VA_ARGS__)
+#define PROBE_LOG(c, ...) send_log((c), __VA_ARGS__)
 
 #ifdef __cplusplus
 }

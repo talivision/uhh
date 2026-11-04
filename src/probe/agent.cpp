@@ -43,23 +43,23 @@ static uint64_t *register_slot(probe_context *c, enum probe_register reg) {
     }
 }
 
-extern "C" uint64_t probe_reg(probe_context *c, enum probe_register reg) {
+extern "C" uint64_t get_reg(probe_context *c, enum probe_register reg) {
     uint64_t *slot = register_slot(c, reg);
-    return !slot ? 0 : reg == PROBE_REG_AX ? (uint32_t)*slot : *slot;
+    return slot ? *slot : 0;
 }
-extern "C" int probe_set_reg(probe_context *c, enum probe_register reg, uint64_t value) {
+extern "C" int set_reg(probe_context *c, enum probe_register reg, uint64_t value) {
     uint64_t *slot = register_slot(c, reg); if (!slot) return 0;
-    *slot = reg == PROBE_REG_AX ? (uint32_t)value : value; return 1;
+    *slot = value; return 1;
 }
-extern "C" int probe_read(probe_context *c, uint64_t address, void *buffer, size_t size) {
+extern "C" int get_mem(probe_context *c, uint64_t address, void *buffer, size_t size) {
     if (!c || !c->ops || !c->ops->read || (!buffer && size)) return 0;
     size_t done{}; return c->ops->read(c->backend, address, buffer, size, &done) && done == size;
 }
-extern "C" int probe_write(probe_context *c, uint64_t address, const void *buffer, size_t size) {
+extern "C" int set_mem(probe_context *c, uint64_t address, const void *buffer, size_t size) {
     if (!c || !c->ops || !c->ops->write || (!buffer && size)) return 0;
     size_t done{}; return c->ops->write(c->backend, address, buffer, size, &done) && done == size;
 }
-extern "C" uint64_t probe_arg(probe_context *c, size_t index) {
+extern "C" uint64_t get_func_arg(probe_context *c, size_t index) {
     if (!c) return 0;
 #if defined(_WIN64)
     /* x64 __fastcall: first four args in registers, rest above the shadow space. */
@@ -69,21 +69,61 @@ extern "C" uint64_t probe_arg(probe_context *c, size_t index) {
     default: {
         if (c->regs.rsp > UINT64_MAX - 8 || index > (UINT64_MAX - c->regs.rsp - 8) / 8) return 0;
         uint64_t value{}, address = c->regs.rsp + 8 + 8 * index;
-        return probe_read(c, address, &value, sizeof(value)) ? value : 0;
+        return get_mem(c, address, &value, sizeof(value)) ? value : 0;
     }
     }
 #else
     /* x86 __stdcall: every arg on the stack at [esp+4+4*i], read exactly 4 bytes. */
     if (c->regs.rsp > UINT64_MAX - 4 || index > (UINT64_MAX - c->regs.rsp - 4) / 4) return 0;
     uint32_t value{}; uint64_t address = c->regs.rsp + 4 + 4 * index;
-    return probe_read(c, address, &value, sizeof(value)) ? value : 0;
+    return get_mem(c, address, &value, sizeof(value)) ? value : 0;
 #endif
 }
-extern "C" uint64_t probe_retval(probe_context *c) { return c ? c->regs.rax : 0; }
 
-extern "C" void probe_log(probe_context *c, const char *format, ...) {
-    /* Chunk 2 records the stable format text only. Typed argument capture and
-       reader-side formatting arrive with the per-thread queues in chunk 3. */
+// In-process stack snapshot from the HOOKED register image (not the agent's own frames):
+// x64 unwinds with the image's .pdata (RtlVirtualUnwind); x86 follows the EBP chain.
+static uint32_t capture_stack(probe_context *c, uint64_t *frames, uint32_t cap) {
+    uint32_t n = 0;
+    if (!cap) return 0;
+    frames[n++] = c->regs.pc;
+#if defined(_WIN64)
+    CONTEXT w{};
+    w.Rip = c->regs.pc; w.Rsp = c->regs.rsp; w.Rbp = c->regs.rbp; w.Rax = c->regs.rax;
+    w.Rbx = c->regs.rbx; w.Rcx = c->regs.rcx; w.Rdx = c->regs.rdx; w.Rsi = c->regs.rsi; w.Rdi = c->regs.rdi;
+    w.R8 = c->regs.r8; w.R9 = c->regs.r9; w.R10 = c->regs.r10; w.R11 = c->regs.r11;
+    w.R12 = c->regs.r12; w.R13 = c->regs.r13; w.R14 = c->regs.r14; w.R15 = c->regs.r15;
+    __try {
+        while (n < cap) {
+            DWORD64 image = 0;
+            PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(w.Rip, &image, nullptr);
+            if (!fn) {                                   // leaf: return address is at [rsp]
+                w.Rip = *(DWORD64 *)w.Rsp; w.Rsp += 8;
+            } else {
+                void *handler_data = nullptr; DWORD64 establisher = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, w.Rip, fn, &w, &handler_data, &establisher, nullptr);
+            }
+            if (!w.Rip) break;
+            frames[n++] = w.Rip;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+#else
+    __try {
+        uint32_t ebp = (uint32_t)c->regs.rbp;
+        while (n < cap && ebp) {
+            uint32_t next = *(uint32_t *)(uintptr_t)ebp, ret = *(uint32_t *)(uintptr_t)(ebp + 4);
+            if (!ret) break;
+            frames[n++] = ret;
+            if (next <= ebp) break;                      // stack grows down: frames must ascend
+            ebp = next;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+#endif
+    return n;
+}
+
+static void agent_log(probe_context *c, bool stack, const char *format) {
+    /* The agent records the stable format text only (typed argument capture arrives
+       with the per-thread queues). A stack snapshot rides in the same record. */
     auto *state = c ? static_cast<AgentState *>(c->controller) : nullptr;
     if (!state || !state->shared || !format) return;
     LONG slot = InterlockedIncrement(&state->shared->log_reserve) - 1;
@@ -97,7 +137,60 @@ extern "C" void probe_log(probe_context *c, const char *format, ...) {
         for (; i + 1 < PROBE_AGENT_LOG_TEXT_CAP && format[i]; ++i) record.text[i] = format[i];
     } __except (EXCEPTION_EXECUTE_HANDLER) { i = 0; }
     record.text[i] = 0;
+    record.has_stack = stack ? 1 : 0;
+    record.frame_count = stack ? capture_stack(c, record.frames, PROBE_STACK_MAX_FRAMES) : 0;
     MemoryBarrier(); InterlockedExchange(&record.committed, 1);
+}
+
+extern "C" void send_log(probe_context *c, const char *format, ...) { agent_log(c, false, format); }
+extern "C" void send_log_stack(probe_context *c, const char *format, ...) { agent_log(c, true, format); }
+extern "C" const void *get_config(probe_context *c) { return c ? c->config : nullptr; }
+
+/* ---- Control plane from an inline callback: forwarded to the controller. ----
+   get_session(c) returns a per-site proxy (so the controller knows which probe's
+   callback module to resolve names in). Each call is one synchronous exception to the
+   debugger; the callback itself is passed by EXPORT NAME and the controller runs its
+   own copy of the same source (breakpoint/HW probes execute controller-side). */
+struct probe_session { uint32_t site; };
+static probe_session proxies[PROBE_AGENT_MAX_PROBES];
+
+extern "C" probe_session *get_session(probe_context *c) {
+    auto *state = c ? static_cast<AgentState *>(c->controller) : nullptr;
+    return state && state->index < PROBE_AGENT_MAX_PROBES ? &proxies[state->index] : nullptr;
+}
+
+// SEH cannot share a frame with C++ objects; keep the raise in its own function.
+static bool raise_ipc(probe_ipc_request *req) {
+    ULONG_PTR arg = (ULONG_PTR)req;
+    __try { RaiseException(PROBE_IPC_CODE, 0, 1, &arg); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }   // no controller listening
+    return true;
+}
+
+static int forward(probe_session *s, uint32_t op, uint64_t address, const char *symbol,
+                   probe_callback cb, uint32_t flags) {
+    if (!s || s < proxies || s >= proxies + PROBE_AGENT_MAX_PROBES || !cb) return 0;
+    probe_ipc_request req{};
+    req.op = op; req.flags = flags; req.origin_site = s->site; req.address = address;
+    std::string name;
+    if (!callback_export_name(cb, name) || name.size() >= sizeof(req.callback)) return 0;
+    std::memcpy(req.callback, name.c_str(), name.size() + 1);
+    if (symbol) {
+        size_t n = strnlen(symbol, sizeof(req.symbol));
+        if (n >= sizeof(req.symbol)) return 0;
+        std::memcpy(req.symbol, symbol, n + 1);
+    }
+    return raise_ipc(&req) ? req.result : 0;
+}
+
+extern "C" int probe_add_address(probe_session *s, uint64_t address, probe_callback cb, uint32_t flags) {
+    return forward(s, PROBE_IPC_ADD_ADDRESS, address, nullptr, cb, flags);
+}
+extern "C" int probe_watch(probe_session *s, uint64_t address, probe_callback cb, uint32_t flags) {
+    return forward(s, PROBE_IPC_WATCH, address, nullptr, cb, flags);
+}
+extern "C" int probe_add_symbol(probe_session *s, const char *symbol, probe_callback cb, uint32_t flags) {
+    return forward(s, PROBE_IPC_ADD_SYMBOL, 0, symbol, cb, flags);
 }
 
 static void call_mid(safetyhook::Context &native, uint32_t index) {
@@ -171,7 +264,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
         }
         if (InterlockedCompareExchange(&request.status, PROBE_AGENT_INSTALLING, PROBE_AGENT_PENDING) != PROBE_AGENT_PENDING)
             continue;
-        sites[i] = request.site; states[i] = {shared, i};
+        sites[i] = request.site; states[i] = {shared, i}; proxies[i].site = i;
         hooks[i] = safetyhook::create_mid((void *)(uintptr_t)request.site, mid_callbacks[i]);
         InterlockedExchange(&request.status, hooks[i] ? PROBE_AGENT_INSTALLED : PROBE_AGENT_HOOK_FAILED);
     }

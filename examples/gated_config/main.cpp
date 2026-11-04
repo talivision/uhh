@@ -82,8 +82,8 @@ int main(int argc, char **argv) {
     // the async install (the config flag site lives in a late-loaded DLL).
     uint32_t flag_flags = flag_backend | (flag_backend == PROBE_INLINE ? PROBE_FALLBACK_HW : 0u);
     uint32_t read_flags = read_backend | (read_backend == PROBE_INLINE ? PROBE_FALLBACK_HW : 0u);
-    int ok = probe_add(s, flag_text, enable_reads, flag_flags) &&
-             probe_add_cfg(s, read_text, log_read, read_flags, &cfg, sizeof(cfg)) &&
+    int ok = probe_add_symbol(s, flag_text, enable_reads, flag_flags) &&
+             probe_add_symbol_cfg(s, read_text, log_read, read_flags, &cfg, sizeof(cfg)) &&
              probe_launch(s, child_args.data()) && probe_run(s) && probe_wait_for_exit(s);
     ok = ok && gated_override_count() == 1;
     probe_report(s, stdout);

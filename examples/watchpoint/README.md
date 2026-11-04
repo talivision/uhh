@@ -8,7 +8,7 @@ it is exact under multithreading, just like the execute breakpoints.
 
 ```c
 /* Break whenever the dword at this address is written. */
-probe_add(s, "watch_target.exe+0x40a0", on_write, PROBE_HW | PROBE_WATCH_WRITE);
+probe_add_symbol(s, "watch_target.exe+0x40a0", on_write, PROBE_HW | PROBE_WATCH_WRITE);
 /* or PROBE_HW | PROBE_WATCH_RW to also trap reads. */
 ```
 

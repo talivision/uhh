@@ -14,7 +14,7 @@ static volatile size_t seen_size;
 static volatile char seen_name[64];
 
 /* The entry sleds tail-jump here, so the original caller's return address and x86
-   __stdcall arguments remain exactly where probe_arg expects them. */
+   __stdcall arguments remain exactly where get_func_arg expects them. */
 __declspec(noinline) int __stdcall ParityObserve(uintptr_t handle, const char *name, size_t n) {
     size_t i, copy = n < sizeof(seen_name) - 1 ? n : sizeof(seen_name) - 1;
     seen_handle = handle;

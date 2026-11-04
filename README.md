@@ -9,18 +9,52 @@ read and write registers and memory, change arguments, flip a return value, log.
 ```c
 /* The same callback works on x64 and x86, under any backend. */
 void log_read(probe_context *c) {
-    struct read_filter *f = c->config;            /* your optional parameters   */
-    uint64_t handle = probe_arg(c, 0);            /* arg 0: reg on x64, stack x86 */
-    uint64_t size   = probe_arg(c, 3);            /* arg 3                       */
+    const struct read_filter *f = get_config(c);  /* your optional parameters     */
+    uint64_t handle = get_func_arg(c, 0);         /* arg 0: reg on x64, stack x86 */
+    uint64_t size   = get_func_arg(c, 3);         /* arg 3                        */
     if (f && handle != f->selected_handle) return;
     PROBE_LOG(c, "read handle=%llu size=%llu", handle, size);
 }
 
-probe_add(s, "configparse.dll+0x1102", enable_reads, PROBE_BREAKPOINT);        /* software breakpoint */
-probe_add_cfg(s, "probe_app.exe+0x4690", log_read, PROBE_INLINE, &cfg, len);   /* inline mid-hook     */
+probe_add_symbol(s, "configparse.dll+0x1102", enable_reads, PROBE_BREAKPOINT);        /* software breakpoint */
+probe_add_symbol_cfg(s, "probe_app.exe+0x4690", log_read, PROBE_INLINE, &cfg, len);   /* inline mid-hook     */
 ```
 
-The full, locked API is in [`docs/api-sketch.md`](docs/api-sketch.md).
+### The API in one screen
+
+Two nouns, two prefixes, and the compiler keeps them apart (both are opaque types):
+
+| Takes | Functions | Meaning |
+|---|---|---|
+| a **session** | `probe_add_symbol`, `probe_add_symbol_cfg`, `probe_add_address`, `probe_watch`, `probe_launch`, `probe_run`, `probe_report`, `probe_close` | the instrumentation run (control plane) |
+| a **context** `c` | `get_reg`, `set_reg`, `get_func_arg`, `get_mem`, `set_mem`, `get_config`, `send_log`, `send_log_stack`, `get_session` | this one hit (data plane) |
+
+`get_session(c)` is the bridge: **every control-plane call works from inside any
+callback** — breakpoint, hardware, or inline. The target is stopped, so a probe added
+there is armed before the target runs another instruction. From an inline callback (which
+executes inside the target) the call is forwarded to the controller synchronously; the
+callback source does not change.
+
+```c
+/* malloc -> watch: probe the allocator, follow the pointer, watch the memory. */
+void on_write(probe_context *c) { send_log_stack(c, "write to watched block"); }
+
+void on_return(probe_context *c) {                      /* one-shot, at malloc's return  */
+    probe_watch(get_session(c), get_reg(c, PROBE_REG_AX), on_write, PROBE_WATCH_WRITE);
+}
+void on_malloc(probe_context *c) {                      /* malloc entry                  */
+    uint64_t sp = get_reg(c, PROBE_REG_SP), ret = 0;
+    if (get_func_arg(c, 0) != 0x1337) return;           /* only the block we care about  */
+    get_mem(c, sp, &ret, sizeof(void *));               /* return address                */
+    probe_add_address(get_session(c), ret, on_return, PROBE_BREAKPOINT | PROBE_ONCE);
+}
+probe_add_symbol(s, "ucrtbase.dll!malloc", on_malloc, PROBE_BREAKPOINT);
+```
+
+`send_log_stack` captures only raw return addresses at the hit; they are symbolized
+(`module!function+0xoff`, plus `file:line` with PDBs) when the log is reported, so the
+stack costs almost nothing inside the breakpoint and prints as part of the same log
+record. See [`examples/dynwatch`](examples/dynwatch).
 
 ## Backends
 
@@ -40,9 +74,10 @@ in-place fallback. Inline is the fastest where the site has room for a trampolin
 
 Backends are picked **per probe** and interoperate in one session — e.g. a
 breakpoint on a config-flag site (fires once) mixed with an inline hook on a hot
-read path (millions of hits). Probe locations are `module+0xRVA` today (symbol
-resolution via dbghelp is on the roadmap), and probes may be registered **before
-the target module is loaded** — they stay pending and activate on load.
+read path (millions of hits). Probe locations are `module+0xRVA` or `module!Export[+0xOFF]`
+(resolved from the target's export table; PDB-only symbols are on the roadmap), and
+probes may be registered **before the target module is loaded** — they stay pending
+and activate on load.
 
 ## Build
 

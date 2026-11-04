@@ -10,7 +10,7 @@
 #include <cstdio>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 1;
+constexpr uint32_t PROBE_AGENT_VERSION = 2;
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 32;
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
 constexpr uint32_t PROBE_AGENT_CONFIG_CAP = 256;
@@ -42,6 +42,23 @@ struct probe_agent_log {
     uint32_t probe;
     uint32_t tid;
     char text[PROBE_AGENT_LOG_TEXT_CAP];
+    uint32_t frame_count;          /* 0 = plain log; else frames[] is a stack snapshot */
+    uint32_t has_stack;
+    uint64_t frames[32];           /* == PROBE_STACK_MAX_FRAMES */
+};
+
+/* Agent -> controller control-plane call from an INLINE callback (which runs inside the
+   target). The agent fills this on its stack and RaiseException(PROBE_IPC_CODE, ptr); the
+   controller (the debugger) gets it first-chance, services it while the thread is stopped,
+   writes result, and continues -- a synchronous call, no polling, no extra thread. */
+constexpr DWORD PROBE_IPC_CODE = 0xE0554848u;   /* 'UHH' */
+enum probe_ipc_op : uint32_t { PROBE_IPC_ADD_ADDRESS = 1, PROBE_IPC_WATCH = 2, PROBE_IPC_ADD_SYMBOL = 3 };
+struct probe_ipc_request {
+    uint32_t op, flags, origin_site;
+    int32_t result;
+    uint64_t address;
+    char callback[PROBE_AGENT_EXPORT_CAP];
+    char symbol[256];
 };
 
 struct probe_agent_shared {

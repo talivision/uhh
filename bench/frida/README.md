@@ -21,7 +21,7 @@ bench/frida/
 
 | Ours (`examples/gated_config/callbacks.cpp`) | Frida here |
 |---|---|
-| `log_read`: inline hook at `ReadSite`, reads `probe_arg(c,0)` / `probe_arg(c,3)`, `PROBE_LOG` | `read_logger.js`: `Interceptor.attach(ntdll!NtReadVirtualMemory)`, `args[0]`/`args[3]` |
+| `log_read`: inline hook at `ReadSite`, reads `get_func_arg(c,0)` / `get_func_arg(c,3)`, `PROBE_LOG` | `read_logger.js`: `Interceptor.attach(ntdll!NtReadVirtualMemory)`, `args[0]`/`args[3]` |
 | `read_logger` CLI: filter by resolved PID + address range | `read_logger.js` `configure({ onlyPid, rangeStart, rangeSize, selectedHandle })` |
 | `enable_reads`: deferred **breakpoint** at `configparse.dll+ParsedFlagSite`, sets `PROBE_REG_AX`=1 | `enable_reads.js`: hook `ParseConfig` (default) or the flag-site register (`flagsite`) |
 | `note_open`: `NtOpenProcess` return probe building handle->PID map | `GetProcessId(handle)` cached in `read_logger.js` (see note below) |
@@ -202,7 +202,7 @@ gated read; the local buffer verification in `app.cpp` does not go through
   the **remote** (child) process. Frida runs in-target, so `ptr(base).read*()`
   would read the wrong process - we log the raw args only, exactly as `log_read`
   does. The address-range filter compares the pointer value; it needs no memory read.
-- **`args[i]` is arch-neutral**, like our `probe_arg`: registers on x64, stack on
+- **`args[i]` is arch-neutral**, like our `get_func_arg`: registers on x64, stack on
   x86, handled by Frida. One script covers x64, x86-native and WoW64 targets (for
   WoW64, inject the matching-bitness agent; frida handles this).
 - **Per-call `send()` is not free.** Frida's strength (scriptable JS, rich

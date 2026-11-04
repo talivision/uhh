@@ -73,8 +73,9 @@ add_library(probe_api_agent SHARED
     src/probe/agent.cpp
     examples/gated_config/callbacks.cpp
     examples/breakage/breakage_driver.cpp
-    examples/frida_parity/frida_parity.cpp)
-target_include_directories(probe_api_agent PRIVATE include examples/gated_config)
+    examples/frida_parity/frida_parity.cpp
+    examples/dynwatch/dynwatch_callbacks.cpp)
+target_include_directories(probe_api_agent PRIVATE include examples/gated_config examples/dynwatch)
 target_link_libraries(probe_api_agent PRIVATE safetyhook)
 target_compile_definitions(probe_api_agent PRIVATE BREAKAGE_AGENT_ONLY FRIDA_PARITY_AGENT_ONLY)
 # Undecorated names for the __stdcall agent entries (x86 would otherwise export
@@ -115,7 +116,20 @@ target_include_directories(watch_driver PRIVATE include)
 target_link_libraries(watch_driver PRIVATE probe_api)
 add_dependencies(watch_driver watch_target)
 
-foreach(t probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver)
+# --- Example: dynamic / data-driven watchpoint (malloc-return -> watch the buffer) ---
+# A code probe reads a returned pointer and arms a watchpoint on it from inside the
+# callback -- runtime composition no fixed probe list can express.
+# Uses the real CRT malloc (ucrtbase.dll, dynamic CRT) -- no labels, no linker map.
+add_executable(dynwatch_target examples/dynwatch/dynwatch_target.c)
+# A PDB so logged stacks show function names and file:line, not just module+offset.
+target_compile_options(dynwatch_target PRIVATE /Zi)
+target_link_options(dynwatch_target PRIVATE /DEBUG)
+add_executable(dynwatch_driver examples/dynwatch/dynwatch_driver.cpp examples/dynwatch/dynwatch_callbacks.cpp)
+target_include_directories(dynwatch_driver PRIVATE include examples/dynwatch)
+target_link_libraries(dynwatch_driver PRIVATE probe_api)
+add_dependencies(dynwatch_driver dynwatch_target probe_api_agent)
+
+foreach(t probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
     target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 endforeach()

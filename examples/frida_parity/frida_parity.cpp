@@ -22,7 +22,7 @@ static void log_string(probe_context *c, const char *tag, uint64_t address, uint
     while (*tag && at + 1 < sizeof(line)) line[at++] = *tag++;
     size_t room = sizeof(line) - at - 1;
     size_t n = requested < room ? (size_t)requested : room;
-    if (!n || !probe_read(c, address, line + at, n)) {
+    if (!n || !get_mem(c, address, line + at, n)) {
         const char failed[] = "<read-failed>";
         n = sizeof(failed) - 1 < room ? sizeof(failed) - 1 : room;
         std::memcpy(line + at, failed, n);
@@ -34,41 +34,41 @@ static void log_string(probe_context *c, const char *tag, uint64_t address, uint
 extern "C" PARITY_EXPORT void parity_b1_log_argument(probe_context *c) {
     /* Frida: Interceptor.attach(..., { onEnter(args) { send(args[0]); } }). */
     char line[48] = "B1:"; size_t at = 3;
-    append_u64(line, sizeof(line), at, probe_arg(c, 0));
+    append_u64(line, sizeof(line), at, get_func_arg(c, 0));
     PROBE_LOG(c, line);
 }
 
 extern "C" PARITY_EXPORT void parity_b2_read_string(probe_context *c) {
     /* Frida: args[1].readUtf8String(). UHH explicitly reads target memory. */
-    const auto *cfg = static_cast<const parity_string_config *>(c->config);
-    uint64_t n = probe_arg(c, 2);
+    const auto *cfg = static_cast<const parity_string_config *>(get_config(c));
+    uint64_t n = get_func_arg(c, 2);
     if (cfg && n > cfg->max_bytes) n = cfg->max_bytes;
-    log_string(c, "B2:", probe_arg(c, 1), n);
+    log_string(c, "B2:", get_func_arg(c, 1), n);
 }
 
 extern "C" PARITY_EXPORT void parity_b4_modify_argument(probe_context *c) {
     /* Frida: onEnter(args) { args[1] = ptr(...); }. The fixture puts the desired
        target pointer in arg0, avoiding any target-allocation feature. */
-    uint64_t replacement = probe_arg(c, 0);
+    uint64_t replacement = get_func_arg(c, 0);
 #if defined(_WIN64)
-    int changed = probe_set_reg(c, PROBE_REG_DX, replacement); // x64 arg1 is RDX
+    int changed = set_reg(c, PROBE_REG_DX, replacement); // x64 arg1 is RDX
 #else
     uint32_t value = (uint32_t)replacement;
-    int changed = probe_write(c, probe_reg(c, PROBE_REG_SP) + 8, &value, sizeof(value));
+    int changed = set_mem(c, get_reg(c, PROBE_REG_SP) + 8, &value, sizeof(value));
 #endif
-    if (changed) log_string(c, "B4:", replacement, probe_arg(c, 2));
+    if (changed) log_string(c, "B4:", replacement, get_func_arg(c, 2));
     else PROBE_LOG(c, "B4:<write-failed>");
 }
 
 extern "C" PARITY_EXPORT void parity_b6_modify_register(probe_context *c) {
     /* Frida: read/assign this.context.rax at an arbitrary instruction. AX is UHH's
        documented 32-bit EAX view, which is the same contract on x64 and x86. */
-    uint64_t before = probe_reg(c, PROBE_REG_AX);
-    int changed = probe_set_reg(c, PROBE_REG_AX, 42);
+    uint64_t before = get_reg(c, PROBE_REG_AX);
+    int changed = set_reg(c, PROBE_REG_AX, 42);
     char line[48] = "B6:"; size_t at = 3;
     append_u64(line, sizeof(line), at, before);
     if (at + 2 < sizeof(line)) { line[at++] = '-'; line[at++] = '>'; line[at] = 0; }
-    if (changed) append_u64(line, sizeof(line), at, probe_reg(c, PROBE_REG_AX));
+    if (changed) append_u64(line, sizeof(line), at, get_reg(c, PROBE_REG_AX));
     else std::strcpy(line, "B6:<write-failed>");
     PROBE_LOG(c, line);
 }
@@ -203,11 +203,11 @@ int main(int argc, char **argv) {
 
     parity_string_config string_cfg{64};
     bool added = true;
-    added &= !!probe_add(session, locations[B1], parity_b1_log_argument, PROBE_INLINE);
-    added &= !!probe_add_cfg(session, locations[B2], parity_b2_read_string, PROBE_INLINE,
+    added &= !!probe_add_symbol(session, locations[B1], parity_b1_log_argument, PROBE_INLINE);
+    added &= !!probe_add_symbol_cfg(session, locations[B2], parity_b2_read_string, PROBE_INLINE,
                              &string_cfg, sizeof(string_cfg));
-    added &= !!probe_add(session, locations[B4], parity_b4_modify_argument, PROBE_INLINE);
-    added &= !!probe_add(session, locations[B6], parity_b6_modify_register, PROBE_HW);
+    added &= !!probe_add_symbol(session, locations[B4], parity_b4_modify_argument, PROBE_INLINE);
+    added &= !!probe_add_symbol(session, locations[B6], parity_b6_modify_register, PROBE_HW);
 
     std::string target = sibling_target(); std::vector<char *> child{target.data(), nullptr};
     bool launched = added && probe_launch(session, child.data());
