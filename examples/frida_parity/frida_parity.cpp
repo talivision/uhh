@@ -92,13 +92,6 @@ struct Results {
     bool report_ok = false;
 };
 
-static std::string sibling_target() {
-    char path[MAX_PATH]; DWORD n = GetModuleFileNameA(nullptr, path, MAX_PATH);
-    if (!n || n >= MAX_PATH) return "parity_target.exe";
-    std::string result(path); size_t slash = result.find_last_of("\\/");
-    return result.substr(0, slash == std::string::npos ? 0 : slash + 1) + "parity_target.exe";
-}
-
 static bool parse_rva(const char *text, const char *name, uint64_t &value) {
     if (!text || !*text) {
         std::fprintf(stderr, "frida_parity: missing %s RVA\n", name); return false;
@@ -173,22 +166,13 @@ static bool print_demo(Demo demo, const Results &r, bool ran) {
 
 int main(int argc, char **argv) {
     static const char *site_names[] = {"ParityB1Site", "ParityB2Site", "ParityB4Site", "ParityB6Site"};
-    static const char *env_names[] = {"UHH_PARITY_B1_RVA", "UHH_PARITY_B2_RVA",
-                                      "UHH_PARITY_B4_RVA", "UHH_PARITY_B6_RVA"};
-    uint64_t rvas[DEMO_COUNT]{}; bool any_env = false, all_env = true;
-    for (int i = 0; i < DEMO_COUNT; ++i) {
-        const char *value = std::getenv(env_names[i]);
-        any_env = any_env || (value && *value); all_env = all_env && value && *value;
-    }
-    if ((any_env && !all_env) || (!all_env && argc != DEMO_COUNT + 1)) {
-        std::fprintf(stderr, "usage: frida_parity <b1_rva> <b2_rva> <b4_rva> <b6_rva>\n"
-                             "       or set all four UHH_PARITY_B*_RVA variables\n");
+    if (argc != DEMO_COUNT + 2) {
+        std::fprintf(stderr, "usage: frida_parity <parity_target.exe> <b1_rva> <b2_rva> <b4_rva> <b6_rva>\n");
         return 2;
     }
-    for (int i = 0; i < DEMO_COUNT; ++i) {
-        const char *value = all_env ? std::getenv(env_names[i]) : argv[i + 1];
-        if (!parse_rva(value, site_names[i], rvas[i])) return 2;
-    }
+    uint64_t rvas[DEMO_COUNT]{};
+    for (int i = 0; i < DEMO_COUNT; ++i)
+        if (!parse_rva(argv[i + 2], site_names[i], rvas[i])) return 2;
 
     probe_session *session = probe_session_create();
     if (!session) {
@@ -209,8 +193,8 @@ int main(int argc, char **argv) {
     added &= !!probe_add_symbol(session, locations[B4], parity_b4_modify_argument, PROBE_INLINE);
     added &= !!probe_add_symbol(session, locations[B6], parity_b6_modify_register, PROBE_HW);
 
-    std::string target = sibling_target(); std::vector<char *> child{target.data(), nullptr};
-    bool launched = added && probe_launch(session, child.data());
+    char *child[] = {argv[1], nullptr};
+    bool launched = added && probe_launch(session, child);
     bool ran = launched && probe_run(session);
     if (ran) (void)probe_wait_for_exit(session); // Nonzero target bits are decoded below.
 

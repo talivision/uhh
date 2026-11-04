@@ -8,16 +8,19 @@ read and write registers and memory, change arguments, flip a return value, log.
 
 ```c
 /* The same callback works on x64 and x86, under any backend. */
+void enable_reads(probe_context *c) {            /* parsed flag is in EAX here    */
+    if (get_reg(c, PROBE_REG_AX) == 0) set_reg(c, PROBE_REG_AX, 1);
+}
 void log_read(probe_context *c) {
     const struct read_filter *f = get_config(c);  /* your optional parameters     */
-    uint64_t handle = get_func_arg(c, 0);         /* arg 0: reg on x64, stack x86 */
-    uint64_t size   = get_func_arg(c, 3);         /* arg 3                        */
-    if (f && handle != f->selected_handle) return;
-    PROBE_LOG(c, "read handle=%llu size=%llu", handle, size);
+    uint64_t addr = get_func_arg(c, 1);           /* arg 1: reg on x64, stack x86 */
+    uint64_t size = get_func_arg(c, 3);           /* arg 3                        */
+    if (f && (addr < f->base || addr >= f->base + f->size)) return;
+    PROBE_LOG(c, "read addr=0x%llx size=%llu", addr, size);
 }
 
-probe_add_symbol(s, "configparse.dll+0x1102", enable_reads, PROBE_BREAKPOINT);        /* software breakpoint */
-probe_add_symbol_cfg(s, "probe_app.exe+0x4690", log_read, PROBE_INLINE, &cfg, len);   /* inline mid-hook     */
+probe_add_symbol(s, "configparse.dll!ParseConfig+0x16", enable_reads, PROBE_BREAKPOINT);  /* software breakpoint */
+probe_add_symbol_cfg(s, "probe_app.exe!ReadThunk", log_read, PROBE_INLINE, &cfg, len);    /* inline mid-hook     */
 ```
 
 ### The API in one screen
@@ -94,28 +97,26 @@ cmake -S . -B build-x86 -G "Visual Studio 17 2022" -A Win32
 cmake --build build-x86 --config Release
 ```
 
-## Example: `gated_config`
+## Examples: `gated_config` (launch) and `uhh_attach` (attach)
 
-A contrived but realistic target (`probe_app`) that, on a keystroke, late-loads a
-config DLL (`configparse.dll`), parses a flag, and — only if the flag is set — runs
-a multithreaded `NtReadVirtualMemory` workload. The shipped config has the flag
-**off**. Two probes turn it on and watch it:
+The target (`examples/targets/probe_app`) ships a feature **disabled in its config**:
+after a keystroke it late-loads `configparse.dll`, parses `reads_enabled=0`, and does
+nothing. Only when the flag is on does it open its helper processes by pid
+(`ntdll!NtOpenProcess`) and read their memory from many threads
+(`NtReadVirtualMemory`). The examples turn the feature on **from outside, without
+modifying the target or its config**: a breakpoint inside `configparse.dll` flips the
+parsed flag `0 -> 1` just before it is stored, and further probes log (and filter)
+every read — this is how you build metrics on a code path that normally never runs.
 
-- a **deferred software breakpoint** on the parsed-flag site, pending before the
-  DLL loads, that flips the value `0 -> 1` exactly once, and
-- an **inline** probe on the read site that logs every read.
-
-Run the end-to-end check against either build (it derives the probe RVAs from the
-linker maps, launches the target under the library, and verifies the result):
+- [`examples/gated_config`](examples/gated_config): launch the target under UHH; the
+  flag probe is pending until the DLL loads; every read is logged with its pid.
+- [`examples/attach`](examples/attach): attach to an already-running target by pid; log
+  only the reads of one helper process inside one address range.
 
 ```sh
-python scripts/check_scenario.py --bin build-x64/Release --threads 4 --reads 200
-python scripts/check_scenario.py --bin build-x86/Release --threads 4 --reads 200
+build-x64\Release\gated_config.exe configparse.dll!ParseConfig+0x16 probe_app.exe!ReadThunk -- build-x64\Release\probe_app.exe
+python scripts/regress.py --bin build-x64/Release      # everything, incl. both examples
 ```
-
-Expected on **both** x64 and x86: the workload is gated off under the shipped
-config; with the probes installed the flag is overridden once and the inline
-probe's hit count equals the number of reads.
 
 ## Status
 

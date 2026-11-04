@@ -9,8 +9,8 @@ clock scripts/bench.py reads, so the two result sets line up column-for-column.
 
 Comparability with scripts/bench.py:
   - Workload shape is identical: W threads x R reads through ReadThunk ->
-    NtReadVirtualMemory, 4-way rotation (selected/in-range, selected/out-of-range,
-    decoy/in-range, selected/other-offset). probe_app implements it.
+    NtReadVirtualMemory over probe_app's helper processes (read i -> helper i % N at
+    offset 64 * ((i / N) % 4)). probe_app implements it.
   - "ns per iteration" == elapsed_ns / reads_per_thread (bench.py's normalization,
     so Frida slots next to inline/veh-sw/debug-sw/debug-hw as another `mode`).
   - We ALSO emit ns-per-read-total and added-ns-per-read-total, the intuitive
@@ -77,7 +77,7 @@ def parse_lines(text):
 
 
 def rva_from_map(map_file, sym):
-    """Reuse scripts/site_rvas.py so RVAs match check_scenario.py exactly."""
+    """Reuse scripts/site_rvas.py (same RVAs regress.py uses)."""
     tool = HERE.parent.parent / "scripts" / "site_rvas.py"
     out = subprocess.check_output([sys.executable, str(tool), str(map_file), sym], text=True)
     return json.loads(out)[sym]
@@ -88,7 +88,7 @@ def run_baseline(exe, threads, reads, prehook, timeout):
     """probe_app, no Frida, reads enabled via config. Returns the app JSON."""
     cmd = [str(exe), "--no-wait", "--config", "reads_enabled=1",
            "--threads", str(threads), "--reads", str(reads),
-           "--prehook" if prehook else "--clean"]
+           *(["--prehook"] if prehook else [])]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if r.returncode:
         raise RuntimeError(f"baseline failed: {cmd}\n{r.stdout}\n{r.stderr}")
@@ -110,7 +110,7 @@ def run_frida(exe, threads, reads, prehook, timeout,
                  full real scenario (late DLL load + flag flip + gate)."""
     device = frida.get_local_device()
     argv = [str(exe), "--threads", str(threads), "--reads", str(reads),
-            "--prehook" if prehook else "--clean"]
+            *(["--prehook"] if prehook else [])]
     if not gated:
         argv += ["--no-wait", "--config", "reads_enabled=1"]
 
@@ -287,7 +287,7 @@ def main():
                    frida_matched=rstats.get("matched", 0),
                    frida_overrides=estats.get("overrides", 0))
         raw.append(row)
-        # Correctness gates, mirroring check_scenario.py.
+        # Correctness gates, mirroring scripts/regress.py.
         assert app["reads_enabled"] == 1, app
         assert app["successful_reads"] == total, app
         return row

@@ -9,12 +9,18 @@ and exits non-zero if ANY check fails, so it catches regressions without re-deri
 the checks by hand. Store-and-run this instead of ad-hoc scripts.
 
 Checks:
-  - gated-off: probe_app alone runs 0 reads (workload gated by the shipped config).
+  - sites: the hard-coded flag location configparse.dll!ParseConfig+0x16 is exactly the
+    ParsedFlagSite of the linker map (the offset is fixed by the asm, on both arches).
+  - gated-off: probe_app alone runs 0 opens and 0 reads (feature off in the shipped config).
   - mix matrix: flag x read over {breakpoint, inline, hw}; exactly one override and the
     read probe's hit count equals the reads (flag=inline exercises the HW fallback).
   - multithread exact: each read backend at >cores threads -> hits == threads*reads,
     the no-dropped-events guarantee -- and one formatted log per hit, log_dropped == 0
-    (the no-dropped-LOGS guarantee; inline logs cross a shared ring the controller drains).
+    (the no-dropped-LOGS guarantee; inline logs cross a shared ring the controller drains),
+    and every logged read carries the helper pid mapped at ntdll!NtOpenProcess.
+  - attach-<backend>: probe_app started on its own (waiting at its gate); uhh_attach
+    attaches, flips the flag, and logs only one helper's reads in one range. Exactly the
+    predicted number of reads is logged, every read is still counted, nothing dropped.
   - log-throughput-<backend>: per-log overhead (logging run vs --no-log run) under a
     ceiling, so logging getting slow fails like any other regression.
   - breakage: the hostile fixtures produce their expected verdicts.
@@ -30,6 +36,7 @@ import argparse
 import json
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 BIN = None
@@ -88,32 +95,55 @@ def app(objs):
     return {}
 
 
+FLAG_LOCATION = "configparse.dll!ParseConfig+0x16"
+READ_LOCATION = "probe_app.exe!ReadThunk"
+HELPERS = 4
+
+
+def check_sites():
+    try:
+        r = rvas("configparse.map", "ParseConfig", "ParsedFlagSite")
+        off = r["ParsedFlagSite"] - r["ParseConfig"]
+        record("sites", off == 0x16, f"ParsedFlagSite = ParseConfig+{off:#x} (hard-coded +0x16)")
+    except Exception as e:
+        record("sites", False, repr(e))
+
+
 def check_gated_off():
     p = exe("probe_app.exe")
     if not p:
         return skip("gated-off", "probe_app.exe missing")
     try:
-        r, o = run([p, "--no-wait", "--threads", "4", "--reads", "200", "--clean"], timeout=60)
+        r, o = run([p, "--no-wait", "--helpers", HELPERS, "--threads", "4", "--reads", "200"], timeout=60)
         a = app(o)
-        ok = r.returncode == 0 and a.get("reads_enabled") == 0 and a.get("successful_reads") == 0
-        record("gated-off", ok, f"reads_enabled={a.get('reads_enabled')} reads={a.get('successful_reads')}")
+        ok = (r.returncode == 0 and a.get("reads_enabled") == 0 and a.get("opened") == 0
+              and a.get("successful_reads") == 0)
+        record("gated-off", ok, f"reads_enabled={a.get('reads_enabled')} opened={a.get('opened')} "
+                                f"reads={a.get('successful_reads')}")
     except Exception as e:
         record("gated-off", False, repr(e))
 
 
-def gated(flag_bk, read_bk, threads, reads, timeout=200, log=True, extra=()):
-    g = exe("gated_config.exe")
-    flag = rvas("configparse.map", "ParsedFlagSite")["ParsedFlagSite"]
-    read = rvas("probe_app.map", "ReadSite")["ReadSite"]
-    return run([g, flag, read, "--flag-backend", flag_bk, "--read-backend", read_bk,
-                *([] if log else ["--no-log"]), *extra,
-                "--no-wait", "--threads", threads, "--reads", reads], timeout=timeout)
+def gated(flag_bk, read_bk, threads, reads, timeout=200, log=True):
+    return run([exe("gated_config.exe"), "--flag-backend", flag_bk, "--read-backend", read_bk,
+                *([] if log else ["--no-log"]), FLAG_LOCATION, READ_LOCATION,
+                "--", exe("probe_app.exe"), "--no-wait", "--helpers", HELPERS,
+                "--threads", threads, "--reads", reads], timeout=timeout)
+
+
+def read_log_lines(objs):
+    return [str(o.get("message")) for o in objs
+            if o.get("kind") == "probe_log" and str(o.get("message", "")).startswith("read handle=")]
 
 
 def read_logs(objs):
     """Logs emitted by log_read (one per read hit) and the report's drop counter."""
-    n = sum(1 for o in objs if o.get("kind") == "probe_log" and str(o.get("message", "")).startswith("read handle="))
-    return n, report(objs).get("log_dropped")
+    return len(read_log_lines(objs)), report(objs).get("log_dropped")
+
+
+def unmapped(objs):
+    """Logged reads whose handle the NtOpenProcess map could not attribute to a pid."""
+    return sum(1 for m in read_log_lines(objs) if " pid=0 " in m)
 
 
 def check_mix_matrix(threads, reads):
@@ -145,32 +175,106 @@ def check_multithread_exact(threads, reads):
             rd = next((x for x in probes(o) if "probe_app.exe" in x.get("location", "")), {})
             a = app(o)
             logs, dropped = read_logs(o)
+            nomap = unmapped(o)
             ok = (rd.get("hits") == total and a.get("successful_reads") == total and
-                  logs == total and dropped == 0)
+                  logs == total and dropped == 0 and nomap == 0)
             record(name, ok, f"hits={rd.get('hits')} reads={a.get('successful_reads')} logs={logs} "
-                             f"dropped={dropped} want={total}")
+                             f"dropped={dropped} unmapped={nomap} want={total}")
         except Exception as e:
             record(name, False, repr(e))
 
 
-def check_filtered_logging(threads, reads):
-    """The original scenario with a runtime-learned filter: log only reads of the
-    SELECTED child's handle inside the selected range. probe_app's request rotation makes
-    that exactly half the reads; every read is still counted."""
-    if not exe("gated_config.exe"):
-        return skip("filtered-log", "gated_config.exe missing")
-    total = int(threads) * int(reads)
-    for read_bk in ("breakpoint", "hw", "inline"):
-        name = f"filtered-log-{read_bk}"
+def predicted_reads(threads, reads, helpers, helper, offset):
+    """probe_app's read pattern: global read i (= t*R + k) goes to helper i % N at
+    base + 64 * ((i // N) % 4). How many reads hit (helper, offset)."""
+    return sum(1 for i in range(threads * reads)
+               if i % helpers == helper and 64 * ((i // helpers) % 4) == offset)
+
+
+class Lines:
+    """Collect a pipe's lines on a thread; wait for one matching a predicate."""
+
+    def __init__(self, pipe):
+        self.lines, self.cv = [], threading.Condition()
+        self.t = threading.Thread(target=self._pump, args=(pipe,), daemon=True)
+        self.t.start()
+
+    def _pump(self, pipe):
+        for line in pipe:
+            with self.cv:
+                self.lines.append(line.rstrip("\r\n"))
+                self.cv.notify_all()
+
+    def wait_for(self, pred, timeout):
+        with self.cv:
+            ok = self.cv.wait_for(lambda: any(pred(l) for l in self.lines), timeout)
+            return next((l for l in self.lines if pred(l)), None) if ok else None
+
+    def objs(self):
+        self.t.join(timeout=30)
+        out = []
+        for l in list(self.lines):
+            if l.startswith("{"):
+                try:
+                    out.append(json.loads(l))
+                except json.JSONDecodeError:
+                    pass
+        return out
+
+
+def check_attach(threads, reads):
+    """The attach scenario end to end: probe_app runs on its own and waits at its gate;
+    uhh_attach attaches by pid, flips the flag and logs only helper #1's reads at
+    offset 64 (range [base+64, base+128)). Release the gate and compare."""
+    a, p = exe("uhh_attach.exe"), exe("probe_app.exe")
+    if not a or not p:
+        return skip("attach", "uhh_attach/probe_app missing")
+    W, R, N, helper, offset = int(threads), int(reads), HELPERS, 1, 64
+    want = predicted_reads(W, R, N, helper, offset)
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"attach-{bk}"
+        procs = []
         try:
-            _, o = gated("breakpoint", read_bk, threads, reads, timeout=300, extra=("--log-selected",))
-            rd = next((x for x in probes(o) if "probe_app.exe" in x.get("location", "")), {})
+            tgt = subprocess.Popen([str(p), "--helpers", str(N), "--threads", str(W), "--reads", str(R)],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   text=True)
+            procs.append(tgt)
+            tout = Lines(tgt.stdout)
+            waiting = tout.wait_for(lambda l: '"kind":"waiting"' in l, 30)
+            if not waiting:
+                raise RuntimeError("target never reached its gate")
+            helpers = [json.loads(l) for l in tout.lines if '"kind":"helper"' in l]
+            h = next(x for x in helpers if x["index"] == helper)
+            att = subprocess.Popen([str(a), str(json.loads(waiting)["pid"]), "--pid", str(h["pid"]),
+                                    "--range", f"{h['base'] + offset}:64", "--backend", bk],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            procs.append(att)
+            aout, aerr = Lines(att.stdout), Lines(att.stderr)
+            if not aout.wait_for(lambda l: '"kind":"attached"' in l, 30):
+                raise RuntimeError("uhh_attach did not attach")
+            # Probes on already-loaded modules arm after the attach (inline: asynchronously,
+            # in the injected agent). Release the gate only once both are live.
+            for loc in ("ntdll.dll!NtOpenProcess", READ_LOCATION):
+                if not aerr.wait_for(lambda l, loc=loc: l.startswith(f"probe: active {loc} "), 30):
+                    raise RuntimeError(f"{loc} never became active")
+            tgt.stdin.write("x"); tgt.stdin.flush()
+            tgt.wait(timeout=300); att.wait(timeout=60)
+            o, t_objs = aout.objs(), tout.objs()
+            rep, appl = report(o), app(t_objs)
+            rd = next((x for x in probes(o) if x.get("location") == READ_LOCATION), {})
             logs, dropped = read_logs(o)
-            learned = [x for x in o if x.get("kind") == "probe_log" and str(x.get("message", "")).startswith("learned")]
-            ok = rd.get("hits") == total and logs == total // 2 and dropped == 0 and len(learned) == 1
-            record(name, ok, f"hits={rd.get('hits')} logged={logs} want_logged={total // 2} learned={len(learned)}")
+            wrong = [m for m in read_log_lines(o) if f" pid={h['pid']} " not in m]
+            ok = (att.returncode == 0 and rep.get("overrides") == 1 and rd.get("hits") == W * R and
+                  appl.get("successful_reads") == W * R and logs == want and dropped == 0 and not wrong)
+            record(name, ok, f"override={rep.get('overrides')} read_hits={rd.get('hits')}/{W * R} "
+                             f"logged={logs} want_logged={want} dropped={dropped} wrong_pid={len(wrong)} "
+                             f"rc={att.returncode}")
         except Exception as e:
             record(name, False, repr(e))
+        finally:
+            for pr in procs:              # only the processes this check started
+                if pr.poll() is None:
+                    pr.kill()
 
 
 # Per-log overhead floors (ns per logged hit, over the same run without logging). Loose
@@ -237,7 +341,7 @@ def check_breakage():
     }
     try:
         r = rvas("hook_edge.map", "ShortSite", "PrehookSite", "UnrelocSite", "StackSite", "StackInsideSite")
-        _, o = run([d, r["ShortSite"], r["PrehookSite"], r["UnrelocSite"], r["StackSite"], r["StackInsideSite"]],
+        _, o = run([d, exe("hook_edge.exe"), r["ShortSite"], r["PrehookSite"], r["UnrelocSite"], r["StackSite"], r["StackInsideSite"]],
                    timeout=180)
         bad = []
         for row in o:
@@ -268,7 +372,7 @@ def check_frida_parity():
         return skip("frida-parity", "frida_parity/parity_target missing")
     try:
         r = rvas("parity_target.map", "ParityB1Site", "ParityB2Site", "ParityB4Site", "ParityB6Site")
-        _, o = run([d, r["ParityB1Site"], r["ParityB2Site"], r["ParityB4Site"], r["ParityB6Site"]], timeout=90)
+        _, o = run([d, exe("parity_target.exe"), r["ParityB1Site"], r["ParityB2Site"], r["ParityB4Site"], r["ParityB6Site"]], timeout=90)
         passed = [row for row in o if row.get("verdict") == "pass"]
         ok = len(passed) == 4
         record("frida-parity", ok, f"{len(passed)}/4 pass")
@@ -286,7 +390,8 @@ def check_watchpoint():
     for name, extra, want in (("watchpoint-write", [], 4000), ("watchpoint-rw", ["--rw"], 8001)):
         try:
             rva = rvas("watch_target.map", "g_watched")["g_watched"]
-            _, o = run([d, rva, *extra, "--no-wait", "--threads", "4", "--writes", "1000", "--reads", "1000"],
+            _, o = run([d, *extra, rva, "--", exe("watch_target.exe"),
+                        "--no-wait", "--threads", "4", "--writes", "1000", "--reads", "1000"],
                        timeout=120)
             rd = next((x for x in probes(o) if x.get("backend") == "hw"), {})
             hits = next((x.get("callback_hits") for x in o if x.get("kind") == "watch_driver"), None)
@@ -304,7 +409,7 @@ def check_dynwatch(writes=100):
     for entry in ("breakpoint", "hw", "inline"):
         name = f"dynwatch-{entry}"
         try:
-            _, o = run([d, "--entry", entry, "--writes", writes], timeout=120)
+            _, o = run([d, "--entry", entry, "--", exe("dynwatch_target.exe"), "--writes", writes], timeout=120)
             res = next((x for x in o if x.get("kind") == "dynwatch_result"), {})
             rep = report(o)
             once = [p for p in probes(o) if p.get("location", "").startswith("0x") and p.get("backend") == "breakpoint"]
@@ -374,11 +479,12 @@ def main():
     args = ap.parse_args()
     BIN = args.bin.resolve()
     print(f"UHH regression suite — bin={BIN}")
+    check_sites()
     check_gated_off()
     check_mix_matrix(args.threads, args.reads)
     check_multithread_exact(args.threads, args.reads)
     check_log_throughput(args.threads, args.reads)
-    check_filtered_logging(args.threads, args.reads)
+    check_attach(args.threads, args.reads)
     if int(args.volume_reads) > 0:
         check_volume(args.volume_reads)
     check_breakage()

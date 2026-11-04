@@ -1,5 +1,9 @@
 #pragma once
+// Callbacks shared by gated_config (launch) and uhh_attach (attach). One source,
+// compiled into the driver (breakpoint / hw: callbacks run in the controller) AND into
+// probe_api_agent.dll (inline: callbacks run inside the target, found by export name).
 #include "probe_api.h"
+#include <string.h>
 
 #ifdef _WIN32
 #define PROBE_EXAMPLE_EXPORT __declspec(dllexport)
@@ -7,13 +11,27 @@
 #define PROBE_EXAMPLE_EXPORT
 #endif
 
-/* log=0: count hits only. filter=1: log only reads of the SELECTED child's handle inside
-   the selected range -- values learned at runtime by learn_target (below). */
-struct read_log_config { uint64_t cookie; uint32_t log; uint32_t filter; };
+/* Config of the read probe. log=0: count hits only (no logs). filter=1: log only reads
+   whose handle was opened (NtOpenProcess) for `pid` and whose address is in
+   [base, base+size). */
+struct read_log_config {
+    uint64_t cookie;          /* READ_LOG_COOKIE */
+    uint32_t log, filter;
+    uint64_t pid, base, size;
+};
+#define READ_LOG_COOKIE 0x7265616473697465ULL
+
+/* Drivers: "breakpoint" | "hw" | "inline" -> PROBE_* flag, 0 if unknown. */
+inline uint32_t backend_flag(const char *name) {
+    return !strcmp(name, "breakpoint") ? PROBE_BREAKPOINT : !strcmp(name, "hw") ? PROBE_HW
+         : !strcmp(name, "inline") ? PROBE_INLINE : 0u;
+}
 
 extern "C" {
+/* configparse.dll!ParseConfig+0x16: the parsed flag is in EAX; 0 -> 1. */
 PROBE_EXAMPLE_EXPORT void enable_reads(probe_context *);
+/* ntdll.dll!NtOpenProcess entry: remember (pid, out-handle pointer). */
+PROBE_EXAMPLE_EXPORT void track_open_process(probe_context *);
+/* probe_app.exe!ReadThunk (NtReadVirtualMemory args): log handle/pid/addr/size. */
 PROBE_EXAMPLE_EXPORT void log_read(probe_context *);
-PROBE_EXAMPLE_EXPORT void learn_target(probe_context *);
-uint64_t gated_override_count(void);
 }

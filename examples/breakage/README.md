@@ -82,7 +82,7 @@ The map is emitted beside the selected configuration's executable.
 cmake -S . -B build-breakage-x64 -A x64
 cmake --build build-breakage-x64 --config Release --target breakage_driver
 $r = (python scripts/site_rvas.py build-breakage-x64\Release\hook_edge.map ShortSite PrehookSite UnrelocSite StackSite StackInsideSite | Out-String | ConvertFrom-Json)
-build-breakage-x64\Release\breakage_driver.exe $r.ShortSite $r.PrehookSite $r.UnrelocSite $r.StackSite $r.StackInsideSite
+build-breakage-x64\Release\breakage_driver.exe build-breakage-x64\Release\hook_edge.exe $r.ShortSite $r.PrehookSite $r.UnrelocSite $r.StackSite $r.StackInsideSite
 ```
 
 ### Win32
@@ -91,20 +91,8 @@ build-breakage-x64\Release\breakage_driver.exe $r.ShortSite $r.PrehookSite $r.Un
 cmake -S . -B build-breakage-x86 -A Win32
 cmake --build build-breakage-x86 --config Release --target breakage_driver
 $r = (python scripts/site_rvas.py build-breakage-x86\Release\hook_edge.map ShortSite PrehookSite UnrelocSite StackSite StackInsideSite | Out-String | ConvertFrom-Json)
-build-breakage-x86\Release\breakage_driver.exe $r.ShortSite $r.PrehookSite $r.UnrelocSite $r.StackSite $r.StackInsideSite
-```
-
-The same RVAs may be supplied entirely through the environment (partial sets are
-rejected):
-
-```powershell
-$env:UHH_SHORT_RVA       = "$($r.ShortSite)"
-$env:UHH_PREHOOK_RVA     = "$($r.PrehookSite)"
-$env:UHH_UNRELOC_RVA     = "$($r.UnrelocSite)"
-$env:UHH_STACK_RVA       = "$($r.StackSite)"
-$env:UHH_STACK_INSIDE_RVA = "$($r.StackInsideSite)"
-build-breakage-x64\Release\breakage_driver.exe
+build-breakage-x86\Release\breakage_driver.exe build-breakage-x86\Release\hook_edge.exe $r.ShortSite $r.PrehookSite $r.UnrelocSite $r.StackSite $r.StackInsideSite
 ```
 
 The DLL containing inline callbacks is built as a dependency and must remain next
-to the driver and target. No RVA is compiled into either binary.
+to the driver (`probe_api_agent.dll`). The target path is the first argument. No RVA is compiled into either binary.

@@ -87,7 +87,7 @@ python bench_frida.py --bin build-x64\RelWithDebInfo
 ```
 
 Full real gate (late DLL load + flag flip via Frida + stdin keystroke), matching
-`check_scenario.py` end to end:
+`scripts/check_scenario.py` end to end:
 
 ```bat
 python bench_frida.py --bin build-x64\RelWithDebInfo --gated --threads 4 --reads 200
@@ -191,13 +191,12 @@ gated read; the local buffer verification in `app.cpp` does not go through
   falls back with a clear message otherwise. Frida does not expose a simple
   hardware-breakpoint primitive from JS, so it has no clean no-code-modification
   option at that site the way our HW/breakpoint backends do.
-- **Handle->PID resolution.** Our `note_open` builds a handle->PID map from
-  `NtOpenProcess` returns. But `src/app.cpp` passes the **`CreateProcess`** handle
-  to the reads (not an `OpenProcess` handle), so `NtOpenProcess` never fires for
-  that handle and such a map would be empty here. `read_logger.js` therefore
-  resolves with `GetProcessId(handle)`, **cached per handle** (one syscall per
-  distinct handle, then a JS-map hit) - the same "resolve once, cache, never on
-  the hot path uncached" rule as our reader-side PID/name resolution.
+- **Handle->PID resolution.** UHH's `track_open_process`
+  (examples/gated_config/callbacks.cpp) builds a handle->PID map at `NtOpenProcess`
+  (probe_app opens every helper by pid there). `read_logger.js` instead resolves with
+  `GetProcessId(handle)`, **cached per handle** (one syscall per distinct handle,
+  then a JS-map hit) - the same "resolve once, cache, never on the hot path
+  uncached" rule.
 - **In-target vs out-of-process.** `BaseAddress` in `NtReadVirtualMemory` names
   the **remote** (child) process. Frida runs in-target, so `ptr(base).read*()`
   would read the wrong process - we log the raw args only, exactly as `log_read`
