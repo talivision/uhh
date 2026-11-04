@@ -22,6 +22,7 @@ static std::string sibling_app() {
 static bool parse_backend(const char *name, uint32_t &out) {
     if (!std::strcmp(name, "breakpoint") || !std::strcmp(name, "bp")) { out = PROBE_BREAKPOINT; return true; }
     if (!std::strcmp(name, "inline")) { out = PROBE_INLINE; return true; }
+    if (!std::strcmp(name, "hw") || !std::strcmp(name, "hwbp")) { out = PROBE_HW; return true; }
     return false;
 }
 
@@ -36,7 +37,7 @@ int main(int argc, char **argv) {
                         : !std::strcmp(a, "--read-backend") ? &read_backend : nullptr;
         if (which) {
             if (i + 1 >= argc || !parse_backend(argv[i + 1], *which)) {
-                std::fprintf(stderr, "gated_config: --flag-backend/--read-backend need breakpoint|inline\n");
+                std::fprintf(stderr, "gated_config: --flag-backend/--read-backend need breakpoint|inline|hw\n");
                 return 2;
             }
             ++i; continue;   // skip the selector and its value

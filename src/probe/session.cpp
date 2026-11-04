@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <vector>
 #include <Zydis/Zydis.h>
+#include <unordered_set>
 
 struct Probe {
     std::string location, module, callback_export;
@@ -28,6 +29,7 @@ struct Probe {
     probe_callback callback = nullptr;
     uint32_t flags = 0;
     std::vector<unsigned char> config;
+    int dr_slot = -1;   // hardware-breakpoint DR register (0-3); -1 if not a HW probe
     bool active = false;
 };
 
@@ -69,6 +71,12 @@ struct probe_session {
     // One out-of-line step buffer per thread (lazily allocated in the target), so
     // concurrent threads can displaced-step independently without contending.
     std::unordered_map<DWORD, uint64_t> scratch;
+    // Live target threads + hardware-breakpoint state. HW probes set a debug
+    // register on EVERY thread (and each new one), so there is no code to modify
+    // and no re-arm race: exact under threads for any instruction, up to 4 slots.
+    std::unordered_set<DWORD> threads;
+    uint8_t dr_used = 0;
+    int hw_active = 0;
     bool launched = false, ran = false, exited = false, gate_sent = false;
 };
 
@@ -238,6 +246,42 @@ static bool decode_site(const unsigned char *bytes, size_t n, uint32_t &len,
     return true;
 }
 
+static bool set_dr_on_thread(HANDLE thread, int slot, uint64_t addr, bool enable) {
+    CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (!GetThreadContext(thread, &c)) return false;
+    switch (slot) { case 0: c.Dr0 = addr; break; case 1: c.Dr1 = addr; break;
+                    case 2: c.Dr2 = addr; break; case 3: c.Dr3 = addr; break; default: return false; }
+    DWORD64 ln = (DWORD64)1 << (slot * 2);                 // local-enable Ln
+    DWORD64 rwlen = (DWORD64)0xF << (16 + slot * 4);       // RWn/LENn; 0 = execute, 1 byte
+    DWORD64 dr7 = c.Dr7;
+    if (enable) { dr7 |= ln; dr7 &= ~rwlen; } else { dr7 &= ~ln; }
+    c.Dr7 = dr7;
+    return !!SetThreadContext(thread, &c);
+}
+
+// Hardware execute breakpoint: no code is modified, so there is no re-arm window and
+// nothing to single-step. Set the DR on every current thread; new threads get it in
+// the CREATE_THREAD handler. Exact under multithreading for ANY instruction (incl.
+// control-flow/REP the displaced software path cannot handle), limited to 4 slots.
+static bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
+    if (p.rva > UINT64_MAX - base) { set_error(s, "probe address overflow"); return false; }
+    uint64_t address = base + p.rva;
+    int slot = -1;
+    for (int i = 0; i < 4; ++i) if (!(s->dr_used & (1u << i))) { slot = i; break; }
+    if (slot < 0) { set_error(s, "no free hardware breakpoint slot (max 4)"); return false; }
+    for (DWORD tid : s->threads) {
+        HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+        if (!t) continue;
+        set_dr_on_thread(t, slot, address, true);
+        CloseHandle(t);
+    }
+    s->dr_used |= (uint8_t)(1u << slot); ++s->hw_active;
+    p.dr_slot = slot; p.base = base; p.address = address; p.active = true;
+    std::fprintf(stderr, "probe: active %s -> base=0x%llx addr=0x%llx (hw DR%d)\n",
+                 p.location.c_str(), (unsigned long long)base, (unsigned long long)address, slot);
+    return true;
+}
+
 static bool arm_breakpoint(probe_session *s, Probe &p, uint64_t base) {
     if (p.rva > UINT64_MAX - base) { set_error(s, "probe address overflow"); return false; }
     uint64_t address = base + p.rva; size_t got{};
@@ -282,7 +326,8 @@ static bool arm_module(probe_session *s, const std::string &module, uint64_t bas
     for (auto &item : s->probes) {
         if (item->active || item->address || !iequals(item->module, module)) continue;
         bool ok = item->flags & PROBE_BREAKPOINT ? arm_breakpoint(s, *item, base)
-                                                 : resolve_inline(s, *item, base);
+                 : item->flags & PROBE_HW          ? arm_hw(s, *item, base)
+                                                   : resolve_inline(s, *item, base);
         if (!ok) return false;
     }
     return true;
@@ -313,7 +358,7 @@ extern "C" int probe_add_cfg(probe_session *s, const char *location, probe_callb
     constexpr uint32_t known = types | PROBE_AT_RETURN | PROBE_ALLOW_PREHOOKED | PROBE_FALLBACK_HW;
     if (flags & ~known) { set_error(s, "unknown probe flags"); return 0; }
     uint32_t type = flags & types;
-    if ((type != PROBE_BREAKPOINT && type != PROBE_INLINE) || (flags & PROBE_AT_RETURN) ||
+    if ((type != PROBE_BREAKPOINT && type != PROBE_INLINE && type != PROBE_HW) || (flags & PROBE_AT_RETURN) ||
         (flags & (PROBE_ALLOW_PREHOOKED | PROBE_FALLBACK_HW))) {
         set_error(s, "requested probe type/options are unsupported in this build");
         return 0;
@@ -426,6 +471,40 @@ static uint64_t thread_scratch(probe_session *s, DWORD tid) {
     uint64_t addr = (uint64_t)(uintptr_t)mem; s->scratch[tid] = addr; return addr;
 }
 
+// Service a hardware-breakpoint #DB (a single-step exception carrying a DR status
+// bit, not one of our software single-steps). Returns false on error; sets handled
+// when a DR we own fired. RF lets the flagged instruction run once without re-trapping.
+static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
+    handled = false;
+    HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
+    if (!thread) { set_error(s, win_error("open hw event thread")); return false; }
+    CONTEXT native{}; native.ContextFlags = CONTEXT_ALL;
+    if (!GetThreadContext(thread, &native)) { CloseHandle(thread); set_error(s, win_error("get hw context")); return false; }
+    int slot = (native.Dr6 & 0x1) ? 0 : (native.Dr6 & 0x2) ? 1 : (native.Dr6 & 0x4) ? 2 : (native.Dr6 & 0x8) ? 3 : -1;
+    if (slot < 0) { CloseHandle(thread); return true; }              // not a DR hit
+    Probe *probe = nullptr;
+    for (auto &p : s->probes) if (p->active && (p->flags & PROBE_HW) && p->dr_slot == slot) { probe = p.get(); break; }
+    if (!probe) { CloseHandle(thread); return true; }                // a DR we do not own
+    probe_context context = from_context(native, probe_index(s, probe), probe->address, &remote_ops, s->pi.hProcess);
+    context.config = probe->config.empty() ? nullptr : probe->config.data();
+    context.tid = event.dwThreadId;
+    CallbackState state{s, probe}; context.controller = &state;
+    try { probe->callback(&context); }
+    catch (const std::exception &e) { CloseHandle(thread); set_error(s, std::string("probe callback: ") + e.what()); return false; }
+    catch (...) { CloseHandle(thread); set_error(s, "probe callback threw an unknown exception"); return false; }
+    ++probe->hits;
+    to_context(context, native);
+#if defined(_WIN64)
+    native.Rsp = context.regs.rsp;
+#else
+    native.Esp = (DWORD)context.regs.rsp;
+#endif
+    native.EFlags |= 0x10000u;   // RF: execute the flagged instruction once without re-trapping
+    native.Dr6 = 0;              // clear the debug status bits we consumed
+    if (!SetThreadContext(thread, &native)) { CloseHandle(thread); set_error(s, win_error("resume hw breakpoint")); return false; }
+    CloseHandle(thread); handled = true; return true;
+}
+
 static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
                              std::unordered_map<DWORD, StepState> &stepping,
                              bool &initial_break, DWORD &disposition) {
@@ -441,6 +520,11 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         std::fprintf(stderr, "EV code=0x%lx tid=%lu addr=0x%llx step=%d probe=%d\n",
                      (unsigned long)code, (unsigned long)event.dwThreadId,
                      (unsigned long long)address, step != stepping.end(), probe != nullptr);
+    if (code == EXCEPTION_SINGLE_STEP && step == stepping.end() && s->hw_active) {
+        bool handled = false;
+        if (!handle_hw(s, event, handled)) return false;
+        if (handled) { disposition = DBG_CONTINUE; return true; }   // else fall through (not our DR)
+    }
     if ((code != EXCEPTION_SINGLE_STEP || step == stepping.end()) && !probe) {
         // An unexpected exception (a fault in the out-of-line copy, or any app
         // exception) reached a thread still mid-step. Drop its stale StepState so a
@@ -654,6 +738,7 @@ extern "C" int probe_run(probe_session *s) {
         DWORD disposition = DBG_CONTINUE; bool ok = true;
         switch (event.dwDebugEventCode) {
         case CREATE_PROCESS_DEBUG_EVENT: {
+            s->threads.insert(event.dwThreadId);                 // initial thread (for HW DRs)
             std::string name = module_name_from_handle(event.u.CreateProcessInfo.hFile);
             uint64_t base = (uint64_t)(uintptr_t)event.u.CreateProcessInfo.lpBaseOfImage;
             if (!name.empty()) s->module_bases[name] = base;
@@ -662,10 +747,16 @@ extern "C" int probe_run(probe_session *s) {
             break;
         }
         case CREATE_THREAD_DEBUG_EVENT:
+            s->threads.insert(event.dwThreadId);
+            if (s->hw_active && event.u.CreateThread.hThread)     // new thread inherits the DRs
+                for (auto &p : s->probes)
+                    if (p->active && (p->flags & PROBE_HW))
+                        set_dr_on_thread(event.u.CreateThread.hThread, p->dr_slot, p->address, true);
             if (event.u.CreateThread.hThread) CloseHandle(event.u.CreateThread.hThread);
             break;
         case EXIT_THREAD_DEBUG_EVENT: {
             if (event.dwThreadId == s->remote_tid) ok = complete_remote_thread(s, event.u.ExitThread.dwExitCode);
+            s->threads.erase(event.dwThreadId);
             auto it = stepping.find(event.dwThreadId);
             if (ok && it != stepping.end()) {
                 // Only the in-place path lifted the byte; a displaced step left it armed.
@@ -761,7 +852,7 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
     for (const auto &p : s->probes) {
         std::fputs("{\"kind\":\"probe\",\"location\":", out); json_string(out, p->location);
         std::fprintf(out, ",\"backend\":\"%s\",\"active\":%s,\"hits\":%llu}\n",
-                     p->flags & PROBE_INLINE ? "inline" : "breakpoint",
+                     p->flags & PROBE_INLINE ? "inline" : p->flags & PROBE_HW ? "hw" : "breakpoint",
                      p->active ? "true" : "false", (unsigned long long)p->hits);
     }
     uint64_t hits = 0, active = 0;
