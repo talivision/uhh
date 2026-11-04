@@ -4,6 +4,7 @@
 /* Per-probe config for the generic tracer: which function and how to print its args.
    fmt has one character per argument:
      x hex   d signed int   s ANSI string   W wide string   S sockaddr (IPv4/IPv6 port)
+     O OBJECT_ATTRIBUTES (prints its ObjectName, e.g. NtCreateFile's path)
      - skip */
 struct trace_config {
     char name[96];

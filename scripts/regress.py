@@ -249,15 +249,6 @@ def check_breakage():
         controls = [row for row in o if row.get("backend") in ("breakpoint", "hw")]
         ok = len(controls) == 10 and all(row.get("verdict") == "pass" for row in controls) and not bad
         record("breakage-controls", ok, f"controls={len(controls)}/10 bad={bad}")
-        # Pre-hooked site handling (the fixture's TLS callback installs a real foreign E9):
-        # default inline is refused WITH a report; fallback moves to hw and hits once.
-        rows = {row.get("backend"): row for row in o if row.get("site") == "PrehookSite"}
-        dflt, fb = rows.get("inline-default", {}), rows.get("inline-fallback", {})
-        ok2 = (dflt.get("verdict") == "expected_breakage" and dflt.get("prehook_reports", 0) >= 1 and
-               fb.get("verdict") == "pass" and fb.get("prehook_reports", 0) >= 1 and
-               rows.get("breakpoint", {}).get("verdict") == "pass")
-        record("prehook-detect", ok2, f"default={dflt.get('verdict')}/reports={dflt.get('prehook_reports')} "
-                                      f"fallback={fb.get('verdict')}/reports={fb.get('prehook_reports')}")
     except Exception as e:
         record("breakage-controls", False, repr(e))
 
@@ -308,24 +299,126 @@ def check_dynwatch(writes=100):
             res = next((x for x in o if x.get("kind") == "dynwatch_result"), {})
             rep = report(o)
             once = [p for p in probes(o) if p.get("location", "").startswith("0x") and p.get("backend") == "breakpoint"]
-            stacks = [x.get("stack") for x in o if x.get("kind") == "probe_log" and x.get("stack")]
+            stacks = [x.get("stack") for x in o if x.get("kind") == "probe_log" and x.get("stack")
+                      and x.get("message") == "write to tracked block"]
             sym_ok = bool(stacks) and len(stacks[0]) >= 3 and stacks[0][0].startswith("dynwatch_target")
             marker = next((p for p in probes(o) if p.get("location", "").endswith("!dynwatch_marker")), {})
             calls = [x.get("message") for x in o if x.get("kind") == "probe_log" and "call_func" in str(x.get("message"))]
+            entry = next((x.get("stack") for x in o if x.get("kind") == "probe_log" and x.get("message") == "malloc(0x1337) entry"), None)
+            entry_ok = bool(entry) and len(entry) >= 2 and entry[1].startswith("dynwatch_target")
             tgt = next((x for x in o if x.get("kind") == "target"), {})
             ok = (res.get("returns") == 1 and res.get("arms") == 1 and res.get("watch_hits") == want and
                   rep.get("error") is None and len(once) == 1 and once[0].get("active") is False and
                   once[0].get("hits") == 1 and sym_ok and
                   marker.get("backend") == "inline" and marker.get("hits") == 50 and tgt.get("marker_calls") == 50 and
-                  calls == ["call_func sum6=91 ok=1"])
+                  calls == ["call_func sum6=91 ok=1"] and entry_ok)
             record(name, ok, f"returns={res.get('returns')} arms={res.get('arms')} watch_hits={res.get('watch_hits')} "
                              f"want={want} once_retired={bool(once) and once[0].get('active') is False} "
-                             f"runtime_inline_hits={marker.get('hits')}/50 call_func={calls} stack0={(stacks[0][0] if stacks else None)}")
+                             f"runtime_inline_hits={marker.get('hits')}/50 call_func={calls} entry_caller={(entry[1][:40] if entry and len(entry) > 1 else entry)} stack0={(stacks[0][0] if stacks else None)}")
         except Exception as e:
             record(name, False, repr(e))
 
 
 SYS32 = Path(r"C:\Windows\System32")
+
+
+CONFORMANCE_CHECKS = ["get_config", "get_func_arg", "get_mem", "set_mem", "get_reg", "set_reg/arg-rewrite",
+                      "call_func", "get_session", "probe_add_symbol", "probe_watch", "probe_add_address",
+                      "later-hit", "watch-hit"]
+
+
+def check_conformance():
+    """Every context method + the control ops, one callback source, every backend."""
+    d, t = exe("conformance_driver.exe"), exe("conformance_target.exe")
+    if not d or not t:
+        return skip("conformance", "conformance_driver/target missing")
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"conformance-{bk}"
+        try:
+            _, o = run([d, "--backend", bk, "--", t], timeout=120)
+            msgs = [str(x.get("message", "")) for x in o if x.get("kind") == "probe_log"]
+            fails = sorted({m for m in msgs if m.startswith("FAIL")})
+            oks = {m[3:] for m in msgs if m.startswith("ok ")}
+            missing = [c for c in CONFORMANCE_CHECKS if c not in oks]
+            tgt = next((x for x in o if x.get("kind") == "target"), {})
+            stacks = [x.get("stack") for x in o if x.get("kind") == "probe_log" and x.get("message") == "stack conf_site"]
+            stack_ok = bool(stacks) and all(len(st) >= 2 and st[1].startswith("conformance_target") for st in stacks)
+            ok = (not fails and not missing and tgt.get("arg_rewritten") == 10 and tgt.get("mem_written") == 10 and
+                  stack_ok and report(o).get("error") is None and report(o).get("log_dropped") == 0)
+            record(name, ok, f"fails={fails[:3]} missing={missing} arg_rewritten={tgt.get('arg_rewritten')} "
+                             f"mem_written={tgt.get('mem_written')} stack_ok={stack_ok}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+def check_memstress(threads=8, iters=20000):
+    """get_mem/set_mem at scale, every backend: exact values, writes visible, page-crossing
+    access, bad addresses failing closed, nothing else in the target's memory touched."""
+    d, t = exe("memstress_driver.exe"), exe("memstress_target.exe")
+    if not d or not t:
+        return skip("memstress", "memstress_driver/target missing")
+    calls = threads * iters
+    for bk in ("inline", "hw", "breakpoint"):
+        name = f"memstress-{bk} {threads}x{iters}"
+        try:
+            _, o = run([d, "--backend", bk, "--", t, "--threads", threads, "--iters", iters], timeout=900)
+            tgt = next((x for x in o if x.get("kind") == "target"), {})
+            rep = report(o)
+            pr = next(iter(probes(o)), {})
+            summ = [str(x.get("message", "")) for x in o if x.get("kind") == "probe_log"
+                    and str(x.get("message", "")).startswith("memstress ")]
+            fields = {}
+            if summ:
+                last = max(summ, key=lambda m: int(m.split("reads_ok=")[1].split()[0]) if "reads_ok=" in m else -1)
+                for kv in last.split()[1:]:
+                    if "=" in kv:
+                        k, v = kv.split("=", 1)
+                        try: fields[k] = int(v)
+                        except ValueError: pass
+            ok = (tgt.get("calls") == calls and tgt.get("write_ok") == calls and tgt.get("cross_ok") == calls and
+                  tgt.get("untouched_ok") is True and tgt.get("readonly_intact") is True and
+                  fields.get("reads_ok") == calls and fields.get("reads_bad") == 0 and fields.get("writes") == calls and
+                  fields.get("fault_reads_failed_closed") == calls and fields.get("ro_writes_failed_closed") == calls and
+                  pr.get("hits") == calls and rep.get("log_dropped") == 0 and rep.get("error") is None)
+            record(name, ok, f"calls={tgt.get('calls')} write_ok={tgt.get('write_ok')} untouched={tgt.get('untouched_ok')} "
+                             f"reads_ok={fields.get('reads_ok')} bad={fields.get('reads_bad')} "
+                             f"fault_closed={fields.get('fault_reads_failed_closed')} hits={pr.get('hits')} "
+                             f"ns={tgt.get('elapsed_ns')}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+def check_prehook_attach():
+    """The realistic 'already hooked' case: attach to a process whose function another
+    tool already detoured (hook_edge installs a real foreign E9 on PrehookSite at start-up,
+    then waits). An inline probe there must produce the pre-hook report and fall back to
+    the hardware backend; the call is then still observed exactly once."""
+    t, h = exe("uhh_trace.exe"), exe("hook_edge.exe")
+    if not t or not h:
+        return skip("prehook-attach", "uhh_trace/hook_edge missing")
+    import time
+    try:
+        rva = rvas("hook_edge.map", "PrehookSite")["PrehookSite"]
+        target = subprocess.Popen([str(h), "--case", "prehook"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        time.sleep(0.5)                                      # past its TLS-time foreign hook
+        tracer = subprocess.Popen([str(t), "--backend", "inline", "--attach", str(target.pid),
+                                   "-p", f"hook_edge.exe+{rva}:d"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        time.sleep(3.0)                                      # attach + agent load + vet/install
+        target.stdin.write(b"\n"); target.stdin.flush()
+        out, _ = tracer.communicate(timeout=60)
+        target.wait(timeout=30)
+        objs = [json.loads(l) for l in out.splitlines() if l.startswith("{")]
+        pre = [o for o in objs if o.get("kind") == "prehook"]
+        pr = next((o for o in probes(objs) if "hook_edge.exe" in o.get("location", "")), {})
+        ok = (bool(pre) and "jmp" in pre[0].get("pattern", "") and pre[0].get("destination") and
+              len(pre[0].get("suggest", [])) >= 2 and pr.get("backend") == "hw" and pr.get("hits") == 1 and
+              target.returncode == 0)
+        record("prehook-attach", ok, f"reports={len(pre)} pattern={pre[0].get('pattern') if pre else None} "
+                                     f"backend={pr.get('backend')} hits={pr.get('hits')} target_exit={target.returncode}")
+    except Exception as e:
+        record("prehook-attach", False, repr(e))
 
 
 def check_realworld():
@@ -340,8 +433,8 @@ def check_realworld():
          [SYS32 / "curl.exe", "-s", "-o", "NUL", "file:///C:/Windows/win.ini"], r"CreateFileW\(\".*win\.ini\""),
         ("curl-connect", ["ws2_32.dll!connect:xSd"],
          [SYS32 / "curl.exe", "-s", "--connect-timeout", "3", "http://127.0.0.1:9/"], r"connect\(0x[0-9a-f]+, 127\.0\.0\.1:9,"),
-        ("findstr-open", ["KernelBase.dll!CreateFileW:Wxx"],
-         [SYS32 / "findstr.exe", "/c:fonts", r"C:\Windows\win.ini"], r"CreateFileW\(\"C:\\Windows\\win\.ini\""),
+        ("findstr-open", ["ntdll.dll!NtCreateFile:xxO"],
+         [SYS32 / "findstr.exe", "/c:fonts", r"C:\Windows\win.ini"], r"NtCreateFile\(.*\"[^\"]*\\Windows\\win\.ini\""),
     ]
     import re
     for name, specs, argv, pattern in cases:
@@ -386,6 +479,9 @@ def main():
     check_watchpoint()
     check_dynwatch()
     check_realworld()
+    check_conformance()
+    check_prehook_attach()
+    check_memstress()
     print("-" * 72)
     failed = 0
     for name, status, detail in RESULTS:

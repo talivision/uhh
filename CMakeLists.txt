@@ -65,7 +65,7 @@ target_link_options(parity_target PRIVATE "/MAP:$<TARGET_FILE_DIR:parity_target>
 
 # --- UHH library: the locked probe_api. External native-bitness INT3 and injected
 #     SafetyHook mid-hooks. Builds for both -A x64 and -A Win32. ----------------
-add_library(probe_api STATIC src/probe/session.cpp)
+add_library(probe_api STATIC src/probe/session.cpp src/probe/symbols.cpp)
 target_include_directories(probe_api PUBLIC include)
 target_link_libraries(probe_api PRIVATE Zydis)   # decode probe sites for displaced stepping
 
@@ -75,8 +75,11 @@ add_library(probe_api_agent SHARED
     examples/breakage/breakage_driver.cpp
     examples/frida_parity/frida_parity.cpp
     examples/dynwatch/dynwatch_callbacks.cpp
-    examples/trace/trace_callback.cpp)
-target_include_directories(probe_api_agent PRIVATE include examples/gated_config examples/dynwatch examples/trace)
+    examples/trace/trace_callback.cpp
+    examples/conformance/conformance_callbacks.cpp
+    bench/hitcost/hitcost_callbacks.cpp
+    examples/memstress/memstress_callbacks.cpp)
+target_include_directories(probe_api_agent PRIVATE include examples/gated_config examples/dynwatch examples/trace examples/memstress)
 target_link_libraries(probe_api_agent PRIVATE safetyhook)
 target_compile_definitions(probe_api_agent PRIVATE BREAKAGE_AGENT_ONLY FRIDA_PARITY_AGENT_ONLY)
 # Undecorated names for the __stdcall agent entries (x86 would otherwise export
@@ -136,7 +139,31 @@ target_include_directories(uhh_trace PRIVATE include examples/trace)
 target_link_libraries(uhh_trace PRIVATE probe_api)
 add_dependencies(uhh_trace probe_api_agent)
 
-foreach(t uhh_trace probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
+# --- conformance: every context method, identical callback, every backend -------------
+add_executable(conformance_target examples/conformance/conformance_target.c)
+add_executable(conformance_driver examples/conformance/conformance_driver.cpp examples/conformance/conformance_callbacks.cpp)
+target_include_directories(conformance_driver PRIVATE include)
+target_link_libraries(conformance_driver PRIVATE probe_api)
+add_dependencies(conformance_driver conformance_target probe_api_agent)
+
+# --- per-hit cost microbenchmark (inline state-save variants etc.) --------------------
+add_executable(hitcost_target bench/hitcost/hitcost_target.c)
+if(MSVC)
+    target_compile_options(hitcost_target PRIVATE /arch:AVX2)
+endif()
+add_executable(hitcost_driver bench/hitcost/hitcost_driver.cpp bench/hitcost/hitcost_callbacks.cpp)
+target_include_directories(hitcost_driver PRIVATE include)
+target_link_libraries(hitcost_driver PRIVATE probe_api)
+add_dependencies(hitcost_driver hitcost_target probe_api_agent)
+
+# --- memory read/write at scale (every backend) ------------------------------------------
+add_executable(memstress_target examples/memstress/memstress_target.c)
+add_executable(memstress_driver examples/memstress/memstress_driver.cpp examples/memstress/memstress_callbacks.cpp)
+target_include_directories(memstress_driver PRIVATE include examples/memstress)
+target_link_libraries(memstress_driver PRIVATE probe_api)
+add_dependencies(memstress_driver memstress_target probe_api_agent)
+
+foreach(t memstress_target memstress_driver hitcost_target hitcost_driver conformance_target conformance_driver uhh_trace probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
     target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 endforeach()

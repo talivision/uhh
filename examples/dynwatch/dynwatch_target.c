@@ -19,10 +19,11 @@ static volatile long g_marker_calls;
 // a fresh agent thread (asynchronously), so main pauses briefly before calling it.
 __declspec(dllexport) __declspec(noinline) void dynwatch_marker(long i) { (void)i; g_marker_calls += 1; }
 
-// Called FROM a callback via call_func (never by the program itself): six arguments so
-// x64 passes two on the stack. Returns 1*a + 2*b + ... + 6*f.
-__declspec(dllexport) __declspec(noinline) long long dynwatch_sum6(long long a, long long b, long long c,
-                                                                  long long d, long long e, long long f) {
+// Called FROM a callback via call_func (never by the program itself): six pointer-sized
+// arguments (call_func's portable contract) so x64 passes two on the stack.
+// Returns 1*a + 2*b + ... + 6*f.
+__declspec(dllexport) __declspec(noinline) intptr_t dynwatch_sum6(intptr_t a, intptr_t b, intptr_t c,
+                                                                 intptr_t d, intptr_t e, intptr_t f) {
     return a + 2 * b + 3 * c + 4 * d + 5 * e + 6 * f;
 }
 static volatile long *g_block;

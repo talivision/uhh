@@ -22,6 +22,23 @@ static void read_string(probe_context *c, uint64_t p, bool wide, char *out, size
     out[n++] = '"'; out[n] = 0;
 }
 
+/* OBJECT_ATTRIBUTES -> its ObjectName (UNICODE_STRING), e.g. NtCreateFile/NtOpenFile arg 2. */
+static void read_objattr(probe_context *c, uint64_t p, char *out, size_t cap) {
+    size_t ptr = sizeof(void *);
+    uint64_t name_ptr = 0, buf = 0; uint16_t len = 0;
+    if (!p || !get_mem(c, p + 2 * ptr, &name_ptr, ptr) || !name_ptr ||   /* Length+pad, RootDirectory, ObjectName */
+        !get_mem(c, name_ptr, &len, 2) || !get_mem(c, name_ptr + ptr, &buf, ptr) || !buf) {
+        snprintf(out, cap, "objattr@0x%llx", (unsigned long long)p); return;
+    }
+    size_t n = 0; out[n++] = '"';
+    for (size_t i = 0; i < len / 2u && n + 3 < cap; ++i) {
+        uint16_t ch = 0;
+        if (!get_mem(c, buf + i * 2, &ch, 2)) break;
+        out[n++] = (ch >= 0x20 && ch < 0x7f) ? (char)ch : '.';
+    }
+    out[n++] = '"'; out[n] = 0;
+}
+
 static void read_sockaddr(probe_context *c, uint64_t p, char *out, size_t cap) {
     unsigned char sa[28] = {0};
     if (!p || !get_mem(c, p, sa, 8)) { snprintf(out, cap, "sockaddr@0x%llx", (unsigned long long)p); return; }
@@ -48,6 +65,7 @@ extern "C" __declspec(dllexport) void uhh_trace_call(probe_context *c) {
         case 's': read_string(c, v, false, item, sizeof(item)); break;
         case 'W': read_string(c, v, true, item, sizeof(item)); break;
         case 'S': read_sockaddr(c, v, item, sizeof(item)); break;
+        case 'O': read_objattr(c, v, item, sizeof(item)); break;
         case '-': snprintf(item, sizeof(item), "_"); break;
         default:  snprintf(item, sizeof(item), "0x%llx", (unsigned long long)v); break;
         }

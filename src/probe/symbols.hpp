@@ -1,0 +1,41 @@
+#ifndef UHH_PROBE_SYMBOLS_HPP
+#define UHH_PROBE_SYMBOLS_HPP
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace uhh_sym {
+
+struct symbol_entry {
+    std::string name;
+    std::uint64_t address = 0;
+    std::uint32_t size = 0;
+    bool is_export = false;
+};
+
+bool init(HANDLE process, std::string &which_dbghelp_or_error);
+void register_module(HANDLE process, const std::wstring &image_path,
+                     std::uint64_t base, std::uint32_t size_of_image);
+bool resolve(HANDLE process, const std::string &module, const std::string &name,
+             std::uint64_t &address);
+std::string symbolize(HANDLE process, std::uint64_t address);
+bool walk_stack(HANDLE process, HANDLE thread, CONTEXT ctx,
+                std::uint64_t pc, std::uint64_t sp, std::uint64_t fp,
+                std::vector<std::uint64_t> &frames, std::size_t max_frames);
+bool enumerate(HANDLE process, const std::string &module, const std::string &mask,
+               std::vector<symbol_entry> &out);
+void cleanup(HANDLE process);
+
+std::string active_dbghelp_path();
+bool has_symbol_server();
+
+} // namespace uhh_sym
+
+#endif

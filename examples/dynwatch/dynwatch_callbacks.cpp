@@ -34,6 +34,7 @@ extern "C" DYNWATCH_EXPORT void dynwatch_on_marker(probe_context *c) { (void)c; 
 
 extern "C" DYNWATCH_EXPORT void dynwatch_on_malloc(probe_context *c) {
     if (get_func_arg(c, 0) != TRACKED_SIZE) return;           // ignore CRT/noise allocations
+    send_log_stack(c, "malloc(0x1337) entry");                // frame 1 must be the caller (main)
     // An inline hook added from inside a callback -- with --entry inline, from inside an
     // inline hook. Installed asynchronously on a fresh agent thread.
     probe_add_symbol(get_session(c), "dynwatch_target.exe!dynwatch_marker", dynwatch_on_marker, PROBE_INLINE);

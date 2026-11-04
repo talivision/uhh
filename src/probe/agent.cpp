@@ -2,6 +2,8 @@
 #include "probe_agent_shared.hpp"
 #include <safetyhook.hpp>
 #include <cstdarg>
+#include <intrin.h>
+#include <immintrin.h>
 
 static HMODULE self_module;
 static HANDLE mapping;
@@ -15,15 +17,49 @@ static AgentState states[PROBE_AGENT_MAX_PROBES];
 
 /* Callback memory helpers fail closed on bad target addresses. They never change
    page protections: executable writes belong to the hook installer, not hits. */
+/* A bad pointer must fail cleanly WITHOUT raising an exception the target could observe
+   (its vectored handlers see first-chance faults before our __except). So the range is
+   validated first. The last validated region is cached per thread, so the common case
+   -- repeated access to the same buffer/stack/image -- costs a bounds check, not a
+   syscall. The __try stays only for a region freed concurrently (a race the target
+   would also have). */
+struct RegionCache { uintptr_t lo = 0, hi = 0; bool writable = false; };
+static thread_local RegionCache t_region;
+
+static bool range_ok(uintptr_t a, size_t n, bool write) {
+    if (!n) return true;
+    if (a + n < a) return false;
+    uintptr_t end = a + n;
+    while (a < end) {
+        if (a >= t_region.lo && a < t_region.hi && (!write || t_region.writable)) {
+            a = t_region.hi; continue;
+        }
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery((void *)a, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
+        DWORD prot = mbi.Protect & 0xFF;
+        if ((mbi.Protect & PAGE_GUARD) || prot == PAGE_NOACCESS || prot == 0) return false;
+        bool w = prot == PAGE_READWRITE || prot == PAGE_WRITECOPY || prot == PAGE_EXECUTE_READWRITE ||
+                 prot == PAGE_EXECUTE_WRITECOPY;
+        bool r = w || prot == PAGE_READONLY || prot == PAGE_EXECUTE_READ;
+        if (!r || (write && !w)) return false;
+        t_region.lo = (uintptr_t)mbi.BaseAddress;
+        t_region.hi = t_region.lo + mbi.RegionSize;
+        t_region.writable = w;
+        a = t_region.hi;
+    }
+    return true;
+}
 static int local_read(void *, uint64_t address, void *buffer, size_t size, size_t *done) {
     *done = 0;
+    if (!range_ok((uintptr_t)address, size, false)) return 0;
     __try { std::memcpy(buffer, (const void *)(uintptr_t)address, size); *done = size; return 1; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { t_region = {}; return 0; }
 }
 static int local_write(void *, uint64_t address, const void *buffer, size_t size, size_t *done) {
     *done = 0;
+    if (!range_ok((uintptr_t)address, size, true)) return 0;
     __try { std::memcpy((void *)(uintptr_t)address, buffer, size); *done = size; return 1; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { t_region = {}; return 0; }
 }
 static const probe_ops local_ops{local_read, local_write};
 
@@ -50,7 +86,12 @@ extern "C" uint64_t get_reg(probe_context *c, enum probe_register reg) {
 }
 extern "C" int set_reg(probe_context *c, enum probe_register reg, uint64_t value) {
     uint64_t *slot = register_slot(c, reg); if (!slot) return 0;
-    *slot = value; return 1;
+    if (*slot != value) {
+        *slot = value;
+        auto *state = static_cast<AgentState *>(c->controller);
+        if (state && state->shared) InterlockedIncrement64(&state->shared->overrides);   // same metric as controller
+    }
+    return 1;
 }
 extern "C" int get_mem(probe_context *c, uint64_t address, void *buffer, size_t size) {
     if (!c || !c->ops || !c->ops->read || (!buffer && size)) return 0;
@@ -81,6 +122,21 @@ extern "C" uint64_t get_func_arg(probe_context *c, size_t index) {
 #endif
 }
 
+#if !defined(_WIN64)
+// True when addr follows a call instruction: E8 rel32, or FF /2 (call r/m32) in its
+// 2/3/6/7-byte forms. Caller holds an SEH guard (addr may be unmapped).
+static bool looks_like_return(uint32_t addr) {
+    const unsigned char *p = (const unsigned char *)(uintptr_t)addr;
+    if (p[-5] == 0xE8) return true;
+    if (p[-2] == 0xFF && ((p[-1] >> 3) & 7) == 2 && (p[-1] >> 6) == 3) return true;           // call reg
+    if (p[-2] == 0xFF && ((p[-1] >> 3) & 7) == 2 && (p[-1] >> 6) == 0 && (p[-1] & 7) != 4 && (p[-1] & 7) != 5) return true;
+    if (p[-3] == 0xFF && ((p[-2] >> 3) & 7) == 2 && (p[-2] >> 6) == 1) return true;            // call [reg+disp8]
+    if (p[-6] == 0xFF && ((p[-5] >> 3) & 7) == 2 && ((p[-5] >> 6) == 2 || (p[-5] & 0xC7) == 5)) return true; // disp32 / [abs]
+    if (p[-7] == 0xFF && ((p[-6] >> 3) & 7) == 2 && (p[-6] >> 6) == 2 && (p[-6] & 7) == 4) return true;      // SIB+disp32
+    return false;
+}
+#endif
+
 // In-process stack snapshot from the HOOKED register image (not the agent's own frames):
 // x64 unwinds with the image's .pdata (RtlVirtualUnwind); x86 follows the EBP chain.
 static uint32_t capture_stack(probe_context *c, uint64_t *frames, uint32_t cap) {
@@ -109,6 +165,13 @@ static uint32_t capture_stack(probe_context *c, uint64_t *frames, uint32_t cap) 
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 #else
     __try {
+        // At a function's first instructions EBP is still the CALLER's frame, so the EBP
+        // chain would skip the immediate caller. If [esp] is a genuine return address
+        // (the bytes before it encode a call), record it first. Mid-function, [esp] is
+        // usually a local that fails this test, and a duplicate of [ebp+4] is skipped.
+        uint32_t top = *(uint32_t *)(uintptr_t)c->regs.rsp;
+        uint32_t caller_ret = c->regs.rbp ? *(uint32_t *)(uintptr_t)(c->regs.rbp + 4) : 0;
+        if (n < cap && top && top != caller_ret && looks_like_return(top)) frames[n++] = top;
         uint32_t ebp = (uint32_t)c->regs.rbp;
         while (n < cap && ebp) {
             uint32_t next = *(uint32_t *)(uintptr_t)ebp, ret = *(uint32_t *)(uintptr_t)(ebp + 4);
@@ -138,7 +201,7 @@ static void agent_log(probe_context *c, bool stack, const char *format, va_list 
     auto *sh = state->shared;
     LONG64 pos = sh->log_head;
     probe_agent_log *rec = nullptr;
-    ULONGLONG full_since = 0;
+    ULONGLONG full_since = 0; LONG64 seen_beat = 0;
     for (;;) {
         rec = &sh->logs[(uint64_t)pos % PROBE_AGENT_LOG_CAP];
         LONG64 diff = rec->seq - pos;
@@ -147,8 +210,11 @@ static void agent_log(probe_context *c, bool stack, const char *format, va_list 
             pos = sh->log_head;
         } else if (diff < 0) {
             // Full: the controller's drainer is behind. Wait for a slot (backpressure)
-            // rather than lose the record; only if the consumer is gone for 2 s, drop.
-            if (!full_since) full_since = GetTickCount64();
+            // rather than lose the record. Give up only if the drainer's heartbeat has
+            // not moved for 2 s -- wall time alone is wrong because the debugger may stop
+            // this whole process for a while; the heartbeat keeps going in the controller.
+            LONG64 beat = sh->drain_beat;
+            if (!full_since || beat != seen_beat) { full_since = GetTickCount64(); seen_beat = beat; }
             else if (GetTickCount64() - full_since > 2000) { InterlockedIncrement(&sh->log_dropped); return; }
             SwitchToThread();
             pos = sh->log_head;
@@ -291,6 +357,63 @@ extern "C" int probe_add_symbol(probe_session *s, const char *symbol, probe_call
     return forward(s, PROBE_IPC_ADD_SYMBOL, 0, symbol, cb, flags);
 }
 
+static volatile LONG g_stopping;
+static struct alignas(64) { volatile LONG value; } g_inflight[PROBE_AGENT_STRIPES];
+static bool any_inflight() {
+    for (auto &x : g_inflight) if (x.value) return true;
+    return false;
+}
+
+// XSAVE support, probed once: mask = XCR0 restricted to x87|SSE|AVX|AVX-512 components.
+static struct XState { bool ok = false, compact = false, xinuse = false; uint64_t mask = 0; uint32_t size = 0; } g_xs = [] {
+    XState x;
+    int r[4];
+    __cpuid(r, 1);
+    if (!(r[2] & (1 << 27))) return x;                     // OSXSAVE
+    x.mask = _xgetbv(0) & 0xE7ull;
+    __cpuidex(r, 0xD, 0); x.size = (uint32_t)r[1];
+    __cpuidex(r, 0xD, 1); x.compact = (r[0] & 2) != 0; x.xinuse = (r[0] & 4) != 0;   // XGETBV(1)
+    x.ok = x.size && x.size <= 4096;
+    return x;
+}();
+
+static bool xstate_save(unsigned char *area) {
+    if (!g_xs.ok) return false;
+    std::memset(area + 512, 0, 64);                        // XSAVE header must start clean
+#if defined(_WIN64)
+    if (g_xs.compact) _xsavec64(area, g_xs.mask); else _xsave64(area, g_xs.mask);
+#else
+    if (g_xs.compact) _xsavec(area, g_xs.mask); else _xsave(area, g_xs.mask);
+#endif
+    return true;
+}
+static void xstate_restore(unsigned char *area) {
+#if defined(_WIN64)
+    _xrstor64(area, g_xs.mask);
+#else
+    _xrstor(area, g_xs.mask);
+#endif
+}
+
+static bool xstate_save(unsigned char *area);
+static void xstate_restore(unsigned char *area);
+
+static bool run_callback(probe_callback cb, probe_context *c) {
+    __writeeflags(__readeflags() & ~(uintptr_t)0x400);
+    __try { cb(c); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    return true;
+}
+// Kept out of line so the 4 KiB save area (and its stack probe) costs nothing on the
+// common path.
+static __declspec(noinline) bool run_callback_full(probe_callback cb, probe_context *c) {
+    alignas(64) unsigned char area[4096];
+    xstate_save(area);
+    bool ok = run_callback(cb, c);
+    xstate_restore(area);
+    return ok;
+}
+
 static void call_mid(safetyhook::Context &native, uint32_t index) {
     probe_context c{};
     /* SafetyHook's Context is Context64 on x64 and Context32 on x86; fill the same
@@ -312,10 +435,35 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     // the callback under SEH so an access violation (or any exception) inside user code
     // cannot take down the target. On a fault we skip register write-back, leaving the
     // target's registers untouched (the callback behaves as a no-op mutation).
-    InterlockedIncrement64(&shared->requests[index].hits);
-    bool callback_ok = true;
-    __try { callbacks[index](&c); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { callback_ok = false; }
+    uint32_t stripe = (GetCurrentThreadId() >> 2) & (PROBE_AGENT_STRIPES - 1);
+    InterlockedIncrement64(&shared->hit_stripes[index][stripe].value);
+    if (g_stopping) return;                                // being unhooked: pass straight through
+    InterlockedIncrement(&g_inflight[stripe].value);
+    // The mid-hook stub preserves GPRs, flags and XMM0-15 only. The callback (and the CRT
+    // it calls) may touch x87/MXCSR/YMM/ZMM state -- e.g. vzeroupper -- which the target
+    // could be relying on at a mid-function site. Save and restore the full extended state
+    // and give C code the ABI-required DF=0.
+    // What the callback could disturb beyond what the stub preserves (GPRs, flags, XMM):
+    // MXCSR (always; one instruction each way), and the
+    // AVX/AVX-512 state only when the target has it live at this moment -- XGETBV(1)
+    // reports the in-use components, so the expensive XSAVE is paid only by code that is
+    // actually running AVX at the site. DF is cleared for the C ABI.
+    LONG xmode = shared->xstate_mode;            // 0 gated (default), 1 none, 2 full (bench knob)
+    bool full = xmode == 2 || (xmode == 0 && g_xs.xinuse && (_xgetbv(1) & 0xE4ull));
+    bool callback_ok;
+    if (full && g_xs.ok) {
+        callback_ok = run_callback_full(callbacks[index], &c);
+    } else if (xmode == 1) {
+        callback_ok = run_callback(callbacks[index], &c);
+    } else {
+        // MXCSR: a callback's float math can set its sticky exception flags, which the
+        // target could observe (fetestexcept). One instruction each way. (The x87 control
+        // word only changes via explicit _controlfp, which no callback path performs.)
+        unsigned int mxcsr = _mm_getcsr();
+        callback_ok = run_callback(callbacks[index], &c);
+        _mm_setcsr(mxcsr);
+    }
+    InterlockedDecrement(&g_inflight[stripe].value);
     if (!callback_ok) return;
 #if defined(_WIN64)
 #define COPY(a,b) native.a = c.regs.a;
@@ -400,7 +548,11 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
     return 0;
 }
 
+// Unhook without pulling code out from under a thread: stop new callbacks, wait for the
+// ones in flight to finish (bounded), then remove the hooks.
 extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_stop(void *) {
+    InterlockedExchange(&g_stopping, 1);
+    for (int i = 0; i < 2000 && any_inflight(); ++i) Sleep(1);
     for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i) hooks[i].reset();
     return 0;
 }
