@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -15,7 +16,35 @@ static std::string sibling_app() {
     return result.substr(0, slash == std::string::npos ? 0 : slash + 1) + "probe_app.exe";
 }
 
+// Map a backend name to its flag; returns false on an unknown name. Lets the demo
+// run any probe under any backend, so one binary covers the whole mix matrix and
+// the high-volume breakpoint vs inline comparison.
+static bool parse_backend(const char *name, uint32_t &out) {
+    if (!std::strcmp(name, "breakpoint") || !std::strcmp(name, "bp")) { out = PROBE_BREAKPOINT; return true; }
+    if (!std::strcmp(name, "inline")) { out = PROBE_INLINE; return true; }
+    return false;
+}
+
 int main(int argc, char **argv) {
+    // Pull the backend selectors out of argv first (consumed here, not passed to
+    // probe_app); everything else keeps its original position for the logic below.
+    uint32_t flag_backend = PROBE_BREAKPOINT, read_backend = PROBE_INLINE;
+    std::vector<char *> kept; kept.reserve(argc);
+    for (int i = 0; i < argc; ++i) {
+        const char *a = argv[i];
+        uint32_t *which = !std::strcmp(a, "--flag-backend") ? &flag_backend
+                        : !std::strcmp(a, "--read-backend") ? &read_backend : nullptr;
+        if (which) {
+            if (i + 1 >= argc || !parse_backend(argv[i + 1], *which)) {
+                std::fprintf(stderr, "gated_config: --flag-backend/--read-backend need breakpoint|inline\n");
+                return 2;
+            }
+            ++i; continue;   // skip the selector and its value
+        }
+        kept.push_back(argv[i]);
+    }
+    argv = kept.data(); argc = (int)kept.size();
+
     const char *env_flag = std::getenv("PROBE_FLAG_RVA");
     const char *env_read = std::getenv("PROBE_READ_RVA");
     bool any_env = (env_flag && *env_flag) || (env_read && *env_read);
@@ -48,8 +77,8 @@ int main(int argc, char **argv) {
     probe_session *s = probe_session_create();
     if (!s) return 1;
     read_log_config cfg{0x7265616473697465ULL};
-    int ok = probe_add(s, flag_text, enable_reads, PROBE_BREAKPOINT) &&
-             probe_add_cfg(s, read_text, log_read, PROBE_INLINE, &cfg, sizeof(cfg)) &&
+    int ok = probe_add(s, flag_text, enable_reads, flag_backend) &&
+             probe_add_cfg(s, read_text, log_read, read_backend, &cfg, sizeof(cfg)) &&
              probe_launch(s, child_args.data()) && probe_run(s) && probe_wait_for_exit(s);
     ok = ok && gated_override_count() == 1;
     probe_report(s, stdout);
