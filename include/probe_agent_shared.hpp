@@ -10,7 +10,7 @@
 #include <cstdio>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 3;
+constexpr uint32_t PROBE_AGENT_VERSION = 4;
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 32;
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
 constexpr uint32_t PROBE_AGENT_CONFIG_CAP = 256;
@@ -57,7 +57,8 @@ struct probe_agent_log {
    controller (the debugger) gets it first-chance, services it while the thread is stopped,
    writes result, and continues -- a synchronous call, no polling, no extra thread. */
 constexpr DWORD PROBE_IPC_CODE = 0xE0554848u;   /* 'UHH' */
-enum probe_ipc_op : uint32_t { PROBE_IPC_ADD_ADDRESS = 1, PROBE_IPC_WATCH = 2, PROBE_IPC_ADD_SYMBOL = 3 };
+enum probe_ipc_op : uint32_t { PROBE_IPC_ADD_ADDRESS = 1, PROBE_IPC_WATCH = 2, PROBE_IPC_ADD_SYMBOL = 3,
+                               PROBE_IPC_INSTALL_DONE = 4 };   /* agent service: an install round finished */
 struct probe_ipc_request {
     uint32_t op, flags, origin_site;
     int32_t result;
@@ -74,11 +75,17 @@ struct probe_agent_shared {
     volatile LONG64 log_head;      /* next position producers claim */
     volatile LONG64 log_tail;      /* next position the controller consumes */
     volatile LONG log_dropped;
-    LONG log_pad;
+    volatile LONG service_ready;   /* agent's persistent install thread is waiting on the svc event */
     probe_agent_request requests[PROBE_AGENT_MAX_PROBES];
     probe_agent_log logs[PROBE_AGENT_LOG_CAP];
 };
 
 inline void probe_agent_mapping_name(DWORD pid, wchar_t (&name)[64]) {
     _snwprintf_s(name, _countof(name), _TRUNCATE, L"Local\\probe_api_%lu", pid);
+}
+/* Auto-reset event the controller signals to ask the agent's service thread for an
+   install round. A persistent thread is used because a NEW thread cannot start while
+   another thread holds the loader lock (e.g. one stopped at a LOAD_DLL event). */
+inline void probe_agent_service_name(DWORD pid, wchar_t (&name)[64]) {
+    _snwprintf_s(name, _countof(name), _TRUNCATE, L"Local\\probe_api_svc_%lu", pid);
 }

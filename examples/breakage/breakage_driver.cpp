@@ -30,7 +30,7 @@ struct Case {
     Expected outcome;
     std::vector<Registration> registrations;
 };
-struct RunResult { bool install_ok = false, target_ok = false; uint64_t hits = 0; };
+struct RunResult { bool install_ok = false, target_ok = false; uint64_t hits = 0; int prehook_reports = 0; };
 
 static std::string sibling_target() {
     char path[MAX_PATH]; DWORD n = GetModuleFileNameA(nullptr, path, MAX_PATH);
@@ -75,8 +75,9 @@ static RunResult run_case(const Case &c, const uint64_t rvas[SITE_COUNT]) {
     size_t active = 0, probes = 0;
     if (report) {
         probe_report(session, report); std::rewind(report);
-        char line[2048];
+        char line[16384];
         while (std::fgets(line, sizeof(line), report)) {
+            if (std::strstr(line, "\"kind\":\"prehook\"")) { ++result.prehook_reports; continue; }
             if (!std::strstr(line, "\"kind\":\"probe\"")) continue;
             ++probes;
             if (std::strstr(line, "\"active\":true")) ++active;
@@ -118,8 +119,8 @@ static const char *verdict(const Case &c, const RunResult &r) {
 static void print_result(const Case &c, const RunResult &r) {
     std::fputs("{\"site\":", stdout); json_string(c.site);
     std::fputs(",\"backend\":", stdout); json_string(c.backend);
-    std::fprintf(stdout, ",\"install_ok\":%s,\"hits\":%llu,\"expected\":",
-                 r.install_ok ? "true" : "false", (unsigned long long)r.hits);
+    std::fprintf(stdout, ",\"install_ok\":%s,\"hits\":%llu,\"prehook_reports\":%d,\"expected\":",
+                 r.install_ok ? "true" : "false", (unsigned long long)r.hits, r.prehook_reports);
     json_string(c.expected); std::fputs(",\"verdict\":", stdout); json_string(verdict(c, r));
     std::fputs("}\n", stdout); std::fflush(stdout);
 }
@@ -155,7 +156,14 @@ int main(int argc, char **argv) {
          "inline install rejection/no hit at the two-byte region", PROBE_INLINE, MUST_BREAK,
          {{SHORT_SITE, breakage_hit_a}}},
         {"prehook_inline", "PrehookSite", "prehook", "inline",
-         "one hit, then relocated foreign E9 -> replacement -> foreign trampoline", PROBE_INLINE, PREHOOK_CHAIN,
+         "one hit, then relocated foreign E9 -> replacement -> foreign trampoline (opted in)",
+         PROBE_INLINE | PROBE_ALLOW_PREHOOKED, PREHOOK_CHAIN,
+         {{PREHOOK_SITE, breakage_hit_a}}},
+        {"prehook_inline_default", "PrehookSite", "prehook", "inline-default",
+         "refused with a pre-hook report (live vs disk bytes, disassembly, suggestions)", PROBE_INLINE, MUST_BREAK,
+         {{PREHOOK_SITE, breakage_hit_a}}},
+        {"prehook_inline_fallback", "PrehookSite", "prehook", "inline-fallback",
+         "pre-hook detected -> moved to a debug register; one hit, clean exit", PROBE_INLINE | PROBE_FALLBACK_HW, MUST_PASS,
          {{PREHOOK_SITE, breakage_hit_a}}},
         {"unreloc_inline", "UnrelocSite", "unreloc", "inline",
          "naive rel8 copy misbranches; aware relocation may preserve one hit and exit", PROBE_INLINE, MAY_RELOCATE,

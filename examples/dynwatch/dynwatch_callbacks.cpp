@@ -37,6 +37,11 @@ extern "C" DYNWATCH_EXPORT void dynwatch_on_malloc(probe_context *c) {
     // An inline hook added from inside a callback -- with --entry inline, from inside an
     // inline hook. Installed asynchronously on a fresh agent thread.
     probe_add_symbol(get_session(c), "dynwatch_target.exe!dynwatch_marker", dynwatch_on_marker, PROBE_INLINE);
+    // Run a target function from inside the callback (any backend): expect 91.
+    uint64_t sum = 0;
+    int called = call_func(c, "dynwatch_target.exe!dynwatch_sum6", &sum, 6,
+                           (uint64_t)1, (uint64_t)2, (uint64_t)3, (uint64_t)4, (uint64_t)5, (uint64_t)6);
+    send_log(c, "call_func sum6=%llu ok=%d", (unsigned long long)sum, called);
     uint64_t ret = 0;
     if (!get_mem(c, get_reg(c, PROBE_REG_SP), &ret, sizeof(void *))) return;   // return address
     probe_add_address(get_session(c), ret, dynwatch_on_return, PROBE_BREAKPOINT | PROBE_ONCE);

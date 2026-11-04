@@ -74,8 +74,9 @@ add_library(probe_api_agent SHARED
     examples/gated_config/callbacks.cpp
     examples/breakage/breakage_driver.cpp
     examples/frida_parity/frida_parity.cpp
-    examples/dynwatch/dynwatch_callbacks.cpp)
-target_include_directories(probe_api_agent PRIVATE include examples/gated_config examples/dynwatch)
+    examples/dynwatch/dynwatch_callbacks.cpp
+    examples/trace/trace_callback.cpp)
+target_include_directories(probe_api_agent PRIVATE include examples/gated_config examples/dynwatch examples/trace)
 target_link_libraries(probe_api_agent PRIVATE safetyhook)
 target_compile_definitions(probe_api_agent PRIVATE BREAKAGE_AGENT_ONLY FRIDA_PARITY_AGENT_ONLY)
 # Undecorated names for the __stdcall agent entries (x86 would otherwise export
@@ -129,7 +130,13 @@ target_include_directories(dynwatch_driver PRIVATE include examples/dynwatch)
 target_link_libraries(dynwatch_driver PRIVATE probe_api)
 add_dependencies(dynwatch_driver dynwatch_target probe_api_agent)
 
-foreach(t probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
+# --- uhh_trace: trace any export of any program (the general CLI) ---------------------
+add_executable(uhh_trace examples/trace/uhh_trace.cpp examples/trace/trace_callback.cpp)
+target_include_directories(uhh_trace PRIVATE include examples/trace)
+target_link_libraries(uhh_trace PRIVATE probe_api)
+add_dependencies(uhh_trace probe_api_agent)
+
+foreach(t uhh_trace probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
     target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 endforeach()

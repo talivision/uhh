@@ -30,11 +30,12 @@ int main(int argc, char **argv) {
     // Pull the backend selectors out of argv first (consumed here, not passed to
     // probe_app); everything else keeps its original position for the logic below.
     uint32_t flag_backend = PROBE_BREAKPOINT, read_backend = PROBE_INLINE;
-    uint32_t log_reads = 1;
+    uint32_t log_reads = 1, filter = 0;
     std::vector<char *> kept; kept.reserve(argc);
     for (int i = 0; i < argc; ++i) {
         const char *a = argv[i];
         if (!std::strcmp(a, "--no-log")) { log_reads = 0; continue; }   // count hits, emit no logs
+        if (!std::strcmp(a, "--log-selected")) { filter = 1; continue; } // log selected/in-range reads only
         uint32_t *which = !std::strcmp(a, "--flag-backend") ? &flag_backend
                         : !std::strcmp(a, "--read-backend") ? &read_backend : nullptr;
         if (which) {
@@ -79,13 +80,16 @@ int main(int argc, char **argv) {
 
     probe_session *s = probe_session_create();
     if (!s) return 1;
-    read_log_config cfg{0x7265616473697465ULL, log_reads, 0};
+    read_log_config cfg{0x7265616473697465ULL, log_reads, filter};
     // Let an inline probe fall back to the hardware backend if it would otherwise race
     // the async install (the config flag site lives in a late-loaded DLL).
     uint32_t flag_flags = flag_backend | (flag_backend == PROBE_INLINE ? PROBE_FALLBACK_HW : 0u);
     uint32_t read_flags = read_backend | (read_backend == PROBE_INLINE ? PROBE_FALLBACK_HW : 0u);
     int ok = probe_add_symbol(s, flag_text, enable_reads, flag_flags) &&
              probe_add_symbol_cfg(s, read_text, log_read, read_flags, &cfg, sizeof(cfg)) &&
+             // The filter's values are learned from probe_app's own announcement printf
+             // (same backend as the read probe so both callbacks share their state).
+             (!filter || probe_add_symbol(s, "ucrtbase.dll!__stdio_common_vfprintf", learn_target, read_flags)) &&
              probe_launch(s, child_args.data()) && probe_run(s) && probe_wait_for_exit(s);
     ok = ok && gated_override_count() == 1;
     probe_report(s, stdout);

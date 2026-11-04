@@ -138,6 +138,7 @@ static void agent_log(probe_context *c, bool stack, const char *format, va_list 
     auto *sh = state->shared;
     LONG64 pos = sh->log_head;
     probe_agent_log *rec = nullptr;
+    ULONGLONG full_since = 0;
     for (;;) {
         rec = &sh->logs[(uint64_t)pos % PROBE_AGENT_LOG_CAP];
         LONG64 diff = rec->seq - pos;
@@ -145,7 +146,12 @@ static void agent_log(probe_context *c, bool stack, const char *format, va_list 
             if (InterlockedCompareExchange64(&sh->log_head, pos + 1, pos) == pos) break;
             pos = sh->log_head;
         } else if (diff < 0) {
-            InterlockedIncrement(&sh->log_dropped); return;      // full: controller is behind
+            // Full: the controller's drainer is behind. Wait for a slot (backpressure)
+            // rather than lose the record; only if the consumer is gone for 2 s, drop.
+            if (!full_since) full_since = GetTickCount64();
+            else if (GetTickCount64() - full_since > 2000) { InterlockedIncrement(&sh->log_dropped); return; }
+            SwitchToThread();
+            pos = sh->log_head;
         } else {
             pos = sh->log_head;
         }
@@ -165,6 +171,78 @@ extern "C" void send_log_stack(probe_context *c, const char *format, ...) {
     va_list ap; va_start(ap, format); agent_log(c, true, format, ap); va_end(ap);
 }
 extern "C" const void *get_config(probe_context *c) { return c ? c->config : nullptr; }
+
+// call_func inside the target: resolve and call directly on this (the hit) thread.
+static uint64_t agent_resolve(const char *symbol) {
+    if (!symbol || !*symbol) return 0;
+    if (symbol[0] == '0' && (symbol[1] == 'x' || symbol[1] == 'X')) return _strtoui64(symbol + 2, nullptr, 16);
+    char mod[MAX_PATH]; const char *bang = strchr(symbol, '!'), *plus = strrchr(symbol, '+');
+    const char *split = bang ? bang : plus;
+    if (!split || (size_t)(split - symbol) >= sizeof(mod)) return 0;
+    memcpy(mod, symbol, split - symbol); mod[split - symbol] = 0;
+    HMODULE m = GetModuleHandleA(mod);
+    if (!m) return 0;
+    if (!bang) return (uint64_t)(uintptr_t)m + _strtoui64(split + 1, nullptr, 16);
+    char name[256]; const char *end = plus && plus > bang ? plus : bang + strlen(bang);
+    if ((size_t)(end - bang - 1) >= sizeof(name)) return 0;
+    memcpy(name, bang + 1, end - bang - 1); name[end - bang - 1] = 0;
+    FARPROC f = GetProcAddress(m, name);
+    if (!f) return 0;
+    uint64_t off = (plus && plus > bang) ? _strtoui64(plus + 1, nullptr, 16) : 0;
+    return (uint64_t)(uintptr_t)f + off;
+}
+
+#if defined(_WIN64)
+using fn8 = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+static bool call_raw(uint64_t fn, const uint64_t *a, uint64_t *ret) {
+    __try { uint64_t r = reinterpret_cast<fn8>(fn)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]); if (ret) *ret = r; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    return true;
+}
+#else
+// Push the args, call, and restore ESP ourselves: correct for stdcall AND cdecl callees.
+static bool call_raw(uint64_t fn, const uint64_t *a, uint64_t *ret, int nargs) {
+    uint32_t args32[8]; for (int i = 0; i < 8; ++i) args32[i] = (uint32_t)a[i];
+    uint32_t target = (uint32_t)fn, lo = 0, hi = 0;
+    __try {
+        __asm {
+            mov ebx, esp
+            mov ecx, nargs
+            lea esi, args32
+        push_loop:
+            test ecx, ecx
+            jz do_call
+            dec ecx
+            push dword ptr [esi + ecx*4]
+            jmp push_loop
+        do_call:
+            call dword ptr [target]
+            mov esp, ebx
+            mov lo, eax
+            mov hi, edx
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    if (ret) *ret = ((uint64_t)hi << 32) | lo;
+    return true;
+}
+#endif
+
+extern "C" int call_func(probe_context *c, const char *symbol, uint64_t *ret, int nargs, ...) {
+    (void)c;
+    if (nargs < 0 || nargs > 8) return 0;
+    uint64_t fn = agent_resolve(symbol);
+    if (!fn) return 0;
+    uint64_t a[8] = {0};
+    va_list ap; va_start(ap, nargs);
+    for (int i = 0; i < nargs; ++i) a[i] = va_arg(ap, uint64_t);
+    va_end(ap);
+#if defined(_WIN64)
+    return call_raw(fn, a, ret) ? 1 : 0;
+#else
+    return call_raw(fn, a, ret, nargs) ? 1 : 0;
+#endif
+}
+
 
 /* ---- Control plane from an inline callback: forwarded to the controller. ----
    get_session(c) returns a per-site proxy (so the controller knows which probe's
@@ -263,18 +341,12 @@ static mid_callback mid_callbacks[PROBE_AGENT_MAX_PROBES] = {
     mid_16,mid_17,mid_18,mid_19,mid_20,mid_21,mid_22,mid_23,mid_24,mid_25,mid_26,mid_27,mid_28,mid_29,mid_30,mid_31
 };
 
-extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
-    if (!shared) {
-        wchar_t name[64]; probe_agent_mapping_name(GetCurrentProcessId(), name);
-        mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, name);
-        if (!mapping) return 1;
-        shared = static_cast<probe_agent_shared *>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(*shared)));
-        if (!shared || shared->magic != PROBE_AGENT_MAGIC || shared->version != PROBE_AGENT_VERSION) return 2;
-    }
-    if (shared->request_count > PROBE_AGENT_MAX_PROBES) return 3;
-    for (uint32_t i = 0; i < shared->request_count; ++i) {
+static void install_pending() {
+    uint32_t count = shared->request_count;
+    if (count > PROBE_AGENT_MAX_PROBES) count = PROBE_AGENT_MAX_PROBES;
+    for (uint32_t i = 0; i < count; ++i) {
         auto &request = shared->requests[i];
-        if (!request.site || request.status == PROBE_AGENT_INSTALLED) continue;
+        if (!request.site || request.status != PROBE_AGENT_PENDING) continue;
         if (request.config_len > PROBE_AGENT_CONFIG_CAP || !request.callback[0]) {
             InterlockedExchange(&request.status, PROBE_AGENT_BAD_REQUEST); continue;
         }
@@ -287,6 +359,43 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
         sites[i] = request.site; states[i] = {shared, i}; proxies[i].site = i;
         hooks[i] = safetyhook::create_mid((void *)(uintptr_t)request.site, mid_callbacks[i]);
         InterlockedExchange(&request.status, hooks[i] ? PROBE_AGENT_INSTALLED : PROBE_AGENT_HOOK_FAILED);
+    }
+}
+
+// Tell the controller an install round finished (synchronous: the controller services
+// it while this thread is stopped, then releases any threads it held for the install).
+static bool notify_installed() {
+    probe_ipc_request req{};
+    req.op = PROBE_IPC_INSTALL_DONE; req.origin_site = UINT32_MAX;
+    return raise_ipc(&req);
+}
+
+static HANDLE service_event;
+static DWORD WINAPI service_main(void *) {
+    for (;;) {
+        if (WaitForSingleObject(service_event, INFINITE) != WAIT_OBJECT_0) return 1;
+        install_pending();
+        notify_installed();
+    }
+}
+
+extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
+    if (!shared) {
+        wchar_t name[64]; probe_agent_mapping_name(GetCurrentProcessId(), name);
+        mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, name);
+        if (!mapping) return 1;
+        shared = static_cast<probe_agent_shared *>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(*shared)));
+        if (!shared || shared->magic != PROBE_AGENT_MAGIC || shared->version != PROBE_AGENT_VERSION) return 2;
+    }
+    if (shared->request_count > PROBE_AGENT_MAX_PROBES) return 3;
+    install_pending();
+    if (!service_event) {   // first init: start the persistent install thread
+        wchar_t name[64]; probe_agent_service_name(GetCurrentProcessId(), name);
+        service_event = OpenEventW(SYNCHRONIZE, FALSE, name);
+        if (service_event) {
+            HANDLE t = CreateThread(nullptr, 0, service_main, nullptr, 0, nullptr);
+            if (t) { CloseHandle(t); InterlockedExchange(&shared->service_ready, 1); }
+        }
     }
     return 0;
 }

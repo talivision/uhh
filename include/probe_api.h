@@ -69,6 +69,17 @@ int probe_add_address(probe_session *, uint64_t address, probe_callback, uint32_
    or PROBE_WATCH_RW, optionally | PROBE_ONCE. Max 4 hardware probes in total. */
 int probe_watch(probe_session *, uint64_t address, probe_callback, uint32_t flags);
 int probe_launch(probe_session *, char *const argv[]);
+/* Attach to an already-running process instead of launching one. Probes resolve against
+   the modules already loaded (and any loaded later). probe_run returns when the target
+   exits; probe_close on a still-running target DETACHES (restores breakpoints, clears
+   debug registers, removes inline hooks) instead of terminating it. Inline hooks install
+   asynchronously after attach (the process is already running). */
+int probe_attach(probe_session *, uint32_t pid);
+/* Wait (up to timeout_ms, 0 = forever) for a NEW process whose image name matches
+   (e.g. "probe_app.exe"; processes already running are ignored) and attach to it as
+   early as possible. Polls about every millisecond, so the target may run for a few
+   milliseconds before the attach lands: instrument what it does after start-up. */
+int probe_attach_new(probe_session *, const char *image_name, uint32_t timeout_ms);
 int probe_run(probe_session *);
 int probe_wait_for_exit(probe_session *);
 void probe_report(probe_session *, FILE *);
@@ -86,6 +97,15 @@ void send_log(probe_context *, const char *format, ...);
    file:line when PDBs are present) is resolved later, when the log is reported. */
 void send_log_stack(probe_context *, const char *format, ...);
 const void *get_config(probe_context *);
+/* Call a function IN THE TARGET from a callback, on the thread that hit the probe:
+   symbol is "module!Export[+0xOFF]", "module+0xRVA" or "0xADDRESS"; up to 8 integer/
+   pointer args (Windows x64 ABI / x86 stack args; stdcall or cdecl). *ret receives the
+   return register. Returns 1 on success. Inline: a direct call. Breakpoint/hw: the
+   debugger runs the call on the stopped thread and restores its context exactly (other
+   threads keep running; probes hit inside the callee do not re-enter callbacks) -- tens
+   of microseconds, so cache results. The callee runs with whatever locks the hit thread
+   holds: avoid functions that need them (e.g. the allocator from inside a malloc hook). */
+int call_func(probe_context *, const char *symbol, uint64_t *ret, int nargs, ...);
 /* The session this callback belongs to, for control-plane calls from a callback. In a
    breakpoint/hardware callback it is the real session; in an inline callback (running
    inside the target) it is an agent-side proxy whose control calls are forwarded to the

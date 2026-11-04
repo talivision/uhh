@@ -101,12 +101,12 @@ def check_gated_off():
         record("gated-off", False, repr(e))
 
 
-def gated(flag_bk, read_bk, threads, reads, timeout=200, log=True):
+def gated(flag_bk, read_bk, threads, reads, timeout=200, log=True, extra=()):
     g = exe("gated_config.exe")
     flag = rvas("configparse.map", "ParsedFlagSite")["ParsedFlagSite"]
     read = rvas("probe_app.map", "ReadSite")["ReadSite"]
     return run([g, flag, read, "--flag-backend", flag_bk, "--read-backend", read_bk,
-                *([] if log else ["--no-log"]),
+                *([] if log else ["--no-log"]), *extra,
                 "--no-wait", "--threads", threads, "--reads", reads], timeout=timeout)
 
 
@@ -149,6 +149,26 @@ def check_multithread_exact(threads, reads):
                   logs == total and dropped == 0)
             record(name, ok, f"hits={rd.get('hits')} reads={a.get('successful_reads')} logs={logs} "
                              f"dropped={dropped} want={total}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+def check_filtered_logging(threads, reads):
+    """The original scenario with a runtime-learned filter: log only reads of the
+    SELECTED child's handle inside the selected range. probe_app's request rotation makes
+    that exactly half the reads; every read is still counted."""
+    if not exe("gated_config.exe"):
+        return skip("filtered-log", "gated_config.exe missing")
+    total = int(threads) * int(reads)
+    for read_bk in ("breakpoint", "hw", "inline"):
+        name = f"filtered-log-{read_bk}"
+        try:
+            _, o = gated("breakpoint", read_bk, threads, reads, timeout=300, extra=("--log-selected",))
+            rd = next((x for x in probes(o) if "probe_app.exe" in x.get("location", "")), {})
+            logs, dropped = read_logs(o)
+            learned = [x for x in o if x.get("kind") == "probe_log" and str(x.get("message", "")).startswith("learned")]
+            ok = rd.get("hits") == total and logs == total // 2 and dropped == 0 and len(learned) == 1
+            record(name, ok, f"hits={rd.get('hits')} logged={logs} want_logged={total // 2} learned={len(learned)}")
         except Exception as e:
             record(name, False, repr(e))
 
@@ -229,6 +249,15 @@ def check_breakage():
         controls = [row for row in o if row.get("backend") in ("breakpoint", "hw")]
         ok = len(controls) == 10 and all(row.get("verdict") == "pass" for row in controls) and not bad
         record("breakage-controls", ok, f"controls={len(controls)}/10 bad={bad}")
+        # Pre-hooked site handling (the fixture's TLS callback installs a real foreign E9):
+        # default inline is refused WITH a report; fallback moves to hw and hits once.
+        rows = {row.get("backend"): row for row in o if row.get("site") == "PrehookSite"}
+        dflt, fb = rows.get("inline-default", {}), rows.get("inline-fallback", {})
+        ok2 = (dflt.get("verdict") == "expected_breakage" and dflt.get("prehook_reports", 0) >= 1 and
+               fb.get("verdict") == "pass" and fb.get("prehook_reports", 0) >= 1 and
+               rows.get("breakpoint", {}).get("verdict") == "pass")
+        record("prehook-detect", ok2, f"default={dflt.get('verdict')}/reports={dflt.get('prehook_reports')} "
+                                      f"fallback={fb.get('verdict')}/reports={fb.get('prehook_reports')}")
     except Exception as e:
         record("breakage-controls", False, repr(e))
 
@@ -282,16 +311,56 @@ def check_dynwatch(writes=100):
             stacks = [x.get("stack") for x in o if x.get("kind") == "probe_log" and x.get("stack")]
             sym_ok = bool(stacks) and len(stacks[0]) >= 3 and stacks[0][0].startswith("dynwatch_target")
             marker = next((p for p in probes(o) if p.get("location", "").endswith("!dynwatch_marker")), {})
+            calls = [x.get("message") for x in o if x.get("kind") == "probe_log" and "call_func" in str(x.get("message"))]
             tgt = next((x for x in o if x.get("kind") == "target"), {})
             ok = (res.get("returns") == 1 and res.get("arms") == 1 and res.get("watch_hits") == want and
                   rep.get("error") is None and len(once) == 1 and once[0].get("active") is False and
                   once[0].get("hits") == 1 and sym_ok and
-                  marker.get("backend") == "inline" and marker.get("hits") == 50 and tgt.get("marker_calls") == 50)
+                  marker.get("backend") == "inline" and marker.get("hits") == 50 and tgt.get("marker_calls") == 50 and
+                  calls == ["call_func sum6=91 ok=1"])
             record(name, ok, f"returns={res.get('returns')} arms={res.get('arms')} watch_hits={res.get('watch_hits')} "
                              f"want={want} once_retired={bool(once) and once[0].get('active') is False} "
-                             f"runtime_inline_hits={marker.get('hits')}/50 stack0={(stacks[0][0] if stacks else None)}")
+                             f"runtime_inline_hits={marker.get('hits')}/50 call_func={calls} stack0={(stacks[0][0] if stacks else None)}")
         except Exception as e:
             record(name, False, repr(e))
+
+
+SYS32 = Path(r"C:\Windows\System32")
+
+
+def check_realworld():
+    """Real shipped Windows binaries, real system-DLL exports, via uhh_trace. Each case
+    asserts the logged ARGUMENTS match what the program demonstrably did."""
+    t = exe("uhh_trace.exe")
+    if not t:
+        return skip("realworld", "uhh_trace.exe missing")
+    cases = [
+        # (name, probes, argv, regex that must appear in some probe_log message)
+        ("curl-file-open", ["KernelBase.dll!CreateFileW:Wxx"],
+         [SYS32 / "curl.exe", "-s", "-o", "NUL", "file:///C:/Windows/win.ini"], r"CreateFileW\(\".*win\.ini\""),
+        ("curl-connect", ["ws2_32.dll!connect:xSd"],
+         [SYS32 / "curl.exe", "-s", "--connect-timeout", "3", "http://127.0.0.1:9/"], r"connect\(0x[0-9a-f]+, 127\.0\.0\.1:9,"),
+        ("findstr-open", ["KernelBase.dll!CreateFileW:Wxx"],
+         [SYS32 / "findstr.exe", "/c:fonts", r"C:\Windows\win.ini"], r"CreateFileW\(\"C:\\Windows\\win\.ini\""),
+    ]
+    import re
+    for name, specs, argv, pattern in cases:
+        if not Path(argv[0]).exists():
+            skip(f"realworld-{name}", f"{argv[0]} missing"); continue
+        for bk in ("breakpoint", "hw", "inline"):
+            label = f"realworld-{name}-{bk}"
+            try:
+                cmd = [t, "--backend", bk]
+                for sp in specs:
+                    cmd += ["-p", sp]
+                _, o = run(cmd + ["--", *argv], timeout=120)
+                msgs = [x.get("message", "") for x in o if x.get("kind") == "probe_log"]
+                hit = next((m for m in msgs if re.search(pattern, m)), None)
+                rep = report(o)
+                ok = hit is not None and rep.get("error") is None
+                record(label, ok, f"logs={len(msgs)} match={hit[:70] if hit else None} err={rep.get('error')}")
+            except Exception as e:
+                record(label, False, repr(e))
 
 
 def main():
@@ -309,12 +378,14 @@ def main():
     check_mix_matrix(args.threads, args.reads)
     check_multithread_exact(args.threads, args.reads)
     check_log_throughput(args.threads, args.reads)
+    check_filtered_logging(args.threads, args.reads)
     if int(args.volume_reads) > 0:
         check_volume(args.volume_reads)
     check_breakage()
     check_frida_parity()
     check_watchpoint()
     check_dynwatch()
+    check_realworld()
     print("-" * 72)
     failed = 0
     for name, status, detail in RESULTS:
