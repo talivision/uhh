@@ -148,6 +148,16 @@ image across the boundary.
 - Ship: push to GitHub as `usermode-hook-helper` (UHH), PUBLIC repo, short-and-sweet
   README, and several VERIFIED examples of the tool working. Confirm before the push.
 
+## No backward compatibility (4 Nov 2026)
+
+Nothing is public yet, so the final tree is ONE internally-consistent codebase
+on the locked probe_api - no compat shims, no parallel precursor. Before the
+public push, a consolidation pass: drop the PROBE_PUBLIC_API dual include and
+the precursor src/session.cpp; fold its unique value (on-disk hook detection +
+Zydis disasm surfacing) into the probe_api backend; remove or port any first-
+pass code (probe_target/probe_debugger/old bench) that does not serve as a
+verified example on the new API. Keep shims only while actively building.
+
 ## Order
 
 1. `probe_app` + `configparse.dll` + RVA tooling + check script.
