@@ -55,6 +55,7 @@ target_link_options(probe_app PRIVATE "/MAP:$<TARGET_FILE_DIR:probe_app>/probe_a
 #     SafetyHook mid-hooks. Builds for both -A x64 and -A Win32. ----------------
 add_library(probe_api STATIC src/probe/session.cpp)
 target_include_directories(probe_api PUBLIC include)
+target_link_libraries(probe_api PRIVATE Zydis)   # decode probe sites for displaced stepping
 
 add_library(probe_api_agent SHARED
     src/probe/agent.cpp

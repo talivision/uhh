@@ -10,12 +10,21 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <Zydis/Zydis.h>
 
 struct Probe {
     std::string location, module, callback_export;
     uint64_t rva = 0, base = 0, address = 0, hits = 0;
     uint32_t agent_index = UINT32_MAX;
     unsigned char original = 0;
+    // Software-breakpoint displaced stepping: the full original instruction so it can
+    // be executed out-of-line while the INT3 stays armed (no re-arm race, no thread
+    // suspension). displaced_ok is false for control-flow instructions (handled by the
+    // in-place fallback); riprel_disp_off marks a RIP-relative disp32 to retarget.
+    std::vector<unsigned char> orig_insn;
+    uint32_t insn_len = 0;
+    bool displaced_ok = false;
+    int riprel_disp_off = -1;
     probe_callback callback = nullptr;
     uint32_t flags = 0;
     std::vector<unsigned char> config;
@@ -25,6 +34,14 @@ struct Probe {
 struct CallbackState {
     probe_session *session;
     Probe *probe;
+};
+
+// A thread mid-single-step over a software breakpoint. displaced == true means the
+// INT3 was left armed and the instruction is running out-of-line (land at address +
+// insn_len); false means the byte was lifted in place and must be re-armed.
+struct StepState {
+    Probe *probe = nullptr;
+    bool displaced = false;
 };
 
 struct probe_session {
@@ -44,6 +61,9 @@ struct probe_session {
     DWORD remote_tid = 0;
     enum RemoteWork { REMOTE_NONE, REMOTE_LOAD_AGENT, REMOTE_INIT_AGENT } remote_work = REMOTE_NONE;
     std::wstring agent_path;
+    // One out-of-line step buffer per thread (lazily allocated in the target), so
+    // concurrent threads can displaced-step independently without contending.
+    std::unordered_map<DWORD, uint64_t> scratch;
     bool launched = false, ran = false, exited = false, gate_sent = false;
 };
 
@@ -164,22 +184,62 @@ static std::string quote_arg(const char *arg) {
     out.append(slashes * 2, '\\'); out += '\"'; return out;
 }
 
+// Decode the site instruction to plan the single-step. Fills its length, whether it
+// may be stepped out-of-line (not a relative branch / call / ret), and the offset of a
+// RIP-relative disp32 to retarget in the out-of-line copy. Control-flow instructions
+// return displaced_ok=false so the caller uses the in-place fallback.
+static bool decode_site(const unsigned char *bytes, size_t n, uint32_t &len,
+                        bool &displaced_ok, int &riprel_off) {
+    ZydisDecoder dec;
+#if defined(_WIN64)
+    ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+#else
+    ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_COMPAT_32, ZYDIS_STACK_WIDTH_32);
+#endif
+    ZydisDecodedInstruction insn;
+    ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, bytes, n, &insn, ops))) return false;
+    len = insn.length; riprel_off = -1; displaced_ok = true;
+    if (insn.meta.branch_type != ZYDIS_BRANCH_TYPE_NONE ||
+        insn.meta.category == ZYDIS_CATEGORY_CALL || insn.meta.category == ZYDIS_CATEGORY_RET ||
+        insn.meta.category == ZYDIS_CATEGORY_COND_BR || insn.meta.category == ZYDIS_CATEGORY_UNCOND_BR) {
+        displaced_ok = false; return true;            // control flow -> in-place fallback
+    }
+    // RIP-relative memory operand (x64): record the disp32 so the copy can be retargeted.
+    for (int i = 0; i < insn.operand_count; ++i) {
+        if (ops[i].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[i].mem.base == ZYDIS_REGISTER_RIP) {
+            if (insn.raw.disp.size == 32 && insn.raw.disp.offset) riprel_off = insn.raw.disp.offset;
+            else displaced_ok = false;                // RIP-relative but not a disp32 we can retarget
+            break;
+        }
+    }
+    return true;
+}
+
 static bool arm_breakpoint(probe_session *s, Probe &p, uint64_t base) {
     if (p.rva > UINT64_MAX - base) { set_error(s, "probe address overflow"); return false; }
     uint64_t address = base + p.rva; size_t got{};
-    if (!remote_read(s->pi.hProcess, address, &p.original, 1, &got) || got != 1) {
-        set_error(s, win_error("read original probe byte")); return false;
+    unsigned char buf[16];
+    if (!remote_read(s->pi.hProcess, address, buf, sizeof(buf), &got) || got != sizeof(buf)) {
+        set_error(s, win_error("read original probe bytes")); return false;
     }
-    if (p.original == 0xcc) {
+    if (buf[0] == 0xcc) {
         set_error(s, "pre-hooked INT3 sites are unsupported by this breakpoint backend"); return false;
     }
+    uint32_t len = 0; bool disp_ok = false; int riprel = -1;
+    if (!decode_site(buf, sizeof(buf), len, disp_ok, riprel) || len == 0 || len > sizeof(buf)) {
+        set_error(s, "could not decode probe site instruction"); return false;
+    }
+    p.original = buf[0];
+    p.orig_insn.assign(buf, buf + len);
+    p.insn_len = len; p.displaced_ok = disp_ok; p.riprel_disp_off = riprel;
     if (!patch(s->pi.hProcess, address, 0xcc)) {
         set_error(s, win_error("arm software breakpoint")); return false;
     }
     p.base = base; p.address = address; p.active = true;
-    std::fprintf(stderr, "probe: active %s -> base=0x%llx addr=0x%llx (was 0x%02x)\n",
-                 p.location.c_str(), (unsigned long long)base,
-                 (unsigned long long)address, p.original);
+    std::fprintf(stderr, "probe: active %s -> base=0x%llx addr=0x%llx (was 0x%02x, len=%u, %s)\n",
+                 p.location.c_str(), (unsigned long long)base, (unsigned long long)address,
+                 p.original, len, disp_ok ? "displaced" : "in-place");
     return true;
 }
 
@@ -333,8 +393,19 @@ extern "C" int probe_launch(probe_session *s, char *const argv[]) {
     } catch (const std::exception &e) { set_error(s, e.what()); return 0; }
 }
 
+// Per-thread out-of-line step buffer in the target (executable), allocated on demand.
+static bool trace_enabled() { static const bool on = std::getenv("PROBE_TRACE") != nullptr; return on; }
+
+static uint64_t thread_scratch(probe_session *s, DWORD tid) {
+    auto it = s->scratch.find(tid);
+    if (it != s->scratch.end()) return it->second;
+    void *mem = VirtualAllocEx(s->pi.hProcess, nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!mem) return 0;
+    uint64_t addr = (uint64_t)(uintptr_t)mem; s->scratch[tid] = addr; return addr;
+}
+
 static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
-                             std::unordered_map<DWORD, Probe *> &stepping,
+                             std::unordered_map<DWORD, StepState> &stepping,
                              bool &initial_break, DWORD &disposition) {
     auto &ex = event.u.Exception.ExceptionRecord; DWORD code = ex.ExceptionCode;
     disposition = DBG_EXCEPTION_NOT_HANDLED;
@@ -344,17 +415,35 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     auto step = stepping.find(event.dwThreadId);
     uint64_t address = (uint64_t)(uintptr_t)ex.ExceptionAddress;
     Probe *probe = code == EXCEPTION_BREAKPOINT ? probe_at(s, address) : nullptr;
+    if (trace_enabled())
+        std::fprintf(stderr, "EV code=0x%lx tid=%lu addr=0x%llx step=%d probe=%d\n",
+                     (unsigned long)code, (unsigned long)event.dwThreadId,
+                     (unsigned long long)address, step != stepping.end(), probe != nullptr);
     if ((code != EXCEPTION_SINGLE_STEP || step == stepping.end()) && !probe) return true;
     HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
     if (!thread) { set_error(s, win_error("open event thread")); return false; }
     CONTEXT native{}; native.ContextFlags = CONTEXT_ALL;
     if (code == EXCEPTION_SINGLE_STEP && step != stepping.end()) {
-        bool ok = !!GetThreadContext(thread, &native);
-        if (ok) ok = patch(s->pi.hProcess, step->second->address, 0xcc);
+        Probe *sp = step->second.probe; bool ok = !!GetThreadContext(thread, &native);
+        if (step->second.displaced) {
+            // The instruction ran out-of-line; the INT3 was never lifted, so there is
+            // nothing to re-arm — just land on the instruction after the probe site.
+            uint64_t next = sp->address + sp->insn_len;
+#if defined(_WIN64)
+            native.Rip = next;
+#else
+            native.Eip = (DWORD)next;
+#endif
+        } else if (ok) {
+            ok = patch(s->pi.hProcess, sp->address, 0xcc);   // in-place: re-arm the byte
+        }
         native.EFlags &= ~0x100u;
         if (ok) ok = !!SetThreadContext(thread, &native);
         CloseHandle(thread);
         if (!ok) { set_error(s, win_error("complete breakpoint single-step")); return false; }
+        if (trace_enabled())
+            std::fprintf(stderr, "  step-done tid=%lu displaced=%d\n",
+                         (unsigned long)event.dwThreadId, step->second.displaced);
         stepping.erase(step); disposition = DBG_CONTINUE; return true;
     }
     if (!GetThreadContext(thread, &native)) {
@@ -378,19 +467,59 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
 #else
     native.Esp = (DWORD)context.regs.rsp;
 #endif
-    if (!patch(s->pi.hProcess, probe->address, probe->original)) {
-        CloseHandle(thread); set_error(s, win_error("restore probed instruction")); return false;
+    // Displaced stepping (default for ordinary instructions): run the original
+    // instruction out-of-line with the INT3 left armed, so no other thread can cross
+    // this site unobserved (no re-arm race) and no thread is suspended (no deadlock).
+    bool displaced = probe->displaced_ok;
+    uint64_t scratch_addr = displaced ? thread_scratch(s, event.dwThreadId) : 0;
+    if (displaced && scratch_addr) {
+        std::vector<unsigned char> code = probe->orig_insn;
+        if (probe->riprel_disp_off >= 0) {
+            int32_t disp; std::memcpy(&disp, code.data() + probe->riprel_disp_off, sizeof(disp));
+            // Preserve the same absolute target when the copy runs from scratch.
+            int64_t nd = (int64_t)disp + (int64_t)(probe->address - scratch_addr);
+            if (nd < INT32_MIN || nd > INT32_MAX) displaced = false;
+            else { int32_t v = (int32_t)nd; std::memcpy(code.data() + probe->riprel_disp_off, &v, sizeof(v)); }
+        }
+        size_t wrote = 0;
+        if (displaced && (!remote_write(s->pi.hProcess, scratch_addr, code.data(), code.size(), &wrote) ||
+                          wrote != code.size())) {
+            CloseHandle(thread); set_error(s, win_error("stage displaced instruction")); return false;
+        }
+        if (displaced) FlushInstructionCache(s->pi.hProcess, (void *)(uintptr_t)scratch_addr, code.size());
+    } else {
+        displaced = false;   // no scratch available -> in-place fallback
     }
+    if (displaced) {
 #if defined(_WIN64)
-    native.Rip = probe->address;
+        native.Rip = scratch_addr;
 #else
-    native.Eip = (DWORD)probe->address;
+        native.Eip = (DWORD)scratch_addr;
 #endif
+    } else {
+        // In-place fallback (control-flow sites, or scratch/reach failure): lift the
+        // byte, step over it at the real address, re-arm on the single-step (this is
+        // the only path with a brief unarmed window, so it is kept for the rare cases).
+        if (!patch(s->pi.hProcess, probe->address, probe->original)) {
+            CloseHandle(thread); set_error(s, win_error("restore probed instruction")); return false;
+        }
+#if defined(_WIN64)
+        native.Rip = probe->address;
+#else
+        native.Eip = (DWORD)probe->address;
+#endif
+    }
     native.EFlags |= 0x100u;
     if (!SetThreadContext(thread, &native)) {
         CloseHandle(thread); set_error(s, win_error("apply callback context")); return false;
     }
-    CloseHandle(thread); stepping[event.dwThreadId] = probe; disposition = DBG_CONTINUE; return true;
+    CloseHandle(thread);
+    if (trace_enabled())
+        std::fprintf(stderr, "  setup tid=%lu displaced=%d scratch=0x%llx rip=0x%llx\n",
+                     (unsigned long)event.dwThreadId, displaced,
+                     (unsigned long long)scratch_addr, (unsigned long long)(displaced ? scratch_addr : probe->address));
+    stepping[event.dwThreadId] = StepState{probe, displaced};
+    disposition = DBG_CONTINUE; return true;
 }
 
 static bool start_remote(probe_session *s, LPTHREAD_START_ROUTINE entry,
@@ -486,7 +615,7 @@ static bool complete_remote_thread(probe_session *s, DWORD result) {
 extern "C" int probe_run(probe_session *s) {
     if (!s || !s->launched) { if (s) set_error(s, "session is not launched"); return 0; }
     if (s->ran) { set_error(s, "session already ran"); return 0; }
-    s->ran = true; bool initial_break = false; std::unordered_map<DWORD, Probe *> stepping;
+    s->ran = true; bool initial_break = false; std::unordered_map<DWORD, StepState> stepping;
     DEBUG_EVENT event{};
     while (!s->exited) {
         if (!WaitForDebugEvent(&event, INFINITE)) { set_error(s, win_error("wait for debug event")); break; }
@@ -507,8 +636,15 @@ extern "C" int probe_run(probe_session *s) {
             if (event.dwThreadId == s->remote_tid) ok = complete_remote_thread(s, event.u.ExitThread.dwExitCode);
             auto it = stepping.find(event.dwThreadId);
             if (ok && it != stepping.end()) {
-                ok = patch(s->pi.hProcess, it->second->address, 0xcc); stepping.erase(it);
+                // Only the in-place path lifted the byte; a displaced step left it armed.
+                if (!it->second.displaced) ok = patch(s->pi.hProcess, it->second.probe->address, 0xcc);
+                stepping.erase(it);
                 if (!ok) set_error(s, win_error("re-arm probe after thread exit"));
+            }
+            auto sc = s->scratch.find(event.dwThreadId);    // reclaim the thread's step buffer
+            if (sc != s->scratch.end()) {
+                VirtualFreeEx(s->pi.hProcess, (void *)(uintptr_t)sc->second, 0, MEM_RELEASE);
+                s->scratch.erase(sc);
             }
             break;
         }
@@ -614,6 +750,8 @@ extern "C" void probe_close(probe_session *s) {
             if (p->active && (p->flags & PROBE_BREAKPOINT)) patch(s->pi.hProcess, p->address, p->original);
         TerminateProcess(s->pi.hProcess, 3);
     }
+    if (s->pi.hProcess)
+        for (auto &kv : s->scratch) VirtualFreeEx(s->pi.hProcess, (void *)(uintptr_t)kv.second, 0, MEM_RELEASE);
     if (s->remote_thread) CloseHandle(s->remote_thread);
     if (s->remote_path && s->pi.hProcess) VirtualFreeEx(s->pi.hProcess, s->remote_path, 0, MEM_RELEASE);
     if (s->shared) UnmapViewOfFile(s->shared);
