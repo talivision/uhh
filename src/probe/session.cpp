@@ -2268,7 +2268,7 @@ static void ipc_freeze_thread(probe_session *s, DWORD tid) {
 // resume on torn bytes. Move it to the same instruction in that hook's trampoline, which
 // holds relocated copies of exactly those instructions (one-to-one, in order) and then
 // jumps back to site + patch_len.
-static void move_into_trampoline(probe_session *s, HANDLE t, uint64_t mask) {
+static void move_into_trampoline(probe_session *s, HANDLE t) {
     CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
     if (!GetThreadContext(t, &c)) return;
 #if defined(_WIN64)
@@ -2277,8 +2277,8 @@ static void move_into_trampoline(probe_session *s, HANDLE t, uint64_t mask) {
     uint64_t ip = c.Eip;
 #endif
     for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i) {
-        if (!(mask & (1ull << i))) continue;
         const auto &r = s->shared->requests[i];
+        if (!r.enabling) continue;                    // only ranges about to be overwritten
         const uint64_t site = r.site, tramp = r.trampoline; const uint32_t len = r.patch_len;
         if (!site || !tramp || !len || len > 32 || ip <= site || ip >= site + len) continue;
         unsigned char ob[48] = {}, tb[128] = {}; size_t on = 0, tn = 0;
@@ -2318,7 +2318,7 @@ static int32_t ipc_freeze(probe_session *s, DWORD self, uint64_t mask) {
         if (tid == self) continue;
         size_t before = s->ipc_frozen.size();
         ipc_freeze_thread(s, tid);
-        if (mask && s->ipc_frozen.size() > before) move_into_trampoline(s, s->ipc_frozen.back(), mask);
+        if (mask && s->ipc_frozen.size() > before) move_into_trampoline(s, s->ipc_frozen.back());
     }
     s->ipc_freezer = self;
     return 1;

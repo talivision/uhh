@@ -26,7 +26,7 @@ int main(int argc, char **argv) {
     int two_types = probe_add_symbol(t, site, refusal_noop, PROBE_INLINE | PROBE_HW);
     int watch_on_bp = probe_add_symbol(t, site, refusal_noop, PROBE_BREAKPOINT | PROBE_WATCH_WRITE);
     int inline33 = 1;
-    for (int k = 0; k < 33; ++k) inline33 = probe_add_symbol(t, site, refusal_noop, PROBE_INLINE);
+    for (int k = 0; k < 129; ++k) inline33 = probe_add_symbol(t, site, refusal_noop, PROBE_INLINE);   // 129th refused
     probe_close(t);
 
     // 4 hw probes on one site, then a 5th that must be refused.
