@@ -1,6 +1,9 @@
 #include "win_common.hpp"
 #include "probe_agent_shared.hpp"
 #include <safetyhook.hpp>
+#include <array>
+#include <bitset>
+#include <utility>
 #include <cstdarg>
 #include <intrin.h>
 #include <immintrin.h>
@@ -563,17 +566,13 @@ static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
     _mm_setcsr(mxcsr);
 }
 
-#define MID_THUNK(n) static void mid_##n(safetyhook::Context &c) { mid_entry(c, n); }
-MID_THUNK(0) MID_THUNK(1) MID_THUNK(2) MID_THUNK(3) MID_THUNK(4) MID_THUNK(5) MID_THUNK(6) MID_THUNK(7)
-MID_THUNK(8) MID_THUNK(9) MID_THUNK(10) MID_THUNK(11) MID_THUNK(12) MID_THUNK(13) MID_THUNK(14) MID_THUNK(15)
-MID_THUNK(16) MID_THUNK(17) MID_THUNK(18) MID_THUNK(19) MID_THUNK(20) MID_THUNK(21) MID_THUNK(22) MID_THUNK(23)
-MID_THUNK(24) MID_THUNK(25) MID_THUNK(26) MID_THUNK(27) MID_THUNK(28) MID_THUNK(29) MID_THUNK(30) MID_THUNK(31)
-#undef MID_THUNK
+// One entry thunk per request slot (the slot index is baked in), generated at compile time.
 using mid_callback = void (*)(safetyhook::Context &);
-static mid_callback mid_callbacks[PROBE_AGENT_MAX_PROBES] = {
-    mid_0,mid_1,mid_2,mid_3,mid_4,mid_5,mid_6,mid_7,mid_8,mid_9,mid_10,mid_11,mid_12,mid_13,mid_14,mid_15,
-    mid_16,mid_17,mid_18,mid_19,mid_20,mid_21,mid_22,mid_23,mid_24,mid_25,mid_26,mid_27,mid_28,mid_29,mid_30,mid_31
-};
+template <uint32_t N> static void mid_thunk(safetyhook::Context &c) { mid_entry(c, N); }
+template <size_t... I> static constexpr std::array<mid_callback, sizeof...(I)> make_mid_thunks(std::index_sequence<I...>) {
+    return {{ &mid_thunk<(uint32_t)I>... }};
+}
+static constexpr auto mid_callbacks = make_mid_thunks(std::make_index_sequence<PROBE_AGENT_MAX_PROBES>{});
 
 // Run fn with every other thread of the target suspended by the controller (FREEZE/THAW
 // IPC; the controller is a debugger, so the raise is serviced synchronously). While frozen,
@@ -582,9 +581,12 @@ static mid_callback mid_callbacks[PROBE_AGENT_MAX_PROBES] = {
 // the ntdll routines the patching itself calls. Inside fn: no heap, no locks another
 // thread could hold. Without a controller (never in UHH) SafetyHook's own trap is used.
 extern "C" volatile long uhh_safetyhook_frozen;
-template <class F> static void frozen(uint64_t enabling_mask, F &&fn) {
+using slot_set = std::bitset<PROBE_AGENT_MAX_PROBES>;
+template <class F> static void frozen(const slot_set &enabling, F &&fn) {
+    for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i)          // tell the controller which ranges change
+        InterlockedExchange(&shared->requests[i].enabling, enabling[i] ? 1 : 0);
     probe_ipc_request req{};
-    req.op = PROBE_IPC_FREEZE; req.origin_site = UINT32_MAX; req.address = enabling_mask;
+    req.op = PROBE_IPC_FREEZE; req.origin_site = UINT32_MAX; req.address = enabling.any() ? 1 : 0;
     const bool held = raise_ipc(&req) && req.result == 1;
     if (held) InterlockedExchange(&uhh_safetyhook_frozen, 1);
     fn();
@@ -608,7 +610,7 @@ static void install_pending() {
 static void install_pending_locked() {
     uint32_t count = shared->request_count;
     if (count > PROBE_AGENT_MAX_PROBES) count = PROBE_AGENT_MAX_PROBES;
-    uint64_t enabling = 0;
+    slot_set enabling;
     for (uint32_t i = 0; i < count; ++i) {
         auto &request = shared->requests[i];
         if (!request.site || request.status != PROBE_AGENT_PENDING) continue;
@@ -634,27 +636,28 @@ static void install_pending_locked() {
         if (!hooks[i]) { InterlockedExchange(&request.status, PROBE_AGENT_HOOK_FAILED); continue; }
         request.patch_len = (uint32_t)hooks[i].original_bytes().size();
         request.trampoline = (uint64_t)hooks[i].uhh_trampoline();
-        enabling |= 1ull << i;
+        enabling.set(i);
     }
-    if (!enabling) return;
-    auto enable = [&](uint64_t which) {
+    if (enabling.none()) return;
+    auto enable = [&](const slot_set &which) {
         for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i) {
-            if (!(which & (1ull << i))) continue;
+            if (!which[i]) continue;
             const bool ok = hooks[i].enable().has_value();
             InterlockedExchange(&shared->requests[i].status, ok ? PROBE_AGENT_INSTALLED : PROBE_AGENT_HOOK_FAILED);
         }
     };
     // PROBE_UNSAFE_FAST_PATCH: write while the other threads keep running (page kept
     // executable, no freeze, no trap) -- the race the freeze exists to prevent.
-    uint64_t unsafe = 0;
+    slot_set unsafe;
     for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i)
-        if ((enabling & (1ull << i)) && (shared->requests[i].flags & PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH)) unsafe |= 1ull << i;
-    if (unsafe) {
+        if (enabling[i] && (shared->requests[i].flags & PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH)) unsafe.set(i);
+    if (unsafe.any()) {
         InterlockedExchange(&uhh_safetyhook_frozen, 1);
         enable(unsafe);
         InterlockedExchange(&uhh_safetyhook_frozen, 0);
     }
-    if (enabling & ~unsafe) frozen(enabling & ~unsafe, [&] { enable(enabling & ~unsafe); });
+    const slot_set safe = enabling & ~unsafe;
+    if (safe.any()) frozen(safe, [&] { enable(safe); });
 }
 
 // Tell the controller an install round finished (synchronous: the controller services
@@ -703,7 +706,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_stop(void *) {
     AcquireSRWLockExclusive(&g_install_lock);            // after any install round in progress
     InterlockedExchange(&g_stopping, 1);
     for (int i = 0; i < 2000 && any_inflight(); ++i) Sleep(1);
-    frozen(0, [] {
+    frozen(slot_set{}, [] {
         for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i)
             // Restore the original bytes -- unless the controller saw the module unload
             // (the address is unmapped or holds another image now).

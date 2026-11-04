@@ -2264,6 +2264,12 @@ static bool agent_thread(probe_session *s, DWORD tid) {
     return a >= s->remote_agent && a < s->remote_agent + nt.OptionalHeader.SizeOfImage;
 }
 
+// Inline probes other than PROBE_UNSAFE_FAST_PATCH ones (those ask for no suspension at all).
+static bool has_safe_inline(const probe_session *s) {
+    for (const auto &p : s->probes) if ((p->flags & PROBE_INLINE) && !(p->flags & PROBE_UNSAFE_FAST_PATCH)) return true;
+    return false;
+}
+
 static bool inline_hold_needed(const probe_session *s) {
     if (inline_unconfirmed(s)) return true;
     return has_inline(s) && !(s->shared && s->shared->service_ready && s->svc_event);
@@ -2681,7 +2687,7 @@ static void ipc_freeze_thread(probe_session *s, DWORD tid) {
 // resume on torn bytes. Move it to the same instruction in that hook's trampoline, which
 // holds relocated copies of exactly those instructions (one-to-one, in order) and then
 // jumps back to site + patch_len.
-static void move_into_trampoline(probe_session *s, HANDLE t, uint64_t mask) {
+static void move_into_trampoline(probe_session *s, HANDLE t) {
     CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
     if (!GetThreadContext(t, &c)) return;
 #if defined(_WIN64)
@@ -2690,8 +2696,8 @@ static void move_into_trampoline(probe_session *s, HANDLE t, uint64_t mask) {
     uint64_t ip = c.Eip;
 #endif
     for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i) {
-        if (!(mask & (1ull << i))) continue;
         const auto &r = s->shared->requests[i];
+        if (!r.enabling) continue;                    // only ranges about to be overwritten
         const uint64_t site = r.site, tramp = r.trampoline; const uint32_t len = r.patch_len;
         if (!site || !tramp || !len || len > 32 || ip <= site || ip >= site + len) continue;
         unsigned char ob[48] = {}, tb[128] = {}; size_t on = 0, tn = 0;
@@ -2731,7 +2737,7 @@ static int32_t ipc_freeze(probe_session *s, DWORD self, uint64_t mask) {
         if (tid == self) continue;
         size_t before = s->ipc_frozen.size();
         ipc_freeze_thread(s, tid);
-        if (mask && s->ipc_frozen.size() > before) move_into_trampoline(s, s->ipc_frozen.back(), mask);
+        if (mask && s->ipc_frozen.size() > before) move_into_trampoline(s, s->ipc_frozen.back());
     }
     s->ipc_freezer = self;
     return 1;
@@ -3477,9 +3483,7 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
         s->cb_tid = 0;
         for (DWORD tid : s->pending_hold) hold_thread(s, tid);
         s->pending_hold.clear();
-        bool safe_inline = false;           // PROBE_UNSAFE_FAST_PATCH probes ask for no suspension at all
-        for (auto &p : s->probes) if ((p->flags & PROBE_INLINE) && !(p->flags & PROBE_UNSAFE_FAST_PATCH)) safe_inline = true;
-        if (ok && s->initial_break && s->attached && !s->attach_held && safe_inline) {
+        if (ok && s->initial_break && s->attached && !s->attach_held && has_safe_inline(s)) {
             // Attach: the target was already running. Hold every thread (not the break-in
             // thread, which only returns) until the agent confirms the inline hooks, so no
             // call slips past a site that is about to be hooked. Released by the install

@@ -60,7 +60,7 @@ identical source under every backend.
 - ⬜ P2 hw PROBE_ONCE and watch RW|ONCE proven distinctly; 5th hw probe refused cleanly (setup and runtime), slot reuse after ONCE
 - ⬜ P2 runtime adds on a DLL loaded later by a non-main thread (all backends); probe_add_address(PROBE_INLINE) from a callback
 - ⬜ P2 threads started during the entry hold (TLS/DllMain thread calling the probed function)
-- 🔧 P2 refusal tests: PROBE_AT_RETURN, inline ONCE, 33rd inline probe ✅; ALLOW_PREHOOKED inline assertion ⬜
+- 🔧 P2 refusal tests: PROBE_AT_RETURN, inline ONCE, 129th inline probe ✅; ALLOW_PREHOOKED inline assertion ⬜
 - ✅ P2 sidefx: full arithmetic EFLAGS (probe between cmp and jcc), LastStatus; below-SP documented as exempt
 - ⬜ P2 x86 stacks mid-function / FPO frames identical across backends
 - ⬜ P2 mixed backends for state-sharing probes: documented limitation (state lives where callbacks run)
@@ -122,8 +122,8 @@ identical source under every backend.
 - ⬜ [fan-out] Windows 11 VM on the Proxmox server, run the suite there too (later)
 - ⬜ [fan-out] Stability on real large apps (important): browsers / heavily multi-threaded / JIT processes under all backends
 - ⬜ [fan-out, Codex] Docs: quickstart, API reference, per-backend limitations table, troubleshooting
-- ❓ Raise the 32-inline-probe cap (fixed table of 32 agent thunks/request slots; 33rd refused) -- user to decide
-- ⬜ (lower) Follow child processes: brainstorm strategies and API design first
+- 🔧 Inline cap raised to 128 per session (user: 128 is enough; error beyond) -- compile-time thunk table, per-request FREEZE flag; refusal test uses the 129th -- VM verify pending
+- ⬜ Follow child processes: write docs/child-processes.md -- strategies + robust API options for the user to choose from (during the soak test)
 - ⬜ (maybe) CI on GitHub Actions; (maybe) CMake package + versioned release zip
 - ⬜ (very last) Soak test: hours under load; handles/memory/threads flat
 - ✗ Controller-crash self-unhook (user: the analyst sees the controller died and restarts the target; not worth the cost)
