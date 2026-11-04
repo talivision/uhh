@@ -139,6 +139,9 @@ image across the boundary.
   hook, we install an INLINE hook (no breakpoint fallback) that chains through
   the original trampoline and both run correctly (PROBE_ALLOW_PREHOOKED). Prove
   the inline-on-inline coexistence, not just detect-and-fail or HW fallback.
+- HIGH VOLUME: test at scale - millions of reads, MORE threads than CPU cores -
+  verifying exact hit counts (logs may drop; counts must not) and measuring
+  performance, not just small smoke runs.
 - MIX MATRIX: test the gated scenario across ALL permutations of backend per probe
   (config-flag site and read site x {software breakpoint, inline hook}, HW where
   applicable), proving each combination works and gives correct results. This is
