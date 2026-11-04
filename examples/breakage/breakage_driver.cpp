@@ -32,13 +32,6 @@ struct Case {
 };
 struct RunResult { bool install_ok = false, target_ok = false; uint64_t hits = 0; int prehook_reports = 0; };
 
-static std::string sibling_target() {
-    char path[MAX_PATH]; DWORD n = GetModuleFileNameA(nullptr, path, MAX_PATH);
-    if (!n || n >= MAX_PATH) return "hook_edge.exe";
-    std::string result(path); size_t slash = result.find_last_of("\\/");
-    return result.substr(0, slash == std::string::npos ? 0 : slash + 1) + "hook_edge.exe";
-}
-
 static bool parse_rva(const char *text, const char *name, uint64_t &value) {
     if (!text || !*text) {
         std::fprintf(stderr, "breakage_driver: invalid %s RVA: %s\n", name, text ? text : "(null)");
@@ -52,7 +45,7 @@ static bool parse_rva(const char *text, const char *name, uint64_t &value) {
     value = (uint64_t)parsed; return true;
 }
 
-static RunResult run_case(const Case &c, const uint64_t rvas[SITE_COUNT]) {
+static RunResult run_case(const char *target, const Case &c, const uint64_t rvas[SITE_COUNT]) {
     RunResult result;
     probe_session *session = probe_session_create();
     if (!session) return result;
@@ -63,10 +56,9 @@ static RunResult run_case(const Case &c, const uint64_t rvas[SITE_COUNT]) {
                       (unsigned long long)rvas[registration.site]);
         if (!probe_add_symbol_cfg(session, location, registration.callback, c.flags, nullptr, 0)) added = false;
     }
-    std::string target = sibling_target();
     char case_arg[32]; std::snprintf(case_arg, sizeof(case_arg), "%s", c.target_case);
     char option[] = "--case";
-    std::vector<char *> child{target.data(), option, case_arg, nullptr};
+    std::vector<char *> child{const_cast<char *>(target), option, case_arg, nullptr};
     bool launched = added && probe_launch(session, child.data());
     bool ran = launched && probe_run(session);
     result.target_ok = ran && probe_wait_for_exit(session);
@@ -129,26 +121,15 @@ int main(int argc, char **argv) {
     static const char *names[SITE_COUNT] = {
         "ShortSite", "PrehookSite", "UnrelocSite", "StackSite", "StackInsideSite"
     };
-    static const char *envs[SITE_COUNT] = {
-        "UHH_SHORT_RVA", "UHH_PREHOOK_RVA", "UHH_UNRELOC_RVA", "UHH_STACK_RVA", "UHH_STACK_INSIDE_RVA"
-    };
-    uint64_t rvas[SITE_COUNT]{};
-    bool any_env = false, all_env = true;
-    for (int i = 0; i < SITE_COUNT; ++i) {
-        const char *value = std::getenv(envs[i]); any_env = any_env || (value && *value);
-        all_env = all_env && value && *value;
-    }
-    if (any_env && !all_env) {
-        std::fprintf(stderr, "breakage_driver: set all five UHH_*_RVA variables or none\n"); return 2;
-    }
-    if (!all_env && argc != SITE_COUNT + 1) {
-        std::fprintf(stderr, "usage: breakage_driver <short> <prehook> <unreloc> <stack> <stack_inside>\n");
+    if (argc != SITE_COUNT + 2) {
+        std::fprintf(stderr, "usage: breakage_driver <hook_edge.exe> <short> <prehook> <unreloc> <stack> <stack_inside>\n"
+                             "       (site RVAs from hook_edge.map, e.g. via scripts/site_rvas.py)\n");
         return 2;
     }
-    for (int i = 0; i < SITE_COUNT; ++i) {
-        const char *value = all_env ? std::getenv(envs[i]) : argv[i + 1];
-        if (!parse_rva(value, names[i], rvas[i])) return 2;
-    }
+    const char *target = argv[1];
+    uint64_t rvas[SITE_COUNT]{};
+    for (int i = 0; i < SITE_COUNT; ++i)
+        if (!parse_rva(argv[i + 2], names[i], rvas[i])) return 2;
 
     const char *control = "one install, one hit, correct target exit";
     std::vector<Case> cases = {
@@ -189,7 +170,7 @@ int main(int argc, char **argv) {
         cases.push_back({"control_stack_inner", "StackInsideSite", "stack", label, control, flag, MUST_PASS,
                          {{STACK_INSIDE_SITE, breakage_hit_a}}});
     }
-    for (const auto &c : cases) print_result(c, run_case(c, rvas));
+    for (const auto &c : cases) print_result(c, run_case(target, c, rvas));
     return 0; /* Rows carry the expected failures; setup/usage errors return nonzero. */
 }
 #endif

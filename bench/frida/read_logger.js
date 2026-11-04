@@ -77,10 +77,9 @@ var cfg = {
 var calls = 0, matched = 0, logged = 0, resolveCalls = 0;
 var rangeLo = null, rangeHi = null, selPtr = null, decoyPtr = null;
 
-// HANDLE(string) -> pid cache. probe_app passes the CreateProcess handle to the
-// reads (see src/app.cpp), so NtOpenProcess never fires for it and an
-// NtOpenProcess-built map (our note_open) would be empty here. GetProcessId works
-// on any process handle, so we resolve lazily and cache - the robust analogue.
+// HANDLE(string) -> pid cache. UHH builds this map at ntdll!NtOpenProcess
+// (examples/gated_config/callbacks.cpp); GetProcessId works on any process handle,
+// so here we resolve lazily and cache instead.
 var pidByHandle = Object.create(null);
 var GetProcessId = new NativeFunction(modExport('kernel32.dll', 'GetProcessId'),
                                       'uint32', ['pointer']);

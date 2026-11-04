@@ -29,7 +29,7 @@ cmake --build build-frida-x64 --config Release --target frida_parity
 $bin = Resolve-Path build-frida-x64\Release
 $r = (python scripts\site_rvas.py "$bin\parity_target.map" `
   ParityB1Site ParityB2Site ParityB4Site ParityB6Site | Out-String | ConvertFrom-Json)
-& "$bin\frida_parity.exe" $r.ParityB1Site $r.ParityB2Site $r.ParityB4Site $r.ParityB6Site
+& "$bin\frida_parity.exe" "$bin\parity_target.exe" $r.ParityB1Site $r.ParityB2Site $r.ParityB4Site $r.ParityB6Site
 ```
 
 For x86, use the same commands with a Win32 build directory:
@@ -41,12 +41,10 @@ cmake --build build-frida-x86 --config Release --target frida_parity
 $bin = Resolve-Path build-frida-x86\Release
 $r = (python scripts\site_rvas.py "$bin\parity_target.map" `
   ParityB1Site ParityB2Site ParityB4Site ParityB6Site | Out-String | ConvertFrom-Json)
-& "$bin\frida_parity.exe" $r.ParityB1Site $r.ParityB2Site $r.ParityB4Site $r.ParityB6Site
+& "$bin\frida_parity.exe" "$bin\parity_target.exe" $r.ParityB1Site $r.ParityB2Site $r.ParityB4Site $r.ParityB6Site
 ```
 
-The four RVAs may instead be supplied through `UHH_PARITY_B1_RVA`,
-`UHH_PARITY_B2_RVA`, `UHH_PARITY_B4_RVA`, and `UHH_PARITY_B6_RVA`. All four must be
-set together. A successful run emits four lines shaped like:
+A successful run emits four lines shaped like:
 
 ```json
 {"name":"B4_modify_argument","frida_equivalent":"onEnter: args[1] = ptr(...)","arg_seen":"instrumented","verdict":"pass"}
@@ -55,8 +53,8 @@ set together. A successful run emits four lines shaped like:
 ## Assumptions
 
 - The build uses MSVC/MASM through CMake 3.28 or newer, as required by the project.
-- The driver, target, and `probe_api_agent.dll` are kept in the same configuration
-  directory so sibling discovery works.
+- `probe_api_agent.dll` is kept next to the driver; the target path is the driver's
+  first argument.
 - Site RVAs come from the matching architecture/configuration's linker map; ASLR is
   handled by UHH's `module+RVA` resolution.
 - Each fixture site executes once on the initial target thread, so one callback hit

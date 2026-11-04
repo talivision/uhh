@@ -13,7 +13,7 @@ ucrtbase.dll!malloc  (entry probe: breakpoint | hw | inline)
 ```
 
 ```
-dynwatch_driver --entry breakpoint|hw|inline [--writes N]
+dynwatch_driver --entry breakpoint|hw|inline -- <dynwatch_target.exe> [--writes N]
 ```
 
 What it shows:

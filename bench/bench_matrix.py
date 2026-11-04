@@ -6,7 +6,7 @@ Measures per-read overhead for every backend on the SAME in-target clock
 line up column-for-column:
 
   baseline            probe_app, no instrumentation (reads enabled via config)
-  uhh:inline          UHH SafetyHook mid-hook at ReadSite
+  uhh:inline          UHH SafetyHook mid-hook at probe_app.exe!ReadThunk
   uhh:hw              UHH debug-register backend
   uhh:breakpoint      UHH external INT3 + displaced-step backend
   frida:interceptor   Frida Interceptor (inline trampoline), JS onEnter, count mode
@@ -15,7 +15,7 @@ line up column-for-column:
   frida:hwbp          Frida per-thread hardware breakpoint + exception handler
 
 UHH runs go through gated_config.exe (flag flip via breakpoint enables reads, then
-the chosen read backend probes ReadSite). Frida runs ATTACH to a gated probe_app
+the chosen read backend probes probe_app.exe!ReadThunk). Frida runs ATTACH to a gated probe_app
 (reads enabled via --config), install the hook before releasing the gate, measure.
 
 NOTE: Frida is driven via ATTACH, not spawn, because frida 17.25.2 aborts on this
@@ -60,16 +60,10 @@ def parse_objs(text):
     return app, probes, report
 
 
-def rva(map_file, sym):
-    tool = REPO / "scripts" / "site_rvas.py"
-    out = subprocess.check_output([sys.executable, str(tool), str(map_file), sym], text=True)
-    return json.loads(out)[sym]
-
-
 # --------------------------------------------------------------------------- UHH
 def run_baseline(rel, threads, reads, timeout):
     cmd = [str(rel / "probe_app.exe"), "--no-wait", "--config", "reads_enabled=1",
-           "--threads", str(threads), "--reads", str(reads), "--clean"]
+           "--threads", str(threads), "--reads", str(reads)]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     app, _, _ = parse_objs(r.stdout)
     if app is None:
@@ -77,11 +71,11 @@ def run_baseline(rel, threads, reads, timeout):
     return app
 
 
-def run_uhh(rel, backend, flag_rva, read_rva, threads, reads, timeout, tmp):
+def run_uhh(rel, backend, threads, reads, timeout, tmp):
     outfile = tmp / f"uhh_{backend}_{threads}x{reads}.out"
-    cmd = [str(rel / "gated_config.exe"), str(flag_rva), str(read_rva),
-           "--flag-backend", "breakpoint", "--read-backend", backend,
-           "--no-wait", "--threads", str(threads), "--reads", str(reads)]
+    cmd = [str(rel / "gated_config.exe"), "--flag-backend", "breakpoint", "--read-backend", backend,
+           "configparse.dll!ParseConfig+0x16", "probe_app.exe!ReadThunk",
+           "--", str(rel / "probe_app.exe"), "--no-wait", "--threads", str(threads), "--reads", str(reads)]
     with open(outfile, "w") as f:
         r = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE, text=True, timeout=timeout)
     text = outfile.read_text(errors="replace")
@@ -97,7 +91,7 @@ def run_frida(rel, method, threads, reads, timeout):
     import frida
     src = (FRIDADIR / FRIDA_JS[method]).read_text(encoding="utf-8")
     cmd = [str(rel / "probe_app.exe"), "--config", "reads_enabled=1",
-           "--threads", str(threads), "--reads", str(reads), "--clean"]
+           "--threads", str(threads), "--reads", str(reads)]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, bufsize=0)
     errbuf = []
@@ -187,8 +181,6 @@ def main():
     tmp.mkdir(parents=True, exist_ok=True)
     W, R, N = args.threads, args.reads, args.repeats
     total = W * R
-    flag_rva = rva(rel / "configparse.map", "ParsedFlagSite")
-    read_rva = rva(rel / "probe_app.map", "ReadSite")
     methods = [m.strip() for m in args.methods.split(",") if m.strip()]
 
     print(f"[{args.tag}] W={W} R={R} total={total:,} repeats={N} methods={methods}", flush=True)
@@ -221,7 +213,7 @@ def main():
             if m.startswith("uhh:"):
                 backend = m.split(":", 1)[1]
                 for i in range(N):
-                    app, rp, rep, rc = run_uhh(rel, backend, flag_rva, read_rva, W, R, args.timeout, tmp)
+                    app, rp, rep, rc = run_uhh(rel, backend, W, R, args.timeout, tmp)
                     hit = rp["hits"] if rp else -1
                     elapsed.append(app["elapsed_ns"]); hits_list.append(hit)
                     raw.append(dict(method=m, repeat=i, elapsed_ns=app["elapsed_ns"],

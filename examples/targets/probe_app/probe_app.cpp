@@ -1,0 +1,272 @@
+// probe_app: the target the gated_config and attach examples instrument.
+//
+//   probe_app [--helpers N] [--threads W] [--reads R] [--prehook] [--config k=v;...] [--no-wait]
+//
+// 1. Spawn N helper processes (probe_app --helper). Each holds the same known 256-byte
+//    buffer (byte j == j) at the same address and prints nothing; probe_app prints one
+//    {"kind":"helper","index":k,"pid":..,"base":..,"size":256} line per helper.
+// 2. Print {"kind":"waiting","pid":<own pid>,...} and block until one byte/keystroke on
+//    stdin (the gate). --no-wait skips it.
+// 3. LoadLibrary configparse.dll (late; never a static import) and ParseConfig. The
+//    shipped config is reads_enabled=0: the feature is OFF and the run ends here with
+//    no opens and no reads. Only a probe at configparse.dll!ParseConfig+0x16 that flips
+//    the parsed flag turns it on.
+// 4. Flag on: enumerate every PID on the system (Toolhelp), pick out our helpers, open
+//    each one BY PID with PROCESS_VM_READ via ntdll!NtOpenProcess -- so a probe there
+//    sees every handle being created -- then W threads x R reads of the helpers' buffers via
+//    NtReadVirtualMemory, through the hookable ReadThunk (exported, probe_app.exe!ReadThunk).
+//    Every read is verified; totals are reported as one {"kind":"app",...} JSON line.
+//
+// Read pattern (deterministic, so a filter on one pid + one address range selects an
+// exactly predictable count): global read i = t*R + k (thread t, its k-th read) reads
+// 16 bytes from helper (i % N) at base + 64 * ((i / N) % 4).
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <tlhelp32.h>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+#include <safetyhook.hpp>
+#include "configparse.h"
+
+using NtRead = LONG (NTAPI *)(HANDLE, const void *, void *, SIZE_T, SIZE_T *);
+struct ObjectAttributes { ULONG Length; HANDLE RootDirectory; void *ObjectName; ULONG Attributes;
+                          void *SecurityDescriptor; void *SecurityQualityOfService; };
+struct ClientId { HANDLE UniqueProcess, UniqueThread; };
+using NtOpen = LONG (NTAPI *)(HANDLE *, ACCESS_MASK, ObjectAttributes *, ClientId *);
+static NtOpen g_ntopen = nullptr;
+extern "C" {
+    NtRead g_ntread = nullptr;
+    LONG NTAPI ReadThunk(HANDLE, const void *, void *, SIZE_T, SIZE_T *);
+}
+
+static void require(bool ok, const std::string &what) {
+    if (!ok) throw std::runtime_error(what + " (Win32=" + std::to_string(GetLastError()) + ")");
+}
+
+static std::string exe_path() {
+    char p[MAX_PATH]; DWORD n = GetModuleFileNameA(nullptr, p, MAX_PATH);
+    require(n && n < MAX_PATH, "executable path");
+    return p;
+}
+
+static std::string exe_directory() {
+    std::string s = exe_path(); return s.substr(0, s.find_last_of("\\/") + 1);
+}
+
+// --- Optional pre-existing hook on the read site (--prehook) ----------------------
+static SafetyHookInline prehook;
+static std::atomic<uint64_t> prehook_calls{0};
+static LONG NTAPI pre_read(HANDLE h, const void *a, void *b, SIZE_T n, SIZE_T *done) {
+    prehook_calls.fetch_add(1, std::memory_order_relaxed);
+    return prehook.call<LONG>(h, a, b, n, done);
+}
+
+// --- Helpers ------------------------------------------------------------------------
+constexpr unsigned kBufferSize = 256, kReadSize = 16, kStride = 64, kOffsets = 4;
+
+struct Hello { uint64_t address; uint32_t pid; uint32_t reserved; };
+
+// A child process holding the known buffer until probe_app signals it to exit.
+struct Helper {
+    PROCESS_INFORMATION pi{}; HANDLE finish{}; Hello hello{};
+    HANDLE read_handle{};   // from OpenProcess(PROCESS_VM_READ, pid), used for every read
+    ~Helper() {
+        if (read_handle) CloseHandle(read_handle);
+        if (finish) { SetEvent(finish); WaitForSingleObject(pi.hProcess, 5000); CloseHandle(finish); }
+        if (pi.hThread) CloseHandle(pi.hThread);
+        if (pi.hProcess) CloseHandle(pi.hProcess);
+    }
+    void start() {
+        SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE}; HANDLE rd{}, wr{};
+        require(!!CreatePipe(&rd, &wr, &sa, 0), "pipe"); SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+        finish = CreateEventA(&sa, TRUE, FALSE, nullptr); require(finish != nullptr, "event");
+        STARTUPINFOA si{}; si.cb = sizeof(si); si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdOutput = wr; si.hStdError = GetStdHandle(STD_ERROR_HANDLE); si.hStdInput = nullptr;
+        std::string exe = exe_path();
+        std::string command = "\"" + exe + "\" --helper " + std::to_string((uintptr_t)finish);
+        // Only the pipe and event are inherited; no DEBUG_* flags, so a debugger on
+        // probe_app does not follow the helpers.
+        BOOL ok = CreateProcessA(exe.c_str(), command.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi);
+        CloseHandle(wr); if (!ok) { CloseHandle(rd); require(false, "helper launch"); }
+        DWORD got = 0; BOOL read = ReadFile(rd, &hello, sizeof(hello), &got, nullptr); CloseHandle(rd);
+        require(read && got == sizeof(hello) && hello.pid == pi.dwProcessId, "helper handshake");
+        SetHandleInformation(finish, HANDLE_FLAG_INHERIT, 0);
+    }
+};
+
+static int helper_main(const char *finish_handle) {
+    static unsigned char data[kBufferSize];
+    for (unsigned i = 0; i < kBufferSize; ++i) data[i] = (unsigned char)i;
+    Hello h{(uint64_t)(uintptr_t)data, GetCurrentProcessId(), 0}; DWORD n{};
+    require(!!WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), &h, sizeof(h), &n, nullptr) && n == sizeof(h), "helper write");
+    return WaitForSingleObject((HANDLE)(uintptr_t)_strtoui64(finish_handle, nullptr, 10), 600000) == WAIT_OBJECT_0 ? 0 : 2;
+}
+
+// Find our helpers among ALL processes on the system, then open each one by PID.
+// The open calls ntdll!NtOpenProcess directly (OpenProcess(PROCESS_VM_READ, pid) is the
+// same syscall) so that its out-handle pointer is a long-lived variable: a probe on
+// NtOpenProcess remembers that pointer at entry and can dereference it any time later
+// to learn which handle the open produced. Through kernel32!OpenProcess the pointer
+// would be a stack local of kernelbase, reused as soon as OpenProcess returns.
+static void open_helpers(std::vector<Helper> &helpers) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    require(snap != INVALID_HANDLE_VALUE, "process snapshot");
+    std::vector<DWORD> found;
+    PROCESSENTRY32W pe{}; pe.dwSize = sizeof(pe);
+    for (BOOL more = Process32FirstW(snap, &pe); more; more = Process32NextW(snap, &pe))
+        if (pe.th32ParentProcessID == GetCurrentProcessId()) found.push_back(pe.th32ProcessID);
+    CloseHandle(snap);
+    for (auto &h : helpers) {
+        bool listed = false;
+        for (DWORD pid : found) listed = listed || pid == h.hello.pid;
+        require(listed, "helper " + std::to_string(h.hello.pid) + " not in the process list");
+    }
+    for (auto &h : helpers) {
+        // ntdll!NtOpenProcess(PHANDLE out, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID):
+        // what kernel32!OpenProcess(PROCESS_VM_READ, FALSE, pid) does, but with the
+        // out-handle pointing at h.read_handle, which lives as long as the helper.
+        ObjectAttributes oa{sizeof(oa)};
+        ClientId cid{(HANDLE)(uintptr_t)h.hello.pid, nullptr};
+        require(g_ntopen(&h.read_handle, PROCESS_VM_READ, &oa, &cid) >= 0 && h.read_handle, "NtOpenProcess helper");
+    }
+}
+
+// --- Gate -------------------------------------------------------------------------
+// One keystroke. Interactive console: raw mode, any key. Pipe/file: one byte.
+static bool wait_for_key() {
+    HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode = 0;
+    if (GetConsoleMode(in, &mode)) {
+        SetConsoleMode(in, mode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT));
+        for (;;) {
+            INPUT_RECORD r{}; DWORD got = 0;
+            if (!ReadConsoleInputA(in, &r, 1, &got)) return false;
+            if (got && r.EventType == KEY_EVENT && r.Event.KeyEvent.bKeyDown) break;
+        }
+        SetConsoleMode(in, mode);
+        return true;
+    }
+    char c; DWORD got = 0;
+    return ReadFile(in, &c, 1, &got, nullptr) && got == 1;
+}
+
+// --- Reads ------------------------------------------------------------------------
+struct ThreadResult { uint64_t success = 0, checksum = 0; std::string error; };
+
+static void read_worker(std::vector<Helper> &helpers, uint64_t t, uint64_t reads, ThreadResult &r) {
+    const uint64_t n = helpers.size();
+    for (uint64_t k = 0; k < reads; ++k) {
+        uint64_t i = t * reads + k;
+        Helper &h = helpers[(size_t)(i % n)];
+        unsigned offset = kStride * (unsigned)((i / n) % kOffsets);
+        unsigned char buffer[kReadSize]{}; SIZE_T bytes = 0;
+        LONG status = ReadThunk(h.read_handle, (const void *)(uintptr_t)(h.hello.address + offset),
+                                buffer, sizeof(buffer), &bytes);
+        bool ok = status >= 0 && bytes == sizeof(buffer);
+        for (unsigned j = 0; ok && j < sizeof(buffer); ++j) ok = buffer[j] == (unsigned char)(offset + j);
+        if (!ok) { r.error = "read " + std::to_string(i) + " failed"; return; }
+        ++r.success; r.checksum += buffer[0];
+    }
+}
+
+// W threads released together; returns the elapsed time of the read phase.
+static double run_reads(std::vector<Helper> &helpers, size_t threads, uint64_t reads,
+                        std::vector<ThreadResult> &results) {
+    results.assign(threads, {});
+    std::atomic<size_t> ready{0}; std::atomic<bool> go{false};
+    std::vector<std::thread> pool;
+    for (size_t t = 0; t < threads; ++t) pool.emplace_back([&, t] {
+        ready.fetch_add(1); while (!go.load(std::memory_order_acquire)) YieldProcessor();
+        read_worker(helpers, t, reads, results[t]);
+    });
+    while (ready.load() != threads) YieldProcessor();
+    LARGE_INTEGER f{}, begin{}, end{}; QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&begin);
+    go.store(true, std::memory_order_release);
+    for (auto &th : pool) th.join();
+    QueryPerformanceCounter(&end);
+    return (double)(end.QuadPart - begin.QuadPart) * 1e9 / (double)f.QuadPart;
+}
+
+int main(int argc, char **argv) try {
+    if (argc == 3 && !std::strcmp(argv[1], "--helper")) return helper_main(argv[2]);
+    size_t helper_count = 4, threads = std::thread::hardware_concurrency();
+    uint64_t reads = 1000;
+    bool existing_hook = false, wait = true;
+    std::string config = "reads_enabled=0\n";   // shipped config: the feature is OFF
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        auto next = [&]() -> const char * { require(i + 1 < argc, "missing option value"); return argv[++i]; };
+        if (a == "--helpers") helper_count = (size_t)_strtoui64(next(), nullptr, 10);
+        else if (a == "--threads") threads = (size_t)_strtoui64(next(), nullptr, 10);
+        else if (a == "--reads") reads = _strtoui64(next(), nullptr, 10);
+        else if (a == "--prehook") existing_hook = true;
+        else if (a == "--config") { config = next(); for (auto &c : config) if (c == ';') c = '\n'; }
+        else if (a == "--no-wait") wait = false;
+        else throw std::runtime_error("usage: probe_app [--helpers N] [--threads W] [--reads R] [--prehook] "
+                                      "[--config k=v;...] [--no-wait]");
+    }
+    require(helper_count >= 1 && helper_count <= 64 && threads >= 1 && threads <= 256 &&
+            reads >= 1 && reads <= 1000000000ULL, "helper/thread/read counts");
+
+    g_ntread = (NtRead)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtReadVirtualMemory");
+    g_ntopen = (NtOpen)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtOpenProcess");
+    require(g_ntread != nullptr && g_ntopen != nullptr, "ntdll exports");
+    if (existing_hook) {
+        prehook = safetyhook::create_inline((void *)&ReadThunk, (void *)&pre_read);
+        require(!!prehook, "install existing hook");
+    }
+
+    // 1. Helpers exist before the gate so an attaching tool can be told which one to
+    //    watch; they stay idle (never opened, never read) unless the flag gets turned on.
+    std::vector<Helper> helpers(helper_count);
+    for (size_t k = 0; k < helper_count; ++k) {
+        helpers[k].start();
+        std::printf("{\"kind\":\"helper\",\"index\":%llu,\"pid\":%lu,\"base\":%llu,\"size\":%u}\n",
+                    (unsigned long long)k, helpers[k].hello.pid,
+                    (unsigned long long)helpers[k].hello.address, kBufferSize);
+    }
+
+    // 2. Gate.
+    std::printf("{\"kind\":\"waiting\",\"pid\":%lu,\"helpers\":%llu}\n", GetCurrentProcessId(),
+                (unsigned long long)helper_count);
+    std::fflush(stdout);
+    if (wait) require(wait_for_key(), "keystroke");
+
+    // 3. Late-load the config library and parse the shipped config.
+    require(GetModuleHandleA("configparse.dll") == nullptr, "configparse.dll loaded before the gate");
+    HMODULE dll = LoadLibraryA((exe_directory() + "configparse.dll").c_str());
+    require(dll != nullptr, "load configparse.dll");
+    auto parse = (parse_config_fn)GetProcAddress(dll, "ParseConfig"); require(parse != nullptr, "ParseConfig");
+    parsed_config parsed{};
+    require(parse(config.c_str(), &parsed) == 1, "config parse");
+
+    // 4. The gated feature: open the helpers by PID and read them.
+    std::vector<ThreadResult> results;
+    double elapsed_ns = 0;
+    if (parsed.reads_enabled) {
+        open_helpers(helpers);
+        elapsed_ns = run_reads(helpers, threads, reads, results);
+    }
+    uint64_t success = 0, checksum = 0;
+    for (auto &r : results) { require(r.error.empty(), r.error); success += r.success; checksum += r.checksum; }
+    uint64_t hook_calls = prehook_calls.load();
+    prehook.reset();
+    std::printf("{\"kind\":\"app\",\"reads_enabled\":%u,\"helpers\":%llu,\"opened\":%llu,\"threads\":%llu,"
+                "\"reads_per_thread\":%llu,\"successful_reads\":%llu,\"checksum\":%llu,\"elapsed_ns\":%.0f,"
+                "\"prehook\":%s,\"prehook_calls\":%llu,\"configparse_base\":%llu}\n",
+                parsed.reads_enabled, (unsigned long long)helper_count,
+                (unsigned long long)(parsed.reads_enabled ? helper_count : 0), (unsigned long long)threads,
+                (unsigned long long)reads, (unsigned long long)success, (unsigned long long)checksum, elapsed_ns,
+                existing_hook ? "true" : "false", (unsigned long long)hook_calls,
+                (unsigned long long)(uintptr_t)dll);
+    std::fflush(stdout);
+    return 0;
+} catch (const std::exception &e) { std::fprintf(stderr, "probe_app: %s\n", e.what()); return 1; }

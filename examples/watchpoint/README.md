@@ -27,7 +27,7 @@ probe_add_symbol(s, "watch_target.exe+0x40a0", on_write, PROBE_HW | PROBE_WATCH_
 cmake -S . -B build-x64 -G "Visual Studio 17 2022" -A x64
 cmake --build build-x64 --config Release --target watch_driver watch_target
 $rva = (python scripts\site_rvas.py build-x64\Release\watch_target.map g_watched | ConvertFrom-Json).g_watched
-build-x64\Release\watch_driver.exe $rva --no-wait --threads 4 --writes 1000
+build-x64\Release\watch_driver.exe $rva -- build-x64\Release\watch_target.exe --no-wait --threads 4 --writes 1000
 ```
 
 Expected: the probe's hit count equals the number of writes (4 × 1000 = 4000), exactly.

@@ -1,38 +1,29 @@
 #!/usr/bin/env python3
-"""On-demand correctness gate for the gated scenario (plan v2) on the UHH probe_api.
+"""Quick end-to-end check of the gated scenario (a subset of regress.py).
 
     check_scenario.py --bin build-x64/Release [--threads W] [--reads R]
 
-Checks, against a built tree (works for both the -A x64 and -A Win32 outputs):
-- probe_app alone, shipped config: the read workload is gated off (0 reads), and the
-  config DLL is late-loaded (never a static dependency).
-- gated_config: the deferred configparse.dll+RVA flag probe (software breakpoint) is
+- probe_app alone, shipped config: the feature is off (0 opens, 0 reads) and the config
+  DLL is late-loaded (never a static dependency).
+- gated_config: the deferred flag breakpoint at configparse.dll!ParseConfig+0x16 is
   pending before the DLL loads, activates on load, and overrides the parsed flag
-  exactly once; the inline probe on ReadSite then logs every read, so its hit count
-  equals the total number of reads. Proves the breakpoint and inline backends mixed
-  in one session, and is the same check on x86 and x64.
+  exactly once; the inline probe on probe_app.exe!ReadThunk then logs every read, so
+  its hit count equals the total number of reads (breakpoint + inline in one session).
 """
 import argparse
 import json
 import subprocess
-import sys
 from pathlib import Path
 
 
 def run(cmd, timeout=180):
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    r = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, timeout=timeout)
     objs, probes = {}, []
     for line in r.stdout.splitlines():
         if line.startswith("{"):
             o = json.loads(line)
             (probes.append(o) if o.get("kind") == "probe" else objs.__setitem__(o["kind"], o))
     return r, objs, probes
-
-
-def rvas(map_file, *syms):
-    out = subprocess.check_output([sys.executable, str(Path(__file__).with_name("site_rvas.py")),
-                                   str(map_file), *syms], text=True)
-    return json.loads(out)
 
 
 def main():
@@ -43,26 +34,25 @@ def main():
     args = p.parse_args()
     b = args.bin.resolve()
     total = args.threads * args.reads
-    app, gated = str(b / "probe_app.exe"), str(b / "gated_config.exe")
-    flag_rva = rvas(b / "configparse.map", "ParsedFlagSite")["ParsedFlagSite"]
-    read_rva = rvas(b / "probe_app.map", "ReadSite")["ReadSite"]
+    app = b / "probe_app.exe"
+    workload = ["--no-wait", "--threads", args.threads, "--reads", args.reads]
 
     # 1. Gated off by the shipped config.
-    r, o, _ = run([app, "--no-wait", "--threads", str(args.threads), "--reads", str(args.reads), "--clean"])
+    r, o, _ = run([app, *workload])
     assert r.returncode == 0, r.stderr
-    assert o["app"]["reads_enabled"] == 0 and o["app"]["successful_reads"] == 0, o["app"]
-    print("PASS gated-off: shipped config runs 0 reads")
+    assert o["app"]["reads_enabled"] == 0 and o["app"]["opened"] == 0 and o["app"]["successful_reads"] == 0, o["app"]
+    print("PASS gated-off: shipped config runs 0 opens, 0 reads")
 
     # 2. Deferred flag breakpoint + inline read log, mixed in one session.
-    r, o, probes = run([gated, str(flag_rva), str(read_rva),
-                        "--no-wait", "--threads", str(args.threads), "--reads", str(args.reads), "--clean"])
+    r, o, probes = run([b / "gated_config.exe", "configparse.dll!ParseConfig+0x16", "probe_app.exe!ReadThunk",
+                        "--", app, *workload])
     assert r.returncode == 0, r.stderr + "\n" + r.stdout
     rep = o["probe_report"]
     assert rep["overrides"] == 1, rep
-    bp = next(x for x in probes if x["backend"] == "breakpoint")
-    inl = next(x for x in probes if x["backend"] == "inline")
-    assert bp["hits"] == 1, bp
-    assert inl["hits"] == total, inl
+    flag = next(x for x in probes if x["location"].startswith("configparse.dll"))
+    read = next(x for x in probes if x["location"] == "probe_app.exe!ReadThunk")
+    assert flag["backend"] == "breakpoint" and flag["hits"] == 1, flag
+    assert read["backend"] == "inline" and read["hits"] == total, read
     print(f"PASS deferred-activation: 1 override, inline hits == {total} reads "
           f"(breakpoint + inline mixed)")
     print("All scenario checks passed.")
