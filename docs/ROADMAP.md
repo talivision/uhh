@@ -117,6 +117,18 @@ identical source under every backend.
   - ✅ (3) Exceptions (C++, SEH, through a callback) unwinding across hooked frames
 - ✅ (9) Hot-patch `mov edi,edi` prologues (x86); 🔧 coexistence with Frida hooking the same function
 
+## Production readiness (user decisions 2026-11-05)
+- ⬜ [fan-out] Intel CET shadow stacks: test /CETCOMPAT targets on CET hardware (SafetyHook's resume path, inline set_reg(SP), call_func all use ret-to-pushed-address)
+- ⬜ [fan-out] Windows 11 VM on the Proxmox server, run the suite there too (later)
+- ⬜ [fan-out] Stability on real large apps (important): browsers / heavily multi-threaded / JIT processes under all backends
+- ⬜ [fan-out, Codex] Docs: quickstart, API reference, per-backend limitations table, troubleshooting
+- ❓ Raise the 32-inline-probe cap (fixed table of 32 agent thunks/request slots; 33rd refused) -- user to decide
+- ⬜ (lower) Follow child processes: brainstorm strategies and API design first
+- ⬜ (maybe) CI on GitHub Actions; (maybe) CMake package + versioned release zip
+- ⬜ (very last) Soak test: hours under load; handles/memory/threads flat
+- ✗ Controller-crash self-unhook (user: the analyst sees the controller died and restarts the target; not worth the cost)
+- ✗ Named-object hardening (user: unlikely; a clash fails loudly)
+
 ## Later
 - ⬜ x86 cumulative-session flakiness (possibly the same handle double-close; recheck)
 - ✅ PDB-only symbols (`module!InternalFunc`), Microsoft symbol server via dbghelp+symsrv and `_NT_SYMBOL_PATH`, export/function enumeration (`uhh_trace --list`) — engine by Codex, wired into the library; suite checks added
