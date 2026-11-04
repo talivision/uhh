@@ -27,10 +27,12 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
     set(APP_SITES_ASM src/app_sites_x86.asm)
     set(FLAG_ASM      src/configparse/flag_x86.asm)
     set(BREAKAGE_ASM  examples/breakage/hook_edge_x86.asm)
+    set(PARITY_ASM    examples/frida_parity/parity_sites_x86.asm)
 else()
     set(APP_SITES_ASM src/app_sites.asm)
     set(FLAG_ASM      src/configparse/flag.asm)
     set(BREAKAGE_ASM  examples/breakage/hook_edge_x64.asm)
+    set(PARITY_ASM    examples/frida_parity/parity_sites_x64.asm)
 endif()
 
 include(FetchContent)
@@ -57,6 +59,10 @@ target_link_options(probe_app PRIVATE "/MAP:$<TARGET_FILE_DIR:probe_app>/probe_a
 add_executable(hook_edge examples/breakage/hook_edge.c ${BREAKAGE_ASM})
 target_link_options(hook_edge PRIVATE "/MAP:$<TARGET_FILE_DIR:hook_edge>/hook_edge.map")
 
+# Frida-parity demo target: labelled sites exercised by frida_parity.
+add_executable(parity_target examples/frida_parity/parity_target.c ${PARITY_ASM})
+target_link_options(parity_target PRIVATE "/MAP:$<TARGET_FILE_DIR:parity_target>/parity_target.map")
+
 # --- UHH library: the locked probe_api. External native-bitness INT3 and injected
 #     SafetyHook mid-hooks. Builds for both -A x64 and -A Win32. ----------------
 add_library(probe_api STATIC src/probe/session.cpp)
@@ -66,10 +72,11 @@ target_link_libraries(probe_api PRIVATE Zydis)   # decode probe sites for displa
 add_library(probe_api_agent SHARED
     src/probe/agent.cpp
     examples/gated_config/callbacks.cpp
-    examples/breakage/breakage_driver.cpp)
+    examples/breakage/breakage_driver.cpp
+    examples/frida_parity/frida_parity.cpp)
 target_include_directories(probe_api_agent PRIVATE include examples/gated_config)
 target_link_libraries(probe_api_agent PRIVATE safetyhook)
-target_compile_definitions(probe_api_agent PRIVATE BREAKAGE_AGENT_ONLY)
+target_compile_definitions(probe_api_agent PRIVATE BREAKAGE_AGENT_ONLY FRIDA_PARITY_AGENT_ONLY)
 # Undecorated names for the __stdcall agent entries (x86 would otherwise export
 # _probe_agent_init@4; the controller resolves them by a fixed bare name).
 target_link_options(probe_api_agent PRIVATE "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/src/probe/agent.def")
@@ -93,6 +100,12 @@ target_include_directories(breakage_driver PRIVATE include)
 target_link_libraries(breakage_driver PRIVATE probe_api)
 add_dependencies(breakage_driver hook_edge probe_api_agent)
 
+# --- Example: frida_parity (Frida introspection demos on today's API) ----------
+add_executable(frida_parity examples/frida_parity/frida_parity.cpp)
+target_include_directories(frida_parity PRIVATE include)
+target_link_libraries(frida_parity PRIVATE probe_api)
+add_dependencies(frida_parity parity_target probe_api_agent)
+
 # --- Example: hardware data watchpoint (break on a memory WRITE; modifies no code) ---
 # Demonstrates the one thing inline/trampoline hooking cannot do — observe data access.
 add_executable(watch_target examples/watchpoint/watch_target.c)
@@ -102,7 +115,7 @@ target_include_directories(watch_driver PRIVATE include)
 target_link_libraries(watch_driver PRIVATE probe_api)
 add_dependencies(watch_driver watch_target)
 
-foreach(t probe_app configparse hook_edge probe_api probe_api_agent gated_config breakage_driver watch_target watch_driver)
+foreach(t probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver)
     target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 endforeach()
