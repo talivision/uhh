@@ -367,6 +367,10 @@ extern "C" int probe_add_cfg(probe_session *s, const char *location, probe_callb
     if (type == PROBE_INLINE && config_len > PROBE_AGENT_CONFIG_CAP) {
         set_error(s, "inline probe config exceeds the agent limit"); return 0;
     }
+    if (type == PROBE_HW) {                        // only 4 debug-register slots exist
+        size_t hw = 0; for (auto &pp : s->probes) if (pp->flags & PROBE_HW) ++hw;
+        if (hw >= 4) { set_error(s, "too many hardware-breakpoint probes (max 4 DR slots)"); return 0; }
+    }
     try {
         auto p = std::make_unique<Probe>();
         if (!parse_location(s, location, *p)) return 0;
@@ -791,6 +795,18 @@ extern "C" int probe_run(probe_session *s) {
             for (auto &p : s->probes) if (p->active && p->base == base) {
                 if (p->flags & PROBE_INLINE) {
                     set_error(s, "unloading a module with an active inline probe is unsupported"); ok = false;
+                } else if (p->flags & PROBE_HW) {
+                    // Fully release the hardware breakpoint: clear its DR on every thread,
+                    // free the slot, and drop the active count. A half-disarm (just
+                    // clearing active/address) leaks the DR slot and strands the physical
+                    // breakpoint on the unloaded address -> later slot exhaustion / crash.
+                    for (DWORD tid : s->threads) {
+                        HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+                        if (t) { set_dr_on_thread(t, p->dr_slot, 0, false); CloseHandle(t); }
+                    }
+                    if (p->dr_slot >= 0) s->dr_used &= (uint8_t)~(1u << p->dr_slot);
+                    if (s->hw_active > 0) --s->hw_active;
+                    p->active = false; p->base = p->address = 0; p->dr_slot = -1;
                 } else { p->active = false; p->base = p->address = 0; }
             }
             break;

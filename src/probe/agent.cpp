@@ -117,8 +117,15 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     c.regs.pc = sites[index];
     c.config = shared->requests[index].config_len ? shared->requests[index].config : nullptr;
     c.ops = &local_ops; c.tid = GetCurrentThreadId(); c.site = index; c.controller = &states[index];
-    callbacks[index](&c);
+    // Count the hit before the call so a faulting callback is still accounted, and run
+    // the callback under SEH so an access violation (or any exception) inside user code
+    // cannot take down the target. On a fault we skip register write-back, leaving the
+    // target's registers untouched (the callback behaves as a no-op mutation).
     InterlockedIncrement64(&shared->requests[index].hits);
+    bool callback_ok = true;
+    __try { callbacks[index](&c); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { callback_ok = false; }
+    if (!callback_ok) return;
 #if defined(_WIN64)
 #define COPY(a,b) native.a = c.regs.a;
     PROBE_GPRS(COPY)
