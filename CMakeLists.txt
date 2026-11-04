@@ -93,7 +93,16 @@ target_include_directories(breakage_driver PRIVATE include)
 target_link_libraries(breakage_driver PRIVATE probe_api)
 add_dependencies(breakage_driver hook_edge probe_api_agent)
 
-foreach(t probe_app configparse hook_edge probe_api probe_api_agent gated_config breakage_driver)
+# --- Example: hardware data watchpoint (break on a memory WRITE; modifies no code) ---
+# Demonstrates the one thing inline/trampoline hooking cannot do — observe data access.
+add_executable(watch_target examples/watchpoint/watch_target.c)
+target_link_options(watch_target PRIVATE "/MAP:$<TARGET_FILE_DIR:watch_target>/watch_target.map")
+add_executable(watch_driver examples/watchpoint/watch_driver.cpp)
+target_include_directories(watch_driver PRIVATE include)
+target_link_libraries(watch_driver PRIVATE probe_api)
+add_dependencies(watch_driver watch_target)
+
+foreach(t probe_app configparse hook_edge probe_api probe_api_agent gated_config breakage_driver watch_target watch_driver)
     target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 endforeach()

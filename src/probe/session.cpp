@@ -246,15 +246,19 @@ static bool decode_site(const unsigned char *bytes, size_t n, uint32_t &len,
     return true;
 }
 
-static bool set_dr_on_thread(HANDLE thread, int slot, uint64_t addr, bool enable) {
+// Program debug register `slot` for execute (rw=0,len=0) or a data watchpoint. rw:
+// 0=execute, 1=write, 3=read/write. len: 0=1,1=2,3=4,2=8 bytes (Intel DR7 LEN encoding).
+static bool set_dr_on_thread(HANDLE thread, int slot, uint64_t addr, bool enable,
+                             uint32_t rw = 0, uint32_t len = 0) {
     CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     if (!GetThreadContext(thread, &c)) return false;
     switch (slot) { case 0: c.Dr0 = addr; break; case 1: c.Dr1 = addr; break;
                     case 2: c.Dr2 = addr; break; case 3: c.Dr3 = addr; break; default: return false; }
-    DWORD64 ln = (DWORD64)1 << (slot * 2);                 // local-enable Ln
-    DWORD64 rwlen = (DWORD64)0xF << (16 + slot * 4);       // RWn/LENn; 0 = execute, 1 byte
+    DWORD64 ln = (DWORD64)1 << (slot * 2);                       // local-enable Ln
+    DWORD64 fieldmask = (DWORD64)0xF << (16 + slot * 4);         // this slot's RWn|LENn nibble
+    DWORD64 field = (DWORD64)(((len & 3u) << 2) | (rw & 3u)) << (16 + slot * 4);
     DWORD64 dr7 = c.Dr7;
-    if (enable) { dr7 |= ln; dr7 &= ~rwlen; } else { dr7 &= ~ln; }
+    if (enable) { dr7 &= ~fieldmask; dr7 |= ln | field; } else { dr7 &= ~ln; }
     c.Dr7 = dr7;
     return !!SetThreadContext(thread, &c);
 }
@@ -263,18 +267,28 @@ static bool set_dr_on_thread(HANDLE thread, int slot, uint64_t addr, bool enable
 // nothing to single-step. Set the DR on every current thread; new threads get it in
 // the CREATE_THREAD handler. Exact under multithreading for ANY instruction (incl.
 // control-flow/REP the displaced software path cannot handle), limited to 4 slots.
+// Translate the probe flags into the DR7 RW/LEN encoding: execute breakpoint by
+// default, or a data watchpoint (write / read+write) of one machine word.
+static void hw_rw_len(uint32_t flags, uint32_t &rw, uint32_t &len) {
+    if (flags & PROBE_WATCH_RW)          rw = 3;
+    else if (flags & PROBE_WATCH_WRITE)  rw = 1;
+    else { rw = 0; len = 0; return; }                 // execute breakpoint, 1 byte
+    len = 3;   // LEN=11 -> 4-byte (dword) watchpoint; the address must be dword-aligned
+}
+
 static bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
     if (p.rva > UINT64_MAX - base) { set_error(s, "probe address overflow"); return false; }
     uint64_t address = base + p.rva;
     int slot = -1;
     for (int i = 0; i < 4; ++i) if (!(s->dr_used & (1u << i))) { slot = i; break; }
     if (slot < 0) { set_error(s, "no free hardware breakpoint slot (max 4)"); return false; }
+    uint32_t rw = 0, len = 0; hw_rw_len(p.flags, rw, len);
     size_t tried = 0, set_ok = 0;
     for (DWORD tid : s->threads) {
         HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
         if (!t) continue;
         ++tried;
-        if (set_dr_on_thread(t, slot, address, true)) ++set_ok;
+        if (set_dr_on_thread(t, slot, address, true, rw, len)) ++set_ok;
         CloseHandle(t);
     }
     if (tried && !set_ok) {   // could not arm the DR on any thread -> the probe would never fire
@@ -282,8 +296,9 @@ static bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
     }
     s->dr_used |= (uint8_t)(1u << slot); ++s->hw_active;
     p.dr_slot = slot; p.base = base; p.address = address; p.active = true;
-    std::fprintf(stderr, "probe: active %s -> base=0x%llx addr=0x%llx (hw DR%d)\n",
-                 p.location.c_str(), (unsigned long long)base, (unsigned long long)address, slot);
+    std::fprintf(stderr, "probe: active %s -> base=0x%llx addr=0x%llx (hw DR%d, %s)\n",
+                 p.location.c_str(), (unsigned long long)base, (unsigned long long)address, slot,
+                 rw == 3 ? "watch rw" : rw == 1 ? "watch write" : "execute");
     return true;
 }
 
@@ -360,11 +375,15 @@ extern "C" int probe_add_cfg(probe_session *s, const char *location, probe_callb
     if (s->launched) { set_error(s, "probes must be added before launch"); return 0; }
     if (!callback) { set_error(s, "probe callback is null"); return 0; }
     constexpr uint32_t types = PROBE_BREAKPOINT | PROBE_INLINE | PROBE_HW;
-    constexpr uint32_t known = types | PROBE_AT_RETURN | PROBE_ALLOW_PREHOOKED | PROBE_FALLBACK_HW;
+    constexpr uint32_t known = types | PROBE_AT_RETURN | PROBE_ALLOW_PREHOOKED | PROBE_FALLBACK_HW
+                             | PROBE_WATCH_WRITE | PROBE_WATCH_RW;
     if (flags & ~known) { set_error(s, "unknown probe flags"); return 0; }
     uint32_t type = flags & types;
+    uint32_t watch = flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW);
     if ((type != PROBE_BREAKPOINT && type != PROBE_INLINE && type != PROBE_HW) || (flags & PROBE_AT_RETURN) ||
-        (flags & (PROBE_ALLOW_PREHOOKED | PROBE_FALLBACK_HW))) {
+        (flags & (PROBE_ALLOW_PREHOOKED | PROBE_FALLBACK_HW)) ||
+        (watch && type != PROBE_HW) ||                               // a watchpoint uses the DR/HW backend
+        watch == (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) {             // pick one access mode, not both
         set_error(s, "requested probe type/options are unsupported in this build");
         return 0;
     }
@@ -766,8 +785,10 @@ extern "C" int probe_run(probe_session *s) {
             s->threads.insert(event.dwThreadId);
             if (s->hw_active && event.u.CreateThread.hThread)     // new thread inherits the DRs
                 for (auto &p : s->probes)
-                    if (p->active && (p->flags & PROBE_HW))
-                        set_dr_on_thread(event.u.CreateThread.hThread, p->dr_slot, p->address, true);
+                    if (p->active && (p->flags & PROBE_HW)) {
+                        uint32_t rw = 0, len = 0; hw_rw_len(p->flags, rw, len);
+                        set_dr_on_thread(event.u.CreateThread.hThread, p->dr_slot, p->address, true, rw, len);
+                    }
             if (event.u.CreateThread.hThread) CloseHandle(event.u.CreateThread.hThread);
             break;
         case EXIT_THREAD_DEBUG_EVENT: {

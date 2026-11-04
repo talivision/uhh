@@ -19,7 +19,14 @@ enum probe_flags {
     PROBE_HW              = 1u << 2,
     PROBE_AT_RETURN       = 1u << 3,
     PROBE_ALLOW_PREHOOKED = 1u << 4,
-    PROBE_FALLBACK_HW     = 1u << 5
+    PROBE_FALLBACK_HW     = 1u << 5,
+    /* Hardware DATA watchpoints (PROBE_HW only): the callback fires when the probed
+       ADDRESS is written (or read+written). No code is modified and no execution is
+       hooked -- this observes DATA access, which inline/trampoline hooking cannot do.
+       The address is a data location (module+RVA of a variable) aligned to the word
+       size. Exactly one of WRITE/RW; absent = an ordinary execute breakpoint. */
+    PROBE_WATCH_WRITE     = 1u << 6,
+    PROBE_WATCH_RW        = 1u << 7
 };
 
 /* AX is the 32-bit EAX view: writes zero-extend into RAX. Other IDs expose the
