@@ -345,6 +345,16 @@ static bool resolve_inline(probe_session *s, Probe &p, uint64_t base) {
 static bool arm_module(probe_session *s, const std::string &module, uint64_t base) {
     for (auto &item : s->probes) {
         if (item->active || item->address || !iequals(item->module, module)) continue;
+        // A late-resolving inline probe (the gate is already released, so the target may
+        // call the site before the async agent install lands) with PROBE_FALLBACK_HW set
+        // becomes a hardware probe: that arms synchronously here (just debug registers —
+        // no in-target code, no loader lock, no race) and is exact. The callback is
+        // backend-agnostic, so it runs controller-side unchanged.
+        if ((item->flags & PROBE_INLINE) && (item->flags & PROBE_FALLBACK_HW) && s->gate_sent) {
+            item->flags = (item->flags & ~(uint32_t)PROBE_INLINE) | PROBE_HW;
+            std::fprintf(stderr, "probe: %s -> hardware fallback (late inline would race the first call)\n",
+                         item->location.c_str());
+        }
         bool ok = item->flags & PROBE_BREAKPOINT ? arm_breakpoint(s, *item, base)
                  : item->flags & PROBE_HW          ? arm_hw(s, *item, base)
                                                    : resolve_inline(s, *item, base);
@@ -381,7 +391,8 @@ extern "C" int probe_add_cfg(probe_session *s, const char *location, probe_callb
     uint32_t type = flags & types;
     uint32_t watch = flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW);
     if ((type != PROBE_BREAKPOINT && type != PROBE_INLINE && type != PROBE_HW) || (flags & PROBE_AT_RETURN) ||
-        (flags & (PROBE_ALLOW_PREHOOKED | PROBE_FALLBACK_HW)) ||
+        (flags & PROBE_ALLOW_PREHOOKED) ||                           // chain-through not implemented yet
+        ((flags & PROBE_FALLBACK_HW) && type != PROBE_INLINE) ||     // fallback only modifies an inline probe
         (watch && type != PROBE_HW) ||                               // a watchpoint uses the DR/HW backend
         watch == (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) {             // pick one access mode, not both
         set_error(s, "requested probe type/options are unsupported in this build");
