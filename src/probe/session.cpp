@@ -42,6 +42,11 @@ struct CallbackState {
 struct StepState {
     Probe *probe = nullptr;
     bool displaced = false;
+    // Captured at setup so single-step completion never dereferences the Probe*: a
+    // mid-step UNLOAD_DLL zeroes probe->address, which would otherwise land RIP at
+    // 0 + insn_len. site is the probe address (also the in-place re-arm target).
+    uint64_t site = 0;
+    uint32_t insn_len = 0;
 };
 
 struct probe_session {
@@ -204,6 +209,23 @@ static bool decode_site(const unsigned char *bytes, size_t n, uint32_t &len,
         insn.meta.category == ZYDIS_CATEGORY_CALL || insn.meta.category == ZYDIS_CATEGORY_RET ||
         insn.meta.category == ZYDIS_CATEGORY_COND_BR || insn.meta.category == ZYDIS_CATEGORY_UNCOND_BR) {
         displaced_ok = false; return true;            // control flow -> in-place fallback
+    }
+    // Flags-image / trap / privileged instructions can clear or expose the trap flag,
+    // or raise their own exception instead of the single-step, so out-of-line stepping
+    // misbehaves; route them to the in-place fallback.
+    switch (insn.mnemonic) {
+        case ZYDIS_MNEMONIC_POPF:  case ZYDIS_MNEMONIC_POPFD:  case ZYDIS_MNEMONIC_POPFQ:
+        case ZYDIS_MNEMONIC_PUSHF: case ZYDIS_MNEMONIC_PUSHFD: case ZYDIS_MNEMONIC_PUSHFQ:
+        case ZYDIS_MNEMONIC_STI:   case ZYDIS_MNEMONIC_CLI:
+        case ZYDIS_MNEMONIC_INT:   case ZYDIS_MNEMONIC_INT3:   case ZYDIS_MNEMONIC_INT1:
+        case ZYDIS_MNEMONIC_SYSCALL: case ZYDIS_MNEMONIC_SYSENTER:
+            displaced_ok = false; return true;
+        default: break;
+    }
+    // REP/REPE/REPNE string ops single-step one iteration at a time; stepped out-of-line
+    // we would force RIP past after a single pass and truncate the operation.
+    if (insn.attributes & (ZYDIS_ATTRIB_HAS_REP | ZYDIS_ATTRIB_HAS_REPE | ZYDIS_ATTRIB_HAS_REPNE)) {
+        displaced_ok = false; return true;
     }
     // RIP-relative memory operand (x64): record the disp32 so the copy can be retargeted.
     for (int i = 0; i < insn.operand_count; ++i) {
@@ -419,23 +441,33 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         std::fprintf(stderr, "EV code=0x%lx tid=%lu addr=0x%llx step=%d probe=%d\n",
                      (unsigned long)code, (unsigned long)event.dwThreadId,
                      (unsigned long long)address, step != stepping.end(), probe != nullptr);
-    if ((code != EXCEPTION_SINGLE_STEP || step == stepping.end()) && !probe) return true;
+    if ((code != EXCEPTION_SINGLE_STEP || step == stepping.end()) && !probe) {
+        // An unexpected exception (a fault in the out-of-line copy, or any app
+        // exception) reached a thread still mid-step. Drop its stale StepState so a
+        // later stray single-step can't teleport it to site+insn_len; re-arm the byte
+        // if the step was in-place. Pass the exception through unchanged.
+        if (step != stepping.end()) {
+            if (!step->second.displaced) patch(s->pi.hProcess, step->second.site, 0xcc);
+            stepping.erase(step);
+        }
+        return true;
+    }
     HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
     if (!thread) { set_error(s, win_error("open event thread")); return false; }
     CONTEXT native{}; native.ContextFlags = CONTEXT_ALL;
     if (code == EXCEPTION_SINGLE_STEP && step != stepping.end()) {
-        Probe *sp = step->second.probe; bool ok = !!GetThreadContext(thread, &native);
+        bool ok = !!GetThreadContext(thread, &native);
         if (step->second.displaced) {
             // The instruction ran out-of-line; the INT3 was never lifted, so there is
             // nothing to re-arm — just land on the instruction after the probe site.
-            uint64_t next = sp->address + sp->insn_len;
+            uint64_t next = step->second.site + step->second.insn_len;
 #if defined(_WIN64)
             native.Rip = next;
 #else
             native.Eip = (DWORD)next;
 #endif
         } else if (ok) {
-            ok = patch(s->pi.hProcess, sp->address, 0xcc);   // in-place: re-arm the byte
+            ok = patch(s->pi.hProcess, step->second.site, 0xcc);   // in-place: re-arm the byte
         }
         native.EFlags &= ~0x100u;
         if (ok) ok = !!SetThreadContext(thread, &native);
@@ -518,7 +550,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         std::fprintf(stderr, "  setup tid=%lu displaced=%d scratch=0x%llx rip=0x%llx\n",
                      (unsigned long)event.dwThreadId, displaced,
                      (unsigned long long)scratch_addr, (unsigned long long)(displaced ? scratch_addr : probe->address));
-    stepping[event.dwThreadId] = StepState{probe, displaced};
+    stepping[event.dwThreadId] = StepState{probe, displaced, probe->address, probe->insn_len};
     disposition = DBG_CONTINUE; return true;
 }
 
@@ -637,7 +669,7 @@ extern "C" int probe_run(probe_session *s) {
             auto it = stepping.find(event.dwThreadId);
             if (ok && it != stepping.end()) {
                 // Only the in-place path lifted the byte; a displaced step left it armed.
-                if (!it->second.displaced) ok = patch(s->pi.hProcess, it->second.probe->address, 0xcc);
+                if (!it->second.displaced) ok = patch(s->pi.hProcess, it->second.site, 0xcc);
                 stepping.erase(it);
                 if (!ok) set_error(s, win_error("re-arm probe after thread exit"));
             }
