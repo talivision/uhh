@@ -196,7 +196,30 @@ static double run_reads(std::vector<Helper> &helpers, size_t threads, uint64_t r
     return (double)(end.QuadPart - begin.QuadPart) * 1e9 / (double)f.QuadPart;
 }
 
+// Diagnostics for instrumentation tests: if anything ever reaches this process as an
+// unhandled exception (e.g. a debug trap left behind by a detaching tool), say exactly
+// what and where before the process dies.
+static LONG WINAPI report_unhandled(EXCEPTION_POINTERS *ep) {
+    const CONTEXT *c = ep->ContextRecord;
+#if defined(_WIN64)
+    unsigned long long ip = c->Rip;
+#else
+    unsigned long long ip = c->Eip;
+#endif
+    char buf[512];
+    int n = std::snprintf(buf, sizeof(buf), "{\"kind\":\"unhandled\",\"code\":\"0x%08lx\",\"address\":\"0x%llx\",\"ip\":\"0x%llx\","
+                 "\"tid\":%lu,\"eflags\":\"0x%lx\",\"dr6\":\"0x%llx\",\"dr7\":\"0x%llx\",\"dr0\":\"0x%llx\"}\n",
+                 (unsigned long)ep->ExceptionRecord->ExceptionCode,
+                 (unsigned long long)(uintptr_t)ep->ExceptionRecord->ExceptionAddress, ip,
+                 (unsigned long)GetCurrentThreadId(), (unsigned long)c->EFlags,
+                 (unsigned long long)c->Dr6, (unsigned long long)c->Dr7, (unsigned long long)c->Dr0);
+    DWORD w = 0;                                        // straight to the handle: no CRT buffering
+    if (n > 0) WriteFile(GetStdHandle(STD_ERROR_HANDLE), buf, (DWORD)n, &w, nullptr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 int main(int argc, char **argv) try {
+    SetUnhandledExceptionFilter(report_unhandled);
     if (argc == 3 && !std::strcmp(argv[1], "--helper")) return helper_main(argv[2]);
     size_t helper_count = 4, threads = std::thread::hardware_concurrency();
     uint64_t reads = 1000;

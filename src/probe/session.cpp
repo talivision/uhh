@@ -123,12 +123,14 @@ struct probe_session {
     std::vector<HANDLE> held;                  // threads held until inline installs confirm
     ULONGLONG held_since = 0;                       // slots we have ever owned (stale-#DB filter)
     std::unordered_set<uint64_t> retired_bps;  // removed INT3 sites (stale-hit filter)
+    std::unordered_set<uint64_t> retired_hw;   // addresses of released hardware probes (stale #DB filter)
     int hw_active = 0;
     bool launched = false, ran = false, exited = false, gate_sent = false;
     bool attached = false;                     // probe_attach: detach (not kill) on close
     std::atomic<bool> stop_requested{false};   // probe_close from another thread while probe_run runs
     std::atomic<bool> running{false};          // probe_run is executing (on some thread)
     bool detached = false;
+    DWORD debug_tid = 0;                       // the thread that launched/attached: owns the debug object
     DWORD in_call_tid = 0;                     // thread currently running a call_func callee
     bool skip_continue = false;                // call_func already continued the current event
     uint64_t call_trap = 0;                    // INT3 the callee returns into
@@ -461,6 +463,7 @@ static bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
         set_error(s, win_error("set hardware breakpoint on target threads")); return false;
     }
     s->dr_used |= (uint8_t)(1u << slot); s->dr_ever |= (uint8_t)(1u << slot); ++s->hw_active;
+    s->retired_hw.erase(address);
     p.dr_slot = slot; p.base = base; p.address = address; p.active = true;
     std::fprintf(stderr, "probe: active %s -> base=0x%llx addr=0x%llx (hw DR%d, %s)\n",
                  p.location.c_str(), (unsigned long long)base, (unsigned long long)address, slot,
@@ -1032,6 +1035,12 @@ static bool check_flags(probe_session *s, uint32_t flags, bool allow_inline) {
     if (type == PROBE_HW && hw_in_use(s) >= 4) {
         set_error(s, "too many hardware probes (max 4 DR slots)"); return false;
     }
+    if (type == PROBE_INLINE) {                            // the agent has a fixed number of hook slots
+        size_t inl = 0; for (auto &pp : s->probes) if ((pp->flags & PROBE_INLINE) && !pp->retired) ++inl;
+        if (inl >= PROBE_AGENT_MAX_PROBES) {
+            set_error(s, "too many inline probes (max " + std::to_string(PROBE_AGENT_MAX_PROBES) + ")"); return false;
+        }
+    }
     return true;
 }
 
@@ -1267,6 +1276,7 @@ static bool same_bitness(probe_session *s, HANDLE process);
 extern "C" int probe_launch(probe_session *s, char *const argv[]) {
     if (!s || !argv || !argv[0]) { if (s) set_error(s, "launch argv is empty"); return 0; }
     if (s->launched) { set_error(s, "session already launched"); return 0; }
+    s->error.clear();          // a refused probe_add already reported itself (returned 0)
     try {
         std::string command;
         for (size_t i = 0; argv[i]; ++i) { if (i) command += ' '; command += quote_arg(argv[i]); }
@@ -1299,6 +1309,7 @@ extern "C" int probe_launch(probe_session *s, char *const argv[]) {
             return 0;
         }
         s->launched = true;
+        s->debug_tid = GetCurrentThreadId();
         { std::string which; s->sym_ready = uhh_sym::init(s->pi.hProcess, which);
           std::fprintf(stderr, "probe: symbols via %s%s\n", which.c_str(), uhh_sym::has_symbol_server() ? " (symbol server capable)" : ""); }
         if (!create_agent_channel(s) || (!has_inline(s) && !release_gate(s))) {
@@ -1323,6 +1334,7 @@ static bool same_bitness(probe_session *s, HANDLE process) {
 extern "C" int probe_attach(probe_session *s, uint32_t pid) {
     if (!s) return 0;
     if (s->launched) { set_error(s, "session already launched"); return 0; }
+    s->error.clear();          // a refused probe_add already reported itself (returned 0)
     s->pi.hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
     if (!s->pi.hProcess) { set_error(s, win_error("open target process")); return 0; }
     if (!same_bitness(s, s->pi.hProcess)) { CloseHandle(s->pi.hProcess); s->pi.hProcess = nullptr; return 0; }
@@ -1330,6 +1342,7 @@ extern "C" int probe_attach(probe_session *s, uint32_t pid) {
         set_error(s, win_error("attach debugger")); CloseHandle(s->pi.hProcess); s->pi.hProcess = nullptr; return 0;
     }
     DebugSetProcessKillOnExit(FALSE);              // our exit must never take the target down
+    s->debug_tid = GetCurrentThreadId();
     s->pi.dwProcessId = pid;
     s->attached = true; s->launched = true; s->gate_sent = true;
     { std::string which; s->sym_ready = uhh_sym::init(s->pi.hProcess, which); }
@@ -1347,7 +1360,19 @@ static void snapshot_pids(const char *name, std::unordered_set<DWORD> &out, DWOR
     for (BOOL more = Process32FirstW(snap, &pe); more; more = Process32NextW(snap, &pe)) {
         if (_wcsicmp(pe.szExeFile, wname)) continue;
         out.insert(pe.th32ProcessID);
-        if (newest_new && exclude && !exclude->count(pe.th32ProcessID)) *newest_new = pe.th32ProcessID;
+        if (newest_new && exclude && !exclude->count(pe.th32ProcessID)) {
+            // Several new instances can appear in one snapshot (e.g. the target and the
+            // helpers it spawns with the same image name): take the EARLIEST created.
+            auto created = [](DWORD pid) -> ULONGLONG {
+                HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+                FILETIME c{}, e{}, k{}, u{};
+                ULONGLONG t = ~0ull;
+                if (h && GetProcessTimes(h, &c, &e, &k, &u)) t = ((ULONGLONG)c.dwHighDateTime << 32) | c.dwLowDateTime;
+                if (h) CloseHandle(h);
+                return t;
+            };
+            if (!*newest_new || created(pe.th32ProcessID) < created(*newest_new)) *newest_new = pe.th32ProcessID;
+        }
     }
     CloseHandle(snap);
 }
@@ -1405,6 +1430,17 @@ static void detach(probe_session *s) {
             }
         }
     }
+    // From here no target thread may run until the debugger is gone: a thread could hit an
+    // INT3 or debug register just before it is removed, and an event still queued at
+    // DebugActiveProcessStop would reach the target as an unhandled exception.
+    std::vector<HANDLE> frozen;
+    for (DWORD tid : s->threads) {
+        HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT |
+                              THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+        if (!t) continue;
+        if (SuspendThread(t) == (DWORD)-1) { CloseHandle(t); continue; }
+        frozen.push_back(t);
+    }
     for (auto &p : s->probes) {
         if (!p->active) continue;
         if (p->flags & PROBE_BREAKPOINT) {
@@ -1414,11 +1450,101 @@ static void detach(probe_session *s) {
             release_hw(s, *p);
         }
     }
-    // Let in-flight breakpoint hits rewind and mid-step threads land before letting go.
-    ULONGLONG until = GetTickCount64() + 2000;
-    do { pump(s, 50); } while (!s->exited && !s->stepping.empty() && GetTickCount64() < until);
+    // Drain everything already queued: stale INT3 hits are rewound onto the restored
+    // instruction, stale #DBs are swallowed, finished steps land. (Continuing an event of
+    // a suspended thread leaves it suspended.)
+    // Let the threads RUN while draining: a thread can be caught (frozen) between raising
+    // an exception and its delivery to the debugger -- on WOW64 the 32-bit exception is
+    // first processed by the 64-bit layer in user mode -- and such an event would only
+    // surface after we let go. With every probe already removed nothing new can trap, so
+    // run until the queue has been quiet for 200 ms: everything in flight lands here.
+    for (HANDLE t : frozen) ResumeThread(t);
+    int drained_logged = 0;
+    for (int guard = 0, quiet = 0; guard < 100000 && !s->exited && quiet < 4; ++guard) {
+        DEBUG_EVENT ev{};
+        if (!WaitForDebugEvent(&ev, 50)) { ++quiet; continue; }
+        quiet = 0;
+        if (ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT && drained_logged < 24) {
+            ++drained_logged;
+            std::fprintf(stderr, "probe: detach-drain tid=%lu code=0x%lx addr=0x%llx first=%lu\n",
+                         (unsigned long)ev.dwThreadId, (unsigned long)ev.u.Exception.ExceptionRecord.ExceptionCode,
+                         (unsigned long long)(uintptr_t)ev.u.Exception.ExceptionRecord.ExceptionAddress,
+                         (unsigned long)ev.u.Exception.dwFirstChance);
+        }
+        DWORD disposition = DBG_CONTINUE;
+        dispatch_event(s, ev, disposition);
+        if (s->skip_continue) { s->skip_continue = false; continue; }
+        ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, disposition);
+    }
+    for (HANDLE t : frozen) SuspendThread(t);                // freeze again for the fix-ups below
+    // A thread still mid single-step: put it on the real instruction stream (the INT3 is
+    // gone) with the trap flag clear.
+    for (auto &kv : s->stepping) {
+        HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, kv.first);
+        CONTEXT w{}; w.ContextFlags = CONTEXT_CONTROL;
+        if (t && GetThreadContext(t, &w)) {
+#if defined(_WIN64)
+            uint64_t ip = w.Rip;
+#else
+            uint64_t ip = w.Eip;
+#endif
+            if (kv.second.displaced && kv.second.scratch && ip >= kv.second.scratch &&
+                ip <= kv.second.scratch + kv.second.insn_len)
+                ip = kv.second.site + (ip - kv.second.scratch);     // not yet run -> site; run -> site+len
+#if defined(_WIN64)
+            w.Rip = ip;
+#else
+            w.Eip = (DWORD)ip;
+#endif
+            w.EFlags &= ~0x100u;
+            SetThreadContext(t, &w);
+        }
+        if (t) CloseHandle(t);
+    }
+    s->stepping.clear();
+    // Final pass, after every queued event has been continued: continuing an event can
+    // restore the debug registers captured when the exception was raised. Clear our DR
+    // slots and the trap flag on every frozen thread one last time, right before letting go.
+    std::string report_tids;
+    for (HANDLE t : frozen) {
+        CONTEXT w{}; w.ContextFlags = CONTEXT_DEBUG_REGISTERS | CONTEXT_CONTROL;
+        BOOL got = FALSE; DWORD why = 0;
+        for (int attempt = 0; attempt < 200 && !(got = GetThreadContext(t, &w)); ++attempt) {
+            why = GetLastError();
+            DWORD code = 0;
+            if (GetExitCodeThread(t, &code) && code != STILL_ACTIVE) break;   // exited: nothing to clear
+            Sleep(1);                                                           // transient: retry
+        }
+        if (!got) {
+            DWORD code = 0;
+            bool gone = GetExitCodeThread(t, &code) && code != STILL_ACTIVE;
+            if (!gone) report_tids += " " + std::to_string(GetThreadId(t)) + ":getfail=" + std::to_string(why);
+            continue;
+        }
+        for (int slot = 0; slot < 4; ++slot) {
+            if (!(s->dr_ever & (1u << slot))) continue;
+            w.Dr7 &= ~((DWORD64)3 << (slot * 2)) & ~((DWORD64)0xF << (16 + slot * 4));
+            switch (slot) { case 0: w.Dr0 = 0; break; case 1: w.Dr1 = 0; break; case 2: w.Dr2 = 0; break; default: w.Dr3 = 0; }
+        }
+        w.Dr6 = 0;
+        w.EFlags &= ~0x100u;
+        BOOL set_ok = SetThreadContext(t, &w);
+        CONTEXT v{}; v.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        GetThreadContext(t, &v);
+        if (!set_ok || (v.Dr7 & 0xFF))
+            report_tids += " " + std::to_string(GetThreadId(t)) + ":dr7=" + std::to_string((unsigned long long)v.Dr7) +
+                           (set_ok ? "" : ":setfail");
+    }
+    {   // threads the debugger knows about but could not freeze
+        std::unordered_set<DWORD> fz;
+        for (HANDLE t : frozen) fz.insert(GetThreadId(t));
+        for (DWORD tid : s->threads) if (!fz.count(tid)) report_tids += " " + std::to_string(tid) + ":notfrozen";
+    }
+    std::fprintf(stderr, "probe: detach: %zu thread(s) frozen;%s\n", frozen.size(),
+                 report_tids.empty() ? " all clean" : report_tids.c_str());
     stop_drainer(s);
     if (!s->exited) DebugActiveProcessStop(s->pi.dwProcessId);
+    for (HANDLE t : frozen) { ResumeThread(t); CloseHandle(t); }
     std::fprintf(stderr, "probe: detached from pid %lu\n", (unsigned long)s->pi.dwProcessId);
 }
 
@@ -1471,6 +1597,7 @@ static uint64_t thread_scratch(probe_session *s, DWORD tid, uint64_t site) {
 // Fully release a hardware probe: clear its DR on every thread and free the slot.
 static void release_hw(probe_session *s, Probe &p) {
     if (p.dr_slot < 0) return;
+    if (p.address) s->retired_hw.insert(p.address);
     for (DWORD tid : s->threads) {
         HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
         if (t) { set_dr_on_thread(t, p.dr_slot, 0, false); CloseHandle(t); }
@@ -1614,6 +1741,10 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
                              std::unordered_map<DWORD, StepState> &stepping,
                              bool &initial_break, DWORD &disposition) {
     auto &ex = event.u.Exception.ExceptionRecord; DWORD code = ex.ExceptionCode;
+    // A 32-bit (WOW64) target's traps can arrive in their WOW64 form; they are the same
+    // events as far as the probes are concerned.
+    if (code == 0x4000001Eu /*STATUS_WX86_SINGLE_STEP*/) code = EXCEPTION_SINGLE_STEP;
+    else if (code == 0x4000001Fu /*STATUS_WX86_BREAKPOINT*/) code = EXCEPTION_BREAKPOINT;
     disposition = DBG_EXCEPTION_NOT_HANDLED;
     // The loader's initial breakpoint -- but only if it is not one of OUR INT3s: a probe
     // can fire during loader initialisation (e.g. ntdll!NtCreateFile from the shim engine),
@@ -1653,6 +1784,24 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         bool handled = false;
         if (!handle_hw(s, event, handled)) return false;
         if (handled) { disposition = DBG_CONTINUE; return true; }   // else fall through (not our DR)
+        // A trap at the address of a hardware probe we have RELEASED, raised before the
+        // release reached this thread (its debug status no longer names the slot): ours,
+        // stale. Clear our slots on the thread, step over with RF, and swallow it.
+        if (s->retired_hw.count(address) && !probe_at(s, address)) {
+            HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
+            CONTEXT w{}; w.ContextFlags = CONTEXT_DEBUG_REGISTERS | CONTEXT_CONTROL;
+            if (t && GetThreadContext(t, &w)) {
+                for (int slot = 0; slot < 4; ++slot) {
+                    if (!(s->dr_ever & (1u << slot)) || (s->dr_used & (1u << slot))) continue;   // keep live probes
+                    w.Dr7 &= ~((DWORD64)3 << (slot * 2)) & ~((DWORD64)0xF << (16 + slot * 4));
+                }
+                w.Dr6 = 0;
+                w.EFlags |= 0x10000u;                                  // RF: run the instruction once
+                SetThreadContext(t, &w);
+            }
+            if (t) CloseHandle(t);
+            disposition = DBG_CONTINUE; return true;
+        }
     }
     if (trace_enabled() && code == EXCEPTION_ACCESS_VIOLATION && ex.NumberParameters >= 2) {
         unsigned char around[24] = {0}; size_t got = 0;
@@ -2162,6 +2311,11 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
 extern "C" int probe_run(probe_session *s) {
     if (!s || !s->launched) { if (s) set_error(s, "session is not launched"); return 0; }
     if (s->ran) { set_error(s, "session already ran"); return 0; }
+    if (s->debug_tid && s->debug_tid != GetCurrentThreadId()) {
+        // Windows binds the debug object to the thread that created the process or attached.
+        set_error(s, "probe_run must be called on the thread that called probe_launch/probe_attach");
+        return 0;
+    }
     s->ran = true;
     s->running = true;
     DEBUG_EVENT event{};

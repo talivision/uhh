@@ -692,7 +692,7 @@ def check_sidefx(iters=1000, threads=4):
             r, o = run([d, "--backend", bk, "--", t, "--iters", iters, "--threads", threads], timeout=600)
             tg = next((x for x in o if x.get("kind") == "target"), {})
             rep, pr = report(o), next(iter(probes(o)), {})
-            keys = ("gpr_ok", "xmm_ok", "ymm_upper_ok", "mxcsr_ok", "df_ok", "x87cw_ok", "lasterror_ok")
+            keys = ("gpr_ok", "xmm_ok", "ymm_upper_ok", "mxcsr_ok", "df_ok", "arith_flags_ok", "x87cw_ok", "lasterror_ok")
             ok = (r.returncode == 0 and all(tg.get(k) == calls for k in keys) and pr.get("backend") == bk and
                   pr.get("hits") == calls and rep.get("log_dropped") == 0 and rep.get("app_exit") == 0 and
                   rep.get("error") is None)
@@ -700,6 +700,24 @@ def check_sidefx(iters=1000, threads=4):
                    f" below_sp={tg.get('below_sp_ok')} hits={pr.get('hits')}/{calls} backend={pr.get('backend')}")
         except Exception as e:
             record(name, False, repr(e))
+
+
+def lines_until(proc, marker, timeout):
+    """Read a child's stdout lines until one contains marker (or timeout). Helper processes
+    may inherit the pipe, so never wait for EOF."""
+    import threading
+    got, done = [], threading.Event()
+
+    def reader():
+        for raw in iter(proc.stdout.readline, b""):
+            line = raw.decode(errors="replace")
+            got.append(line)
+            if marker in line:
+                break
+        done.set()
+    threading.Thread(target=reader, daemon=True).start()
+    done.wait(timeout)
+    return got
 
 
 def check_detach():
@@ -733,9 +751,11 @@ def check_detach():
             time.sleep(1.0)                                      # attach + install
             target.stdin.write(b"\n"); target.stdin.flush()
             out, err = tracer.communicate(timeout=120)
-            rest = target.stdout.read().decode(errors="replace")
-            target.wait(timeout=600)
-            tobjs = [json.loads(l) for l in rest.splitlines() if l.strip().startswith("{")]
+            rest = lines_until(target, '"kind":"app"', 600)
+            target.wait(timeout=120)
+            terr = target.stderr.read().decode(errors="replace") if target.returncode != 0 else ""
+            unhandled = [l for l in terr.splitlines() if '"unhandled"' in l][:2]
+            tobjs = [json.loads(l) for l in rest if l.strip().startswith("{")]
             res = next((o for o in tobjs if o.get("kind") == "app"), {})
             objs = [json.loads(l) for l in out.splitlines() if l.startswith("{")]
             pr = next((o for o in objs if o.get("kind") == "probe"), {})
@@ -745,7 +765,8 @@ def check_detach():
                   res.get("checksum") == base.get("checksum"))
             record(name, ok, f"hits_before_detach={pr.get('hits')}/{total} detached={detached} exit={target.returncode} "
                              f"reads={res.get('successful_reads')} checksum_same={res.get('checksum') == base.get('checksum')}"
-                             + ("" if ok else " stderr=" + " | ".join(err.strip().splitlines()[-4:])))
+                             + ("" if ok else f" target_unhandled={unhandled} detach_line=" +
+                                " | ".join(l for l in err.strip().splitlines() if "detach" in l)[:1200]))
         except Exception as e:
             record(name, False, repr(e))
         finally:
@@ -795,15 +816,28 @@ def check_attach_new():
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         time.sleep(2.0)                                          # attach lands while it waits at its gate
         target.stdin.write(b"\n"); target.stdin.flush()
-        target.wait(timeout=120)
-        out, err = tracer.communicate(timeout=120)
+        t_app = time.time()
+        lines_until(target, '"kind":"app"', 120)                 # keep its pipe drained
+        t_app = time.time() - t_app
+        try:
+            out, err = tracer.communicate(timeout=180)           # returns when the target exits
+        except subprocess.TimeoutExpired:
+            tracer.kill(); out, err = tracer.communicate()
+        try:
+            target.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            pass
+        err = (err or "") + f" | secs_to_app_line={t_app:.1f}"
         m = re.search(r"new probe_app\.exe pid (\d+)", err or "")
         objs = [json.loads(l) for l in out.splitlines() if l.startswith("{")]
         pr = next((o for o in objs if o.get("kind") == "probe"), {})
         ok = (m is not None and int(m.group(1)) == target.pid and pr.get("hits") == threads * reads and
               target.returncode == 0)
+        if not ok:
+            err = f"target_rc={target.returncode} | " + (err or "")
         record("attach-new", ok, f"attached_pid={m.group(1) if m else None} target_pid={target.pid} "
-                                 f"decoy_pid={decoy.pid} hits={pr.get('hits')}/{threads * reads}")
+                                 f"decoy_pid={decoy.pid} hits={pr.get('hits')}/{threads * reads}"
+                                 + ("" if ok else " stderr=" + " | ".join((err or "").strip().splitlines()[:8])))
     except Exception as e:
         record("attach-new", False, repr(e))
     finally:
@@ -816,6 +850,86 @@ def check_attach_new():
         record("attach-new-timeout", ok, f"rc={r.returncode}")
     except Exception as e:
         record("attach-new-timeout", False, repr(e))
+
+
+def check_refusals(calls=2000):
+    """Unsupported/excess probes are refused cleanly (0 + error) and do not disturb the
+    rest; 4 hardware probes on one function (the debug-register limit) each count every
+    call exactly."""
+    d, t = exe("refusal_driver.exe"), exe("hitcost_target.exe")
+    if not d or not t:
+        return skip("refusals", "refusal_driver/hitcost_target missing")
+    try:
+        _, o = run([d, "--", t, "--calls", calls, "--threads", 1], timeout=300)
+        r = next((x for x in o if x.get("kind") == "refusals"), {})
+        ok = (r.get("at_return") == 0 and r.get("inline_once") == 0 and r.get("two_types") == 0 and
+              r.get("watch_on_bp") == 0 and r.get("inline33") == 0 and r.get("hw4") == 1 and r.get("hw5") == 0 and
+              r.get("hits") == [calls] * 4 and r.get("run_ok") == 1)
+        record("refusals", ok, json.dumps(r))
+    except Exception as e:
+        record("refusals", False, repr(e))
+
+
+def pe_export_bytes(path, name, n=8):
+    """First n bytes of an exported function, read from the DLL FILE (no loading)."""
+    import struct
+    data = Path(path).read_bytes()
+    pe = struct.unpack_from("<I", data, 0x3C)[0]
+    nsec = struct.unpack_from("<H", data, pe + 6)[0]
+    opt = pe + 24
+    magic = struct.unpack_from("<H", data, opt)[0]
+    dd = opt + (96 if magic == 0x10B else 112)
+    exp_rva = struct.unpack_from("<I", data, dd)[0]
+    secs = pe + 24 + struct.unpack_from("<H", data, pe + 20)[0]
+
+    def off(rva):
+        for i in range(nsec):
+            vs, va, raw_sz, raw = struct.unpack_from("<IIII", data, secs + 40 * i + 8)
+            if va <= rva < va + raw_sz:                  # file-backed part of the section only
+                return raw + (rva - va)
+        return None
+    e = off(exp_rva)
+    nfun, nnames, afun, anames, aords = struct.unpack_from("<IIIII", data, e + 20)
+    for i in range(nnames):
+        nm_rva = struct.unpack_from("<I", data, off(anames) + 4 * i)[0]
+        o = off(nm_rva)
+        nm = data[o:data.index(b"\0", o)].decode()
+        if nm == name:
+            ordinal = struct.unpack_from("<H", data, off(aords) + 2 * i)[0]
+            frva = struct.unpack_from("<I", data, off(afun) + 4 * ordinal)[0]
+            return data[off(frva):off(frva) + n]
+    return None
+
+
+def check_hotpatch_prologue():
+    """x86 system DLL functions begin with the 2-byte hot-patch prologue `mov edi,edi`
+    (8B FF). An inline probe there must work: KernelBase!CreateFileW in the shipped 32-bit
+    curl.exe, args logged correctly, curl unaffected. (x86 builds only.)"""
+    t = exe("uhh_trace.exe")
+    if not t:
+        return skip("hotpatch", "uhh_trace missing")
+    import struct
+    data = Path(t).read_bytes()
+    machine = struct.unpack_from("<H", data, struct.unpack_from("<I", data, 0x3C)[0] + 4)[0]
+    if machine != 0x14C:
+        return skip("hotpatch-prologue", "x86-only (32-bit system DLLs carry the hot-patch prologue)")
+    kb = Path(r"C:\Windows\SysWOW64\KernelBase.dll")
+    curl = Path(r"C:\Windows\SysWOW64\curl.exe")
+    if not kb.exists() or not curl.exists():
+        return skip("hotpatch-prologue", "SysWOW64 KernelBase/curl missing")
+    try:
+        head = pe_export_bytes(kb, "CreateFileW") or b""
+        r, o = run([t, "--backend", "inline", "-p", "KernelBase.dll!CreateFileW:Wxx", "--",
+                    curl, "-s", "-o", "NUL", "file:///C:/Windows/win.ini"], timeout=120)
+        msgs = [str(x.get("message", "")) for x in o if x.get("kind") == "probe_log"]
+        pr = next(iter(probes(o)), {})
+        hit = any("win.ini" in m for m in msgs)
+        ok = (head[:2] == b"\x8b\xff" and pr.get("backend") == "inline" and hit and
+              report(o).get("app_exit") == 0 and report(o).get("error") is None)
+        record("hotpatch-prologue-inline", ok, f"prologue={head[:5].hex(' ')} backend={pr.get('backend')} "
+                                               f"logged_win_ini={hit} exit={report(o).get('app_exit')}")
+    except Exception as e:
+        record("hotpatch-prologue-inline", False, repr(e))
 
 
 def check_prehook_attach():
@@ -930,6 +1044,8 @@ def main():
     if want(check_detach): check_detach()
     if want(check_crash_logs): check_crash_logs()
     if want(check_attach_new): check_attach_new()
+    if want(check_refusals): check_refusals()
+    if want(check_hotpatch_prologue): check_hotpatch_prologue()
     print("-" * 72)
     failed = 0
     for name, status, detail in RESULTS:

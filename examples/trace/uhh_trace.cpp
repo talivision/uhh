@@ -223,11 +223,15 @@ int main(int argc, char **argv) {
         if (ok) { std::printf("{\"kind\":\"attached\"}\n"); std::fflush(stdout); }
         ok = ok && probe_run(s);
     } else if (attach_pid && detach_ms) {
-        // Detach while the target keeps running: probe_run on a worker thread, probe_close
-        // from this one after the delay. The target must carry on exactly as before.
-        ok = ok && probe_attach(s, (uint32_t)attach_pid);
-        if (ok) { std::printf("{\"kind\":\"attached\",\"pid\":%lu}\n", attach_pid); std::fflush(stdout); }
-        std::thread runner([&] { probe_run(s); });
+        // Detach while the target keeps running: attach AND run on a worker thread (the debug
+        // object belongs to the thread that attached), probe_close from this one after the
+        // delay. The target must carry on exactly as before.
+        std::thread runner([&] {
+            if (ok && probe_attach(s, (uint32_t)attach_pid)) {
+                std::printf("{\"kind\":\"attached\",\"pid\":%lu}\n", attach_pid); std::fflush(stdout);
+                probe_run(s);
+            }
+        });
         Sleep(detach_ms);
         probe_report(s, stdout);              // what was observed before letting go
         probe_close(s);                       // detach: hooks removed, INT3s restored, DRs cleared

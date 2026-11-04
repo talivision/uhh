@@ -123,6 +123,7 @@ sidefx_fill_below:
     mov r14, 0EEEEEEEEEEEEEEEEh
     mov r15, 0FFFFFFFFFFFFFFFFh
     std                             ; deliberately legal only inside this function
+    cmp rsi, rdi                    ; known arithmetic flags at the site: CF=1 AF=1 SF=1, ZF=PF=OF=0
 
 SideFxSite LABEL BYTE
     REPT 16
@@ -131,6 +132,9 @@ SideFxSite LABEL BYTE
 
     ; Save GPRs before borrowing any of them for capture work.
     mov QWORD PTR [rbp+000h], rax
+    pushfq                          ; capture EFLAGS before any flag-changing capture code
+    pop  rax
+    mov  DWORD PTR [rbp+SIDEFX_FLAGS], eax
     mov QWORD PTR [rbp+008h], rbx
     mov QWORD PTR [rbp+010h], rcx
     mov QWORD PTR [rbp+018h], rdx
@@ -191,10 +195,7 @@ sidefx_copy_below:
     add  rdx, 32
     dec  ecx
     jne  sidefx_copy_below
-    pushfq
-    pop  rax
-    mov  DWORD PTR [rbp+SIDEFX_FLAGS], eax
-    cld
+    cld                             ; (EFLAGS were captured right after the site)
 
     ldmxcsr DWORD PTR [rsp+0A0h]
     fldcw   WORD PTR [rsp+0A4h]

@@ -64,6 +64,7 @@ typedef struct sidefx_counts {
     uint64_t ymm_upper_ok;
     uint64_t mxcsr_ok;
     uint64_t df_ok;
+    uint64_t arith_flags_ok;
     uint64_t x87cw_ok;
     uint64_t lasterror_ok;
     uint64_t below_sp_ok;
@@ -142,6 +143,8 @@ static DWORD WINAPI worker_main(void *opaque) {
         args->counts.ymm_upper_ok += (uint64_t)check_vectors(capture.ymm_upper);
         args->counts.mxcsr_ok += (uint64_t)(capture.mxcsr == SIDEFX_MXCSR);
         args->counts.df_ok += (uint64_t)((capture.eflags & SIDEFX_DF) != 0u);
+        /* CF PF AF ZF SF OF exactly as the cmp before the site left them (0x91 under 0x8D5) */
+        args->counts.arith_flags_ok += (uint64_t)((capture.eflags & 0x8D5u) == 0x91u);
         args->counts.x87cw_ok += (uint64_t)(capture.x87cw == SIDEFX_X87CW);
         args->counts.lasterror_ok += (uint64_t)(last_error == SIDEFX_LAST_ERROR);
         args->counts.below_sp_ok += (uint64_t)check_below_sp(&capture);
@@ -222,6 +225,7 @@ int main(int argc, char **argv) {
         total.ymm_upper_ok += workers[i].counts.ymm_upper_ok;
         total.mxcsr_ok += workers[i].counts.mxcsr_ok;
         total.df_ok += workers[i].counts.df_ok;
+        total.arith_flags_ok += workers[i].counts.arith_flags_ok;
         total.x87cw_ok += workers[i].counts.x87cw_ok;
         total.lasterror_ok += workers[i].counts.lasterror_ok;
         total.below_sp_ok += workers[i].counts.below_sp_ok;
@@ -234,17 +238,17 @@ int main(int argc, char **argv) {
     printf("{\"kind\":\"target\",\"name\":\"sidefx\",\"iters\":%u,\"threads\":%u,"
            "\"gpr_ok\":%" PRIu64 ",\"xmm_ok\":%" PRIu64
            ",\"ymm_upper_ok\":%" PRIu64 ",\"mxcsr_ok\":%" PRIu64
-           ",\"df_ok\":%" PRIu64 ",\"x87cw_ok\":%" PRIu64
+           ",\"df_ok\":%" PRIu64 ",\"arith_flags_ok\":%" PRIu64 ",\"x87cw_ok\":%" PRIu64
            ",\"lasterror_ok\":%" PRIu64 ",\"below_sp_ok\":%" PRIu64
            ",\"calls\":%" PRIu64 "}\n",
            iterations, threads, total.gpr_ok, total.xmm_ok, total.ymm_upper_ok,
-           total.mxcsr_ok, total.df_ok, total.x87cw_ok, total.lasterror_ok,
+           total.mxcsr_ok, total.df_ok, total.arith_flags_ok, total.x87cw_ok, total.lasterror_ok,
            total.below_sp_ok, calls);
     fflush(stdout);
 
     pass = total.gpr_ok == calls && total.xmm_ok == calls &&
            total.ymm_upper_ok == calls && total.mxcsr_ok == calls &&
-           total.df_ok == calls && total.x87cw_ok == calls &&
+           total.df_ok == calls && total.arith_flags_ok == calls && total.x87cw_ok == calls &&
            total.lasterror_ok == calls;
     return pass ? 0 : 1;
 }

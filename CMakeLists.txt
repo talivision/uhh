@@ -206,7 +206,12 @@ foreach(rw reentrancy_target thread_stress_target antitamper_target antidebug_ta
     target_link_options(${rw} PRIVATE /DEBUG)
 endforeach()
 
-foreach(t sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
+add_executable(refusal_driver examples/conformance/refusal_driver.cpp)
+target_include_directories(refusal_driver PRIVATE include)
+target_link_libraries(refusal_driver PRIVATE probe_api)
+add_dependencies(refusal_driver hitcost_target)
+
+foreach(t refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
     target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 endforeach()

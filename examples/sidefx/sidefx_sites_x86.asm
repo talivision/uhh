@@ -66,6 +66,7 @@ sidefx_fill_below:
     mov esi, 55555555h
     mov edi, 66666666h
     std
+    cmp esi, edi                   ; known arithmetic flags at the site: CF=1 AF=1 SF=1, ZF=PF=OF=0
 
 _SideFxSite:
     REPT 16
@@ -73,6 +74,9 @@ _SideFxSite:
     ENDM
 
     mov DWORD PTR [ebp+00h], eax
+    pushfd                          ; capture EFLAGS before any flag-changing capture code
+    pop  eax
+    mov  DWORD PTR [ebp+SIDEFX_FLAGS], eax
     mov DWORD PTR [ebp+04h], ebx
     mov DWORD PTR [ebp+08h], ecx
     mov DWORD PTR [ebp+0Ch], edx
@@ -109,10 +113,7 @@ sidefx_copy_below:
     add  edx, 32
     dec  ecx
     jne  sidefx_copy_below
-    pushfd
-    pop  eax
-    mov  DWORD PTR [ebp+SIDEFX_FLAGS], eax
-    cld
+    cld                             ; (EFLAGS were captured right after the site)
 
     ldmxcsr DWORD PTR [esp]
     fldcw   WORD PTR [esp+4]
