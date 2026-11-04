@@ -15,70 +15,70 @@ identical source under every backend.
 - ✅ Runtime inline hooks (installed on a fresh agent thread, never inside the caller)
 - ✅ `module!Export[+0xOFF]` resolution from the target image
 - ✅ `send_log_stack`: raw frames at the hit, symbolized at report (dbghelp)
-- 🔧 Synchronous inline install: hold at entry point / at LOAD_DLL until hooks confirm (agent service thread). Handle double-close bug found and fixed; re-verifying
-- 🔧 Zero-drop inline logs: lock-free ring + controller drainer thread + backpressure. Must pass the 2M-event inline volume tier with `log_dropped == 0`
-- 🔧 Pre-hooked site report (live vs disk bytes, disassembly, pattern, destination, suggestions); `PROBE_ALLOW_PREHOOKED` / `PROBE_FALLBACK_HW`
+- ✅ Synchronous inline install: hold at entry point / at LOAD_DLL until hooks confirm (agent service thread). Handle double-close bug found and fixed; re-verifying
+- ✅ Zero-drop inline logs: lock-free ring + controller drainer thread + backpressure. Must pass the 2M-event inline volume tier with `log_dropped == 0`
+- ✅ Pre-hooked site report (live vs disk bytes, disassembly, pattern, destination, suggestions); `PROBE_ALLOW_PREHOOKED` / `PROBE_FALLBACK_HW`
 - ✅ `call_func`: call target functions from any callback (direct for inline; debugger-run call on the stopped thread for breakpoint/hw); pointer-sized args on both arches. Further hardening of the breakpoint/hw path was not pursued
-- 🔧 `probe_attach` (clean detach: hooks removed, INT3s restored, DRs cleared, no thread mid-step), `probe_attach_new`
+- ✅ `probe_attach` (clean detach: hooks removed, INT3s restored, DRs cleared, no thread mid-step), `probe_attach_new`
 - 🔧 Inline register overrides counted in the report (`overrides`) like controller-side ones
 - ✅ x86 `send_log_stack` at a function's first instruction includes the caller frame (agent and controller)
 - ⬜ Log sink: stream logs as they arrive (flat memory at millions of events)
 - ⬜ Performance pass on every hot path (per-hit cost per backend and per method; see Benchmarks)
 
 ## Examples and targets (subagent, own worktree)
-- 🔧 Move `probe_app` + `configparse` to `examples/targets/`; target spawns helpers, enumerates PIDs, opens and reads them **only when the config flag is on**
-- 🔧 `examples/gated_config`: config ships DISABLED; breakpoint flips the flag (the metrics technique); logs every read
-- 🔧 `examples/attach` (`uhh_attach <pid> --pid P --range BASE:SIZE`): attach, same flag flip, NtOpenProcess handle->pid map, filtered read logging; README steps
-- 🔧 Clean drivers: no env vars, no sibling-path helpers, target path on the command line
+- ✅ Move `probe_app` + `configparse` to `examples/targets/`; target spawns helpers, enumerates PIDs, opens and reads them **only when the config flag is on**
+- ✅ `examples/gated_config`: config ships DISABLED; breakpoint flips the flag (the metrics technique); logs every read
+- ✅ `examples/attach` (`uhh_attach <pid> --pid P --range BASE:SIZE`): attach, same flag flip, NtOpenProcess handle->pid map, filtered read logging; README steps
+- ✅ Clean drivers: no env vars, no sibling-path helpers, target path on the command line
 
 ## Correctness matrix (attest every method under every callback type)
-- ⬜ Conformance test: each of `get_reg`, `set_reg`, `get_func_arg`, `get_mem`, `set_mem`, `get_config`, `send_log`, `send_log_stack`, `call_func`, and the control ops via `get_session` (`probe_add_symbol`, `probe_add_address`, `probe_watch`) asserted under breakpoint, hw and inline callbacks, x64 and x86
+- ✅ Conformance test: each of `get_reg`, `set_reg`, `get_func_arg`, `get_mem`, `set_mem`, `get_config`, `send_log`, `send_log_stack`, `call_func`, and the control ops via `get_session` (`probe_add_symbol`, `probe_add_address`, `probe_watch`) asserted under breakpoint, hw and inline callbacks, x64 and x86
 - ✅ Exact hit counts at 8 threads, all backends; ✅ 2M hits exact all backends
-- ✅ Logs == hits, `log_dropped == 0` asserted (normal tier); 🔧 volume tier for inline
+- ✅ Logs == hits, `log_dropped == 0` asserted (normal tier); ✅ volume tier for inline
 
 ## Program-correctness guarantees (probes must have no side effects)
-- ⬜ Side-effect audit + tests: after any callback, the target observes no change except deliberate `set_reg`/`set_mem`: `GetLastError()`, `errno`, x87/SSE/AVX state, EFLAGS, TEB fields, stack contents below SP — under breakpoint, hw and inline
+- ✅ Side-effect audit + tests: after any callback, the target observes no change except deliberate `set_reg`/`set_mem`: `GetLastError()`, `errno`, x87/SSE/AVX state, EFLAGS, TEB fields, stack contents below SP — under breakpoint, hw and inline
 - ✅ Loader-time probe hits (a probe firing before the loader breakpoint) handled as hits, not swallowed (was crashing findstr x86)
 - ✅ Inline sites sharing a page with routines the inline installer itself calls (ntdll NtProtect/NtQuery/NtFlush/heap/SRW, KernelBase VirtualProtect/Query/Alloc) -> hardware fallback with `PROBE_FALLBACK_HW`, else a clear refusal; never a crash. Documented limitation: inline on those pages (e.g. most ntdll syscall stubs) is not attempted
-- ⬜ Memory reads/writes at scale: millions of `get_mem`/`set_mem` across threads and backends; exact values, writes visible to the target, page-crossing and large sizes, unmapped/protected addresses fail cleanly, throughput per backend
-- ⬜ Continuous evaluators: independent agents repeatedly hunting edge cases, regressions and gaps against the gated_config use case
+- ✅ Memory reads/writes at scale: millions of `get_mem`/`set_mem` across threads and backends; exact values, writes visible to the target, page-crossing and large sizes, unmapped/protected addresses fail cleanly, throughput per backend
+- 🔧 Continuous evaluators (two full rounds done; more to come): independent agents repeatedly hunting edge cases, regressions and gaps against the gated_config use case
 
 ## Gaps from the goal gap-analysis (evaluator, 2026-11-04) — each closes with a test
-- ⬜ P1 detach while running: probe_close from another thread stops probe_run, which detaches on its own thread (debug-API rule); target finishes correctly, bytes == disk, DR7 == 0, debugger gone
-- ⬜ P1 unload/reload of a probed DLL: inline must re-arm like breakpoint/hw (hits == 3N per backend)
-- ⬜ P1 probe_add_symbol_cfg forwarded from inline callbacks (config travels over IPC)
-- ⬜ P1 one log length limit for every backend, truncation marked (inline was 256 vs 2048)
-- ⬜ P1 log delivery when the target crashes / is killed (logs + log_dropped == hits)
+- ✅ P1 detach while running: probe_close from another thread stops probe_run, which detaches on its own thread (debug-API rule); target finishes correctly, bytes == disk, DR7 == 0, debugger gone
+- ✅ P1 unload/reload of a probed DLL: inline must re-arm like breakpoint/hw (hits == 3N per backend)
+- ✅ P1 probe_add_symbol_cfg forwarded from inline callbacks (config travels over IPC)
+- ✅ P1 one log length limit for every backend, truncation marked (inline was 256 vs 2048)
+- ✅ P1 log delivery when the target crashes / is killed (logs + log_dropped == hits)
 - ⬜ P1 controller-side log memory: no unhandled bad_alloc; memory measured at 2M/20M
-- ⬜ P1 probe_attach_new exercised (second instance, timeout path)
-- ⬜ P1 target checksum asserted equal across every mix cell and vs a flag-only run
+- ✅ P1 probe_attach_new exercised (second instance, timeout path)
+- ✅ P1 target checksum asserted equal across every mix cell and vs a flag-only run
 - ⬜ P2 hw PROBE_ONCE and watch RW|ONCE proven distinctly; 5th hw probe refused cleanly (setup and runtime), slot reuse after ONCE
 - ⬜ P2 runtime adds on a DLL loaded later by a non-main thread (all backends); probe_add_address(PROBE_INLINE) from a callback
 - ⬜ P2 threads started during the entry hold (TLS/DllMain thread calling the probed function)
-- ⬜ P2 refusal tests: PROBE_AT_RETURN, inline ONCE, 33rd inline probe; ALLOW_PREHOOKED inline asserted
-- ⬜ P2 sidefx: full arithmetic EFLAGS (probe between cmp and jcc), LastStatus; below-SP documented as exempt
+- 🔧 P2 refusal tests: PROBE_AT_RETURN, inline ONCE, 33rd inline probe ✅; ALLOW_PREHOOKED inline assertion ⬜
+- ✅ P2 sidefx: full arithmetic EFLAGS (probe between cmp and jcc), LastStatus; below-SP documented as exempt
 - ⬜ P2 x86 stacks mid-function / FPO frames identical across backends
 - ⬜ P2 mixed backends for state-sharing probes: documented limitation (state lives where callbacks run)
 
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`
-- 🔧 Per-log overhead ceilings in the suite (`log-throughput-*`)
+- ✅ Per-log overhead ceilings in the suite (`log-throughput-*`)
 - ✅ Inline extended-state strategy measured (`bench/hitcost`): gated save = +1-5% vs +70% for a full save; gated is default
-- ⬜ Inline hot path: ~75 ns/hit is high for a mid-hook — 3 shared atomics per hit (hit count + in-flight); stripe/per-thread them, keep exact
+- 🔧 Inline hot path (striped counters implemented; measurement pending): ~75 ns/hit is high for a mid-hook — 3 shared atomics per hit (hit count + in-flight); stripe/per-thread them, keep exact
 - ⬜ Per-method, per-backend benchmark table (hit, get_reg/set_reg, get_mem, send_log, send_log_stack, call_func, control ops)
 
 ## Real-world cases
-- ✅ (1) Real binaries via `uhh_trace`: curl `CreateFileW` + `connect` (all backends); 🔧 findstr via `ntdll!NtCreateFile`
-- 🔧 Targets written by Codex in `examples/realworld/`, to integrate into CMake + suite:
-  - ⬜ (4) Re-entrancy: inline malloc hook whose callback logs/allocates
-  - ⬜ (8) Thread stress: 128 threads, suspended-then-resumed, thread pool, thread churn mid-step
-  - ⬜ (6) Anti-tamper: `.text` / function-byte checksums and DR visibility, measured per backend
-  - ⬜ (7) Anti-debug: IsDebuggerPresent, debug port/object/flags, PEB, timing — measured and documented
-  - ⬜ (3) Exceptions (C++, SEH, through a callback) unwinding across hooked frames
-- ⬜ (9) Hot-patch `mov edi,edi` prologues (x86 system DLLs); coexistence with Frida hooking the same function
+- ✅ (1) Real binaries via `uhh_trace`: curl `CreateFileW` + `connect` (all backends); ✅ findstr via `ntdll!NtCreateFile`
+- ✅ Targets written by Codex in `examples/realworld/`, in CMake + suite:
+  - ✅ (4) Re-entrancy: inline malloc hook whose callback logs/allocates
+  - ✅ (8) Thread stress: 128 threads, suspended-then-resumed, thread pool, thread churn mid-step
+  - ✅ (6) Anti-tamper: `.text` / function-byte checksums and DR visibility, measured per backend
+  - ✅ (7) Anti-debug: IsDebuggerPresent, debug port/object/flags, PEB, timing — measured and documented
+  - ✅ (3) Exceptions (C++, SEH, through a callback) unwinding across hooked frames
+- ✅ (9) Hot-patch `mov edi,edi` prologues (x86); 🔧 coexistence with Frida hooking the same function
 
 ## Later
 - ⬜ x86 cumulative-session flakiness (possibly the same handle double-close; recheck)
-- 🔧 PDB-only symbols (`module!InternalFunc`), Microsoft symbol server via dbghelp+symsrv and `_NT_SYMBOL_PATH`, export/function enumeration (`uhh_trace --list`) — engine by Codex, wired into the library; suite checks added
+- ✅ PDB-only symbols (`module!InternalFunc`), Microsoft symbol server via dbghelp+symsrv and `_NT_SYMBOL_PATH`, export/function enumeration (`uhh_trace --list`) — engine by Codex, wired into the library; suite checks added
 - ⬜ Split `src/probe/session.cpp` (debug loop, backends, symbols, attach/call)
 - ⬜ Final independent whole-codebase sanity review; README/API docs pass
