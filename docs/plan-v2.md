@@ -162,6 +162,10 @@ image across the boundary.
   launches/attaches the named target, probes NtReadVirtualMemory, and logs only
   reads whose handle resolves to <pid> and whose address falls in <range>
   (pid via the handle->pid map, maintained controller-side for this backend).
+- SHIP the compiled read_logger EXECUTABLE (x64 and x86) in the repo (force-added
+  past .gitignore) so the tool is runnable without building - the one binary
+  exception; library DLLs are still not committed. read_logger resolves
+  ntdll!NtReadVirtualMemory via the export table (no PDB needed).
 
 ## No backward compatibility (4 Nov 2026)
 
