@@ -1,18 +1,21 @@
-// Public PROBE_BREAKPOINT backend. The debug API binds event consumption to the
-// launching thread, so probe_run owns the synchronous event loop through exit.
+// Public x64 breakpoint + inline backends. The debug API binds event consumption
+// to the launching thread, so probe_run owns the event loop through exit.
 #define PROBE_PUBLIC_API
 #include "win_common.hpp"
+#include "probe_agent_shared.hpp"
 #include <cerrno>
 #include <cctype>
 #include <cstdarg>
+#include <climits>
 #include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 struct Probe {
-    std::string location, module;
+    std::string location, module, callback_export;
     uint64_t rva = 0, base = 0, address = 0, hits = 0;
+    uint32_t agent_index = UINT32_MAX;
     unsigned char original = 0;
     probe_callback callback = nullptr;
     uint32_t flags = 0;
@@ -28,12 +31,21 @@ struct CallbackState {
 struct probe_session {
     std::vector<std::unique_ptr<Probe>> probes;
     std::vector<std::string> logs;
+    std::unordered_map<std::string, uint64_t> module_bases;
     PROCESS_INFORMATION pi{};
     HANDLE stdin_write = nullptr;
     DWORD exit_code = 1;
     uint64_t overrides = 0;
     std::string error;
-    bool launched = false, ran = false, exited = false;
+    HANDLE mapping = nullptr, remote_thread = nullptr;
+    probe_agent_shared *shared = nullptr;
+    HMODULE local_agent = nullptr;
+    void *remote_path = nullptr;
+    uint64_t remote_agent = 0;
+    DWORD remote_tid = 0;
+    enum RemoteWork { REMOTE_NONE, REMOTE_LOAD_AGENT, REMOTE_INIT_AGENT } remote_work = REMOTE_NONE;
+    std::wstring agent_path;
+    bool launched = false, ran = false, exited = false, gate_sent = false;
 };
 
 static void set_error(probe_session *s, const std::string &message) {
@@ -57,8 +69,53 @@ static std::string module_name_from_handle(HANDLE file) {
     return n && n < MAX_PATH ? basename_of(path) : std::string{};
 }
 
+static std::string module_name_from_module(HMODULE module) {
+    char path[MAX_PATH]; DWORD n = GetModuleFileNameA(module, path, MAX_PATH);
+    return n && n < MAX_PATH ? basename_of(path) : std::string{};
+}
+
 static bool iequals(const std::string &a, const std::string &b) {
     return a.size() == b.size() && !_stricmp(a.c_str(), b.c_str());
+}
+
+static bool has_inline(const probe_session *s) {
+    for (const auto &p : s->probes) if (p->flags & PROBE_INLINE) return true;
+    return false;
+}
+
+static bool callback_export_name(probe_callback callback, std::string &name) {
+    HMODULE module{};
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCSTR>(callback), &module)) return false;
+    auto base = reinterpret_cast<const unsigned char *>(module);
+    auto dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64 *>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        return false;
+    auto dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dir.VirtualAddress || !dir.Size) return false;
+    auto exports = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY *>(base + dir.VirtualAddress);
+    auto functions = reinterpret_cast<const DWORD *>(base + exports->AddressOfFunctions);
+    auto names = reinterpret_cast<const DWORD *>(base + exports->AddressOfNames);
+    auto ordinals = reinterpret_cast<const WORD *>(base + exports->AddressOfNameOrdinals);
+    uint64_t callback_rva = reinterpret_cast<const unsigned char *>(callback) - base;
+    for (DWORD i = 0; i < exports->NumberOfNames; ++i) {
+        WORD ordinal = ordinals[i];
+        if (ordinal < exports->NumberOfFunctions && functions[ordinal] == callback_rva) {
+            name = reinterpret_cast<const char *>(base + names[i]); return true;
+        }
+    }
+    return false;
+}
+
+static std::wstring sibling_agent_path() {
+    wchar_t path[MAX_PATH]; DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (!n || n >= MAX_PATH) return L"probe_api_agent.dll";
+    std::wstring result(path, n); size_t slash = result.find_last_of(L"\\/");
+    result.resize(slash == std::wstring::npos ? 0 : slash + 1);
+    return result + L"probe_api_agent.dll";
 }
 
 static bool patch(HANDLE process, uint64_t address, unsigned char byte) {
@@ -108,7 +165,7 @@ static std::string quote_arg(const char *arg) {
     out.append(slashes * 2, '\\'); out += '\"'; return out;
 }
 
-static bool arm_probe(probe_session *s, Probe &p, uint64_t base) {
+static bool arm_breakpoint(probe_session *s, Probe &p, uint64_t base) {
     if (p.rva > UINT64_MAX - base) { set_error(s, "probe address overflow"); return false; }
     uint64_t address = base + p.rva; size_t got{};
     if (!remote_read(s->pi.hProcess, address, &p.original, 1, &got) || got != 1) {
@@ -127,9 +184,26 @@ static bool arm_probe(probe_session *s, Probe &p, uint64_t base) {
     return true;
 }
 
+static bool resolve_inline(probe_session *s, Probe &p, uint64_t base) {
+    if (p.rva > UINT64_MAX - base) { set_error(s, "probe address overflow"); return false; }
+    if (!s->shared || p.agent_index >= s->shared->request_count) {
+        set_error(s, "inline shared request is unavailable"); return false;
+    }
+    p.base = base; p.address = base + p.rva;
+    auto &request = s->shared->requests[p.agent_index];
+    request.site = p.address; MemoryBarrier();
+    std::fprintf(stderr, "probe: resolved %s -> base=0x%llx addr=0x%llx (awaiting agent)\n",
+                 p.location.c_str(), (unsigned long long)base, (unsigned long long)p.address);
+    return true;
+}
+
 static bool arm_module(probe_session *s, const std::string &module, uint64_t base) {
-    for (auto &item : s->probes)
-        if (!item->active && iequals(item->module, module) && !arm_probe(s, *item, base)) return false;
+    for (auto &item : s->probes) {
+        if (item->active || item->address || !iequals(item->module, module)) continue;
+        bool ok = item->flags & PROBE_BREAKPOINT ? arm_breakpoint(s, *item, base)
+                                                 : resolve_inline(s, *item, base);
+        if (!ok) return false;
+    }
     return true;
 }
 
@@ -157,15 +231,26 @@ extern "C" int probe_add_cfg(probe_session *s, const char *location, probe_callb
     constexpr uint32_t types = PROBE_BREAKPOINT | PROBE_INLINE | PROBE_HW;
     constexpr uint32_t known = types | PROBE_AT_RETURN | PROBE_ALLOW_PREHOOKED | PROBE_FALLBACK_HW;
     if (flags & ~known) { set_error(s, "unknown probe flags"); return 0; }
-    if ((flags & types) != PROBE_BREAKPOINT || (flags & PROBE_AT_RETURN)) {
-        set_error(s, "requested probe type/options are unsupported in this build (breakpoint entry probes only)");
+    uint32_t type = flags & types;
+    if ((type != PROBE_BREAKPOINT && type != PROBE_INLINE) || (flags & PROBE_AT_RETURN) ||
+        (flags & (PROBE_ALLOW_PREHOOKED | PROBE_FALLBACK_HW))) {
+        set_error(s, "requested probe type/options are unsupported in this build");
         return 0;
     }
     if (config_len && !config) { set_error(s, "non-empty probe config is null"); return 0; }
+    if (type == PROBE_INLINE && config_len > PROBE_AGENT_CONFIG_CAP) {
+        set_error(s, "inline probe config exceeds the agent limit"); return 0;
+    }
     try {
         auto p = std::make_unique<Probe>();
         if (!parse_location(s, location, *p)) return 0;
         p->callback = callback; p->flags = flags;
+        if (type == PROBE_INLINE && !callback_export_name(callback, p->callback_export)) {
+            set_error(s, "inline callback is not a named export"); return 0;
+        }
+        if (p->callback_export.size() >= PROBE_AGENT_EXPORT_CAP) {
+            set_error(s, "inline callback export name is too long"); return 0;
+        }
         if (config_len) {
             auto first = static_cast<const unsigned char *>(config);
             p->config.assign(first, first + config_len);
@@ -177,6 +262,46 @@ extern "C" int probe_add_cfg(probe_session *s, const char *location, probe_callb
 
 extern "C" int probe_add(probe_session *s, const char *location, probe_callback callback, uint32_t flags) {
     return probe_add_cfg(s, location, callback, flags, nullptr, 0);
+}
+
+static bool create_agent_channel(probe_session *s) {
+    uint32_t count = 0;
+    for (auto &p : s->probes) if (p->flags & PROBE_INLINE) p->agent_index = count++;
+    if (!count) return true;
+    if (count > PROBE_AGENT_MAX_PROBES) { set_error(s, "too many inline probes"); return false; }
+    wchar_t name[64]; probe_agent_mapping_name(s->pi.dwProcessId, name);
+    s->mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+                                    (DWORD)sizeof(probe_agent_shared), name);
+    if (!s->mapping || GetLastError() == ERROR_ALREADY_EXISTS) {
+        set_error(s, win_error("create inline shared section")); return false;
+    }
+    s->shared = static_cast<probe_agent_shared *>(MapViewOfFile(
+        s->mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(probe_agent_shared)));
+    if (!s->shared) { set_error(s, win_error("map inline shared section")); return false; }
+    std::memset(s->shared, 0, sizeof(*s->shared));
+    s->shared->magic = PROBE_AGENT_MAGIC; s->shared->version = PROBE_AGENT_VERSION;
+    s->shared->request_count = count;
+    for (const auto &p : s->probes) if (p->flags & PROBE_INLINE) {
+        auto &request = s->shared->requests[p->agent_index]; request.flags = p->flags;
+        request.config_len = (uint32_t)p->config.size();
+        std::memcpy(request.callback, p->callback_export.c_str(), p->callback_export.size() + 1);
+        if (!p->config.empty()) std::memcpy(request.config, p->config.data(), p->config.size());
+    }
+    s->agent_path = sibling_agent_path();
+    s->local_agent = LoadLibraryW(s->agent_path.c_str());
+    if (!s->local_agent || !GetProcAddress(s->local_agent, "probe_agent_init")) {
+        set_error(s, win_error("map probe_api_agent.dll exports")); return false;
+    }
+    return true;
+}
+
+static bool release_gate(probe_session *s) {
+    if (s->gate_sent) return true;
+    DWORD wrote{}; char key = '\n';
+    if (!WriteFile(s->stdin_write, &key, 1, &wrote, nullptr) || wrote != 1) {
+        set_error(s, win_error("deliver gate keystroke")); return false;
+    }
+    s->gate_sent = true; return true;
 }
 
 extern "C" int probe_launch(probe_session *s, char *const argv[]) {
@@ -201,11 +326,11 @@ extern "C" int probe_launch(probe_session *s, char *const argv[]) {
             CloseHandle(s->stdin_write); s->stdin_write = nullptr;
             set_error(s, win_error("debug launch")); return 0;
         }
-        DWORD wrote{}; char key = '\n';
-        if (!WriteFile(s->stdin_write, &key, 1, &wrote, nullptr) || wrote != 1) {
-            set_error(s, win_error("deliver gate keystroke")); TerminateProcess(s->pi.hProcess, 3); return 0;
+        s->launched = true;
+        if (!create_agent_channel(s) || (!has_inline(s) && !release_gate(s))) {
+            TerminateProcess(s->pi.hProcess, 3); return 0;
         }
-        s->launched = true; return 1;
+        return 1;
     } catch (const std::exception &e) { set_error(s, e.what()); return 0; }
 }
 
@@ -259,6 +384,96 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     CloseHandle(thread); stepping[event.dwThreadId] = probe; disposition = DBG_CONTINUE; return true;
 }
 
+static bool start_remote(probe_session *s, LPTHREAD_START_ROUTINE entry,
+                         void *argument, probe_session::RemoteWork work) {
+    s->remote_thread = CreateRemoteThread(s->pi.hProcess, nullptr, 0, entry, argument, 0, &s->remote_tid);
+    if (!s->remote_thread) { set_error(s, win_error("create agent thread")); return false; }
+    s->remote_work = work; return true;
+}
+
+static bool start_agent_load(probe_session *s) {
+    if (s->remote_work != probe_session::REMOTE_NONE || s->remote_agent) return true;
+    HMODULE local_kernel = GetModuleHandleW(L"kernel32.dll");
+    auto local_load = reinterpret_cast<uintptr_t>(GetProcAddress(local_kernel, "LoadLibraryW"));
+    if (!local_kernel || !local_load) { set_error(s, win_error("resolve LoadLibraryW")); return false; }
+    HMODULE load_owner{};
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCSTR>(local_load), &load_owner)) {
+        set_error(s, win_error("resolve LoadLibraryW owner")); return false;
+    }
+    std::string owner_name = module_name_from_module(load_owner); uint64_t remote_owner = 0;
+    for (const auto &module : s->module_bases)
+        if (iequals(module.first, owner_name)) { remote_owner = module.second; break; }
+    if (!remote_owner) {
+        set_error(s, "target module owning LoadLibraryW was not observed"); return false;
+    }
+    size_t bytes = (s->agent_path.size() + 1) * sizeof(wchar_t);
+    s->remote_path = VirtualAllocEx(s->pi.hProcess, nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!s->remote_path) { set_error(s, win_error("allocate remote agent path")); return false; }
+    SIZE_T written{};
+    if (!WriteProcessMemory(s->pi.hProcess, s->remote_path, s->agent_path.c_str(), bytes, &written) ||
+        written != bytes) {
+        set_error(s, win_error("write remote agent path")); return false;
+    }
+    uint64_t remote_load = remote_owner + local_load - reinterpret_cast<uintptr_t>(load_owner);
+    return start_remote(s, reinterpret_cast<LPTHREAD_START_ROUTINE>((uintptr_t)remote_load),
+                        s->remote_path, probe_session::REMOTE_LOAD_AGENT);
+}
+
+static bool start_agent_init(probe_session *s) {
+    if (s->remote_work != probe_session::REMOTE_NONE || !s->remote_agent || !s->local_agent) {
+        set_error(s, "inline agent is not ready for initialization"); return false;
+    }
+    auto local_init = reinterpret_cast<uintptr_t>(GetProcAddress(s->local_agent, "probe_agent_init"));
+    uint64_t remote_init = s->remote_agent + local_init - reinterpret_cast<uintptr_t>(s->local_agent);
+    return start_remote(s, reinterpret_cast<LPTHREAD_START_ROUTINE>((uintptr_t)remote_init), nullptr,
+                        probe_session::REMOTE_INIT_AGENT);
+}
+
+static bool agent_has_pending(const probe_session *s) {
+    if (!s->shared) return false;
+    for (const auto &p : s->probes) if ((p->flags & PROBE_INLINE) && p->address &&
+        s->shared->requests[p->agent_index].status == PROBE_AGENT_PENDING) return true;
+    return false;
+}
+
+static bool accept_agent_install(probe_session *s) {
+    MemoryBarrier();
+    for (auto &p : s->probes) if ((p->flags & PROBE_INLINE) && p->address) {
+        LONG status = s->shared->requests[p->agent_index].status;
+        if (status != PROBE_AGENT_INSTALLED) {
+            set_error(s, "inline agent failed to install " + p->location +
+                         " (status=" + std::to_string(status) + ")");
+            return false;
+        }
+        p->active = true;
+        std::fprintf(stderr, "probe: active %s -> addr=0x%llx (inline)\n",
+                     p->location.c_str(), (unsigned long long)p->address);
+    }
+    return release_gate(s);
+}
+
+static bool complete_remote_thread(probe_session *s, DWORD result) {
+    // The exit code comes from EXIT_THREAD_DEBUG_EVENT, not GetExitCodeThread: at
+    // the instant that event is delivered the thread handle can still report
+    // STILL_ACTIVE, which is the race that made agent init look like it failed.
+    CloseHandle(s->remote_thread); s->remote_thread = nullptr;
+    auto work = s->remote_work; s->remote_work = probe_session::REMOTE_NONE; s->remote_tid = 0;
+    if (work == probe_session::REMOTE_LOAD_AGENT) {
+        if (s->remote_path) {
+            VirtualFreeEx(s->pi.hProcess, s->remote_path, 0, MEM_RELEASE); s->remote_path = nullptr;
+        }
+        if (result == 0 || !s->remote_agent) { set_error(s, "LoadLibraryW failed for probe_api_agent.dll"); return false; }
+        return start_agent_init(s);
+    }
+    if (work == probe_session::REMOTE_INIT_AGENT) {
+        if (result != 0) { set_error(s, "probe_agent_init failed (code=" + std::to_string(result) + ")"); return false; }
+        return accept_agent_install(s);
+    }
+    return true;
+}
+
 extern "C" int probe_run(probe_session *s) {
     if (!s || !s->launched) { if (s) set_error(s, "session is not launched"); return 0; }
     if (s->ran) { set_error(s, "session already ran"); return 0; }
@@ -271,6 +486,7 @@ extern "C" int probe_run(probe_session *s) {
         case CREATE_PROCESS_DEBUG_EVENT: {
             std::string name = module_name_from_handle(event.u.CreateProcessInfo.hFile);
             uint64_t base = (uint64_t)(uintptr_t)event.u.CreateProcessInfo.lpBaseOfImage;
+            if (!name.empty()) s->module_bases[name] = base;
             ok = arm_module(s, name, base);
             if (event.u.CreateProcessInfo.hFile) CloseHandle(event.u.CreateProcessInfo.hFile);
             break;
@@ -279,8 +495,9 @@ extern "C" int probe_run(probe_session *s) {
             if (event.u.CreateThread.hThread) CloseHandle(event.u.CreateThread.hThread);
             break;
         case EXIT_THREAD_DEBUG_EVENT: {
+            if (event.dwThreadId == s->remote_tid) ok = complete_remote_thread(s, event.u.ExitThread.dwExitCode);
             auto it = stepping.find(event.dwThreadId);
-            if (it != stepping.end()) {
+            if (ok && it != stepping.end()) {
                 ok = patch(s->pi.hProcess, it->second->address, 0xcc); stepping.erase(it);
                 if (!ok) set_error(s, win_error("re-arm probe after thread exit"));
             }
@@ -289,18 +506,33 @@ extern "C" int probe_run(probe_session *s) {
         case LOAD_DLL_DEBUG_EVENT: {
             std::string name = module_name_from_handle(event.u.LoadDll.hFile);
             uint64_t base = (uint64_t)(uintptr_t)event.u.LoadDll.lpBaseOfDll;
+            if (!name.empty()) s->module_bases[name] = base;
             ok = arm_module(s, name, base);
+            if (iequals(name, "probe_api_agent.dll")) {
+                s->remote_agent = base;
+            }
+            if (ok && s->remote_agent && s->remote_work == probe_session::REMOTE_NONE && agent_has_pending(s))
+                ok = start_agent_init(s);
             if (event.u.LoadDll.hFile) CloseHandle(event.u.LoadDll.hFile);
             break;
         }
         case UNLOAD_DLL_DEBUG_EVENT: {
             uint64_t base = (uint64_t)(uintptr_t)event.u.UnloadDll.lpBaseOfDll;
-            for (auto &p : s->probes)
-                if (p->active && p->base == base) { p->active = false; p->base = p->address = 0; }
+            for (auto it = s->module_bases.begin(); it != s->module_bases.end(); )
+                if (it->second == base) it = s->module_bases.erase(it); else ++it;
+            for (auto &p : s->probes) if (p->active && p->base == base) {
+                if (p->flags & PROBE_INLINE) {
+                    set_error(s, "unloading a module with an active inline probe is unsupported"); ok = false;
+                } else { p->active = false; p->base = p->address = 0; }
+            }
             break;
         }
         case EXCEPTION_DEBUG_EVENT:
-            ok = handle_exception(s, event, stepping, initial_break, disposition); break;
+            ok = handle_exception(s, event, stepping, initial_break, disposition);
+            if (ok && initial_break && has_inline(s) && !s->remote_agent &&
+                s->remote_work == probe_session::REMOTE_NONE)
+                ok = start_agent_load(s);
+            break;
         case EXIT_PROCESS_DEBUG_EVENT:
             s->exit_code = event.u.ExitProcess.dwExitCode; s->exited = true; break;
         default: break;
@@ -311,6 +543,7 @@ extern "C" int probe_run(probe_session *s) {
         if (!ok) break;
     }
     if (!s->exited && s->pi.hProcess) TerminateProcess(s->pi.hProcess, 3);
+    if (s->exited && has_inline(s) && !s->gate_sent) set_error(s, "target exited before inline probes were ready");
     return s->exited && s->error.empty();
 }
 
@@ -331,15 +564,36 @@ static void json_string(FILE *out, const std::string &value) {
 
 extern "C" void probe_report(probe_session *s, FILE *out) {
     if (!s || !out) return;
+    if (s->shared) {
+        MemoryBarrier();
+        for (auto &p : s->probes) if (p->flags & PROBE_INLINE)
+            p->hits = (uint64_t)s->shared->requests[p->agent_index].hits;
+        LONG count = s->shared->log_reserve;
+        if (count > (LONG)PROBE_AGENT_LOG_CAP) count = PROBE_AGENT_LOG_CAP;
+        for (LONG i = 0; i < count; ++i) {
+            auto &record = s->shared->logs[i];
+            if (!record.committed) continue;
+            std::fputs("{\"kind\":\"probe_log\",\"probe\":", out);
+            std::fprintf(out, "%u,\"tid\":%u,\"message\":", record.probe, record.tid);
+            json_string(out, record.text); std::fputs("}\n", out);
+        }
+    }
     for (const auto &line : s->logs) {
         std::fputs("{\"kind\":\"probe_log\",\"message\":", out); json_string(out, line); std::fputs("}\n", out);
+    }
+    for (const auto &p : s->probes) {
+        std::fputs("{\"kind\":\"probe\",\"location\":", out); json_string(out, p->location);
+        std::fprintf(out, ",\"backend\":\"%s\",\"active\":%s,\"hits\":%llu}\n",
+                     p->flags & PROBE_INLINE ? "inline" : "breakpoint",
+                     p->active ? "true" : "false", (unsigned long long)p->hits);
     }
     uint64_t hits = 0, active = 0;
     for (const auto &p : s->probes) { hits += p->hits; active += p->active; }
     std::fprintf(out, "{\"kind\":\"probe_report\",\"probes\":%llu,\"active\":%llu,"
-                 "\"hits\":%llu,\"overrides\":%llu,\"app_exit\":%lu,\"error\":",
+                 "\"hits\":%llu,\"overrides\":%llu,\"log_dropped\":%ld,\"app_exit\":%lu,\"error\":",
                  (unsigned long long)s->probes.size(), (unsigned long long)active,
-                 (unsigned long long)hits, (unsigned long long)s->overrides, s->exit_code);
+                 (unsigned long long)hits, (unsigned long long)s->overrides,
+                 s->shared ? s->shared->log_dropped : 0, s->exit_code);
     if (s->error.empty()) std::fputs("null", out); else json_string(out, s->error);
     std::fputs("}\n", out); std::fflush(out);
 }
@@ -347,9 +601,15 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
 extern "C" void probe_close(probe_session *s) {
     if (!s) return;
     if (s->launched && !s->exited && s->pi.hProcess) {
-        for (auto &p : s->probes) if (p->active) patch(s->pi.hProcess, p->address, p->original);
+        for (auto &p : s->probes)
+            if (p->active && (p->flags & PROBE_BREAKPOINT)) patch(s->pi.hProcess, p->address, p->original);
         TerminateProcess(s->pi.hProcess, 3);
     }
+    if (s->remote_thread) CloseHandle(s->remote_thread);
+    if (s->remote_path && s->pi.hProcess) VirtualFreeEx(s->pi.hProcess, s->remote_path, 0, MEM_RELEASE);
+    if (s->shared) UnmapViewOfFile(s->shared);
+    if (s->mapping) CloseHandle(s->mapping);
+    if (s->local_agent) FreeLibrary(s->local_agent);
     if (s->stdin_write) CloseHandle(s->stdin_write);
     if (s->pi.hThread) CloseHandle(s->pi.hThread);
     if (s->pi.hProcess) CloseHandle(s->pi.hProcess);
