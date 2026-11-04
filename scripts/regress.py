@@ -25,6 +25,7 @@ Checks:
     ceiling, so logging getting slow fails like any other regression.
   - stream-volume/latency/order: logs are emitted promptly, losslessly and in per-thread
     order through a bounded-memory controller queue, including a 20M inline-log run.
+  - stream-sink-speed: inline 2M logging rate with stdout at NUL and at a disk file.
   - breakage: the hostile fixtures produce their expected verdicts.
   - frida-parity: the four Interceptor-parity demos all pass.
   - watchpoint: a hardware write-watchpoint fires once per store.
@@ -40,6 +41,7 @@ import math
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -65,8 +67,20 @@ def run(args, timeout=180, feed=None):
 def stream_run(args, timeout, on_line):
     """Drain stdout incrementally so volume checks never retain probe_log records."""
     proc = subprocess.Popen([str(a) for a in args], stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL, text=True, bufsize=1)
+                            stderr=subprocess.PIPE, text=True, bufsize=1)
     timed_out = threading.Event()
+
+    def drain_stderr():
+        for line in proc.stderr:
+            marker = "probe: logs -> "
+            if line.startswith(marker):
+                try:
+                    Path(line[len(marker):].strip()).unlink()
+                except OSError:
+                    pass
+
+    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+    stderr_thread.start()
 
     def expire():
         timed_out.set()
@@ -91,6 +105,7 @@ def stream_run(args, timeout, on_line):
             except OSError:
                 pass
             proc.wait()
+        stderr_thread.join(timeout=30)
     return proc.returncode, timed_out.is_set()
 
 
@@ -455,6 +470,48 @@ def check_stream_volume():
                             for x, n in zip(runs, sizes)) + f" flat={flat}")
         except Exception as e:
             record(name, False, repr(e))
+
+
+def check_stream_sink_speed():
+    """Measure the file-backed writer with tailing disabled (NUL) and to a disk file."""
+    driver, target = exe("hitcost_driver.exe"), exe("hitcost_target.exe")
+    if not driver or not target:
+        return skip("stream-sink-speed", "hitcost driver/target missing")
+    calls = 2_000_000
+    command = [driver, "--backend", "inline", "--method", "send_log", "--",
+               target, "--calls", calls, "--threads", 1]
+
+    def measure(sink):
+        started = time.perf_counter()
+        result = subprocess.run([str(x) for x in command], stdout=sink, stderr=subprocess.PIPE,
+                                text=True, timeout=600)
+        elapsed = time.perf_counter() - started
+        log_size = 0
+        for line in result.stderr.splitlines():
+            marker = "probe: logs -> "
+            if line.startswith(marker):
+                try:
+                    log_path = Path(line[len(marker):])
+                    log_size = log_path.stat().st_size
+                    log_path.unlink()
+                except OSError:
+                    pass
+        return result.returncode, calls / elapsed, log_size
+
+    try:
+        nul_rc, nul_rate, nul_log_size = measure(subprocess.DEVNULL)
+        with tempfile.TemporaryDirectory(prefix="uhh-stream-") as directory:
+            output = Path(directory) / "stdout.jsonl"
+            with output.open("w", encoding="utf-8", newline="") as sink:
+                file_rc, file_rate, file_log_size = measure(sink)
+            output_size = output.stat().st_size
+        ok = (nul_rc == file_rc == 0 and nul_rate > 0 and file_rate > 0 and
+              nul_log_size > calls * 40 and file_log_size > calls * 40 and output_size > calls * 40)
+        record("stream-sink-speed", ok, f"NUL={nul_rate:,.0f} logs/s file={file_rate:,.0f} logs/s "
+                                          f"stdout_bytes={output_size:,} log_bytes={nul_log_size:,}/{file_log_size:,} "
+                                          f"rc={nul_rc}/{file_rc}")
+    except Exception as e:
+        record("stream-sink-speed", False, repr(e))
 
 
 def trace_logstream(backend, target_args, timeout, consume):
@@ -1405,6 +1462,7 @@ def main():
     if want(check_multithread_exact): check_multithread_exact(args.threads, args.reads)
     if want(check_log_throughput): check_log_throughput(args.threads, args.reads)
     if want(check_stream_volume): check_stream_volume()
+    if want(check_stream_sink_speed): check_stream_sink_speed()
     if want(check_stream_latency): check_stream_latency()
     if want(check_stream_order): check_stream_order()
     if want(check_attach): check_attach(args.threads, args.reads)

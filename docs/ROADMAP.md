@@ -22,8 +22,9 @@ identical source under every backend.
 - ✅ `probe_attach` (clean detach: hooks removed, INT3s restored, DRs cleared, no thread mid-step), `probe_attach_new`
 - 🔧 Inline register overrides counted in the report (`overrides`) like controller-side ones
 - ✅ x86 `send_log_stack` at a function's first instruction includes the caller frame (agent and controller)
-- ✅ Stream logs to controller stdout as they arrive: one bounded queue and writer thread,
-  lossless backpressure, complete-line writes, <=10 ms/idle flush, report-time drain, and
+- ✅ Stream logs through a per-session `%TEMP%\uhh\logs` JSONL file: one bounded producer
+  queue/file-writer plus a live stdout tailer, lossless filesystem backpressure, raw-handle
+  complete-line writes, <=10 ms/idle publication, report-time catch-up, NUL opt-out, and
   `logs_written`/controller peak-working-set metrics. Covered at 20M inline and 200k hw/breakpoint.
 - ⬜ Performance pass on every hot path (per-hit cost per backend and per method; see Benchmarks)
 

@@ -75,7 +75,7 @@ struct StepState {
 };
 
 // One log line, optionally with a raw stack snapshot (return addresses only). Frames
-// are symbolized by the stdout writer -- never inside the breakpoint.
+// are symbolized by the file writer -- never inside the breakpoint.
 struct LogRecord {
     std::string text;
     uint32_t tid = 0, probe = 0;
@@ -89,19 +89,30 @@ struct probe_session {
     std::mutex drain_mu;                       // shared ring has exactly one consumer at a time
     uint32_t agent_map[PROBE_AGENT_MAX_PROBES] = {};   // agent request index -> probes[] index (under agent_mu)
     std::thread drainer;                       // empties the agent's log ring continuously
-    std::atomic<uint64_t> controller_dropped{0}; // only broken stdout/allocation can lose controller logs
+    std::atomic<uint64_t> controller_dropped{0}; // only broken file I/O/allocation can lose controller logs
     std::atomic<bool> drain_stop{false};
     // Both producer paths wait on this bounded queue. The writer never holds queue_mu
-    // while symbolizing or writing, so a full stdout pipe cannot invert locks with the
+    // while symbolizing or writing, so a slow filesystem cannot invert locks with the
     // debugger or the agent-ring drainer.
     static constexpr size_t LOG_QUEUE_CAP = 2048;
     std::deque<LogRecord> log_queue;
     std::mutex queue_mu;
     std::condition_variable queue_readable, queue_writable, queue_flushed;
     std::thread log_writer;
+    HANDLE log_file = INVALID_HANDLE_VALUE;
+    HANDLE log_reader = INVALID_HANDLE_VALUE;
+    std::wstring log_path;
     HANDLE stdout_handle = INVALID_HANDLE_VALUE;
+    DWORD stdout_type = FILE_TYPE_UNKNOWN;
+    bool stdout_is_console = false, tail_enabled = false;
     bool writer_stop = false, writer_busy = false, writer_failed = false;
     std::string writer_error;
+    std::thread log_tailer;
+    std::mutex tail_mu;
+    std::condition_variable tail_changed, tail_caught_up;
+    uint64_t log_bytes_written = 0, log_bytes_tailed = 0;
+    bool tail_stop = false, tail_failed = false, console_warning = false;
+    std::string tail_error;
     std::atomic<uint64_t> logs_written{0};
     bool sym_ready = false;    // dbghelp initialised on the target (stack walk + symbolize)
     std::unordered_map<std::string, uint64_t> module_bases;
@@ -171,10 +182,10 @@ static bool trace_enabled() { static const bool on = std::getenv("PROBE_TRACE") 
 static void start_drainer(probe_session *s);
 static void stop_drainer(probe_session *s);
 static std::string symbolize(probe_session *s, uint64_t addr);
-static bool start_log_writer(probe_session *s);
+static bool start_log_output(probe_session *s);
 static bool enqueue_log(probe_session *s, LogRecord &&record);
 static void flush_log_writer(probe_session *s);
-static void stop_log_writer(probe_session *s);
+static void stop_log_output(probe_session *s);
 static void release_hw(probe_session *s, Probe &p);
 static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposition);
 static void release_held(probe_session *s, const char *why);
@@ -235,14 +246,21 @@ static void writer_failed(probe_session *s, const std::string &message, uint64_t
 static bool write_log_batch(probe_session *s, const std::string &bytes, uint64_t records) {
     if (bytes.empty()) return true;
     DWORD wrote = 0;
-    if (s->stdout_handle == nullptr || s->stdout_handle == INVALID_HANDLE_VALUE ||
+    if (s->log_file == nullptr || s->log_file == INVALID_HANDLE_VALUE ||
         bytes.size() > MAXDWORD ||
-        !WriteFile(s->stdout_handle, bytes.data(), (DWORD)bytes.size(), &wrote, nullptr) ||
+        !WriteFile(s->log_file, bytes.data(), (DWORD)bytes.size(), &wrote, nullptr) ||
         (size_t)wrote != bytes.size()) {
-        writer_failed(s, win_error("write probe logs to stdout"), records);
+        writer_failed(s, win_error("write probe log file"), records);
         return false;
     }
     s->logs_written.fetch_add(records, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(s->tail_mu);
+        s->log_bytes_written += bytes.size();
+        if (!s->tail_enabled) s->log_bytes_tailed = s->log_bytes_written;
+    }
+    s->tail_changed.notify_one();
+    s->tail_caught_up.notify_all();
     return true;
 }
 
@@ -307,14 +325,194 @@ static void log_writer_main(probe_session *s) {
     s->queue_flushed.notify_all();
 }
 
-static bool start_log_writer(probe_session *s) {
+static void warn_console_once(probe_session *s) {
+    bool print = false;
+    {
+        std::lock_guard<std::mutex> lock(s->tail_mu);
+        if (s->stdout_is_console && !s->console_warning) {
+            s->console_warning = true; print = true;
+        }
+    }
+    if (print)
+        std::fprintf(stderr, "probe: logs are being written to a console, which is slowing the target; "
+                             "redirect stdout to a file or pipe for full speed\n");
+    if (print) std::fflush(stderr);
+}
+
+static void tail_failed(probe_session *s, const std::string &message) {
+    {
+        std::lock_guard<std::mutex> lock(s->tail_mu);
+        if (s->tail_failed) return;
+        s->tail_failed = true;
+        s->tail_error = message;
+    }
+    std::fprintf(stderr, "probe: error: %s\n", message.c_str());
+    s->tail_caught_up.notify_all();
+}
+
+static bool write_stdout_chunk(probe_session *s, const char *bytes, size_t size) {
+    if (!size) return true;
+    // The driver still owns the CRT FILE*. Empty it before the raw-handle write so its
+    // own complete lines cannot remain buffered behind newer tailed log lines.
+    if (std::fflush(stdout) != 0) {
+        tail_failed(s, "flush controller stdout before probe logs"); return false;
+    }
+    DWORD wrote = 0;
+    auto started = std::chrono::steady_clock::now();
+    if (s->stdout_handle == nullptr || s->stdout_handle == INVALID_HANDLE_VALUE || size > MAXDWORD ||
+        !WriteFile(s->stdout_handle, bytes, (DWORD)size, &wrote, nullptr) || (size_t)wrote != size) {
+        tail_failed(s, win_error("tail probe logs to stdout")); return false;
+    }
+    if (s->stdout_is_console && std::chrono::steady_clock::now() - started >= std::chrono::seconds(1))
+        warn_console_once(s);
+    return true;
+}
+
+static void log_tailer_main(probe_session *s) {
+    constexpr size_t CHUNK_BYTES = 64 * 1024;
+    std::string pending;
+    uint64_t file_bytes_read = 0;
+    auto behind_since = std::chrono::steady_clock::time_point{};
+    try {
+        for (;;) {
+            uint64_t published = 0;
+            {
+                std::unique_lock<std::mutex> lock(s->tail_mu);
+                s->tail_changed.wait(lock, [s, file_bytes_read] {
+                    return s->tail_stop || s->tail_failed || s->log_bytes_written > file_bytes_read;
+                });
+                if (s->tail_failed) return;
+                published = s->log_bytes_written;
+                if (s->tail_stop && published == file_bytes_read && pending.empty()) break;
+            }
+            if (published > file_bytes_read && behind_since == std::chrono::steady_clock::time_point{})
+                behind_since = std::chrono::steady_clock::now();
+
+            while (file_bytes_read < published) {
+                char buffer[CHUNK_BYTES];
+                DWORD want = (DWORD)std::min<uint64_t>(sizeof(buffer), published - file_bytes_read);
+                DWORD got = 0;
+                if (!ReadFile(s->log_reader, buffer, want, &got, nullptr)) {
+                    tail_failed(s, win_error("read probe log file")); return;
+                }
+                if (!got) { Sleep(1); continue; }       // published only after WriteFile; defensive for cache lag
+                pending.append(buffer, got);
+                file_bytes_read += got;
+
+                for (;;) {
+                    size_t limit = std::min(pending.size(), CHUNK_BYTES);
+                    size_t newline = limit ? pending.rfind('\n', limit - 1) : std::string::npos;
+                    if (newline == std::string::npos) {
+                        newline = pending.find('\n');
+                        if (newline == std::string::npos) break;
+                    }
+                    size_t chunk = newline + 1;          // every raw stdout write ends on a line boundary
+                    if (!write_stdout_chunk(s, pending.data(), chunk)) return;
+                    pending.erase(0, chunk);
+                    {
+                        std::lock_guard<std::mutex> lock(s->tail_mu);
+                        s->log_bytes_tailed += chunk;
+                    }
+                    s->tail_caught_up.notify_all();
+                }
+            }
+
+            uint64_t written = 0, tailed = 0;
+            {
+                std::lock_guard<std::mutex> lock(s->tail_mu);
+                written = s->log_bytes_written; tailed = s->log_bytes_tailed;
+            }
+            if (written == tailed) behind_since = {};
+            else if (s->stdout_is_console && behind_since != std::chrono::steady_clock::time_point{} &&
+                     std::chrono::steady_clock::now() - behind_since >= std::chrono::seconds(1))
+                warn_console_once(s);
+        }
+    } catch (const std::exception &e) {
+        tail_failed(s, std::string("probe log tailer failed: ") + e.what());
+    } catch (...) {
+        tail_failed(s, "probe log tailer failed");
+    }
+}
+
+static std::string utf8_path(const std::wstring &path) {
+    if (path.empty()) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 1) return {};
+    std::vector<char> bytes((size_t)n);
+    return WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, bytes.data(), n, nullptr, nullptr)
+               ? std::string(bytes.data()) : std::string{};
+}
+
+static bool make_directory(const std::wstring &path) {
+    return CreateDirectoryW(path.c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
+static bool start_log_output(probe_session *s) {
+    wchar_t temp[MAX_PATH];
+    DWORD n = GetTempPathW(MAX_PATH, temp);
+    if (!n || n >= MAX_PATH - 64) { set_error(s, win_error("find temporary log directory")); return false; }
+    std::wstring root = std::wstring(temp, n) + L"uhh";
+    std::wstring directory = root + L"\\logs";
+    if (!make_directory(root) || !make_directory(directory)) {
+        set_error(s, win_error("create temporary log directory")); return false;
+    }
+
+    static std::atomic<unsigned> counter{0};
+    for (unsigned attempts = 0; attempts < 1000; ++attempts) {
+        unsigned id = counter.fetch_add(1, std::memory_order_relaxed);
+        s->log_path = directory + L"\\uhh-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+                      std::to_wstring(id) + L".jsonl";
+        s->log_file = CreateFileW(s->log_path.c_str(), GENERIC_WRITE,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                  nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (s->log_file != INVALID_HANDLE_VALUE) break;
+        if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) break;
+    }
+    if (s->log_file == INVALID_HANDLE_VALUE) { set_error(s, win_error("create probe log file")); return false; }
+
     s->stdout_handle = GetStdHandle(STD_OUTPUT_HANDLE);
-    try { s->log_writer = std::thread(log_writer_main, s); return true; }
-    catch (...) { std::fprintf(stderr, "probe: error: log writer thread creation failed\n"); return false; }
+    bool stdout_valid = s->stdout_handle != nullptr && s->stdout_handle != INVALID_HANDLE_VALUE;
+    s->stdout_type = stdout_valid ? GetFileType(s->stdout_handle) : FILE_TYPE_UNKNOWN;
+    DWORD console_mode = 0;
+    s->stdout_is_console = s->stdout_type == FILE_TYPE_CHAR &&
+                           GetConsoleMode(s->stdout_handle, &console_mode) != FALSE;
+    // NUL is a character device but not a console. It is the no-new-API opt-out: keep
+    // the complete file and avoid spending a thread copying bytes into the null device.
+    s->tail_enabled = stdout_valid &&
+                      !(s->stdout_type == FILE_TYPE_CHAR && !s->stdout_is_console);
+    if (s->tail_enabled) {
+        s->log_reader = CreateFileW(s->log_path.c_str(), GENERIC_READ,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (s->log_reader == INVALID_HANDLE_VALUE) {
+            set_error(s, win_error("open probe log tail")); CloseHandle(s->log_file);
+            s->log_file = INVALID_HANDLE_VALUE; return false;
+        }
+    }
+
+    try {
+        s->log_writer = std::thread(log_writer_main, s);
+        if (s->tail_enabled) s->log_tailer = std::thread(log_tailer_main, s);
+    } catch (...) {
+        {
+            std::lock_guard<std::mutex> lock(s->queue_mu); s->writer_stop = true;
+        }
+        s->queue_readable.notify_one();
+        if (s->log_writer.joinable()) s->log_writer.join();
+        if (s->log_reader != INVALID_HANDLE_VALUE) { CloseHandle(s->log_reader); s->log_reader = INVALID_HANDLE_VALUE; }
+        CloseHandle(s->log_file); s->log_file = INVALID_HANDLE_VALUE;
+        set_error(s, "probe log thread creation failed"); return false;
+    }
+    std::string shown = utf8_path(s->log_path);
+    std::fprintf(stderr, "probe: logs -> %s\n", shown.empty() ? "(unprintable path)" : shown.c_str());
+    std::fflush(stderr);
+    return true;
 }
 
 static bool enqueue_log(probe_session *s, LogRecord &&record) {
     std::unique_lock<std::mutex> lock(s->queue_mu);
+    bool blocked = s->log_queue.size() >= probe_session::LOG_QUEUE_CAP && !s->writer_failed;
+    auto blocked_at = std::chrono::steady_clock::now();
     s->queue_writable.wait(lock, [s] {
         return s->log_queue.size() < probe_session::LOG_QUEUE_CAP || s->writer_failed;
     });
@@ -322,17 +520,20 @@ static bool enqueue_log(probe_session *s, LogRecord &&record) {
         s->controller_dropped.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+    bool warned = blocked && std::chrono::steady_clock::now() - blocked_at >= std::chrono::seconds(1);
     try { s->log_queue.push_back(std::move(record)); }
     catch (...) {
         s->controller_dropped.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     lock.unlock();
+    if (warned) warn_console_once(s);
     s->queue_readable.notify_one();
     return true;
 }
 
 static void flush_log_writer(probe_session *s) {
+    if (s->log_file == INVALID_HANDLE_VALUE) return;
     std::string error;
     {
         std::unique_lock<std::mutex> lock(s->queue_mu);
@@ -342,17 +543,40 @@ static void flush_log_writer(probe_session *s) {
         error = s->writer_error;
     }
     if (!error.empty()) set_error(s, error);
+
+    std::string tail_error;
+    if (s->tail_enabled) {
+        std::unique_lock<std::mutex> lock(s->tail_mu);
+        uint64_t target = s->log_bytes_written;
+        s->tail_caught_up.wait(lock, [s, target] {
+            return s->log_bytes_tailed >= target || s->tail_failed;
+        });
+        tail_error = s->tail_error;
+    }
+    if (!tail_error.empty()) set_error(s, tail_error);
 }
 
-static void stop_log_writer(probe_session *s) {
-    if (!s->log_writer.joinable()) return;
-    {
-        std::lock_guard<std::mutex> lock(s->queue_mu);
-        s->writer_stop = true;
+static void stop_log_output(probe_session *s) {
+    if (s->log_writer.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(s->queue_mu); s->writer_stop = true;
+        }
+        s->queue_readable.notify_one();
+        s->log_writer.join();
+        flush_log_writer(s);
     }
-    s->queue_readable.notify_one();
-    s->log_writer.join();
+    if (s->log_tailer.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(s->tail_mu); s->tail_stop = true;
+        }
+        s->tail_changed.notify_one();
+        s->log_tailer.join();
+    }
     if (!s->writer_error.empty()) set_error(s, s->writer_error);
+    if (!s->tail_error.empty()) set_error(s, s->tail_error);
+    if (s->log_reader != INVALID_HANDLE_VALUE) CloseHandle(s->log_reader);
+    if (s->log_file != INVALID_HANDLE_VALUE) CloseHandle(s->log_file);
+    s->log_reader = s->log_file = INVALID_HANDLE_VALUE;
 }
 
 static std::string basename_of(std::string path) {
@@ -478,6 +702,16 @@ static bool ensure_local_agent(probe_session *s) {
                 if (h != INVALID_HANDLE_VALUE) {
                     do {
                         if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.') continue;
+                        // Only copies of DEAD controllers: a live session may have just made its
+                        // copy and not loaded it yet (it would look unused). Name: <pid>-<tick>-<n>.
+                        const DWORD owner = (DWORD)wcstoul(fd.cFileName, nullptr, 10);
+                        if (owner) {
+                            HANDLE ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, owner);
+                            DWORD code = 0;
+                            const bool alive = ph && GetExitCodeProcess(ph, &code) && code == STILL_ACTIVE;
+                            if (ph) CloseHandle(ph);
+                            if (alive) continue;
+                        }
                         std::wstring d = root + L"\\" + fd.cFileName;
                         if (DeleteFileW((d + L"\\probe_api_agent.dll").c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND)
                             RemoveDirectoryW(d.c_str());          // in use by a live session: left alone
@@ -1760,11 +1994,7 @@ static void arm_entry_fixup(probe_session *s, uint64_t entry) {
 }
 
 extern "C" probe_session *probe_session_create(void) {
-    try {
-        std::unique_ptr<probe_session> s(new probe_session);
-        if (!start_log_writer(s.get())) return nullptr;
-        return s.release();
-    }
+    try { return new probe_session; }
     catch (...) { std::fprintf(stderr, "probe: error: session allocation failed\n"); return nullptr; }
 }
 
@@ -2102,6 +2332,7 @@ extern "C" int probe_launch(probe_session *s, char *const argv[]) {
         }
         s->launched = true;
         s->debug_tid = GetCurrentThreadId();
+        if (!start_log_output(s)) { TerminateProcess(s->pi.hProcess, 3); return 0; }
         { std::string which; s->sym_ready = uhh_sym::init(s->pi.hProcess, which);
           std::fprintf(stderr, "probe: symbols via %s%s\n", which.c_str(), uhh_sym::has_symbol_server() ? " (symbol server capable)" : ""); }
         if (!create_agent_channel(s) || (!has_inline(s) && !release_gate(s))) {
@@ -2137,6 +2368,7 @@ extern "C" int probe_attach(probe_session *s, uint32_t pid) {
     s->debug_tid = GetCurrentThreadId();
     s->pi.dwProcessId = pid;
     s->attached = true; s->launched = true; s->gate_sent = true;
+    if (!start_log_output(s)) { DebugActiveProcessStop(pid); return 0; }
     { std::string which; s->sym_ready = uhh_sym::init(s->pi.hProcess, which); }
     if (!create_agent_channel(s)) { DebugActiveProcessStop(pid); return 0; }
     return 1;
@@ -3354,7 +3586,7 @@ extern "C" void probe_close(probe_session *s) {
         if (WaitForSingleObject(s->pi.hProcess, 5000) == WAIT_OBJECT_0) s->exited = true;
     }
     stop_drainer(s);
-    stop_log_writer(s);                         // symbolization needs dbghelp and the process handle
+    stop_log_output(s);                         // symbolization needs dbghelp and the process handle
     if (s->pi.hProcess)
         for (uint64_t b : s->scratch_blocks) VirtualFreeEx(s->pi.hProcess, (void *)(uintptr_t)b, 0, MEM_RELEASE);
     if (s->sym_ready) uhh_sym::cleanup(s->pi.hProcess);
