@@ -12,7 +12,13 @@ static void check(probe_context *c, bool ok, const char *name) {
     if (ok) send_log(c, "ok %s", name); else send_log(c, "FAIL %s", name);
 }
 
-CONF_EXPORT void conf_on_later(probe_context *c) { send_log(c, "ok later-hit"); }
+struct later_config { uint64_t cookie; };
+CONF_EXPORT void conf_on_later(probe_context *c) {
+    const later_config *k = (const later_config *)get_config(c);
+    if (k && k->cookie == 0x1A7E1A7E1A7E1A7Eull) send_log(c, "ok later-hit");      // config arrived with the add
+    else send_log(c, "FAIL later-hit config");
+}
+CONF_EXPORT void conf_on_once_hw(probe_context *c) { send_log(c, "ok once-hw-hit"); }
 CONF_EXPORT void conf_on_watch(probe_context *c) { send_log(c, "ok watch-hit"); }
 
 CONF_EXPORT void conf_on_site(probe_context *c) {
@@ -53,13 +59,14 @@ CONF_EXPORT void conf_on_site(probe_context *c) {
         first = 0;
         probe_session *s = get_session(c);
         check(c, s != nullptr, "get_session");
-        check(c, probe_add_symbol(s, "conformance_target.exe!conf_later", conf_on_later, PROBE_BREAKPOINT) == 1,
-              "probe_add_symbol");
+        later_config k{0x1A7E1A7E1A7E1A7Eull};
+        check(c, probe_add_symbol_cfg(s, "conformance_target.exe!conf_later", conf_on_later, PROBE_BREAKPOINT,
+                                      &k, sizeof(k)) == 1, "probe_add_symbol");
         uint64_t watched = 0;
         bool got = call_func(c, "conformance_target.exe!conf_watch_addr", &watched, 0) && watched;
         check(c, got && probe_watch(s, watched, conf_on_watch, PROBE_WATCH_WRITE) == 1, "probe_watch");
         uint64_t ret = 0;
         get_mem(c, sp, &ret, sizeof(void *));               // our return address: a valid code address
-        check(c, probe_add_address(s, ret, conf_on_later, PROBE_HW | PROBE_ONCE) == 1, "probe_add_address");
+        check(c, probe_add_address(s, ret, conf_on_once_hw, PROBE_HW | PROBE_ONCE) == 1, "probe_add_address");
     }
 }

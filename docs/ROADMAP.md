@@ -21,7 +21,7 @@ identical source under every backend.
 - ✅ `call_func`: call target functions from any callback (direct for inline; debugger-run call on the stopped thread for breakpoint/hw); pointer-sized args on both arches. Further hardening of the breakpoint/hw path was not pursued
 - 🔧 `probe_attach` (clean detach: hooks removed, INT3s restored, DRs cleared, no thread mid-step), `probe_attach_new`
 - 🔧 Inline register overrides counted in the report (`overrides`) like controller-side ones
-- ⬜ x86 inline `send_log_stack` at a function's first instruction: include the caller frame (`[esp]`)
+- ✅ x86 `send_log_stack` at a function's first instruction includes the caller frame (agent and controller)
 - ⬜ Log sink: stream logs as they arrive (flat memory at millions of events)
 - ⬜ Performance pass on every hot path (per-hit cost per backend and per method; see Benchmarks)
 
@@ -42,6 +42,23 @@ identical source under every backend.
 - ✅ Inline sites sharing a page with routines the inline installer itself calls (ntdll NtProtect/NtQuery/NtFlush/heap/SRW, KernelBase VirtualProtect/Query/Alloc) -> hardware fallback with `PROBE_FALLBACK_HW`, else a clear refusal; never a crash. Documented limitation: inline on those pages (e.g. most ntdll syscall stubs) is not attempted
 - ⬜ Memory reads/writes at scale: millions of `get_mem`/`set_mem` across threads and backends; exact values, writes visible to the target, page-crossing and large sizes, unmapped/protected addresses fail cleanly, throughput per backend
 - ⬜ Continuous evaluators: independent agents repeatedly hunting edge cases, regressions and gaps against the gated_config use case
+
+## Gaps from the goal gap-analysis (evaluator, 2026-11-04) — each closes with a test
+- ⬜ P1 detach while running: probe_close from another thread stops probe_run, which detaches on its own thread (debug-API rule); target finishes correctly, bytes == disk, DR7 == 0, debugger gone
+- ⬜ P1 unload/reload of a probed DLL: inline must re-arm like breakpoint/hw (hits == 3N per backend)
+- ⬜ P1 probe_add_symbol_cfg forwarded from inline callbacks (config travels over IPC)
+- ⬜ P1 one log length limit for every backend, truncation marked (inline was 256 vs 2048)
+- ⬜ P1 log delivery when the target crashes / is killed (logs + log_dropped == hits)
+- ⬜ P1 controller-side log memory: no unhandled bad_alloc; memory measured at 2M/20M
+- ⬜ P1 probe_attach_new exercised (second instance, timeout path)
+- ⬜ P1 target checksum asserted equal across every mix cell and vs a flag-only run
+- ⬜ P2 hw PROBE_ONCE and watch RW|ONCE proven distinctly; 5th hw probe refused cleanly (setup and runtime), slot reuse after ONCE
+- ⬜ P2 runtime adds on a DLL loaded later by a non-main thread (all backends); probe_add_address(PROBE_INLINE) from a callback
+- ⬜ P2 threads started during the entry hold (TLS/DllMain thread calling the probed function)
+- ⬜ P2 refusal tests: PROBE_AT_RETURN, inline ONCE, 33rd inline probe; ALLOW_PREHOOKED inline asserted
+- ⬜ P2 sidefx: full arithmetic EFLAGS (probe between cmp and jcc), LastStatus; below-SP documented as exempt
+- ⬜ P2 x86 stacks mid-function / FPO frames identical across backends
+- ⬜ P2 mixed backends for state-sharing probes: documented limitation (state lives where callbacks run)
 
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`

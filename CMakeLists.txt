@@ -83,7 +83,8 @@ add_library(probe_api_agent SHARED
     examples/trace/trace_callback.cpp
     examples/conformance/conformance_callbacks.cpp
     bench/hitcost/hitcost_callbacks.cpp
-    examples/memstress/memstress_callbacks.cpp)
+    examples/memstress/memstress_callbacks.cpp
+    examples/sidefx/sidefx_callbacks.cpp)
 target_include_directories(probe_api_agent PRIVATE include examples/gated_config examples/dynwatch examples/trace examples/memstress)
 target_link_libraries(probe_api_agent PRIVATE safetyhook)
 target_compile_definitions(probe_api_agent PRIVATE BREAKAGE_AGENT_ONLY FRIDA_PARITY_AGENT_ONLY)
@@ -153,6 +154,8 @@ add_dependencies(uhh_trace probe_api_agent)
 
 # --- conformance: every context method, identical callback, every backend -------------
 add_executable(conformance_target examples/conformance/conformance_target.c)
+target_compile_options(conformance_target PRIVATE /Zi)
+target_link_options(conformance_target PRIVATE /DEBUG)
 add_executable(conformance_driver examples/conformance/conformance_driver.cpp examples/conformance/conformance_callbacks.cpp)
 target_include_directories(conformance_driver PRIVATE include)
 target_link_libraries(conformance_driver PRIVATE probe_api)
@@ -175,7 +178,35 @@ target_include_directories(memstress_driver PRIVATE include examples/memstress)
 target_link_libraries(memstress_driver PRIVATE probe_api)
 add_dependencies(memstress_driver memstress_target probe_api_agent)
 
-foreach(t memstress_target memstress_driver hitcost_target hitcost_driver conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
+# --- side-effect transparency: a probe hit leaves no trace on the thread ----------------
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    set(SIDEFX_ASM examples/sidefx/sidefx_sites_x86.asm)
+    set(SIDEFX_SITE_EXPORT "/EXPORT:SideFxSite")   # the x86 linker adds the cdecl underscore itself
+else()
+    set(SIDEFX_ASM examples/sidefx/sidefx_sites_x64.asm)
+    set(SIDEFX_SITE_EXPORT "/EXPORT:SideFxSite")
+endif()
+add_executable(sidefx_target examples/sidefx/sidefx_target.c ${SIDEFX_ASM})
+target_compile_options(sidefx_target PRIVATE $<$<COMPILE_LANGUAGE:C>:/arch:AVX2>)
+target_link_options(sidefx_target PRIVATE ${SIDEFX_SITE_EXPORT} "/MAP:$<TARGET_FILE_DIR:sidefx_target>/sidefx_target.map")
+add_executable(sidefx_driver examples/sidefx/sidefx_driver.cpp examples/sidefx/sidefx_callbacks.cpp)
+target_include_directories(sidefx_driver PRIVATE include)
+target_link_libraries(sidefx_driver PRIVATE probe_api)
+add_dependencies(sidefx_driver sidefx_target probe_api_agent)
+
+# --- real-world behaviour targets (driven by uhh_trace in the suite) --------------------
+foreach(rw reentrancy_target thread_stress_target antitamper_target antidebug_target)
+    add_executable(${rw} examples/realworld/${rw}.c)
+endforeach()
+add_executable(exceptions_target examples/realworld/exceptions_target.cpp)
+target_compile_options(exceptions_target PRIVATE /EHs)   # NOT /EHsc: its extern "C" functions throw
+# A PDB so stacks and symbol checks resolve these targets' functions.
+foreach(rw reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target)
+    target_compile_options(${rw} PRIVATE /Zi)
+    target_link_options(${rw} PRIVATE /DEBUG)
+endforeach()
+
+foreach(t sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
     target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 endforeach()

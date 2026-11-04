@@ -10,12 +10,12 @@
 #include <cstdio>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 8;
+constexpr uint32_t PROBE_AGENT_VERSION = 10;
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 32;
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
 constexpr uint32_t PROBE_AGENT_CONFIG_CAP = 256;
 constexpr uint32_t PROBE_AGENT_LOG_CAP = 4096;      /* ring slots; the controller drains continuously */
-constexpr uint32_t PROBE_AGENT_LOG_TEXT_CAP = 256;
+constexpr uint32_t PROBE_AGENT_LOG_TEXT_CAP = 1024;   /* == the controller-side limit: one limit for every backend */
 
 enum probe_agent_status : LONG {
     PROBE_AGENT_PENDING = 0,
@@ -66,6 +66,8 @@ struct probe_ipc_request {
     uint64_t address;
     char callback[PROBE_AGENT_EXPORT_CAP];
     char symbol[256];
+    uint32_t config_len;                  /* probe_add_symbol_cfg: config travels with the call */
+    unsigned char config[PROBE_AGENT_CONFIG_CAP];
 };
 
 /* Hit counting and in-flight tracking are striped over cache-line-separated counters
@@ -86,6 +88,7 @@ struct probe_agent_shared {
     volatile LONG64 overrides;     /* set_reg calls that changed a register, inline side */
     volatile LONG64 drain_beat;    /* bumped by the controller's drainer every loop: liveness */
     volatile LONG xstate_mode;     /* benchmark knob: 0 = default (gated), 1 = none, 2 = full */
+    volatile LONG controller_gone; /* set when the controller stops consuming (detach/close): log calls return at once */
     probe_agent_stripe hit_stripes[PROBE_AGENT_MAX_PROBES][PROBE_AGENT_STRIPES];
     probe_agent_request requests[PROBE_AGENT_MAX_PROBES];
     probe_agent_log logs[PROBE_AGENT_LOG_CAP];

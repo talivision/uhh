@@ -3,6 +3,7 @@
 //   uhh_trace [--backend inline|breakpoint|hw] [--stack]
 //             -p "KernelBase.dll!CreateFileW:Wxx" [-p ...] -- program.exe [args...]
 //   uhh_trace ... --attach <pid>          (instrument an already-running process)
+//   uhh_trace ... --attach-new <image> [--timeout ms]   (attach to the next NEW instance)
 //
 // After the ':' one format character per argument (see trace_callback.h). Inline probes
 // fall back to a hardware breakpoint when the site cannot be hooked in time or is
@@ -17,6 +18,7 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <thread>
 
 static std::wstring wide_arg(const char *text) {
     if (!text || !*text) return {};
@@ -171,13 +173,17 @@ static int list_symbols(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     if (argc > 1 && !std::strcmp(argv[1], "--list")) return list_symbols(argc, argv);
-    uint32_t backend = PROBE_BREAKPOINT; bool stack = false; unsigned long attach_pid = 0;
+    uint32_t backend = PROBE_BREAKPOINT; bool stack = false; unsigned long attach_pid = 0, detach_ms = 0;
+    const char *attach_new = nullptr; unsigned long attach_timeout = 0;
     std::vector<trace_config> cfgs; std::vector<std::string> locs;
     int i = 1;
     for (; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--")) { ++i; break; }
         if (!std::strcmp(argv[i], "--stack")) { stack = true; continue; }
         if (!std::strcmp(argv[i], "--attach") && i + 1 < argc) { attach_pid = std::strtoul(argv[++i], nullptr, 0); continue; }
+        if (!std::strcmp(argv[i], "--detach-after-ms") && i + 1 < argc) { detach_ms = std::strtoul(argv[++i], nullptr, 0); continue; }
+        if (!std::strcmp(argv[i], "--attach-new") && i + 1 < argc) { attach_new = argv[++i]; continue; }
+        if (!std::strcmp(argv[i], "--timeout") && i + 1 < argc) { attach_timeout = std::strtoul(argv[++i], nullptr, 0); continue; }
         if (!std::strcmp(argv[i], "--backend") && i + 1 < argc) {
             const char *b = argv[++i];
             backend = !std::strcmp(b, "inline") ? PROBE_INLINE : !std::strcmp(b, "hw") ? PROBE_HW : PROBE_BREAKPOINT;
@@ -196,7 +202,7 @@ int main(int argc, char **argv) {
         }
         std::fprintf(stderr, "uhh_trace: unknown option %s\n", argv[i]); return 2;
     }
-    if (cfgs.empty() || (!attach_pid && i >= argc)) {
+    if (cfgs.empty() || (!attach_pid && !attach_new && i >= argc)) {
         std::fprintf(stderr, "usage: uhh_trace [--backend inline|breakpoint|hw] [--stack] -p mod!Export[:fmt] ... -- prog [args]\n"
                              "       uhh_trace --list <module.dll|path> [--mask *pattern*]\n");
         return 2;
@@ -210,7 +216,25 @@ int main(int argc, char **argv) {
         ok = ok && probe_add_symbol_cfg(s, locs[k].c_str(), uhh_trace_call, flags, &cfgs[k], sizeof(cfgs[k]));
     }
     std::vector<char *> child(argv + (i < argc ? i : argc), argv + argc); child.push_back(nullptr);
-    if (attach_pid) {
+    if (attach_new) {
+        // Wait for a NEW process with this image name (already-running ones are ignored).
+        std::printf("{\"kind\":\"waiting_for\",\"image\":\"%s\"}\n", attach_new); std::fflush(stdout);
+        ok = ok && probe_attach_new(s, attach_new, (uint32_t)attach_timeout);
+        if (ok) { std::printf("{\"kind\":\"attached\"}\n"); std::fflush(stdout); }
+        ok = ok && probe_run(s);
+    } else if (attach_pid && detach_ms) {
+        // Detach while the target keeps running: probe_run on a worker thread, probe_close
+        // from this one after the delay. The target must carry on exactly as before.
+        ok = ok && probe_attach(s, (uint32_t)attach_pid);
+        if (ok) { std::printf("{\"kind\":\"attached\",\"pid\":%lu}\n", attach_pid); std::fflush(stdout); }
+        std::thread runner([&] { probe_run(s); });
+        Sleep(detach_ms);
+        probe_report(s, stdout);              // what was observed before letting go
+        probe_close(s);                       // detach: hooks removed, INT3s restored, DRs cleared
+        runner.join();
+        std::printf("{\"kind\":\"detached\",\"pid\":%lu}\n", attach_pid);
+        return ok ? 0 : 1;
+    } else if (attach_pid) {
         ok = ok && probe_attach(s, (uint32_t)attach_pid);
         if (ok) { std::printf("{\"kind\":\"attached\",\"pid\":%lu}\n", attach_pid); std::fflush(stdout); }
         ok = ok && probe_run(s);

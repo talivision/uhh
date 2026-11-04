@@ -23,6 +23,7 @@ struct symbol_entry {
 bool init(HANDLE process, std::string &which_dbghelp_or_error);
 void register_module(HANDLE process, const std::wstring &image_path,
                      std::uint64_t base, std::uint32_t size_of_image);
+void unregister_module(HANDLE process, std::uint64_t base);
 bool resolve(HANDLE process, const std::string &module, const std::string &name,
              std::uint64_t &address);
 std::string symbolize(HANDLE process, std::uint64_t address);

@@ -27,6 +27,7 @@ struct dbghelp_api {
     decltype(&::StackWalk64) stack_walk = nullptr;
     decltype(&::SymFunctionTableAccess64) function_table_access = nullptr;
     decltype(&::SymGetModuleBase64) get_module_base = nullptr;
+    decltype(&::SymUnloadModule64) unload_module = nullptr;
 };
 
 struct session_state {
@@ -338,7 +339,8 @@ bool bind_api(std::string &error) {
         bind(g_api.set_search_path, "SymSetSearchPathW") &&
         bind(g_api.stack_walk, "StackWalk64") &&
         bind(g_api.function_table_access, "SymFunctionTableAccess64") &&
-        bind(g_api.get_module_base, "SymGetModuleBase64"))
+        bind(g_api.get_module_base, "SymGetModuleBase64") &&
+        bind(g_api.unload_module, "SymUnloadModule64"))
         return true;
     error = win32_error("GetProcAddress for a required DbgHelp function");
     return false;
@@ -467,7 +469,8 @@ BOOL CALLBACK collect_symbol(PSYMBOL_INFOW symbol, ULONG size, PVOID user) noexc
     enum_context *context = static_cast<enum_context *>(user);
     try {
         symbol_entry entry;
-        entry.name = narrow(std::wstring(symbol->Name, symbol->NameLen));
+        entry.name = narrow(std::wstring(symbol->Name, symbol->NameLen < symbol->MaxNameLen ? symbol->NameLen
+                                                                                           : symbol->MaxNameLen - 1));
         entry.address = static_cast<std::uint64_t>(symbol->Address);
         entry.size = static_cast<std::uint32_t>(size);
         entry.is_export = (symbol->Flags & SYMFLAG_EXPORT) != 0;
@@ -546,6 +549,23 @@ void register_module(HANDLE process, const std::wstring &image_path,
     }
 }
 
+// Forget a module that was unloaded, so a later module at the same base (or the same
+// name reloaded elsewhere) is never resolved or symbolized through stale information.
+void unregister_module(HANDLE process, std::uint64_t base) {
+    try {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (!g_dbghelp) return;
+        const auto session = find_session(process);
+        if (session == g_sessions.end()) return;
+        auto &mods = session->modules;
+        for (auto it = mods.begin(); it != mods.end(); ) {
+            if (it->base == base) it = mods.erase(it); else ++it;
+        }
+        g_api.unload_module(process, static_cast<DWORD64>(base));
+    } catch (...) {
+    }
+}
+
 bool resolve(HANDLE process, const std::string &module, const std::string &name,
              std::uint64_t &address) {
     try {
@@ -609,7 +629,8 @@ std::string symbolize(HANDLE process, std::uint64_t address) {
         if (g_api.from_addr(process, static_cast<DWORD64>(address), &displacement, symbol)) {
             std::string output = narrow(module_name);
             if (!output.empty()) output.push_back('!');
-            output += narrow(std::wstring(symbol->Name, symbol->NameLen));
+            output += narrow(std::wstring(symbol->Name, symbol->NameLen < symbol->MaxNameLen ? symbol->NameLen
+                                                                                             : symbol->MaxNameLen - 1));
             output += "+" + hex_address(static_cast<std::uint64_t>(displacement));
 
             IMAGEHLP_LINEW64 line{};

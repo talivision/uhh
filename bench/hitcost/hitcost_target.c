@@ -13,6 +13,7 @@
 static volatile intptr_t g_sink;
 __declspec(dllexport) __declspec(noinline) intptr_t hit_site(intptr_t i);
 static long long g_calls = 10000000; static int g_avx = 0;
+static long long g_crash_after = 0;            /* >0: die with an unhandled access violation after N calls */
 static volatile LONG g_go;
 
 static DWORD WINAPI loop(void *arg) {
@@ -21,6 +22,7 @@ static DWORD WINAPI loop(void *arg) {
     while (!g_go) YieldProcessor();
     for (long long i = 0; i < g_calls; ++i) {
         hit_site((intptr_t)i);
+        if (g_crash_after && i + 1 == g_crash_after) *(volatile int *)(uintptr_t)8 = 1;   /* crash */
         if (g_avx) live = _mm256_xor_ps(live, flip);
     }
     float keep[8]; _mm256_storeu_ps(keep, live); return (DWORD)keep[0];
@@ -37,6 +39,7 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--calls") && i + 1 < argc) g_calls = atoll(argv[++i]);
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--avx")) g_avx = 1;
+        else if (!strcmp(argv[i], "--crash-after") && i + 1 < argc) g_crash_after = atoll(argv[++i]);
         else if (!strcmp(argv[i], "--no-wait")) no_wait = 1;
     }
     if (threads < 1 || threads > 64) threads = 1;

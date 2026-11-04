@@ -79,8 +79,10 @@ struct LogRecord {
 struct probe_session {
     std::vector<std::unique_ptr<Probe>> probes;
     std::vector<LogRecord> logs;
-    std::mutex log_mu;                         // logs: debug-loop thread + drainer thread
+    std::mutex log_mu;                         // logs + agent_map: debug-loop thread + drainer thread
+    uint32_t agent_map[PROBE_AGENT_MAX_PROBES] = {};   // agent request index -> probes[] index (under log_mu)
     std::thread drainer;                       // empties the agent's log ring continuously
+    uint64_t controller_dropped = 0;           // controller-side logs lost to allocation failure
     std::atomic<bool> drain_stop{false};
     bool sym_ready = false;    // dbghelp initialised on the target (stack walk + symbolize)
     std::unordered_map<std::string, uint64_t> module_bases;
@@ -124,6 +126,9 @@ struct probe_session {
     int hw_active = 0;
     bool launched = false, ran = false, exited = false, gate_sent = false;
     bool attached = false;                     // probe_attach: detach (not kill) on close
+    std::atomic<bool> stop_requested{false};   // probe_close from another thread while probe_run runs
+    std::atomic<bool> running{false};          // probe_run is executing (on some thread)
+    bool detached = false;
     DWORD in_call_tid = 0;                     // thread currently running a call_func callee
     bool skip_continue = false;                // call_func already continued the current event
     uint64_t call_trap = 0;                    // INT3 the callee returns into
@@ -188,10 +193,17 @@ static void sym_register(probe_session *s, HANDLE file, uint64_t base) {
         remote_read(s->pi.hProcess, base + (uint32_t)dos.e_lfanew, &nt, sizeof(nt), &got) && got == sizeof(nt) &&
         nt.Signature == IMAGE_NT_SIGNATURE)
         size = nt.OptionalHeader.SizeOfImage;
-    std::wstring wpath(path.begin(), path.end());
-    int wn = MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, nullptr, 0);
-    if (wn > 0) { wpath.assign((size_t)wn, L'\0'); MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, wpath.data(), wn); wpath.resize((size_t)wn - 1); }
-    uhh_sym::register_module(s->pi.hProcess, wpath, base, size);
+    // dbghelp gets the exact (wide) path, so non-ASCII directories work.
+    std::wstring wpath;
+    {
+        wchar_t w[1024];
+        DWORD n = GetFinalPathNameByHandleW(file, w, 1024, FILE_NAME_NORMALIZED);
+        if (n && n < 1024) {
+            wpath.assign(w, n);
+            if (wpath.size() > 4 && wpath.compare(0, 4, L"\\\\?\\") == 0) wpath = wpath.substr(4);
+        }
+    }
+    if (!wpath.empty()) uhh_sym::register_module(s->pi.hProcess, wpath, base, size);
 }
 
 static std::string module_name_from_module(HMODULE module) {
@@ -508,6 +520,8 @@ static bool resolve_inline(probe_session *s, Probe &p, uint64_t base) {
     p.base = base; p.address = base + p.rva;
     auto &request = s->shared->requests[p.agent_index];
     request.site = p.address; MemoryBarrier();
+    // A probe re-armed after its module was unloaded and loaded again: a new install.
+    if (request.status != PROBE_AGENT_PENDING) InterlockedExchange(&request.status, PROBE_AGENT_PENDING);
     std::fprintf(stderr, "probe: resolved %s -> base=0x%llx addr=0x%llx (awaiting agent)\n",
                  p.location.c_str(), (unsigned long long)base, (unsigned long long)p.address);
     return true;
@@ -867,7 +881,16 @@ static bool arm_probe(probe_session *s, Probe &item, uint64_t base) {
             // Not exported: try the module's symbols (PDB beside the image, or a symbol
             // server via _NT_SYMBOL_PATH) -- internal functions by name.
             uint64_t addr = 0; std::string saved = s->error;
-            if (!s->sym_ready || !uhh_sym::resolve(s->pi.hProcess, item.module, item.export_name, addr) || addr < base)
+            uint32_t image = 0;
+            {
+                IMAGE_DOS_HEADER d{}; IMAGE_NT_HEADERS n{}; size_t g = 0;
+                if (remote_read(s->pi.hProcess, base, &d, sizeof(d), &g) && g == sizeof(d) &&
+                    remote_read(s->pi.hProcess, base + (uint32_t)d.e_lfanew, &n, sizeof(n), &g) && g == sizeof(n))
+                    image = n.OptionalHeader.SizeOfImage;
+            }
+            // The symbol must lie inside THIS module's image (not a stale or same-named one).
+            if (!s->sym_ready || !uhh_sym::resolve(s->pi.hProcess, item.module, item.export_name, addr) ||
+                addr < base || addr >= base + image)
                 return false;
             s->error.clear();
             exp = addr - base;
@@ -1139,7 +1162,15 @@ static void fill_request(probe_session *s, const Probe &p) {
 
 static bool create_agent_channel(probe_session *s) {
     uint32_t count = 0;
-    for (auto &p : s->probes) if (p->flags & PROBE_INLINE) p->agent_index = count++;
+    {
+        std::lock_guard<std::mutex> lock(s->log_mu);
+        for (auto &m : s->agent_map) m = UINT32_MAX;
+        for (size_t i = 0; i < s->probes.size(); ++i)
+            if (s->probes[i]->flags & PROBE_INLINE) {
+                if (count < PROBE_AGENT_MAX_PROBES) s->agent_map[count] = (uint32_t)i;
+                s->probes[i]->agent_index = count++;
+            }
+    }
     if (!count) return true;
     if (count > PROBE_AGENT_MAX_PROBES) { set_error(s, "too many inline probes"); return false; }
     if (!open_agent_section(s, count)) return false;
@@ -1163,6 +1194,11 @@ static bool register_runtime_inline(probe_session *s, Probe &p) {
     uint32_t idx = s->shared->request_count;
     if (idx >= PROBE_AGENT_MAX_PROBES) { set_error(s, "too many inline probes"); return false; }
     p.agent_index = idx; p.runtime = true;
+    {
+        std::lock_guard<std::mutex> lock(s->log_mu);
+        if (idx == 0) for (auto &m : s->agent_map) m = UINT32_MAX;
+        s->agent_map[idx] = probe_index(s, &p);
+    }
     fill_request(s, p);
     MemoryBarrier();
     s->shared->request_count = idx + 1;
@@ -1487,7 +1523,9 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
         std::fprintf(stderr, "probe: dynamic add from inline callback: no controller-side export '%s'\n", req.callback);
     } else if (req.op == PROBE_IPC_ADD_ADDRESS) result = probe_add_address(s, req.address, cb, req.flags);
     else if (req.op == PROBE_IPC_WATCH)       result = probe_watch(s, req.address, cb, req.flags);
-    else if (req.op == PROBE_IPC_ADD_SYMBOL)  result = probe_add_symbol(s, req.symbol, cb, req.flags);
+    else if (req.op == PROBE_IPC_ADD_SYMBOL)
+        result = probe_add_symbol_cfg(s, req.symbol, cb, req.flags, req.config_len ? req.config : nullptr,
+                                      req.config_len <= sizeof(req.config) ? req.config_len : 0);
     std::fprintf(stderr, "probe: ipc op=%u from inline site %u cb=%s -> %d\n", req.op, req.origin_site, req.callback, result);
     size_t wrote = 0;
     remote_write(s->pi.hProcess, at + offsetof(probe_ipc_request, result), &result, sizeof(result), &wrote);
@@ -1951,12 +1989,17 @@ static size_t drain_agent_logs(probe_session *s) {
         LogRecord r;
         rec.text[PROBE_AGENT_LOG_TEXT_CAP - 1] = 0;
         r.text = rec.text; r.tid = rec.tid; r.has_stack = rec.has_stack != 0;
-        r.probe = rec.probe;
-        for (size_t i = 0; i < s->probes.size(); ++i)
-            if ((s->probes[i]->flags & PROBE_INLINE) && s->probes[i]->agent_index == rec.probe) { r.probe = (uint32_t)i; break; }
+        // Never touch s->probes here (the debug loop may be growing it): agent_map is the
+        // lock-protected agent-index -> probe-index translation.
+        r.probe = rec.probe < PROBE_AGENT_MAX_PROBES && s->agent_map[rec.probe] != UINT32_MAX
+                      ? s->agent_map[rec.probe] : rec.probe;
         uint32_t n = rec.frame_count > PROBE_STACK_MAX_FRAMES ? PROBE_STACK_MAX_FRAMES : rec.frame_count;
-        r.frames.assign(rec.frames, rec.frames + n);
-        s->logs.push_back(std::move(r));
+        try {
+            r.frames.assign(rec.frames, rec.frames + n);
+            s->logs.push_back(std::move(r));
+        } catch (...) {
+            InterlockedIncrement(&sh->log_dropped);       // out of memory: count it, keep going
+        }
         MemoryBarrier();
         InterlockedExchange64(&rec.seq, tail + PROBE_AGENT_LOG_CAP);    // slot free again
         sh->log_tail = tail + 1;
@@ -1981,10 +2024,35 @@ static void start_drainer(probe_session *s) {
     });
 }
 
-static void stop_drainer(probe_session *s) {
-    if (!s->drainer.joinable()) return;
-    s->drain_stop = true; s->drainer.join();
+// After the target has exited no producer can still be mid-publish, so records published
+// beyond a slot that was claimed but never published (its producer died at exit) are
+// recovered, and each such slot is counted as dropped -- never lost silently.
+static void drain_final(probe_session *s) {
+    if (!s->shared) return;
     drain_agent_logs(s);
+    if (!s->exited) return;
+    auto *sh = s->shared;
+    std::lock_guard<std::mutex> lock(s->log_mu);
+    LONG64 head = sh->log_head;
+    for (LONG64 pos = sh->log_tail; pos < head; ++pos) {
+        auto &rec = sh->logs[(uint64_t)pos % PROBE_AGENT_LOG_CAP];
+        if (rec.seq != pos + 1) { InterlockedIncrement(&sh->log_dropped); continue; }
+        LogRecord r;
+        rec.text[PROBE_AGENT_LOG_TEXT_CAP - 1] = 0;
+        r.text = rec.text; r.tid = rec.tid; r.has_stack = rec.has_stack != 0;
+        r.probe = rec.probe < PROBE_AGENT_MAX_PROBES && s->agent_map[rec.probe] != UINT32_MAX ? s->agent_map[rec.probe] : rec.probe;
+        uint32_t n = rec.frame_count > PROBE_STACK_MAX_FRAMES ? PROBE_STACK_MAX_FRAMES : rec.frame_count;
+        try { r.frames.assign(rec.frames, rec.frames + n); s->logs.push_back(std::move(r)); }
+        catch (...) { InterlockedIncrement(&sh->log_dropped); }
+    }
+    sh->log_tail = head;
+}
+
+static void stop_drainer(probe_session *s) {
+    if (s->shared) InterlockedExchange(&s->shared->controller_gone, 1);   // producers stop waiting
+    if (!s->drainer.joinable()) { drain_final(s); return; }
+    s->drain_stop = true; s->drainer.join();
+    drain_final(s);
 }
 
 // One debug event -> library state changes. Shared by probe_run and the detach path.
@@ -2041,6 +2109,7 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
         if (iequals(name, "probe_api_agent.dll")) {
             s->remote_agent = base;
         }
+        if (!s->held.empty()) s->held_since = GetTickCount64();   // symbol work above may have been slow
         if (ok && agent_has_pending(s)) {
             if (s->shared->service_ready && s->svc_event) {
                 // This thread holds the loader lock: keep it (and so the new module's
@@ -2056,14 +2125,16 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
     }
     case UNLOAD_DLL_DEBUG_EVENT: {
         uint64_t base = (uint64_t)(uintptr_t)event.u.UnloadDll.lpBaseOfDll;
+        if (s->sym_ready) uhh_sym::unregister_module(s->pi.hProcess, base);
         for (auto it = s->module_bases.begin(); it != s->module_bases.end(); )
             if (it->second == base) it = s->module_bases.erase(it); else ++it;
         for (auto &p : s->probes) if (p->active && p->base == base) {
             if (p->flags & PROBE_INLINE) {
-                // The hooked code went away with its module, so the hook is never entered
-                // again. Retire the probe; the target keeps running.
-                std::fprintf(stderr, "probe: %s unloaded with its module; probe retired\n", p->location.c_str());
-                p->active = false; p->retired = true; p->base = p->address = 0;
+                // The hooked code went away with its module. The probe goes back to pending,
+                // exactly like breakpoint/hw probes: if the module loads again (anywhere),
+                // the agent installs a fresh hook at the new address.
+                std::fprintf(stderr, "probe: %s unloaded with its module; pending until it loads again\n", p->location.c_str());
+                p->active = false; p->vetted = false; p->base = p->address = 0;
             } else if (p->flags & PROBE_HW) {
                 // Fully release the hardware breakpoint: clear its DR on every thread,
                 // free the slot, and drop the active count. A half-disarm (just
@@ -2092,8 +2163,16 @@ extern "C" int probe_run(probe_session *s) {
     if (!s || !s->launched) { if (s) set_error(s, "session is not launched"); return 0; }
     if (s->ran) { set_error(s, "session already ran"); return 0; }
     s->ran = true;
+    s->running = true;
     DEBUG_EVENT event{};
     while (!s->exited) {
+        if (s->stop_requested) {
+            // probe_close was called on another thread. The debug API binds the debug object
+            // to THIS thread, so the detach (or termination) happens here.
+            if (s->attached) { detach(s); s->detached = true; }
+            else if (s->pi.hProcess) { TerminateProcess(s->pi.hProcess, 3); s->stop_requested = false; continue; }
+            break;
+        }
         drain_agent_logs(s);
         if (!s->held.empty() && GetTickCount64() - s->held_since > 5000) {
             // Never wedge the target: an install that does not confirm in 5 s is reported
@@ -2101,7 +2180,7 @@ extern "C" int probe_run(probe_session *s) {
             std::fprintf(stderr, "probe: warning: inline install not confirmed within 5 s\n");
             release_held(s, "install timeout");
         }
-        if (!WaitForDebugEvent(&event, s->shared ? 20 : INFINITE)) {
+        if (!WaitForDebugEvent(&event, 20)) {                         // short: also polls stop requests
             if (GetLastError() == ERROR_SEM_TIMEOUT) continue;            // idle: drain and wait again
             set_error(s, win_error("wait for debug event")); break;
         }
@@ -2117,7 +2196,9 @@ extern "C" int probe_run(probe_session *s) {
     stop_drainer(s);
     if (!s->exited && s->pi.hProcess && !s->attached) TerminateProcess(s->pi.hProcess, 3);
     if (s->exited && has_inline(s) && !s->gate_sent) set_error(s, "target exited before inline probes were ready");
-    return s->exited && s->error.empty();
+    int result = (s->exited || s->detached) && s->error.empty();
+    s->running = false;                                   // last touch of s on this thread
+    return result;
 }
 
 extern "C" int probe_wait_for_exit(probe_session *s) {
@@ -2174,14 +2255,22 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
                  "\"hits\":%llu,\"overrides\":%llu,\"log_dropped\":%ld,\"app_exit\":%lu,\"error\":",
                  (unsigned long long)visible, (unsigned long long)active,
                  (unsigned long long)hits, (unsigned long long)(s->overrides + (s->shared ? (uint64_t)s->shared->overrides : 0)),
-                 s->shared ? s->shared->log_dropped : 0, s->exit_code);
+                 (long)((s->shared ? s->shared->log_dropped : 0) + (long)s->controller_dropped), s->exit_code);
     if (s->error.empty()) std::fputs("null", out); else json_string(out, s->error);
     std::fputs("}\n", out); std::fflush(out);
 }
 
 extern "C" void probe_close(probe_session *s) {
     if (!s) return;
-    if (s->attached && !s->exited && s->pi.hProcess) {
+    if (s->running) {
+        // probe_run is executing on another thread: ask it to detach/stop (it owns the
+        // debug object) and wait for it to finish before tearing the session down.
+        s->stop_requested = true;
+        for (int i = 0; i < 1500 && s->running; ++i) Sleep(10);
+    }
+    if (s->detached) {
+        // already detached by probe_run
+    } else if (s->attached && !s->exited && s->pi.hProcess) {
         detach(s);
     } else if (s->launched && !s->exited && s->pi.hProcess) {
         for (auto &p : s->probes)
@@ -2437,16 +2526,21 @@ static std::string symbolize(probe_session *s, uint64_t addr) {
 
 static void log_common(probe_context *c, bool stack, const char *format, va_list ap) {
     if (!format) return;
-    char line[2048];
+    char line[PROBE_AGENT_LOG_TEXT_CAP];                      // the same limit inline uses
     int n = std::vsnprintf(line, sizeof(line), format, ap);
     if (n < 0) return; line[sizeof(line) - 1] = 0;
+    if ((size_t)n >= sizeof(line)) {                          // truncated: say so, never silently
+        static const char mark[] = "...[truncated]";
+        std::memcpy(line + sizeof(line) - sizeof(mark), mark, sizeof(mark));
+    }
     auto *state = c ? static_cast<CallbackState *>(c->controller) : nullptr;
     if (!state || !state->session) { std::fprintf(stderr, "probe: %s\n", line); return; }
     LogRecord r; r.text = line; r.tid = c->tid; r.probe = c->site; r.has_stack = stack;
     if (stack) capture_stack(state->session, c, r.frames);
     std::fprintf(stderr, stack ? "probe: %s [+stack %zu frames]\n" : "probe: %s\n", line, r.frames.size());
     std::lock_guard<std::mutex> lock(state->session->log_mu);
-    state->session->logs.push_back(std::move(r));
+    try { state->session->logs.push_back(std::move(r)); }
+    catch (...) { ++state->session->controller_dropped; }      // out of memory: counted, not fatal
 }
 
 extern "C" void send_log(probe_context *c, const char *format, ...) {

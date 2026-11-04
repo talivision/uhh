@@ -192,16 +192,21 @@ static void agent_log(probe_context *c, bool stack, const char *format, va_list 
     if (!state || !state->shared || !format) return;
     char text[PROBE_AGENT_LOG_TEXT_CAP];
     int n = -1;
+    text[0] = 0;
     __try { n = _vsnprintf_s(text, sizeof(text), _TRUNCATE, format, ap); }
     __except (EXCEPTION_EXECUTE_HANDLER) { n = -1; }
-    if (n < 0 && !text[0]) { text[0] = 0; }
     text[sizeof(text) - 1] = 0;
+    if (n < 0 && text[0]) {                                  // truncated: say so, never silently
+        static const char mark[] = "...[truncated]";
+        std::memcpy(text + sizeof(text) - sizeof(mark), mark, sizeof(mark));
+    }
     uint64_t frames[PROBE_STACK_MAX_FRAMES]; uint32_t nframes = 0;
     if (stack) nframes = capture_stack(c, frames, PROBE_STACK_MAX_FRAMES);
     auto *sh = state->shared;
+    if (sh->controller_gone) { InterlockedIncrement(&sh->log_dropped); return; }   // nobody will read it
     LONG64 pos = sh->log_head;
     probe_agent_log *rec = nullptr;
-    ULONGLONG full_since = 0; LONG64 seen_beat = 0;
+    ULONGLONG last_tick = 0, waited = 0; LONG64 seen_beat = 0, seen_tail = -1;
     for (;;) {
         rec = &sh->logs[(uint64_t)pos % PROBE_AGENT_LOG_CAP];
         LONG64 diff = rec->seq - pos;
@@ -210,12 +215,18 @@ static void agent_log(probe_context *c, bool stack, const char *format, va_list 
             pos = sh->log_head;
         } else if (diff < 0) {
             // Full: the controller's drainer is behind. Wait for a slot (backpressure)
-            // rather than lose the record. Give up only if the drainer's heartbeat has
-            // not moved for 2 s -- wall time alone is wrong because the debugger may stop
-            // this whole process for a while; the heartbeat keeps going in the controller.
-            LONG64 beat = sh->drain_beat;
-            if (!full_since || beat != seen_beat) { full_since = GetTickCount64(); seen_beat = beat; }
-            else if (GetTickCount64() - full_since > 2000) { InterlockedIncrement(&sh->log_dropped); return; }
+            // rather than lose the record. Give up only after THIS thread has itself
+            // waited 2 s while the drainer was alive (its heartbeat moving) but the ring did
+            // not move (tail stuck behind a slot whose producer is gone or suspended).
+            // Time is accumulated in small steps so a debugger freezing the whole process
+            // (when nothing here runs) never counts as waiting.
+            if (sh->controller_gone) { InterlockedIncrement(&sh->log_dropped); return; }
+            ULONGLONG now = GetTickCount64();
+            LONG64 beat = sh->drain_beat, tail = sh->log_tail;
+            if (!last_tick || tail != seen_tail) { waited = 0; seen_tail = tail; }
+            else if (beat != seen_beat) waited += (now - last_tick) < 50 ? (now - last_tick) : 50;
+            last_tick = now; seen_beat = beat;
+            if (waited > 2000) { InterlockedIncrement(&sh->log_dropped); return; }
             SwitchToThread();
             pos = sh->log_head;
         } else {
@@ -333,7 +344,7 @@ static bool raise_ipc(probe_ipc_request *req) {
 }
 
 static int forward(probe_session *s, uint32_t op, uint64_t address, const char *symbol,
-                   probe_callback cb, uint32_t flags) {
+                   probe_callback cb, uint32_t flags, const void *config = nullptr, size_t config_len = 0) {
     if (!s || s < proxies || s >= proxies + PROBE_AGENT_MAX_PROBES || !cb) return 0;
     probe_ipc_request req{};
     req.op = op; req.flags = flags; req.origin_site = s->site; req.address = address;
@@ -344,6 +355,11 @@ static int forward(probe_session *s, uint32_t op, uint64_t address, const char *
         size_t n = strnlen(symbol, sizeof(req.symbol));
         if (n >= sizeof(req.symbol)) return 0;
         std::memcpy(req.symbol, symbol, n + 1);
+    }
+    if (config_len) {
+        if (!config || config_len > sizeof(req.config)) return 0;
+        std::memcpy(req.config, config, config_len);
+        req.config_len = (uint32_t)config_len;
     }
     return raise_ipc(&req) ? req.result : 0;
 }
@@ -357,6 +373,10 @@ extern "C" int probe_watch(probe_session *s, uint64_t address, probe_callback cb
 extern "C" int probe_add_symbol(probe_session *s, const char *symbol, probe_callback cb, uint32_t flags) {
     return forward(s, PROBE_IPC_ADD_SYMBOL, 0, symbol, cb, flags);
 }
+extern "C" int probe_add_symbol_cfg(probe_session *s, const char *symbol, probe_callback cb, uint32_t flags,
+                                    const void *config, size_t config_len) {
+    return forward(s, PROBE_IPC_ADD_SYMBOL, 0, symbol, cb, flags, config, config_len);
+}
 
 static volatile LONG g_stopping;
 static struct alignas(64) { volatile LONG value; } g_inflight[PROBE_AGENT_STRIPES];
@@ -366,55 +386,41 @@ static bool any_inflight() {
 }
 
 // XSAVE support, probed once: mask = XCR0 restricted to x87|SSE|AVX|AVX-512 components.
-static struct XState { bool ok = false, compact = false, xinuse = false; uint64_t mask = 0; uint32_t size = 0; } g_xs = [] {
+static struct XState { bool ok = false, compact = false, xinuse = false; uint64_t mask = 0, avx_mask = 0; uint32_t size = 0; } g_xs = [] {
     XState x;
     int r[4];
     __cpuid(r, 1);
     if (!(r[2] & (1 << 27))) return x;                     // OSXSAVE
     x.mask = _xgetbv(0) & 0xE7ull;
+    x.avx_mask = x.mask & 0xE4ull;                         // AVX upper + AVX-512 (opmask, ZMM) only
     __cpuidex(r, 0xD, 0); x.size = (uint32_t)r[1];
     __cpuidex(r, 0xD, 1); x.compact = (r[0] & 2) != 0; x.xinuse = (r[0] & 4) != 0;   // XGETBV(1)
     x.ok = x.size && x.size <= 4096;
     return x;
 }();
 
-static bool xstate_save(unsigned char *area) {
-    if (!g_xs.ok) return false;
-    std::memset(area + 512, 0, 64);                        // XSAVE header must start clean
-#if defined(_WIN64)
-    if (g_xs.compact) _xsavec64(area, g_xs.mask); else _xsave64(area, g_xs.mask);
-#else
-    if (g_xs.compact) _xsavec(area, g_xs.mask); else _xsave(area, g_xs.mask);
-#endif
-    return true;
-}
-static void xstate_restore(unsigned char *area) {
-#if defined(_WIN64)
-    _xrstor64(area, g_xs.mask);
-#else
-    _xrstor(area, g_xs.mask);
-#endif
-}
 
-static bool xstate_save(unsigned char *area);
-static void xstate_restore(unsigned char *area);
 
+// The callback runs on the target's own thread: any Win32 call it (or the library) makes
+// can change the thread's last-error / last-status, which the target may read right
+// after the probed instruction. Save and restore both (plain TEB fields: ~free).
+#if defined(_WIN64)
+static inline volatile DWORD *teb_last_status() { return (volatile DWORD *)((unsigned char *)NtCurrentTeb() + 0x1250); }
+#else
+static inline volatile DWORD *teb_last_status() { return (volatile DWORD *)((unsigned char *)NtCurrentTeb() + 0xBF4); }
+#endif
 static bool run_callback(probe_callback cb, probe_context *c) {
+    DWORD last_error = GetLastError(), last_status = *teb_last_status();
     __writeeflags(__readeflags() & ~(uintptr_t)0x400);
+    bool ok = true;
     __try { cb(c); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-    return true;
+    __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+    *teb_last_status() = last_status;
+    SetLastError(last_error);
+    return ok;
 }
 // Kept out of line so the 4 KiB save area (and its stack probe) costs nothing on the
 // common path.
-static __declspec(noinline) bool run_callback_full(probe_callback cb, probe_context *c) {
-    alignas(64) unsigned char area[4096];
-    xstate_save(area);
-    bool ok = run_callback(cb, c);
-    xstate_restore(area);
-    return ok;
-}
-
 static void call_mid(safetyhook::Context &native, uint32_t index) {
     probe_context c{};
     /* SafetyHook's Context is Context64 on x64 and Context32 on x86; fill the same
@@ -444,26 +450,9 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     // it calls) may touch x87/MXCSR/YMM/ZMM state -- e.g. vzeroupper -- which the target
     // could be relying on at a mid-function site. Save and restore the full extended state
     // and give C code the ABI-required DF=0.
-    // What the callback could disturb beyond what the stub preserves (GPRs, flags, XMM):
-    // MXCSR (always; one instruction each way), and the
-    // AVX/AVX-512 state only when the target has it live at this moment -- XGETBV(1)
-    // reports the in-use components, so the expensive XSAVE is paid only by code that is
-    // actually running AVX at the site. DF is cleared for the C ABI.
-    LONG xmode = shared->xstate_mode;            // 0 gated (default), 1 none, 2 full (bench knob)
-    bool full = xmode == 2 || (xmode == 0 && g_xs.xinuse && (_xgetbv(1) & 0xE4ull));
-    bool callback_ok;
-    if (full && g_xs.ok) {
-        callback_ok = run_callback_full(callbacks[index], &c);
-    } else if (xmode == 1) {
-        callback_ok = run_callback(callbacks[index], &c);
-    } else {
-        // MXCSR: a callback's float math can set its sticky exception flags, which the
-        // target could observe (fetestexcept). One instruction each way. (The x87 control
-        // word only changes via explicit _controlfp, which no callback path performs.)
-        unsigned int mxcsr = _mm_getcsr();
-        callback_ok = run_callback(callbacks[index], &c);
-        _mm_setcsr(mxcsr);
-    }
+    // Extended state (MXCSR, AVX/AVX-512) and DF are handled in mid_entry, BEFORE any of
+    // this C code runs -- see there.
+    bool callback_ok = run_callback(callbacks[index], &c);
     InterlockedDecrement(&g_inflight[stripe].value);
     if (!callback_ok) return;
 #if defined(_WIN64)
@@ -478,7 +467,46 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
 #endif
 }
 
-#define MID_THUNK(n) static void mid_##n(safetyhook::Context &c) { call_mid(c, n); }
+// Entry point of every inline hit. It runs FIRST, before any C code that might call the
+// CRT: the CRT's memset/memcpy pick AVX paths ending in VZEROUPPER (wiping every YMM upper
+// half the target may have live at a mid-function site), and its x86 rep-stos/movs paths
+// run BACKWARDS if the site executes with DF=1. So: clear DF, then save what the stub
+// does not (MXCSR always; AVX/AVX-512 when live, or unconditionally when the CPU cannot
+// report liveness), using intrinsics only -- then run the hit. The stub restores RFLAGS
+// (so the target's DF) on the way out.
+static __declspec(noinline) void mid_entry_saved(safetyhook::Context &native, uint32_t index, uint64_t mask) {
+    alignas(64) unsigned char area[4096];
+    __stosb(area + 512, 0, 64);                            // XSAVE header must start clean (no CRT call)
+#if defined(_WIN64)
+    if (g_xs.compact) _xsavec64(area, mask); else _xsave64(area, mask);
+#else
+    if (g_xs.compact) _xsavec(area, mask); else _xsave(area, mask);
+#endif
+    unsigned int mxcsr = _mm_getcsr();
+    call_mid(native, index);
+    _mm_setcsr(mxcsr);
+#if defined(_WIN64)
+    _xrstor64(area, mask);
+#else
+    _xrstor(area, mask);
+#endif
+}
+
+static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
+    __writeeflags(__readeflags() & ~(uintptr_t)0x400);    // DF=0 before ANY C code
+    LONG xmode = shared->xstate_mode;                      // 0 gated (default), 1 none, 2 full (bench knob)
+    if (xmode == 1 || !g_xs.ok) { call_mid(native, index); return; }
+    uint64_t mask = 0;
+    if (xmode == 2) mask = g_xs.mask;
+    else if (g_xs.xinuse) mask = _xgetbv(1) & g_xs.avx_mask;  // only components actually live
+    else mask = g_xs.avx_mask;                             // liveness unknown: keep AVX state
+    if (mask) { mid_entry_saved(native, index, mask); return; }
+    unsigned int mxcsr = _mm_getcsr();                     // the common case: just MXCSR
+    call_mid(native, index);
+    _mm_setcsr(mxcsr);
+}
+
+#define MID_THUNK(n) static void mid_##n(safetyhook::Context &c) { mid_entry(c, n); }
 MID_THUNK(0) MID_THUNK(1) MID_THUNK(2) MID_THUNK(3) MID_THUNK(4) MID_THUNK(5) MID_THUNK(6) MID_THUNK(7)
 MID_THUNK(8) MID_THUNK(9) MID_THUNK(10) MID_THUNK(11) MID_THUNK(12) MID_THUNK(13) MID_THUNK(14) MID_THUNK(15)
 MID_THUNK(16) MID_THUNK(17) MID_THUNK(18) MID_THUNK(19) MID_THUNK(20) MID_THUNK(21) MID_THUNK(22) MID_THUNK(23)
@@ -506,6 +534,12 @@ static void install_pending() {
         if (InterlockedCompareExchange(&request.status, PROBE_AGENT_INSTALLING, PROBE_AGENT_PENDING) != PROBE_AGENT_PENDING)
             continue;
         sites[i] = request.site; states[i] = {shared, i}; proxies[i].site = i;
+        if (hooks[i]) {
+            // A re-install after the module was unloaded: the old hook's code and target are
+            // gone, so it must NOT be destroyed (its destructor would write to unmapped
+            // memory). Leak it deliberately.
+            new SafetyHookMid(std::move(hooks[i]));
+        }
         hooks[i] = safetyhook::create_mid((void *)(uintptr_t)request.site, mid_callbacks[i]);
         InterlockedExchange(&request.status, hooks[i] ? PROBE_AGENT_INSTALLED : PROBE_AGENT_HOOK_FAILED);
     }

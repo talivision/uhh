@@ -95,6 +95,42 @@ static BOOL locate_text_section(const unsigned char **text, SIZE_T *text_size)
     return FALSE;
 }
 
+/* Compare the first 8 bytes of guarded_fn in memory with the same bytes in this
+   executable's FILE on disk -- what a real integrity check does, independent of when
+   the in-memory baseline was taken. (8 bytes: the prologue carries no relocations.) */
+static BOOL function_matches_disk(void)
+{
+    union { guarded_fn_pointer function; const unsigned char *bytes; } address;
+    unsigned char *base = (unsigned char *)GetModuleHandleW(NULL);
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+    IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+    wchar_t path[MAX_PATH];
+    unsigned char disk[8];
+    DWORD rva, got = 0;
+    WORD i;
+    HANDLE file;
+    LARGE_INTEGER off;
+    BOOL ok = FALSE;
+
+    address.function = guarded_fn;
+    rva = (DWORD)(address.bytes - base);
+    if (!GetModuleFileNameW(NULL, path, MAX_PATH)) return FALSE;
+    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                       OPEN_EXISTING, 0, NULL);
+    if (file == INVALID_HANDLE_VALUE) return FALSE;
+    for (i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+        if (rva >= sec->VirtualAddress && rva + 8U <= sec->VirtualAddress + sec->SizeOfRawData) {
+            off.QuadPart = (LONGLONG)sec->PointerToRawData + (rva - sec->VirtualAddress);
+            if (SetFilePointerEx(file, off, NULL, FILE_BEGIN) && ReadFile(file, disk, 8, &got, NULL) && got == 8)
+                ok = memcmp(disk, address.bytes, 8) == 0;
+            break;
+        }
+    }
+    CloseHandle(file);
+    return ok;
+}
+
 static BOOL initialize_baseline(integrity_baseline *baseline)
 {
     union function_address {
@@ -220,6 +256,7 @@ int main(int argc, char **argv)
     integrity_result result;
     HANDLE main_thread = NULL;
     BOOL debug_registers_seen = FALSE;
+    BOOL fn_disk_ok = TRUE;
 
     for (i = 1U; i < (DWORD)argc; ++i) {
         if (strcmp(argv[i], "--no-wait") == 0) {
@@ -264,6 +301,7 @@ int main(int argc, char **argv)
         (void)guarded_fn((int)i);
         if (i + 1U == (calls + 1U) / 2U) {
             check_integrity(&baseline, &result, "middle");
+            fn_disk_ok = function_matches_disk();
             if (!inspect_debug_registers(main_thread, &debug_registers_seen)) {
                 (void)fprintf(stderr, "unable to inspect main-thread debug registers\n");
                 (void)CloseHandle(main_thread);
@@ -276,10 +314,10 @@ int main(int argc, char **argv)
 
     (void)printf("{\"kind\":\"target\",\"name\":\"antitamper\","
                  "\"calls\":%lu,\"text_ok\":%s,\"fn_bytes_ok\":%s,"
-                 "\"text_changed_at\":\"%s\",\"debug_registers_seen\":%s}\n",
+                 "\"text_changed_at\":\"%s\",\"debug_registers_seen\":%s,\"fn_disk_ok\":%s}\n",
                  (unsigned long)calls, json_bool(result.text_ok),
                  json_bool(result.function_ok), result.text_changed_at,
-                 json_bool(debug_registers_seen));
+                 json_bool(debug_registers_seen), json_bool(fn_disk_ok));
     (void)fflush(stdout);
     return 0;
 }
