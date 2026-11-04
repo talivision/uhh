@@ -148,6 +148,17 @@ image across the boundary.
 - Ship: push to GitHub as `talivision/uhh` (usermode-hook-helper, UHH), PUBLIC repo, short-and-sweet
   README, and several VERIFIED examples of the tool working. Confirm before the push.
 
+## Ship details (4 Nov 2026)
+
+- x86 is TOP PRIORITY after chunk 2 (inline) integrates - x86-working is the
+  push trigger; the breakpoint path on x86 suffices for the first push.
+- Commit the example PROCESSES (probe_app, configparse) and the INTROSPECTION
+  example (the full api-sketch program: deferred flag probe + inline read log +
+  handle->pid) into the repo.
+- Ship COMPILED BINARIES in the repo too: a dist/ folder (force-added past
+  .gitignore) holding the built DLLs/exes for BOTH x86 and x64, so the repo is
+  runnable without building. Refresh them on each relevant commit/push.
+
 ## No backward compatibility (4 Nov 2026)
 
 Nothing is public yet, so the final tree is ONE internally-consistent codebase
