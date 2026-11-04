@@ -114,6 +114,17 @@ identical source under every backend.
   - ✅ (3) Exceptions (C++, SEH, through a callback) unwinding across hooked frames
 - ✅ (9) Hot-patch `mov edi,edi` prologues (x86); 🔧 coexistence with Frida hooking the same function
 
+## Production readiness (proposed 2026-11-05, awaiting user OK) -- fan-out
+- ⬜ Controller-crash safety: the agent notices the controller is gone and unhooks itself (no hooks left live, no thread blocked on an undrained ring)
+- ⬜ Intel CET shadow stacks: test /CETCOMPAT targets on CET hardware (SafetyHook's resume path, inline set_reg(SP), call_func all use ret-to-pushed-address)
+- ⬜ Soak test: hours under load; handles/memory/threads flat
+- ⬜ Named-object hardening: random per-session names for the shared section/events (no squatting)
+- ⬜ Windows version matrix: Windows 10, Windows 11, Server 2022
+- ⬜ Raise the 32 inline-probe cap
+- ⬜ CI: GitHub Actions (Windows runners) build both arches + run the suite on push
+- ⬜ Docs: quickstart, API reference, per-backend limitations table, troubleshooting
+- (optional) follow child processes; CMake package + versioned release zip; big-app soak (browser/JIT)
+
 ## Later
 - ⬜ x86 cumulative-session flakiness (possibly the same handle double-close; recheck)
 - ✅ PDB-only symbols (`module!InternalFunc`), Microsoft symbol server via dbghelp+symsrv and `_NT_SYMBOL_PATH`, export/function enumeration (`uhh_trace --list`) — engine by Codex, wired into the library; suite checks added
