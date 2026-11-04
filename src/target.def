@@ -1,5 +1,0 @@
-EXPORTS
-    FlagMemSite
-    FlagRegSite
-    ReadSite
-    g_config DATA

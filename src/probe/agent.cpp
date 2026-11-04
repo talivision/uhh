@@ -1,4 +1,3 @@
-#define PROBE_PUBLIC_API
 #include "win_common.hpp"
 #include "probe_agent_shared.hpp"
 #include <safetyhook.hpp>

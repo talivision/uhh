@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Correctness gate for the gated multithreaded scenario (plan v2).
+"""On-demand correctness gate for the gated scenario (plan v2) on the UHH probe_api.
 
-    check_scenario.py --bin build/Release [--threads W] [--reads R]
+    check_scenario.py --bin build-x64/Release [--threads W] [--reads R]
 
-Checks:
-- probe_app alone, shipped config: workload gated off (0 reads), DLL late-loaded.
-- probe_session: deferred configparse.dll+RVA probe is pending pre-load, activates
-  on load, overrides the parsed flag exactly once, and every read then runs.
-- existing-hook variant: the pre-existing ReadThunk hook runs exactly once per read.
+Checks, against a built tree (works for both the -A x64 and -A Win32 outputs):
+- probe_app alone, shipped config: the read workload is gated off (0 reads), and the
+  config DLL is late-loaded (never a static dependency).
+- gated_config: the deferred configparse.dll+RVA flag probe (software breakpoint) is
+  pending before the DLL loads, activates on load, and overrides the parsed flag
+  exactly once; the inline probe on ReadSite then logs every read, so its hit count
+  equals the total number of reads. Proves the breakpoint and inline backends mixed
+  in one session, and is the same check on x86 and x64.
 """
 import argparse
 import json
@@ -16,14 +19,14 @@ import sys
 from pathlib import Path
 
 
-def run(cmd, timeout=120):
+def run(cmd, timeout=180):
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    objs = {}
+    objs, probes = {}, []
     for line in r.stdout.splitlines():
         if line.startswith("{"):
             o = json.loads(line)
-            objs[o["kind"]] = o
-    return r, objs
+            (probes.append(o) if o.get("kind") == "probe" else objs.__setitem__(o["kind"], o))
+    return r, objs, probes
 
 
 def rvas(map_file, *syms):
@@ -34,40 +37,34 @@ def rvas(map_file, *syms):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--bin", type=Path, default=Path("build/Release"))
+    p.add_argument("--bin", type=Path, default=Path("build-x64/Release"))
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--reads", type=int, default=200)
     args = p.parse_args()
     b = args.bin.resolve()
     total = args.threads * args.reads
-    app, session = str(b / "probe_app.exe"), str(b / "probe_session.exe")
+    app, gated = str(b / "probe_app.exe"), str(b / "gated_config.exe")
     flag_rva = rvas(b / "configparse.map", "ParsedFlagSite")["ParsedFlagSite"]
     read_rva = rvas(b / "probe_app.map", "ReadSite")["ReadSite"]
 
     # 1. Gated off by the shipped config.
-    r, o = run([app, "--no-wait", "--threads", str(args.threads), "--reads", str(args.reads), "--clean"])
+    r, o, _ = run([app, "--no-wait", "--threads", str(args.threads), "--reads", str(args.reads), "--clean"])
     assert r.returncode == 0, r.stderr
     assert o["app"]["reads_enabled"] == 0 and o["app"]["successful_reads"] == 0, o["app"]
     print("PASS gated-off: shipped config runs 0 reads")
 
-    # 2. Deferred probe enables the workload; exactly one override. On-attach
-    #    comparison against the on-disk image detects the pre-existing hook.
-    for prehook in ("--clean", "--prehook"):
-        r, o = run([session, str(flag_rva), str(read_rva),
-                    "--threads", str(args.threads), "--reads", str(args.reads), prehook])
-        assert r.returncode == 0, r.stderr
-        s, a = o["session"], o["app"]
-        assert s["flag_probe_active"] and s["overrides"] == 1, s
-        assert a["reads_enabled"] == 1 and a["successful_reads"] == total, a
-        assert "probe: active configparse.dll" in r.stderr, r.stderr
-        want_hooked = prehook == "--prehook"
-        assert s["read_site_checked"] and s["read_site_hooked"] == want_hooked, s
-        assert ("PRE-EXISTING HOOK" in r.stderr) == want_hooked, r.stderr
-        if want_hooked:
-            assert a["prehook_calls"] == total, a
-        print(f"PASS deferred-activation {prehook}: 1 override, {total} reads, "
-              f"read-site hooked={want_hooked} detected on attach")
-
+    # 2. Deferred flag breakpoint + inline read log, mixed in one session.
+    r, o, probes = run([gated, str(flag_rva), str(read_rva),
+                        "--no-wait", "--threads", str(args.threads), "--reads", str(args.reads), "--clean"])
+    assert r.returncode == 0, r.stderr + "\n" + r.stdout
+    rep = o["probe_report"]
+    assert rep["overrides"] == 1, rep
+    bp = next(x for x in probes if x["backend"] == "breakpoint")
+    inl = next(x for x in probes if x["backend"] == "inline")
+    assert bp["hits"] == 1, bp
+    assert inl["hits"] == total, inl
+    print(f"PASS deferred-activation: 1 override, inline hits == {total} reads "
+          f"(breakpoint + inline mixed)")
     print("All scenario checks passed.")
 
 

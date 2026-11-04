@@ -1,110 +1,83 @@
 cmake_minimum_required(VERSION 3.28)
-project(probe_first_pass LANGUAGES C CXX)
+project(uhh LANGUAGES C CXX)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-add_library(probe_callback STATIC src/callback.c)
-target_include_directories(probe_callback PUBLIC include)
-add_executable(policy_tests tests/policy_tests.c)
-target_link_libraries(policy_tests PRIVATE probe_callback)
-enable_testing()
-add_test(NAME policy COMMAND policy_tests)
-if(WIN32)
-    # Accept x64 (-A x64) or x86 (-A Win32); reject ARM64 and non-MSVC. ARM64 is
-    # 64-bit too, so it is rejected by platform name, not by pointer size.
-    if(NOT MSVC)
-        message(FATAL_ERROR "Windows prototype requires MSVC")
-    endif()
-    if(CMAKE_GENERATOR_PLATFORM MATCHES "[Aa][Rr][Mm]" OR CMAKE_SYSTEM_PROCESSOR MATCHES "[Aa][Rr][Mm]")
-        message(FATAL_ERROR "Windows prototype supports x64 and x86 only (ARM64 rejected)")
-    endif()
-    if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
-        message(FATAL_ERROR "Windows prototype requires an x64 or x86 (Win32) target")
-    endif()
-    enable_language(ASM_MASM)
-    # MASM dialect (ml64 vs ml) follows the generator platform automatically; only
-    # the fixture .asm variant is selected by pointer width (plan expects one file
-    # per arch, not IFDEF inside a single .asm).
-    if(CMAKE_SIZEOF_VOID_P EQUAL 4)
-        set(SITES_ASM     src/sites_x86.asm)
-        set(APP_SITES_ASM src/app_sites_x86.asm)
-        set(FLAG_ASM      src/configparse/flag_x86.asm)
-    else()
-        set(SITES_ASM     src/sites.asm)
-        set(APP_SITES_ASM src/app_sites.asm)
-        set(FLAG_ASM      src/configparse/flag.asm)
-    endif()
-    include(FetchContent)
-    set(SAFETYHOOK_BUILD_TEST OFF CACHE BOOL "" FORCE)
-    set(SAFETYHOOK_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-    set(SAFETYHOOK_BUILD_DOCS OFF CACHE BOOL "" FORCE)
-    set(SAFETYHOOK_FETCH_ZYDIS ON CACHE BOOL "" FORCE)
-    FetchContent_Declare(safetyhook GIT_REPOSITORY https://github.com/cursey/safetyhook.git GIT_TAG v0.7.0 GIT_SHALLOW TRUE)
-    FetchContent_MakeAvailable(safetyhook)
-    # Earlier single-thread prototype controller/agent (src/agent.cpp,
-    # src/debugger.cpp, src/session.cpp) read a raw x64 CONTEXT / SafetyHook
-    # Context64 directly and are not part of the x86 port's scope (the locked API
-    # path below is). Build them x64-only so -A Win32 configures and builds cleanly.
-    set(PROBE_PROTOTYPE_TARGETS "")
-    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-        add_library(probe_agent SHARED src/agent.cpp)
-        target_link_libraries(probe_agent PRIVATE probe_callback safetyhook)
-        add_executable(probe_debugger src/debugger.cpp)
-        target_link_libraries(probe_debugger PRIVATE probe_callback)
-        list(APPEND PROBE_PROTOTYPE_TARGETS probe_agent probe_debugger)
-    endif()
-    add_executable(probe_target src/target.cpp ${SITES_ASM})
-    target_link_libraries(probe_target PRIVATE probe_callback safetyhook)
-    # CMake only applies .def sources to DLLs; the external debugger resolves
-    # these exports from the EXE, so pass the module definition explicitly.
-    target_link_options(probe_target PRIVATE "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/src/target.def")
-    set_property(TARGET probe_target APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/target.def")
 
-    # --- Plan v2: gated multithreaded scenario ---------------------------------
-    # Late-loaded config library. Its mid-function flag site is found by RVA from
-    # the linker map, so emit one. Never a static dependency of probe_app.
-    add_library(configparse SHARED src/configparse/configparse.c ${FLAG_ASM})
-    target_include_directories(configparse PUBLIC src)
-    target_link_options(configparse PRIVATE "/MAP:$<TARGET_FILE_DIR:configparse>/configparse.map")
-
-    add_executable(probe_app src/app.cpp ${APP_SITES_ASM})
-    target_include_directories(probe_app PRIVATE src)
-    target_link_libraries(probe_app PRIVATE probe_callback safetyhook)
-    target_link_options(probe_app PRIVATE "/MAP:$<TARGET_FILE_DIR:probe_app>/probe_app.map")
-
-    # Prototype hook-surfacing controller: raw x64 CONTEXT, x64-only (see above).
-    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-        add_executable(probe_session src/session.cpp)
-        target_include_directories(probe_session PRIVATE include)
-        target_link_libraries(probe_session PRIVATE Zydis)   # disasm for hook surfacing
-        list(APPEND PROBE_PROTOTYPE_TARGETS probe_session)
-    endif()
-
-    # Locked end-user API: external native-bitness INT3 and injected SafetyHook
-    # mid-hooks. Builds for both -A x64 and -A Win32.
-    add_library(probe_api STATIC src/probe/session.cpp)
-    target_include_directories(probe_api PUBLIC include)
-    add_library(probe_api_agent SHARED
-        src/probe/agent.cpp
-        examples/gated_config/callbacks.cpp)
-    target_include_directories(probe_api_agent PRIVATE include examples/gated_config)
-    target_link_libraries(probe_api_agent PRIVATE safetyhook)
-    # Undecorated names for the __stdcall agent entries (x86 would otherwise
-    # export _probe_agent_init@4; the controller looks them up by bare name).
-    target_link_options(probe_api_agent PRIVATE "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/src/probe/agent.def")
-    set_property(TARGET probe_api_agent APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/probe/agent.def")
-    add_executable(gated_config
-        examples/gated_config/main.cpp
-        examples/gated_config/callbacks.cpp)
-    target_include_directories(gated_config PRIVATE examples/gated_config)
-    target_link_libraries(gated_config PRIVATE probe_api)
-    add_dependencies(gated_config probe_app configparse probe_api_agent)
-    # The gated scenario is a heavyweight end-to-end demo (debugger launch, several
-    # processes), run on demand via scripts/check_scenario.py — deliberately NOT a
-    # CTest/CI gate. CTest keeps only the fast, deterministic policy unit tests.
-
-    foreach(t probe_target probe_app configparse probe_api probe_api_agent gated_config ${PROBE_PROTOTYPE_TARGETS})
-        target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
-        target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
-    endforeach()
+if(NOT WIN32)
+    message(FATAL_ERROR "UHH is a Windows user-mode instrumentation library")
 endif()
+# Accept x64 (-A x64) or x86 (-A Win32); reject ARM64 and non-MSVC. ARM64 is 64-bit
+# too, so it is rejected by platform name, not by pointer size.
+if(NOT MSVC)
+    message(FATAL_ERROR "UHH requires MSVC")
+endif()
+if(CMAKE_GENERATOR_PLATFORM MATCHES "[Aa][Rr][Mm]" OR CMAKE_SYSTEM_PROCESSOR MATCHES "[Aa][Rr][Mm]")
+    message(FATAL_ERROR "UHH supports x64 and x86 only (ARM64 rejected)")
+endif()
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
+    message(FATAL_ERROR "UHH requires an x64 or x86 (Win32) target")
+endif()
+
+enable_language(ASM_MASM)
+# MASM dialect (ml64 vs ml) follows the generator platform automatically; only the
+# fixture .asm variant is selected by pointer width (one file per arch, not IFDEF
+# inside a single .asm).
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    set(APP_SITES_ASM src/app_sites_x86.asm)
+    set(FLAG_ASM      src/configparse/flag_x86.asm)
+else()
+    set(APP_SITES_ASM src/app_sites.asm)
+    set(FLAG_ASM      src/configparse/flag.asm)
+endif()
+
+include(FetchContent)
+set(SAFETYHOOK_BUILD_TEST OFF CACHE BOOL "" FORCE)
+set(SAFETYHOOK_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(SAFETYHOOK_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(SAFETYHOOK_FETCH_ZYDIS ON CACHE BOOL "" FORCE)
+FetchContent_Declare(safetyhook GIT_REPOSITORY https://github.com/cursey/safetyhook.git GIT_TAG v0.7.0 GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(safetyhook)
+
+# --- Fixtures: the contrived target the examples instrument -------------------
+# Late-loaded config library. Its mid-function flag site is found by RVA from the
+# linker map, so emit one. Never a static dependency of probe_app.
+add_library(configparse SHARED src/configparse/configparse.c ${FLAG_ASM})
+target_include_directories(configparse PUBLIC src)
+target_link_options(configparse PRIVATE "/MAP:$<TARGET_FILE_DIR:configparse>/configparse.map")
+
+add_executable(probe_app src/app.cpp ${APP_SITES_ASM})
+target_include_directories(probe_app PRIVATE src include)
+target_link_libraries(probe_app PRIVATE safetyhook)
+target_link_options(probe_app PRIVATE "/MAP:$<TARGET_FILE_DIR:probe_app>/probe_app.map")
+
+# --- UHH library: the locked probe_api. External native-bitness INT3 and injected
+#     SafetyHook mid-hooks. Builds for both -A x64 and -A Win32. ----------------
+add_library(probe_api STATIC src/probe/session.cpp)
+target_include_directories(probe_api PUBLIC include)
+
+add_library(probe_api_agent SHARED
+    src/probe/agent.cpp
+    examples/gated_config/callbacks.cpp)
+target_include_directories(probe_api_agent PRIVATE include examples/gated_config)
+target_link_libraries(probe_api_agent PRIVATE safetyhook)
+# Undecorated names for the __stdcall agent entries (x86 would otherwise export
+# _probe_agent_init@4; the controller resolves them by a fixed bare name).
+target_link_options(probe_api_agent PRIVATE "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/src/probe/agent.def")
+set_property(TARGET probe_api_agent APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/probe/agent.def")
+
+# --- Example: gated_config -----------------------------------------------------
+# Deferred flag probe (software breakpoint, fires once, flips the parsed flag) mixed
+# with an inline read-log probe (SafetyHook mid-hook, millions of hits). Run on
+# demand via scripts/check_scenario.py (a heavyweight end-to-end demo, not a CI gate).
+add_executable(gated_config
+    examples/gated_config/main.cpp
+    examples/gated_config/callbacks.cpp)
+target_include_directories(gated_config PRIVATE examples/gated_config include)
+target_link_libraries(gated_config PRIVATE probe_api)
+add_dependencies(gated_config probe_app configparse probe_api_agent)
+
+foreach(t probe_app configparse probe_api probe_api_agent gated_config)
+    target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
+endforeach()

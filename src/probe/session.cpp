@@ -1,6 +1,5 @@
 // Public x64 breakpoint + inline backends. The debug API binds event consumption
 // to the launching thread, so probe_run owns the event loop through exit.
-#define PROBE_PUBLIC_API
 #include "win_common.hpp"
 #include "probe_agent_shared.hpp"
 #include <cerrno>
