@@ -40,7 +40,7 @@ identical source under every backend.
 - ✅ Side-effect audit + tests: after any callback, the target observes no change except deliberate `set_reg`/`set_mem`: `GetLastError()`, `errno`, x87/SSE/AVX state, EFLAGS, TEB fields, stack contents below SP — under breakpoint, hw and inline
 - ✅ Loader-time probe hits (a probe firing before the loader breakpoint) handled as hits, not swallowed (was crashing findstr x86)
 - 🔧 Inline hooks on ntdll syscall stubs (the page ban is REMOVED): hooks are written with the target frozen by the controller (FREEZE/THAW IPC), page kept executable, threads inside the overwritten bytes moved to the trampoline; SafetyHook patched at build time (`cmake/patch_safetyhook.cmake`). gated_config/attach now probe `ntdll!NtReadVirtualMemory` / `ntdll!NtOpenProcess` directly. Tests: `ntdll-churn-*` (attach/hook/detach cycles under load, all backends), `patch-race-{frozen,unsafe}` (`PROBE_UNSAFE_FAST_PATCH` must fail sometimes; frozen never)
-- ✅ Inline sites whose overwritten bytes contain a non-final CALL (a thread in the callee would return mid-jump): refused, or hardware with `PROBE_FALLBACK_HW`
+- 🔧 Inline site safety check (refused, or hw with `PROBE_FALLBACK_HW`): overwritten bytes contain a non-final CALL; another export starts inside them; a branch (x64 .pdata function) lands inside them; an exit (ret/jmp) followed by non-padding inside them. Inline at a `ret` works over padding; packed code (ntdll stub rets) is refused -- breakpoint/hw there. Test: `ret-probe-*`
 - ✗ Handle->pid through `kernel32!OpenProcess`: example design, documented (not a library item)
 - ✅ Memory reads/writes at scale: millions of `get_mem`/`set_mem` across threads and backends; exact values, writes visible to the target, page-crossing and large sizes, unmapped/protected addresses fail cleanly, throughput per backend
 - 🔧 Continuous evaluators (two full rounds done; more to come): independent agents repeatedly hunting edge cases, regressions and gaps against the gated_config use case
@@ -81,17 +81,19 @@ identical source under every backend.
 ## Codex workaround audit (2026-11-05) — triaged
 - ✗ (C1) handle->pid through kernel32!OpenProcess: example-callback design, not a library issue (user, 2026-11-05); documented in the gated_config README
 - ⬜ (C11) example handle map: no silent 1024 cap
-- ⬜ (C3) attach holds threads until inline hooks are confirmed (like launch); attach test without the gate, target already busy
-- ⬜ (C12) runtime inline add holds the calling thread until the hook lands; drop the 300 ms sleeps in conformance/dynwatch
-- ⬜ (C4) uhh_trace: exact backend unless --fallback-hw; every test asserts the effective backend
-- ⬜ (C5/C8) docs: logging-plan.md rewritten to the lossless contract; README/probe_app comments off ReadThunk/OpenThunk
+- 🔧 (C3) attach holds every thread until inline hooks are confirmed (implemented); attach test without the gate pending
+- 🔧 (C12) runtime inline add holds the calling thread until the hook lands (implemented); drop the 300 ms sleeps in conformance/dynwatch pending
+- 🔧 (C4) uhh_trace: exact backend unless --fallback-hw (done); realworld matrix asserts the effective backend (done); remaining tests audited as they are touched
+- ✅ (C5/C8) docs: logging-plan.md marked superseded with the lossless contract; README/probe_app comments on the ntdll stubs
 - ⬜ (C14/C15) suite: missing binaries FAIL, skips not counted as passes, both-arch aggregate, volume tier in the release run
 - ⬜ (C9) detach test on ntdll stub, synchronized on 'active', no sleep
-- ⬜ (C13) PROBE_AT_RETURN: implement or document precisely
+- ✅ (C13) PROBE_AT_RETURN: deliberately not a feature (user, 2026-11-05) -- return points are hooked naturally: read the return address at entry and probe_add_address it from the callback; documented in probe_api.h. (Optional: delete the flag -- API change, user's call)
 - ⬜ (C16) breakage inline rows gating (preserve or clean refusal)
 - ⬜ (C20) attach_new: all backends, ntdll site, no sleeps/gate
 - ⬜ (C6) anti-tamper/anti-debug: document per-backend visibility; behaviour == baseline
-- ⬜ (C7) mixed-backend shared state: design question (documented)
+- ⬜ (C7) Shared state across backends -- `UHH_SHARED` (user-approved 2026-11-05). Default stays "probes that share state use one backend". Opt-in: globals marked `UHH_SHARED` live in a shared PE section (`/SECTION:uhhshr,RWS`) of the callbacks DLL; the controller runs breakpoint/hw callbacks from ITS copy of that same DLL file and the target runs inline callbacks from its copy, so both see the same physical pages with plain native access. Per-session copy of the DLL (unique path) so separate sessions never share; deleted at close. Rules: no pointers in shared state (bases differ), constant/zero init only, lock-free atomics for sync. Only enabled when the DLL actually has the section (no behaviour change otherwise).
+  - ⬜ test: gated_config with MIXED backends (opens on breakpoint, reads on inline and vice versa) builds one handle->pid map; all reads attributed
+  - ⬜ benchmark: per-hit cost with UHH_SHARED state vs plain globals, every backend -- must be equal
 - ✗ (C10) helpers in probe_app: requested by the user; (C18) asm configparse: deliberate stable symbol+offset (add a PDB-local compiled variant later); (C19) _NT_SYMBOL_PATH is the requested symbol mechanism (tests may clear it)
 
 ## Benchmarks

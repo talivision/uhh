@@ -12,7 +12,7 @@
 #endif
 
 /* Config of the read probe. log=0: count hits only (no logs). filter=1: log only reads
-   whose handle was opened (OpenThunk -> NtOpenProcess) for `pid` and whose address is in
+   whose handle was opened (ntdll!NtOpenProcess) for `pid` and whose address is in
    [base, base+size). */
 struct read_log_config {
     uint64_t cookie;          /* READ_LOG_COOKIE */
@@ -30,8 +30,8 @@ inline uint32_t backend_flag(const char *name) {
 extern "C" {
 /* configparse.dll!ParseConfig+0x16: the parsed flag is in EAX; 0 -> 1. */
 PROBE_EXAMPLE_EXPORT void enable_reads(probe_context *);
-/* probe_app.exe!OpenThunk entry (NtOpenProcess signature): remember (pid, out-handle pointer). */
+/* ntdll!NtOpenProcess entry: remember (pid, out-handle pointer). */
 PROBE_EXAMPLE_EXPORT void track_open_process(probe_context *);
-/* probe_app.exe!ReadThunk (NtReadVirtualMemory args): log handle/pid/addr/size. */
+/* ntdll!NtReadVirtualMemory entry: log handle/pid/addr/size. */
 PROBE_EXAMPLE_EXPORT void log_read(probe_context *);
 }

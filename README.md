@@ -20,7 +20,7 @@ void log_read(probe_context *c) {
 }
 
 probe_add_symbol(s, "configparse.dll!ParseConfig+0x16", enable_reads, PROBE_BREAKPOINT);  /* software breakpoint */
-probe_add_symbol_cfg(s, "probe_app.exe!ReadThunk", log_read, PROBE_INLINE, &cfg, len);    /* inline mid-hook     */
+probe_add_symbol_cfg(s, "ntdll.dll!NtReadVirtualMemory", log_read, PROBE_INLINE, &cfg, len); /* inline mid-hook  */
 ```
 
 ### The API in one screen
@@ -102,8 +102,9 @@ cmake --build build-x86 --config Release
 The target (`examples/targets/probe_app`) ships a feature **disabled in its config**:
 after a keystroke it late-loads `configparse.dll`, parses `reads_enabled=0`, and does
 nothing. Only when the flag is on does it open its helper processes by pid
-(`probe_app.exe!OpenThunk`, its own `NtOpenProcess` wrapper) and read their memory from many threads
-(`NtReadVirtualMemory`). The examples turn the feature on **from outside, without
+(`ntdll!NtOpenProcess`) and read their memory from many threads (`ntdll!NtReadVirtualMemory`).
+The probes sit on those ntdll syscall stubs, so every caller is seen whatever wrapper it
+went through -- under every backend, inline included. The examples turn the feature on **from outside, without
 modifying the target or its config**: a breakpoint inside `configparse.dll` flips the
 parsed flag `0 -> 1` just before it is stored, and further probes log (and filter)
 every read — this is how you build metrics on a code path that normally never runs.
@@ -114,7 +115,7 @@ every read — this is how you build metrics on a code path that normally never 
   only the reads of one helper process inside one address range.
 
 ```sh
-build-x64\Release\gated_config.exe configparse.dll!ParseConfig+0x16 probe_app.exe!ReadThunk -- build-x64\Release\probe_app.exe
+build-x64\Release\gated_config.exe configparse.dll!ParseConfig+0x16 ntdll.dll!NtReadVirtualMemory -- build-x64\Release\probe_app.exe
 python scripts/regress.py --bin build-x64/Release      # everything, incl. both examples
 ```
 

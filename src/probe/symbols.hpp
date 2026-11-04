@@ -27,6 +27,9 @@ void unregister_module(HANDLE process, std::uint64_t base);
 bool resolve(HANDLE process, const std::string &module, const std::string &name,
              std::uint64_t &address);
 std::string symbolize(HANDLE process, std::uint64_t address);
+// The function (from the PDB) that contains address: its start and size. False when
+// unknown (no PDB, an export-only symbol has no size, or address is past its end).
+bool containing_function(HANDLE process, std::uint64_t address, std::uint64_t &start, std::uint32_t &size);
 bool walk_stack(HANDLE process, HANDLE thread, CONTEXT ctx,
                 std::uint64_t pc, std::uint64_t sp, std::uint64_t fp,
                 std::vector<std::uint64_t> &frames, std::size_t max_frames);

@@ -41,7 +41,7 @@ int main(int argc, char **argv) {
         if (r == 7000 + 14 + g_buf[0]) ++arg_rewritten;
         if (g_buf[8] == 0xA5) ++mem_written;                // set_mem marker
     }
-    Sleep(300);                                             // runtime-added inline probe lands async
+    // No wait: the callback that added conf_later's inline probe held this thread until it landed.
     for (int i = 0; i < 20; ++i) conf_later(i);
     g_watch_value = 1; g_watch_value = 2; g_watch_value = 3; // three stores to the watched address
     printf("{\"kind\":\"target\",\"calls\":%d,\"arg_rewritten\":%d,\"mem_written\":%d,\"later_calls\":%ld}\n",

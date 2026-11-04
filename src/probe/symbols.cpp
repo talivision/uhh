@@ -591,6 +591,28 @@ bool resolve(HANDLE process, const std::string &module, const std::string &name,
     }
 }
 
+bool containing_function(HANDLE process, std::uint64_t address, std::uint64_t &start, std::uint32_t &size) {
+    try {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        const auto session = find_session(process);
+        if (!g_dbghelp || session == g_sessions.end()) return false;
+        constexpr ULONG max_name = 512;
+        std::vector<unsigned char> storage(sizeof(SYMBOL_INFOW) +
+            (static_cast<std::size_t>(max_name) - 1) * sizeof(wchar_t), 0);
+        PSYMBOL_INFOW symbol = reinterpret_cast<PSYMBOL_INFOW>(storage.data());
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFOW);
+        symbol->MaxNameLen = max_name;
+        DWORD64 displacement = 0;
+        if (!g_api.from_addr(process, static_cast<DWORD64>(address), &displacement, symbol)) return false;
+        if (symbol->Size == 0 || displacement >= symbol->Size) return false;
+        start = static_cast<std::uint64_t>(symbol->Address);
+        size = symbol->Size;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 std::string symbolize(HANDLE process, std::uint64_t address) {
     try {
         std::lock_guard<std::mutex> lock(g_mutex);

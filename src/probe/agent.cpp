@@ -621,7 +621,9 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
         if (!shared || shared->magic != PROBE_AGENT_MAGIC || shared->version != PROBE_AGENT_VERSION) return 2;
     }
     if (shared->request_count > PROBE_AGENT_MAX_PROBES) return 3;
+    InterlockedExchange(&g_stopping, 0);   // a new session after a detach: callbacks run again
     install_pending();
+    if (service_event) InterlockedExchange(&shared->service_ready, 1);   // thread from an earlier session
     if (!service_event) {   // first init: start the persistent install thread
         wchar_t name[64]; probe_agent_service_name(GetCurrentProcessId(), name);
         service_event = OpenEventW(SYNCHRONIZE, FALSE, name);

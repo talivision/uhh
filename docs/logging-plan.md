@@ -1,6 +1,15 @@
 # Logging subsystem design (`PROBE_LOG`)
 
-Status: design, not yet implemented. Agreed against `api-sketch.md` (GOSPEL),
+> **Superseded (historical design notes).** The implemented contract is LOSSLESS:
+> inline logs go through a bounded MPMC ring that the controller's drainer thread
+> empties continuously; a full ring applies backpressure (the logging thread waits),
+> never count-and-drop. A record is dropped only if the controller is gone (detach /
+> close, `controller_gone`) or provably stuck (drainer alive but the tail has not
+> moved for 2 s), and every such drop is counted in the report's `log_dropped`.
+> Breakpoint/hw logs are written by the controller directly. The suite asserts
+> `log_dropped == 0` and logs == hits on every backend. Text below is the original plan.
+
+Status (original): design, not yet implemented. Agreed against `api-sketch.md` (GOSPEL),
 `plan-v2.md` (§Logging), and `design-review-codex.md` point #8. This is the
 concrete, implementable spec for order-of-work item 3 ("Logging queues +
 `PROBE_LOG`") in `plan-v2.md`.

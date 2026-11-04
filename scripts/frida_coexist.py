@@ -59,7 +59,7 @@ def main():
 
     def start_uhh():
         nonlocal tracer
-        tracer = subprocess.Popen([a.trace, "--backend", a.backend, "--attach", str(app.pid),
+        tracer = subprocess.Popen([a.trace, "--backend", a.backend, "--fallback-hw", "--attach", str(app.pid),
                                    "-p", "probe_app.exe!ReadThunk:xxxx"],
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         time.sleep(3.0)                       # attach + agent install (async after attach)

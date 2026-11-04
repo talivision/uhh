@@ -17,6 +17,10 @@ enum probe_flags {
     PROBE_BREAKPOINT      = 1u << 0,
     PROBE_INLINE          = 1u << 1,
     PROBE_HW              = 1u << 2,
+    /* Not supported (refused by every backend). To observe a function's return, read the
+       return address at its entry (get_mem at the stack pointer) and add a probe THERE
+       from the callback: probe_add_address(get_session(c), ret, on_return, flags). It
+       fires on every return to that site, on any backend, without touching the stack. */
     PROBE_AT_RETURN       = 1u << 3,
     PROBE_ALLOW_PREHOOKED = 1u << 4,
     PROBE_FALLBACK_HW     = 1u << 5,

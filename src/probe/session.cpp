@@ -10,6 +10,8 @@
 #include <string>
 #include <unordered_map>
 #include <map>
+#include <set>
+#include <algorithm>
 #include <vector>
 #include <Zydis/Zydis.h>
 #include "symbols.hpp"   // dbghelp+symsrv loaded dynamically; honours _NT_SYMBOL_PATH
@@ -971,32 +973,330 @@ static bool detect_prehook(probe_session *s, const Probe &p, std::string &json) 
 // inspect); PROBE_ALLOW_PREHOOKED chains anyway, PROBE_FALLBACK_HW moves the probe to a
 // debug register. Breakpoint probes still work (the jmp is stepped in place): report only.
 // Returns false when the probe must not be armed; sets moved_to_hw when converted.
-// An inline hook replaces the first instructions (>= 5 bytes) with a jump. If one of
-// those instructions is a CALL that is not the last of them, a thread that is inside the
-// callee when the hook is written later returns into the middle of the jump. No freeze
-// can fix that (the return address is on its stack, not in its IP), so such sites go to
-// the hardware backend with PROBE_FALLBACK_HW, else are refused.
-static bool inline_inner_call(probe_session *s, const Probe &p, std::string &why) {
-    unsigned char b[32] = {}; size_t n = 0;
-    if (!remote_read(s->pi.hProcess, p.address, b, sizeof(b), &n) || n < 5) return false;
+// An inline hook replaces the first instructions at the site (>= 5 bytes) with a jump.
+// That is only safe if nothing else can arrive INSIDE those bytes later:
+//  1. a CALL among them that is not the last one: a thread inside the callee when the
+//     hook is written returns into the middle of the jump (no freeze can fix a return
+//     address on a stack);
+//  2. another exported function starting inside them (a probe on a function's final
+//     `ret` overwrites its neighbour: e.g. the next ntdll syscall stub on x86);
+//  3. a branch elsewhere in the same function landing inside them (x64: the function's
+//     bounds come from .pdata; e.g. a syscall stub's `jne` into its `int 2e; ret` tail);
+//  4. an exit (ret/jmp) followed, still inside them, by anything but padding: that code
+//     is reachable only by a jump (the same stub tail, even without .pdata).
+// Such sites go to the hardware backend with PROBE_FALLBACK_HW, else are refused.
+static uint32_t inline_patch_len(const unsigned char *b, size_t n, int64_t *call_end, bool *code_after_exit) {
     ZydisDecoder dec;
 #if defined(_WIN64)
     ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
 #else
     ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_COMPAT_32, ZYDIS_STACK_WIDTH_32);
 #endif
-    size_t off = 0; int64_t call_end = -1;
+    size_t off = 0; *call_end = -1; *code_after_exit = false;
+    bool exited = false;
     while (off < 5) {
         ZydisDecodedInstruction insn{};
-        if (!ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(&dec, nullptr, b + off, n - off, &insn))) return false;
+        if (!ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(&dec, nullptr, b + off, n - off, &insn))) return 0;
         off += insn.length;
-        if (insn.meta.category == ZYDIS_CATEGORY_CALL) call_end = (int64_t)off;
+        if (exited && insn.mnemonic != ZYDIS_MNEMONIC_NOP && insn.mnemonic != ZYDIS_MNEMONIC_INT3)
+            *code_after_exit = true;                   // reachable only by a jump into the patch
+        if (insn.meta.category == ZYDIS_CATEGORY_CALL) *call_end = (int64_t)off;
+        if (insn.meta.category == ZYDIS_CATEGORY_RET || insn.meta.category == ZYDIS_CATEGORY_UNCOND_BR ||
+            insn.mnemonic == ZYDIS_MNEMONIC_INT3 || insn.mnemonic == ZYDIS_MNEMONIC_UD2) exited = true;
     }
-    if (call_end < 0 || call_end == (int64_t)off) return false;   // no call, or the call is the last stolen instruction
-    char buf[160];
-    std::snprintf(buf, sizeof(buf), "a call at +0x%llx returns inside the %zu bytes the hook overwrites",
-                  (unsigned long long)(call_end), off);
-    why = buf;
+    return (uint32_t)off;
+}
+
+static bool read_image_dir(probe_session *s, uint64_t base, int which, IMAGE_DATA_DIRECTORY &dir,
+                           uint32_t *size_of_image = nullptr) {
+    IMAGE_DOS_HEADER dos{}; IMAGE_NT_HEADERS nt{}; size_t got = 0;
+    if (!remote_read(s->pi.hProcess, base, &dos, sizeof(dos), &got) || got != sizeof(dos) || dos.e_magic != IMAGE_DOS_SIGNATURE) return false;
+    if (!remote_read(s->pi.hProcess, base + (uint32_t)dos.e_lfanew, &nt, sizeof(nt), &got) || got != sizeof(nt) ||
+        nt.Signature != IMAGE_NT_SIGNATURE || nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR_MAGIC) return false;
+    if (size_of_image) *size_of_image = nt.OptionalHeader.SizeOfImage;
+    dir = nt.OptionalHeader.DataDirectory[which];
+    return dir.VirtualAddress && dir.Size;
+}
+
+// ---- Entry points near an inline site --------------------------------------------------
+// Every address control can ARRIVE at (other than by falling through): function starts
+// from every source we have, plus -- inside the function that holds the site -- branch
+// targets, return points after calls, and switch-table targets. Over-collecting is the
+// safe direction: an extra entry point can only make a hook refuse, never clobber code.
+struct SiteAnalysis {
+    uint64_t func_start = 0, func_end = 0;      // 0/0: function bounds unknown
+    const char *bounds_from = "none";
+    std::vector<uint64_t> insns;                // instruction starts in the function (linear)
+    std::set<uint64_t> entries;                 // entry points (absolute)
+    int tables = 0;                             // switch tables recovered
+    std::vector<uint64_t> indirect_jumps;       // jmp reg / jmp [reg...]: targets unknown unless a table explains them
+};
+
+static void add_export_starts(probe_session *s, uint64_t base, std::set<uint64_t> &out) {
+    IMAGE_DATA_DIRECTORY dir{};
+    if (!read_image_dir(s, base, IMAGE_DIRECTORY_ENTRY_EXPORT, dir) || dir.Size < sizeof(IMAGE_EXPORT_DIRECTORY)) return;
+    IMAGE_EXPORT_DIRECTORY ex{}; size_t got = 0;
+    if (!remote_read(s->pi.hProcess, base + dir.VirtualAddress, &ex, sizeof(ex), &got) || got != sizeof(ex)) return;
+    if (!ex.NumberOfFunctions || ex.NumberOfFunctions > (1u << 20)) return;
+    std::vector<DWORD> funcs(ex.NumberOfFunctions);
+    if (!remote_read(s->pi.hProcess, base + ex.AddressOfFunctions, funcs.data(), funcs.size() * 4, &got) || got != funcs.size() * 4) return;
+    for (DWORD r : funcs)
+        if (r && !(r >= dir.VirtualAddress && r < dir.VirtualAddress + dir.Size)) out.insert(base + r);   // skip forwarders
+}
+
+// Control Flow Guard: every address-taken function (static ones included).
+static void add_cfg_starts(probe_session *s, uint64_t base, std::set<uint64_t> &out) {
+    IMAGE_DATA_DIRECTORY dir{};
+    if (!read_image_dir(s, base, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, dir)) return;
+#if defined(_WIN64)
+    IMAGE_LOAD_CONFIG_DIRECTORY64 lc{};
+#else
+    IMAGE_LOAD_CONFIG_DIRECTORY32 lc{};
+#endif
+    size_t got = 0, want = (std::min)((size_t)dir.Size, sizeof(lc));
+    if (!remote_read(s->pi.hProcess, base + dir.VirtualAddress, &lc, want, &got) || got != want) return;
+    if (lc.Size < offsetof(decltype(lc), GuardFlags) + sizeof(lc.GuardFlags)) return;
+    if (!lc.GuardCFFunctionTable || !lc.GuardCFFunctionCount || lc.GuardCFFunctionCount > (1u << 22)) return;
+    const size_t stride = 4 + ((lc.GuardFlags & IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_MASK) >> IMAGE_GUARD_CF_FUNCTION_TABLE_SIZE_SHIFT);
+    std::vector<unsigned char> t((size_t)lc.GuardCFFunctionCount * stride);
+    if (!remote_read(s->pi.hProcess, (uint64_t)lc.GuardCFFunctionTable, t.data(), t.size(), &got) || got != t.size()) return;
+    for (size_t i = 0; i < (size_t)lc.GuardCFFunctionCount; ++i) {
+        DWORD rva; std::memcpy(&rva, t.data() + i * stride, 4); out.insert(base + rva);
+    }
+}
+
+#if defined(_WIN64)
+// x64 .pdata: the start of every non-leaf function; also the bounds of the site's own.
+static void add_pdata(probe_session *s, uint64_t base, uint64_t site, std::set<uint64_t> &out,
+                      uint64_t &fs, uint64_t &fe) {
+    IMAGE_DATA_DIRECTORY dir{};
+    if (!read_image_dir(s, base, IMAGE_DIRECTORY_ENTRY_EXCEPTION, dir)) return;
+    const size_t count = dir.Size / sizeof(RUNTIME_FUNCTION);
+    if (!count || count > (1u << 22)) return;
+    std::vector<RUNTIME_FUNCTION> rf(count); size_t got = 0;
+    if (!remote_read(s->pi.hProcess, base + dir.VirtualAddress, rf.data(), count * sizeof(RUNTIME_FUNCTION), &got) ||
+        got != count * sizeof(RUNTIME_FUNCTION)) return;
+    for (const auto &f : rf) {
+        out.insert(base + f.BeginAddress);
+        if (site >= base + f.BeginAddress && site < base + f.EndAddress) { fs = base + f.BeginAddress; fe = base + f.EndAddress; }
+    }
+}
+#endif
+
+static void analyse_site(probe_session *s, uint64_t base, uint64_t site, SiteAnalysis &a) {
+    uint32_t image_size = 0; IMAGE_DATA_DIRECTORY unused{};
+    read_image_dir(s, base, IMAGE_DIRECTORY_ENTRY_EXPORT, unused, &image_size);
+    add_export_starts(s, base, a.entries);
+    add_cfg_starts(s, base, a.entries);
+#if defined(_WIN64)
+    add_pdata(s, base, site, a.entries, a.func_start, a.func_end);
+    if (a.func_start) a.bounds_from = ".pdata";
+#endif
+    if (s->sym_ready) {                                            // PDB: every function, statics included
+        uint64_t fs = 0; uint32_t fz = 0;
+        if (uhh_sym::containing_function(s->pi.hProcess, site, fs, fz) && fz <= (1u << 20)) {
+            a.entries.insert(fs);
+            if (!a.func_start || fs + fz > a.func_end) { a.func_start = fs; a.func_end = fs + fz; a.bounds_from = "pdb"; }
+        }
+        for (uint64_t x = site + 1; x < site + 32; ++x)            // a PDB function starting just after the site
+            if (uhh_sym::containing_function(s->pi.hProcess, x, fs, fz) && fs == x) a.entries.insert(fs);
+    }
+    if (!a.func_start || a.func_end - a.func_start > (1u << 16)) { a.func_start = a.func_end = 0; return; }
+    std::vector<unsigned char> code(a.func_end - a.func_start); size_t got = 0;
+    if (!remote_read(s->pi.hProcess, a.func_start, code.data(), code.size(), &got) || got != code.size()) { a.func_start = a.func_end = 0; return; }
+    ZydisDecoder dec;
+#if defined(_WIN64)
+    ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+#else
+    ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_COMPAT_32, ZYDIS_STACK_WIDTH_32);
+#endif
+    ZydisDecodedInstruction in; ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+    const uint64_t fs = a.func_start, fe = a.func_end;
+    auto inside = [&](uint64_t t) { return t >= fs && t < fe; };
+    for (size_t off = 0; off < code.size();) {
+        if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, code.data() + off, code.size() - off, &in, ops))) { ++off; continue; }
+        const uint64_t at = fs + off, next = at + in.length;
+        a.insns.push_back(at);
+        if (in.mnemonic == ZYDIS_MNEMONIC_JMP && in.operand_count_visible >= 1) {
+            const auto &o = ops[0];
+            const bool via_import = o.type == ZYDIS_OPERAND_TYPE_MEMORY && o.mem.index == ZYDIS_REGISTER_NONE &&
+                (o.mem.base == ZYDIS_REGISTER_NONE || o.mem.base == ZYDIS_REGISTER_RIP);   // jmp [IAT]: leaves the function
+            if (o.type == ZYDIS_OPERAND_TYPE_REGISTER || (o.type == ZYDIS_OPERAND_TYPE_MEMORY && !via_import))
+                a.indirect_jumps.push_back(at);
+        }
+        if (in.meta.category == ZYDIS_CATEGORY_CALL) a.entries.insert(next);               // return point
+        for (int k = 0; k < in.operand_count_visible; ++k) {
+            const auto &o = ops[k];
+            if (o.type == ZYDIS_OPERAND_TYPE_IMMEDIATE && o.imm.is_relative && in.meta.branch_type != ZYDIS_BRANCH_TYPE_NONE) {
+                uint64_t t = next + (uint64_t)o.imm.value.s;
+#if !defined(_WIN64)
+                t = (uint32_t)t;
+#endif
+                a.entries.insert(t);                                                      // direct branch/call target
+            }
+            // Switch tables: [reg*4 + disp32] (x86: absolute entries; x64 MSVC: image-base
+            // relative, base register = image base). Read entries while they land in this
+            // function; every one is an entry point.
+            if (o.type == ZYDIS_OPERAND_TYPE_MEMORY && o.mem.index != ZYDIS_REGISTER_NONE &&
+                o.mem.scale == 4 && o.mem.disp.has_displacement && o.mem.disp.value > 0) {
+#if defined(_WIN64)
+                const uint64_t table = base + (uint64_t)o.mem.disp.value;
+                if ((uint64_t)o.mem.disp.value >= image_size) continue;
+#else
+                const uint64_t table = (uint32_t)o.mem.disp.value;
+                if (table < base || table - base >= image_size) continue;
+#endif
+                int found = 0;
+                for (int e = 0; e < 4096; ++e) {
+                    uint32_t v = 0; size_t n = 0;
+                    if (!remote_read(s->pi.hProcess, table + 4ull * e, &v, 4, &n) || n != 4) break;
+#if defined(_WIN64)
+                    const uint64_t t = base + v;
+#else
+                    const uint64_t t = v;
+#endif
+                    if (!inside(t)) break;
+                    a.entries.insert(t); ++found;
+                }
+                if (found) ++a.tables;
+            }
+        }
+        off += in.length;
+    }
+}
+
+// The section holding [lo, hi): false when the patch would leave executable code.
+static bool patch_in_code_section(probe_session *s, uint64_t base, uint64_t lo, uint64_t hi, std::string &name) {
+    IMAGE_DOS_HEADER dos{}; IMAGE_NT_HEADERS nt{}; size_t got = 0;
+    if (!remote_read(s->pi.hProcess, base, &dos, sizeof(dos), &got) || got != sizeof(dos)) return true;
+    const uint64_t nth = base + (uint32_t)dos.e_lfanew;
+    if (!remote_read(s->pi.hProcess, nth, &nt, sizeof(nt), &got) || got != sizeof(nt)) return true;
+    const uint16_t nsec = nt.FileHeader.NumberOfSections;
+    if (!nsec || nsec > 96) return true;
+    std::vector<IMAGE_SECTION_HEADER> sec(nsec);
+    const uint64_t first = nth + offsetof(IMAGE_NT_HEADERS, OptionalHeader) + nt.FileHeader.SizeOfOptionalHeader;
+    if (!remote_read(s->pi.hProcess, first, sec.data(), nsec * sizeof(IMAGE_SECTION_HEADER), &got) ||
+        got != nsec * sizeof(IMAGE_SECTION_HEADER)) return true;
+    for (const auto &h : sec) {
+        const uint64_t st = base + h.VirtualAddress, en = st + (std::max)(h.Misc.VirtualSize, h.SizeOfRawData);
+        if (lo < st || lo >= en) continue;
+        name.assign((const char *)h.Name, strnlen((const char *)h.Name, 8));
+        return (h.Characteristics & IMAGE_SCN_MEM_EXECUTE) && hi <= en;
+    }
+    return true;                                     // not in a mapped image section: nothing to say
+}
+
+// Inline hooks overwrite >= 5 bytes; they are refused where code could ARRIVE inside those
+// bytes, with one clear reason per case:
+//   [exit]     the patch runs past a ret/jmp into code only a jump can reach
+//   [call]     a call inside the patch returns into it
+//   [entry]    a function start, branch target, return point or switch-table target is inside it
+//   [indirect] the function has an indirect jump whose targets cannot be resolved
+//   [section]  the patch runs past the end of the executable section
+// (Threads executing inside the patch when it is written are handled by the freeze.)
+// Not visible to any static check: jumps into this function from OTHER code.
+static bool inline_site_unsafe(probe_session *s, const Probe &p, std::string &why) {
+    unsigned char b[32] = {}; size_t n = 0;
+    if (!remote_read(s->pi.hProcess, p.address, b, sizeof(b), &n) || n < 5) return false;
+    int64_t call_end = -1; bool code_after_exit = false;
+    const uint32_t len = inline_patch_len(b, n, &call_end, &code_after_exit);
+    if (!len) return false;
+    char buf[320];
+    std::string reason;
+    std::string secname;
+    if (p.base && !patch_in_code_section(s, p.base, p.address, p.address + len, secname)) {
+        std::snprintf(buf, sizeof(buf), "[section] the %u-byte patch runs past the end of executable section '%s'",
+                      len, secname.c_str());
+        reason = buf;
+    } else if (code_after_exit) {
+        std::snprintf(buf, sizeof(buf), "[exit] the %u-byte patch runs past a ret/jmp into code that only a jump can reach "
+                      "(it would be overwritten)", len);
+        reason = buf;
+    } else if (call_end >= 0 && call_end != (int64_t)len) {
+        std::snprintf(buf, sizeof(buf), "[call] a call inside the %u-byte patch returns to +0x%llx, into the middle of the hook's jump",
+                      len, (unsigned long long)call_end);
+        reason = buf;
+    }
+    SiteAnalysis a;
+    if (p.base) analyse_site(s, p.base, p.address, a);
+    if (reason.empty()) {
+        auto it = a.entries.upper_bound(p.address);
+        if (it != a.entries.end() && *it < p.address + len) {
+            std::snprintf(buf, sizeof(buf), "[entry] code can arrive at +0x%llx (a function start, branch target, return point "
+                          "or switch-table target), inside the %u-byte patch", (unsigned long long)(*it - p.address), len);
+            reason = buf;
+        }
+    }
+    if (reason.empty() && a.func_start && !a.indirect_jumps.empty() && !a.tables) {
+        std::snprintf(buf, sizeof(buf), "[indirect] the function (0x%llx-0x%llx, bounds from %s) has an indirect jump at 0x%llx "
+                      "whose targets cannot be resolved, so the %u-byte patch cannot be verified",
+                      (unsigned long long)a.func_start, (unsigned long long)a.func_end, a.bounds_from,
+                      (unsigned long long)a.indirect_jumps.front(), len);
+        reason = buf;
+    }
+    if (reason.empty() && p.base && !a.func_start) {
+        // No function bounds (no .pdata/PDB entry): walk forward from the site to the end of
+        // its block and check every direct branch met there (catches loops back into it).
+        ZydisDecoder dec;
+#if defined(_WIN64)
+        ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+#else
+        ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_COMPAT_32, ZYDIS_STACK_WIDTH_32);
+#endif
+        unsigned char w[512] = {}; size_t wn = 0;
+        remote_read(s->pi.hProcess, p.address, w, sizeof(w), &wn);
+        ZydisDecodedInstruction in; ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+        for (size_t off = 0; off < wn && reason.empty();) {
+            if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, w + off, wn - off, &in, ops))) break;
+            const uint64_t at = p.address + off, next = at + in.length;
+            if (in.meta.branch_type != ZYDIS_BRANCH_TYPE_NONE && in.operand_count_visible >= 1 &&
+                ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && ops[0].imm.is_relative) {
+                uint64_t t = next + (uint64_t)ops[0].imm.value.s;
+#if !defined(_WIN64)
+                t = (uint32_t)t;
+#endif
+                if (t > p.address && t < p.address + len) {
+                    std::snprintf(buf, sizeof(buf), "[entry] a branch at +0x%llx jumps back to +0x%llx, inside the %u-byte patch",
+                                  (unsigned long long)(at - p.address), (unsigned long long)(t - p.address), len);
+                    reason = buf;
+                }
+            }
+            if (in.meta.category == ZYDIS_CATEGORY_RET || in.meta.category == ZYDIS_CATEGORY_UNCOND_BR) break;
+            off += in.length;
+        }
+        if (reason.empty())
+            std::fprintf(stderr, "probe: %s: function bounds unknown (no .pdata/PDB entry): inline site checked to the end "
+                         "of its block only\n", p.location.c_str());
+    }
+    if (reason.empty()) return false;
+    // Suggest instruction boundaries in this function where the whole patch passes the same
+    // checks, nearest first. The callback would run at a different instruction there.
+    std::string modname;
+    for (auto &kv : s->module_bases) if (kv.second == p.base) { modname = kv.first; break; }
+    std::vector<std::pair<uint64_t, uint64_t>> cands;    // (distance, address)
+    const bool fn_ok = !(!a.indirect_jumps.empty() && !a.tables);
+    for (uint64_t x : a.insns) {
+        if (x == p.address || !fn_ok) continue;
+        unsigned char c[32] = {}; size_t cn = 0;
+        if (!remote_read(s->pi.hProcess, x, c, sizeof(c), &cn) || cn < 5) continue;
+        int64_t ce = -1; bool cx = false;
+        const uint32_t cl = inline_patch_len(c, cn, &ce, &cx);
+        if (!cl || cx || (ce >= 0 && ce != (int64_t)cl) || x + cl > a.func_end) continue;
+        auto it = a.entries.upper_bound(x);
+        if (it != a.entries.end() && *it < x + cl) continue;
+        cands.push_back({x > p.address ? x - p.address : p.address - x, x});
+    }
+    std::sort(cands.begin(), cands.end());
+    std::string sugg;
+    for (size_t i = 0; i < cands.size() && i < 3; ++i) {
+        const uint64_t x = cands[i].second;
+        std::snprintf(buf, sizeof(buf), "%s%s+0x%llx (%s%llu bytes)", sugg.empty() ? "" : ", ",
+                      modname.empty() ? "module" : modname.c_str(), (unsigned long long)(x - p.base),
+                      x < p.address ? "-" : "+", (unsigned long long)cands[i].first);
+        sugg += buf;
+    }
+    why = reason + ". Use PROBE_BREAKPOINT or PROBE_HW at this exact address (or PROBE_FALLBACK_HW)" +
+          (sugg.empty() ? std::string("") : "; inline-safe nearby (callback runs at a different instruction): " + sugg);
     return true;
 }
 
@@ -1004,13 +1304,14 @@ static bool vet_site(probe_session *s, Probe &p, bool &moved_to_hw) {
     moved_to_hw = false;
     if (p.flags & PROBE_HW) return true;
     std::string inner;
-    if ((p.flags & PROBE_INLINE) && inline_inner_call(s, p, inner)) {
+    if ((p.flags & PROBE_INLINE) && inline_site_unsafe(s, p, inner)) {
         if (p.flags & PROBE_FALLBACK_HW) {
             p.flags = (p.flags & ~(uint32_t)PROBE_INLINE) | PROBE_HW; moved_to_hw = true;
             std::fprintf(stderr, "probe: %s -> hardware fallback (%s)\n", p.location.c_str(), inner.c_str());
             return true;
         }
-        set_error(s, "inline probe " + p.location + ": " + inner + "; use PROBE_HW/PROBE_BREAKPOINT or PROBE_FALLBACK_HW");
+        std::fprintf(stderr, "probe: inline probe %s refused: %s\n", p.location.c_str(), inner.c_str());
+        set_error(s, "inline probe " + p.location + " refused: " + inner);
         return false;
     }
     std::string json;
@@ -1315,7 +1616,11 @@ static bool open_agent_section(probe_session *s, uint32_t count) {
     wchar_t name[64]; probe_agent_mapping_name(s->pi.dwProcessId, name);
     s->mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
                                     (DWORD)sizeof(probe_agent_shared), name);
-    if (!s->mapping || GetLastError() == ERROR_ALREADY_EXISTS) {
+    // ALREADY_EXISTS on attach: an agent from an earlier, detached session is still loaded
+    // in the target and holds the section. It is quiescent (its hooks were removed and it
+    // stopped logging at that detach), so the channel is reset below and reused; the
+    // agent's init re-arms it. Anywhere else an existing section is not ours: refuse.
+    if (!s->mapping || (GetLastError() == ERROR_ALREADY_EXISTS && !s->attached)) {
         set_error(s, win_error("create inline shared section")); return false;
     }
     s->shared = static_cast<probe_agent_shared *>(MapViewOfFile(
@@ -2357,7 +2662,10 @@ static bool start_agent_init(probe_session *s) {
         set_error(s, "inline agent is not ready for initialization"); return false;
     }
     if (!vet_pending_inline(s)) return false;
-    if (!agent_has_pending(s)) return accept_agent_install(s);
+    // Nothing to install yet: still run init once if the agent's service thread is not up --
+    // it is what installs hooks in modules that load later (whose loading thread holds the
+    // loader lock, so no new thread could do it then).
+    if (!agent_has_pending(s) && s->shared && s->shared->service_ready) return accept_agent_install(s);
     auto local_init = reinterpret_cast<uintptr_t>(GetProcAddress(s->local_agent, "probe_agent_init"));
     uint64_t remote_init = s->remote_agent + local_init - reinterpret_cast<uintptr_t>(s->local_agent);
     return start_remote(s, reinterpret_cast<LPTHREAD_START_ROUTINE>((uintptr_t)remote_init), nullptr,

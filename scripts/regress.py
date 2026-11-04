@@ -917,6 +917,47 @@ def check_emulated_sites(threads=8, calls=20000):
                 record(name, False, repr(e))
 
 
+def check_ret_probe(threads=2, reads=50):
+    """A probe on a function's own `ret` -- the natural way to see a return (no special
+    flag): ntdll!NtOpenProcess's ret, found by decoding the stub in the DLL file. probe_app
+    opens each helper once. breakpoint and hw must fire once per open. inline must be REFUSED cleanly (the 5-byte jump would run past the ret
+    into code only a jump reaches -- the int 2e tail on x64, the next stub on x86) or,
+    with --fallback-hw, move to hw. The target must be unaffected either way."""
+    t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
+    if not t or not a:
+        return skip("ret-probe", "uhh_trace/probe_app missing")
+    import struct
+    data = Path(t).read_bytes()
+    x86 = struct.unpack_from("<H", data, struct.unpack_from("<I", data, 0x3C)[0] + 4)[0] == 0x14C
+    nt = Path(r"C:\Windows\SysWOW64\ntdll.dll") if x86 else SYS32 / "ntdll.dll"
+    stub = pe_export_bytes(nt, "NtOpenProcess", 32) or b""
+    anchor_bytes, ret_ops = (b"\xff\xd2", (0xC2, 0xC3)) if x86 else (b"\x0f\x05", (0xC3,))
+    i = stub.find(anchor_bytes)
+    off = next((k for k in range(i + len(anchor_bytes), len(stub)) if stub[k] in ret_ops), None) if i >= 0 else None
+    if off is None:
+        return record("ret-probe", False, f"no ret found in NtOpenProcess stub: {stub.hex()}")
+    site = f"ntdll.dll!NtOpenProcess+0x{off:x}"
+    helpers = 4
+    for bk, extra in (("breakpoint", []), ("hw", []), ("inline", []), ("inline", ["--fallback-hw"])):
+        name = f"ret-probe-{bk}{'-fallback' if extra else ''}"
+        try:
+            r, objs = run([t, "--backend", bk, *extra, "-p", f"{site}:x", "--", a, "--no-wait", "--helpers", helpers,
+                           "--threads", threads, "--reads", reads, "--config", "reads_enabled=1"], timeout=300)
+            res = next((x for x in objs if x.get("kind") == "app"), {})
+            pr = next((x for x in objs if x.get("kind") == "probe"), {})
+            rep = report(objs)
+            app_ok = res.get("opened") == helpers and res.get("successful_reads") == threads * reads
+            if bk == "inline" and not extra:
+                ok = r.returncode != 0 and "overwrites" in (rep.get("error") or "") and not pr.get("hits")
+            else:
+                want_bk = "hw" if extra else bk
+                ok = app_ok and pr.get("backend") == want_bk and pr.get("hits") == helpers
+            record(name, ok, f"site={site} backend={pr.get('backend')} hits={pr.get('hits')} opened={res.get('opened')} "
+                             f"reads={res.get('successful_reads')} rc={r.returncode} err={(rep.get('error') or '')[:120]}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
 def check_crash_logs(n=5000):
     """Log delivery when the TARGET crashes: after n probed calls (one log each) it dies
     with an unhandled access violation. Every log must still arrive -- for inline they
@@ -1080,7 +1121,7 @@ def check_prehook_attach():
     functions at run time (probe_app --prehook puts a SafetyHook inline detour on ReadThunk
     before its gate). An inline probe there must produce the pre-hook report (live bytes
     differ from the image on disk: pattern, symbolized destination, suggestions) and, with
-    PROBE_FALLBACK_HW (uhh_trace's inline default), move to the hardware backend."""
+    PROBE_FALLBACK_HW (uhh_trace --fallback-hw), move to the hardware backend."""
     t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
     if not t or not a:
         return skip("prehook-attach", "uhh_trace/probe_app missing")
@@ -1090,7 +1131,7 @@ def check_prehook_attach():
         target = subprocess.Popen([str(a), "--prehook", "--helpers", "1"], stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         line = target.stdout.readline().decode(errors="replace")       # {"kind":"waiting",...}: hook is in
-        tracer = subprocess.Popen([str(t), "--backend", "inline", "--attach", str(target.pid),
+        tracer = subprocess.Popen([str(t), "--backend", "inline", "--fallback-hw", "--attach", str(target.pid),
                                    "-p", "probe_app.exe!ReadThunk:xxxx"],
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         time.sleep(3.0)                                                  # attach + vet
@@ -1142,8 +1183,9 @@ def check_realworld():
                 msgs = [x.get("message", "") for x in o if x.get("kind") == "probe_log"]
                 hit = next((m for m in msgs if re.search(pattern, m)), None)
                 rep = report(o)
-                ok = hit is not None and rep.get("error") is None
-                record(label, ok, f"logs={len(msgs)} match={hit[:70] if hit else None} err={rep.get('error')}")
+                got = sorted({x.get("backend") for x in probes(o)})
+                ok = hit is not None and rep.get("error") is None and got == [bk]   # exactly the backend asked for
+                record(label, ok, f"logs={len(msgs)} backends={got} match={hit[:70] if hit else None} err={rep.get('error')}")
             except Exception as e:
                 record(label, False, repr(e))
 
@@ -1188,6 +1230,7 @@ def main():
     if want(check_ntdll_churn): check_ntdll_churn()
     if want(check_patch_race): check_patch_race()
     if want(check_emulated_sites): check_emulated_sites()
+    if want(check_ret_probe): check_ret_probe()
     if want(check_crash_logs): check_crash_logs()
     if want(check_attach_new): check_attach_new()
     if want(check_refusals): check_refusals()

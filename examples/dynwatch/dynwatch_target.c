@@ -57,8 +57,8 @@ int main(int argc, char **argv) {
     }
     HANDLE t = CreateThread(NULL, 0, worker, NULL, 0, NULL);
     if (!t) return 5;
-    WaitForSingleObject(t, INFINITE); CloseHandle(t);
-    Sleep(300);
+    WaitForSingleObject(t, INFINITE); CloseHandle(t);   // the worker's callback added the marker probe;
+                                                       // it was held until the hook landed
     for (long i = 0; i < 50; ++i) dynwatch_marker(i);
     printf("{\"kind\":\"target\",\"marker_calls\":%ld,\"writes_per_thread\":%ld,\"threads\":2,\"expected_watch_hits\":%ld}\n",
            g_marker_calls, g_writes, 2 * g_writes);
