@@ -24,8 +24,8 @@ struct DiskImage {
         if (bytes.size() < sizeof(IMAGE_DOS_HEADER)) return false;
         auto *dos = (const IMAGE_DOS_HEADER *)bytes.data();
         if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
-        if ((size_t)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > bytes.size()) return false;
-        auto *nt = (const IMAGE_NT_HEADERS64 *)(bytes.data() + dos->e_lfanew);
+        if ((size_t)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS) > bytes.size()) return false;
+        auto *nt = (const IMAGE_NT_HEADERS *)(bytes.data() + dos->e_lfanew);
         if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
         if (rva < nt->OptionalHeader.SizeOfHeaders) { offset = rva; return true; }
         auto *sec = IMAGE_FIRST_SECTION(nt);

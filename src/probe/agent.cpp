@@ -34,11 +34,13 @@ static uint64_t *register_slot(probe_context *c, enum probe_register reg) {
     case PROBE_REG_CX: return &c->regs.rcx; case PROBE_REG_DX: return &c->regs.rdx;
     case PROBE_REG_SI: return &c->regs.rsi; case PROBE_REG_DI: return &c->regs.rdi;
     case PROBE_REG_BP: return &c->regs.rbp; case PROBE_REG_SP: return &c->regs.rsp;
+#if defined(_WIN64)
     case PROBE_REG_R8: return &c->regs.r8; case PROBE_REG_R9: return &c->regs.r9;
     case PROBE_REG_R10: return &c->regs.r10; case PROBE_REG_R11: return &c->regs.r11;
     case PROBE_REG_R12: return &c->regs.r12; case PROBE_REG_R13: return &c->regs.r13;
     case PROBE_REG_R14: return &c->regs.r14; case PROBE_REG_R15: return &c->regs.r15;
-    default: return nullptr;
+#endif
+    default: return nullptr;  /* x86: R8..R15 are unsupported -> null slot */
     }
 }
 
@@ -60,6 +62,8 @@ extern "C" int probe_write(probe_context *c, uint64_t address, const void *buffe
 }
 extern "C" uint64_t probe_arg(probe_context *c, size_t index) {
     if (!c) return 0;
+#if defined(_WIN64)
+    /* x64 __fastcall: first four args in registers, rest above the shadow space. */
     switch (index) {
     case 0: return c->regs.rcx; case 1: return c->regs.rdx;
     case 2: return c->regs.r8; case 3: return c->regs.r9;
@@ -69,6 +73,12 @@ extern "C" uint64_t probe_arg(probe_context *c, size_t index) {
         return probe_read(c, address, &value, sizeof(value)) ? value : 0;
     }
     }
+#else
+    /* x86 __stdcall: every arg on the stack at [esp+4+4*i], read exactly 4 bytes. */
+    if (c->regs.rsp > UINT64_MAX - 4 || index > (UINT64_MAX - c->regs.rsp - 4) / 4) return 0;
+    uint32_t value{}; uint64_t address = c->regs.rsp + 4 + 4 * index;
+    return probe_read(c, address, &value, sizeof(value)) ? value : 0;
+#endif
 }
 extern "C" uint64_t probe_retval(probe_context *c) { return c ? c->regs.rax : 0; }
 
@@ -93,17 +103,33 @@ extern "C" void probe_log(probe_context *c, const char *format, ...) {
 
 static void call_mid(safetyhook::Context &native, uint32_t index) {
     probe_context c{};
+    /* SafetyHook's Context is Context64 on x64 and Context32 on x86; fill the same
+       gospel probe_regs from whichever register image this build captured. */
+#if defined(_WIN64)
 #define COPY(a,b) c.regs.a = native.a;
     PROBE_GPRS(COPY)
 #undef COPY
-    c.regs.rsp = native.rsp; c.regs.flags = native.rflags; c.regs.pc = sites[index];
+    c.regs.rsp = native.rsp; c.regs.flags = native.rflags;
+#else
+    c.regs.rax = native.eax; c.regs.rbx = native.ebx; c.regs.rcx = native.ecx;
+    c.regs.rdx = native.edx; c.regs.rsi = native.esi; c.regs.rdi = native.edi;
+    c.regs.rbp = native.ebp; c.regs.rsp = native.esp; c.regs.flags = native.eflags;
+#endif
+    c.regs.pc = sites[index];
     c.config = shared->requests[index].config_len ? shared->requests[index].config : nullptr;
     c.ops = &local_ops; c.tid = GetCurrentThreadId(); c.site = index; c.controller = &states[index];
     callbacks[index](&c);
     InterlockedIncrement64(&shared->requests[index].hits);
+#if defined(_WIN64)
 #define COPY(a,b) native.a = c.regs.a;
     PROBE_GPRS(COPY)
 #undef COPY
+#else
+    native.eax = (uint32_t)c.regs.rax; native.ebx = (uint32_t)c.regs.rbx;
+    native.ecx = (uint32_t)c.regs.rcx; native.edx = (uint32_t)c.regs.rdx;
+    native.esi = (uint32_t)c.regs.rsi; native.edi = (uint32_t)c.regs.rdi;
+    native.ebp = (uint32_t)c.regs.rbp;
+#endif
 }
 
 #define MID_THUNK(n) static void mid_##n(safetyhook::Context &c) { call_mid(c, n); }

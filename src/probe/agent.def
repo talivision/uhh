@@ -1,0 +1,8 @@
+; Export the agent control entries under their UNDECORATED names so the controller
+; resolves them by a fixed string on both arches. They are __stdcall (WINAPI) remote
+; thread routines, so on x86 the real symbols are _probe_agent_init@4 etc.; MSVC maps
+; these bare .def names onto the decorated symbols. The callbacks keep their own
+; __declspec exports (resolved by table lookup, so their decoration is self-consistent).
+EXPORTS
+    probe_agent_init
+    probe_agent_stop

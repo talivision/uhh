@@ -91,8 +91,8 @@ static bool callback_export_name(probe_callback callback, std::string &name) {
     auto base = reinterpret_cast<const unsigned char *>(module);
     auto dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
-    auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64 *>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+    auto nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR_MAGIC)
         return false;
     auto dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
     if (!dir.VirtualAddress || !dir.Size) return false;
@@ -373,11 +373,21 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         CloseHandle(thread); set_error(s, "probe callback threw an unknown exception"); return false;
     }
     ++probe->hits;
-    to_context(context, native); native.Rsp = context.regs.rsp;
+    to_context(context, native);
+#if defined(_WIN64)
+    native.Rsp = context.regs.rsp;
+#else
+    native.Esp = (DWORD)context.regs.rsp;
+#endif
     if (!patch(s->pi.hProcess, probe->address, probe->original)) {
         CloseHandle(thread); set_error(s, win_error("restore probed instruction")); return false;
     }
-    native.Rip = probe->address; native.EFlags |= 0x100u;
+#if defined(_WIN64)
+    native.Rip = probe->address;
+#else
+    native.Eip = (DWORD)probe->address;
+#endif
+    native.EFlags |= 0x100u;
     if (!SetThreadContext(thread, &native)) {
         CloseHandle(thread); set_error(s, win_error("apply callback context")); return false;
     }
@@ -623,11 +633,13 @@ static uint64_t *register_slot(probe_context *c, enum probe_register reg) {
     case PROBE_REG_CX: return &c->regs.rcx; case PROBE_REG_DX: return &c->regs.rdx;
     case PROBE_REG_SI: return &c->regs.rsi; case PROBE_REG_DI: return &c->regs.rdi;
     case PROBE_REG_BP: return &c->regs.rbp; case PROBE_REG_SP: return &c->regs.rsp;
+#if defined(_WIN64)
     case PROBE_REG_R8: return &c->regs.r8; case PROBE_REG_R9: return &c->regs.r9;
     case PROBE_REG_R10: return &c->regs.r10; case PROBE_REG_R11: return &c->regs.r11;
     case PROBE_REG_R12: return &c->regs.r12; case PROBE_REG_R13: return &c->regs.r13;
     case PROBE_REG_R14: return &c->regs.r14; case PROBE_REG_R15: return &c->regs.r15;
-    default: return nullptr;
+#endif
+    default: return nullptr;  /* x86: R8..R15 are unsupported -> null slot */
     }
 }
 
@@ -660,6 +672,8 @@ extern "C" int probe_write(probe_context *c, uint64_t address, const void *buffe
 
 extern "C" uint64_t probe_arg(probe_context *c, size_t index) {
     if (!c) return 0;
+#if defined(_WIN64)
+    /* x64 __fastcall: first four args in registers, rest above the shadow space. */
     switch (index) {
     case 0: return c->regs.rcx; case 1: return c->regs.rdx;
     case 2: return c->regs.r8; case 3: return c->regs.r9;
@@ -669,6 +683,12 @@ extern "C" uint64_t probe_arg(probe_context *c, size_t index) {
         return probe_read(c, address, &value, sizeof(value)) ? value : 0;
     }
     }
+#else
+    /* x86 __stdcall: every arg on the stack at [esp+4+4*i], read exactly 4 bytes. */
+    if (c->regs.rsp > UINT64_MAX - 4 || index > (UINT64_MAX - c->regs.rsp - 4) / 4) return 0;
+    uint32_t value = 0; uint64_t address = c->regs.rsp + 4 + 4 * index;
+    return probe_read(c, address, &value, sizeof(value)) ? value : 0;
+#endif
 }
 
 extern "C" uint64_t probe_retval(probe_context *c) { return c ? c->regs.rax : 0; }

@@ -25,19 +25,34 @@ inline int remote_write(void *h, uint64_t a, const void *b, size_t n, size_t *do
     *done = bytes; return !!ok;
 }
 inline const probe_ops remote_ops = {remote_read, remote_write};
+/* Same CONTEXT struct both arches; the register image differs only by field
+   name/width, so from/to_context fork on the build target. Logical register
+   names stay the gospel probe_regs on both arches; on x86 r8..r15 stay zero. */
 #define PROBE_GPRS(X) X(rax,Rax) X(rbx,Rbx) X(rcx,Rcx) X(rdx,Rdx) X(rsi,Rsi) X(rdi,Rdi) X(rbp,Rbp) X(r8,R8) X(r9,R9) X(r10,R10) X(r11,R11) X(r12,R12) X(r13,R13) X(r14,R14) X(r15,R15)
 inline probe_context from_context(CONTEXT &w, uint32_t site, uint64_t pc, const probe_ops *ops, void *backend) {
     probe_context c{};
+#if defined(_WIN64)
 #define COPY(a,b) c.regs.a = w.b;
     PROBE_GPRS(COPY)
 #undef COPY
-    c.regs.rsp = w.Rsp; c.regs.flags = w.EFlags; c.regs.pc = pc;
+    c.regs.rsp = w.Rsp;
+#else
+    c.regs.rax = w.Eax; c.regs.rbx = w.Ebx; c.regs.rcx = w.Ecx; c.regs.rdx = w.Edx;
+    c.regs.rsi = w.Esi; c.regs.rdi = w.Edi; c.regs.rbp = w.Ebp; c.regs.rsp = w.Esp;
+#endif
+    c.regs.flags = w.EFlags; c.regs.pc = pc;
     c.site = site; c.ops = ops; c.backend = backend; return c;
 }
 inline void to_context(const probe_context &c, CONTEXT &w) {
+#if defined(_WIN64)
 #define COPY(a,b) w.b = c.regs.a;
     PROBE_GPRS(COPY)
 #undef COPY
+#else
+    w.Eax = (DWORD)c.regs.rax; w.Ebx = (DWORD)c.regs.rbx; w.Ecx = (DWORD)c.regs.rcx;
+    w.Edx = (DWORD)c.regs.rdx; w.Esi = (DWORD)c.regs.rsi; w.Edi = (DWORD)c.regs.rdi;
+    w.Ebp = (DWORD)c.regs.rbp;
+#endif
     /* PC/SP and flags are read-only in this first common contract. */
 }
 #ifndef PROBE_PUBLIC_API
