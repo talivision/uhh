@@ -11,6 +11,7 @@
 #include <string.h>
 
 static volatile intptr_t g_sink;
+__declspec(dllexport) __declspec(noinline) intptr_t hit_site(intptr_t i);
 static long long g_calls = 10000000; static int g_avx = 0;
 static volatile LONG g_go;
 
