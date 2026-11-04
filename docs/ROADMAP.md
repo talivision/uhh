@@ -14,7 +14,7 @@ identical source under every backend.
 - ✅ Runtime control from any callback via `get_session(c)`; inline callbacks forward over synchronous IPC
 - ✅ Runtime inline hooks (installed on a fresh agent thread, never inside the caller)
 - ✅ `module!Export[+0xOFF]` resolution from the target image
-- ✅ `send_log_stack`: raw frames at the hit, symbolized at report (dbghelp)
+- ✅ `send_log_stack`: raw frames at the hit, symbolized on the controller writer thread (dbghelp)
 - ✅ Synchronous inline install: hold at entry point / at LOAD_DLL until hooks confirm (agent service thread). Handle double-close bug found and fixed; re-verifying
 - ✅ Zero-drop inline logs: lock-free ring + controller drainer thread + backpressure. Must pass the 2M-event inline volume tier with `log_dropped == 0`
 - ✅ Pre-hooked site report (live vs disk bytes, disassembly, pattern, destination, suggestions); `PROBE_ALLOW_PREHOOKED` / `PROBE_FALLBACK_HW`
@@ -22,7 +22,9 @@ identical source under every backend.
 - ✅ `probe_attach` (clean detach: hooks removed, INT3s restored, DRs cleared, no thread mid-step), `probe_attach_new`
 - 🔧 Inline register overrides counted in the report (`overrides`) like controller-side ones
 - ✅ x86 `send_log_stack` at a function's first instruction includes the caller frame (agent and controller)
-- ⬜ **NEXT after UHH_SHARED (user priority, 2026-11-05):** stream logs out as they arrive (today every log is held in memory until probe_report) -- flat memory at millions of events, same API
+- ✅ Stream logs to controller stdout as they arrive: one bounded queue and writer thread,
+  lossless backpressure, complete-line writes, <=10 ms/idle flush, report-time drain, and
+  `logs_written`/controller peak-working-set metrics. Covered at 20M inline and 200k hw/breakpoint.
 - ⬜ Performance pass on every hot path (per-hit cost per backend and per method; see Benchmarks)
 
 ## Examples and targets (subagent, own worktree)
@@ -51,7 +53,7 @@ identical source under every backend.
 - ✅ P1 probe_add_symbol_cfg forwarded from inline callbacks (config travels over IPC)
 - ✅ P1 one log length limit for every backend, truncation marked (inline was 256 vs 2048)
 - ✅ P1 log delivery when the target crashes / is killed (logs + log_dropped == hits)
-- ⬜ P1 controller-side log memory: no unhandled bad_alloc; memory measured at 2M/20M
+- ✅ P1 controller-side log memory: bounded queue; peak working set measured and compared at 2M/20M
 - ✅ P1 probe_attach_new exercised (second instance, timeout path)
 - ✅ P1 target checksum asserted equal across every mix cell and vs a flag-only run
 - ⬜ P2 hw PROBE_ONCE and watch RW|ONCE proven distinctly; 5th hw probe refused cleanly (setup and runtime), slot reuse after ONCE

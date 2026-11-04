@@ -54,10 +54,15 @@ void on_malloc(probe_context *c) {                      /* malloc entry         
 probe_add_symbol(s, "ucrtbase.dll!malloc", on_malloc, PROBE_BREAKPOINT);
 ```
 
-`send_log_stack` captures only raw return addresses at the hit; they are symbolized
-(`module!function+0xoff`, plus `file:line` with PDBs) when the log is reported, so the
-stack costs almost nothing inside the breakpoint and prints as part of the same log
-record. See [`examples/dynwatch`](examples/dynwatch).
+`send_log` and `send_log_stack` stream `probe_log` JSON lines to the controller's
+stdout while the target is running. Both the debugger callbacks and the inline agent
+feed one bounded controller queue; if stdout is slow, producers wait instead of dropping
+logs or growing memory. The writer batches complete lines for throughput and flushes on
+idle or within about 10 ms. `send_log_stack` captures only raw return addresses at the
+hit; the writer resolves them to `module!function+0xoff` (plus `file:line` with PDBs), so
+symbol work never runs in the hit path. `probe_report` flushes pending logs, then emits
+only pre-hook/probe/summary records; its summary includes `logs_written`, `log_dropped`,
+and `controller_peak_ws_mb`. See [`examples/dynwatch`](examples/dynwatch).
 
 ## Backends
 
@@ -128,6 +133,5 @@ Software breakpoints are multithread-safe via displaced stepping and proven exac
 exact under multithreading too. The backend mix matrix passes for breakpoint-flag
 combinations.
 
-Roadmap (see [`docs/plan-v2.md`](docs/plan-v2.md)): per-thread `PROBE_LOG` queues,
-`module!symbol` resolution, attach-by-name (`watch_new`), inline-over-existing-hook
-chaining, a general `read_logger` CLI, and Frida benchmarks.
+Roadmap (see [`docs/ROADMAP.md`](docs/ROADMAP.md)): further hot-path measurement,
+inline-over-existing-hook chaining, and the remaining adversarial correctness cases.

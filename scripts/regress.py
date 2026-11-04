@@ -23,6 +23,8 @@ Checks:
     predicted number of reads is logged, every read is still counted, nothing dropped.
   - log-throughput-<backend>: per-log overhead (logging run vs --no-log run) under a
     ceiling, so logging getting slow fails like any other regression.
+  - stream-volume/latency/order: logs are emitted promptly, losslessly and in per-thread
+    order through a bounded-memory controller queue, including a 20M inline-log run.
   - breakage: the hostile fixtures produce their expected verdicts.
   - frida-parity: the four Interceptor-parity demos all pass.
   - watchpoint: a hardware write-watchpoint fires once per store.
@@ -34,9 +36,12 @@ Missing binaries (an example not built) are reported as SKIP, not FAIL.
 """
 import argparse
 import json
+import math
+import re
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 BIN = None
@@ -55,6 +60,38 @@ def run(args, timeout=180, feed=None):
             except json.JSONDecodeError:
                 pass
     return r, objs
+
+
+def stream_run(args, timeout, on_line):
+    """Drain stdout incrementally so volume checks never retain probe_log records."""
+    proc = subprocess.Popen([str(a) for a in args], stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True, bufsize=1)
+    timed_out = threading.Event()
+
+    def expire():
+        timed_out.set()
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+    timer = threading.Timer(timeout, expire)
+    timer.daemon = True
+    timer.start()
+    try:
+        for line in proc.stdout:
+            on_line(line.rstrip("\r\n"), time.perf_counter())
+        proc.wait()
+    finally:
+        timer.cancel()
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            proc.wait()
+    return proc.returncode, timed_out.is_set()
 
 
 def rvas(map_name, *syms):
@@ -371,6 +408,132 @@ def check_volume(volume_reads):
             record(name, False, repr(e))
 
 
+def stream_volume_once(backend, calls, timeout):
+    driver, target = exe("hitcost_driver.exe"), exe("hitcost_target.exe")
+    state = {"logs": 0, "objects": []}
+
+    def consume(line, _arrival):
+        if line.startswith('{"kind":"probe_log",'):
+            state["logs"] += 1
+        elif line.startswith("{"):
+            try:
+                state["objects"].append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+
+    rc, timed_out = stream_run(
+        [driver, "--backend", backend, "--method", "send_log", "--",
+         target, "--calls", calls, "--threads", 1], timeout, consume)
+    rep = report(state["objects"])
+    pr = next(iter(probes(state["objects"])), {})
+    return {
+        "rc": rc, "timeout": timed_out, "logs": state["logs"], "report": rep,
+        "hits": pr.get("hits"), "peak": rep.get("controller_peak_ws_mb"),
+    }
+
+
+def check_stream_volume():
+    """The controller's peak must be independent of total streamed-log volume."""
+    if not exe("hitcost_driver.exe") or not exe("hitcost_target.exe"):
+        return skip("stream-volume", "hitcost driver/target missing")
+    for backend in ("inline", "hw", "breakpoint"):
+        name = f"stream-volume-{backend}"
+        try:
+            sizes = (2_000_000, 20_000_000) if backend == "inline" else (200_000,)
+            runs = [stream_volume_once(backend, n, 1800) for n in sizes]
+            exact = all(not x["timeout"] and x["rc"] == 0 and x["logs"] == n and
+                        x["hits"] == n and x["report"].get("logs_written") == n and
+                        x["report"].get("log_dropped") == 0
+                        for x, n in zip(runs, sizes))
+            peaks = [x["peak"] for x in runs]
+            small = all(isinstance(p, (int, float)) and 0 < p <= 256 for p in peaks)
+            flat = (backend != "inline" or
+                    (peaks[0] is not None and peaks[1] is not None and peaks[1] <= peaks[0] * 1.20))
+            record(name, exact and small and flat,
+                   " ".join(f"N={n:,} logs={x['logs']:,} hits={x['hits']} written={x['report'].get('logs_written')} "
+                            f"drop={x['report'].get('log_dropped')} peak={x['peak']}MB rc={x['rc']}"
+                            for x, n in zip(runs, sizes)) + f" flat={flat}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+def trace_logstream(backend, target_args, timeout, consume):
+    tracer, target = exe("uhh_trace.exe"), exe("logstream_target.exe")
+    return stream_run([tracer, "--backend", backend, "-p",
+                       "logstream_target.exe!LogSite:d", "--", target, *target_args],
+                      timeout, consume)
+
+
+def check_stream_latency():
+    tracer, target = exe("uhh_trace.exe"), exe("logstream_target.exe")
+    if not tracer or not target:
+        return skip("stream-latency", "uhh_trace/logstream_target missing")
+    for backend in ("inline", "hw", "breakpoint"):
+        name = f"stream-latency-{backend}"
+        ticks, logs, objects = {}, {}, []
+        try:
+            def consume(line, arrival):
+                if not line.startswith("{"):
+                    return
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    return
+                if obj.get("kind") == "tick":
+                    ticks.setdefault(obj.get("i"), arrival)
+                elif obj.get("kind") == "probe_log":
+                    match = re.fullmatch(r"LogSite\((-?\d+)\)", str(obj.get("message", "")))
+                    if match:
+                        logs.setdefault(int(match.group(1)), arrival)
+                else:
+                    objects.append(obj)
+
+            rc, timed_out = trace_logstream(backend, [], 120, consume)
+            latencies = [logs[i] - ticks[i] for i in range(50) if i in ticks and i in logs]
+            ordered = all(logs.get(i, 0) >= ticks.get(i, float("inf")) for i in range(50))
+            p99 = sorted(latencies)[max(0, math.ceil(.99 * len(latencies)) - 1)] if latencies else float("inf")
+            rep = report(objects)
+            ok = (not timed_out and rc == 0 and len(ticks) == len(logs) == len(latencies) == 50 and
+                  ordered and p99 < .100 and rep.get("logs_written") == 50 and rep.get("log_dropped") == 0)
+            record(name, ok, f"pairs={len(latencies)}/50 p99={p99 * 1000:.1f}ms "
+                             f"written={rep.get('logs_written')} dropped={rep.get('log_dropped')} rc={rc}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+def check_stream_order():
+    tracer, target = exe("uhh_trace.exe"), exe("logstream_target.exe")
+    if not tracer or not target:
+        return skip("stream-order", "uhh_trace/logstream_target missing")
+    count = 1000
+    by_tid, objects = {}, []
+    try:
+        def consume(line, _arrival):
+            if not line.startswith("{"):
+                return
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                return
+            if obj.get("kind") == "probe_log":
+                match = re.fullmatch(r"LogSite\((-?\d+)\)", str(obj.get("message", "")))
+                if match:
+                    by_tid.setdefault(obj.get("tid"), []).append(int(match.group(1)))
+            else:
+                objects.append(obj)
+
+        rc, timed_out = trace_logstream("inline", ["--threads", 8, "--count", count,
+                                                     "--delay", 0, "--no-ticks"], 120, consume)
+        complete = len(by_tid) == 8 and all(seq == list(range(count)) for seq in by_tid.values())
+        rep = report(objects)
+        ok = (not timed_out and rc == 0 and complete and rep.get("logs_written") == 8 * count and
+              rep.get("log_dropped") == 0)
+        record("stream-order", ok, f"threads={len(by_tid)}/8 logs={sum(map(len, by_tid.values()))}/{8 * count} "
+                                   f"written={rep.get('logs_written')} dropped={rep.get('log_dropped')} rc={rc}")
+    except Exception as e:
+        record("stream-order", False, repr(e))
+
+
 def check_breakage():
     d = exe("breakage_driver.exe")
     if not d or not exe("hook_edge.exe"):
@@ -407,9 +570,13 @@ def check_frida_parity():
     try:
         r = rvas("parity_target.map", "ParityB1Site", "ParityB2Site", "ParityB4Site", "ParityB6Site")
         _, o = run([d, exe("parity_target.exe"), r["ParityB1Site"], r["ParityB2Site"], r["ParityB4Site"], r["ParityB6Site"]], timeout=90)
-        passed = [row for row in o if row.get("verdict") == "pass"]
-        ok = len(passed) == 4
-        record("frida-parity", ok, f"{len(passed)}/4 pass")
+        # This legacy driver asks probe_report for a private FILE and used to parse logs
+        # back out of it. Logs now deliberately stream only to controller stdout, so
+        # validate the four observable callback results directly from that stream.
+        got = [row.get("message") for row in o if row.get("kind") == "probe_log"]
+        expected = ["B1:4660", "B2:hello-from-target", "B4:instrumented", "B6:7->42"]
+        ok = sorted(got) == sorted(expected)
+        record("frida-parity", ok, f"streamed={sorted(got)}")
     except Exception as e:
         record("frida-parity", False, repr(e))
 
@@ -1237,6 +1404,9 @@ def main():
     if want(check_mix_matrix): check_mix_matrix(args.threads, args.reads)
     if want(check_multithread_exact): check_multithread_exact(args.threads, args.reads)
     if want(check_log_throughput): check_log_throughput(args.threads, args.reads)
+    if want(check_stream_volume): check_stream_volume()
+    if want(check_stream_latency): check_stream_latency()
+    if want(check_stream_order): check_stream_order()
     if want(check_attach): check_attach(args.threads, args.reads)
     if int(args.volume_reads) > 0:
         if want(check_volume): check_volume(args.volume_reads)

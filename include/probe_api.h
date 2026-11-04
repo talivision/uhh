@@ -118,7 +118,10 @@ int probe_attach(probe_session *, uint32_t pid);
    milliseconds before the attach lands: instrument what it does after start-up. */
 int probe_attach_new(probe_session *, const char *image_name, uint32_t timeout_ms);
 int probe_run(probe_session *);
+/* Waits until all probe_log records have been streamed and flushed to controller stdout. */
 int probe_wait_for_exit(probe_session *);
+/* Flushes controller stdout first, then writes only prehook/probe/probe_report records
+   to out. Streamed logs are never replayed, including on repeated calls. */
 void probe_report(probe_session *, FILE *);
 void probe_close(probe_session *);
 
@@ -131,7 +134,8 @@ int set_mem(probe_context *, uint64_t address, const void *buffer, size_t size);
 void send_log(probe_context *, const char *format, ...);
 /* Same as send_log, plus a snapshot of the call stack at the hit, emitted as ONE log
    record. Only raw return addresses are captured at the hit; module!symbol+off (and
-   file:line when PDBs are present) is resolved later, when the log is reported. */
+   file:line when PDBs are present) is resolved later on the controller's log-writer
+   thread. Both logging calls stream complete JSON lines to controller stdout. */
 void send_log_stack(probe_context *, const char *format, ...);
 const void *get_config(probe_context *);
 /* Call a function IN THE TARGET from a callback, on the thread that hit the probe:

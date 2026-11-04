@@ -20,8 +20,13 @@
 #pragma comment(lib, "winmm.lib")
 #include <unordered_set>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <thread>
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
 
 struct Probe {
     std::string location, module, callback_export;
@@ -70,7 +75,7 @@ struct StepState {
 };
 
 // One log line, optionally with a raw stack snapshot (return addresses only). Frames
-// are symbolized at report time -- never inside the breakpoint.
+// are symbolized by the stdout writer -- never inside the breakpoint.
 struct LogRecord {
     std::string text;
     uint32_t tid = 0, probe = 0;
@@ -80,12 +85,24 @@ struct LogRecord {
 
 struct probe_session {
     std::vector<std::unique_ptr<Probe>> probes;
-    std::vector<LogRecord> logs;
-    std::mutex log_mu;                         // logs + agent_map: debug-loop thread + drainer thread
-    uint32_t agent_map[PROBE_AGENT_MAX_PROBES] = {};   // agent request index -> probes[] index (under log_mu)
+    std::mutex agent_mu;
+    std::mutex drain_mu;                       // shared ring has exactly one consumer at a time
+    uint32_t agent_map[PROBE_AGENT_MAX_PROBES] = {};   // agent request index -> probes[] index (under agent_mu)
     std::thread drainer;                       // empties the agent's log ring continuously
-    uint64_t controller_dropped = 0;           // controller-side logs lost to allocation failure
+    std::atomic<uint64_t> controller_dropped{0}; // only broken stdout/allocation can lose controller logs
     std::atomic<bool> drain_stop{false};
+    // Both producer paths wait on this bounded queue. The writer never holds queue_mu
+    // while symbolizing or writing, so a full stdout pipe cannot invert locks with the
+    // debugger or the agent-ring drainer.
+    static constexpr size_t LOG_QUEUE_CAP = 2048;
+    std::deque<LogRecord> log_queue;
+    std::mutex queue_mu;
+    std::condition_variable queue_readable, queue_writable, queue_flushed;
+    std::thread log_writer;
+    HANDLE stdout_handle = INVALID_HANDLE_VALUE;
+    bool writer_stop = false, writer_busy = false, writer_failed = false;
+    std::string writer_error;
+    std::atomic<uint64_t> logs_written{0};
     bool sym_ready = false;    // dbghelp initialised on the target (stack walk + symbolize)
     std::unordered_map<std::string, uint64_t> module_bases;
     std::unordered_map<std::string, std::string> module_paths;   // name -> on-disk image (prehook diff)
@@ -153,6 +170,11 @@ static Probe *probe_at(probe_session *s, uint64_t address);
 static bool trace_enabled() { static const bool on = std::getenv("PROBE_TRACE") != nullptr; return on; }
 static void start_drainer(probe_session *s);
 static void stop_drainer(probe_session *s);
+static std::string symbolize(probe_session *s, uint64_t addr);
+static bool start_log_writer(probe_session *s);
+static bool enqueue_log(probe_session *s, LogRecord &&record);
+static void flush_log_writer(probe_session *s);
+static void stop_log_writer(probe_session *s);
 static void release_hw(probe_session *s, Probe &p);
 static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposition);
 static void release_held(probe_session *s, const char *why);
@@ -164,6 +186,173 @@ static void set_error(probe_session *s, const std::string &message) {
 
 static std::string win_error(const char *what) {
     return std::string(what) + " (Win32=" + std::to_string(GetLastError()) + ")";
+}
+
+static void append_json_string(std::string &out, const std::string &value) {
+    out.push_back('"');
+    for (unsigned char ch : value) {
+        if (ch == '"' || ch == '\\') { out.push_back('\\'); out.push_back((char)ch); }
+        else if (ch == '\n') out += "\\n";
+        else if (ch >= 0x20) out.push_back((char)ch);
+    }
+    out.push_back('"');
+}
+
+static std::string format_log_line(probe_session *s, const LogRecord &r) {
+    char prefix[96];
+    int n = std::snprintf(prefix, sizeof(prefix),
+                          "{\"kind\":\"probe_log\",\"probe\":%u,\"tid\":%u,\"message\":",
+                          r.probe, r.tid);
+    std::string line(prefix, n > 0 ? (size_t)n : 0);
+    append_json_string(line, r.text);
+    if (r.has_stack) {
+        line += ",\"stack\":[";
+        for (size_t i = 0; i < r.frames.size(); ++i) {
+            if (i) line.push_back(',');
+            append_json_string(line, symbolize(s, r.frames[i]));
+        }
+        line.push_back(']');
+    }
+    line += "}\n";
+    return line;
+}
+
+static void writer_failed(probe_session *s, const std::string &message, uint64_t unwritten) {
+    std::lock_guard<std::mutex> lock(s->queue_mu);
+    if (!s->writer_failed) {
+        s->writer_failed = true;
+        s->writer_error = message;
+        unwritten += (uint64_t)s->log_queue.size();
+        s->log_queue.clear();
+        s->controller_dropped.fetch_add(unwritten, std::memory_order_relaxed);
+        std::fprintf(stderr, "probe: error: %s\n", message.c_str());
+    }
+    s->writer_busy = false;
+    s->queue_writable.notify_all();
+    s->queue_flushed.notify_all();
+}
+
+static bool write_log_batch(probe_session *s, const std::string &bytes, uint64_t records) {
+    if (bytes.empty()) return true;
+    DWORD wrote = 0;
+    if (s->stdout_handle == nullptr || s->stdout_handle == INVALID_HANDLE_VALUE ||
+        bytes.size() > MAXDWORD ||
+        !WriteFile(s->stdout_handle, bytes.data(), (DWORD)bytes.size(), &wrote, nullptr) ||
+        (size_t)wrote != bytes.size()) {
+        writer_failed(s, win_error("write probe logs to stdout"), records);
+        return false;
+    }
+    s->logs_written.fetch_add(records, std::memory_order_relaxed);
+    return true;
+}
+
+static void log_writer_main(probe_session *s) {
+    constexpr size_t BATCH_BYTES = 64 * 1024;
+    uint64_t unwritten = 0;
+    try {
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lock(s->queue_mu);
+                s->queue_readable.wait(lock, [s] { return s->writer_stop || !s->log_queue.empty(); });
+                if (s->log_queue.empty() && s->writer_stop) break;
+                s->writer_busy = true;
+            }
+
+            std::string batch;
+            uint64_t batch_records = 0;
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
+            for (;;) {
+                LogRecord record;
+                {
+                    std::lock_guard<std::mutex> lock(s->queue_mu);
+                    if (s->log_queue.empty()) break;
+                    record = std::move(s->log_queue.front());
+                    s->log_queue.pop_front();
+                    s->queue_writable.notify_one();
+                }
+                ++unwritten;
+                std::string line = format_log_line(s, record);
+                if (!batch.empty() && batch.size() + line.size() > BATCH_BYTES) {
+                    if (!write_log_batch(s, batch, batch_records)) return;
+                    unwritten -= batch_records;
+                    batch.clear(); batch_records = 0;
+                    deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
+                }
+                batch += line; ++batch_records;
+                if (batch.size() >= BATCH_BYTES || std::chrono::steady_clock::now() >= deadline) {
+                    if (!write_log_batch(s, batch, batch_records)) return;
+                    unwritten -= batch_records;
+                    batch.clear(); batch_records = 0;
+                    deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
+                }
+            }
+            // An empty queue is an idle boundary: do not hold a short batch for the timer.
+            if (!write_log_batch(s, batch, batch_records)) return;
+            unwritten -= batch_records;
+            {
+                std::lock_guard<std::mutex> lock(s->queue_mu);
+                s->writer_busy = false;
+                s->queue_flushed.notify_all();
+            }
+        }
+    } catch (const std::exception &e) {
+        writer_failed(s, std::string("probe log writer failed: ") + e.what(), unwritten);
+        return;
+    } catch (...) {
+        writer_failed(s, "probe log writer failed", unwritten);
+        return;
+    }
+    std::lock_guard<std::mutex> lock(s->queue_mu);
+    s->writer_busy = false;
+    s->queue_flushed.notify_all();
+}
+
+static bool start_log_writer(probe_session *s) {
+    s->stdout_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+    try { s->log_writer = std::thread(log_writer_main, s); return true; }
+    catch (...) { std::fprintf(stderr, "probe: error: log writer thread creation failed\n"); return false; }
+}
+
+static bool enqueue_log(probe_session *s, LogRecord &&record) {
+    std::unique_lock<std::mutex> lock(s->queue_mu);
+    s->queue_writable.wait(lock, [s] {
+        return s->log_queue.size() < probe_session::LOG_QUEUE_CAP || s->writer_failed;
+    });
+    if (s->writer_failed) {
+        s->controller_dropped.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    try { s->log_queue.push_back(std::move(record)); }
+    catch (...) {
+        s->controller_dropped.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    lock.unlock();
+    s->queue_readable.notify_one();
+    return true;
+}
+
+static void flush_log_writer(probe_session *s) {
+    std::string error;
+    {
+        std::unique_lock<std::mutex> lock(s->queue_mu);
+        s->queue_flushed.wait(lock, [s] {
+            return (s->log_queue.empty() && !s->writer_busy) || s->writer_failed;
+        });
+        error = s->writer_error;
+    }
+    if (!error.empty()) set_error(s, error);
+}
+
+static void stop_log_writer(probe_session *s) {
+    if (!s->log_writer.joinable()) return;
+    {
+        std::lock_guard<std::mutex> lock(s->queue_mu);
+        s->writer_stop = true;
+    }
+    s->queue_readable.notify_one();
+    s->log_writer.join();
+    if (!s->writer_error.empty()) set_error(s, s->writer_error);
 }
 
 static std::string basename_of(std::string path) {
@@ -188,8 +377,8 @@ static std::string module_path_from_handle(HANDLE file) {
     return r;
 }
 
-// Register a mapped image with dbghelp (deferred: no symbol I/O until a frame is
-// symbolized at report time). Keeps working after the target exits: it reads files.
+// Register a mapped image with dbghelp (deferred: no symbol I/O until the writer sees
+// a stack frame). Keeps working after the target exits: it reads files.
 static void sym_register(probe_session *s, HANDLE file, uint64_t base) {
     std::string path = module_path_from_handle(file);
     if (path.empty()) return;
@@ -921,8 +1110,6 @@ struct DiskImage {          // just enough of the PE file to map RVAs and find r
     }
 };
 
-static std::string symbolize(probe_session *s, uint64_t addr);
-
 // Returns true when the site is modified relative to disk; fills a JSON report and
 // prints a readable one. Sites in modules we have no file for are not judged.
 static bool detect_prehook(probe_session *s, const Probe &p, std::string &json) {
@@ -1573,7 +1760,11 @@ static void arm_entry_fixup(probe_session *s, uint64_t entry) {
 }
 
 extern "C" probe_session *probe_session_create(void) {
-    try { return new probe_session; }
+    try {
+        std::unique_ptr<probe_session> s(new probe_session);
+        if (!start_log_writer(s.get())) return nullptr;
+        return s.release();
+    }
     catch (...) { std::fprintf(stderr, "probe: error: session allocation failed\n"); return nullptr; }
 }
 
@@ -1760,7 +1951,7 @@ static void fill_request(probe_session *s, const Probe &p) {
 static bool create_agent_channel(probe_session *s) {
     uint32_t count = 0;
     {
-        std::lock_guard<std::mutex> lock(s->log_mu);
+        std::lock_guard<std::mutex> lock(s->agent_mu);
         for (auto &m : s->agent_map) m = UINT32_MAX;
         for (size_t i = 0; i < s->probes.size(); ++i)
             if (s->probes[i]->flags & PROBE_INLINE) {
@@ -1792,7 +1983,7 @@ static bool register_runtime_inline(probe_session *s, Probe &p) {
     if (idx >= PROBE_AGENT_MAX_PROBES) { set_error(s, "too many inline probes"); return false; }
     p.agent_index = idx; p.runtime = true;
     {
-        std::lock_guard<std::mutex> lock(s->log_mu);
+        std::lock_guard<std::mutex> lock(s->agent_mu);
         if (idx == 0) for (auto &m : s->agent_map) m = UINT32_MAX;
         s->agent_map[idx] = probe_index(s, &p);
     }
@@ -2835,23 +3026,26 @@ static size_t drain_agent_logs(probe_session *s) {
     if (!s->shared) return 0;
     auto *sh = s->shared;
     size_t moved = 0;
-    std::lock_guard<std::mutex> lock(s->log_mu);   // also makes this the single consumer
+    std::lock_guard<std::mutex> consume(s->drain_mu);
     for (;;) {
         LONG64 tail = sh->log_tail;
         auto &rec = sh->logs[(uint64_t)tail % PROBE_AGENT_LOG_CAP];
         if (rec.seq != tail + 1) break;
         MemoryBarrier();
-        LogRecord r;
-        rec.text[PROBE_AGENT_LOG_TEXT_CAP - 1] = 0;
-        r.text = rec.text; r.tid = rec.tid; r.has_stack = rec.has_stack != 0;
-        // Never touch s->probes here (the debug loop may be growing it): agent_map is the
-        // lock-protected agent-index -> probe-index translation.
-        r.probe = rec.probe < PROBE_AGENT_MAX_PROBES && s->agent_map[rec.probe] != UINT32_MAX
-                      ? s->agent_map[rec.probe] : rec.probe;
-        uint32_t n = rec.frame_count > PROBE_STACK_MAX_FRAMES ? PROBE_STACK_MAX_FRAMES : rec.frame_count;
         try {
+            LogRecord r;
+            rec.text[PROBE_AGENT_LOG_TEXT_CAP - 1] = 0;
+            r.text = rec.text; r.tid = rec.tid; r.has_stack = rec.has_stack != 0;
+            // Never touch s->probes here (the debug loop may be growing it). Do not retain
+            // agent_mu while a full stdout queue applies backpressure.
+            {
+                std::lock_guard<std::mutex> map_lock(s->agent_mu);
+                r.probe = rec.probe < PROBE_AGENT_MAX_PROBES && s->agent_map[rec.probe] != UINT32_MAX
+                              ? s->agent_map[rec.probe] : rec.probe;
+            }
+            uint32_t n = rec.frame_count > PROBE_STACK_MAX_FRAMES ? PROBE_STACK_MAX_FRAMES : rec.frame_count;
             r.frames.assign(rec.frames, rec.frames + n);
-            s->logs.push_back(std::move(r));
+            enqueue_log(s, std::move(r));
         } catch (...) {
             InterlockedIncrement(&sh->log_dropped);       // out of memory: count it, keep going
         }
@@ -2887,17 +3081,24 @@ static void drain_final(probe_session *s) {
     drain_agent_logs(s);
     if (!s->exited) return;
     auto *sh = s->shared;
-    std::lock_guard<std::mutex> lock(s->log_mu);
+    std::lock_guard<std::mutex> consume(s->drain_mu);
     LONG64 head = sh->log_head;
     for (LONG64 pos = sh->log_tail; pos < head; ++pos) {
         auto &rec = sh->logs[(uint64_t)pos % PROBE_AGENT_LOG_CAP];
         if (rec.seq != pos + 1) { InterlockedIncrement(&sh->log_dropped); continue; }
-        LogRecord r;
-        rec.text[PROBE_AGENT_LOG_TEXT_CAP - 1] = 0;
-        r.text = rec.text; r.tid = rec.tid; r.has_stack = rec.has_stack != 0;
-        r.probe = rec.probe < PROBE_AGENT_MAX_PROBES && s->agent_map[rec.probe] != UINT32_MAX ? s->agent_map[rec.probe] : rec.probe;
-        uint32_t n = rec.frame_count > PROBE_STACK_MAX_FRAMES ? PROBE_STACK_MAX_FRAMES : rec.frame_count;
-        try { r.frames.assign(rec.frames, rec.frames + n); s->logs.push_back(std::move(r)); }
+        try {
+            LogRecord r;
+            rec.text[PROBE_AGENT_LOG_TEXT_CAP - 1] = 0;
+            r.text = rec.text; r.tid = rec.tid; r.has_stack = rec.has_stack != 0;
+            {
+                std::lock_guard<std::mutex> map_lock(s->agent_mu);
+                r.probe = rec.probe < PROBE_AGENT_MAX_PROBES && s->agent_map[rec.probe] != UINT32_MAX
+                              ? s->agent_map[rec.probe] : rec.probe;
+            }
+            uint32_t n = rec.frame_count > PROBE_STACK_MAX_FRAMES ? PROBE_STACK_MAX_FRAMES : rec.frame_count;
+            r.frames.assign(rec.frames, rec.frames + n);
+            enqueue_log(s, std::move(r));
+        }
         catch (...) { InterlockedIncrement(&sh->log_dropped); }
     }
     sh->log_tail = head;
@@ -3072,6 +3273,7 @@ extern "C" int probe_run(probe_session *s) {
     }
     release_held(s, "session end");
     stop_drainer(s);
+    flush_log_writer(s);
     if (!s->exited && s->pi.hProcess && !s->attached) TerminateProcess(s->pi.hProcess, 3);
     if (s->exited && has_inline(s) && !s->gate_sent) set_error(s, "target exited before inline probes were ready");
     int result = (s->exited || s->detached) && s->error.empty();
@@ -3081,6 +3283,8 @@ extern "C" int probe_run(probe_session *s) {
 
 extern "C" int probe_wait_for_exit(probe_session *s) {
     if (!s || !s->ran) { if (s) set_error(s, "session has not been run"); return 0; }
+    if (s->exited) stop_drainer(s);             // includes recovery past a dead producer's ring slot
+    flush_log_writer(s);
     return s->exited && s->error.empty() && s->exit_code == 0;
 }
 
@@ -3094,8 +3298,6 @@ static void json_string(FILE *out, const std::string &value) {
     std::fputc('\"', out);
 }
 
-static std::string symbolize(probe_session *s, uint64_t addr);
-
 extern "C" void probe_report(probe_session *s, FILE *out) {
     if (!s || !out) return;
     if (s->shared) {
@@ -3103,22 +3305,9 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
         for (auto &p : s->probes) if (p->flags & PROBE_INLINE)
             p->hits = probe_agent_hits(s->shared, p->agent_index);
     }
-    drain_agent_logs(s);
+    if (s->exited) stop_drainer(s); else drain_agent_logs(s);
+    flush_log_writer(s);                         // all probe_log lines precede report records
     for (const auto &j : s->prehooks) { std::fputs(j.c_str(), out); std::fputc('\n', out); }
-    std::lock_guard<std::mutex> log_lock(s->log_mu);
-    for (const auto &r : s->logs) {
-        std::fprintf(out, "{\"kind\":\"probe_log\",\"probe\":%u,\"tid\":%u,\"message\":", r.probe, r.tid);
-        json_string(out, r.text);
-        if (r.has_stack) {                       // symbolized here, long after the hit
-            std::fputs(",\"stack\":[", out);
-            for (size_t i = 0; i < r.frames.size(); ++i) {
-                if (i) std::fputc(',', out);
-                json_string(out, symbolize(s, r.frames[i]));
-            }
-            std::fputc(']', out);
-        }
-        std::fputs("}\n", out);
-    }
     for (const auto &p : s->probes) {
         if (p->internal) continue;
         std::fputs("{\"kind\":\"probe\",\"location\":", out); json_string(out, p->location);
@@ -3129,11 +3318,19 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
     uint64_t hits = 0, active = 0;
     size_t visible = 0;
     for (const auto &p : s->probes) if (!p->internal) { hits += p->hits; active += p->active; ++visible; }
+    PROCESS_MEMORY_COUNTERS memory{}; memory.cb = (DWORD)sizeof(memory);
+    uint64_t peak_mb = GetProcessMemoryInfo(GetCurrentProcess(), &memory, (DWORD)sizeof(memory))
+                           ? ((uint64_t)memory.PeakWorkingSetSize + (1024 * 1024 - 1)) / (1024 * 1024) : 0;
+    uint64_t dropped = (uint64_t)(s->shared ? s->shared->log_dropped : 0) +
+                       s->controller_dropped.load(std::memory_order_relaxed);
     std::fprintf(out, "{\"kind\":\"probe_report\",\"probes\":%llu,\"active\":%llu,"
-                 "\"hits\":%llu,\"overrides\":%llu,\"log_dropped\":%ld,\"app_exit\":%lu,\"error\":",
+                 "\"hits\":%llu,\"overrides\":%llu,\"log_dropped\":%llu,"
+                 "\"logs_written\":%llu,\"controller_peak_ws_mb\":%llu,\"app_exit\":%lu,\"error\":",
                  (unsigned long long)visible, (unsigned long long)active,
                  (unsigned long long)hits, (unsigned long long)(s->overrides + (s->shared ? (uint64_t)s->shared->overrides : 0)),
-                 (long)((s->shared ? s->shared->log_dropped : 0) + (long)s->controller_dropped), s->exit_code);
+                 (unsigned long long)dropped,
+                 (unsigned long long)s->logs_written.load(std::memory_order_relaxed),
+                 (unsigned long long)peak_mb, s->exit_code);
     if (s->error.empty()) std::fputs("null", out); else json_string(out, s->error);
     std::fputs("}\n", out); std::fflush(out);
 }
@@ -3154,14 +3351,16 @@ extern "C" void probe_close(probe_session *s) {
         for (auto &p : s->probes)
             if (p->active && (p->flags & PROBE_BREAKPOINT)) patch(s->pi.hProcess, p->address, p->original);
         TerminateProcess(s->pi.hProcess, 3);
+        if (WaitForSingleObject(s->pi.hProcess, 5000) == WAIT_OBJECT_0) s->exited = true;
     }
+    stop_drainer(s);
+    stop_log_writer(s);                         // symbolization needs dbghelp and the process handle
     if (s->pi.hProcess)
         for (uint64_t b : s->scratch_blocks) VirtualFreeEx(s->pi.hProcess, (void *)(uintptr_t)b, 0, MEM_RELEASE);
     if (s->sym_ready) uhh_sym::cleanup(s->pi.hProcess);
     if (s->remote_thread) CloseHandle(s->remote_thread);
     if (s->svc_event) CloseHandle(s->svc_event);
     if (s->remote_path && s->pi.hProcess) VirtualFreeEx(s->pi.hProcess, s->remote_path, 0, MEM_RELEASE);
-    stop_drainer(s);
     if (s->shared) UnmapViewOfFile(s->shared);
     if (s->mapping) CloseHandle(s->mapping);
     if (s->local_agent) FreeLibrary(s->local_agent);
@@ -3424,12 +3623,17 @@ static void log_common(probe_context *c, bool stack, const char *format, va_list
     }
     auto *state = c ? static_cast<CallbackState *>(c->controller) : nullptr;
     if (!state || !state->session) { std::fprintf(stderr, "probe: %s\n", line); return; }
-    LogRecord r; r.text = line; r.tid = c->tid; r.probe = c->site; r.has_stack = stack;
-    if (stack) capture_stack(state->session, c, r.frames);
-    std::fprintf(stderr, stack ? "probe: %s [+stack %zu frames]\n" : "probe: %s\n", line, r.frames.size());
-    std::lock_guard<std::mutex> lock(state->session->log_mu);
-    try { state->session->logs.push_back(std::move(r)); }
-    catch (...) { ++state->session->controller_dropped; }      // out of memory: counted, not fatal
+    try {
+        LogRecord r; r.text = line; r.tid = c->tid; r.probe = c->site; r.has_stack = stack;
+        if (stack) capture_stack(state->session, c, r.frames);
+        if (trace_enabled()) {
+            if (stack) std::fprintf(stderr, "probe: %s [+stack %zu frames]\n", line, r.frames.size());
+            else std::fprintf(stderr, "probe: %s\n", line);
+        }
+        enqueue_log(state->session, std::move(r));
+    } catch (...) {
+        state->session->controller_dropped.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 extern "C" void send_log(probe_context *c, const char *format, ...) {
