@@ -1516,7 +1516,21 @@ def main():
     BIN = args.bin.resolve()
     only = [x for x in args.only.split(",") if x]
 
+    import os as _os
+
+    def sweep_logs():
+        """Every UHH session keeps its log file (%TEMP%\\uhh\\logs\\uhh-*.jsonl) -- that is the
+        product. The suite runs hundreds of sessions (some with 20M logs), so it deletes the
+        files it produced after each check; a file still open by a live session is skipped."""
+        d = Path(_os.environ.get("TEMP", ".")) / "uhh" / "logs"
+        for f in d.glob("uhh-*.jsonl") if d.is_dir() else []:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
     def want(fn):
+        sweep_logs()
         return not only or any(o in fn.__name__ for o in only)
     print(f"UHH regression suite — bin={BIN}")
     if want(check_sites): check_sites()
