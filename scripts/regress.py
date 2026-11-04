@@ -136,6 +136,27 @@ def check_multithread_exact(threads, reads):
             record(name, False, repr(e))
 
 
+def check_volume(volume_reads):
+    """No-dropped-events at scale: W threads x volume_reads, hits must equal the total
+    exactly. Opt-in (slow, esp. the software breakpoint) — gates the millions-no-drops
+    guarantee instead of leaving it a one-off. Inline is fast at any size; the software
+    breakpoint is ~hundreds of us/hit so keep its volume sane unless you have time."""
+    if not exe("gated_config.exe"):
+        return skip("volume", "gated_config.exe missing")
+    threads = 8
+    total = threads * int(volume_reads)
+    for read_bk, timeout in (("inline", 180), ("hw", 900), ("breakpoint", 1800)):
+        name = f"volume-{read_bk} 8x{volume_reads}"
+        try:
+            r, o = gated("breakpoint", read_bk, str(threads), str(volume_reads), timeout=timeout)
+            rd = next((x for x in probes(o) if "probe_app.exe" in x.get("location", "")), {})
+            a = app(o)
+            ok = (rd.get("hits") == total and a.get("successful_reads") == total)
+            record(name, ok, f"hits={rd.get('hits')} reads={a.get('successful_reads')} want={total}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
 def check_breakage():
     d = exe("breakage_driver.exe")
     if not d or not exe("hook_edge.exe"):
@@ -200,12 +221,16 @@ def main():
     ap.add_argument("--bin", type=Path, default=Path("build-x64/Release"))
     ap.add_argument("--threads", default="8")
     ap.add_argument("--reads", default="1000")
+    ap.add_argument("--volume-reads", default="0",
+                    help="per-thread reads for the opt-in no-drop-at-scale tier (e.g. 250000 = 2M); 0 skips")
     args = ap.parse_args()
     BIN = args.bin.resolve()
     print(f"UHH regression suite — bin={BIN}")
     check_gated_off()
     check_mix_matrix(args.threads, args.reads)
     check_multithread_exact(args.threads, args.reads)
+    if int(args.volume_reads) > 0:
+        check_volume(args.volume_reads)
     check_breakage()
     check_frida_parity()
     check_watchpoint()
