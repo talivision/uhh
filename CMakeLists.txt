@@ -89,7 +89,7 @@ add_library(probe_api_agent SHARED
     examples/sidefx/sidefx_callbacks.cpp)
 target_include_directories(probe_api_agent PRIVATE include examples/gated_config examples/dynwatch examples/trace examples/memstress)
 target_link_libraries(probe_api_agent PRIVATE safetyhook)
-target_compile_definitions(probe_api_agent PRIVATE BREAKAGE_AGENT_ONLY FRIDA_PARITY_AGENT_ONLY)
+target_compile_definitions(probe_api_agent PRIVATE BREAKAGE_AGENT_ONLY FRIDA_PARITY_AGENT_ONLY HITCOST_SHARED)
 # Undecorated names for the __stdcall agent entries (x86 would otherwise export
 # _probe_agent_init@4; the controller resolves them by a fixed bare name).
 target_link_options(probe_api_agent PRIVATE "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/src/probe/agent.def")
@@ -172,6 +172,11 @@ add_executable(hitcost_driver bench/hitcost/hitcost_driver.cpp bench/hitcost/hit
 target_include_directories(hitcost_driver PRIVATE include)
 target_link_libraries(hitcost_driver PRIVATE probe_api)
 add_dependencies(hitcost_driver hitcost_target probe_api_agent)
+add_executable(hitcost_driver_shared bench/hitcost/hitcost_driver.cpp bench/hitcost/hitcost_callbacks.cpp)
+target_include_directories(hitcost_driver_shared PRIVATE include)
+target_compile_definitions(hitcost_driver_shared PRIVATE HITCOST_SHARED)
+target_link_libraries(hitcost_driver_shared PRIVATE probe_api)
+add_dependencies(hitcost_driver_shared hitcost_target probe_api_agent)
 
 # --- memory read/write at scale (every backend) ------------------------------------------
 add_executable(memstress_target examples/memstress/memstress_target.c)

@@ -11,7 +11,7 @@
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
 constexpr uint32_t PROBE_AGENT_VERSION = 11;
-constexpr uint32_t PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH = 1u << 9;   /* == PROBE_UNSAFE_FAST_PATCH (asserted in session.cpp) */
+constexpr uint32_t PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH = 1u << 9;   /* agent side only needs this one */   /* == PROBE_UNSAFE_FAST_PATCH (asserted in session.cpp) */
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 32;
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
 constexpr uint32_t PROBE_AGENT_CONFIG_CAP = 256;

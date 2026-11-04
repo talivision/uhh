@@ -25,8 +25,12 @@ struct OpenRecord {
     std::atomic<uint64_t> handle{0};    // 0 = not resolved yet
 };
 constexpr uint32_t kMaxOpens = 1024;
-OpenRecord g_opens[kMaxOpens];
-std::atomic<uint32_t> g_open_count{0};
+// UHH_SHARED: the map is ONE piece of memory for every backend -- the open probe and the
+// read probe may run in different processes (breakpoint/hw in the controller, inline in
+// the target) and still see each other's records. Plain values only (pids, target
+// addresses, handles), constant-initialised, lock-free atomics.
+UHH_SHARED OpenRecord g_opens[kMaxOpens] = {};
+UHH_SHARED std::atomic<uint32_t> g_open_count{0};
 
 uint64_t read_pointer(probe_context *c, uint64_t address) {
     uintptr_t value = 0;                 // target pointer width == ours (same arch)

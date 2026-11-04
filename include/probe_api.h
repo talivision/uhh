@@ -5,6 +5,24 @@
 #include <stdint.h>
 #include <stdio.h>
 
+/* Shared state across backends (opt-in). Breakpoint/hw callbacks run in the controller,
+   inline callbacks inside the target: a plain global exists once in EACH process, so
+   probes that share state normally use one backend. A global marked UHH_SHARED lives in
+   a shared section of the callbacks DLL: the controller runs those callbacks from its
+   own copy of the same DLL file that the target loads, so both processes see the SAME
+   memory, with ordinary native access. Rules: constant/zero initialisation only (C++:
+   enforced by constinit), no pointers into either process (store values, handles,
+   indices), lock-free atomics for synchronisation. Per session: separate sessions never
+   share. Callbacks of a module without UHH_SHARED globals are unaffected. */
+#if defined(_MSC_VER)
+#pragma section("uhhshr", read, write, shared)
+#if defined(__cplusplus) && defined(__cpp_constinit)
+#define UHH_SHARED __declspec(allocate("uhhshr")) constinit
+#else
+#define UHH_SHARED __declspec(allocate("uhhshr"))
+#endif
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -40,7 +58,14 @@ enum probe_flags {
        thread caught inside the overwritten bytes onto the trampoline. With this flag a
        thread executing those bytes at that moment resumes mid-jump and crashes or
        misbehaves. For measurement/testing; do not use on code other threads may run. */
-    PROBE_UNSAFE_FAST_PATCH = 1u << 9
+    PROBE_UNSAFE_FAST_PATCH = 1u << 9,
+    /* PROBE_INLINE only. Install even where the site check refuses: an inline hook
+       overwrites >= 5 bytes, and it is refused (with the reason) when code could arrive
+       inside them -- a branch target, function start, return point or switch-table target,
+       a ret/jmp followed by live code, an unresolvable indirect jump in the function, or the
+       end of the code section. With this flag the reason is printed as a warning and the
+       hook is installed anyway: you assert that nothing reaches those bytes. */
+    PROBE_ALLOW_UNSAFE_SITE = 1u << 10
 };
 
 /* Every ID is the full native register: RAX..R15 on x64, EAX..EBP/ESP on x86

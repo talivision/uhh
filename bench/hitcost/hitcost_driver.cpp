@@ -1,5 +1,6 @@
 // hitcost_driver --backend inline|breakpoint|hw [--method empty|get_reg|get_func_arg|get_mem|
-//                set_mem|send_log|send_log_stack|call_func] -- hitcost_target.exe [args]
+//                set_mem|send_log|send_log_stack|call_func|counter_plain|counter_shared] -- hitcost_target.exe [args]
+// hitcost_driver_shared: the same, with the callbacks module opted in to UHH_SHARED.
 #include "probe_api.h"
 #include <cstdio>
 #include <cstring>
@@ -8,7 +9,7 @@ extern "C" void hitcost_empty(probe_context *);
 struct hitcost_config { uint32_t method; uint32_t pad; };
 int main(int argc, char **argv) {
     static const char *const methods[] = {"empty", "get_reg", "get_func_arg", "get_mem", "set_mem",
-                                          "send_log", "send_log_stack", "call_func"};
+                                          "send_log", "send_log_stack", "call_func", "counter_plain", "counter_shared"};
     uint32_t backend = PROBE_INLINE; hitcost_config cfg{0, 0}; int i = 1;
     for (; i < argc && std::strcmp(argv[i], "--"); ++i) {
         if (!std::strcmp(argv[i], "--backend") && i + 1 < argc) {

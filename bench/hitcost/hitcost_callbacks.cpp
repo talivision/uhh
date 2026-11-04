@@ -2,11 +2,22 @@
 // config), so ns/hit(method) - ns/hit(empty) is that operation's cost on that backend.
 #include "probe_api.h"
 #include <stdint.h>
+#include <atomic>
 
 struct hitcost_config { uint32_t method; uint32_t pad; };
-enum { M_EMPTY, M_GET_REG, M_GET_ARG, M_GET_MEM, M_SET_MEM, M_SEND_LOG, M_SEND_LOG_STACK, M_CALL_FUNC };
+enum { M_EMPTY, M_GET_REG, M_GET_ARG, M_GET_MEM, M_SET_MEM, M_SEND_LOG, M_SEND_LOG_STACK, M_CALL_FUNC,
+       M_COUNTER_PLAIN, M_COUNTER_SHARED };
 
 static volatile uint64_t g_sink;
+// UHH_SHARED cost: the same atomic increment on a plain global and on a shared one. With
+// HITCOST_SHARED the module opts in (breakpoint/hw callbacks then run from the controller's
+// copy of the agent DLL); without it both methods hit the plain counter.
+static std::atomic<uint64_t> g_plain_counter{0};
+#if defined(HITCOST_SHARED)
+UHH_SHARED std::atomic<uint64_t> g_shared_counter{0};
+#else
+static std::atomic<uint64_t> &g_shared_counter = g_plain_counter;
+#endif
 
 extern "C" __declspec(dllexport) void hitcost_empty(probe_context *c) {
     const hitcost_config *cfg = (const hitcost_config *)get_config(c);
@@ -20,6 +31,8 @@ extern "C" __declspec(dllexport) void hitcost_empty(probe_context *c) {
     case M_SEND_LOG: send_log(c, "hit %llu", (unsigned long long)get_func_arg(c, 0)); break;
     case M_SEND_LOG_STACK: send_log_stack(c, "hit"); break;
     case M_CALL_FUNC: { uint64_t r = 0; call_func(c, "kernel32.dll!GetCurrentProcessId", &r, 0); g_sink += r; break; }
+    case M_COUNTER_PLAIN: g_plain_counter.fetch_add(1, std::memory_order_relaxed); break;
+    case M_COUNTER_SHARED: g_shared_counter.fetch_add(1, std::memory_order_relaxed); break;
     default: break;
     }
 }

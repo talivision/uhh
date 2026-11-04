@@ -125,8 +125,9 @@ def check_gated_off():
         record("gated-off", False, repr(e))
 
 
-def gated(flag_bk, read_bk, threads, reads, timeout=200, log=True):
+def gated(flag_bk, read_bk, threads, reads, timeout=200, log=True, open_bk=None):
     return run([exe("gated_config.exe"), "--flag-backend", flag_bk, "--read-backend", read_bk,
+                *(["--open-backend", open_bk] if open_bk else []),
                 *([] if log else ["--no-log"]), FLAG_LOCATION, READ_LOCATION,
                 "--", exe("probe_app.exe"), "--no-wait", "--helpers", HELPERS,
                 "--threads", threads, "--reads", reads], timeout=timeout)
@@ -870,8 +871,9 @@ def check_patch_race(trials=4):
                     if target.poll() is not None:
                         break
                     cycles += 1
-                    if pr.get("backend") != "inline":
-                        notes.append(f"backend={pr.get('backend')}")
+                    if pr.get("backend") != "inline" or not pr.get("hits"):
+                        notes.append(f"backend={pr.get('backend')} hits={pr.get('hits')} "
+                                     f"err={(report(objs).get('error') or '')[:80]}")
                 try:
                     tout, _ = target.communicate(timeout=120)
                 except subprocess.TimeoutExpired:
@@ -883,7 +885,7 @@ def check_patch_race(trials=4):
             if mode == "frozen":
                 ok = crashed == 0 and torn_total == 0 and min(cycles_all) >= 5 and not notes
             else:
-                ok = crashed >= 1 or torn_total >= 1
+                ok = (crashed >= 1 or torn_total >= 1) and not any("hits=None" in n or "hits=0" in n for n in notes)
             record(name, ok, f"trials={trials} crashed={crashed} torn={torn} exits={[hex(e & 0xffffffff) for e in exits]} "
                              f"hook_cycles={cycles_all}" + (f" notes={notes[:3]}" if notes else "")
                              + ("" if ok or mode == "frozen" else " (unsafe never failed: test not sensitive)"))
@@ -948,12 +950,36 @@ def check_ret_probe(threads=2, reads=50):
             rep = report(objs)
             app_ok = res.get("opened") == helpers and res.get("successful_reads") == threads * reads
             if bk == "inline" and not extra:
-                ok = r.returncode != 0 and "overwrites" in (rep.get("error") or "") and not pr.get("hits")
+                ok = r.returncode != 0 and "would be written across" in (rep.get("error") or "") and "PROBE_ALLOW_UNSAFE_SITE" in (rep.get("error") or "") and not pr.get("hits")
             else:
                 want_bk = "hw" if extra else bk
                 ok = app_ok and pr.get("backend") == want_bk and pr.get("hits") == helpers
             record(name, ok, f"site={site} backend={pr.get('backend')} hits={pr.get('hits')} opened={res.get('opened')} "
                              f"reads={res.get('successful_reads')} rc={r.returncode} err={(rep.get('error') or '')[:120]}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+def check_shared_mix(threads=8, reads=1000):
+    """UHH_SHARED: the open probe and the read probe on DIFFERENT backends -- one runs in
+    the controller, the other inside the target -- still build and use ONE handle->pid
+    map (a shared section of the callbacks DLL). Every read must be logged with the right
+    helper pid (unmapped == 0), hits == logs == reads, nothing dropped."""
+    if not exe("gated_config.exe"):
+        return skip("shared-mix", "gated_config.exe missing")
+    want = threads * reads
+    for open_bk, read_bk in (("breakpoint", "inline"), ("inline", "breakpoint"), ("hw", "inline"), ("inline", "hw")):
+        name = f"shared-mix open={open_bk} read={read_bk}"
+        try:
+            r, o = gated("breakpoint", read_bk, threads, reads, open_bk=open_bk)
+            rd, op = read_probe(o), open_probe(o)
+            logs, dropped = read_logs(o)
+            ok = (r.returncode == 0 and rd.get("hits") == want and logs == want and dropped == 0 and
+                  unmapped(o) == 0 and logged_pids(o) == helper_pids(o) and
+                  rd.get("backend") == read_bk and op.get("backend") == open_bk)
+            record(name, ok, f"read_hits={rd.get('hits')} logs={logs} dropped={dropped} unmapped={unmapped(o)} "
+                             f"pids_ok={logged_pids(o) == helper_pids(o)} backends={op.get('backend')}/{rd.get('backend')} "
+                             f"err={(report(o).get('error') or '')[:100]}")
         except Exception as e:
             record(name, False, repr(e))
 
@@ -1231,6 +1257,7 @@ def main():
     if want(check_patch_race): check_patch_race()
     if want(check_emulated_sites): check_emulated_sites()
     if want(check_ret_probe): check_ret_probe()
+    if want(check_shared_mix): check_shared_mix()
     if want(check_crash_logs): check_crash_logs()
     if want(check_attach_new): check_attach_new()
     if want(check_refusals): check_refusals()

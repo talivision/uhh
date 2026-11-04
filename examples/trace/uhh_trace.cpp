@@ -1,6 +1,6 @@
 // uhh_trace -- trace calls to any exported function of any program.
 //
-//   uhh_trace [--backend inline|breakpoint|hw] [--fallback-hw] [--stack] [--unsafe-fast-patch]
+//   uhh_trace [--backend inline|breakpoint|hw] [--fallback-hw] [--allow-unsafe-site] [--stack] [--unsafe-fast-patch]
 //             -p "KernelBase.dll!CreateFileW:Wxx" [-p ...] -- program.exe [args...]
 //   uhh_trace ... --attach <pid>          (instrument an already-running process)
 //   uhh_trace ... --attach-new <image> [--timeout ms]   (attach to the next NEW instance)
@@ -174,7 +174,7 @@ static int list_symbols(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     if (argc > 1 && !std::strcmp(argv[1], "--list")) return list_symbols(argc, argv);
-    uint32_t backend = PROBE_BREAKPOINT; bool stack = false, unsafe_fast_patch = false, fallback_hw = false; unsigned long attach_pid = 0, detach_ms = 0;
+    uint32_t backend = PROBE_BREAKPOINT; bool stack = false, unsafe_fast_patch = false, fallback_hw = false, allow_unsafe_site = false; unsigned long attach_pid = 0, detach_ms = 0;
     const char *attach_new = nullptr; unsigned long attach_timeout = 0;
     std::vector<trace_config> cfgs; std::vector<std::string> locs;
     int i = 1;
@@ -183,6 +183,7 @@ int main(int argc, char **argv) {
         if (!std::strcmp(argv[i], "--stack")) { stack = true; continue; }
         if (!std::strcmp(argv[i], "--unsafe-fast-patch")) { unsafe_fast_patch = true; continue; }
         if (!std::strcmp(argv[i], "--fallback-hw")) { fallback_hw = true; continue; }
+        if (!std::strcmp(argv[i], "--allow-unsafe-site")) { allow_unsafe_site = true; continue; }
         if (!std::strcmp(argv[i], "--attach") && i + 1 < argc) { attach_pid = std::strtoul(argv[++i], nullptr, 0); continue; }
         if (!std::strcmp(argv[i], "--detach-after-ms") && i + 1 < argc) { detach_ms = std::strtoul(argv[++i], nullptr, 0); continue; }
         if (!std::strcmp(argv[i], "--attach-new") && i + 1 < argc) { attach_new = argv[++i]; continue; }
@@ -216,6 +217,7 @@ int main(int argc, char **argv) {
     // already hooked by someone else (or otherwise not inline-safe) move to a debug register.
     uint32_t flags = backend | (backend == PROBE_INLINE && fallback_hw ? static_cast<uint32_t>(PROBE_FALLBACK_HW) : 0u);
     if (unsafe_fast_patch && backend == PROBE_INLINE) flags |= PROBE_UNSAFE_FAST_PATCH;
+    if (allow_unsafe_site && backend == PROBE_INLINE) flags |= PROBE_ALLOW_UNSAFE_SITE;
     int ok = 1;
     for (size_t k = 0; k < cfgs.size(); ++k) {
         cfgs[k].stack = stack ? 1 : 0;
@@ -232,12 +234,21 @@ int main(int argc, char **argv) {
         // Detach while the target keeps running: attach AND run on a worker thread (the debug
         // object belongs to the thread that attached), probe_close from this one after the
         // delay. The target must carry on exactly as before.
+        // The delay counts from the moment the attach has completed: closing a session while
+        // probe_attach is still running on the other thread is not allowed.
+        HANDLE attached = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        bool attach_ok = false;
         std::thread runner([&] {
-            if (ok && probe_attach(s, (uint32_t)attach_pid)) {
+            attach_ok = ok && probe_attach(s, (uint32_t)attach_pid);
+            SetEvent(attached);
+            if (attach_ok) {
                 std::printf("{\"kind\":\"attached\",\"pid\":%lu}\n", attach_pid); std::fflush(stdout);
                 probe_run(s);
             }
         });
+        WaitForSingleObject(attached, INFINITE);
+        CloseHandle(attached);
+        if (!attach_ok) { runner.join(); probe_report(s, stdout); probe_close(s); return 1; }
         Sleep(detach_ms);
         probe_report(s, stdout);              // what was observed before letting go
         probe_close(s);                       // detach: hooks removed, INT3s restored, DRs cleared

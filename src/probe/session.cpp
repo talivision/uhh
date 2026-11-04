@@ -132,6 +132,7 @@ struct probe_session {
     bool launched = false, ran = false, exited = false, gate_sent = false;
     bool attach_held = false;                  // attach: threads held once until inline hooks confirmed
     DWORD cb_tid = 0;                          // thread whose callback / IPC is being serviced (0 = none)
+    std::wstring agent_copy;                   // per-session copy of the agent DLL (UHH_SHARED), deleted at close
     std::vector<DWORD> pending_hold;           // callers of a runtime inline add: hold until it lands
     bool attached = false;                     // probe_attach: detach (not kill) on close
     std::atomic<bool> stop_requested{false};   // probe_close from another thread while probe_run runs
@@ -229,12 +230,112 @@ static bool has_inline(const probe_session *s) {
     return false;
 }
 
+// ---- UHH_SHARED: one callbacks DLL file, loaded by controller and target ---------------
+static bool image_has_section(const unsigned char *base, const char *name) {
+    auto dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    auto sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i)
+        if (!strncmp(reinterpret_cast<const char *>(sec[i].Name), name, 8)) return true;
+    return false;
+}
+
+static bool module_of(const void *address, HMODULE &m) {
+    return GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                              reinterpret_cast<LPCSTR>(address), &m) != 0;
+}
+
 static std::wstring sibling_agent_path() {
     wchar_t path[MAX_PATH]; DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
     if (!n || n >= MAX_PATH) return L"probe_api_agent.dll";
     std::wstring result(path, n); size_t slash = result.find_last_of(L"\\/");
     result.resize(slash == std::wstring::npos ? 0 : slash + 1);
     return result + L"probe_api_agent.dll";
+}
+
+const probe_controller_api *controller_api_table();
+
+static bool file_has_section(const std::wstring &path, const char *name) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    std::vector<unsigned char> head(8192); DWORD got = 0;
+    BOOL ok = ReadFile(f, head.data(), (DWORD)head.size(), &got, nullptr);
+    CloseHandle(f);
+    if (!ok || got < 1024) return false;
+    auto dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(head.data());
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || (DWORD)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS) > got) return false;
+    auto nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(head.data() + dos->e_lfanew);
+    auto sec = IMAGE_FIRST_SECTION(nt);
+    if ((const unsigned char *)(sec + nt->FileHeader.NumberOfSections) > head.data() + got) return false;
+    return image_has_section(head.data(), name);
+}
+
+// The agent DLL this session loads into BOTH processes. If it carries UHH_SHARED state,
+// every session gets its own copy of the file (a shared section is shared by everyone who
+// maps the same file): %TEMP%\uhh\<pid>-<n>\probe_api_agent.dll, deleted at close; stale
+// copies of dead sessions are swept here.
+static bool ensure_local_agent(probe_session *s) {
+    if (s->local_agent) return true;
+    if (s->agent_path.empty()) {
+        s->agent_path = sibling_agent_path();
+        if (file_has_section(s->agent_path, "uhhshr")) {
+            wchar_t tmp[MAX_PATH]; DWORD n = GetTempPathW(MAX_PATH, tmp);
+            if (n && n < MAX_PATH - 64) {
+                std::wstring root = std::wstring(tmp) + L"uhh";
+                CreateDirectoryW(root.c_str(), nullptr);
+                WIN32_FIND_DATAW fd{}; HANDLE h = FindFirstFileW((root + L"\\*").c_str(), &fd);   // sweep
+                if (h != INVALID_HANDLE_VALUE) {
+                    do {
+                        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.') continue;
+                        std::wstring d = root + L"\\" + fd.cFileName;
+                        if (DeleteFileW((d + L"\\probe_api_agent.dll").c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND)
+                            RemoveDirectoryW(d.c_str());          // in use by a live session: left alone
+                    } while (FindNextFileW(h, &fd));
+                    FindClose(h);
+                }
+                static std::atomic<unsigned> counter{0};
+                std::wstring dir = root + L"\\" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+                                   std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(counter++);
+                std::wstring copy = dir + L"\\probe_api_agent.dll";
+                if (CreateDirectoryW(dir.c_str(), nullptr) && CopyFileW(s->agent_path.c_str(), copy.c_str(), TRUE)) {
+                    s->agent_path = copy; s->agent_copy = copy;
+                } else {
+                    std::fprintf(stderr, "probe: warning: could not make a per-session copy of the agent DLL; "
+                                         "UHH_SHARED state is shared with other sessions using the same file\n");
+                }
+            }
+        }
+    }
+    s->local_agent = LoadLibraryW(s->agent_path.c_str());
+    if (!s->local_agent || !GetProcAddress(s->local_agent, "probe_agent_init")) {
+        set_error(s, win_error("map probe_api_agent.dll exports")); return false;
+    }
+    // Callbacks this process runs from its copy of the agent DLL must reach THIS library.
+    using bind_fn = void (*)(const probe_controller_api *);
+    if (auto bind = reinterpret_cast<bind_fn>(GetProcAddress(s->local_agent, "probe_agent_bind_controller")))
+        bind(controller_api_table());
+    return true;
+}
+
+// A breakpoint/hw callback whose module uses UHH_SHARED runs from the controller's copy of
+// the agent DLL (found by export name), so it shares those globals with inline callbacks.
+static bool bind_shared_callback(probe_session *s, probe_callback &cb, uint32_t flags) {
+    if (flags & PROBE_INLINE) return true;                   // runs in the target's copy anyway
+    HMODULE m{};
+    if (!module_of(reinterpret_cast<const void *>(cb), m) || m == s->local_agent ||
+        !image_has_section(reinterpret_cast<const unsigned char *>(m), "uhhshr")) return true;
+    std::string name;
+    if (!callback_export_name(cb, name)) {
+        set_error(s, "callback uses UHH_SHARED state but is not a named export (the controller runs it from the agent DLL)");
+        return false;
+    }
+    if (!ensure_local_agent(s)) return false;
+    auto shared_cb = reinterpret_cast<probe_callback>(GetProcAddress(s->local_agent, name.c_str()));
+    if (!shared_cb) { set_error(s, "UHH_SHARED callback '" + name + "' is not exported by the agent DLL"); return false; }
+    cb = shared_cb;
+    return true;
 }
 
 static bool patch(HANDLE process, uint64_t address, unsigned char byte) {
@@ -985,7 +1086,8 @@ static bool detect_prehook(probe_session *s, const Probe &p, std::string &json) 
 //  4. an exit (ret/jmp) followed, still inside them, by anything but padding: that code
 //     is reachable only by a jump (the same stub tail, even without .pdata).
 // Such sites go to the hardware backend with PROBE_FALLBACK_HW, else are refused.
-static uint32_t inline_patch_len(const unsigned char *b, size_t n, int64_t *call_end, bool *code_after_exit) {
+static uint32_t inline_patch_len(const unsigned char *b, size_t n, int64_t *call_end, bool *code_after_exit,
+                                 size_t *exit_at = nullptr) {
     ZydisDecoder dec;
 #if defined(_WIN64)
     ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
@@ -1001,8 +1103,11 @@ static uint32_t inline_patch_len(const unsigned char *b, size_t n, int64_t *call
         if (exited && insn.mnemonic != ZYDIS_MNEMONIC_NOP && insn.mnemonic != ZYDIS_MNEMONIC_INT3)
             *code_after_exit = true;                   // reachable only by a jump into the patch
         if (insn.meta.category == ZYDIS_CATEGORY_CALL) *call_end = (int64_t)off;
-        if (insn.meta.category == ZYDIS_CATEGORY_RET || insn.meta.category == ZYDIS_CATEGORY_UNCOND_BR ||
-            insn.mnemonic == ZYDIS_MNEMONIC_INT3 || insn.mnemonic == ZYDIS_MNEMONIC_UD2) exited = true;
+        if (!exited && (insn.meta.category == ZYDIS_CATEGORY_RET || insn.meta.category == ZYDIS_CATEGORY_UNCOND_BR ||
+                        insn.mnemonic == ZYDIS_MNEMONIC_INT3 || insn.mnemonic == ZYDIS_MNEMONIC_UD2)) {
+            exited = true;
+            if (exit_at) *exit_at = off - insn.length;
+        }
     }
     return (uint32_t)off;
 }
@@ -1198,22 +1303,21 @@ static bool patch_in_code_section(probe_session *s, uint64_t base, uint64_t lo, 
 static bool inline_site_unsafe(probe_session *s, const Probe &p, std::string &why) {
     unsigned char b[32] = {}; size_t n = 0;
     if (!remote_read(s->pi.hProcess, p.address, b, sizeof(b), &n) || n < 5) return false;
-    int64_t call_end = -1; bool code_after_exit = false;
-    const uint32_t len = inline_patch_len(b, n, &call_end, &code_after_exit);
+    int64_t call_end = -1; bool code_after_exit = false; size_t exit_at = 0;
+    const uint32_t len = inline_patch_len(b, n, &call_end, &code_after_exit, &exit_at);
     if (!len) return false;
     char buf[320];
-    std::string reason;
+    std::string reason;          // "<N>-byte hook would be written across <what> at +0xK"
     std::string secname;
     if (p.base && !patch_in_code_section(s, p.base, p.address, p.address + len, secname)) {
-        std::snprintf(buf, sizeof(buf), "[section] the %u-byte patch runs past the end of executable section '%s'",
-                      len, secname.c_str());
+        std::snprintf(buf, sizeof(buf), "%u-byte hook would be written across the end of section %s", len, secname.c_str());
         reason = buf;
     } else if (code_after_exit) {
-        std::snprintf(buf, sizeof(buf), "[exit] the %u-byte patch runs past a ret/jmp into code that only a jump can reach "
-                      "(it would be overwritten)", len);
+        std::snprintf(buf, sizeof(buf), "%u-byte hook would be written across the end of the function (ret/jmp at +0x%zx)",
+                      len, exit_at);
         reason = buf;
     } else if (call_end >= 0 && call_end != (int64_t)len) {
-        std::snprintf(buf, sizeof(buf), "[call] a call inside the %u-byte patch returns to +0x%llx, into the middle of the hook's jump",
+        std::snprintf(buf, sizeof(buf), "%u-byte hook would be written across a call's return point at +0x%llx",
                       len, (unsigned long long)call_end);
         reason = buf;
     }
@@ -1222,16 +1326,14 @@ static bool inline_site_unsafe(probe_session *s, const Probe &p, std::string &wh
     if (reason.empty()) {
         auto it = a.entries.upper_bound(p.address);
         if (it != a.entries.end() && *it < p.address + len) {
-            std::snprintf(buf, sizeof(buf), "[entry] code can arrive at +0x%llx (a function start, branch target, return point "
-                          "or switch-table target), inside the %u-byte patch", (unsigned long long)(*it - p.address), len);
+            std::snprintf(buf, sizeof(buf), "%u-byte hook would be written across a jump/call target at +0x%llx",
+                          len, (unsigned long long)(*it - p.address));
             reason = buf;
         }
     }
     if (reason.empty() && a.func_start && !a.indirect_jumps.empty() && !a.tables) {
-        std::snprintf(buf, sizeof(buf), "[indirect] the function (0x%llx-0x%llx, bounds from %s) has an indirect jump at 0x%llx "
-                      "whose targets cannot be resolved, so the %u-byte patch cannot be verified",
-                      (unsigned long long)a.func_start, (unsigned long long)a.func_end, a.bounds_from,
-                      (unsigned long long)a.indirect_jumps.front(), len);
+        std::snprintf(buf, sizeof(buf), "%u-byte hook cannot be verified: the function has an indirect jump at 0x%llx "
+                      "with unknown targets", len, (unsigned long long)a.indirect_jumps.front());
         reason = buf;
     }
     if (reason.empty() && p.base && !a.func_start) {
@@ -1256,8 +1358,8 @@ static bool inline_site_unsafe(probe_session *s, const Probe &p, std::string &wh
                 t = (uint32_t)t;
 #endif
                 if (t > p.address && t < p.address + len) {
-                    std::snprintf(buf, sizeof(buf), "[entry] a branch at +0x%llx jumps back to +0x%llx, inside the %u-byte patch",
-                                  (unsigned long long)(at - p.address), (unsigned long long)(t - p.address), len);
+                    std::snprintf(buf, sizeof(buf), "%u-byte hook would be written across a jump target at +0x%llx",
+                                  len, (unsigned long long)(t - p.address));
                     reason = buf;
                 }
             }
@@ -1295,8 +1397,8 @@ static bool inline_site_unsafe(probe_session *s, const Probe &p, std::string &wh
                       x < p.address ? "-" : "+", (unsigned long long)cands[i].first);
         sugg += buf;
     }
-    why = reason + ". Use PROBE_BREAKPOINT or PROBE_HW at this exact address (or PROBE_FALLBACK_HW)" +
-          (sugg.empty() ? std::string("") : "; inline-safe nearby (callback runs at a different instruction): " + sugg);
+    why = reason;
+    if (!sugg.empty()) std::fprintf(stderr, "probe: %s: inline-safe nearby: %s\n", p.location.c_str(), sugg.c_str());
     return true;
 }
 
@@ -1305,14 +1407,19 @@ static bool vet_site(probe_session *s, Probe &p, bool &moved_to_hw) {
     if (p.flags & PROBE_HW) return true;
     std::string inner;
     if ((p.flags & PROBE_INLINE) && inline_site_unsafe(s, p, inner)) {
-        if (p.flags & PROBE_FALLBACK_HW) {
+        if (p.flags & PROBE_ALLOW_UNSAFE_SITE) {
+            std::fprintf(stderr, "probe: warning: inline probe %s: %s (installed: PROBE_ALLOW_UNSAFE_SITE)\n",
+                         p.location.c_str(), inner.c_str());
+        } else if (p.flags & PROBE_FALLBACK_HW) {
             p.flags = (p.flags & ~(uint32_t)PROBE_INLINE) | PROBE_HW; moved_to_hw = true;
             std::fprintf(stderr, "probe: %s -> hardware fallback (%s)\n", p.location.c_str(), inner.c_str());
             return true;
+        } else {
+            std::string msg = "inline probe " + p.location + " refused: " + inner + ". Override with PROBE_ALLOW_UNSAFE_SITE.";
+            std::fprintf(stderr, "probe: %s\n", msg.c_str());
+            set_error(s, msg);
+            return false;
         }
-        std::fprintf(stderr, "probe: inline probe %s refused: %s\n", p.location.c_str(), inner.c_str());
-        set_error(s, "inline probe " + p.location + " refused: " + inner);
-        return false;
     }
     std::string json;
     if (!detect_prehook(s, p, json)) return true;
@@ -1495,7 +1602,8 @@ static_assert(PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH == PROBE_UNSAFE_FAST_PATCH, "ag
 static bool check_flags(probe_session *s, uint32_t flags, bool allow_inline) {
     constexpr uint32_t types = PROBE_BREAKPOINT | PROBE_INLINE | PROBE_HW;
     constexpr uint32_t known = types | PROBE_AT_RETURN | PROBE_ALLOW_PREHOOKED | PROBE_FALLBACK_HW
-                             | PROBE_WATCH_WRITE | PROBE_WATCH_RW | PROBE_ONCE | PROBE_UNSAFE_FAST_PATCH;
+                             | PROBE_WATCH_WRITE | PROBE_WATCH_RW | PROBE_ONCE | PROBE_UNSAFE_FAST_PATCH
+                             | PROBE_ALLOW_UNSAFE_SITE;
     if (flags & ~known) { set_error(s, "unknown probe flags"); return false; }
     uint32_t type = flags & types;
     uint32_t watch = flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW);
@@ -1503,6 +1611,7 @@ static bool check_flags(probe_session *s, uint32_t flags, bool allow_inline) {
         ((flags & PROBE_ALLOW_PREHOOKED) && type != PROBE_INLINE) || // only meaningful for inline
         ((flags & PROBE_FALLBACK_HW) && type != PROBE_INLINE) ||     // fallback only modifies an inline probe
         ((flags & PROBE_UNSAFE_FAST_PATCH) && type != PROBE_INLINE) || // only inline hooks write code
+        ((flags & PROBE_ALLOW_UNSAFE_SITE) && type != PROBE_INLINE) || // only inline hooks overwrite >1 byte
         (watch && type != PROBE_HW) ||                               // a watchpoint uses the DR/HW backend
         watch == (PROBE_WATCH_WRITE | PROBE_WATCH_RW) ||             // pick one access mode, not both
         ((flags & PROBE_ONCE) && type == PROBE_INLINE)) {            // one-shot needs a controller backend
@@ -1538,6 +1647,7 @@ extern "C" int probe_add_symbol_cfg(probe_session *s, const char *location, prob
         auto p = std::make_unique<Probe>();
         if (!parse_location(s, location, *p)) return scope.done(0);
         p->callback = callback; p->flags = flags; p->runtime = s->launched;
+        if (!bind_shared_callback(s, p->callback, flags)) return scope.done(0);
         if (type == PROBE_INLINE && !callback_export_name(callback, p->callback_export)) {
             set_error(s, "inline callback is not a named export"); return scope.done(0);
         }
@@ -1582,6 +1692,7 @@ static int add_absolute(probe_session *s, uint64_t address, probe_callback cb, u
         auto p = std::make_unique<Probe>();
         char loc[40]; std::snprintf(loc, sizeof(loc), "0x%llx", (unsigned long long)address);
         p->location = loc; p->flags = flags; p->callback = cb; p->rva = address; p->runtime = true;
+        if (!bind_shared_callback(s, p->callback, flags)) return scope.done(0);
         if ((flags & PROBE_INLINE) && !callback_export_name(cb, p->callback_export)) {
             set_error(s, "inline callback is not a named export"); return scope.done(0);
         }
@@ -1636,12 +1747,7 @@ static bool open_agent_section(probe_session *s, uint32_t count) {
     start_drainer(s);
     wchar_t svc[64]; probe_agent_service_name(s->pi.dwProcessId, svc);
     s->svc_event = CreateEventW(nullptr, FALSE, FALSE, svc);
-    s->agent_path = sibling_agent_path();
-    s->local_agent = LoadLibraryW(s->agent_path.c_str());
-    if (!s->local_agent || !GetProcAddress(s->local_agent, "probe_agent_init")) {
-        set_error(s, win_error("map probe_api_agent.dll exports")); return false;
-    }
-    return true;
+    return ensure_local_agent(s);
 }
 
 static void fill_request(probe_session *s, const Probe &p) {
@@ -3059,6 +3165,10 @@ extern "C" void probe_close(probe_session *s) {
     if (s->shared) UnmapViewOfFile(s->shared);
     if (s->mapping) CloseHandle(s->mapping);
     if (s->local_agent) FreeLibrary(s->local_agent);
+    if (!s->agent_copy.empty()) {             // fails if the (detached) target still has it loaded
+        DeleteFileW(s->agent_copy.c_str());
+        RemoveDirectoryW(s->agent_copy.substr(0, s->agent_copy.find_last_of(L'\\')).c_str());
+    }
     if (s->stdin_write) CloseHandle(s->stdin_write);
     if (s->pi.hThread) CloseHandle(s->pi.hThread);
     if (s->pi.hProcess) CloseHandle(s->pi.hProcess);
@@ -3237,17 +3347,24 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
     return result;
 }
 
-extern "C" int call_func(probe_context *c, const char *symbol, uint64_t *ret, int nargs, ...) {
+static int call_func_args(probe_context *c, const char *symbol, uint64_t *ret, int nargs, const uint64_t *in) {
     auto *st = c ? static_cast<CallbackState *>(c->controller) : nullptr;
     if (!st || !st->session || !st->tid) return 0;
+    if (nargs < 0 || nargs > 8) return 0;
     uint64_t fn = resolve_symbol(st->session, symbol);
     if (!fn) return 0;
     uint64_t args[8] = {0};
+    for (int i = 0; i < nargs; ++i) args[i] = in[i];
+    return call_in_target(st->session, st, fn, ret, nargs, args);
+}
+
+extern "C" int call_func(probe_context *c, const char *symbol, uint64_t *ret, int nargs, ...) {
     if (nargs < 0 || nargs > 8) return 0;
+    uint64_t args[8] = {0};
     va_list ap; va_start(ap, nargs);
     for (int i = 0; i < nargs; ++i) args[i] = va_arg(ap, uint64_t);
     va_end(ap);
-    return call_in_target(st->session, st, fn, ret, nargs, args);
+    return call_func_args(c, symbol, ret, nargs, args);
 }
 
 extern "C" probe_session *get_session(probe_context *c) {
@@ -3322,3 +3439,11 @@ extern "C" void send_log(probe_context *c, const char *format, ...) {
 extern "C" void send_log_stack(probe_context *c, const char *format, ...) {
     va_list ap; va_start(ap, format); log_common(c, true, format, ap); va_end(ap);
 }
+
+// The table the controller's copy of the agent DLL forwards to (UHH_SHARED callbacks).
+static void vlog_entry(probe_context *c, int stack, const char *format, va_list ap) { log_common(c, stack != 0, format, ap); }
+static const probe_controller_api g_controller_api = {
+    get_reg, set_reg, get_func_arg, get_mem, set_mem, vlog_entry, get_config, call_func_args, get_session,
+    probe_add_address, probe_watch, probe_add_symbol, probe_add_symbol_cfg,
+};
+const probe_controller_api *controller_api_table() { return &g_controller_api; }

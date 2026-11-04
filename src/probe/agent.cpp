@@ -84,11 +84,19 @@ static uint64_t *register_slot(probe_context *c, enum probe_register reg) {
     }
 }
 
+// Non-null only in the CONTROLLER's copy of this DLL (UHH_SHARED callbacks run there for
+// breakpoint/hw probes): every API entry point then forwards to the controller library.
+// In the target it stays null -- one predictable branch per call.
+static const probe_controller_api *g_ctrl;
+extern "C" __declspec(dllexport) void probe_agent_bind_controller(const probe_controller_api *api) { g_ctrl = api; }
+
 extern "C" uint64_t get_reg(probe_context *c, enum probe_register reg) {
+    if (g_ctrl) return g_ctrl->get_reg(c, reg);
     uint64_t *slot = register_slot(c, reg);
     return slot ? *slot : 0;
 }
 extern "C" int set_reg(probe_context *c, enum probe_register reg, uint64_t value) {
+    if (g_ctrl) return g_ctrl->set_reg(c, reg, value);
     uint64_t *slot = register_slot(c, reg); if (!slot) return 0;
     if (*slot != value) {
         *slot = value;
@@ -98,14 +106,17 @@ extern "C" int set_reg(probe_context *c, enum probe_register reg, uint64_t value
     return 1;
 }
 extern "C" int get_mem(probe_context *c, uint64_t address, void *buffer, size_t size) {
+    if (g_ctrl) return g_ctrl->get_mem(c, address, buffer, size);
     if (!c || !c->ops || !c->ops->read || (!buffer && size)) return 0;
     size_t done{}; return c->ops->read(c->backend, address, buffer, size, &done) && done == size;
 }
 extern "C" int set_mem(probe_context *c, uint64_t address, const void *buffer, size_t size) {
+    if (g_ctrl) return g_ctrl->set_mem(c, address, buffer, size);
     if (!c || !c->ops || !c->ops->write || (!buffer && size)) return 0;
     size_t done{}; return c->ops->write(c->backend, address, buffer, size, &done) && done == size;
 }
 extern "C" uint64_t get_func_arg(probe_context *c, size_t index) {
+    if (g_ctrl) return g_ctrl->get_func_arg(c, index);
     if (!c) return 0;
 #if defined(_WIN64)
     /* x64 __fastcall: first four args in registers, rest above the shadow space. */
@@ -246,12 +257,19 @@ static void agent_log(probe_context *c, bool stack, const char *format, va_list 
 }
 
 extern "C" void send_log(probe_context *c, const char *format, ...) {
-    va_list ap; va_start(ap, format); agent_log(c, false, format, ap); va_end(ap);
+    va_list ap; va_start(ap, format);
+    if (g_ctrl) g_ctrl->vlog(c, 0, format, ap); else agent_log(c, false, format, ap);
+    va_end(ap);
 }
 extern "C" void send_log_stack(probe_context *c, const char *format, ...) {
-    va_list ap; va_start(ap, format); agent_log(c, true, format, ap); va_end(ap);
+    va_list ap; va_start(ap, format);
+    if (g_ctrl) g_ctrl->vlog(c, 1, format, ap); else agent_log(c, true, format, ap);
+    va_end(ap);
 }
-extern "C" const void *get_config(probe_context *c) { return c ? c->config : nullptr; }
+extern "C" const void *get_config(probe_context *c) {
+    if (g_ctrl) return g_ctrl->get_config(c);
+    return c ? c->config : nullptr;
+}
 
 // call_func inside the target: resolve and call directly on this (the hit) thread.
 static uint64_t agent_resolve(const char *symbol) {
@@ -310,14 +328,14 @@ static bool call_raw(uint64_t fn, const uint64_t *a, uint64_t *ret, int nargs) {
 #endif
 
 extern "C" int call_func(probe_context *c, const char *symbol, uint64_t *ret, int nargs, ...) {
-    (void)c;
     if (nargs < 0 || nargs > 8) return 0;
-    uint64_t fn = agent_resolve(symbol);
-    if (!fn) return 0;
     uint64_t a[8] = {0};
     va_list ap; va_start(ap, nargs);
     for (int i = 0; i < nargs; ++i) a[i] = va_arg(ap, uint64_t);
     va_end(ap);
+    if (g_ctrl) return g_ctrl->call_func_args(c, symbol, ret, nargs, a);
+    uint64_t fn = agent_resolve(symbol);
+    if (!fn) return 0;
 #if defined(_WIN64)
     return call_raw(fn, a, ret) ? 1 : 0;
 #else
@@ -335,6 +353,7 @@ struct probe_session { uint32_t site; };
 static probe_session proxies[PROBE_AGENT_MAX_PROBES];
 
 extern "C" probe_session *get_session(probe_context *c) {
+    if (g_ctrl) return g_ctrl->get_session(c);
     auto *state = c ? static_cast<AgentState *>(c->controller) : nullptr;
     return state && state->index < PROBE_AGENT_MAX_PROBES ? &proxies[state->index] : nullptr;
 }
@@ -369,16 +388,20 @@ static int forward(probe_session *s, uint32_t op, uint64_t address, const char *
 }
 
 extern "C" int probe_add_address(probe_session *s, uint64_t address, probe_callback cb, uint32_t flags) {
+    if (g_ctrl) return g_ctrl->add_address(s, address, cb, flags);
     return forward(s, PROBE_IPC_ADD_ADDRESS, address, nullptr, cb, flags);
 }
 extern "C" int probe_watch(probe_session *s, uint64_t address, probe_callback cb, uint32_t flags) {
+    if (g_ctrl) return g_ctrl->watch(s, address, cb, flags);
     return forward(s, PROBE_IPC_WATCH, address, nullptr, cb, flags);
 }
 extern "C" int probe_add_symbol(probe_session *s, const char *symbol, probe_callback cb, uint32_t flags) {
+    if (g_ctrl) return g_ctrl->add_symbol(s, symbol, cb, flags);
     return forward(s, PROBE_IPC_ADD_SYMBOL, 0, symbol, cb, flags);
 }
 extern "C" int probe_add_symbol_cfg(probe_session *s, const char *symbol, probe_callback cb, uint32_t flags,
                                     const void *config, size_t config_len) {
+    if (g_ctrl) return g_ctrl->add_symbol_cfg(s, symbol, cb, flags, config, config_len);
     return forward(s, PROBE_IPC_ADD_SYMBOL, 0, symbol, cb, flags, config, config_len);
 }
 
