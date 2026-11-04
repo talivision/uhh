@@ -131,6 +131,7 @@ struct probe_session {
     int hw_active = 0;
     bool launched = false, ran = false, exited = false, gate_sent = false;
     bool attach_held = false;                  // attach: threads held once until inline hooks confirmed
+    int shadow_stack = -1;                     // target has hardware shadow stacks (CET): -1 unknown, 0/1
     DWORD cb_tid = 0;                          // thread whose callback / IPC is being serviced (0 = none)
     std::wstring agent_copy;                   // per-session copy of the agent DLL (UHH_SHARED), deleted at close
     std::vector<DWORD> pending_hold;           // callers of a runtime inline add: hold until it lands
@@ -557,6 +558,21 @@ static bool emu_cond(ZydisMnemonic m, DWORD f) {
 
 // Executes the instruction at `site` on `c`. Returns true when emulated (c updated,
 // memory written); false = not handled, take the stepping path instead.
+// Hardware-enforced shadow stacks (Intel CET, /CETCOMPAT): an emulated CALL/RET would move
+// the normal stack but not the shadow stack, so the target would fault at its next real ret.
+// Such targets get CALL/RET stepped by the CPU (in-place path) instead.
+static bool target_has_shadow_stack(probe_session *s) {
+    if (s->shadow_stack < 0) {
+        s->shadow_stack = 0;
+        PROCESS_MITIGATION_USER_SHADOW_STACK_POLICY pol{};
+        using GetPolicyFn = BOOL(WINAPI *)(HANDLE, PROCESS_MITIGATION_POLICY, PVOID, SIZE_T);
+        auto get = reinterpret_cast<GetPolicyFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetProcessMitigationPolicy"));
+        if (get && s->pi.hProcess && get(s->pi.hProcess, ProcessUserShadowStackPolicy, &pol, sizeof(pol)))
+            s->shadow_stack = pol.EnableUserShadowStack ? 1 : 0;
+    }
+    return s->shadow_stack == 1;
+}
+
 static bool emulate_site(probe_session *s, const Probe &p, CONTEXT &c) {
     if (p.orig_insn.empty()) return false;
     ZydisDecoder dec;
@@ -615,8 +631,10 @@ static bool emulate_site(probe_session *s, const Probe &p, CONTEXT &c) {
         case ZYDIS_MNEMONIC_JMP:
             ok = target(t); if (ok) EMU_IP(c) = (decltype(EMU_IP(c)))t; break;
         case ZYDIS_MNEMONIC_CALL:
+            if (target_has_shadow_stack(s)) break;          // the CPU must push the shadow stack itself
             ok = target(t) && push(next, ptr); if (ok) EMU_IP(c) = (decltype(EMU_IP(c)))t; break;
         case ZYDIS_MNEMONIC_RET:
+            if (target_has_shadow_stack(s)) break;          // ... and pop it
             if (in.operand_count_visible > 1) break;
             ok = pop(v, ptr);
             if (ok && in.operand_count_visible == 1 && ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE)
