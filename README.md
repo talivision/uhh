@@ -24,10 +24,19 @@ The full, locked API is in [`docs/api-sketch.md`](docs/api-sketch.md).
 
 ## Backends
 
-| Backend | How | Per-hit cost | Modifies code? |
-|---|---|---|---|
-| `PROBE_BREAKPOINT` | external debugger, native-bitness INT3 | ~tens of µs | 1 byte |
-| `PROBE_INLINE` | injected SafetyHook mid-hook | ~tens of ns | trampoline |
+| Backend | How | Per-hit cost | Modifies code? | Multithread |
+|---|---|---|---|---|
+| `PROBE_INLINE` | injected SafetyHook mid-hook | ~tens of ns | trampoline (≥5 bytes) | exact |
+| `PROBE_HW` | execute debug register (DR0–3) | ~tens of µs | none | exact (≤4 probes) |
+| `PROBE_BREAKPOINT` | external debugger, native-bitness INT3 | ~hundreds of µs | 1 byte | exact |
+
+All three are **exact under multithreading** (no dropped hits). The software
+breakpoint achieves this with **displaced (out-of-line) stepping** — the `INT3`
+stays armed while the original instruction runs from a per-thread scratch buffer, so
+no other thread can cross the site unobserved and no thread is suspended (no race, no
+deadlock). The hardware breakpoint modifies no code at all and handles any
+instruction, including the control-flow sites displaced stepping routes to an
+in-place fallback. Inline is the fastest where the site has room for a trampoline.
 
 Backends are picked **per probe** and interoperate in one session — e.g. a
 breakpoint on a config-flag site (fires once) mixed with an inline hook on a hot
@@ -75,10 +84,13 @@ probe's hit count equals the number of reads.
 
 ## Status
 
-Verified working on x64 and x86: the breakpoint and inline backends, deferred
-module+RVA probes, and the mixed `gated_config` scenario above.
+Verified on x64 **and** x86: all three backends (inline, hardware, software
+breakpoint), deferred module+RVA probes, and the mixed `gated_config` scenario.
+Software breakpoints are multithread-safe via displaced stepping and proven exact at
+**2,000,000 reads across 8 threads (zero dropped hits)**; hardware and inline are
+exact under multithreading too. The backend mix matrix passes for breakpoint-flag
+combinations.
 
 Roadmap (see [`docs/plan-v2.md`](docs/plan-v2.md)): per-thread `PROBE_LOG` queues,
-hardware-breakpoint backend, thread-safe INT3 stepping, `module!symbol` resolution,
-attach-by-name (`watch_new`), inline-over-existing-hook chaining, a general
-`read_logger` CLI, and Frida benchmarks.
+`module!symbol` resolution, attach-by-name (`watch_new`), inline-over-existing-hook
+chaining, a general `read_logger` CLI, and Frida benchmarks.
