@@ -3054,7 +3054,9 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
         s->cb_tid = 0;
         for (DWORD tid : s->pending_hold) hold_thread(s, tid);
         s->pending_hold.clear();
-        if (ok && s->initial_break && s->attached && !s->attach_held && has_inline(s)) {
+        bool safe_inline = false;           // PROBE_UNSAFE_FAST_PATCH probes ask for no suspension at all
+        for (auto &p : s->probes) if ((p->flags & PROBE_INLINE) && !(p->flags & PROBE_UNSAFE_FAST_PATCH)) safe_inline = true;
+        if (ok && s->initial_break && s->attached && !s->attach_held && safe_inline) {
             // Attach: the target was already running. Hold every thread (not the break-in
             // thread, which only returns) until the agent confirms the inline hooks, so no
             // call slips past a site that is about to be hooked. Released by the install

@@ -54,7 +54,8 @@ enum probe_flags {
     PROBE_ONCE            = 1u << 8,
     /* PROBE_INLINE only. UNSAFE: write the hook's jump WITHOUT freezing the target. By
        default the controller suspends every other thread while an inline hook is
-       written (microseconds, at install/remove only -- never per hit) and moves any
+       written (microseconds, at install/remove only -- never per hit; attach also holds
+       every thread until inline hooks are in) and moves any
        thread caught inside the overwritten bytes onto the trampoline. With this flag a
        thread executing those bytes at that moment resumes mid-jump and crashes or
        misbehaves. For measurement/testing; do not use on code other threads may run. */
