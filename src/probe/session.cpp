@@ -247,6 +247,22 @@ static bool module_of(const void *address, HMODULE &m) {
                               reinterpret_cast<LPCSTR>(address), &m) != 0;
 }
 
+// A forwarded export (kernel32!HeapAlloc -> ntdll!RtlAllocateHeap, or into an API set):
+// follow it the way the loader does, through THIS process's copy of the same system DLL
+// (controller and target are the same bitness, so they load the same files), then map the
+// final function onto the target's module of the same name. 0 = not resolvable.
+static uint64_t forwarded_export_target(probe_session *s, const std::string &module, const std::string &name) {
+    HMODULE m = GetModuleHandleA(module.c_str());
+    if (!m) m = LoadLibraryExA(module.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    FARPROC f = m ? GetProcAddress(m, name.c_str()) : nullptr;
+    HMODULE owner{};
+    if (!f || !module_of(reinterpret_cast<const void *>(f), owner)) return 0;
+    std::string owner_name = module_name_from_module(owner);
+    for (auto &kv : s->module_bases)
+        if (iequals(kv.first, owner_name)) return kv.second + (uint64_t)((uintptr_t)f - (uintptr_t)owner);
+    return 0;
+}
+
 static std::wstring sibling_agent_path() {
     wchar_t path[MAX_PATH]; DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
     if (!n || n >= MAX_PATH) return L"probe_api_agent.dll";
@@ -1473,7 +1489,15 @@ static bool arm_probe(probe_session *s, Probe &item, uint64_t base) {
     // and a module loaded later is held at its LOAD_DLL event. Inline stays inline.)
     if (!item.export_name.empty()) {
         uint64_t exp = 0;
-        if (!resolve_export(s, base, item.export_name, exp)) {
+        const bool exported = resolve_export(s, base, item.export_name, exp);
+        if (!exported && s->error.find("forwarded") != std::string::npos) {
+            // A forwarded export: probe the function it forwards to (in its own module).
+            uint64_t target = forwarded_export_target(s, item.module, item.export_name);
+            if (!target) { s->error += " (and its target module is not loaded in the target yet)"; return false; }
+            s->error.clear();
+            exp = target - base;                       // may point into another module: base + rva is absolute
+            std::fprintf(stderr, "probe: %s is forwarded -> 0x%llx\n", item.location.c_str(), (unsigned long long)target);
+        } else if (!exported) {
             // Not exported: try the module's symbols (PDB beside the image, or a symbol
             // server via _NT_SYMBOL_PATH) -- internal functions by name.
             uint64_t addr = 0; std::string saved = s->error;
@@ -3321,16 +3345,8 @@ static uint64_t resolve_symbol(probe_session *s, const char *symbol) {
                     const bool forwarded = s->error.find("forwarded") != std::string::npos;
                     s->error = saved;
                     if (!forwarded) return 0;
-                    HMODULE m = GetModuleHandleA(tmp.module.c_str());
-                    if (!m) m = LoadLibraryExA(tmp.module.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-                    FARPROC f = m ? GetProcAddress(m, tmp.export_name.c_str()) : nullptr;
-                    HMODULE owner{};
-                    if (!f || !module_of(reinterpret_cast<const void *>(f), owner)) return 0;
-                    std::string owner_name = module_name_from_module(owner);
-                    for (auto &kw : s->module_bases)
-                        if (iequals(kw.first, owner_name))
-                            return kw.second + (uint64_t)((uintptr_t)f - (uintptr_t)owner) + tmp.sym_offset;
-                    return 0;
+                    uint64_t target = forwarded_export_target(s, tmp.module, tmp.export_name);
+                    return target ? target + tmp.sym_offset : 0;
                 }
                 rva = exp + tmp.sym_offset;
             }
