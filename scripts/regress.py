@@ -96,7 +96,8 @@ def app(objs):
 
 
 FLAG_LOCATION = "configparse.dll!ParseConfig+0x16"
-READ_LOCATION = "probe_app.exe!ReadThunk"
+READ_LOCATION = "ntdll.dll!NtReadVirtualMemory"
+OPEN_LOCATION = "ntdll.dll!NtOpenProcess"
 HELPERS = 4
 
 
@@ -147,11 +148,11 @@ def unmapped(objs):
 
 
 def read_probe(objs):
-    return next((x for x in probes(objs) if x.get("location", "").endswith("!ReadThunk")), {})
+    return next((x for x in probes(objs) if x.get("location", "") == READ_LOCATION), {})
 
 
 def open_probe(objs):
-    return next((x for x in probes(objs) if x.get("location", "").endswith("!OpenThunk")), {})
+    return next((x for x in probes(objs) if x.get("location", "") == OPEN_LOCATION), {})
 
 
 def logged_pids(objs):
@@ -295,7 +296,7 @@ def check_attach(threads, reads):
                 raise RuntimeError("uhh_attach did not attach")
             # Probes on already-loaded modules arm after the attach (inline: asynchronously,
             # in the injected agent). Release the gate only once both are live.
-            for loc in ("probe_app.exe!OpenThunk", READ_LOCATION):
+            for loc in (OPEN_LOCATION, READ_LOCATION):
                 if not aerr.wait_for(lambda l, loc=loc: l.startswith(f"probe: active {loc} "), 30):
                     raise RuntimeError(f"{loc} never became active")
             tgt.stdin.write("x"); tgt.stdin.flush()
@@ -774,6 +775,148 @@ def check_detach():
                 target.kill()
 
 
+def check_ntdll_churn():
+    """Hooks on ntdll's own syscall stub, installed and removed again and again while
+    threads hammer it: probe_app reads in a tight loop on 4 threads through
+    ntdll!NtReadVirtualMemory (which shares its page with NtProtectVirtualMemory & co.);
+    uhh_trace attaches, hooks the stub, detaches -- repeatedly -- for every backend.
+    Inline hooks are written with the target frozen and threads caught inside the
+    overwritten bytes moved to the trampoline: the target must finish every read, exit 0
+    and match the uninstrumented checksum, and every cycle must have seen hits."""
+    t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
+    if not t or not a:
+        return skip("ntdll-churn", "uhh_trace/probe_app missing")
+    import time
+    for bk, reads in (("inline", 4000000), ("hw", 4000000), ("breakpoint", 4000000)):
+        name = f"ntdll-churn-{bk}"
+        target = None
+        try:
+            threads = 4
+            total = threads * reads
+            _, bo = run([a, "--no-wait", "--threads", threads, "--reads", reads, "--config", "reads_enabled=1"],
+                        timeout=600)
+            base = app(bo)
+            target = subprocess.Popen([str(a), "--threads", str(threads), "--reads", str(reads),
+                                       "--config", "reads_enabled=1"],
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            while True:
+                line = target.stdout.readline().decode(errors="replace")
+                if not line or '"waiting"' in line:
+                    break
+            target.stdin.write(b"\n"); target.stdin.flush()
+            cycles, bad = [], []
+            while target.poll() is None and len(cycles) < 12:
+                tr = subprocess.Popen([str(t), "--backend", bk, "--attach", str(target.pid), "--detach-after-ms", "300",
+                                       "-p", "ntdll.dll!NtReadVirtualMemory:xxxx"],
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                out, err = tr.communicate(timeout=120)
+                objs = [json.loads(l) for l in out.splitlines() if l.startswith("{")]
+                pr = next((o for o in objs if o.get("kind") == "probe"), {})
+                det = any(o.get("kind") == "detached" for o in objs)
+                if target.poll() is not None and not det:
+                    break                                    # target finished mid-cycle: not a failure
+                cycles.append(pr.get("hits") or 0)
+                if not det or not pr.get("hits") or pr.get("backend") != bk:
+                    bad.append(f"cycle{len(cycles)}: detached={det} hits={pr.get('hits')} backend={pr.get('backend')} "
+                               f"err={' | '.join(err.strip().splitlines()[-3:])[:400]}")
+            rest = lines_until(target, '"kind":"app"', 600)
+            target.wait(timeout=120)
+            terr = target.stderr.read().decode(errors="replace") if target.returncode != 0 else ""
+            unhandled = [l for l in terr.splitlines() if '"unhandled"' in l][:2]
+            res = next((json.loads(l) for l in rest if l.strip().startswith("{") and '"kind":"app"' in l), {})
+            ok = (len(cycles) >= 5 and not bad and target.returncode == 0 and res.get("successful_reads") == total
+                  and res.get("checksum") == base.get("checksum"))
+            record(name, ok, f"cycles={len(cycles)} hits/cycle={cycles} exit={target.returncode} "
+                             f"reads={res.get('successful_reads')}/{total} checksum_same={res.get('checksum') == base.get('checksum')}"
+                             + ("" if ok else f" bad={bad[:3]} target_unhandled={unhandled}"))
+        except Exception as e:
+            record(name, False, repr(e))
+        finally:
+            if target and target.poll() is None:
+                target.kill()
+
+
+def check_patch_race(trials=4):
+    """Why inline hooks are written with the target frozen. patchrace_target runs 8
+    threads calling RaceSite -- xor eax,eax + 16 x inc eax, returns 16 -- in a loop, so threads sit
+    INSIDE the 5 bytes a hook overwrites. uhh_trace attaches, hooks it, detaches, over
+    and over. Frozen (default): threads caught in those bytes are moved to the
+    trampoline; every trial must exit 0 with every call returning 16. With
+    PROBE_UNSAFE_FAST_PATCH the jump is written while they run: a thread resumes mid-jump
+    and returns a wrong count or crashes -- this must happen in at least one trial,
+    proof the test can see the race the freeze removes."""
+    t, a = exe("uhh_trace.exe"), exe("patchrace_target.exe")
+    if not t or not a:
+        return skip("patch-race", "uhh_trace/patchrace_target missing")
+    for mode in ("frozen", "unsafe"):
+        name = f"patch-race-{mode}"
+        exits, cycles_all, notes, torn = [], [], [], []
+        try:
+            for _ in range(trials):
+                target = subprocess.Popen([str(a), "--threads", "8", "--seconds", "12"],
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                ready = target.stdout.readline()
+                if '"ready"' not in ready:
+                    raise RuntimeError(f"target not ready: {ready!r}")
+                cycles = 0
+                while target.poll() is None and cycles < 40:
+                    cmd = [str(t), "--backend", "inline", "--attach", str(target.pid), "--detach-after-ms", "50",
+                           "-p", "patchrace_target.exe!RaceSite:-"]
+                    if mode == "unsafe":
+                        cmd.insert(1, "--unsafe-fast-patch")
+                    tr = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                    objs = [json.loads(l) for l in tr.stdout.splitlines() if l.startswith("{")]
+                    pr = next((o for o in objs if o.get("kind") == "probe"), {})
+                    if target.poll() is not None:
+                        break
+                    cycles += 1
+                    if pr.get("backend") != "inline":
+                        notes.append(f"backend={pr.get('backend')}")
+                try:
+                    tout, _ = target.communicate(timeout=120)
+                except subprocess.TimeoutExpired:
+                    target.kill(); tout, _ = target.communicate()
+                res = next((json.loads(l) for l in (tout or "").splitlines() if '"kind":"app"' in l), {})
+                exits.append(target.returncode); cycles_all.append(cycles); torn.append(res.get("torn"))
+            crashed = sum(1 for e in exits if e != 0)
+            torn_total = sum(t or 0 for t in torn)
+            if mode == "frozen":
+                ok = crashed == 0 and torn_total == 0 and min(cycles_all) >= 5 and not notes
+            else:
+                ok = crashed >= 1 or torn_total >= 1
+            record(name, ok, f"trials={trials} crashed={crashed} torn={torn} exits={[hex(e & 0xffffffff) for e in exits]} "
+                             f"hook_cycles={cycles_all}" + (f" notes={notes[:3]}" if notes else "")
+                             + ("" if ok or mode == "frozen" else " (unsafe never failed: test not sensitive)"))
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+def check_emulated_sites(threads=8, calls=20000):
+    """Sites UHH cannot step out-of-line -- a jmp, a pushfq -- are executed by the
+    controller (emulated) under PROBE_BREAKPOINT: the INT3 never leaves the site, so hits
+    are EXACT with 8 threads racing through it, and no trap flag is ever set, so the
+    flags image the code pushes itself never shows TF (it used to: pushf stepped in place
+    pushed TF=1, the RtlCaptureContext case). hw is run as the reference."""
+    t, a = exe("uhh_trace.exe"), exe("patchrace_target.exe")
+    if not t or not a:
+        return skip("emulated-sites", "uhh_trace/patchrace_target missing")
+    for site, mode in (("BranchSite", "branch"), ("PushfSite", "pushf")):
+        for bk in ("breakpoint", "hw"):
+            name = f"emulated-{mode}-{bk}"
+            try:
+                r, objs = run([t, "--backend", bk, "-p", f"patchrace_target.exe!{site}:-", "--",
+                               a, "--flags", mode, "--threads", threads, "--calls", calls], timeout=600)
+                res = next((x for x in objs if x.get("kind") == "app"), {})
+                pr = next((x for x in objs if x.get("kind") == "probe"), {})
+                want = threads * calls
+                ok = (r.returncode == 0 and res.get("calls") == want and pr.get("hits") == want
+                      and res.get("tf_seen") == 0 and pr.get("backend") == bk)
+                record(name, ok, f"hits={pr.get('hits')}/{want} calls={res.get('calls')} tf_seen={res.get('tf_seen')} "
+                                 f"backend={pr.get('backend')} exit={r.returncode}")
+            except Exception as e:
+                record(name, False, repr(e))
+
+
 def check_crash_logs(n=5000):
     """Log delivery when the TARGET crashes: after n probed calls (one log each) it dies
     with an unhandled access violation. Every log must still arrive -- for inline they
@@ -1042,6 +1185,9 @@ def main():
     if want(check_frida_coexist): check_frida_coexist()
     if want(check_sidefx): check_sidefx()
     if want(check_detach): check_detach()
+    if want(check_ntdll_churn): check_ntdll_churn()
+    if want(check_patch_race): check_patch_race()
+    if want(check_emulated_sites): check_emulated_sites()
     if want(check_crash_logs): check_crash_logs()
     if want(check_attach_new): check_attach_new()
     if want(check_refusals): check_refusals()

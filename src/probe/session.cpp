@@ -124,8 +124,13 @@ struct probe_session {
     ULONGLONG held_since = 0;                       // slots we have ever owned (stale-#DB filter)
     std::unordered_set<uint64_t> retired_bps;  // removed INT3 sites (stale-hit filter)
     std::unordered_set<uint64_t> retired_hw;   // addresses of released hardware probes (stale #DB filter)
+    std::vector<HANDLE> ipc_frozen;            // threads suspended for an agent hook write (FREEZE..THAW)
+    DWORD ipc_freezer = 0;                     // the agent thread doing that write (0 = no freeze)
     int hw_active = 0;
     bool launched = false, ran = false, exited = false, gate_sent = false;
+    bool attach_held = false;                  // attach: threads held once until inline hooks confirmed
+    DWORD cb_tid = 0;                          // thread whose callback / IPC is being serviced (0 = none)
+    std::vector<DWORD> pending_hold;           // callers of a runtime inline add: hold until it lands
     bool attached = false;                     // probe_attach: detach (not kill) on close
     std::atomic<bool> stop_requested{false};   // probe_close from another thread while probe_run runs
     std::atomic<bool> running{false};          // probe_run is executing (on some thread)
@@ -347,6 +352,191 @@ static std::string quote_arg(const char *arg) {
         slashes = 0; out += ch;
     }
     out.append(slashes * 2, '\\'); out += '\"'; return out;
+}
+
+// ---- Emulated sites ---------------------------------------------------------------------
+// Instructions that cannot run out-of-line (relative/indirect branches, call, ret, loop,
+// pushf/popf) used to be stepped IN PLACE: the INT3 was lifted for the step, so another
+// thread could cross the site unseen (inexact), and TF leaked into a pushf'd flags image
+// (RtlCaptureContext starts with pushfq). They are now executed by the controller on the
+// stopped thread's context: the INT3 never leaves, no single-step, no trap flag. Anything
+// not understood here (or a memory access that fails, which must fault for real) still
+// takes the in-place path.
+#if defined(_WIN64)
+#define EMU_IP(c) (c).Rip
+#define EMU_SP(c) (c).Rsp
+#else
+#define EMU_IP(c) (c).Eip
+#define EMU_SP(c) (c).Esp
+#endif
+static bool emu_reg(const CONTEXT &c, ZydisRegister r, uint64_t next_ip, uint64_t &v) {
+    if (r == ZYDIS_REGISTER_NONE) { v = 0; return true; }
+    if (r == ZYDIS_REGISTER_RIP || r == ZYDIS_REGISTER_EIP) { v = next_ip; return true; }
+    ZydisRegister full = ZydisRegisterGetLargestEnclosing(
+#if defined(_WIN64)
+        ZYDIS_MACHINE_MODE_LONG_64,
+#else
+        ZYDIS_MACHINE_MODE_LONG_COMPAT_32,
+#endif
+        r);
+    uint64_t x;
+    switch (full) {
+#if defined(_WIN64)
+        case ZYDIS_REGISTER_RAX: x = c.Rax; break; case ZYDIS_REGISTER_RCX: x = c.Rcx; break;
+        case ZYDIS_REGISTER_RDX: x = c.Rdx; break; case ZYDIS_REGISTER_RBX: x = c.Rbx; break;
+        case ZYDIS_REGISTER_RSP: x = c.Rsp; break; case ZYDIS_REGISTER_RBP: x = c.Rbp; break;
+        case ZYDIS_REGISTER_RSI: x = c.Rsi; break; case ZYDIS_REGISTER_RDI: x = c.Rdi; break;
+        case ZYDIS_REGISTER_R8:  x = c.R8;  break; case ZYDIS_REGISTER_R9:  x = c.R9;  break;
+        case ZYDIS_REGISTER_R10: x = c.R10; break; case ZYDIS_REGISTER_R11: x = c.R11; break;
+        case ZYDIS_REGISTER_R12: x = c.R12; break; case ZYDIS_REGISTER_R13: x = c.R13; break;
+        case ZYDIS_REGISTER_R14: x = c.R14; break; case ZYDIS_REGISTER_R15: x = c.R15; break;
+#else
+        case ZYDIS_REGISTER_EAX: x = c.Eax; break; case ZYDIS_REGISTER_ECX: x = c.Ecx; break;
+        case ZYDIS_REGISTER_EDX: x = c.Edx; break; case ZYDIS_REGISTER_EBX: x = c.Ebx; break;
+        case ZYDIS_REGISTER_ESP: x = c.Esp; break; case ZYDIS_REGISTER_EBP: x = c.Ebp; break;
+        case ZYDIS_REGISTER_ESI: x = c.Esi; break; case ZYDIS_REGISTER_EDI: x = c.Edi; break;
+#endif
+        default: return false;
+    }
+    const ZyanU16 width = ZydisRegisterGetWidth(
+#if defined(_WIN64)
+        ZYDIS_MACHINE_MODE_LONG_64,
+#else
+        ZYDIS_MACHINE_MODE_LONG_COMPAT_32,
+#endif
+        r);
+    if (width == 64) v = x;
+    else if (width == 32) v = (uint32_t)x;
+    else return false;                                   // 16/8-bit addressing: not emulated
+    return true;
+}
+
+static bool emu_cond(ZydisMnemonic m, DWORD f) {
+    const bool cf = f & 0x1, pf = f & 0x4, zf = f & 0x40, sf = f & 0x80, of = f & 0x800;
+    switch (m) {
+        case ZYDIS_MNEMONIC_JO: return of;           case ZYDIS_MNEMONIC_JNO: return !of;
+        case ZYDIS_MNEMONIC_JB: return cf;           case ZYDIS_MNEMONIC_JNB: return !cf;
+        case ZYDIS_MNEMONIC_JZ: return zf;           case ZYDIS_MNEMONIC_JNZ: return !zf;
+        case ZYDIS_MNEMONIC_JBE: return cf || zf;    case ZYDIS_MNEMONIC_JNBE: return !cf && !zf;
+        case ZYDIS_MNEMONIC_JS: return sf;           case ZYDIS_MNEMONIC_JNS: return !sf;
+        case ZYDIS_MNEMONIC_JP: return pf;           case ZYDIS_MNEMONIC_JNP: return !pf;
+        case ZYDIS_MNEMONIC_JL: return sf != of;     case ZYDIS_MNEMONIC_JNL: return sf == of;
+        case ZYDIS_MNEMONIC_JLE: return zf || sf != of; case ZYDIS_MNEMONIC_JNLE: return !zf && sf == of;
+        default: return false;
+    }
+}
+
+// Executes the instruction at `site` on `c`. Returns true when emulated (c updated,
+// memory written); false = not handled, take the stepping path instead.
+static bool emulate_site(probe_session *s, const Probe &p, CONTEXT &c) {
+    if (p.orig_insn.empty()) return false;
+    ZydisDecoder dec;
+#if defined(_WIN64)
+    ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+    const uint32_t ptr = 8;
+#else
+    ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_COMPAT_32, ZYDIS_STACK_WIDTH_32);
+    const uint32_t ptr = 4;
+#endif
+    ZydisDecodedInstruction in;
+    ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, p.orig_insn.data(), p.orig_insn.size(), &in, ops))) return false;
+    const uint64_t site = p.address, next = site + in.length;
+    HANDLE h = s->pi.hProcess;
+    auto push = [&](uint64_t v, uint32_t size) {
+        uint64_t sp = (uint64_t)EMU_SP(c) - size; size_t n = 0;
+        if (!remote_write(h, sp, &v, size, &n) || n != size) return false;
+        EMU_SP(c) = (decltype(EMU_SP(c)))sp; return true;
+    };
+    auto pop = [&](uint64_t &v, uint32_t size) {
+        v = 0; size_t n = 0;
+        if (!remote_read(h, (uint64_t)EMU_SP(c), &v, size, &n) || n != size) return false;
+        EMU_SP(c) = (decltype(EMU_SP(c)))((uint64_t)EMU_SP(c) + size); return true;
+    };
+    // The branch target of operand 0 (relative immediate, register, or memory pointer).
+    auto target = [&](uint64_t &t) {
+        const ZydisDecodedOperand &o = ops[0];
+        if (o.type == ZYDIS_OPERAND_TYPE_IMMEDIATE && o.imm.is_relative) {
+            t = next + (uint64_t)o.imm.value.s;
+#if !defined(_WIN64)
+            t = (uint32_t)t;
+#endif
+            return true;
+        }
+        if (o.type == ZYDIS_OPERAND_TYPE_REGISTER) return emu_reg(c, o.reg.value, next, t) && o.size == ptr * 8;
+        if (o.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            if (o.mem.segment == ZYDIS_REGISTER_FS || o.mem.segment == ZYDIS_REGISTER_GS) return false;
+            if (o.size != ptr * 8) return false;                       // far pointers etc.
+            uint64_t base = 0, index = 0;
+            if (!emu_reg(c, o.mem.base, next, base) || !emu_reg(c, o.mem.index, next, index)) return false;
+            uint64_t a = base + index * o.mem.scale + (uint64_t)o.mem.disp.value;
+#if !defined(_WIN64)
+            a = (uint32_t)a;
+#endif
+            t = 0; size_t n = 0;
+            return remote_read(h, a, &t, ptr, &n) && n == ptr;
+        }
+        return false;
+    };
+    if (in.operand_width != 0 && in.operand_width != 64 && in.operand_width != 32) return false;
+    uint64_t t = 0, v = 0;
+    const CONTEXT before = c;
+    bool ok = false;
+    switch (in.mnemonic) {
+        case ZYDIS_MNEMONIC_JMP:
+            ok = target(t); if (ok) EMU_IP(c) = (decltype(EMU_IP(c)))t; break;
+        case ZYDIS_MNEMONIC_CALL:
+            ok = target(t) && push(next, ptr); if (ok) EMU_IP(c) = (decltype(EMU_IP(c)))t; break;
+        case ZYDIS_MNEMONIC_RET:
+            if (in.operand_count_visible > 1) break;
+            ok = pop(v, ptr);
+            if (ok && in.operand_count_visible == 1 && ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE)
+                EMU_SP(c) = (decltype(EMU_SP(c)))((uint64_t)EMU_SP(c) + ops[0].imm.value.u);
+            if (ok) EMU_IP(c) = (decltype(EMU_IP(c)))v;
+            break;
+        case ZYDIS_MNEMONIC_JO: case ZYDIS_MNEMONIC_JNO: case ZYDIS_MNEMONIC_JB: case ZYDIS_MNEMONIC_JNB:
+        case ZYDIS_MNEMONIC_JZ: case ZYDIS_MNEMONIC_JNZ: case ZYDIS_MNEMONIC_JBE: case ZYDIS_MNEMONIC_JNBE:
+        case ZYDIS_MNEMONIC_JS: case ZYDIS_MNEMONIC_JNS: case ZYDIS_MNEMONIC_JP: case ZYDIS_MNEMONIC_JNP:
+        case ZYDIS_MNEMONIC_JL: case ZYDIS_MNEMONIC_JNL: case ZYDIS_MNEMONIC_JLE: case ZYDIS_MNEMONIC_JNLE:
+            ok = target(t); if (ok) EMU_IP(c) = (decltype(EMU_IP(c)))(emu_cond(in.mnemonic, c.EFlags) ? t : next); break;
+        case ZYDIS_MNEMONIC_JRCXZ: case ZYDIS_MNEMONIC_JECXZ: {
+            uint64_t cx = 0;
+            ok = target(t) && emu_reg(c, in.mnemonic == ZYDIS_MNEMONIC_JRCXZ ? ZYDIS_REGISTER_RCX : ZYDIS_REGISTER_ECX, next, cx);
+            if (ok) EMU_IP(c) = (decltype(EMU_IP(c)))(cx == 0 ? t : next);
+            break;
+        }
+        case ZYDIS_MNEMONIC_LOOP: case ZYDIS_MNEMONIC_LOOPE: case ZYDIS_MNEMONIC_LOOPNE: {
+            if (in.address_width != ptr * 8 || !target(t)) break;   // counter = rcx (x64) / ecx (x86)
+#if defined(_WIN64)
+            uint64_t &cx = c.Rcx;
+#else
+            DWORD &cx = c.Ecx;
+#endif
+            --cx;
+            const bool zf = c.EFlags & 0x40;
+            const bool take = cx != 0 && (in.mnemonic == ZYDIS_MNEMONIC_LOOP ||
+                                          (in.mnemonic == ZYDIS_MNEMONIC_LOOPE && zf) ||
+                                          (in.mnemonic == ZYDIS_MNEMONIC_LOOPNE && !zf));
+            EMU_IP(c) = (decltype(EMU_IP(c)))(take ? t : next); ok = true;
+            break;
+        }
+        case ZYDIS_MNEMONIC_PUSHFQ: case ZYDIS_MNEMONIC_PUSHFD:
+            // The image the CPU pushes: RF and VM read as 0. TF as the TARGET has it (ours
+            // is never set here: there is no single-step).
+            ok = push((uint64_t)(c.EFlags & ~0x30000u), ptr); if (ok) EMU_IP(c) = (decltype(EMU_IP(c)))next; break;
+        case ZYDIS_MNEMONIC_POPFQ: case ZYDIS_MNEMONIC_POPFD: {
+            // CPL 3: CF PF AF ZF SF TF DF OF NT AC ID change; IF/IOPL/VM/RF do not.
+            const DWORD mask = 0x1 | 0x4 | 0x10 | 0x40 | 0x80 | 0x100 | 0x400 | 0x800 | 0x4000 | 0x40000 | 0x200000;
+            ok = pop(v, ptr);
+            if (ok) { c.EFlags = (c.EFlags & ~mask) | ((DWORD)v & mask); EMU_IP(c) = (decltype(EMU_IP(c)))next; }
+            break;
+        }
+        default: break;
+    }
+    if (!ok) { c = before; return false; }
+    // Undo a partial write is not needed: push writes only below SP, which the CPU would
+    // have written as well; on any failure c is restored and the real instruction runs.
+    return true;
 }
 
 // Decode the site instruction to plan the single-step. Fills its length, whether it
@@ -781,58 +971,46 @@ static bool detect_prehook(probe_session *s, const Probe &p, std::string &json) 
 // inspect); PROBE_ALLOW_PREHOOKED chains anyway, PROBE_FALLBACK_HW moves the probe to a
 // debug register. Breakpoint probes still work (the jmp is stepped in place): report only.
 // Returns false when the probe must not be armed; sets moved_to_hw when converted.
-// An inline hook is installed by making the site's page non-executable for a moment
-// (SafetyHook's thread-safe patching) while the installer calls back into ntdll. If the
-// site shares a page with the very routines that sequence needs, the installer faults on
-// itself. Those pages are off-limits to inline hooks: use the hardware backend there.
-static bool inline_page_hazard(probe_session *s, const Probe &p, std::string &which) {
-    uint64_t ntdll = 0;
-    for (auto &kv : s->module_bases) if (iequals(kv.first, "ntdll.dll")) { ntdll = kv.second; break; }
-    if (!ntdll || !p.address) return false;
-    static const char *const needed[] = {"NtProtectVirtualMemory", "NtQueryVirtualMemory",
-                                         "NtFlushInstructionCache", "KiUserExceptionDispatcher",
-                                         "NtContinue", "RtlAddVectoredExceptionHandler",
-                                         "RtlAcquireSRWLockExclusive", "RtlReleaseSRWLockExclusive",
-                                         "RtlEnterCriticalSection", "RtlLeaveCriticalSection",
-                                         "RtlAllocateHeap", "RtlFreeHeap", "NtAllocateVirtualMemory",
-                                         "NtFreeVirtualMemory"};
-    uint64_t lo = p.address & ~(uint64_t)0xFFF, hi = (p.address + 32 + 0xFFF) & ~(uint64_t)0xFFF;
-    std::string saved = s->error;
-    for (const char *name : needed) {
-        uint64_t rva = 0;
-        if (!resolve_export(s, ntdll, name, rva)) continue;
-        uint64_t a = ntdll + rva;
-        if (a + 32 > lo && a < hi) { which = std::string("ntdll!") + name; s->error = saved; return true; }
+// An inline hook replaces the first instructions (>= 5 bytes) with a jump. If one of
+// those instructions is a CALL that is not the last of them, a thread that is inside the
+// callee when the hook is written later returns into the middle of the jump. No freeze
+// can fix that (the return address is on its stack, not in its IP), so such sites go to
+// the hardware backend with PROBE_FALLBACK_HW, else are refused.
+static bool inline_inner_call(probe_session *s, const Probe &p, std::string &why) {
+    unsigned char b[32] = {}; size_t n = 0;
+    if (!remote_read(s->pi.hProcess, p.address, b, sizeof(b), &n) || n < 5) return false;
+    ZydisDecoder dec;
+#if defined(_WIN64)
+    ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+#else
+    ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_COMPAT_32, ZYDIS_STACK_WIDTH_32);
+#endif
+    size_t off = 0; int64_t call_end = -1;
+    while (off < 5) {
+        ZydisDecodedInstruction insn{};
+        if (!ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(&dec, nullptr, b + off, n - off, &insn))) return false;
+        off += insn.length;
+        if (insn.meta.category == ZYDIS_CATEGORY_CALL) call_end = (int64_t)off;
     }
-    // KernelBase wrappers the installer calls (VirtualProtect, VirtualQuery, ...).
-    uint64_t kb = 0;
-    for (auto &kv : s->module_bases) if (iequals(kv.first, "KernelBase.dll")) { kb = kv.second; break; }
-    static const char *const kbneeded[] = {"VirtualProtect", "VirtualQuery", "VirtualAlloc", "VirtualFree",
-                                           "FlushInstructionCache"};
-    for (const char *name : kbneeded) {
-        if (!kb) break;
-        uint64_t rva = 0;
-        if (!resolve_export(s, kb, name, rva)) continue;
-        uint64_t a = kb + rva;
-        if (a + 32 > lo && a < hi) { which = std::string("KernelBase!") + name; s->error = saved; return true; }
-    }
-    s->error = saved;
-    return false;
+    if (call_end < 0 || call_end == (int64_t)off) return false;   // no call, or the call is the last stolen instruction
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "a call at +0x%llx returns inside the %zu bytes the hook overwrites",
+                  (unsigned long long)(call_end), off);
+    why = buf;
+    return true;
 }
 
 static bool vet_site(probe_session *s, Probe &p, bool &moved_to_hw) {
     moved_to_hw = false;
     if (p.flags & PROBE_HW) return true;
-    std::string hazard;
-    if ((p.flags & PROBE_INLINE) && inline_page_hazard(s, p, hazard)) {
+    std::string inner;
+    if ((p.flags & PROBE_INLINE) && inline_inner_call(s, p, inner)) {
         if (p.flags & PROBE_FALLBACK_HW) {
             p.flags = (p.flags & ~(uint32_t)PROBE_INLINE) | PROBE_HW; moved_to_hw = true;
-            std::fprintf(stderr, "probe: %s -> hardware fallback (shares a page with %s, which the inline installer needs)\n",
-                         p.location.c_str(), hazard.c_str());
+            std::fprintf(stderr, "probe: %s -> hardware fallback (%s)\n", p.location.c_str(), inner.c_str());
             return true;
         }
-        set_error(s, "inline probe " + p.location + " shares a page with " + hazard +
-                     " (the inline installer needs it); use PROBE_HW or PROBE_FALLBACK_HW");
+        set_error(s, "inline probe " + p.location + ": " + inner + "; use PROBE_HW/PROBE_BREAKPOINT or PROBE_FALLBACK_HW");
         return false;
     }
     std::string json;
@@ -870,14 +1048,11 @@ static bool arm_probe(probe_session *s, Probe &item, uint64_t base) {
         view.address = base + view.rva;
         bool moved = false;
         if (!vet_site(s, view, moved)) { item.retired = true; return false; }
-        if (moved) item.flags = view.flags;                // pre-hooked / hazard page -> hw
+        if (moved) item.flags = view.flags;                // pre-hooked -> hw (PROBE_FALLBACK_HW)
     }
-    if ((item.flags & PROBE_INLINE) && (item.flags & PROBE_FALLBACK_HW) && s->gate_sent &&
-        !(s->shared && s->shared->service_ready && s->svc_event)) {
-        item.flags = (item.flags & ~(uint32_t)PROBE_INLINE) | PROBE_HW;
-        std::fprintf(stderr, "probe: %s -> hardware fallback (late inline would race the first call)\n",
-                     item.location.c_str());
-    }
+    // (No "late inline -> hardware" rule: launch holds the main thread at the entry point
+    // until the agent is ready, attach holds every thread until the hooks are confirmed,
+    // and a module loaded later is held at its LOAD_DLL event. Inline stays inline.)
     if (!item.export_name.empty()) {
         uint64_t exp = 0;
         if (!resolve_export(s, base, item.export_name, exp)) {
@@ -1015,16 +1190,18 @@ static uint32_t hw_in_use(const probe_session *s) {
     return n;
 }
 
+static_assert(PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH == PROBE_UNSAFE_FAST_PATCH, "agent flag mirror");
 static bool check_flags(probe_session *s, uint32_t flags, bool allow_inline) {
     constexpr uint32_t types = PROBE_BREAKPOINT | PROBE_INLINE | PROBE_HW;
     constexpr uint32_t known = types | PROBE_AT_RETURN | PROBE_ALLOW_PREHOOKED | PROBE_FALLBACK_HW
-                             | PROBE_WATCH_WRITE | PROBE_WATCH_RW | PROBE_ONCE;
+                             | PROBE_WATCH_WRITE | PROBE_WATCH_RW | PROBE_ONCE | PROBE_UNSAFE_FAST_PATCH;
     if (flags & ~known) { set_error(s, "unknown probe flags"); return false; }
     uint32_t type = flags & types;
     uint32_t watch = flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW);
     if ((type != PROBE_BREAKPOINT && type != PROBE_INLINE && type != PROBE_HW) || (flags & PROBE_AT_RETURN) ||
         ((flags & PROBE_ALLOW_PREHOOKED) && type != PROBE_INLINE) || // only meaningful for inline
         ((flags & PROBE_FALLBACK_HW) && type != PROBE_INLINE) ||     // fallback only modifies an inline probe
+        ((flags & PROBE_UNSAFE_FAST_PATCH) && type != PROBE_INLINE) || // only inline hooks write code
         (watch && type != PROBE_HW) ||                               // a watchpoint uses the DR/HW backend
         watch == (PROBE_WATCH_WRITE | PROBE_WATCH_RW) ||             // pick one access mode, not both
         ((flags & PROBE_ONCE) && type == PROBE_INLINE)) {            // one-shot needs a controller backend
@@ -1196,8 +1373,8 @@ static bool accept_agent_install(probe_session *s);
 // request slot -- creating the channel on first use -- and is installed by the agent on
 // a FRESH remote thread, never inside the calling callback: the installer freezes other
 // threads, and the caller may hold locks (heap, loader) a frozen thread is waiting on.
-// So it is asynchronous: the hook lands shortly after this returns. Use PROBE_BREAKPOINT
-// or PROBE_HW when it must be live before the target's next instruction.
+// The calling thread is held until the agent confirms the hook (see pending_hold), so
+// from the caller's point of view the add is synchronous.
 static bool register_runtime_inline(probe_session *s, Probe &p) {
     if (!s->shared && !open_agent_section(s, 0)) return false;
     uint32_t idx = s->shared->request_count;
@@ -1211,6 +1388,10 @@ static bool register_runtime_inline(probe_session *s, Probe &p) {
     fill_request(s, p);
     MemoryBarrier();
     s->shared->request_count = idx + 1;
+    // Synchronous for the caller: the thread whose callback added the probe is held
+    // (after its event is handled) until the agent confirms the hook, so its next call
+    // through the new site is seen. Other threads run on; they were never promised it.
+    if (s->cb_tid) s->pending_hold.push_back(s->cb_tid);
     return true;
 }
 
@@ -1225,6 +1406,15 @@ static bool inline_unconfirmed(const probe_session *s) {
     for (const auto &p : s->probes)
         if ((p->flags & PROBE_INLINE) && p->address && !p->active && !p->retired) return true;
     return false;
+}
+
+// Hold the main thread at the entry point while an inline install is outstanding OR
+// while inline probes exist but the agent's service thread is not up yet: a module
+// with an inline site may load at any moment after entry, and the thread loading it
+// holds the loader lock -- only an already-running service thread can install then.
+static bool inline_hold_needed(const probe_session *s) {
+    if (inline_unconfirmed(s)) return true;
+    return has_inline(s) && !(s->shared && s->shared->service_ready && s->svc_event);
 }
 
 static void hold_thread(probe_session *s, DWORD tid) {
@@ -1414,6 +1604,7 @@ static void pump(probe_session *s, DWORD ms) {
     }
 }
 
+static void ipc_thaw(probe_session *s);
 static void detach(probe_session *s) {
     s->error.clear();
     release_held(s, "detach");
@@ -1430,6 +1621,7 @@ static void detach(probe_session *s) {
             }
         }
     }
+    ipc_thaw(s);                                      // never leave an agent hook-write freeze behind
     // From here no target thread may run until the debugger is gone: a thread could hit an
     // INT3 or debug register just before it is removed, and an event still queued at
     // DebugActiveProcessStop would reach the target as an unhandled exception.
@@ -1608,6 +1800,83 @@ static void release_hw(probe_session *s, Probe &p) {
     if (p.flags & PROBE_ONCE) p.retired = true;
 }
 
+// ---- Frozen hook writes (agent FREEZE / THAW) ------------------------------------------
+// The agent writes inline hooks only while every other target thread is suspended here, so
+// no thread can execute bytes mid-write and the page never has to be made non-executable
+// (which faulted on ntdll's own syscall stubs and raised exceptions the target could see).
+static void ipc_thaw(probe_session *s) {
+    for (HANDLE t : s->ipc_frozen) { ResumeThread(t); CloseHandle(t); }
+    s->ipc_frozen.clear();
+    s->ipc_freezer = 0;
+}
+
+static void ipc_freeze_thread(probe_session *s, DWORD tid) {
+    HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+    if (!t) return;
+    if (SuspendThread(t) == (DWORD)-1) { CloseHandle(t); return; }
+    s->ipc_frozen.push_back(t);
+}
+
+// A frozen thread stopped strictly inside a range the agent is about to overwrite would
+// resume on torn bytes. Move it to the same instruction in that hook's trampoline, which
+// holds relocated copies of exactly those instructions (one-to-one, in order) and then
+// jumps back to site + patch_len.
+static void move_into_trampoline(probe_session *s, HANDLE t, uint64_t mask) {
+    CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
+    if (!GetThreadContext(t, &c)) return;
+#if defined(_WIN64)
+    uint64_t ip = c.Rip;
+#else
+    uint64_t ip = c.Eip;
+#endif
+    for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i) {
+        if (!(mask & (1ull << i))) continue;
+        const auto &r = s->shared->requests[i];
+        const uint64_t site = r.site, tramp = r.trampoline; const uint32_t len = r.patch_len;
+        if (!site || !tramp || !len || len > 32 || ip <= site || ip >= site + len) continue;
+        unsigned char ob[48] = {}, tb[128] = {}; size_t on = 0, tn = 0;
+        remote_read(s->pi.hProcess, site, ob, sizeof(ob), &on);
+        remote_read(s->pi.hProcess, tramp, tb, sizeof(tb), &tn);
+        ZydisDecoder dec;
+#if defined(_WIN64)
+        ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+#else
+        ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_COMPAT_32, ZYDIS_STACK_WIDTH_32);
+#endif
+        size_t o = 0, q = 0;
+        while (o < len && o < on && q < tn) {
+            if (site + o == ip) {
+#if defined(_WIN64)
+                c.Rip = tramp + q;
+#else
+                c.Eip = (DWORD)(tramp + q);
+#endif
+                SetThreadContext(t, &c);
+                return;
+            }
+            ZydisDecodedInstruction a{}, b{};
+            if (!ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(&dec, nullptr, ob + o, on - o, &a)) ||
+                !ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(&dec, nullptr, tb + q, tn - q, &b))) break;
+            o += a.length; q += b.length;
+        }
+        std::fprintf(stderr, "probe: freeze: thread at 0x%llx inside hook range 0x%llx+%u not mapped\n",
+                     (unsigned long long)ip, (unsigned long long)site, len);
+        return;
+    }
+}
+
+static int32_t ipc_freeze(probe_session *s, DWORD self, uint64_t mask) {
+    ipc_thaw(s);                                  // a stale freeze (agent thread died) never stacks
+    for (DWORD tid : s->threads) {
+        if (tid == self) continue;
+        size_t before = s->ipc_frozen.size();
+        ipc_freeze_thread(s, tid);
+        if (mask && s->ipc_frozen.size() > before) move_into_trampoline(s, s->ipc_frozen.back(), mask);
+    }
+    s->ipc_freezer = self;
+    return 1;
+}
+
 // Agent -> controller control-plane call (an inline callback used get_session(c)).
 // The raising thread is stopped; service the request and write the result back.
 // Trust boundary: the target is untrusted. A request is honoured only when an inline
@@ -1620,7 +1889,16 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
     {
         probe_ipc_request head{}; size_t n = 0;
         if (remote_read(s->pi.hProcess, (uint64_t)ex.ExceptionInformation[0], &head, offsetof(probe_ipc_request, address), &n) &&
-            n == offsetof(probe_ipc_request, address) && head.op == PROBE_IPC_INSTALL_DONE) {
+            n == offsetof(probe_ipc_request, address) && (head.op == PROBE_IPC_FREEZE || head.op == PROBE_IPC_THAW)) {
+            uint64_t mask = 0; size_t m = 0;
+            remote_read(s->pi.hProcess, (uint64_t)ex.ExceptionInformation[0] + offsetof(probe_ipc_request, address), &mask, sizeof(mask), &m);
+            if (head.op == PROBE_IPC_THAW) { if (s->ipc_freezer == event.dwThreadId) ipc_thaw(s); return true; }
+            int32_t result = ipc_freeze(s, event.dwThreadId, m == sizeof(mask) ? mask : 0);
+            size_t wrote = 0;
+            remote_write(s->pi.hProcess, (uint64_t)ex.ExceptionInformation[0] + offsetof(probe_ipc_request, result), &result, sizeof(result), &wrote);
+            return true;
+        }
+        if (n == offsetof(probe_ipc_request, address) && head.op == PROBE_IPC_INSTALL_DONE) {
             // Harmless if forged: acceptance re-checks every request status itself.
             if (!accept_agent_install(s)) { std::fprintf(stderr, "probe: %s\n", s->error.c_str()); }
             if (agent_has_pending(s)) kick_agent(s);
@@ -1646,6 +1924,8 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
         }
     if (!origin) return false;
     int32_t result = 0;
+    struct CbTid { probe_session *s; ~CbTid() { s->cb_tid = 0; } } cb_tid_scope{s};
+    s->cb_tid = event.dwThreadId;
     if (!cb) {
         std::fprintf(stderr, "probe: dynamic add from inline callback: no controller-side export '%s'\n", req.callback);
     } else if (req.op == PROBE_IPC_ADD_ADDRESS) result = probe_add_address(s, req.address, cb, req.flags);
@@ -1706,7 +1986,8 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
         context.tid = event.dwThreadId;
         CallbackState state{s, probe, event.dwProcessId, event.dwThreadId}; context.controller = &state;
         if (event.dwThreadId == s->in_call_tid) { ++probe->hits; continue; }   // inside call_func: no re-entry
-        try { probe->callback(&context); }
+        s->cb_tid = event.dwThreadId;
+        try { probe->callback(&context); s->cb_tid = 0; }
         catch (const std::exception &e) { CloseHandle(thread); set_error(s, std::string("probe callback: ") + e.what()); return false; }
         catch (...) { CloseHandle(thread); set_error(s, "probe callback threw an unknown exception"); return false; }
         ++probe->hits;
@@ -1902,8 +2183,9 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     context.config = probe->config.empty() ? nullptr : probe->config.data();
     context.tid = event.dwThreadId;
     CallbackState state{s, probe, event.dwProcessId, event.dwThreadId}; context.controller = &state;
+    s->cb_tid = event.dwThreadId;
     if (event.dwThreadId != s->in_call_tid)          // a probe hit INSIDE call_func's callee: step over it
-    try { probe->callback(&context); }
+    try { probe->callback(&context); s->cb_tid = 0; }
     catch (const std::exception &e) {
         CloseHandle(thread); set_error(s, std::string("probe callback: ") + e.what()); return false;
     } catch (...) {
@@ -1933,7 +2215,17 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         bool ok = !!SetThreadContext(thread, &native);
         CloseHandle(thread);
         if (!ok) { set_error(s, win_error("resume after one-shot")); return false; }
-        if (at_entry && inline_unconfirmed(s)) { hold_thread(s, event.dwThreadId); if (!kick_agent(s)) return false; }
+        if (at_entry && inline_hold_needed(s)) { hold_thread(s, event.dwThreadId); if (!kick_agent(s)) return false; }
+        disposition = DBG_CONTINUE; return true;
+    }
+    // Branches, call/ret, loop, pushf/popf: executed here on the context -- the INT3 stays
+    // armed (exact under threads) and no trap flag is ever set (nothing leaks).
+    if (!probe->displaced_ok && emulate_site(s, *probe, native)) {
+        native.ContextFlags = CONTEXT_FULL;               // keep any DRs the callback armed
+        bool ok = !!SetThreadContext(thread, &native);
+        CloseHandle(thread);
+        if (!ok) { set_error(s, win_error("apply emulated instruction")); return false; }
+        if (at_entry && inline_hold_needed(s)) { hold_thread(s, event.dwThreadId); if (!kick_agent(s)) return false; }
         disposition = DBG_CONTINUE; return true;
     }
     // Displaced stepping (default for ordinary instructions): run the original
@@ -1992,7 +2284,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
                      (unsigned long)event.dwThreadId, displaced,
                      (unsigned long long)scratch_addr, (unsigned long long)(displaced ? scratch_addr : probe->address));
     stepping[event.dwThreadId] = StepState{probe, displaced, probe->address, probe->insn_len, displaced ? scratch_addr : 0};
-    if (at_entry && inline_unconfirmed(s)) { hold_thread(s, event.dwThreadId); if (!kick_agent(s)) return false; }
+    if (at_entry && inline_hold_needed(s)) { hold_thread(s, event.dwThreadId); if (!kick_agent(s)) return false; }
     disposition = DBG_CONTINUE; return true;
 }
 
@@ -2221,6 +2513,7 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
     }
     case CREATE_THREAD_DEBUG_EVENT:
         s->threads.insert(event.dwThreadId);
+        if (s->ipc_freezer) ipc_freeze_thread(s, event.dwThreadId);   // born during a hook write: hold it too
         if (s->hw_active && event.u.CreateThread.hThread)     // new thread inherits the DRs
             for (auto &p : s->probes)
                 if (p->active && (p->flags & PROBE_HW)) {
@@ -2233,6 +2526,7 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
         break;
     case EXIT_THREAD_DEBUG_EVENT: {
         if (event.dwThreadId == s->remote_tid) ok = complete_remote_thread(s, event.u.ExitThread.dwExitCode);
+        if (event.dwThreadId == s->ipc_freezer) ipc_thaw(s);       // agent thread died mid-write: never strand the rest
         s->threads.erase(event.dwThreadId);
         auto it = s->stepping.find(event.dwThreadId);
         if (ok && it != s->stepping.end()) {
@@ -2284,6 +2578,10 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
                 // the agent installs a fresh hook at the new address.
                 std::fprintf(stderr, "probe: %s unloaded with its module; pending until it loads again\n", p->location.c_str());
                 p->active = false; p->vetted = false; p->base = p->address = 0;
+                // Tell the agent: its hook there now points at unmapped (or reused) memory,
+                // so detach must not write the original bytes back.
+                if (s->shared && p->agent_index < PROBE_AGENT_MAX_PROBES)
+                    InterlockedExchange(&s->shared->requests[p->agent_index].status, PROBE_AGENT_UNLOADED);
             } else if (p->flags & PROBE_HW) {
                 // Fully release the hardware breakpoint: clear its DR on every thread,
                 // free the slot, and drop the active count. A half-disarm (just
@@ -2297,11 +2595,23 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
     }
     case EXCEPTION_DEBUG_EVENT:
         ok = handle_exception(s, event, s->stepping, s->initial_break, disposition);
+        s->cb_tid = 0;
+        for (DWORD tid : s->pending_hold) hold_thread(s, tid);
+        s->pending_hold.clear();
+        if (ok && s->initial_break && s->attached && !s->attach_held && has_inline(s)) {
+            // Attach: the target was already running. Hold every thread (not the break-in
+            // thread, which only returns) until the agent confirms the inline hooks, so no
+            // call slips past a site that is about to be hooked. Released by the install
+            // confirmation, or by the install timeout if a held thread blocks the loader.
+            s->attach_held = true;
+            for (DWORD tid : s->threads) if (tid != event.dwThreadId) hold_thread(s, tid);
+        }
         if (ok && s->initial_break && has_inline(s) && !s->remote_agent &&
             s->remote_work == probe_session::REMOTE_NONE)
             ok = start_agent_load(s);
         break;
     case EXIT_PROCESS_DEBUG_EVENT:
+        ipc_thaw(s);
         s->exit_code = event.u.ExitProcess.dwExitCode; s->exited = true; break;
     default: break;
     }

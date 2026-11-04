@@ -4,11 +4,12 @@
 //   gated_config [--flag-backend b] [--read-backend b] [--no-log]
 //                <flag_location> <read_location> -- <target.exe> [target args]
 //
-//   e.g. gated_config configparse.dll!ParseConfig+0x16 probe_app.exe!ReadThunk -- probe_app.exe
+//   e.g. gated_config configparse.dll!ParseConfig+0x16 ntdll.dll!NtReadVirtualMemory -- probe_app.exe
 //
 // b = breakpoint | hw | inline (flag default breakpoint, reads default inline). The
-// OpenThunk probe (handle -> pid for the read log) uses the read backend, so the
-// map it builds lives in the same address space as log_read.
+// ntdll!NtOpenProcess probe (handle -> pid for the read log) uses the read backend, so
+// the map it builds lives in the same address space as log_read. Probing the ntdll
+// syscall stubs catches every caller, whichever wrapper (or none) it went through.
 #include "callbacks.h"
 #include <cstdio>
 #include <cstring>
@@ -33,16 +34,12 @@ int main(int argc, char **argv) {
     if (!flag_backend || !read_backend || nloc != 2 || i + 1 >= argc) return usage();
     char **target = argv + i + 1;   // argv is NULL-terminated
 
-    // An inline probe on a site that resolves late (configparse.dll loads after the
-    // gate) may fall back to a hardware breakpoint instead of racing the first call.
-    if (flag_backend == PROBE_INLINE) flag_backend |= PROBE_FALLBACK_HW;
-    if (read_backend == PROBE_INLINE) read_backend |= PROBE_FALLBACK_HW;
     read_log_config cfg{READ_LOG_COOKIE, log, 0, 0, 0, 0};
 
     probe_session *s = probe_session_create();
     if (!s) return 1;
     int ok = probe_add_symbol(s, locations[0], enable_reads, flag_backend) &&
-             probe_add_symbol(s, "probe_app.exe!OpenThunk", track_open_process, read_backend) &&
+             probe_add_symbol(s, "ntdll.dll!NtOpenProcess", track_open_process, read_backend) &&
              probe_add_symbol_cfg(s, locations[1], log_read, read_backend, &cfg, sizeof(cfg)) &&
              probe_launch(s, target) && probe_run(s) && probe_wait_for_exit(s);
     probe_report(s, stdout);   // "overrides" = how many times the flag was flipped

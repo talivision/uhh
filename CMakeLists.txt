@@ -42,7 +42,9 @@ set(SAFETYHOOK_BUILD_TEST OFF CACHE BOOL "" FORCE)
 set(SAFETYHOOK_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(SAFETYHOOK_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(SAFETYHOOK_FETCH_ZYDIS ON CACHE BOOL "" FORCE)
-FetchContent_Declare(safetyhook GIT_REPOSITORY https://github.com/cursey/safetyhook.git GIT_TAG v0.7.0 GIT_SHALLOW TRUE)
+FetchContent_Declare(safetyhook GIT_REPOSITORY https://github.com/cursey/safetyhook.git GIT_TAG v0.7.0 GIT_SHALLOW TRUE
+    PATCH_COMMAND ${CMAKE_COMMAND} -DSRC=<SOURCE_DIR> -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_safetyhook.cmake
+    UPDATE_DISCONNECTED TRUE)
 FetchContent_MakeAvailable(safetyhook)
 
 # --- Example targets (examples/targets): what gated_config and uhh_attach instrument --
@@ -178,6 +180,15 @@ target_include_directories(memstress_driver PRIVATE include examples/memstress)
 target_link_libraries(memstress_driver PRIVATE probe_api)
 add_dependencies(memstress_driver memstress_target probe_api_agent)
 
+# --- patch race: threads inside the bytes an inline hook overwrites ----------------------
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    set(PATCHRACE_ASM examples/targets/patchrace/patchrace_sites_x86.asm)
+else()
+    set(PATCHRACE_ASM examples/targets/patchrace/patchrace_sites_x64.asm)
+endif()
+add_executable(patchrace_target examples/targets/patchrace/patchrace_target.c ${PATCHRACE_ASM})
+target_link_options(patchrace_target PRIVATE "/EXPORT:RaceSite" "/EXPORT:BranchSite" "/EXPORT:PushfSite")
+
 # --- side-effect transparency: a probe hit leaves no trace on the thread ----------------
 if(CMAKE_SIZEOF_VOID_P EQUAL 4)
     set(SIDEFX_ASM examples/sidefx/sidefx_sites_x86.asm)
@@ -211,7 +222,7 @@ target_include_directories(refusal_driver PRIVATE include)
 target_link_libraries(refusal_driver PRIVATE probe_api)
 add_dependencies(refusal_driver hitcost_target)
 
-foreach(t refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
+foreach(t patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
     target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 endforeach()

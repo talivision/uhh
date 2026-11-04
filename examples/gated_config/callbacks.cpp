@@ -11,10 +11,10 @@ extern "C" void enable_reads(probe_context *c) {
     if (get_reg(c, PROBE_REG_AX) == 0) set_reg(c, PROBE_REG_AX, 1);
 }
 
-// 2. Handle -> pid map, built from probe_app.exe!OpenThunk, the target's own wrapper with
-//    NtOpenProcess's signature (PHANDLE out, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID).
-//    The wrapper (not the ntdll syscall stub) is probed so this probe can use the same
-//    backend as the read probe: the map must live where the read callback runs. At ENTRY the pid is known (cid->UniqueProcess)
+// 2. Handle -> pid map, built from ntdll!NtOpenProcess (PHANDLE out, ACCESS_MASK,
+//    POBJECT_ATTRIBUTES, PCLIENT_ID): the syscall stub every OpenProcess path ends in.
+//    It uses the same backend as the read probe: the map must live where the read
+//    callback runs. At ENTRY the pid is known (cid->UniqueProcess)
 //    but the handle is not yet: it is written to *out by the kernel. So remember the
 //    out pointer and dereference it LAZILY, the first time a read uses a handle we have
 //    not seen -- by then the open has long returned.
@@ -66,7 +66,7 @@ extern "C" void track_open_process(probe_context *c) {
     g_opens[slot].pid.store(pid, std::memory_order_release);   // publish
 }
 
-// 3. Every read through probe_app.exe!ReadThunk, i.e. NtReadVirtualMemory(handle,
+// 3. Every read through ntdll!NtReadVirtualMemory(handle,
 //    address, buffer, size, done). Optionally filtered to one pid + one address range.
 extern "C" void log_read(probe_context *c) {
     auto *cfg = static_cast<const read_log_config *>(get_config(c));

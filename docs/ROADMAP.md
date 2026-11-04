@@ -39,7 +39,9 @@ identical source under every backend.
 ## Program-correctness guarantees (probes must have no side effects)
 - ✅ Side-effect audit + tests: after any callback, the target observes no change except deliberate `set_reg`/`set_mem`: `GetLastError()`, `errno`, x87/SSE/AVX state, EFLAGS, TEB fields, stack contents below SP — under breakpoint, hw and inline
 - ✅ Loader-time probe hits (a probe firing before the loader breakpoint) handled as hits, not swallowed (was crashing findstr x86)
-- ✅ Inline sites sharing a page with routines the inline installer itself calls (ntdll NtProtect/NtQuery/NtFlush/heap/SRW, KernelBase VirtualProtect/Query/Alloc) -> hardware fallback with `PROBE_FALLBACK_HW`, else a clear refusal; never a crash. Documented limitation: inline on those pages (e.g. most ntdll syscall stubs) is not attempted
+- 🔧 Inline hooks on ntdll syscall stubs (the page ban is REMOVED): hooks are written with the target frozen by the controller (FREEZE/THAW IPC), page kept executable, threads inside the overwritten bytes moved to the trampoline; SafetyHook patched at build time (`cmake/patch_safetyhook.cmake`). gated_config/attach now probe `ntdll!NtReadVirtualMemory` / `ntdll!NtOpenProcess` directly. Tests: `ntdll-churn-*` (attach/hook/detach cycles under load, all backends), `patch-race-{frozen,unsafe}` (`PROBE_UNSAFE_FAST_PATCH` must fail sometimes; frozen never)
+- ✅ Inline sites whose overwritten bytes contain a non-final CALL (a thread in the callee would return mid-jump): refused, or hardware with `PROBE_FALLBACK_HW`
+- ✗ Handle->pid through `kernel32!OpenProcess`: example design, documented (not a library item)
 - ✅ Memory reads/writes at scale: millions of `get_mem`/`set_mem` across threads and backends; exact values, writes visible to the target, page-crossing and large sizes, unmapped/protected addresses fail cleanly, throughput per backend
 - 🔧 Continuous evaluators (two full rounds done; more to come): independent agents repeatedly hunting edge cases, regressions and gaps against the gated_config use case
 
@@ -59,6 +61,38 @@ identical source under every backend.
 - ✅ P2 sidefx: full arithmetic EFLAGS (probe between cmp and jcc), LastStatus; below-SP documented as exempt
 - ⬜ P2 x86 stacks mid-function / FPO frames identical across backends
 - ⬜ P2 mixed backends for state-sharing probes: documented limitation (state lives where callbacks run)
+
+## Evaluator round 3 (2026-11-05) — open
+- ✅ (#3) detach after a hooked DLL unloaded wrote original bytes to unmapped/reused memory -> agent skips UNLOADED hooks
+- ✅ (#4) call inside the stolen bytes -> refused / hw fallback
+- ⬜ (#1) in-place step of `pushf` leaks TF into the pushed flags (RtlCaptureContext) -> clear TF in the pushed value
+- ⬜ (#2) in-place fallback (branch/call/rep/pushf sites) not exact under threads: missed hits while lifted, double hit via queued INT3
+- ⬜ (#5) x86 inline send_log_stack / set_mem can raise first-chance AVs the target's VEH sees; t_region cache never invalidated
+- ⬜ (#6) breakpoint/hw call_func: last-error/status, x86 FP, YMM not restored; callee exceptions abort the call
+- ⬜ (#7) call_func on forwarded exports works inline, fails breakpoint/hw
+- ⬜ (#8) set_reg(SP) honoured by breakpoint/hw, silently dropped inline (but counted)
+- ⬜ (#9) detach while agent work in flight leaves inline hooks live
+- ⬜ (#10) inline re-attach to a previously detached process fails (mapping/g_stopping persist)
+- ⬜ (#11) slow install releases holds after 5 s silently; HOOK_FAILED stops accepting later probes
+- ⬜ (#12) tests: attach flag probe only breakpoint; detach/crash logs not counted multi-thread; x87 status word
+- ⬜ probe_close 15 s timeout path: detach on the wrong thread while probe_run still detaching (use-after-free)
+- ⬜ frida_coexist hangs (found again 2026-11-05)
+
+## Codex workaround audit (2026-11-05) — triaged
+- ✗ (C1) handle->pid through kernel32!OpenProcess: example-callback design, not a library issue (user, 2026-11-05); documented in the gated_config README
+- ⬜ (C11) example handle map: no silent 1024 cap
+- ⬜ (C3) attach holds threads until inline hooks are confirmed (like launch); attach test without the gate, target already busy
+- ⬜ (C12) runtime inline add holds the calling thread until the hook lands; drop the 300 ms sleeps in conformance/dynwatch
+- ⬜ (C4) uhh_trace: exact backend unless --fallback-hw; every test asserts the effective backend
+- ⬜ (C5/C8) docs: logging-plan.md rewritten to the lossless contract; README/probe_app comments off ReadThunk/OpenThunk
+- ⬜ (C14/C15) suite: missing binaries FAIL, skips not counted as passes, both-arch aggregate, volume tier in the release run
+- ⬜ (C9) detach test on ntdll stub, synchronized on 'active', no sleep
+- ⬜ (C13) PROBE_AT_RETURN: implement or document precisely
+- ⬜ (C16) breakage inline rows gating (preserve or clean refusal)
+- ⬜ (C20) attach_new: all backends, ntdll site, no sleeps/gate
+- ⬜ (C6) anti-tamper/anti-debug: document per-backend visibility; behaviour == baseline
+- ⬜ (C7) mixed-backend shared state: design question (documented)
+- ✗ (C10) helpers in probe_app: requested by the user; (C18) asm configparse: deliberate stable symbol+offset (add a PDB-local compiled variant later); (C19) _NT_SYMBOL_PATH is the requested symbol mechanism (tests may clear it)
 
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`

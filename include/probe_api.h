@@ -29,7 +29,14 @@ enum probe_flags {
     PROBE_WATCH_RW        = 1u << 7,
     /* Remove the probe after its first hit — e.g. a one-shot return hook, or an
        alloc-site hook that arms a watchpoint once and retires. */
-    PROBE_ONCE            = 1u << 8
+    PROBE_ONCE            = 1u << 8,
+    /* PROBE_INLINE only. UNSAFE: write the hook's jump WITHOUT freezing the target. By
+       default the controller suspends every other thread while an inline hook is
+       written (microseconds, at install/remove only -- never per hit) and moves any
+       thread caught inside the overwritten bytes onto the trampoline. With this flag a
+       thread executing those bytes at that moment resumes mid-jump and crashes or
+       misbehaves. For measurement/testing; do not use on code other threads may run. */
+    PROBE_UNSAFE_FAST_PATCH = 1u << 9
 };
 
 /* Every ID is the full native register: RAX..R15 on x64, EAX..EBP/ESP on x86
@@ -57,7 +64,8 @@ enum probe_register {
    so a context can never be mistaken for a session (distinct incomplete types). */
 
 /* ---- Control plane: take a SESSION. Valid before probe_launch, and from inside any
-   callback via get_session(c) (the target is stopped, so new probes arm immediately). */
+   callback via get_session(c). From a callback, breakpoint/hw probes arm before the
+   target resumes; an inline probe holds the calling thread until its hook is in. */
 probe_session *probe_session_create(void);
 /* "module+0xRVA" or "module!Export[+0xOFF]" -- resolved when the module loads. */
 int probe_add_symbol(probe_session *, const char *symbol, probe_callback, uint32_t flags);
@@ -72,8 +80,8 @@ int probe_launch(probe_session *, char *const argv[]);
 /* Attach to an already-running process instead of launching one. Probes resolve against
    the modules already loaded (and any loaded later). probe_run returns when the target
    exits; probe_close on a still-running target DETACHES (restores breakpoints, clears
-   debug registers, removes inline hooks) instead of terminating it. Inline hooks install
-   asynchronously after attach (the process is already running). */
+   debug registers, removes inline hooks) instead of terminating it. With inline probes,
+   every thread is held at the attach until the hooks are confirmed (bounded: 5 s). */
 int probe_attach(probe_session *, uint32_t pid);
 /* Wait (up to timeout_ms, 0 = forever) for a NEW process whose image name matches
    (e.g. "probe_app.exe"; processes already running are ignored) and attach to it as

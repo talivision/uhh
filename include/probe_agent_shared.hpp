@@ -10,7 +10,8 @@
 #include <cstdio>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 10;
+constexpr uint32_t PROBE_AGENT_VERSION = 11;
+constexpr uint32_t PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH = 1u << 9;   /* == PROBE_UNSAFE_FAST_PATCH (asserted in session.cpp) */
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 32;
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
 constexpr uint32_t PROBE_AGENT_CONFIG_CAP = 256;
@@ -21,6 +22,7 @@ enum probe_agent_status : LONG {
     PROBE_AGENT_PENDING = 0,
     PROBE_AGENT_INSTALLING = 1,
     PROBE_AGENT_INSTALLED = 2,
+    PROBE_AGENT_UNLOADED = 3,        /* controller: the hooked module went away -- never touch that hook again */
     PROBE_AGENT_BAD_REQUEST = -1,
     PROBE_AGENT_CALLBACK_MISSING = -2,
     PROBE_AGENT_HOOK_FAILED = -3
@@ -33,8 +35,9 @@ struct probe_agent_request {
     char callback[PROBE_AGENT_EXPORT_CAP];
     unsigned char config[PROBE_AGENT_CONFIG_CAP];
     volatile LONG status;
-    LONG reserved;
+    uint32_t patch_len;            /* agent: bytes the hook overwrites at site (set before a freeze) */
     volatile LONG64 hits;          /* unused (kept for layout); see hit_stripes */
+    uint64_t trampoline;           /* agent: relocated copies of the overwritten instructions */
 };
 
 /* Bounded MPMC ring (Vyukov): slot i starts with seq == i. A producer owns position
@@ -59,7 +62,14 @@ struct probe_agent_log {
    writes result, and continues -- a synchronous call, no polling, no extra thread. */
 constexpr DWORD PROBE_IPC_CODE = 0xE0554848u;   /* 'UHH' */
 enum probe_ipc_op : uint32_t { PROBE_IPC_ADD_ADDRESS = 1, PROBE_IPC_WATCH = 2, PROBE_IPC_ADD_SYMBOL = 3,
-                               PROBE_IPC_INSTALL_DONE = 4 };   /* agent service: an install round finished */
+                               PROBE_IPC_INSTALL_DONE = 4,     /* agent service: an install round finished */
+                               PROBE_IPC_FREEZE = 5,           /* suspend every other thread; address = mask of
+                                                                  request indices about to be enabled */
+                               PROBE_IPC_THAW = 6 };           /* resume the threads the last FREEZE suspended */
+/* Hooks are written ONLY with the rest of the target frozen by the controller (a debugger):
+   the page stays executable, no thread can run the bytes mid-write, nothing faults. A thread
+   the freeze caught inside a range about to be overwritten is moved by the controller to the
+   same instruction in that hook's trampoline. */
 struct probe_ipc_request {
     uint32_t op, flags, origin_site;
     int32_t result;

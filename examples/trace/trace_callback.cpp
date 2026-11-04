@@ -53,7 +53,7 @@ static void read_sockaddr(probe_context *c, uint64_t p, char *out, size_t cap) {
 
 extern "C" __declspec(dllexport) void uhh_trace_call(probe_context *c) {
     const trace_config *cfg = (const trace_config *)get_config(c);
-    if (!cfg) return;
+    if (!cfg || cfg->fmt[0] == '-') return;            // ":-" = count hits only, no log
     char line[600]; size_t at = 0; line[0] = 0;
     append(line, sizeof(line), at, cfg->name);
     append(line, sizeof(line), at, "(");

@@ -1,6 +1,6 @@
 // uhh_trace -- trace calls to any exported function of any program.
 //
-//   uhh_trace [--backend inline|breakpoint|hw] [--stack]
+//   uhh_trace [--backend inline|breakpoint|hw] [--stack] [--unsafe-fast-patch]
 //             -p "KernelBase.dll!CreateFileW:Wxx" [-p ...] -- program.exe [args...]
 //   uhh_trace ... --attach <pid>          (instrument an already-running process)
 //   uhh_trace ... --attach-new <image> [--timeout ms]   (attach to the next NEW instance)
@@ -173,13 +173,14 @@ static int list_symbols(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     if (argc > 1 && !std::strcmp(argv[1], "--list")) return list_symbols(argc, argv);
-    uint32_t backend = PROBE_BREAKPOINT; bool stack = false; unsigned long attach_pid = 0, detach_ms = 0;
+    uint32_t backend = PROBE_BREAKPOINT; bool stack = false, unsafe_fast_patch = false; unsigned long attach_pid = 0, detach_ms = 0;
     const char *attach_new = nullptr; unsigned long attach_timeout = 0;
     std::vector<trace_config> cfgs; std::vector<std::string> locs;
     int i = 1;
     for (; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--")) { ++i; break; }
         if (!std::strcmp(argv[i], "--stack")) { stack = true; continue; }
+        if (!std::strcmp(argv[i], "--unsafe-fast-patch")) { unsafe_fast_patch = true; continue; }
         if (!std::strcmp(argv[i], "--attach") && i + 1 < argc) { attach_pid = std::strtoul(argv[++i], nullptr, 0); continue; }
         if (!std::strcmp(argv[i], "--detach-after-ms") && i + 1 < argc) { detach_ms = std::strtoul(argv[++i], nullptr, 0); continue; }
         if (!std::strcmp(argv[i], "--attach-new") && i + 1 < argc) { attach_new = argv[++i]; continue; }
@@ -210,6 +211,7 @@ int main(int argc, char **argv) {
     probe_session *s = probe_session_create();
     if (!s) return 1;
     uint32_t flags = backend | (backend == PROBE_INLINE ? static_cast<uint32_t>(PROBE_FALLBACK_HW) : 0u);
+    if (unsafe_fast_patch && backend == PROBE_INLINE) flags |= PROBE_UNSAFE_FAST_PATCH;
     int ok = 1;
     for (size_t k = 0; k < cfgs.size(); ++k) {
         cfgs[k].stack = stack ? 1 : 0;

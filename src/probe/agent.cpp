@@ -8,7 +8,11 @@
 static HMODULE self_module;
 static HANDLE mapping;
 static probe_agent_shared *shared;
-static SafetyHookMid hooks[PROBE_AGENT_MAX_PROBES];
+// Never destroyed: at process exit a static array's destructors would unhook through
+// SafetyHook's stock path (page made non-executable while other threads may still run,
+// and on ntdll stub pages the installer then faults on itself). The process is going
+// away; its code is never restored. Explicit removal (probe_agent_stop) runs frozen.
+static SafetyHookMid *const hooks = new SafetyHookMid[PROBE_AGENT_MAX_PROBES];
 static uint64_t sites[PROBE_AGENT_MAX_PROBES];
 static probe_callback callbacks[PROBE_AGENT_MAX_PROBES];
 
@@ -518,9 +522,31 @@ static mid_callback mid_callbacks[PROBE_AGENT_MAX_PROBES] = {
     mid_16,mid_17,mid_18,mid_19,mid_20,mid_21,mid_22,mid_23,mid_24,mid_25,mid_26,mid_27,mid_28,mid_29,mid_30,mid_31
 };
 
+// Run fn with every other thread of the target suspended by the controller (FREEZE/THAW
+// IPC; the controller is a debugger, so the raise is serviced synchronously). While frozen,
+// SafetyHook patches with the page left executable and no thread trap (patch in
+// cmake/patch_safetyhook.cmake), so a site may share a page with anything -- including
+// the ntdll routines the patching itself calls. Inside fn: no heap, no locks another
+// thread could hold. Without a controller (never in UHH) SafetyHook's own trap is used.
+extern "C" volatile long uhh_safetyhook_frozen;
+template <class F> static void frozen(uint64_t enabling_mask, F &&fn) {
+    probe_ipc_request req{};
+    req.op = PROBE_IPC_FREEZE; req.origin_site = UINT32_MAX; req.address = enabling_mask;
+    const bool held = raise_ipc(&req) && req.result == 1;
+    if (held) InterlockedExchange(&uhh_safetyhook_frozen, 1);
+    fn();
+    if (held) {
+        InterlockedExchange(&uhh_safetyhook_frozen, 0);
+        probe_ipc_request thaw{};
+        thaw.op = PROBE_IPC_THAW; thaw.origin_site = UINT32_MAX;
+        raise_ipc(&thaw);
+    }
+}
+
 static void install_pending() {
     uint32_t count = shared->request_count;
     if (count > PROBE_AGENT_MAX_PROBES) count = PROBE_AGENT_MAX_PROBES;
+    uint64_t enabling = 0;
     for (uint32_t i = 0; i < count; ++i) {
         auto &request = shared->requests[i];
         if (!request.site || request.status != PROBE_AGENT_PENDING) continue;
@@ -540,9 +566,33 @@ static void install_pending() {
             // memory). Leak it deliberately.
             new SafetyHookMid(std::move(hooks[i]));
         }
-        hooks[i] = safetyhook::create_mid((void *)(uintptr_t)request.site, mid_callbacks[i]);
-        InterlockedExchange(&request.status, hooks[i] ? PROBE_AGENT_INSTALLED : PROBE_AGENT_HOOK_FAILED);
+        // Build the trampoline now (allocates); write the jump later, frozen.
+        hooks[i] = safetyhook::create_mid((void *)(uintptr_t)request.site, mid_callbacks[i],
+                                          safetyhook::MidHook::StartDisabled);
+        if (!hooks[i]) { InterlockedExchange(&request.status, PROBE_AGENT_HOOK_FAILED); continue; }
+        request.patch_len = (uint32_t)hooks[i].original_bytes().size();
+        request.trampoline = (uint64_t)hooks[i].uhh_trampoline();
+        enabling |= 1ull << i;
     }
+    if (!enabling) return;
+    auto enable = [&](uint64_t which) {
+        for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i) {
+            if (!(which & (1ull << i))) continue;
+            const bool ok = hooks[i].enable().has_value();
+            InterlockedExchange(&shared->requests[i].status, ok ? PROBE_AGENT_INSTALLED : PROBE_AGENT_HOOK_FAILED);
+        }
+    };
+    // PROBE_UNSAFE_FAST_PATCH: write while the other threads keep running (page kept
+    // executable, no freeze, no trap) -- the race the freeze exists to prevent.
+    uint64_t unsafe = 0;
+    for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i)
+        if ((enabling & (1ull << i)) && (shared->requests[i].flags & PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH)) unsafe |= 1ull << i;
+    if (unsafe) {
+        InterlockedExchange(&uhh_safetyhook_frozen, 1);
+        enable(unsafe);
+        InterlockedExchange(&uhh_safetyhook_frozen, 0);
+    }
+    if (enabling & ~unsafe) frozen(enabling & ~unsafe, [&] { enable(enabling & ~unsafe); });
 }
 
 // Tell the controller an install round finished (synchronous: the controller services
@@ -588,7 +638,16 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
 extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_stop(void *) {
     InterlockedExchange(&g_stopping, 1);
     for (int i = 0; i < 2000 && any_inflight(); ++i) Sleep(1);
-    for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i) hooks[i].reset();
+    frozen(0, [] {
+        for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i)
+            // Restore the original bytes -- unless the controller saw the module unload
+            // (the address is unmapped or holds another image now).
+            if (hooks[i] && shared->requests[i].status != PROBE_AGENT_UNLOADED) (void)hooks[i].disable();
+    });
+    // Keep the trampolines and stubs: a thread may still be on its way back through one
+    // (it then jumps to the original code, which is intact). Deliberate leak, once.
+    for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i)
+        if (hooks[i]) new SafetyHookMid(std::move(hooks[i]));
     return 0;
 }
 

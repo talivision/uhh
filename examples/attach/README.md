@@ -12,8 +12,8 @@ its files or its config:
 | Probe | Backend | Callback | What it does |
 |---|---|---|---|
 | `configparse.dll!ParseConfig+0x16` | breakpoint | `enable_reads` | the parsed flag is in EAX just before it is stored: 0 -> 1, so the disabled path runs |
-| `probe_app.exe!OpenThunk` | `--backend` | `track_open_process` | handle -> pid map: pid from `CLIENT_ID` (arg 3), remember the out-handle pointer (arg 0) |
-| `probe_app.exe!ReadThunk` | `--backend` | `log_read` | log only reads whose handle maps to pid P and whose address is in `[BASE, BASE+SIZE)` |
+| `ntdll.dll!NtOpenProcess` | `--backend` | `track_open_process` | handle -> pid map: pid from `CLIENT_ID` (arg 3), remember the out-handle pointer (arg 0) |
+| `ntdll.dll!NtReadVirtualMemory` | `--backend` | `log_read` | log only reads whose handle maps to pid P and whose address is in `[BASE, BASE+SIZE)` |
 
 `configparse.dll` is not loaded yet when `uhh_attach` attaches (the target loads it
 after the keystroke), so the flag breakpoint stays pending and arms when the DLL
@@ -73,8 +73,8 @@ Two consoles in the build directory (`build-x64\Release` or `build-x86\Release`;
    ```
 
    (`140703050012304` = base + 64.) Wait until it has printed (stderr)
-   `probe: active probe_app.exe!OpenThunk ...` and `probe: active
-   probe_app.exe!ReadThunk ...` - for `inline` the hooks install a moment after the
+   `probe: active ntdll.dll!NtOpenProcess ...` and `probe: active
+   ntdll.dll!NtReadVirtualMemory ...` - for `inline` the hooks install a moment after the
    attach.
 
 3. **Console A** - press any key. probe_app loads configparse.dll, the breakpoint flips
@@ -87,12 +87,12 @@ Two consoles in the build directory (`build-x64\Release` or `build-x86\Release`;
    {"kind":"probe_log","probe":2,"tid":...,"message":"read handle=0xa4 pid=7516 addr=0x7ff7fb509690 size=16"}
    ...
    {"kind":"probe","location":"configparse.dll!ParseConfig+0x16","backend":"breakpoint","active":true,"hits":1}
-   {"kind":"probe","location":"probe_app.exe!OpenThunk","backend":"inline","active":true,"hits":4}
-   {"kind":"probe","location":"probe_app.exe!ReadThunk","backend":"inline","active":true,"hits":8000}
+   {"kind":"probe","location":"ntdll.dll!NtOpenProcess","backend":"inline","active":true,"hits":4}
+   {"kind":"probe","location":"ntdll.dll!NtReadVirtualMemory","backend":"inline","active":true,"hits":8000}
    {"kind":"probe_report",...,"overrides":1,"log_dropped":0,...}
    ```
 
-Expected: `"overrides":1`, ReadThunk `hits` = threads x reads (8000: every read is
+Expected: `"overrides":1`, NtReadVirtualMemory `hits` = threads x reads (8000: every read is
 seen), and exactly 500 logged reads. probe_app's read pattern is deterministic: read
 `i` (thread `t`'s `k`-th read, `i = t*R + k`) goes to helper `i % N` at offset
 `64 * ((i / N) % 4)`, so with N=4 helper 1 at offset 64 gets every 16th read:
