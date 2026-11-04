@@ -1853,6 +1853,12 @@ static bool agent_thread(probe_session *s, DWORD tid) {
     return a >= s->remote_agent && a < s->remote_agent + nt.OptionalHeader.SizeOfImage;
 }
 
+// Inline probes other than PROBE_UNSAFE_FAST_PATCH ones (those ask for no suspension at all).
+static bool has_safe_inline(const probe_session *s) {
+    for (const auto &p : s->probes) if ((p->flags & PROBE_INLINE) && !(p->flags & PROBE_UNSAFE_FAST_PATCH)) return true;
+    return false;
+}
+
 static bool inline_hold_needed(const probe_session *s) {
     if (inline_unconfirmed(s)) return true;
     return has_inline(s) && !(s->shared && s->shared->service_ready && s->svc_event);
@@ -3054,9 +3060,7 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
         s->cb_tid = 0;
         for (DWORD tid : s->pending_hold) hold_thread(s, tid);
         s->pending_hold.clear();
-        bool safe_inline = false;           // PROBE_UNSAFE_FAST_PATCH probes ask for no suspension at all
-        for (auto &p : s->probes) if ((p->flags & PROBE_INLINE) && !(p->flags & PROBE_UNSAFE_FAST_PATCH)) safe_inline = true;
-        if (ok && s->initial_break && s->attached && !s->attach_held && safe_inline) {
+        if (ok && s->initial_break && s->attached && !s->attach_held && has_safe_inline(s)) {
             // Attach: the target was already running. Hold every thread (not the break-in
             // thread, which only returns) until the agent confirms the inline hooks, so no
             // call slips past a site that is about to be hooked. Released by the install
