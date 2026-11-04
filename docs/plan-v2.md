@@ -135,6 +135,10 @@ image across the boundary.
   attach to a newly-launched instance by name, then modify (flag flip) and log the
   reads - not only the launch-under-debugger path.
 - Fix the catalogued bugs (review-findings.md) and make the hot path performant.
+- INLINE-OVER-EXISTING-HOOK: test cases where, after detecting a pre-existing
+  hook, we install an INLINE hook (no breakpoint fallback) that chains through
+  the original trampoline and both run correctly (PROBE_ALLOW_PREHOOKED). Prove
+  the inline-on-inline coexistence, not just detect-and-fail or HW fallback.
 - MIX MATRIX: test the gated scenario across ALL permutations of backend per probe
   (config-flag site and read site x {software breakpoint, inline hook}, HW where
   applicable), proving each combination works and gives correct results. This is

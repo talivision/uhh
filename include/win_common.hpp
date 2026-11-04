@@ -8,7 +8,11 @@
 #include <stdexcept>
 #include <string>
 #include <initializer_list>
+#ifdef PROBE_PUBLIC_API
+#include "probe_api.h"
+#else
 #include "probe.h"
+#endif
 inline void require(bool ok, const char *message) {
     if (!ok) throw std::runtime_error(std::string(message) + " (Win32=" + std::to_string(GetLastError()) + ")");
 }
@@ -36,6 +40,7 @@ inline void to_context(const probe_context &c, CONTEXT &w) {
 #undef COPY
     /* PC/SP and flags are read-only in this first common contract. */
 }
+#ifndef PROBE_PUBLIC_API
 inline uint64_t record_digest(const probe_stats &s) {
     uint64_t h=14695981039346656037ULL;
     for(uint64_t i=0;i<s.recorded;++i) {
@@ -72,6 +77,7 @@ inline uint32_t callback_kind(const char *s) {
     if (!std::strcmp(s,"log")) return CALLBACK_LOG;
     throw std::runtime_error("callback must be noop|filter|mutate|log");
 }
+#endif
 inline std::string exe_directory() {
     char p[MAX_PATH]; DWORD n = GetModuleFileNameA(nullptr,p,MAX_PATH);
     require(n && n < MAX_PATH,"executable path");

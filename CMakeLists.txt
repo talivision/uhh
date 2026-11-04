@@ -47,11 +47,18 @@ if(WIN32)
     add_executable(probe_session src/session.cpp)
     target_include_directories(probe_session PRIVATE include)
     target_link_libraries(probe_session PRIVATE Zydis)   # disasm for hook surfacing
+
+    # Locked end-user API, initially backed only by external x64 INT3 probes.
+    add_library(probe_api STATIC src/probe/session.cpp)
+    target_include_directories(probe_api PUBLIC include)
+    add_executable(gated_config examples/gated_config/main.cpp)
+    target_link_libraries(gated_config PRIVATE probe_api)
+    add_dependencies(gated_config probe_app configparse)
     # The gated scenario is a heavyweight end-to-end demo (debugger launch, several
     # processes), run on demand via scripts/check_scenario.py — deliberately NOT a
     # CTest/CI gate. CTest keeps only the fast, deterministic policy unit tests.
 
-    foreach(t probe_agent probe_target probe_debugger probe_app configparse probe_session)
+    foreach(t probe_agent probe_target probe_debugger probe_app configparse probe_session probe_api gated_config)
         target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
         target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
     endforeach()
