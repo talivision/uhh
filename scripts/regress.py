@@ -415,11 +415,36 @@ def check_volume(volume_reads):
     for read_bk, timeout in (("inline", 180), ("hw", 900), ("breakpoint", 1800)):
         name = f"volume-{read_bk} 8x{volume_reads}"
         try:
-            r, o = gated("breakpoint", read_bk, str(threads), str(volume_reads), timeout=timeout)
+            # Stream: millions of log lines are COUNTED as they arrive, never held in memory
+            # (holding 16M parsed lines took 6 GB and starved the VM). Non-log lines are kept.
+            p = subprocess.Popen([str(x) for x in [exe("gated_config.exe"), "--flag-backend", "breakpoint",
+                                  "--read-backend", read_bk, FLAG_LOCATION, READ_LOCATION, "--", exe("probe_app.exe"),
+                                  "--no-wait", "--helpers", HELPERS, "--threads", threads, "--reads", volume_reads]],
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            logs, o, buf, t0 = 0, [], b"", time.time()
+            while True:
+                chunk = p.stdout.read1(1 << 20)
+                if not chunk:
+                    break
+                buf += chunk
+                lines = buf.split(b"\n"); buf = lines.pop()
+                for line in lines:
+                    if b'"kind":"probe_log"' in line:
+                        if b'"message":"read handle=' in line:
+                            logs += 1
+                    elif line.startswith(b"{"):
+                        try:
+                            o.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            pass
+                if time.time() - t0 > timeout:
+                    p.kill()
+                    raise RuntimeError(f"timeout after {timeout}s")
+            p.wait(timeout=60)
             rd = read_probe(o)
             a = app(o)
-            logs, dropped = read_logs(o)
-            ok = (rd.get("hits") == total and a.get("successful_reads") == total and
+            dropped = report(o).get("log_dropped")
+            ok = (p.returncode == 0 and rd.get("hits") == total and a.get("successful_reads") == total and
                   logs == total and dropped == 0)
             record(name, ok, f"hits={rd.get('hits')} reads={a.get('successful_reads')} logs={logs} "
                              f"dropped={dropped} want={total}")
