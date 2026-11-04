@@ -155,9 +155,13 @@ image across the boundary.
 - Commit the example PROCESSES (probe_app, configparse) and the INTROSPECTION
   example (the full api-sketch program: deferred flag probe + inline read log +
   handle->pid) into the repo.
-- Ship COMPILED BINARIES in the repo too: a dist/ folder (force-added past
-  .gitignore) holding the built DLLs/exes for BOTH x86 and x64, so the repo is
-  runnable without building. Refresh them on each relevant commit/push.
+- Do NOT commit compiled DLLs/binaries. Instead include COMPILATION EXAMPLES:
+  clear build instructions in the README (the cmake commands for x64 and x86).
+- Add a configurable CLI example using the BREAKPOINT backend: a general read
+  logger `read_logger --target <process name> --pid <pid> --range <lo-hi>` that
+  launches/attaches the named target, probes NtReadVirtualMemory, and logs only
+  reads whose handle resolves to <pid> and whose address falls in <range>
+  (pid via the handle->pid map, maintained controller-side for this backend).
 
 ## No backward compatibility (4 Nov 2026)
 
