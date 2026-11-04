@@ -18,7 +18,7 @@ identical source under every backend.
 - 🔧 Synchronous inline install: hold at entry point / at LOAD_DLL until hooks confirm (agent service thread). Handle double-close bug found and fixed; re-verifying
 - 🔧 Zero-drop inline logs: lock-free ring + controller drainer thread + backpressure. Must pass the 2M-event inline volume tier with `log_dropped == 0`
 - 🔧 Pre-hooked site report (live vs disk bytes, disassembly, pattern, destination, suggestions); `PROBE_ALLOW_PREHOOKED` / `PROBE_FALLBACK_HW`
-- 🔧 `call_func`: call target functions from any callback (direct for inline; debugger-run call on the stopped thread for breakpoint/hw)
+- ✅ `call_func`: call target functions from any callback (direct for inline; debugger-run call on the stopped thread for breakpoint/hw); pointer-sized args on both arches. Further hardening of the breakpoint/hw path was not pursued
 - 🔧 `probe_attach` (clean detach: hooks removed, INT3s restored, DRs cleared, no thread mid-step), `probe_attach_new`
 - 🔧 Inline register overrides counted in the report (`overrides`) like controller-side ones
 - ⬜ x86 inline `send_log_stack` at a function's first instruction: include the caller frame (`[esp]`)
@@ -39,7 +39,7 @@ identical source under every backend.
 ## Program-correctness guarantees (probes must have no side effects)
 - ⬜ Side-effect audit + tests: after any callback, the target observes no change except deliberate `set_reg`/`set_mem`: `GetLastError()`, `errno`, x87/SSE/AVX state, EFLAGS, TEB fields, stack contents below SP — under breakpoint, hw and inline
 - ✅ Loader-time probe hits (a probe firing before the loader breakpoint) handled as hits, not swallowed (was crashing findstr x86)
-- 🔧 Inline sites sharing a page with ntdll routines the installer needs -> hardware fallback / clear refusal, never a crash
+- ✅ Inline sites sharing a page with routines the inline installer itself calls (ntdll NtProtect/NtQuery/NtFlush/heap/SRW, KernelBase VirtualProtect/Query/Alloc) -> hardware fallback with `PROBE_FALLBACK_HW`, else a clear refusal; never a crash. Documented limitation: inline on those pages (e.g. most ntdll syscall stubs) is not attempted
 - ⬜ Memory reads/writes at scale: millions of `get_mem`/`set_mem` across threads and backends; exact values, writes visible to the target, page-crossing and large sizes, unmapped/protected addresses fail cleanly, throughput per backend
 - ⬜ Continuous evaluators: independent agents repeatedly hunting edge cases, regressions and gaps against the gated_config use case
 
@@ -62,6 +62,6 @@ identical source under every backend.
 
 ## Later
 - ⬜ x86 cumulative-session flakiness (possibly the same handle double-close; recheck)
-- 🔧 PDB-only symbols (`module!InternalFunc`), Microsoft symbol server via dbghelp+symsrv and `_NT_SYMBOL_PATH`, export/function enumeration (`uhh_trace --list`) — Codex, tmux `codex-sym`
+- 🔧 PDB-only symbols (`module!InternalFunc`), Microsoft symbol server via dbghelp+symsrv and `_NT_SYMBOL_PATH`, export/function enumeration (`uhh_trace --list`) — engine by Codex, wired into the library; suite checks added
 - ⬜ Split `src/probe/session.cpp` (debug loop, backends, symbols, attach/call)
 - ⬜ Final independent whole-codebase sanity review; README/API docs pass

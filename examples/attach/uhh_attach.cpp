@@ -5,7 +5,7 @@
 //
 // Three probes, the callbacks shared with gated_config (examples/gated_config):
 //   configparse.dll!ParseConfig+0x16   breakpoint   enable_reads: parsed flag 0 -> 1
-//   ntdll.dll!NtOpenProcess            <backend>    track_open_process: handle -> pid map
+//   probe_app.exe!OpenThunk            <backend>    track_open_process: handle -> pid map
 //   probe_app.exe!ReadThunk            <backend>    log_read: only pid P, only [BASE, BASE+SIZE)
 // The open and read probes share one backend because the map lives with the callbacks
 // (in this process for breakpoint/hw, inside the target for inline).
@@ -38,7 +38,7 @@ int main(int argc, char **argv) {
     probe_session *s = probe_session_create();
     if (!s) return 1;
     int ok = probe_add_symbol(s, "configparse.dll!ParseConfig+0x16", enable_reads, PROBE_BREAKPOINT) &&
-             probe_add_symbol(s, "ntdll.dll!NtOpenProcess", track_open_process, backend) &&
+             probe_add_symbol(s, "probe_app.exe!OpenThunk", track_open_process, backend) &&
              probe_add_symbol_cfg(s, "probe_app.exe!ReadThunk", log_read, backend, &cfg, sizeof(cfg)) &&
              probe_attach(s, target);
     if (ok) {

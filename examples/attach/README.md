@@ -12,7 +12,7 @@ its files or its config:
 | Probe | Backend | Callback | What it does |
 |---|---|---|---|
 | `configparse.dll!ParseConfig+0x16` | breakpoint | `enable_reads` | the parsed flag is in EAX just before it is stored: 0 -> 1, so the disabled path runs |
-| `ntdll.dll!NtOpenProcess` | `--backend` | `track_open_process` | handle -> pid map: pid from `CLIENT_ID` (arg 3), remember the out-handle pointer (arg 0) |
+| `probe_app.exe!OpenThunk` | `--backend` | `track_open_process` | handle -> pid map: pid from `CLIENT_ID` (arg 3), remember the out-handle pointer (arg 0) |
 | `probe_app.exe!ReadThunk` | `--backend` | `log_read` | log only reads whose handle maps to pid P and whose address is in `[BASE, BASE+SIZE)` |
 
 `configparse.dll` is not loaded yet when `uhh_attach` attaches (the target loads it
@@ -73,7 +73,7 @@ Two consoles in the build directory (`build-x64\Release` or `build-x86\Release`;
    ```
 
    (`140703050012304` = base + 64.) Wait until it has printed (stderr)
-   `probe: active ntdll.dll!NtOpenProcess ...` and `probe: active
+   `probe: active probe_app.exe!OpenThunk ...` and `probe: active
    probe_app.exe!ReadThunk ...` - for `inline` the hooks install a moment after the
    attach.
 
@@ -87,7 +87,7 @@ Two consoles in the build directory (`build-x64\Release` or `build-x86\Release`;
    {"kind":"probe_log","probe":2,"tid":...,"message":"read handle=0xa4 pid=7516 addr=0x7ff7fb509690 size=16"}
    ...
    {"kind":"probe","location":"configparse.dll!ParseConfig+0x16","backend":"breakpoint","active":true,"hits":1}
-   {"kind":"probe","location":"ntdll.dll!NtOpenProcess","backend":"inline","active":true,"hits":4}
+   {"kind":"probe","location":"probe_app.exe!OpenThunk","backend":"inline","active":true,"hits":4}
    {"kind":"probe","location":"probe_app.exe!ReadThunk","backend":"inline","active":true,"hits":8000}
    {"kind":"probe_report",...,"overrides":1,"log_dropped":0,...}
    ```

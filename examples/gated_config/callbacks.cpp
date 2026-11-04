@@ -11,15 +11,17 @@ extern "C" void enable_reads(probe_context *c) {
     if (get_reg(c, PROBE_REG_AX) == 0) set_reg(c, PROBE_REG_AX, 1);
 }
 
-// 2. Handle -> pid map, built from ntdll!NtOpenProcess(PHANDLE out, ACCESS_MASK,
-//    POBJECT_ATTRIBUTES, PCLIENT_ID cid). At ENTRY the pid is known (cid->UniqueProcess)
+// 2. Handle -> pid map, built from probe_app.exe!OpenThunk, the target's own wrapper with
+//    NtOpenProcess's signature (PHANDLE out, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID).
+//    The wrapper (not the ntdll syscall stub) is probed so this probe can use the same
+//    backend as the read probe: the map must live where the read callback runs. At ENTRY the pid is known (cid->UniqueProcess)
 //    but the handle is not yet: it is written to *out by the kernel. So remember the
 //    out pointer and dereference it LAZILY, the first time a read uses a handle we have
 //    not seen -- by then the open has long returned.
 namespace {
 struct OpenRecord {
     std::atomic<uint64_t> pid{0};       // 0 = slot not published yet
-    std::atomic<uint64_t> out{0};       // where NtOpenProcess writes the handle
+    std::atomic<uint64_t> out{0};       // where the open writes the handle
     std::atomic<uint64_t> handle{0};    // 0 = not resolved yet
 };
 constexpr uint32_t kMaxOpens = 1024;
@@ -31,20 +33,24 @@ uint64_t read_pointer(probe_context *c, uint64_t address) {
     return get_mem(c, address, &value, sizeof(value)) ? (uint64_t)value : 0;
 }
 
-// pid the handle was opened for, or 0 if no NtOpenProcess we saw produced it.
+// pid the handle was opened for, or 0 if no open we saw produced it. One pass, NEWEST
+// open first: a resolved record is compared directly; an unresolved one is resolved by
+// dereferencing its out-pointer. Newest-first means a handle value reused after a close
+// maps to the open that produced it most recently. A record resolved concurrently by
+// another thread is still matched (re-read after a lost CAS).
 uint64_t pid_of(probe_context *c, uint64_t handle) {
+    if (!handle) return 0;
     uint32_t n = g_open_count.load(std::memory_order_acquire);
     if (n > kMaxOpens) n = kMaxOpens;
-    for (uint32_t i = 0; i < n; ++i)
-        if (g_opens[i].handle.load(std::memory_order_relaxed) == handle) return g_opens[i].pid.load();
-    for (uint32_t i = 0; i < n; ++i) {   // unknown: resolve pending opens by dereferencing
-        OpenRecord &r = g_opens[i];
+    for (uint32_t k = n; k-- > 0;) {
+        OpenRecord &r = g_opens[k];
         uint64_t pid = r.pid.load(std::memory_order_acquire);
-        if (!pid || r.handle.load(std::memory_order_relaxed)) continue;
-        if (read_pointer(c, r.out.load()) != handle) continue;
+        if (!pid) continue;                                    // claimed, not yet published
+        uint64_t h = r.handle.load(std::memory_order_acquire);
+        if (h) { if (h == handle) return pid; continue; }
+        if (read_pointer(c, r.out.load(std::memory_order_relaxed)) != handle) continue;
         uint64_t expected = 0;
-        r.handle.compare_exchange_strong(expected, handle);
-        return pid;
+        if (r.handle.compare_exchange_strong(expected, handle) || expected == handle) return pid;
     }
     return 0;
 }

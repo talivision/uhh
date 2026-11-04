@@ -288,7 +288,8 @@ static bool call_raw(uint64_t fn, const uint64_t *a, uint64_t *ret, int nargs) {
             mov hi, edx
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-    if (ret) *ret = ((uint64_t)hi << 32) | lo;
+    (void)hi;
+    if (ret) *ret = lo;                                    // pointer-sized return (EAX)
     return true;
 }
 #endif

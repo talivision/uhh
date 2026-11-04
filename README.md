@@ -102,7 +102,7 @@ cmake --build build-x86 --config Release
 The target (`examples/targets/probe_app`) ships a feature **disabled in its config**:
 after a keystroke it late-loads `configparse.dll`, parses `reads_enabled=0`, and does
 nothing. Only when the flag is on does it open its helper processes by pid
-(`ntdll!NtOpenProcess`) and read their memory from many threads
+(`probe_app.exe!OpenThunk`, its own `NtOpenProcess` wrapper) and read their memory from many threads
 (`NtReadVirtualMemory`). The examples turn the feature on **from outside, without
 modifying the target or its config**: a breakpoint inside `configparse.dll` flips the
 parsed flag `0 -> 1` just before it is stored, and further probes log (and filter)

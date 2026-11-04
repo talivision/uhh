@@ -295,6 +295,8 @@ std::string narrow(const std::wstring &text) {
     if (WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
                             &result[0], bytes, nullptr, nullptr) != bytes)
         return {};
+    // Callers sometimes pass a length that includes the terminator (dbghelp's NameLen).
+    while (!result.empty() && result.back() == '\0') result.pop_back();
     return result;
 }
 
@@ -659,6 +661,7 @@ bool walk_stack(HANDLE process, HANDLE thread, CONTEXT ctx,
         ctx.Ebp = static_cast<DWORD>(fp);
 #endif
         std::size_t attempts = 0;
+        bool first = true;
         while (frames.size() < max_frames && attempts++ < max_frames + 8) {
             const DWORD64 previous_pc = frame.AddrPC.Offset;
             const DWORD64 previous_sp = frame.AddrStack.Offset;
@@ -667,6 +670,9 @@ bool walk_stack(HANDLE process, HANDLE thread, CONTEXT ctx,
                 break;
             const std::uint64_t next = static_cast<std::uint64_t>(frame.AddrPC.Offset);
             if (next == 0) break;
+            // The first StackWalk64 call reports frame 0 itself (same pc and, on x64, the
+            // same stack pointer): that is not "no progress", it is the frame we already have.
+            if (first) { first = false; if (next == pc) continue; }
             if (frame.AddrPC.Offset == previous_pc && frame.AddrStack.Offset == previous_sp) break;
             if (next != frames.back()) frames.push_back(next);
         }

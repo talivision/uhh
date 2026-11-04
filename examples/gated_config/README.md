@@ -15,7 +15,7 @@ without rebuilding the target, editing its config, or patching its files:
    value; EAX holds it. `enable_reads` changes EAX from 0 to 1 and the target goes on
    to store "enabled" as if its config had said so. The probe is registered before
    the DLL exists in the process; it stays pending and arms when the DLL loads.
-2. **Observe the path you enabled.** `track_open_process` on `ntdll!NtOpenProcess`
+2. **Observe the path you enabled.** `track_open_process` on `probe_app.exe!OpenThunk` (the target's own `NtOpenProcess` wrapper)
    learns which pid each new process handle belongs to, and `log_read` on
    `probe_app.exe!ReadThunk` (the target's `NtReadVirtualMemory` call site) logs every
    read as `read handle=0x.. pid=.. addr=0x.. size=..`.
@@ -41,7 +41,7 @@ known (`cid->UniqueProcess`) but the handle is not: the kernel writes it to `*ou
 during the call. `track_open_process` remembers `(pid, out)`; when `log_read` meets a
 handle it has not seen, it dereferences the remembered `out` pointers with `get_mem`
 to find which open produced it, and caches the answer. This relies on `*out` still
-holding the handle when the read happens: `probe_app` calls `NtOpenProcess` directly
+holding the handle when the read happens: `probe_app` calls `NtOpenProcess` (via `OpenThunk`) directly
 with `out` pointing at a long-lived variable. (Through `kernel32!OpenProcess` the out
 pointer is a stack local inside kernelbase that is reused as soon as `OpenProcess`
 returns.) The callbacks are lock-free, so the same source runs on the controller's
@@ -55,7 +55,7 @@ gated_config [--flag-backend b] [--read-backend b] [--no-log]
 ```
 
 - `b` = `breakpoint` | `hw` | `inline`. Defaults: flag `breakpoint`, reads `inline`.
-  The NtOpenProcess probe uses the read backend, so its map lives in the same address
+  The OpenThunk probe uses the read backend, so its map lives in the same address
   space as `log_read` (the controller for breakpoint/hw, the target for inline).
   An inline probe whose module loads after the gate falls back to a hardware
   breakpoint (`PROBE_FALLBACK_HW`) instead of racing the first call.
@@ -83,3 +83,12 @@ its entry point until inline probes are installed, so no read is missed either w
 `scripts/regress.py`: `sites`, `gated-off`, `mix flag=* read=*` (all 9 backend
 pairs), `exact-*` (hits == logs == reads, no unmapped pid, no drops),
 `log-throughput-*`, and the opt-in `volume-*`.
+
+### Why `OpenThunk` and not `ntdll!NtOpenProcess`
+
+The map must live where the read callback runs (in the target for inline, in the
+controller for breakpoint/hw), so the open probe and the read probe use the same backend.
+ntdll's syscall stubs share a page with the routines the inline installer itself calls,
+so an inline probe there is moved to the hardware backend (`PROBE_FALLBACK_HW`), which
+would split the map across two address spaces. Probing the target's own wrapper keeps
+both probes on one backend.

@@ -6,7 +6,8 @@
 .model flat
 OPTION CASEMAP:NONE
 EXTERN _g_ntread:DWORD
-PUBLIC _ReadThunk@20, _ReadSite
+EXTERN _g_ntopen:DWORD
+PUBLIC _ReadThunk@20, _ReadSite, _OpenThunk@16
 .code
 _ReadThunk@20:
 _ReadSite LABEL BYTE
@@ -14,4 +15,11 @@ _ReadSite LABEL BYTE
         nop
     ENDM
     jmp DWORD PTR [_g_ntread]
+
+; OpenThunk: see read_site_x64.asm. __stdcall, 4 args.
+_OpenThunk@16:
+    REPT 16
+        nop
+    ENDM
+    jmp DWORD PTR [_g_ntopen]
 END

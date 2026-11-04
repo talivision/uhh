@@ -17,7 +17,7 @@ Checks:
   - multithread exact: each read backend at >cores threads -> hits == threads*reads,
     the no-dropped-events guarantee -- and one formatted log per hit, log_dropped == 0
     (the no-dropped-LOGS guarantee; inline logs cross a shared ring the controller drains),
-    and every logged read carries the helper pid mapped at ntdll!NtOpenProcess.
+    and every logged read carries the helper pid mapped at probe_app.exe!OpenThunk.
   - attach-<backend>: probe_app started on its own (waiting at its gate); uhh_attach
     attaches, flips the flag, and logs only one helper's reads in one range. Exactly the
     predicted number of reads is logged, every read is still counted, nothing dropped.
@@ -146,6 +146,27 @@ def unmapped(objs):
     return sum(1 for m in read_log_lines(objs) if " pid=0 " in m)
 
 
+def read_probe(objs):
+    return next((x for x in probes(objs) if x.get("location", "").endswith("!ReadThunk")), {})
+
+
+def open_probe(objs):
+    return next((x for x in probes(objs) if x.get("location", "").endswith("!OpenThunk")), {})
+
+
+def logged_pids(objs):
+    pids = set()
+    for o in objs:
+        m = str(o.get("message", "")) if o.get("kind") == "probe_log" else ""
+        if m.startswith("read handle=") and " pid=" in m:
+            pids.add(int(m.split(" pid=")[1].split()[0]))
+    return pids
+
+
+def helper_pids(objs):
+    return {o.get("pid") for o in objs if o.get("kind") == "helper"}
+
+
 def check_mix_matrix(threads, reads):
     if not exe("gated_config.exe"):
         return skip("mix-matrix", "gated_config.exe missing")
@@ -157,9 +178,17 @@ def check_mix_matrix(threads, reads):
             try:
                 r, o = gated(flag_bk, read_bk, threads, reads)
                 rep = report(o)
-                rd = next((x for x in probes(o) if "probe_app.exe" in x.get("location", "")), {})
-                ok = (r.returncode == 0 and rep.get("overrides") == 1 and rd.get("hits") == total)
-                record(name, ok, f"override={rep.get('overrides')} read_hits={rd.get('hits')} want={total}")
+                rd, op = read_probe(o), open_probe(o)
+                logs, dropped = read_logs(o)
+                nomap = unmapped(o)
+                pids_ok = logged_pids(o) == helper_pids(o) and bool(helper_pids(o))
+                same_backend = rd.get("backend") == read_bk and op.get("backend") == read_bk
+                ok = (r.returncode == 0 and rep.get("overrides") == 1 and rd.get("hits") == total and
+                      logs == total and dropped == 0 and nomap == 0 and pids_ok and same_backend and
+                      rep.get("error") is None)
+                record(name, ok, f"override={rep.get('overrides')} read_hits={rd.get('hits')} logs={logs} "
+                                 f"dropped={dropped} unmapped={nomap} pids_ok={pids_ok} "
+                                 f"backends={rd.get('backend')}/{op.get('backend')} want={total}")
             except Exception as e:
                 record(name, False, repr(e))
 
@@ -172,12 +201,14 @@ def check_multithread_exact(threads, reads):
         name = f"exact-{read_bk} {threads}x{reads}"
         try:
             r, o = gated("breakpoint", read_bk, threads, reads, timeout=300)
-            rd = next((x for x in probes(o) if "probe_app.exe" in x.get("location", "")), {})
+            rd = read_probe(o)
             a = app(o)
             logs, dropped = read_logs(o)
             nomap = unmapped(o)
             ok = (rd.get("hits") == total and a.get("successful_reads") == total and
-                  logs == total and dropped == 0 and nomap == 0)
+                  logs == total and dropped == 0 and nomap == 0 and
+                  logged_pids(o) == helper_pids(o) and rd.get("backend") == read_bk and
+                  open_probe(o).get("backend") == read_bk)
             record(name, ok, f"hits={rd.get('hits')} reads={a.get('successful_reads')} logs={logs} "
                              f"dropped={dropped} unmapped={nomap} want={total}")
         except Exception as e:
@@ -254,7 +285,7 @@ def check_attach(threads, reads):
                 raise RuntimeError("uhh_attach did not attach")
             # Probes on already-loaded modules arm after the attach (inline: asynchronously,
             # in the injected agent). Release the gate only once both are live.
-            for loc in ("ntdll.dll!NtOpenProcess", READ_LOCATION):
+            for loc in ("probe_app.exe!OpenThunk", READ_LOCATION):
                 if not aerr.wait_for(lambda l, loc=loc: l.startswith(f"probe: active {loc} "), 30):
                     raise RuntimeError(f"{loc} never became active")
             tgt.stdin.write("x"); tgt.stdin.flush()
@@ -317,7 +348,7 @@ def check_volume(volume_reads):
         name = f"volume-{read_bk} 8x{volume_reads}"
         try:
             r, o = gated("breakpoint", read_bk, str(threads), str(volume_reads), timeout=timeout)
-            rd = next((x for x in probes(o) if "probe_app.exe" in x.get("location", "")), {})
+            rd = read_probe(o)
             a = app(o)
             logs, dropped = read_logs(o)
             ok = (rd.get("hits") == total and a.get("successful_reads") == total and
@@ -419,6 +450,7 @@ def check_dynwatch(writes=100):
                   calls == ["call_func sum6=91 ok=1"] and entry_ok)
             record(name, ok, f"returns={res.get('returns')} arms={res.get('arms')} watch_hits={res.get('watch_hits')} "
                              f"want={want} once_retired={bool(once) and once[0].get('active') is False} "
+                             f"err={rep.get('error')} once={[(p.get('active'), p.get('hits')) for p in once]} marker_calls={tgt.get('marker_calls')} "
                              f"runtime_inline_hits={marker.get('hits')}/50 call_func={calls} entry_caller={(entry[1][:40] if entry and len(entry) > 1 else entry)} stack0={(stacks[0][0] if stacks else None)}")
         except Exception as e:
             record(name, False, repr(e))
@@ -493,37 +525,66 @@ def check_memstress(threads=8, iters=20000):
             record(name, False, repr(e))
 
 
-def check_prehook_attach():
-    """The realistic 'already hooked' case: attach to a process whose function another
-    tool already detoured (hook_edge installs a real foreign E9 on PrehookSite at start-up,
-    then waits). An inline probe there must produce the pre-hook report and fall back to
-    the hardware backend; the call is then still observed exactly once."""
-    t, h = exe("uhh_trace.exe"), exe("hook_edge.exe")
-    if not t or not h:
-        return skip("prehook-attach", "uhh_trace/hook_edge missing")
-    import time
+def check_symbols():
+    """Hook by PDB-only name (a static, non-exported function) and enumerate a module's
+    exports -- via the dynamically loaded dbghelp/symsrv (honours _NT_SYMBOL_PATH)."""
+    t, d = exe("uhh_trace.exe"), exe("dynwatch_target.exe")
+    if not t or not d:
+        return skip("symbols", "uhh_trace/dynwatch_target missing")
+    for bk in ("breakpoint", "hw", "inline"):
+        try:
+            _, o = run([t, "--backend", bk, "-p", "dynwatch_target.exe!worker:x", "--", d, "--no-wait", "--writes", "10"],
+                       timeout=120)
+            msgs = [str(x.get("message", "")) for x in o if x.get("kind") == "probe_log"]
+            pr = next(iter(probes(o)), {})
+            ok = pr.get("hits") == 1 and any(m.startswith("worker(") for m in msgs) and report(o).get("error") is None
+            record(f"symbols-pdb-name-{bk}", ok, f"hits={pr.get('hits')} logs={msgs[:1]} err={report(o).get('error')}")
+        except Exception as e:
+            record(f"symbols-pdb-name-{bk}", False, repr(e))
     try:
-        rva = rvas("hook_edge.map", "PrehookSite")["PrehookSite"]
-        target = subprocess.Popen([str(h), "--case", "prehook"], stdin=subprocess.PIPE,
+        _, o = run([t, "--list", "kernel32.dll", "--mask", "*CreateFile*"], timeout=60)
+        names = {x.get("name") for x in o if x.get("kind") == "symbol"}
+        record("symbols-list", "CreateFileW" in names, f"found={sorted(n for n in names if n)[:5]}")
+    except Exception as e:
+        record("symbols-list", False, repr(e))
+
+
+def check_prehook_attach():
+    """The realistic 'already hooked' case: attach to a process that detoured one of its own
+    functions at run time (probe_app --prehook puts a SafetyHook inline detour on ReadThunk
+    before its gate). An inline probe there must produce the pre-hook report (live bytes
+    differ from the image on disk: pattern, symbolized destination, suggestions) and, with
+    PROBE_FALLBACK_HW (uhh_trace's inline default), move to the hardware backend."""
+    t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
+    if not t or not a:
+        return skip("prehook-attach", "uhh_trace/probe_app missing")
+    import time
+    target = None
+    try:
+        target = subprocess.Popen([str(a), "--prehook", "--helpers", "1"], stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        time.sleep(0.5)                                      # past its TLS-time foreign hook
+        line = target.stdout.readline().decode(errors="replace")       # {"kind":"waiting",...}: hook is in
         tracer = subprocess.Popen([str(t), "--backend", "inline", "--attach", str(target.pid),
-                                   "-p", f"hook_edge.exe+{rva}:d"],
+                                   "-p", "probe_app.exe!ReadThunk:xxxx"],
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        time.sleep(3.0)                                      # attach + agent load + vet/install
+        time.sleep(3.0)                                                  # attach + vet
         target.stdin.write(b"\n"); target.stdin.flush()
-        out, _ = tracer.communicate(timeout=60)
-        target.wait(timeout=30)
+        target.wait(timeout=60)
+        out, err = tracer.communicate(timeout=60)
         objs = [json.loads(l) for l in out.splitlines() if l.startswith("{")]
         pre = [o for o in objs if o.get("kind") == "prehook"]
-        pr = next((o for o in probes(objs) if "hook_edge.exe" in o.get("location", "")), {})
-        ok = (bool(pre) and "jmp" in pre[0].get("pattern", "") and pre[0].get("destination") and
-              len(pre[0].get("suggest", [])) >= 2 and pr.get("backend") == "hw" and pr.get("hits") == 1 and
-              target.returncode == 0)
+        pr = next((o for o in probes(objs) if o.get("location", "").endswith("!ReadThunk")), {})
+        ok = (bool(pre) and "jmp" in pre[0].get("pattern", "") and bool(pre[0].get("destination")) and
+              "probe_app" in str(pre[0].get("destination")) and
+              len(pre[0].get("suggest", [])) >= 2 and pr.get("backend") == "hw")
+        tail = "" if ok else " stderr=" + " | ".join(err.strip().splitlines()[:12])
         record("prehook-attach", ok, f"reports={len(pre)} pattern={pre[0].get('pattern') if pre else None} "
-                                     f"backend={pr.get('backend')} hits={pr.get('hits')} target_exit={target.returncode}")
+                                     f"dest={pre[0].get('destination') if pre else None} backend={pr.get('backend')}{tail}")
     except Exception as e:
         record("prehook-attach", False, repr(e))
+    finally:
+        if target and target.poll() is None:
+            target.kill()
 
 
 def check_realworld():
@@ -569,25 +630,31 @@ def main():
     ap.add_argument("--reads", default="1000")
     ap.add_argument("--volume-reads", default="0",
                     help="per-thread reads for the opt-in no-drop-at-scale tier (e.g. 250000 = 2M); 0 skips")
+    ap.add_argument("--only", default="", help="comma-separated substrings of check names to run (default: all)")
     args = ap.parse_args()
     BIN = args.bin.resolve()
+    only = [x for x in args.only.split(",") if x]
+
+    def want(fn):
+        return not only or any(o in fn.__name__ for o in only)
     print(f"UHH regression suite — bin={BIN}")
-    check_sites()
-    check_gated_off()
-    check_mix_matrix(args.threads, args.reads)
-    check_multithread_exact(args.threads, args.reads)
-    check_log_throughput(args.threads, args.reads)
-    check_attach(args.threads, args.reads)
+    if want(check_sites): check_sites()
+    if want(check_gated_off): check_gated_off()
+    if want(check_mix_matrix): check_mix_matrix(args.threads, args.reads)
+    if want(check_multithread_exact): check_multithread_exact(args.threads, args.reads)
+    if want(check_log_throughput): check_log_throughput(args.threads, args.reads)
+    if want(check_attach): check_attach(args.threads, args.reads)
     if int(args.volume_reads) > 0:
-        check_volume(args.volume_reads)
-    check_breakage()
-    check_frida_parity()
-    check_watchpoint()
-    check_dynwatch()
-    check_realworld()
-    check_conformance()
-    check_prehook_attach()
-    check_memstress()
+        if want(check_volume): check_volume(args.volume_reads)
+    if want(check_breakage): check_breakage()
+    if want(check_frida_parity): check_frida_parity()
+    if want(check_watchpoint): check_watchpoint()
+    if want(check_dynwatch): check_dynwatch()
+    if want(check_realworld): check_realworld()
+    if want(check_conformance): check_conformance()
+    if want(check_prehook_attach): check_prehook_attach()
+    if want(check_memstress): check_memstress()
+    if want(check_symbols): check_symbols()
     print("-" * 72)
     failed = 0
     for name, status, detail in RESULTS:

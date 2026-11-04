@@ -7,7 +7,7 @@
 //   e.g. gated_config configparse.dll!ParseConfig+0x16 probe_app.exe!ReadThunk -- probe_app.exe
 //
 // b = breakpoint | hw | inline (flag default breakpoint, reads default inline). The
-// NtOpenProcess probe (handle -> pid for the read log) uses the read backend, so the
+// OpenThunk probe (handle -> pid for the read log) uses the read backend, so the
 // map it builds lives in the same address space as log_read.
 #include "callbacks.h"
 #include <cstdio>
@@ -42,7 +42,7 @@ int main(int argc, char **argv) {
     probe_session *s = probe_session_create();
     if (!s) return 1;
     int ok = probe_add_symbol(s, locations[0], enable_reads, flag_backend) &&
-             probe_add_symbol(s, "ntdll.dll!NtOpenProcess", track_open_process, read_backend) &&
+             probe_add_symbol(s, "probe_app.exe!OpenThunk", track_open_process, read_backend) &&
              probe_add_symbol_cfg(s, locations[1], log_read, read_backend, &cfg, sizeof(cfg)) &&
              probe_launch(s, target) && probe_run(s) && probe_wait_for_exit(s);
     probe_report(s, stdout);   // "overrides" = how many times the flag was flipped

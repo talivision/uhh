@@ -40,10 +40,11 @@ struct ObjectAttributes { ULONG Length; HANDLE RootDirectory; void *ObjectName; 
                           void *SecurityDescriptor; void *SecurityQualityOfService; };
 struct ClientId { HANDLE UniqueProcess, UniqueThread; };
 using NtOpen = LONG (NTAPI *)(HANDLE *, ACCESS_MASK, ObjectAttributes *, ClientId *);
-static NtOpen g_ntopen = nullptr;
 extern "C" {
     NtRead g_ntread = nullptr;
+    NtOpen g_ntopen = nullptr;
     LONG NTAPI ReadThunk(HANDLE, const void *, void *, SIZE_T, SIZE_T *);
+    LONG NTAPI OpenThunk(HANDLE *, ACCESS_MASK, ObjectAttributes *, ClientId *);   // probe_app.exe!OpenThunk
 }
 
 static void require(bool ok, const std::string &what) {
@@ -134,7 +135,7 @@ static void open_helpers(std::vector<Helper> &helpers) {
         // out-handle pointing at h.read_handle, which lives as long as the helper.
         ObjectAttributes oa{sizeof(oa)};
         ClientId cid{(HANDLE)(uintptr_t)h.hello.pid, nullptr};
-        require(g_ntopen(&h.read_handle, PROCESS_VM_READ, &oa, &cid) >= 0 && h.read_handle, "NtOpenProcess helper");
+        require(OpenThunk(&h.read_handle, PROCESS_VM_READ, &oa, &cid) >= 0 && h.read_handle, "NtOpenProcess helper");
     }
 }
 

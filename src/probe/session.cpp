@@ -12,10 +12,9 @@
 #include <map>
 #include <vector>
 #include <Zydis/Zydis.h>
-#include <dbghelp.h>
+#include "symbols.hpp"   // dbghelp+symsrv loaded dynamically; honours _NT_SYMBOL_PATH
 #include <tlhelp32.h>
 #include <timeapi.h>
-#pragma comment(lib, "dbghelp.lib")
 #pragma comment(lib, "winmm.lib")
 #include <unordered_set>
 #include <atomic>
@@ -189,7 +188,10 @@ static void sym_register(probe_session *s, HANDLE file, uint64_t base) {
         remote_read(s->pi.hProcess, base + (uint32_t)dos.e_lfanew, &nt, sizeof(nt), &got) && got == sizeof(nt) &&
         nt.Signature == IMAGE_NT_SIGNATURE)
         size = nt.OptionalHeader.SizeOfImage;
-    SymLoadModuleEx(s->pi.hProcess, nullptr, path.c_str(), nullptr, (DWORD64)base, size, nullptr, 0);
+    std::wstring wpath(path.begin(), path.end());
+    int wn = MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, nullptr, 0);
+    if (wn > 0) { wpath.assign((size_t)wn, L'\0'); MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, wpath.data(), wn); wpath.resize((size_t)wn - 1); }
+    uhh_sym::register_module(s->pi.hProcess, wpath, base, size);
 }
 
 static std::string module_name_from_module(HMODULE module) {
@@ -617,6 +619,7 @@ static bool detect_prehook(probe_session *s, const Probe &p, std::string &json) 
     if (p.module.empty() || !p.address || p.address < p.base) return false;
     std::string path;
     for (auto &kv : s->module_paths) if (iequals(kv.first, p.module)) { path = kv.second; break; }
+    if (trace_enabled()) std::fprintf(stderr, "  prehook-check %s path=%s\n", p.location.c_str(), path.c_str());
     if (path.empty()) return false;
     constexpr size_t N = 24;
     unsigned char live[N]{}, disk[N]{}; size_t got = 0;
@@ -666,6 +669,41 @@ static bool detect_prehook(probe_session *s, const Probe &p, std::string &json) 
             }
         }
     }
+    // Follow the jump chain (hooking libraries usually jump to a small relay stub that
+    // jumps on to the replacement): up to 4 hops through jmp rel/[mem]/reg-imm, stopping
+    // at the first address inside a loaded module, which is what the user can act on.
+    std::vector<uint64_t> hops;
+    for (int hop = 0; dest && hop < 4; ++hop) {
+        bool in_module = false;
+        for (auto &kv : s->module_bases) {
+            IMAGE_DOS_HEADER d{}; IMAGE_NT_HEADERS n{}; size_t g = 0;
+            if (dest < kv.second) continue;
+            if (remote_read(s->pi.hProcess, kv.second, &d, sizeof(d), &g) && g == sizeof(d) &&
+                remote_read(s->pi.hProcess, kv.second + (uint32_t)d.e_lfanew, &n, sizeof(n), &g) && g == sizeof(n) &&
+                dest < kv.second + n.OptionalHeader.SizeOfImage) { in_module = true; break; }
+        }
+        if (in_module) break;
+        unsigned char code[24]{};
+        if (!remote_read(s->pi.hProcess, dest, code, sizeof(code), &got) || got != sizeof(code)) break;
+        ZydisDecodedInstruction ji; ZydisDecodedOperand jo[ZYDIS_MAX_OPERAND_COUNT];
+        if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, code, sizeof(code), &ji, jo))) break;
+        uint64_t next = 0; ZyanU64 t = 0;
+        if (ji.mnemonic == ZYDIS_MNEMONIC_JMP && jo[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+            ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&ji, &jo[0], dest, &t))) next = t;
+        else if (ji.mnemonic == ZYDIS_MNEMONIC_JMP && jo[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                 ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&ji, &jo[0], dest, &t))) {
+            uint64_t ptr = 0;
+            if (remote_read(s->pi.hProcess, t, &ptr, sizeof(void *), &got) && got == sizeof(void *)) next = ptr;
+        } else if (ji.mnemonic == ZYDIS_MNEMONIC_MOV && jo[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                   jo[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            ZydisDecodedInstruction j2; ZydisDecodedOperand o2[ZYDIS_MAX_OPERAND_COUNT];
+            if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, code + ji.length, sizeof(code) - ji.length, &j2, o2)) &&
+                j2.mnemonic == ZYDIS_MNEMONIC_JMP && o2[0].type == ZYDIS_OPERAND_TYPE_REGISTER) next = jo[1].imm.value.u;
+        }
+        if (!next || next == dest) break;
+        hops.push_back(dest);
+        dest = next;
+    }
     // First unmodified instruction boundary in the ORIGINAL code at/after the patch.
     size_t resume = 0;
     while (resume < patched && resume < N) {
@@ -676,6 +714,8 @@ static bool detect_prehook(probe_session *s, const Probe &p, std::string &json) 
     auto live_d = disasm(live, (std::max)(patched, (size_t)8), p.address, 4);
     auto disk_d = disasm(disk, resume ? resume : 8, p.address, 4);
     std::string dest_s = dest ? symbolize(s, dest) : std::string();
+    std::string via;
+    for (uint64_t h : hops) { char b[32]; std::snprintf(b, sizeof(b), "%s0x%llx", via.empty() ? "" : " -> ", (unsigned long long)h); via += b; }
     std::vector<std::string> suggest;
     char line[256];
     std::snprintf(line, sizeof(line), "PROBE_HW at %s (debug register; modifies no code, coexists with the existing hook)", p.location.c_str());
@@ -692,7 +732,8 @@ static bool detect_prehook(probe_session *s, const Probe &p, std::string &json) 
     // Human-readable report.
     std::fprintf(stderr, "probe: PRE-HOOKED SITE %s (0x%llx): %zu byte(s) differ from %s\n",
                  p.location.c_str(), (unsigned long long)p.address, patched, path.c_str());
-    std::fprintf(stderr, "probe:   pattern: %s%s%s\n", pattern.c_str(), dest ? " -> " : "", dest_s.c_str());
+    std::fprintf(stderr, "probe:   pattern: %s%s%s%s%s\n", pattern.c_str(), dest ? " -> " : "", dest_s.c_str(),
+                 via.empty() ? "" : "  (via ", via.empty() ? "" : (via + ")").c_str());
     std::fprintf(stderr, "probe:   live (in memory):\n");
     for (auto &l : live_d) std::fprintf(stderr, "probe:     %s\n", l.c_str());
     std::fprintf(stderr, "probe:   original (on disk):\n");
@@ -712,6 +753,7 @@ static bool detect_prehook(probe_session *s, const Probe &p, std::string &json) 
     json = std::string("{\"kind\":\"prehook\",\"location\":") + q(p.location) + ",\"address\":" + q(addr) +
            ",\"patched_bytes\":" + std::to_string(patched) + ",\"pattern\":" + q(pattern) +
            ",\"destination\":" + (dest ? q(dest_s) : std::string("null")) +
+           ",\"via\":" + q(via) +
            ",\"live\":" + q(hex_bytes(live, (std::max)(patched, (size_t)8))) + ",\"original\":" + q(hex_bytes(disk, (std::max)(patched, (size_t)8))) +
            ",\"live_disasm\":" + arr(live_d) + ",\"original_disasm\":" + arr(disk_d) + ",\"suggest\":" + arr(suggest) + "}";
     return true;
@@ -798,6 +840,21 @@ static bool arm_probe(probe_session *s, Probe &item, uint64_t base) {
     // backend-agnostic, so it runs controller-side unchanged.
     // With the agent's service thread running, a late inline site is installed while the
     // loading thread is held (synchronous), so the fallback is only needed without it.
+    // Judge an inline site BEFORE any backend decision, so a foreign hook is always
+    // reported (and handled per PROBE_ALLOW_PREHOOKED / PROBE_FALLBACK_HW) -- including
+    // when the late-install rule below would move the probe anyway.
+    if (item.flags & PROBE_INLINE) {
+        Probe view = item; view.base = base;
+        if (!item.export_name.empty()) {
+            uint64_t exp = 0; std::string saved = s->error;
+            if (resolve_export(s, base, item.export_name, exp)) view.rva = exp + item.sym_offset;
+            s->error = saved;
+        }
+        view.address = base + view.rva;
+        bool moved = false;
+        if (!vet_site(s, view, moved)) { item.retired = true; return false; }
+        if (moved) item.flags = view.flags;                // pre-hooked / hazard page -> hw
+    }
     if ((item.flags & PROBE_INLINE) && (item.flags & PROBE_FALLBACK_HW) && s->gate_sent &&
         !(s->shared && s->shared->service_ready && s->svc_event)) {
         item.flags = (item.flags & ~(uint32_t)PROBE_INLINE) | PROBE_HW;
@@ -806,7 +863,18 @@ static bool arm_probe(probe_session *s, Probe &item, uint64_t base) {
     }
     if (!item.export_name.empty()) {
         uint64_t exp = 0;
-        if (!resolve_export(s, base, item.export_name, exp)) return false;
+        if (!resolve_export(s, base, item.export_name, exp)) {
+            // Not exported: try the module's symbols (PDB beside the image, or a symbol
+            // server via _NT_SYMBOL_PATH) -- internal functions by name.
+            uint64_t addr = 0; std::string saved = s->error;
+            if (!s->sym_ready || !uhh_sym::resolve(s->pi.hProcess, item.module, item.export_name, addr) || addr < base)
+                return false;
+            s->error.clear();
+            exp = addr - base;
+            std::fprintf(stderr, "probe: %s resolved from symbols -> %s+0x%llx\n", item.location.c_str(),
+                         item.module.c_str(), (unsigned long long)exp);
+            (void)saved;
+        }
         item.rva = exp + item.sym_offset;
     }
     if (item.flags & PROBE_BREAKPOINT) {
@@ -1159,6 +1227,7 @@ static bool release_gate(probe_session *s) {
     s->gate_sent = true; return true;
 }
 
+static bool same_bitness(probe_session *s, HANDLE process);
 extern "C" int probe_launch(probe_session *s, char *const argv[]) {
     if (!s || !argv || !argv[0]) { if (s) set_error(s, "launch argv is empty"); return 0; }
     if (s->launched) { set_error(s, "session already launched"); return 0; }
@@ -1187,10 +1256,15 @@ extern "C" int probe_launch(probe_session *s, char *const argv[]) {
             CloseHandle(s->stdin_write); s->stdin_write = nullptr;
             set_error(s, win_error("debug launch")); return 0;
         }
+        if (!same_bitness(s, s->pi.hProcess)) {
+            TerminateProcess(s->pi.hProcess, 3);
+            CloseHandle(s->pi.hThread); CloseHandle(s->pi.hProcess); s->pi = {};
+            CloseHandle(s->stdin_write); s->stdin_write = nullptr;
+            return 0;
+        }
         s->launched = true;
-        SymSetOptions(SymGetOptions() | SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME | SYMOPT_NO_PROMPTS |
-                      SYMOPT_FAIL_CRITICAL_ERRORS);
-        s->sym_ready = !!SymInitialize(s->pi.hProcess, nullptr, FALSE);
+        { std::string which; s->sym_ready = uhh_sym::init(s->pi.hProcess, which);
+          std::fprintf(stderr, "probe: symbols via %s%s\n", which.c_str(), uhh_sym::has_symbol_server() ? " (symbol server capable)" : ""); }
         if (!create_agent_channel(s) || (!has_inline(s) && !release_gate(s))) {
             TerminateProcess(s->pi.hProcess, 3); return 0;
         }
@@ -1198,20 +1272,31 @@ extern "C" int probe_launch(probe_session *s, char *const argv[]) {
     } catch (const std::exception &e) { set_error(s, e.what()); return 0; }
 }
 
+// The controller and target must be the same bitness: callbacks run with the controller's
+// view of registers, argument slots and pointer width. A mismatch would silently produce
+// garbage, so refuse it up front.
+static bool same_bitness(probe_session *s, HANDLE process) {
+    BOOL me = FALSE, it = FALSE;
+    if (!IsWow64Process(GetCurrentProcess(), &me) || !IsWow64Process(process, &it)) return true;   // cannot tell
+    if (me == it) return true;
+    set_error(s, it ? "target is a 32-bit (WOW64) process: use the x86 build of UHH"
+                    : "target is a 64-bit process: use the x64 build of UHH");
+    return false;
+}
+
 extern "C" int probe_attach(probe_session *s, uint32_t pid) {
     if (!s) return 0;
     if (s->launched) { set_error(s, "session already launched"); return 0; }
     s->pi.hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
     if (!s->pi.hProcess) { set_error(s, win_error("open target process")); return 0; }
+    if (!same_bitness(s, s->pi.hProcess)) { CloseHandle(s->pi.hProcess); s->pi.hProcess = nullptr; return 0; }
     if (!DebugActiveProcess(pid)) {
         set_error(s, win_error("attach debugger")); CloseHandle(s->pi.hProcess); s->pi.hProcess = nullptr; return 0;
     }
     DebugSetProcessKillOnExit(FALSE);              // our exit must never take the target down
     s->pi.dwProcessId = pid;
     s->attached = true; s->launched = true; s->gate_sent = true;
-    SymSetOptions(SymGetOptions() | SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME | SYMOPT_NO_PROMPTS |
-                  SYMOPT_FAIL_CRITICAL_ERRORS);
-    s->sym_ready = !!SymInitialize(s->pi.hProcess, nullptr, FALSE);
+    { std::string which; s->sym_ready = uhh_sym::init(s->pi.hProcess, which); }
     if (!create_agent_channel(s)) { DebugActiveProcessStop(pid); return 0; }
     return 1;
 }
@@ -1767,6 +1852,8 @@ static bool vet_pending_inline(probe_session *s) {
     for (size_t i = 0; i < s->probes.size(); ++i) {
         Probe &p = *s->probes[i];
         if (!(p.flags & PROBE_INLINE) || !p.address || p.active || p.retired || p.vetted) continue;
+        // (Re-judged here even if judged at resolve time: a foreign hook may have been
+        //  placed in between, e.g. by a TLS callback during loader initialisation.)
         auto &request = s->shared->requests[p.agent_index];
         if (request.status != PROBE_AGENT_PENDING) continue;
         p.vetted = true;
@@ -2103,7 +2190,7 @@ extern "C" void probe_close(probe_session *s) {
     }
     if (s->pi.hProcess)
         for (uint64_t b : s->scratch_blocks) VirtualFreeEx(s->pi.hProcess, (void *)(uintptr_t)b, 0, MEM_RELEASE);
-    if (s->sym_ready) SymCleanup(s->pi.hProcess);
+    if (s->sym_ready) uhh_sym::cleanup(s->pi.hProcess);
     if (s->remote_thread) CloseHandle(s->remote_thread);
     if (s->svc_event) CloseHandle(s->svc_event);
     if (s->remote_path && s->pi.hProcess) VirtualFreeEx(s->pi.hProcess, s->remote_path, 0, MEM_RELEASE);
@@ -2257,7 +2344,7 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
 #if defined(_WIN64)
                     if (ret) *ret = r.Rax;
 #else
-                    if (ret) *ret = ((uint64_t)r.Edx << 32) | r.Eax;
+                    if (ret) *ret = r.Eax;                     // pointer-sized return (EAX)
 #endif
                     result = 1;
                 }
@@ -2311,54 +2398,41 @@ extern "C" probe_session *get_session(probe_context *c) {
 // target with the hit's register image). No symbol lookup here -- deferred to report.
 static void capture_stack(probe_session *s, probe_context *c, std::vector<uint64_t> &frames) {
     frames.clear();
-    frames.push_back(c->regs.pc);
-    if (!s->sym_ready) return;
+    if (!s->sym_ready) { frames.push_back(c->regs.pc); return; }
     CONTEXT w{}; w.ContextFlags = CONTEXT_FULL;
     to_context(*c, w);
-    STACKFRAME64 f{};
 #if defined(_WIN64)
-    DWORD machine = IMAGE_FILE_MACHINE_AMD64;
     w.Rip = c->regs.pc; w.Rsp = c->regs.rsp; w.Rbp = c->regs.rbp;
 #else
-    DWORD machine = IMAGE_FILE_MACHINE_I386;
     w.Eip = (DWORD)c->regs.pc; w.Esp = (DWORD)c->regs.rsp; w.Ebp = (DWORD)c->regs.rbp;
 #endif
-    f.AddrPC.Offset = c->regs.pc;     f.AddrPC.Mode = AddrModeFlat;
-    f.AddrStack.Offset = c->regs.rsp; f.AddrStack.Mode = AddrModeFlat;
-    f.AddrFrame.Offset = c->regs.rbp; f.AddrFrame.Mode = AddrModeFlat;
     HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, c->tid);
-    for (int i = 0; i < PROBE_STACK_MAX_FRAMES; ++i) {
-        if (!StackWalk64(machine, s->pi.hProcess, thread, &f, &w, nullptr,
-                         SymFunctionTableAccess64, SymGetModuleBase64, nullptr)) break;
-        if (!f.AddrPC.Offset) break;
-        if (i == 0) continue;                          // frame 0 is the site itself (already pushed)
-        frames.push_back(f.AddrPC.Offset);
+    if (!uhh_sym::walk_stack(s->pi.hProcess, thread, w, c->regs.pc, c->regs.rsp, c->regs.rbp, frames,
+                             PROBE_STACK_MAX_FRAMES) || frames.empty())
+        frames.assign(1, c->regs.pc);
+#if !defined(_WIN64)
+    // x86 at a function's first instructions: EBP still frames the CALLER, so a walk can
+    // skip the immediate caller. If [esp] is a genuine return address (the bytes before
+    // it encode a call) and is not already frame 1, insert it -- same rule as the agent.
+    uint32_t top = 0; size_t got = 0; unsigned char pre[8] = {0};
+    if (remote_read(s->pi.hProcess, c->regs.rsp, &top, 4, &got) && got == 4 && top > 8 &&
+        remote_read(s->pi.hProcess, top - 8, pre, 8, &got) && got == 8) {
+        const unsigned char *p = pre + 8;
+        bool call = p[-5] == 0xE8 ||
+                    (p[-2] == 0xFF && ((p[-1] >> 3) & 7) == 2 && ((p[-1] >> 6) == 3 || ((p[-1] >> 6) == 0 && (p[-1] & 7) != 4 && (p[-1] & 7) != 5))) ||
+                    (p[-3] == 0xFF && ((p[-2] >> 3) & 7) == 2 && (p[-2] >> 6) == 1) ||
+                    (p[-6] == 0xFF && ((p[-5] >> 3) & 7) == 2 && ((p[-5] >> 6) == 2 || (p[-5] & 0xC7) == 5)) ||
+                    (p[-7] == 0xFF && ((p[-6] >> 3) & 7) == 2 && (p[-6] >> 6) == 2 && (p[-6] & 7) == 4);
+        if (call && (frames.size() < 2 || frames[1] != top)) frames.insert(frames.begin() + 1, top);
+        if (frames.size() > PROBE_STACK_MAX_FRAMES) frames.resize(PROBE_STACK_MAX_FRAMES);
     }
+#endif
     if (thread) CloseHandle(thread);
 }
 
 static std::string symbolize(probe_session *s, uint64_t addr) {
-    char buf[64]; std::snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)addr);
-    if (!s->sym_ready) return buf;
-    std::string out;
-    IMAGEHLP_MODULE64 mod{}; mod.SizeOfStruct = sizeof(mod);
-    if (SymGetModuleInfo64(s->pi.hProcess, addr, &mod)) out = mod.ModuleName;
-    alignas(SYMBOL_INFO) char sb[sizeof(SYMBOL_INFO) + 256]{};
-    auto *sym = reinterpret_cast<SYMBOL_INFO *>(sb); sym->SizeOfStruct = sizeof(SYMBOL_INFO); sym->MaxNameLen = 255;
-    DWORD64 disp = 0;
-    if (SymFromAddr(s->pi.hProcess, addr, &disp, sym)) {
-        char tmp[300]; std::snprintf(tmp, sizeof(tmp), "!%s+0x%llx", sym->Name, (unsigned long long)disp);
-        out += tmp;
-    } else if (!out.empty()) {
-        char tmp[40]; std::snprintf(tmp, sizeof(tmp), "+0x%llx", (unsigned long long)(addr - mod.BaseOfImage));
-        out += tmp;
-    }
-    IMAGEHLP_LINE64 line{}; line.SizeOfStruct = sizeof(line); DWORD ld = 0;
-    if (SymGetLineFromAddr64(s->pi.hProcess, addr, &ld, &line) && line.FileName) {
-        char tmp[300]; std::snprintf(tmp, sizeof(tmp), " (%s:%lu)", basename_of(line.FileName).c_str(), line.LineNumber);
-        out += tmp;
-    }
-    return out.empty() ? std::string(buf) : out + " [" + buf + "]";
+    if (!s->sym_ready) { char buf[32]; std::snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)addr); return buf; }
+    return uhh_sym::symbolize(s->pi.hProcess, addr);
 }
 
 static void log_common(probe_context *c, bool stack, const char *format, va_list ap) {
