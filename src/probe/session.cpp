@@ -269,11 +269,16 @@ static bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
     int slot = -1;
     for (int i = 0; i < 4; ++i) if (!(s->dr_used & (1u << i))) { slot = i; break; }
     if (slot < 0) { set_error(s, "no free hardware breakpoint slot (max 4)"); return false; }
+    size_t tried = 0, set_ok = 0;
     for (DWORD tid : s->threads) {
         HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
         if (!t) continue;
-        set_dr_on_thread(t, slot, address, true);
+        ++tried;
+        if (set_dr_on_thread(t, slot, address, true)) ++set_ok;
         CloseHandle(t);
+    }
+    if (tried && !set_ok) {   // could not arm the DR on any thread -> the probe would never fire
+        set_error(s, win_error("set hardware breakpoint on target threads")); return false;
     }
     s->dr_used |= (uint8_t)(1u << slot); ++s->hw_active;
     p.dr_slot = slot; p.base = base; p.address = address; p.active = true;
@@ -484,27 +489,34 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
     if (!thread) { set_error(s, win_error("open hw event thread")); return false; }
     CONTEXT native{}; native.ContextFlags = CONTEXT_ALL;
     if (!GetThreadContext(thread, &native)) { CloseHandle(thread); set_error(s, win_error("get hw context")); return false; }
-    int slot = (native.Dr6 & 0x1) ? 0 : (native.Dr6 & 0x2) ? 1 : (native.Dr6 & 0x4) ? 2 : (native.Dr6 & 0x8) ? 3 : -1;
-    if (slot < 0) { CloseHandle(thread); return true; }              // not a DR hit
-    Probe *probe = nullptr;
-    for (auto &p : s->probes) if (p->active && (p->flags & PROBE_HW) && p->dr_slot == slot) { probe = p.get(); break; }
-    if (!probe) { CloseHandle(thread); return true; }                // a DR we do not own
-    probe_context context = from_context(native, probe_index(s, probe), probe->address, &remote_ops, s->pi.hProcess);
-    context.config = probe->config.empty() ? nullptr : probe->config.data();
-    context.tid = event.dwThreadId;
-    CallbackState state{s, probe}; context.controller = &state;
-    try { probe->callback(&context); }
-    catch (const std::exception &e) { CloseHandle(thread); set_error(s, std::string("probe callback: ") + e.what()); return false; }
-    catch (...) { CloseHandle(thread); set_error(s, "probe callback threw an unknown exception"); return false; }
-    ++probe->hits;
-    to_context(context, native);
+    // Service EVERY debug-status bit that fired, not just the lowest: two probes can
+    // share an address (both B-bits set), and clearing DR6 after handling only one
+    // would silently drop the other. Callbacks compose on one context in slot order.
+    bool any = false;
+    for (int slot = 0; slot < 4; ++slot) {
+        if (!(native.Dr6 & (1u << slot))) continue;
+        Probe *probe = nullptr;
+        for (auto &p : s->probes) if (p->active && (p->flags & PROBE_HW) && p->dr_slot == slot) { probe = p.get(); break; }
+        if (!probe) continue;                                        // a DR we do not own
+        any = true;
+        probe_context context = from_context(native, probe_index(s, probe), probe->address, &remote_ops, s->pi.hProcess);
+        context.config = probe->config.empty() ? nullptr : probe->config.data();
+        context.tid = event.dwThreadId;
+        CallbackState state{s, probe}; context.controller = &state;
+        try { probe->callback(&context); }
+        catch (const std::exception &e) { CloseHandle(thread); set_error(s, std::string("probe callback: ") + e.what()); return false; }
+        catch (...) { CloseHandle(thread); set_error(s, "probe callback threw an unknown exception"); return false; }
+        ++probe->hits;
+        to_context(context, native);                                 // fold each callback's changes forward
 #if defined(_WIN64)
-    native.Rsp = context.regs.rsp;
+        native.Rsp = context.regs.rsp;
 #else
-    native.Esp = (DWORD)context.regs.rsp;
+        native.Esp = (DWORD)context.regs.rsp;
 #endif
+    }
+    if (!any) { CloseHandle(thread); return true; }                  // none of our DRs fired
     native.EFlags |= 0x10000u;   // RF: execute the flagged instruction once without re-trapping
-    native.Dr6 = 0;              // clear the debug status bits we consumed
+    native.Dr6 = 0;              // clear all debug status bits we consumed
     if (!SetThreadContext(thread, &native)) { CloseHandle(thread); set_error(s, win_error("resume hw breakpoint")); return false; }
     CloseHandle(thread); handled = true; return true;
 }
