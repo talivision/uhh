@@ -1,0 +1,3 @@
+method,repeats,median_elapsed_ns,median_ns_per_read,added_ns_per_read,slowdown,hits_exact,hits,checksum,notes
+baseline,3,168989200,422.473,0.0,1.0,True,400000,33600000,
+frida:interceptor,3,3409887400,8524.7185,8102.2455,20.1781,True,"[400000, 400000, 400000]",33600000,"{""type"": ""done""}"

@@ -1,0 +1,5 @@
+method,repeats,median_elapsed_ns,median_ns_per_read,added_ns_per_read,slowdown,hits_exact,hits,checksum,notes
+baseline,3,170245700,425.6143,0.0,1.0,True,400000,33600000,
+uhh:inline,3,195262200,488.1555,62.5412,1.1469,True,"[400000, 400000, 400000]",33600000,"{""overrides"": 1, ""log_dropped"": 399488}"
+frida:interceptor,3,3397692900,8494.2322,8068.618,19.9576,False,"[-1, -1, -1]",33600000,"{""note"": ""no done msg, stats failed: script has been destroyed""}"
+frida:cmodule,0,,,,,False,null,,FAILED: frida: no app line

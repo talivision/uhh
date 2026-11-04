@@ -1,0 +1,2 @@
+{"method": "baseline", "repeat": 0, "elapsed_ns": 6801200, "successful_reads": 16000, "checksum": 1344000}
+{"method": "frida:hwbp", "repeat": 0, "elapsed_ns": 647800600, "successful_reads": 16000, "checksum": 1344000, "hits": 8, "frida_stats": {"calls": 8, "matched": 8, "logged": 0, "resolveCalls": 0, "armedThreads": 13, "errors": [], "type": "done"}}

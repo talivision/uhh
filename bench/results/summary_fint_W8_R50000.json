@@ -1,0 +1,30 @@
+[
+  {
+    "method": "baseline",
+    "repeats": 3,
+    "median_elapsed_ns": 168989200,
+    "median_ns_per_read": 422.473,
+    "added_ns_per_read": 0.0,
+    "slowdown": 1.0,
+    "hits": 400000,
+    "hits_exact": true,
+    "checksum": 33600000,
+    "notes": ""
+  },
+  {
+    "method": "frida:interceptor",
+    "repeats": 3,
+    "median_elapsed_ns": 3409887400,
+    "median_ns_per_read": 8524.7185,
+    "added_ns_per_read": 8102.2455,
+    "slowdown": 20.1781,
+    "hits": [
+      400000,
+      400000,
+      400000
+    ],
+    "hits_exact": true,
+    "checksum": 33600000,
+    "notes": "{\"type\": \"done\"}"
+  }
+]

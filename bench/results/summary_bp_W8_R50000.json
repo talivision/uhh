@@ -1,0 +1,30 @@
+[
+  {
+    "method": "baseline",
+    "repeats": 3,
+    "median_elapsed_ns": 169737800,
+    "median_ns_per_read": 424.3445,
+    "added_ns_per_read": 0.0,
+    "slowdown": 1.0,
+    "hits": 400000,
+    "hits_exact": true,
+    "checksum": 33600000,
+    "notes": ""
+  },
+  {
+    "method": "uhh:breakpoint",
+    "repeats": 3,
+    "median_elapsed_ns": 47387362200,
+    "median_ns_per_read": 118468.4055,
+    "added_ns_per_read": 118044.061,
+    "slowdown": 279.1798,
+    "hits": [
+      400000,
+      400000,
+      400000
+    ],
+    "hits_exact": true,
+    "checksum": 33600000,
+    "notes": "{\"overrides\": 1, \"log_dropped\": 0}"
+  }
+]

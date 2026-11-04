@@ -1,0 +1,28 @@
+[
+  {
+    "method": "baseline",
+    "repeats": 1,
+    "median_elapsed_ns": 6964200,
+    "median_ns_per_read": 435.2625,
+    "added_ns_per_read": 0.0,
+    "slowdown": 1.0,
+    "hits": 16000,
+    "hits_exact": true,
+    "checksum": 1344000,
+    "notes": ""
+  },
+  {
+    "method": "frida:stalker",
+    "repeats": 1,
+    "median_elapsed_ns": 41668200,
+    "median_ns_per_read": 2604.2625,
+    "added_ns_per_read": 2169.0,
+    "slowdown": 5.9832,
+    "hits": [
+      16000
+    ],
+    "hits_exact": true,
+    "checksum": 1344000,
+    "notes": "{\"followedThreads\": 9, \"type\": \"done\"}"
+  }
+]

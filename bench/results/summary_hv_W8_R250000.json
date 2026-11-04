@@ -1,0 +1,46 @@
+[
+  {
+    "method": "baseline",
+    "repeats": 3,
+    "median_elapsed_ns": 840423000,
+    "median_ns_per_read": 420.2115,
+    "added_ns_per_read": 0.0,
+    "slowdown": 1.0,
+    "hits": 2000000,
+    "hits_exact": true,
+    "checksum": 168000000,
+    "notes": ""
+  },
+  {
+    "method": "uhh:inline",
+    "repeats": 3,
+    "median_elapsed_ns": 950571500,
+    "median_ns_per_read": 475.2858,
+    "added_ns_per_read": 55.0743,
+    "slowdown": 1.1311,
+    "hits": [
+      2000000,
+      2000000,
+      2000000
+    ],
+    "hits_exact": true,
+    "checksum": 168000000,
+    "notes": "{\"overrides\": 1, \"log_dropped\": 1999488}"
+  },
+  {
+    "method": "frida:interceptor",
+    "repeats": 3,
+    "median_elapsed_ns": 17129752400,
+    "median_ns_per_read": 8564.8762,
+    "added_ns_per_read": 8144.6647,
+    "slowdown": 20.3823,
+    "hits": [
+      2000000,
+      2000000,
+      2000000
+    ],
+    "hits_exact": true,
+    "checksum": 168000000,
+    "notes": "{\"type\": \"done\"}"
+  }
+]

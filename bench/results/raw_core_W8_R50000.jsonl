@@ -1,0 +1,9 @@
+{"method": "baseline", "repeat": 0, "elapsed_ns": 168592300, "successful_reads": 400000, "checksum": 33600000}
+{"method": "baseline", "repeat": 1, "elapsed_ns": 176830300, "successful_reads": 400000, "checksum": 33600000}
+{"method": "baseline", "repeat": 2, "elapsed_ns": 170245700, "successful_reads": 400000, "checksum": 33600000}
+{"method": "uhh:inline", "repeat": 0, "elapsed_ns": 191871200, "successful_reads": 400000, "checksum": 33600000, "hits": 400000, "overrides": 1, "log_dropped": 399488, "rc": 0}
+{"method": "uhh:inline", "repeat": 1, "elapsed_ns": 210411500, "successful_reads": 400000, "checksum": 33600000, "hits": 400000, "overrides": 1, "log_dropped": 399488, "rc": 0}
+{"method": "uhh:inline", "repeat": 2, "elapsed_ns": 195262200, "successful_reads": 400000, "checksum": 33600000, "hits": 400000, "overrides": 1, "log_dropped": 399488, "rc": 0}
+{"method": "frida:interceptor", "repeat": 0, "elapsed_ns": 3377590100, "successful_reads": 400000, "checksum": 33600000, "hits": -1, "frida_stats": {"calls": -1, "note": "no done msg, stats failed: script has been destroyed"}}
+{"method": "frida:interceptor", "repeat": 1, "elapsed_ns": 3423458900, "successful_reads": 400000, "checksum": 33600000, "hits": -1, "frida_stats": {"calls": -1, "note": "no done msg, stats failed: script has been destroyed"}}
+{"method": "frida:interceptor", "repeat": 2, "elapsed_ns": 3397692900, "successful_reads": 400000, "checksum": 33600000, "hits": -1, "frida_stats": {"calls": -1, "note": "no done msg, stats failed: script has been destroyed"}}

@@ -1,0 +1,58 @@
+[
+  {
+    "method": "baseline",
+    "repeats": 3,
+    "median_elapsed_ns": 170245700,
+    "median_ns_per_read": 425.6143,
+    "added_ns_per_read": 0.0,
+    "slowdown": 1.0,
+    "hits": 400000,
+    "hits_exact": true,
+    "checksum": 33600000,
+    "notes": ""
+  },
+  {
+    "method": "uhh:inline",
+    "repeats": 3,
+    "median_elapsed_ns": 195262200,
+    "median_ns_per_read": 488.1555,
+    "added_ns_per_read": 62.5412,
+    "slowdown": 1.1469,
+    "hits": [
+      400000,
+      400000,
+      400000
+    ],
+    "hits_exact": true,
+    "checksum": 33600000,
+    "notes": "{\"overrides\": 1, \"log_dropped\": 399488}"
+  },
+  {
+    "method": "frida:interceptor",
+    "repeats": 3,
+    "median_elapsed_ns": 3397692900,
+    "median_ns_per_read": 8494.2322,
+    "added_ns_per_read": 8068.618,
+    "slowdown": 19.9576,
+    "hits": [
+      -1,
+      -1,
+      -1
+    ],
+    "hits_exact": false,
+    "checksum": 33600000,
+    "notes": "{\"note\": \"no done msg, stats failed: script has been destroyed\"}"
+  },
+  {
+    "method": "frida:cmodule",
+    "repeats": 0,
+    "median_elapsed_ns": null,
+    "median_ns_per_read": null,
+    "added_ns_per_read": null,
+    "slowdown": null,
+    "hits": null,
+    "hits_exact": false,
+    "checksum": null,
+    "notes": "FAILED: frida: no app line"
+  }
+]

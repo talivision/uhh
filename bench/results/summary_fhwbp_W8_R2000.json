@@ -1,0 +1,28 @@
+[
+  {
+    "method": "baseline",
+    "repeats": 1,
+    "median_elapsed_ns": 6801200,
+    "median_ns_per_read": 425.075,
+    "added_ns_per_read": 0.0,
+    "slowdown": 1.0,
+    "hits": 16000,
+    "hits_exact": true,
+    "checksum": 1344000,
+    "notes": ""
+  },
+  {
+    "method": "frida:hwbp",
+    "repeats": 1,
+    "median_elapsed_ns": 647800600,
+    "median_ns_per_read": 40487.5375,
+    "added_ns_per_read": 40062.4625,
+    "slowdown": 95.248,
+    "hits": [
+      8
+    ],
+    "hits_exact": false,
+    "checksum": 1344000,
+    "notes": "{\"armedThreads\": 13, \"errors\": [], \"type\": \"done\"}"
+  }
+]

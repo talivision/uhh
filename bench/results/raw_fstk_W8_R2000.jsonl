@@ -1,0 +1,2 @@
+{"method": "baseline", "repeat": 0, "elapsed_ns": 6964200, "successful_reads": 16000, "checksum": 1344000}
+{"method": "frida:stalker", "repeat": 0, "elapsed_ns": 41668200, "successful_reads": 16000, "checksum": 1344000, "hits": 16000, "frida_stats": {"calls": 16000, "matched": 16000, "logged": 0, "resolveCalls": 0, "followedThreads": 9, "type": "done"}}

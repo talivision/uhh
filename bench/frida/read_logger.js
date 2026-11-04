@@ -153,3 +153,23 @@ Interceptor.attach(ntReadVM, {
 });
 
 send({ type: 'ready', what: 'read_logger', target: ntReadVM.toString() });
+
+// --- benchmark helper: emit the final count at process exit (before Frida/CRT
+// teardown), and HOLD the exiting thread briefly so the driver can read an
+// accurate count via the 'done' message or a stats() RPC - probe_app otherwise
+// exits immediately after its {"kind":"app"} line and tears down the script. ---
+(function () {
+    function sendDone() {
+        var s = {}; try { s = rpc.exports.stats(); } catch (e) {}
+        s.type = 'done';
+        try { send(s); } catch (e) {}
+    }
+    try {
+        var exitFn = modExport('ntdll.dll', 'RtlExitUserProcess');
+        Interceptor.attach(exitFn, { onEnter: function () {
+            sendDone();
+            var end = Date.now() + 4000;   // keep process (and script) alive
+            while (Date.now() < end) {}
+        }});
+    } catch (e) { /* stats() RPC remains the fallback */ }
+})();

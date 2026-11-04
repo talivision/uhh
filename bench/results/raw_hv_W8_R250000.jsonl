@@ -1,0 +1,9 @@
+{"method": "baseline", "repeat": 0, "elapsed_ns": 846789800, "successful_reads": 2000000, "checksum": 168000000}
+{"method": "baseline", "repeat": 1, "elapsed_ns": 833214800, "successful_reads": 2000000, "checksum": 168000000}
+{"method": "baseline", "repeat": 2, "elapsed_ns": 840423000, "successful_reads": 2000000, "checksum": 168000000}
+{"method": "uhh:inline", "repeat": 0, "elapsed_ns": 950571500, "successful_reads": 2000000, "checksum": 168000000, "hits": 2000000, "overrides": 1, "log_dropped": 1999488, "rc": 0}
+{"method": "uhh:inline", "repeat": 1, "elapsed_ns": 967769300, "successful_reads": 2000000, "checksum": 168000000, "hits": 2000000, "overrides": 1, "log_dropped": 1999488, "rc": 0}
+{"method": "uhh:inline", "repeat": 2, "elapsed_ns": 934054100, "successful_reads": 2000000, "checksum": 168000000, "hits": 2000000, "overrides": 1, "log_dropped": 1999488, "rc": 0}
+{"method": "frida:interceptor", "repeat": 0, "elapsed_ns": 17207509300, "successful_reads": 2000000, "checksum": 168000000, "hits": 2000000, "frida_stats": {"calls": 2000000, "matched": 2000000, "logged": 0, "resolveCalls": 0, "type": "done"}}
+{"method": "frida:interceptor", "repeat": 1, "elapsed_ns": 16897035900, "successful_reads": 2000000, "checksum": 168000000, "hits": 2000000, "frida_stats": {"calls": 2000000, "matched": 2000000, "logged": 0, "resolveCalls": 0, "type": "done"}}
+{"method": "frida:interceptor", "repeat": 2, "elapsed_ns": 17129752400, "successful_reads": 2000000, "checksum": 168000000, "hits": 2000000, "frida_stats": {"calls": 2000000, "matched": 2000000, "logged": 0, "resolveCalls": 0, "type": "done"}}

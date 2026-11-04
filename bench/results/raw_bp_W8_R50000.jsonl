@@ -1,0 +1,6 @@
+{"method": "baseline", "repeat": 0, "elapsed_ns": 176112800, "successful_reads": 400000, "checksum": 33600000}
+{"method": "baseline", "repeat": 1, "elapsed_ns": 169737800, "successful_reads": 400000, "checksum": 33600000}
+{"method": "baseline", "repeat": 2, "elapsed_ns": 166807200, "successful_reads": 400000, "checksum": 33600000}
+{"method": "uhh:breakpoint", "repeat": 0, "elapsed_ns": 47243114700, "successful_reads": 400000, "checksum": 33600000, "hits": 400000, "overrides": 1, "log_dropped": 0, "rc": 0}
+{"method": "uhh:breakpoint", "repeat": 1, "elapsed_ns": 47628134300, "successful_reads": 400000, "checksum": 33600000, "hits": 400000, "overrides": 1, "log_dropped": 0, "rc": 0}
+{"method": "uhh:breakpoint", "repeat": 2, "elapsed_ns": 47387362200, "successful_reads": 400000, "checksum": 33600000, "hits": 400000, "overrides": 1, "log_dropped": 0, "rc": 0}

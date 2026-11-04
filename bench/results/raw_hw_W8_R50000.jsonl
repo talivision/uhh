@@ -1,0 +1,6 @@
+{"method": "baseline", "repeat": 0, "elapsed_ns": 168319200, "successful_reads": 400000, "checksum": 33600000}
+{"method": "baseline", "repeat": 1, "elapsed_ns": 167000400, "successful_reads": 400000, "checksum": 33600000}
+{"method": "baseline", "repeat": 2, "elapsed_ns": 168920500, "successful_reads": 400000, "checksum": 33600000}
+{"method": "uhh:hw", "repeat": 0, "elapsed_ns": 26300361300, "successful_reads": 400000, "checksum": 33600000, "hits": 400000, "overrides": 1, "log_dropped": 0, "rc": 0}
+{"method": "uhh:hw", "repeat": 1, "elapsed_ns": 26196417200, "successful_reads": 400000, "checksum": 33600000, "hits": 400000, "overrides": 1, "log_dropped": 0, "rc": 0}
+{"method": "uhh:hw", "repeat": 2, "elapsed_ns": 26388157000, "successful_reads": 400000, "checksum": 33600000, "hits": 400000, "overrides": 1, "log_dropped": 0, "rc": 0}

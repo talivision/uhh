@@ -1,0 +1,6 @@
+{"method": "baseline", "repeat": 0, "elapsed_ns": 171040100, "successful_reads": 400000, "checksum": 33600000}
+{"method": "baseline", "repeat": 1, "elapsed_ns": 168989200, "successful_reads": 400000, "checksum": 33600000}
+{"method": "baseline", "repeat": 2, "elapsed_ns": 165380500, "successful_reads": 400000, "checksum": 33600000}
+{"method": "frida:interceptor", "repeat": 0, "elapsed_ns": 3409887400, "successful_reads": 400000, "checksum": 33600000, "hits": 400000, "frida_stats": {"calls": 400000, "matched": 400000, "logged": 0, "resolveCalls": 0, "type": "done"}}
+{"method": "frida:interceptor", "repeat": 1, "elapsed_ns": 3402096800, "successful_reads": 400000, "checksum": 33600000, "hits": 400000, "frida_stats": {"calls": 400000, "matched": 400000, "logged": 0, "resolveCalls": 0, "type": "done"}}
+{"method": "frida:interceptor", "repeat": 2, "elapsed_ns": 3418946800, "successful_reads": 400000, "checksum": 33600000, "hits": 400000, "frida_stats": {"calls": 400000, "matched": 400000, "logged": 0, "resolveCalls": 0, "type": "done"}}

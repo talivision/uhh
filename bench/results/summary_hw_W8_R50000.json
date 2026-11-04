@@ -1,0 +1,30 @@
+[
+  {
+    "method": "baseline",
+    "repeats": 3,
+    "median_elapsed_ns": 168319200,
+    "median_ns_per_read": 420.798,
+    "added_ns_per_read": 0.0,
+    "slowdown": 1.0,
+    "hits": 400000,
+    "hits_exact": true,
+    "checksum": 33600000,
+    "notes": ""
+  },
+  {
+    "method": "uhh:hw",
+    "repeats": 3,
+    "median_elapsed_ns": 26300361300,
+    "median_ns_per_read": 65750.9033,
+    "added_ns_per_read": 65330.1053,
+    "slowdown": 156.2529,
+    "hits": [
+      400000,
+      400000,
+      400000
+    ],
+    "hits_exact": true,
+    "checksum": 33600000,
+    "notes": "{\"overrides\": 1, \"log_dropped\": 0}"
+  }
+]

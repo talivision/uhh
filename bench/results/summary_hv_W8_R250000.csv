@@ -1,0 +1,4 @@
+method,repeats,median_elapsed_ns,median_ns_per_read,added_ns_per_read,slowdown,hits_exact,hits,checksum,notes
+baseline,3,840423000,420.2115,0.0,1.0,True,2000000,168000000,
+uhh:inline,3,950571500,475.2858,55.0743,1.1311,True,"[2000000, 2000000, 2000000]",168000000,"{""overrides"": 1, ""log_dropped"": 1999488}"
+frida:interceptor,3,17129752400,8564.8762,8144.6647,20.3823,True,"[2000000, 2000000, 2000000]",168000000,"{""type"": ""done""}"
