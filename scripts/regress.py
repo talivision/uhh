@@ -1056,7 +1056,8 @@ def check_callconv():
     d, t = exe("cc_driver.exe"), exe("cc_target.exe")
     if not d or not t:
         return skip("callconv", "cc_driver/cc_target missing")
-    x86 = "x86" in str(BIN).lower() or "win32" in str(BIN).lower()
+    data = Path(t).read_bytes()          # the arch from the PE header (a path can say anything)
+    x86 = struct.unpack_from("<H", data, struct.unpack_from("<I", data, 0x3C)[0] + 4)[0] == 0x14C
     ids = [i for i, n in enumerate(CC_NAMES) if x86 or n not in CC_X86_ONLY]
 
     def rows(objs):
@@ -1096,7 +1097,9 @@ def check_callconv():
                         problems.append(f"mask={mask} rc={r.returncode} target_bad={bad[:3]} cb_fails={fails[:3]} "
                                         f"hits={ {k: v for k, v in hits.items() if want_hits.get(k) != v} } "
                                         f"missing={[k for k in want_hits if k not in hits]} warn={others[:2]} "
-                                        f"err={rep.get('error')} stderr={r.stderr.strip().splitlines()[-2:]}")
+                                        f"err={rep.get('error')} dropped={rep.get('log_dropped')} "
+                                        f"probe_hits={ {str(p.get('location', '')).split('!')[-1]: p.get('hits') for p in probes(o)} } "
+                                        f"stderr={r.stderr.strip().splitlines()[-3:]}")
                 # x86: the wrong nargs is caught (warned once per probe whose pop it contradicts).
                 if mode == "wrongpop" and x86 and not warned:
                     problems.append("no 'return_from ... popped' warning for the wrong nargs")
