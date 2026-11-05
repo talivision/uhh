@@ -10,7 +10,7 @@
 #include <cstdio>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 14;
+constexpr uint32_t PROBE_AGENT_VERSION = 15;
 constexpr uint32_t PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH = 1u << 9;   /* agent side only needs this one */   /* == PROBE_UNSAFE_FAST_PATCH (asserted in session.cpp) */
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 128;   /* inline probes per session; the 129th is refused */
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
@@ -43,11 +43,22 @@ struct probe_agent_request {
 };
 
 /* Bounded MPMC ring (Vyukov): slot i starts with seq == i. A producer owns position
-   pos when logs[pos % CAP].seq == pos, claims it by CAS on log_head, fills the slot,
-   then publishes seq = pos + 1. The single consumer (the controller) reads while
-   seq == tail + 1 and frees the slot with seq = tail + CAP. A full ring makes the
-   producer WAIT (backpressure); it drops (counted in log_dropped) only if the controller's
-   drainer heartbeat stops for 2 s, i.e. the controller is gone. */
+   pos when logs[pos % CAP].seq == pos; it claims it by CAS of the slot's owner (0 -> its
+   tid) and THEN CAS of log_head (pos -> pos + 1) -- so every claimed slot names its producer
+   -- fills the slot, then publishes seq = pos + 1. The single consumer (the controller) reads
+   while seq == tail + 1 and frees the slot (owner = 0, seq = tail + CAP). While the tail is
+   stuck behind an unpublished slot, the controller also delivers the published records
+   beyond it in order and marks them seq = -(pos + 1) (delivered, freed when the tail passes).
+   A full ring makes the producer WAIT (backpressure). Nothing is dropped while the
+   controller is there:
+   - a slot whose owner thread DIED between claim and publish (TerminateThread) is skipped
+     by the controller once that thread is gone -- its callback stays counted in flight
+     (callbacks_interrupted), so it is accounted, and the ring moves on;
+   - while the ring is stuck behind a slot whose owner is alive but not running (suspended
+     by the program), the controller sets ring_stalled and producers hand their record to
+     the controller synchronously (PROBE_IPC_LOG) instead of waiting or dropping.
+   A record is dropped (counted in log_dropped) only when the controller is gone: it
+   stopped consuming (controller_gone: detach/close) or its process died. */
 struct probe_agent_log {
     volatile LONG64 seq;
     uint32_t probe;
@@ -55,6 +66,8 @@ struct probe_agent_log {
     char text[PROBE_AGENT_LOG_TEXT_CAP];
     uint32_t frame_count;          /* 0 = plain log; else frames[] is a stack snapshot */
     uint32_t has_stack;
+    uint32_t text_len;             /* text may contain NULs (%c of 0): this is its length */
+    volatile LONG owner;           /* tid of the producer that claimed the slot; 0 = free/unknown */
     uint64_t frames[32];           /* == PROBE_STACK_MAX_FRAMES */
 };
 
@@ -67,7 +80,9 @@ enum probe_ipc_op : uint32_t { PROBE_IPC_ADD_ADDRESS = 1, PROBE_IPC_WATCH = 2, P
                                PROBE_IPC_INSTALL_DONE = 4,     /* agent service: an install round finished */
                                PROBE_IPC_FREEZE = 5,           /* suspend every other thread; the requests about
                                                                   to be enabled carry enabling = 1 */
-                               PROBE_IPC_THAW = 6 };           /* resume the threads the last FREEZE suspended */
+                               PROBE_IPC_THAW = 6,             /* resume the threads the last FREEZE suspended */
+                               PROBE_IPC_LOG = 7 };            /* address = a probe_agent_log on the caller's
+                                                                  stack: deliver it (the ring is stalled) */
 /* Hooks are written ONLY with the rest of the target frozen by the controller (a debugger):
    the page stays executable, no thread can run the bytes mid-write, nothing faults. A thread
    the freeze caught inside a range about to be overwritten is moved by the controller to the
@@ -101,6 +116,9 @@ struct probe_agent_shared {
     volatile LONG64 drain_beat;    /* bumped by the controller's drainer every loop: liveness */
     volatile LONG xstate_mode;     /* benchmark knob: 0 = default (gated), 1 = none, 2 = full */
     volatile LONG controller_gone; /* set when the controller stops consuming (detach/close): log calls return at once */
+    volatile LONG ring_stalled;    /* controller: the ring is stuck behind a live producer's slot -- use PROBE_IPC_LOG */
+    volatile LONG log_ipc;         /* controller: 1 while it is the debugger and services PROBE_IPC_LOG */
+    uint32_t controller_pid;       /* lets producers tell a dead controller from a busy one */
     /* Per probe, striped by thread: the low 48 bits count hits, the high 16 bits count
        callbacks running now. One atomic add does both, so a thread killed at ANY instant
        (process exit) leaves hits == logs + dropped + interrupted exactly. Non-zero in-flight

@@ -2,8 +2,12 @@
 // (breakpoint/hw callbacks) and the inline agent (inside the target) so that every
 // backend produces the SAME text for the same call, including the bad cases:
 //   - fits:            the formatted text
-//   - too long:        truncated to cap-1, ending in "...[truncated]"
-//   - invalid format (an unknown conversion such as %k, %n, a lone trailing %) or an
+//   - too long:        truncated to cap-1, ending in "...[truncated]" (also when the
+//                      "[unformattable]" copy of a long format does not fit)
+//   - embedded NULs (%c of 0) are part of the text: the length is returned, and the JSON
+//     writer escapes them (\u0000) like every other control character
+//   - invalid format (%n, a lone trailing %; the CRT itself prints an unknown conversion
+//     such as %k as its letter) or an
 //     argument that faults while formatting (%s of a bad pointer):
 //                      "[unformattable] " followed by the raw format string
 // Never terminates the process: the CRT's invalid-parameter handler (whose default is a
@@ -29,24 +33,38 @@ inline int uhh_vformat_guarded(char *buf, size_t cap, const char *format, va_lis
     return n;
 }
 
-inline void uhh_copy_format_guarded(char *buf, size_t cap, size_t used, const char *format) {
-    __try { for (; used + 1 < cap && format && *format; ++format) buf[used++] = *format; }
+// Copies the raw format after the tag; returns the length, or cap (the format did not fit).
+inline size_t uhh_copy_format_guarded(char *buf, size_t cap, size_t used, const char *format) {
+    bool cut = false;
+    __try {
+        for (; format && *format; ++format) {
+            if (used + 1 >= cap) { cut = true; break; }
+            buf[used++] = *format;
+        }
+    }
     __except (EXCEPTION_EXECUTE_HANDLER) {}
     buf[used] = 0;
+    return cut ? cap : used;
 }
 
-// Returns false only when there is nothing to log (null format).
-inline bool uhh_format_log(char *buf, size_t cap, const char *format, va_list ap) {
+// Returns the length of the text in buf (it may contain NULs a %c wrote: the length, not
+// strlen, is the text), or -1 only when there is nothing to log (null format).
+inline int uhh_format_log(char *buf, size_t cap, const char *format, va_list ap) {
     static const char tag[] = "[unformattable] ", mark[] = "...[truncated]";
-    if (!format || cap < sizeof(mark) + 1) return false;
+    if (!format || cap < sizeof(tag) + sizeof(mark) + 1 || cap > 0x7fffffff) return -1;
     buf[0] = 0;
     int n = uhh_vformat_guarded(buf, cap, format, ap);
+    size_t len;
     if (n < 0) {
         memcpy(buf, tag, sizeof(tag));
-        uhh_copy_format_guarded(buf, cap, sizeof(tag) - 1, format);
-        return true;
+        len = uhh_copy_format_guarded(buf, cap, sizeof(tag) - 1, format);
+    } else {
+        len = (size_t)n;
     }
-    buf[cap - 1] = 0;
-    if ((size_t)n >= cap) memcpy(buf + cap - sizeof(mark), mark, sizeof(mark));   // never silently
-    return true;
+    if (len >= cap) {                                                  // never silently
+        memcpy(buf + cap - sizeof(mark), mark, sizeof(mark));
+        len = cap - 1;
+    }
+    buf[len] = 0;
+    return (int)len;
 }

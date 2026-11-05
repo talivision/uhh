@@ -3730,7 +3730,7 @@ def logs_expected_formats():
         "x" * 1023,                                          # exactly the cap: whole
         cut("x" * 1024),                                     # one over: marked, never silent
         "[unformattable] k2 %n",
-        "[unformattable] k3 %k",
+        "k3 k",                                              # the CRT prints an unknown conversion's letter
         cut("k4 " + " " * 4999 + "7"),
         "k5 a\x00b",                                         # embedded NUL kept (escaped)
         "k6 t\tr\rx\x01e\x1bf\x7f",                          # control characters kept (escaped)
@@ -3869,11 +3869,11 @@ def check_logs_controller_killed(threads=4, count=20000):
         tg = subprocess.Popen([str(t), "--mode", "gate", "--threads", str(threads), "--count", str(count)],
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         pid = json.loads(tg.stdout.readline())["pid"]
-        trc = subprocess.Popen([str(tr), "--backend", "inline", "--attach", str(pid), "-p", "logs_target.exe!LogSiteA:uu"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        trc = subprocess.Popen([str(tr), "--backend", "inline", "--attach", str(pid), "-p", "logs_target.exe!LogSiteA:dd"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         terr = Lines(trc.stderr)
-        if not terr.wait_for(lambda l: l.startswith("probe: active logs_target.exe!LogSiteA"), 60):
-            raise RuntimeError("probe never became active")
+        if not terr.wait_for(lambda l: l.startswith("probe: active "), 60):
+            raise RuntimeError("probe never became active: " + " | ".join(terr.lines[-5:])[:400])
         tg.stdin.write(b"\n"); tg.stdin.flush()
         time.sleep(0.3)
         trc.kill(); trc.wait(timeout=30)
