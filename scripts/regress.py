@@ -1680,7 +1680,7 @@ def check_gated_map(threads=4, reads=50):
         name = f"gated-map-open-{open_bk}" + ("" if mode == "lazy" else f"-{mode}")
         try:
             r, o = gated("breakpoint", "inline", threads, reads, open_bk=open_bk,
-                         open_mode=None if mode == "lazy" else "call",
+                         open_mode="lazy" if mode == "lazy" else "call",
                          target_args=("--open-via", "kernel32") if mode.endswith("k32") else ())
             truth = {x["handle"]: x["pid"] for x in o if x.get("kind") == "opened"}
             want_pids = helper_pids(o)

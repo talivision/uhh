@@ -129,7 +129,10 @@ extern "C" void track_open_process_call(probe_context *c) {
     uint64_t out = get_func_arg(c, 0), cid = get_func_arg(c, 3);
     uint64_t pid = cid ? read_pointer(c, cid) : 0;     // CLIENT_ID.UniqueProcess (read before the call)
     uint64_t status = 0;
-    if (!call_original(c, 4, &status)) return;         // could not run it here: fall through (it runs normally)
+    if (!call_original(c, 4, &status)) {                // refused here (e.g. breakpoint/hw under CET):
+        track_open_process(c);                          // remember the open the lazy way, and fall through
+        return;                                         // (the original then runs normally)
+    }
     uint64_t handle = (int32_t)status >= 0 && out ? read_pointer(c, out) : 0;
     if (pid && handle) {
         char name[sizeof(OpenRecord::name)];

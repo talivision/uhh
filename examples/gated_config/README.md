@@ -15,10 +15,16 @@ without rebuilding the target, editing its config, or patching its files:
    value; EAX holds it. `enable_reads` changes EAX from 0 to 1 and the target goes on
    to store "enabled" as if its config had said so. The probe is registered before
    the DLL exists in the process; it stays pending and arms when the DLL loads.
-2. **Observe the path you enabled.** `track_open_process` on `ntdll.dll!NtOpenProcess`
-   logs every open as `open pid=.. name=..` (image name from the kernel by pid, without
-   opening it) and builds a handle -> pid -> name map; the first read through a handle
-   logs `map handle=0x.. -> pid=.. name=..`. `log_read` on
+2. **Observe the path you enabled.** One callback on `ntdll.dll!NtOpenProcess`
+   (`track_open_process_call`) runs the real open with `call_original`, so the new handle
+   (`*out`) and the pid (`CLIENT_ID`) are both in hand at once, records handle -> pid ->
+   name (image name from the kernel by pid, without opening it), logs
+   `open pid=.. name=..` and `map handle=0x.. -> pid=.. name=..`, and returns the real
+   status with `return_from`. The pid cannot be recovered from the handle later (helpers
+   are opened with only `PROCESS_VM_READ`), so it is captured at the open -- for any
+   caller, including `kernel32!OpenProcess` whose output slot dies as it returns.
+   `--open-mode lazy` instead remembers the output pointer at entry and reads it at the
+   first read through an unknown handle (only valid while that pointer lives). `log_read` on
    `ntdll.dll!NtReadVirtualMemory` logs every read as
    `read handle=0x.. pid=.. name=.. addr=0x.. size=..`. Regress `gated-map` checks every
    map and read line against the handle the target's open really returned. Both are the ntdll syscall stubs, so every

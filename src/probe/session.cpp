@@ -35,6 +35,11 @@ struct Probe {
     uint64_t sym_offset = 0;
     bool retired = false;      // PROBE_ONCE probe that already fired (kept for the report)
     bool internal = false;     // library-owned (not reported)
+    // Breakpoint probes: the original bytes that followed the INT3 (to recognise a copy of the
+    // site another hooking tool relocated into its trampoline), and for such an adopted copy,
+    // the probe it stands in for (its hits count there; the copy itself is not reported).
+    std::vector<unsigned char> follow;
+    struct Probe *alias_of = nullptr;
     bool runtime = false;      // added after launch: an install failure is reported, not fatal
     bool vetted = false;       // pre-hook check done for this inline install
     uint64_t rva = 0, base = 0, address = 0, hits = 0;
@@ -827,6 +832,15 @@ static bool patch(HANDLE process, uint64_t address, unsigned char byte) {
     return wrote && done == 1 && flushed && restored;
 }
 
+// Put a breakpoint probe's original byte back -- only if our INT3 is still there. Another
+// hooking tool may have rewritten the site since (e.g. Frida/Detours writing their jump over
+// it): restoring our byte then would corrupt THEIR hook.
+static void restore_original(HANDLE process, uint64_t address, unsigned char original) {
+    unsigned char now = 0; SIZE_T got = 0;
+    if (ReadProcessMemory(process, (void *)(uintptr_t)address, &now, 1, &got) && got == 1 && now == 0xcc)
+        patch(process, address, original);
+}
+
 static bool parse_hex(const char *number, uint64_t &out) {
     if (!number || !*number) return false;
     for (const char *d = number; *d; ++d) if (!std::isxdigit((unsigned char)*d)) return false;
@@ -1299,6 +1313,7 @@ static bool arm_breakpoint(probe_session *s, Probe &p, uint64_t base) {
     }
     p.original = buf[0];
     p.orig_insn.assign(buf, buf + len);
+    p.follow.assign(buf + 1, buf + sizeof(buf));
     p.insn_len = len; p.displaced_ok = disp_ok; p.riprel_disp_off = riprel; p.rep_string = rep_str;
     if (!patch(s->pi.hProcess, address, 0xcc)) {
         set_error(s, win_error("arm software breakpoint")); return false;
@@ -2062,6 +2077,52 @@ static bool arm_module(probe_session *s, const std::string &module, uint64_t bas
 // still active at exactly that site: after detach, PROBE_ONCE retirement or an unload
 // (where another module may now live at the address) the original byte must stay.
 static Probe *probe_at(probe_session *s, uint64_t address);
+// A hit on an adopted copy (see adopt_relocated_breakpoint) counts for the probe it stands in for.
+static void count_hit(Probe *p) {
+    ++p->hits;
+    if (p->alias_of) ++p->alias_of->hits;
+}
+
+// Another hooking tool installed its inline hook on top of one of our breakpoint probes
+// AFTER us (seen: Frida's Interceptor on a site UHH already holds): it read our 0xCC as part
+// of the function, wrote its jump over the site, and copied the INT3 -- followed by the
+// site's real bytes -- into its trampoline. That copy now traps at an address we do not own.
+// Recognise it -- an INT3 in private executable memory, followed by exactly the bytes that
+// followed our site, where our own site no longer holds our INT3 -- and adopt it: put the
+// real byte back (the other tool's trampoline is then exactly what it meant to build) and
+// arm our breakpoint THERE, same callback and config. Both tools keep seeing every call.
+static Probe *adopt_relocated_breakpoint(probe_session *s, uint64_t at) {
+    MEMORY_BASIC_INFORMATION m{};
+    if (!VirtualQueryEx(s->pi.hProcess, (void *)(uintptr_t)at, &m, sizeof(m)) || m.State != MEM_COMMIT ||
+        m.Type == MEM_IMAGE ||
+        !(m.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+        return nullptr;
+    unsigned char copy[16]; size_t got = 0;
+    if (!remote_read(s->pi.hProcess, at, copy, sizeof(copy), &got) || got < 5 || copy[0] != 0xcc) return nullptr;
+    for (auto &up : s->probes) {
+        Probe &p = *up;
+        if (!p.active || !(p.flags & PROBE_BREAKPOINT) || p.alias_of || p.internal || p.follow.size() < 4) continue;
+        unsigned char now = 0; size_t one = 0;
+        if (!remote_read(s->pi.hProcess, p.address, &now, 1, &one) || one != 1 || now == 0xcc) continue;   // still ours
+        const size_t need = std::min<size_t>({p.follow.size(), got - 1, (size_t)8});
+        if (std::memcmp(copy + 1, p.follow.data(), need) != 0) continue;
+        auto a = std::make_unique<Probe>();
+        a->location = p.location + " (relocated copy)";
+        a->flags = p.flags & ~PROBE_ONCE; a->callback = p.callback; a->callback_export = p.callback_export;
+        a->config = p.config;
+        a->rva = at; a->internal = true; a->alias_of = &p;
+        if (!patch(s->pi.hProcess, at, p.original)) return nullptr;    // the copy now runs the real code
+        Probe *raw = a.get();
+        s->probes.push_back(std::move(a));                              // returns before the loop goes on
+        std::string saved = s->error;
+        if (!arm_breakpoint(s, *raw, 0)) { raw->retired = true; s->error = saved; return nullptr; }
+        std::fprintf(stderr, "probe: %s was re-hooked by another tool that relocated our breakpoint to 0x%llx; "
+                             "following it there\n", p.location.c_str(), (unsigned long long)at);
+        return raw;
+    }
+    return nullptr;
+}
+
 static bool still_armed(probe_session *s, uint64_t site) {
     Probe *p = probe_at(s, site);
     return p && (p->flags & PROBE_BREAKPOINT);
@@ -2734,7 +2795,7 @@ static void detach(probe_session *s) {
     for (auto &p : s->probes) {
         if (!p->active) continue;
         if (p->flags & PROBE_BREAKPOINT) {
-            patch(s->pi.hProcess, p->address, p->original);
+            restore_original(s->pi.hProcess, p->address, p->original);
             s->retired_bps.insert(p->address); p->active = false;
         } else if (p->flags & PROBE_HW) {
             release_hw(s, *p);
@@ -3334,12 +3395,12 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
         context.config = probe->config.empty() ? nullptr : probe->config.data();
         context.tid = event.dwThreadId;
         CallbackState state{s, probe, event.dwProcessId, event.dwThreadId}; context.controller = &state;
-        if (event.dwThreadId == s->in_call_tid) { ++probe->hits; continue; }   // inside call_func: no re-entry
+        if (event.dwThreadId == s->in_call_tid) { count_hit(probe); continue; }   // inside call_func: no re-entry
         s->cb_tid = event.dwThreadId;
         try { run_callback(s, probe, &context); s->cb_tid = 0; }
         catch (const std::exception &e) { CloseHandle(thread); set_error(s, std::string("probe callback: ") + e.what()); return false; }
         catch (...) { CloseHandle(thread); set_error(s, "probe callback threw an unknown exception"); return false; }
-        ++probe->hits;
+        count_hit(probe);
         if (probe->flags & PROBE_ONCE) release_hw(s, *probe);
         to_context(context, native);                                 // fold each callback's changes forward
 #if defined(_WIN64)
@@ -3510,6 +3571,8 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     auto step = stepping.find(event.dwThreadId);
     uint64_t address = (uint64_t)(uintptr_t)ex.ExceptionAddress;
     Probe *probe = code == EXCEPTION_BREAKPOINT ? probe_at(s, address) : nullptr;
+    if (code == EXCEPTION_BREAKPOINT && !probe && !s->retired_bps.count(address))
+        probe = adopt_relocated_breakpoint(s, address);   // our INT3, copied by another hooking tool
     if (code == EXCEPTION_BREAKPOINT && !probe && s->retired_bps.count(address)) {
         // Another thread hit a one-shot INT3 that has since been removed: the original
         // byte is back, so rewind to it and continue as if the breakpoint never existed.
@@ -3723,7 +3786,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     } catch (...) {
         CloseHandle(thread); set_error(s, "probe callback threw an unknown exception"); return false;
     }
-    ++probe->hits;
+    count_hit(probe);
     to_context(context, native);
 #if defined(_WIN64)
     native.Rsp = context.regs.rsp;
@@ -4386,7 +4449,7 @@ extern "C" void probe_close(probe_session *s) {
         detach(s);
     } else if (s->launched && !s->exited && s->pi.hProcess) {
         for (auto &p : s->probes)
-            if (p->active && (p->flags & PROBE_BREAKPOINT)) patch(s->pi.hProcess, p->address, p->original);
+            if (p->active && (p->flags & PROBE_BREAKPOINT)) restore_original(s->pi.hProcess, p->address, p->original);
         TerminateProcess(s->pi.hProcess, 3);
         if (WaitForSingleObject(s->pi.hProcess, 5000) == WAIT_OBJECT_0) s->exited = true;
         // On the debugger thread, consume the dead target's remaining events (through its

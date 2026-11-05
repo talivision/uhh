@@ -26,7 +26,7 @@ static int usage() {
 int main(int argc, char **argv) {
     uint32_t flag_backend = PROBE_BREAKPOINT, read_backend = PROBE_INLINE, open_backend = 0, log = 1;
     read_log_config cfg{};
-    bool open_call = false;   // --open-mode call: track_open_process_call (call_original + return_from)
+    bool open_call = true;    // --open-mode call (default): call_original + return_from; lazy: entry only
     const char *locations[2] = {}; int nloc = 0, i = 1;
     for (; i < argc && std::strcmp(argv[i], "--"); ++i) {
         if (!std::strcmp(argv[i], "--no-log")) log = 0;
@@ -37,7 +37,8 @@ int main(int argc, char **argv) {
         else if (!std::strcmp(argv[i], "--range") && i + 1 < argc) { if (!add_read_range(&cfg, argv[++i])) return usage(); }
         else if (!std::strcmp(argv[i], "--open-mode") && i + 1 < argc) {
             const char *m = argv[++i];
-            if (!std::strcmp(m, "call")) open_call = true; else if (std::strcmp(m, "lazy")) return usage();
+            open_call = !std::strcmp(m, "call");
+            if (!open_call && std::strcmp(m, "lazy")) return usage();
         }
         else if (nloc < 2) locations[nloc++] = argv[i];
         else return usage();
