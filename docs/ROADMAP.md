@@ -379,6 +379,49 @@ with the uninstrumented target and with exact hits / "co" logs / `log_dropped ==
   Ctrl+Break while a call_original is in flight complete that call first (`callorig-hunt-
   {detach,ctrlbreak}-*`).
 
+## New-app evaluator findings (2026-11-06, `examples/{filetrace,flagflip,regtrace}`, regress `newapp-*`)
+A new user wrote three tools in gated_config's style from README.md, probe_api.h and the
+examples alone. Each tool has a per-probe `--backend` option and a fixture that prints its
+own ground truth. Every tool ran on every backend and in mixes, on x64 and x86.
+- ✅ (NA1) **call_original was capped at 8 arguments**, so `NtCreateFile` (11 args), the
+  first function a file tracer hooks, could not be run. With nargs 11 it was refused
+  **silently** on every backend (return 0 and no warning, unlike the other refusals). With
+  nargs 8, inline built a frame with garbage for args 9-11. The cap is now 16 on every
+  backend: the x64 `uhh_orig_thunk` frame copies stack args 5..16, and x86 copies up to 16.
+  An out-of-range nargs is refused with a one-time warning. Test: `newapp-file-*`
+  (NtCreateFile call_original + return_from(11)).
+- ✅ (NA2) **Backend mismatch: x64 inline call_original passed only the first `nargs`
+  register arguments, zeroing the rest.** A `bool IsEnabled() const` method has no stack
+  arguments, and following the x86 `__thiscall` reading of the doc ("ECX passed as it is")
+  a user passes nargs 0. Breakpoint/hw ran the original in place and worked. Inline called
+  it with RCX = 0, so `this->enabled_` faulted and the TARGET died (the exception went to
+  the program, as designed). Now the x64 register arguments (RCX/RDX/R8/R9) always go as the
+  hit had them, like x86 ECX/EDX, and nargs only sizes the stack copy. The doc says so.
+  Test: `newapp-flag-inline-modify`.
+- ✅ (NA3) Docs: README said "PDB-only symbols are on the roadmap", but `module!Name`
+  already falls back to the PDB (`flagfeature.dll!Feature::IsEnabled` works, pending until
+  the DLL late-loads). Fixed.
+- ✅ (NA4) Docs: nothing in README said that inline callbacks must be **compiled into
+  `probe_api_agent.dll` and exported by name**; a user learned it only from a comment in
+  gated_config/callbacks.h and the CMake list. README now has a "Writing your own tool"
+  section covering that, UHH_SHARED, the x86 `__thiscall` `this` (in ECX, not
+  `get_func_arg(c, 0)`), the 16-argument limit and the hw register budget.
+- ✅ (NA5) Docs: **inline probes go live at the entry point**, and breakpoint/hw from the first
+  instruction. A tool mixing an inline open probe with a hw value probe sees the loader's own
+  registry queries (IFEO `RaiseExceptionOnPossibleDeadlock`, `LongPathsEnabled`, ...) on
+  handles its map never saw (`key=?`). This is correct, but it was undocumented. README and
+  the regtrace README now cover it.
+- 📄 (NA6) **hw budget**: 4 debug registers in total, and call_original on hw needs one of them free
+  while it runs. A 6-probe tool (regtrace: 3 open stubs, 2 value stubs, NtClose) therefore
+  cannot be all-hw. hw takes either the open group (3 + 1 free) or the value and close
+  probes (3). regtrace refuses `--backend hw` up front with that reason
+  (`newapp-reg-hw-overcommit`). filetrace has 3 probes, so all-hw fits.
+- Asymmetry to know (documented in probe_api.h, kept): call_original's nargs counts the arguments
+  the function takes, and return_from's nargs is the x86 STACK arguments the callee pops
+  (`__thiscall` with no other args: 0, `NtCreateFile`: 11). Fixture-side surprise: `CreateDirectoryW` on an
+  existing dir is an `NtCreateFile` that fails with OBJECT_NAME_COLLISION, which a faithful
+  tracer logs. The fixture's ground truth must include it, or the fixture must skip the call.
+
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`
 - ✅ Per-log overhead ceilings in the suite (`log-throughput-*`)
