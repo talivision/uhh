@@ -35,19 +35,21 @@ extern "C" void enable_reads_mem(probe_context *c) {
 //    out pointer and dereference it LAZILY, the first time a read uses a handle we have
 //    not seen -- by then the open has long returned.
 namespace {
-struct OpenRecord {
-    std::atomic<uint64_t> pid{0};       // 0 = slot not published yet
-    std::atomic<uint64_t> out{0};       // where the open writes the handle
-    std::atomic<uint64_t> handle{0};    // 0 = not resolved yet
+struct OpenRecord {                     // plain data: zero-initialised, no constructors
+    uint64_t pid;                       // 0 = slot not published yet
+    uint64_t out;                       // where the open writes the handle
+    uint64_t handle;                    // 0 = not resolved yet
     char name[64];                      // image name of pid, written before pid is published
 };
 constexpr uint32_t kMaxOpens = 0x10000;   // opens remembered (~5.5 MiB shared, zero-initialised)
 // UHH_SHARED: the map is ONE piece of memory for every backend -- the open probe and the
 // read probe may run in different processes (breakpoint/hw in the controller, inline in
 // the target) and still see each other's records. Plain values only (pids, target
-// addresses, handles), constant-initialised, lock-free atomics.
-UHH_SHARED OpenRecord g_opens[kMaxOpens] = {};
+// addresses, handles), zero-initialised; every shared field is accessed atomically.
+UHH_SHARED OpenRecord g_opens[kMaxOpens];
 UHH_SHARED std::atomic<uint32_t> g_open_count{0};
+
+std::atomic_ref<uint64_t> at(uint64_t &field) { return std::atomic_ref<uint64_t>(field); }
 
 uint64_t read_pointer(probe_context *c, uint64_t address) {
     uintptr_t value = 0;                 // target pointer width == ours (same arch)
@@ -80,19 +82,19 @@ void image_name_of(uint64_t pid, char *out, size_t cap) {
 // dereferencing its out-pointer. Newest-first means a handle value reused after a close
 // maps to the open that produced it most recently. A record resolved concurrently by
 // another thread is still matched (re-read after a lost CAS).
-const OpenRecord *open_of(probe_context *c, uint64_t handle) {
+OpenRecord *open_of(probe_context *c, uint64_t handle) {
     if (!handle) return nullptr;
     uint32_t n = g_open_count.load(std::memory_order_acquire);
     if (n > kMaxOpens) n = kMaxOpens;
     for (uint32_t k = n; k-- > 0;) {
         OpenRecord &r = g_opens[k];
-        uint64_t pid = r.pid.load(std::memory_order_acquire);
+        uint64_t pid = at(r.pid).load(std::memory_order_acquire);
         if (!pid) continue;                                    // claimed, not yet published
-        uint64_t h = r.handle.load(std::memory_order_acquire);
+        uint64_t h = at(r.handle).load(std::memory_order_acquire);
         if (h) { if (h == handle) return &r; continue; }
-        if (read_pointer(c, r.out.load(std::memory_order_relaxed)) != handle) continue;
+        if (read_pointer(c, at(r.out).load(std::memory_order_relaxed)) != handle) continue;
         uint64_t expected = 0;
-        if (r.handle.compare_exchange_strong(expected, handle)) {   // first resolution: log it once
+        if (at(r.handle).compare_exchange_strong(expected, handle)) {   // first resolution: log it once
             send_log(c, "map handle=0x%llx -> pid=%llu name=%s", (unsigned long long)handle,
                      (unsigned long long)pid, r.name);
             return &r;
@@ -113,8 +115,8 @@ extern "C" void track_open_process(probe_context *c) {
     uint32_t slot = g_open_count.fetch_add(1, std::memory_order_relaxed);
     if (slot >= kMaxOpens) return;
     std::memcpy(g_opens[slot].name, name, sizeof(name));
-    g_opens[slot].out.store(out, std::memory_order_relaxed);
-    g_opens[slot].pid.store(pid, std::memory_order_release);   // publish (name before pid)
+    at(g_opens[slot].out).store(out, std::memory_order_relaxed);
+    at(g_opens[slot].pid).store(pid, std::memory_order_release);   // publish (name before pid)
 }
 
 // 3. Every read through ntdll!NtReadVirtualMemory(handle,
@@ -123,8 +125,8 @@ extern "C" void log_read(probe_context *c) {
     auto *cfg = static_cast<const read_log_config *>(get_config(c));
     if (!cfg || cfg->cookie != READ_LOG_COOKIE || !cfg->log) return;
     uint64_t handle = get_func_arg(c, 0), addr = get_func_arg(c, 1), size = get_func_arg(c, 3);
-    const OpenRecord *r = open_of(c, handle);
-    uint64_t pid = r ? r->pid.load(std::memory_order_relaxed) : 0;
+    OpenRecord *r = open_of(c, handle);
+    uint64_t pid = r ? at(r->pid).load(std::memory_order_relaxed) : 0;
     if (cfg->filter && (pid != cfg->pid || addr < cfg->base || addr - cfg->base >= cfg->size)) return;
     send_log(c, "read handle=0x%llx pid=%llu name=%s addr=0x%llx size=%llu", (unsigned long long)handle,
              (unsigned long long)pid, r ? r->name : "?", (unsigned long long)addr, (unsigned long long)size);
