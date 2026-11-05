@@ -421,8 +421,18 @@ Before the fixes, x64 differed in 18 keys (A: 10, B: 2, C: every target row -- t
 - ✅ (P9) `call_func(c, "0x1", ...)` inline called the address and caught the fault, but the
   target's vectored handler saw the first-chance AV (breakpoint/hw: silent 0). Inline now refuses
   an address that is not committed executable memory before calling.
-- ✅ (P10) x86 inline `get_mem`/`set_mem` truncated a 64-bit address to 32 bits: `set_mem(rw +
-  4 GB)` WROTE `rw` (breakpoint/hw: 0). Refused now, as on the controller. (x86 evidence below.)
+- ✅ (P10) **x86 inline `get_mem`/`set_mem` truncated a 64-bit address to 32 bits**: `set_mem(rw +
+  4 GB)` returned 1 and WROTE `rw` (the target's first bytes changed; breakpoint/hw: 0, untouched),
+  `get_mem` of it read `rw`, and `get_func_arg(c, SIZE_MAX)` returned the stack word at `[esp]`
+  (address wrapped past 4 GB; breakpoint/hw: 0). Refused now, as on the controller.
+- Evidence: before the fixes x64 differed in 18 keys and x86 in 21 (P1-P10 above; plus
+  `portability-matrix-C` lost every target row on breakpoint/hw because the session died on the
+  throw); after them `portability-matrix-{A,B,C}` and `portability-documented` pass on x64 and x86.
+- ⬜ Open (seen on the x86 run of this branch, not caused by a portability change): `edgehunt-
+  {breakpoint,hw}-fmtptr` expects `[unformattable] fmtptr %s` for a TARGET pointer printed with
+  `%s` in a controller callback, but on x86 the same address can be mapped in the controller too
+  and then prints the controller's bytes (`fmtptr W..}j`) -- the B10 behaviour itself; the
+  check's expectation is address-layout dependent.
 - 📄 (D1) Win32 calls made directly by a callback act on the process the callback runs in
   (`GetCurrentProcessId() == target pid`: breakpoint/hw 0, inline 1). Portable: `call_func`
   `kernel32.dll!GetCurrentProcessId` / `GetCurrentThreadId`; target memory only via get/set_mem.
