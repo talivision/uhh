@@ -596,6 +596,20 @@ static void install_pending() {
     if (!g_stopping) install_pending_locked();
     ReleaseSRWLockExclusive(&g_install_lock);
 }
+// Resolve every requested callback by name NOW, while no DLL load is in progress, so later
+// install rounds (e.g. for a module that is being loaded right now) never call the loader.
+static void resolve_callbacks() {
+    uint32_t count = shared->request_count;
+    if (count > PROBE_AGENT_MAX_PROBES) count = PROBE_AGENT_MAX_PROBES;
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto &request = shared->requests[i];
+        if (callbacks[i] || !request.callback[0] || request.config_len > PROBE_AGENT_CONFIG_CAP) continue;
+        char name[PROBE_AGENT_EXPORT_CAP];
+        std::memcpy(name, request.callback, sizeof(name)); name[sizeof(name) - 1] = 0;
+        callbacks[i] = reinterpret_cast<probe_callback>(GetProcAddress(self_module, name));
+    }
+}
+
 static void install_pending_locked() {
     uint32_t count = shared->request_count;
     if (count > PROBE_AGENT_MAX_PROBES) count = PROBE_AGENT_MAX_PROBES;
@@ -606,7 +620,11 @@ static void install_pending_locked() {
         if (request.config_len > PROBE_AGENT_CONFIG_CAP || !request.callback[0]) {
             InterlockedExchange(&request.status, PROBE_AGENT_BAD_REQUEST); continue;
         }
-        callbacks[i] = reinterpret_cast<probe_callback>(GetProcAddress(self_module, request.callback));
+        // Normally already resolved by resolve_callbacks() at init: GetProcAddress can block on
+        // loader state held by a thread that is parked at a LOAD_DLL event (the install that
+        // event is waiting for would then never run).
+        if (!callbacks[i])
+            callbacks[i] = reinterpret_cast<probe_callback>(GetProcAddress(self_module, request.callback));
         if (!callbacks[i]) {
             InterlockedExchange(&request.status, PROBE_AGENT_CALLBACK_MISSING); continue;
         }
@@ -676,6 +694,8 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
     }
     if (shared->request_count > PROBE_AGENT_MAX_PROBES) return 3;
     InterlockedExchange(&g_stopping, 0);   // a new session after a detach: callbacks run again
+    for (auto &cb : callbacks) cb = nullptr;  // a new session may map slots to other callbacks
+    resolve_callbacks();
     install_pending();
     if (service_event) InterlockedExchange(&shared->service_ready, 1);   // thread from an earlier session
     if (!service_event) {   // first init: start the persistent install thread
