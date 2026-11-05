@@ -8,6 +8,9 @@
 #include <cstdarg>
 #include <intrin.h>
 #include <immintrin.h>
+#if defined(_WIN64)
+#include <Zydis/Zydis.h>
+#endif
 
 static HMODULE self_module;
 static HANDLE mapping;
@@ -76,6 +79,83 @@ static void overlay_original(uintptr_t a, void *buffer, size_t n) {
             static_cast<uint8_t *>(buffer)[x - a] = g_shadow[i].bytes[x - lo];
     }
 }
+// ---- Faults raised by a relocated instruction (x64) -------------------------------------
+// An inline hook runs the instructions it overwrote from its trampoline. If one of them
+// faults (a load through a null pointer inside a __try, a divide by zero, ...), the
+// exception's address is in the trampoline, which has no unwind data: the x64 dispatcher
+// then unwinds it as a leaf (return address at [rsp]) -- wrong mid-function -- so the
+// function's own __except / catch is never found and the target dies, where the program
+// without UHH (and the breakpoint/hw backends) handles it. A first vectored handler maps a
+// trampoline instruction back to the ORIGINAL instruction address before the search, so
+// the frame-based search sees exactly the program's own fault. A vectored continue
+// handler maps the reverse if a handler resumes inside the overwritten bytes (they hold
+// the hook's jump now), back onto the same instruction in the trampoline.
+#if defined(_WIN64)
+struct RelocMap {
+    volatile uintptr_t tramp;               // 0 = none
+    uintptr_t site;
+    uint32_t n, t_end, o_end;
+    uint8_t t_off[16], o_off[16];           // start offset of instruction k in trampoline / original
+};
+static RelocMap g_reloc[PROBE_AGENT_MAX_PROBES];
+static volatile LONG g_reloc_count;
+
+static void build_reloc(uint32_t i, const uint8_t *orig, size_t olen, uintptr_t site, uintptr_t tramp) {
+    if (!tramp || g_reloc[i].tramp) return;
+    ZydisDecoder dec;
+    ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+    RelocMap m{}; uint32_t o = 0, t = 0;
+    while (o < olen && m.n < 16) {
+        ZydisDecodedInstruction a, b;
+        if (!ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(&dec, nullptr, orig + o, olen - o, &a))) break;
+        if (!ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(&dec, nullptr, (const void *)(tramp + t), 15, &b))) break;
+        if (a.mnemonic != b.mnemonic) break;            // expanded/rewritten: stop mapping here
+        m.t_off[m.n] = (uint8_t)t; m.o_off[m.n] = (uint8_t)o; ++m.n;
+        o += a.length; t += b.length;
+        if (t > 255 || o > 255) break;
+    }
+    if (!m.n) return;
+    m.t_end = t; m.o_end = o; m.site = site;
+    g_reloc[i].site = m.site; g_reloc[i].n = m.n; g_reloc[i].t_end = m.t_end; g_reloc[i].o_end = m.o_end;
+    std::memcpy(g_reloc[i].t_off, m.t_off, sizeof(m.t_off)); std::memcpy(g_reloc[i].o_off, m.o_off, sizeof(m.o_off));
+    MemoryBarrier();
+    g_reloc[i].tramp = tramp;
+    InterlockedIncrement(&g_reloc_count);
+}
+static void drop_reloc(uint32_t i) {
+    if (g_reloc[i].tramp) { g_reloc[i].tramp = 0; InterlockedDecrement(&g_reloc_count); }
+}
+static LONG CALLBACK map_trampoline_fault(EXCEPTION_POINTERS *e) {
+    if (!g_reloc_count || !shared || e->ExceptionRecord->ExceptionCode == PROBE_IPC_CODE) return EXCEPTION_CONTINUE_SEARCH;
+    const uintptr_t ip = (uintptr_t)e->ContextRecord->Rip;
+    if ((uintptr_t)e->ExceptionRecord->ExceptionAddress != ip) return EXCEPTION_CONTINUE_SEARCH;   // fault-type only
+    for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i) {
+        const uintptr_t tr = g_reloc[i].tramp;
+        if (!tr || ip < tr || ip >= tr + g_reloc[i].t_end || shared->requests[i].status != PROBE_AGENT_INSTALLED) continue;
+        for (uint32_t k = 0; k < g_reloc[i].n; ++k)
+            if (tr + g_reloc[i].t_off[k] == ip) {
+                e->ContextRecord->Rip = g_reloc[i].site + g_reloc[i].o_off[k];
+                e->ExceptionRecord->ExceptionAddress = (void *)(uintptr_t)e->ContextRecord->Rip;
+                break;
+            }
+        break;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+static LONG CALLBACK resume_in_trampoline(EXCEPTION_POINTERS *e) {
+    if (!g_reloc_count || !shared) return EXCEPTION_CONTINUE_SEARCH;
+    const uintptr_t ip = (uintptr_t)e->ContextRecord->Rip;
+    for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i) {
+        const uintptr_t tr = g_reloc[i].tramp, site = g_reloc[i].site;
+        if (!tr || ip < site || ip >= site + g_reloc[i].o_end || shared->requests[i].status != PROBE_AGENT_INSTALLED) continue;
+        for (uint32_t k = 0; k < g_reloc[i].n; ++k)
+            if (site + g_reloc[i].o_off[k] == ip) { e->ContextRecord->Rip = tr + g_reloc[i].t_off[k]; break; }
+        break;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
+
 static int local_read(void *, uint64_t address, void *buffer, size_t size, size_t *done) {
     *done = 0;
     if (!range_ok((uintptr_t)address, size, false)) return 0;
@@ -646,6 +726,9 @@ static void install_pending_locked() {
             continue;
         sites[i] = request.site; states[i] = {shared, i}; proxies[i].site = i;
         if (g_shadow[i].lo) { g_shadow[i].lo = 0; InterlockedDecrement(&g_shadow_count); }
+#if defined(_WIN64)
+        drop_reloc(i);
+#endif
         if (hooks[i]) {
             // A re-install after the module was unloaded: the old hook's code and target are
             // gone, so it must NOT be destroyed (its destructor would write to unmapped
@@ -673,6 +756,9 @@ static void install_pending_locked() {
                 g_shadow[i].lo = hooks[i].target_address();
                 InterlockedIncrement(&g_shadow_count);
             }
+#if defined(_WIN64)
+            if (ok) build_reloc(i, orig.data(), orig.size(), hooks[i].target_address(), (uintptr_t)hooks[i].uhh_trampoline());
+#endif
             InterlockedExchange(&shared->requests[i].status, ok ? PROBE_AGENT_INSTALLED : PROBE_AGENT_HOOK_FAILED);
         }
     };
@@ -717,6 +803,14 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
     }
     if (shared->request_count > PROBE_AGENT_MAX_PROBES) return 3;
     InterlockedExchange(&g_stopping, 0);   // a new session after a detach: callbacks run again
+#if defined(_WIN64)
+    static const bool fault_mapping = [] {
+        AddVectoredExceptionHandler(1, map_trampoline_fault);
+        AddVectoredContinueHandler(1, resume_in_trampoline);
+        return true;
+    }();
+    (void)fault_mapping;
+#endif
     for (auto &cb : callbacks) cb = nullptr;  // a new session may map slots to other callbacks
     resolve_callbacks();
     install_pending();
@@ -739,6 +833,9 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_stop(void *) {
     InterlockedExchange(&g_stopping, 1);
     for (int i = 0; i < 2000 && any_inflight(); ++i) Sleep(1);
     for (auto &sh : g_shadow) if (sh.lo) { sh.lo = 0; InterlockedDecrement(&g_shadow_count); }
+#if defined(_WIN64)
+    for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i) drop_reloc(i);
+#endif
     frozen(slot_set{}, [] {
         for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i)
             // Restore the original bytes -- unless the controller saw the module unload
