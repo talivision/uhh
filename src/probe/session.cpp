@@ -2508,11 +2508,24 @@ extern "C" int probe_attach_new(probe_session *s, const char *image_name, uint32
 // inline hooks removed by the agent, every INT3 restored, every debug register cleared,
 // and no thread left mid single-step. Events keep being dispatched while that happens
 // (a thread may hit a breakpoint or finish a step in the meantime).
+// Debug events are per DEBUGGER THREAD, not per session: a thread that ran an earlier
+// session can still have that (terminated) target's last events queued. They belong to
+// another process -- continue them untouched and never let them reach this session's state.
+static bool continue_foreign_event(const probe_session *s, const DEBUG_EVENT &ev) {
+    if (ev.dwProcessId == s->pi.dwProcessId) return false;
+    if (ev.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT && ev.u.CreateProcessInfo.hFile) CloseHandle(ev.u.CreateProcessInfo.hFile);
+    if (ev.dwDebugEventCode == LOAD_DLL_DEBUG_EVENT && ev.u.LoadDll.hFile) CloseHandle(ev.u.LoadDll.hFile);
+    ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId,
+                       ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT ? DBG_EXCEPTION_NOT_HANDLED : DBG_CONTINUE);
+    return true;
+}
+
 static void pump(probe_session *s, DWORD ms) {
     DEBUG_EVENT event{};
     ULONGLONG until = GetTickCount64() + ms;
     while (!s->exited && GetTickCount64() < until) {
         if (!WaitForDebugEvent(&event, 20)) continue;
+        if (continue_foreign_event(s, event)) continue;
         DWORD disposition = DBG_CONTINUE;
         dispatch_event(s, event, disposition);
         if (s->skip_continue) { s->skip_continue = false; continue; }
@@ -2578,6 +2591,7 @@ static void detach(probe_session *s) {
     for (int guard = 0, quiet = 0; guard < 100000 && !s->exited && quiet < 4; ++guard) {
         DEBUG_EVENT ev{};
         if (!WaitForDebugEvent(&ev, 50)) { ++quiet; continue; }
+        if (continue_foreign_event(s, ev)) continue;
         quiet = 0;
         if (ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT && drained_logged < 24) {
             ++drained_logged;
@@ -3592,6 +3606,7 @@ extern "C" int probe_run(probe_session *s) {
             if (GetLastError() == ERROR_SEM_TIMEOUT) continue;            // idle: drain and wait again
             set_error(s, win_error("wait for debug event")); break;
         }
+        if (continue_foreign_event(s, event)) continue;
         DWORD disposition = DBG_CONTINUE;
         bool ok = dispatch_event(s, event, disposition);
         if (s->skip_continue) { s->skip_continue = false; if (!ok) break; continue; }
@@ -3690,6 +3705,18 @@ extern "C" void probe_close(probe_session *s) {
             if (p->active && (p->flags & PROBE_BREAKPOINT)) patch(s->pi.hProcess, p->address, p->original);
         TerminateProcess(s->pi.hProcess, 3);
         if (WaitForSingleObject(s->pi.hProcess, 5000) == WAIT_OBJECT_0) s->exited = true;
+        // On the debugger thread, consume the dead target's remaining events (through its
+        // EXIT_PROCESS) so none is left queued for a later session on this thread.
+        if (GetCurrentThreadId() == s->debug_tid) {
+            for (ULONGLONG until = GetTickCount64() + 2000; GetTickCount64() < until; ) {
+                DEBUG_EVENT ev{};
+                if (!WaitForDebugEvent(&ev, 50)) continue;
+                if (ev.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT && ev.u.CreateProcessInfo.hFile) CloseHandle(ev.u.CreateProcessInfo.hFile);
+                if (ev.dwDebugEventCode == LOAD_DLL_DEBUG_EVENT && ev.u.LoadDll.hFile) CloseHandle(ev.u.LoadDll.hFile);
+                ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
+                if (ev.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT && ev.dwProcessId == s->pi.dwProcessId) break;
+            }
+        }
     }
     stop_drainer(s);
     stop_log_output(s);                         // symbolization needs dbghelp and the process handle
@@ -3854,6 +3881,7 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
             if (GetTickCount64() > until) break;
             continue;
         }
+        if (continue_foreign_event(s, ev)) continue;
         if (ev.dwThreadId == st->tid && ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
             auto &er = ev.u.Exception.ExceptionRecord;
             if (er.ExceptionCode == EXCEPTION_BREAKPOINT && (uint64_t)(uintptr_t)er.ExceptionAddress == s->call_trap) {

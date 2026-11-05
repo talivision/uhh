@@ -693,7 +693,7 @@ def check_breakage():
             key = (row.get("site"), row.get("backend"))
             want = expected.get(key)
             if want and row.get("verdict") != want:
-                bad.append(f"{key}={row.get('verdict')}!={want}")
+                bad.append(f"{key}={row.get('verdict')}!={want} row={json.dumps(row)[:400]}")
         # The 10 breakpoint/hw controls MUST all pass; inline rows are observational.
         controls = [row for row in o if row.get("backend") in ("breakpoint", "hw")]
         ok = len(controls) == 10 and all(row.get("verdict") == "pass" for row in controls) and not bad
