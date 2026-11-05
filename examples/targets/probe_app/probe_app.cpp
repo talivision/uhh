@@ -117,6 +117,9 @@ static int helper_main(const char *finish_handle) {
 // NtOpenProcess remembers that pointer at entry and can dereference it any time later
 // to learn which handle the open produced. Through kernel32!OpenProcess the pointer
 // would be a stack local of kernelbase, reused as soon as OpenProcess returns.
+// --open-via kernel32: open through kernel32!OpenProcess instead, whose out-handle slot is a
+// short-lived stack local of kernelbase (the case a lazy out-pointer map cannot resolve).
+static bool g_open_kernel32 = false;
 static void open_helpers(std::vector<Helper> &helpers) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     require(snap != INVALID_HANDLE_VALUE, "process snapshot");
@@ -134,6 +137,11 @@ static void open_helpers(std::vector<Helper> &helpers) {
         // ntdll!NtOpenProcess(PHANDLE out, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID):
         // what kernel32!OpenProcess(PROCESS_VM_READ, FALSE, pid) does, but with the
         // out-handle pointing at h.read_handle, which lives as long as the helper.
+        if (g_open_kernel32) {
+            h.read_handle = OpenProcess(PROCESS_VM_READ, FALSE, h.hello.pid);
+            require(h.read_handle != nullptr, "OpenProcess helper");
+            continue;
+        }
         ObjectAttributes oa{sizeof(oa)};
         ClientId cid{(HANDLE)(uintptr_t)h.hello.pid, nullptr};
         require(OpenThunk(&h.read_handle, PROCESS_VM_READ, &oa, &cid) >= 0 && h.read_handle, "NtOpenProcess helper");
@@ -235,6 +243,7 @@ int main(int argc, char **argv) try {
         else if (a == "--prehook") existing_hook = true;
         else if (a == "--config") { config = next(); for (auto &c : config) if (c == ';') c = '\n'; }
         else if (a == "--no-wait") wait = false;
+        else if (a == "--open-via") g_open_kernel32 = std::string(next()) == "kernel32";
         else throw std::runtime_error("usage: probe_app [--helpers N] [--threads W] [--reads R] [--prehook] "
                                       "[--config k=v;...] [--no-wait]");
     }

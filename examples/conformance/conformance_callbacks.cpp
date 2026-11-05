@@ -18,6 +18,32 @@ CONF_EXPORT void conf_move_sp(probe_context *c) {
     set_reg(c, PROBE_REG_SP, get_reg(c, PROBE_REG_SP) - 32);
 }
 
+// call_original / return_from (conformance_driver --callorig), entry probes.
+CONF_EXPORT void co_on_args6(probe_context *c) {
+    // Rewrite a0 (1 -> 7) and a5 (6 -> 9, a stack argument on both arches) first: the
+    // original must run with them.
+#if defined(_WIN64)
+    set_reg(c, PROBE_REG_CX, 7);
+    const uint64_t a5_slot = get_reg(c, PROBE_REG_SP) + 8 + 8 * 5;
+    uint64_t nine = 9;
+    set_mem(c, a5_slot, &nine, 8);
+#else
+    const uint64_t sp = get_reg(c, PROBE_REG_SP);
+    uint32_t seven = 7, nine = 9;
+    set_mem(c, sp + 4, &seven, 4); set_mem(c, sp + 4 + 4 * 5, &nine, 4);
+#endif
+    uint64_t r = 0;
+    if (!call_original(c, 6, &r)) { send_log(c, "FAIL co-args6 call_original refused"); return; }
+    if ((uint32_t)r != 723459u) send_log(c, "FAIL co-args6 r=%llu", (unsigned long long)r);
+    return_from(c, r + 1, 0);
+}
+CONF_EXPORT void co_on_std2(probe_context *c) { return_from(c, 99, 2); }   // pure replacement, stdcall 2 args
+CONF_EXPORT void co_on_cdecl2(probe_context *c) {
+    uint64_t r = 0;
+    if (!call_original(c, 2, &r)) { send_log(c, "FAIL co-cdecl2 call_original refused"); return; }
+    return_from(c, r * 2, 0);                                           // cdecl: the caller pops
+}
+
 struct later_config { uint64_t cookie; };
 CONF_EXPORT void conf_on_later(probe_context *c) {
     const later_config *k = (const later_config *)get_config(c);
