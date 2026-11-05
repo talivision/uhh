@@ -368,7 +368,7 @@ def check_attach(threads, reads):
             record(name, ok, f"override={rep.get('overrides')} read_hits={rd.get('hits')}/{W * R} "
                              f"logged={logs} want_logged={want} dropped={dropped} wrong_pid={len(wrong)} "
                              f"rc={att.returncode}" + ("" if ok else
-                             f" err={(rep.get('error') or '')[:120]} stderr_tail={[l[:160] for l in aerr.lines if 'remote' in l or 'ipc' in l or 'hold' in l or 'active' in l or 'release' in l or 'warn' in l or 'kick' in l or 'resolved' in l][-30:]}"))
+                             f" err={(rep.get('error') or '')[:120]} stderr_tail={[l[:160] for l in aerr.lines if 'remote' in l or 'ipc' in l or 'hold' in l or 'active' in l or 'release' in l or 'warn' in l or 'kick' in l or 'resolved' in l or 'vet ' in l or ' t=' in l][-40:]}"))
         except Exception as e:
             record(name, False, repr(e) + (f" stderr_tail={[l[:120] for l in aerr.lines[-6:]]}" if 'aerr' in locals() else ""))
         finally:
@@ -1319,6 +1319,34 @@ def check_forwarded_probe():
             record(name, False, repr(e))
 
 
+def check_gated_mem(threads=8, reads=1000):
+    """gated_config_mem: the disabled flag is flipped in the target's MEMORY (set_mem on the
+    stored config at ParseConfig+0x18) instead of a register. Every flag backend; exactly
+    one flip; the feature then runs and every read is logged with its pid."""
+    d = exe("gated_config_mem.exe")
+    if not d:
+        return skip("gated-mem", "gated_config_mem.exe missing")
+    want = threads * reads
+    for flag_bk, read_bk in (("breakpoint", "inline"), ("hw", "inline"), ("inline", "inline"), ("inline", "breakpoint")):
+        name = f"gated-mem flag={flag_bk} read={read_bk}"
+        try:
+            r, o = run([d, "--flag-backend", flag_bk, "--read-backend", read_bk,
+                        "configparse.dll!ParseConfig+0x18", READ_LOCATION, "--", exe("probe_app.exe"),
+                        "--no-wait", "--helpers", HELPERS, "--threads", threads, "--reads", reads], timeout=200)
+            flips = sum(1 for x in o if x.get("kind") == "probe_log" and
+                        str(x.get("message", "")).startswith("flag flipped in memory"))
+            a, rd = app(o), read_probe(o)
+            logs, dropped = read_logs(o)
+            ok = (r.returncode == 0 and flips == 1 and a.get("reads_enabled") == 1 and
+                  a.get("successful_reads") == want and rd.get("hits") == want and logs == want and
+                  dropped == 0 and unmapped(o) == 0 and report(o).get("overrides") == 0)
+            record(name, ok, f"flips={flips} reads_enabled={a.get('reads_enabled')} reads={a.get('successful_reads')} "
+                             f"hits={rd.get('hits')} logs={logs} dropped={dropped} unmapped={unmapped(o)} "
+                             f"overrides={report(o).get('overrides')} err={(report(o).get('error') or '')[:100]}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
 def check_crash_logs(n=5000):
     """Log delivery when the TARGET crashes: after n probed calls (one log each) it dies
     with an unhandled access violation. Every log must still arrive -- for inline they
@@ -1612,6 +1640,7 @@ def main():
     if want(check_emulated_sites): check_emulated_sites()
     if want(check_ret_probe): check_ret_probe()
     if want(check_shared_mix): check_shared_mix()
+    if want(check_gated_mem): check_gated_mem()
     if want(check_forwarded_probe): check_forwarded_probe()
     if want(check_crash_logs): check_crash_logs()
     if want(check_attach_new): check_attach_new()

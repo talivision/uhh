@@ -2340,6 +2340,7 @@ static void hold_thread(probe_session *s, DWORD tid) {
     if (s->held.empty()) s->held_since = GetTickCount64();
     s->held.push_back(t);
     std::fprintf(stderr, "probe: holding thread %lu until inline installs confirm\n", (unsigned long)tid);
+    if (trace_enabled()) std::fprintf(stderr, "  hold t=%llu\n", (unsigned long long)GetTickCount64());
 }
 
 static void release_held(probe_session *s, const char *why) {
@@ -2358,8 +2359,10 @@ static bool vet_pending_inline(probe_session *s);
 // Start (or queue) agent work for pending inline requests.
 static bool kick_agent(probe_session *s) {
     if (s->shared && s->shared->service_ready && s->svc_event) {     // persistent service thread
+        if (trace_enabled()) std::fprintf(stderr, "  vet start t=%llu\n", (unsigned long long)GetTickCount64());
         if (!vet_pending_inline(s)) return false;
-        if (trace_enabled()) std::fprintf(stderr, "  kick service\n");
+        if (trace_enabled()) std::fprintf(stderr, "  vet end t=%llu\n", (unsigned long long)GetTickCount64());
+        if (trace_enabled()) std::fprintf(stderr, "  kick service t=%llu\n", (unsigned long long)GetTickCount64());
         SetEvent(s->svc_event); return true;
     }
     if (s->remote_work != probe_session::REMOTE_NONE) return true;   // picked up when it finishes
@@ -2827,7 +2830,7 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
         probe_ipc_request head{}; size_t n = 0;
         if (remote_read(s->pi.hProcess, (uint64_t)ex.ExceptionInformation[0], &head, offsetof(probe_ipc_request, address), &n) &&
             n == offsetof(probe_ipc_request, address) && (head.op == PROBE_IPC_FREEZE || head.op == PROBE_IPC_THAW)) {
-            if (trace_enabled()) std::fprintf(stderr, "  ipc op=%u tid=%lu (freeze/thaw)\n", head.op, (unsigned long)event.dwThreadId);
+            if (trace_enabled()) std::fprintf(stderr, "  ipc op=%u tid=%lu (freeze/thaw) t=%llu\n", head.op, (unsigned long)event.dwThreadId, (unsigned long long)GetTickCount64());
             uint64_t mask = 0; size_t m = 0;
             remote_read(s->pi.hProcess, (uint64_t)ex.ExceptionInformation[0] + offsetof(probe_ipc_request, address), &mask, sizeof(mask), &m);
             if (head.op == PROBE_IPC_THAW) { if (s->ipc_freezer == event.dwThreadId) ipc_thaw(s); return true; }
@@ -2837,7 +2840,7 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
             return true;
         }
         if (trace_enabled() && n == offsetof(probe_ipc_request, address))
-            std::fprintf(stderr, "  ipc op=%u tid=%lu\n", head.op, (unsigned long)event.dwThreadId);
+            std::fprintf(stderr, "  ipc op=%u tid=%lu t=%llu\n", head.op, (unsigned long)event.dwThreadId, (unsigned long long)GetTickCount64());
         if (n == offsetof(probe_ipc_request, address) && head.op == PROBE_IPC_INSTALL_DONE) {
             // Harmless if forged: acceptance re-checks every request status itself.
             if (!accept_agent_install(s)) { std::fprintf(stderr, "probe: %s\n", s->error.c_str()); }
