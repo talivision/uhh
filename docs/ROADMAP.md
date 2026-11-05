@@ -469,6 +469,24 @@ by itself, nothing dropped), detach while callbacks run / block in call_original
   It now joins the owned slots; with no slot left enabled the DR7 exact bits (LE/GE, which WOW64
   leaves set) are cleared too. Note: on WOW64 a zeroed address in a DISABLED slot is not always
   propagated -- inert (never fires); the target reports it as `dr_stale`, not as a breakpoint.
+- Verification (2026-11-06, VM): x86 `--only lifecycle` 48/48 PASS (all four configs; hw run in
+  <2 min chunks via UHH_LC), x86 `--only interrupt` 3/3, `--only attach` 11/11, `--only gated` 17/17.
+  x64: every lifecycle-* check PASSED on the final code in some run, `--only interrupt` 3/3,
+  `--only gated` 17/17, `--only attach` 11/11 (attach-new-inline failed once "probe never became
+  active", then passed 3 runs in a row -- looks like a load flake, not re-investigated).
+- 🔧 OPEN (L11) x64 `lifecycle-controller-killed-breakpoint` intermittent (1 of 4 kill timings fails
+  in ~1 of 3 runs): the target still dies after the controller is killed, 0x80000004 at
+  lifecycle_target+0x194d (a return address -- call_original's in-place run / its return-catch
+  DR) or once 0x80000003. Mitigations added in order (each reduced it): call_original's DR slot
+  mirrored into the guard before the thread runs; addresses the cleanup cleared remembered for
+  #DBs already in flight; a single-step on a thread with no DR of its own taken as ours once the
+  debug port is gone; our INT3/DR traps acted on even before the kernel clears the debug port
+  (last commit -- run s64g was in flight at hand-over, UNVERIFIED). Next step if it persists: log
+  (OutputDebugString-free: a shared counter) which VEH branch rejects the trap, and check whether
+  the dying debugger leaves TF set on a thread in the middle of the in-place call_original.
+- Test infra notes: `UHH_LC=substr[,substr]` narrows lifecycle checks; lifecycle_driver links the
+  STATIC probe_api, so rebuild lifecycle_driver (not only probe_api) after session.cpp changes;
+  the target is paced (`--pace-ms 1`) except inline controller-killed (needs the ring to fill).
 - Residual / by design: a breakpoint/hw call_func running in the target when the controller dies
   (the thread's context was redirected to the callee and is never restored); suspensions taken
   inside a single debug event and not yet mirrored when the controller dies (microseconds); the
