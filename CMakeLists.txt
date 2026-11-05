@@ -184,7 +184,8 @@ add_library(probe_api_agent SHARED
     examples/filetrace/callbacks.cpp
     examples/flagflip/callbacks.cpp
     examples/regtrace/callbacks.cpp
-    examples/logs_eval/logs_callbacks.cpp)
+    examples/logs_eval/logs_callbacks.cpp
+    examples/agent_review/ar_callbacks.cpp)
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     target_sources(probe_api_agent PRIVATE src/probe/agent_x64.asm)   # uhh_orig_thunk (call_original)
 endif()
@@ -434,6 +435,16 @@ add_executable(cc_driver examples/callconv/cc_driver.cpp examples/callconv/cc_ca
 target_include_directories(cc_driver PRIVATE include)
 target_link_libraries(cc_driver PRIVATE probe_api)
 add_dependencies(cc_driver cc_target probe_api_agent)
+
+# --- inline-agent review findings (regress `agent-*`, examples/agent_review) -------------
+add_executable(ar_target examples/agent_review/ar_target.cpp)
+target_link_options(ar_target PRIVATE /INCREMENTAL:NO)
+# /EHs without c: the extern "C" callees DO throw (the catches must not be elided).
+target_compile_options(ar_target PRIVATE /EHc-)
+add_executable(ar_driver examples/agent_review/ar_driver.cpp examples/agent_review/ar_callbacks.cpp)
+target_include_directories(ar_driver PRIVATE include)
+target_link_libraries(ar_driver PRIVATE probe_api)
+add_dependencies(ar_driver ar_target probe_api_agent)
 
 # --- blog replicas: API-monitor scenarios from well-known write-ups (examples/blogs) ----
 add_executable(blog_target examples/blogs/blog_target.c)
