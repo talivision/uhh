@@ -78,6 +78,7 @@ struct StepState {
     uint64_t scratch = 0;   // the out-of-line copy's slot (displaced steps)
     bool tail_int3 = false; // displaced copy ends at an INT3 (scratch + insn_len), no trap flag
     bool rep_string = false;// REP string op: an in-place step continues until it leaves the site
+    bool syscall_insn = false; // SYSCALL stepped in place: the CPU copies OUR trap flag into R11
 };
 
 // One log line, optionally with a raw stack snapshot (return addresses only). Frames
@@ -3234,6 +3235,11 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             if (still_armed(s, step->second.site)) ok = patch(s->pi.hProcess, step->second.site, 0xcc);   // in-place: re-arm
         }
         native.EFlags &= ~0x100u;
+#if defined(_WIN64)
+        // SYSCALL saves RFLAGS in R11 -- with the trap flag WE set for the step. The program
+        // can read R11 after the syscall; give it the flags image it would have had.
+        if (!step->second.displaced && step->second.syscall_insn) native.R11 &= ~(DWORD64)0x100;
+#endif
         if (ok) ok = !!SetThreadContext(thread, &native);
         CloseHandle(thread);
         if (!ok) { set_error(s, win_error("complete breakpoint single-step")); return false; }
@@ -3355,8 +3361,9 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         std::fprintf(stderr, "  setup tid=%lu displaced=%d scratch=0x%llx rip=0x%llx\n",
                      (unsigned long)event.dwThreadId, displaced,
                      (unsigned long long)scratch_addr, (unsigned long long)(displaced ? scratch_addr : probe->address));
+    const bool is_syscall = probe->orig_insn.size() == 2 && probe->orig_insn[0] == 0x0F && probe->orig_insn[1] == 0x05;
     stepping[event.dwThreadId] = StepState{probe, displaced, probe->address, probe->insn_len, displaced ? scratch_addr : 0,
-                                           tail, probe->rep_string};
+                                           tail, probe->rep_string, is_syscall};
     if (at_entry && inline_hold_needed(s)) { hold_thread(s, event.dwThreadId); if (!kick_agent(s)) return false; }
     disposition = DBG_CONTINUE; return true;
 }
