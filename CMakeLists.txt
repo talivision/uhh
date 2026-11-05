@@ -133,6 +133,10 @@ target_link_options(probe_app_cet PRIVATE ${READ_THUNK_EXPORT} /CETCOMPAT)
 add_dependencies(probe_app_cet configparse)
 add_executable(cet_probe examples/cet/cet_probe.c)
 target_link_options(cet_probe PRIVATE /CETCOMPAT)
+# cet_smash: positive control for a shadow-stack checker (Intel SDE -cet, regress `cet-sde-*`).
+add_executable(cet_smash examples/cet/cet_smash.c)
+target_link_options(cet_smash PRIVATE /CETCOMPAT)
+set_property(TARGET cet_smash PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")   # a target app
 
 # Hostile entry sequences and a real pre-existing E9 detour for the breakage demo.
 add_executable(hook_edge examples/breakage/hook_edge.c ${BREAKAGE_ASM})
@@ -300,6 +304,14 @@ add_executable(conformance_driver examples/conformance/conformance_driver.cpp ex
 target_include_directories(conformance_driver PRIVATE include)
 target_link_libraries(conformance_driver PRIVATE probe_api)
 add_dependencies(conformance_driver conformance_target probe_api_agent)
+# The conformance probes attached to a running conformance_target (one Intel SDE hosts; regress `cet-sde-*`).
+add_executable(cet_sde_driver examples/cet/cet_sde_driver.cpp examples/conformance/conformance_callbacks.cpp
+               examples/hunt_callorig/co_callbacks.cpp)
+target_include_directories(cet_sde_driver PRIVATE include)
+target_link_libraries(cet_sde_driver PRIVATE probe_api)
+add_dependencies(cet_sde_driver conformance_target cet_smash probe_api_agent)
+target_compile_definitions(cet_sde_driver PRIVATE _CRT_SECURE_NO_WARNINGS)
+target_compile_options(cet_sde_driver PRIVATE /W4)
 
 # --- per-hit cost microbenchmark (inline state-save variants etc.) --------------------
 add_executable(hitcost_target bench/hitcost/hitcost_target.c)

@@ -2130,10 +2130,18 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
     static PVOID veh = nullptr;
     if (!veh) {
         // Under CET shadow stacks a call in a hook's range is relocated verbatim (a return
-        // through a pushed address would be a #CP): see uhh_relocate_call_as_jmp.
+        // through a pushed address would be a #CP): see uhh_relocate_call_as_jmp. The policy
+        // says so on CET hardware; RDSSP (a NOP leaving 0 without an active shadow stack) also
+        // sees one the policy does not report: Intel SDE's emulated shadow stack (regress
+        // `cet-sde-relcall-inline`), or a failed policy query.
         PROCESS_MITIGATION_USER_SHADOW_STACK_POLICY pol{};
-        if (GetProcessMitigationPolicy(GetCurrentProcess(), ProcessUserShadowStackPolicy, &pol, sizeof(pol)) &&
-            pol.EnableUserShadowStack)
+#if defined(_WIN64)
+        const bool ssp = _rdsspq() != 0;
+#else
+        const bool ssp = _rdsspd() != 0;
+#endif
+        if (ssp || (GetProcessMitigationPolicy(GetCurrentProcess(), ProcessUserShadowStackPolicy, &pol, sizeof(pol)) &&
+                    pol.EnableUserShadowStack))
             InterlockedExchange(&uhh_safetyhook_keep_calls, 1);
         g_nt_raise = reinterpret_cast<nt_raise_fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtRaiseException"));
         g_nt_qit = reinterpret_cast<nt_qit_fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
