@@ -717,7 +717,10 @@ bool walk_stack(HANDLE process, HANDLE thread, CONTEXT ctx,
             // same stack pointer): that is not "no progress", it is the frame we already have.
             if (first) { first = false; if (next == pc) continue; }
             if (frame.AddrPC.Offset == previous_pc && frame.AddrStack.Offset == previous_sp) break;
-            if (next != frames.back()) frames.push_back(next);
+            // Recursion returns to the same address from every level: those are distinct frames
+            // (different stack pointers), not duplicates -- collapsing them truncated deep
+            // recursive stacks to 2 frames on breakpoint/hw while inline showed them all.
+            if (next != frames.back() || frame.AddrStack.Offset != previous_sp) frames.push_back(next);
         }
         return true;
     } catch (...) {

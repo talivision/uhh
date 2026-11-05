@@ -1,4 +1,5 @@
 #include "win_common.hpp"
+#include "probe_log_format.hpp"
 #include "probe_agent_shared.hpp"
 #include <safetyhook.hpp>
 #include <array>
@@ -79,11 +80,30 @@ static bool range_ok(uintptr_t a, size_t n, bool write) {
     return true;
 }
 static void forget_region() { if (RegionCache *cache = region_cache()) *cache = {}; }
+// The bytes each installed hook overwrote, so a callback reading code sees the PROGRAM's
+// bytes (as the breakpoint backend shows the original byte under its INT3 and hw changes
+// nothing), not the hook's jump. Published after the jump is written, withdrawn before it
+// is removed; a reader checks the request is still INSTALLED (not unloaded/reused).
+struct PatchShadow { volatile uintptr_t lo; uint32_t len; uint8_t bytes[32]; };
+static PatchShadow g_shadow[PROBE_AGENT_MAX_PROBES];
+static volatile LONG g_shadow_count;
+static void overlay_original(uintptr_t a, void *buffer, size_t n) {
+    for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i) {
+        const uintptr_t lo = g_shadow[i].lo;
+        if (!lo || !shared || shared->requests[i].status != PROBE_AGENT_INSTALLED) continue;
+        const uintptr_t hi = lo + g_shadow[i].len;
+        if (hi <= a || lo >= a + n) continue;
+        for (uintptr_t x = lo > a ? lo : a; x < hi && x < a + n; ++x)
+            static_cast<uint8_t *>(buffer)[x - a] = g_shadow[i].bytes[x - lo];
+    }
+}
 static int local_read(void *, uint64_t address, void *buffer, size_t size, size_t *done) {
     *done = 0;
     if (!range_ok((uintptr_t)address, size, false)) return 0;
-    __try { std::memcpy(buffer, (const void *)(uintptr_t)address, size); *done = size; return 1; }
+    __try { std::memcpy(buffer, (const void *)(uintptr_t)address, size); *done = size; }
     __except (EXCEPTION_EXECUTE_HANDLER) { forget_region(); return 0; }
+    if (g_shadow_count) overlay_original((uintptr_t)address, buffer, size);
+    return 1;
 }
 static int local_write(void *, uint64_t address, const void *buffer, size_t size, size_t *done) {
     *done = 0;
@@ -247,15 +267,9 @@ static void agent_log(probe_context *c, bool stack, const char *format, va_list 
     auto *state = c ? static_cast<AgentState *>(c->controller) : nullptr;
     if (!state || !state->shared || !format) return;
     char text[PROBE_AGENT_LOG_TEXT_CAP];
-    int n = -1;
-    text[0] = 0;
-    __try { n = _vsnprintf_s(text, sizeof(text), _TRUNCATE, format, ap); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { n = -1; }
-    text[sizeof(text) - 1] = 0;
-    if (n < 0 && text[0]) {                                  // truncated: say so, never silently
-        static const char mark[] = "...[truncated]";
-        std::memcpy(text + sizeof(text) - sizeof(mark), mark, sizeof(mark));
-    }
+    // The controller's formatter: an invalid format (%k, %n) used to fast-fail the TARGET
+    // through the CRT's invalid-parameter handler; now logged as "[unformattable] <format>".
+    if (!uhh_format_log(text, sizeof(text), format, ap)) return;
     uint64_t frames[PROBE_STACK_MAX_FRAMES]; uint32_t nframes = 0;
     if (stack) nframes = capture_stack(c, frames, PROBE_STACK_MAX_FRAMES);
     auto *sh = state->shared;
@@ -686,6 +700,7 @@ static void install_pending_locked() {
         if (InterlockedCompareExchange(&request.status, PROBE_AGENT_INSTALLING, PROBE_AGENT_PENDING) != PROBE_AGENT_PENDING)
             continue;
         sites[i] = request.site; states[i] = {shared, i}; proxies[i].site = i;
+        if (g_shadow[i].lo) { g_shadow[i].lo = 0; InterlockedDecrement(&g_shadow_count); }
         if (hooks[i]) {
             // A re-install after the module was unloaded: the old hook's code and target are
             // gone, so it must NOT be destroyed (its destructor would write to unmapped
@@ -705,6 +720,14 @@ static void install_pending_locked() {
         for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i) {
             if (!which[i]) continue;
             const bool ok = hooks[i].enable().has_value();
+            const auto &orig = hooks[i].original_bytes();
+            if (ok && !g_shadow[i].lo && orig.size() <= sizeof(g_shadow[i].bytes)) {
+                std::memcpy(g_shadow[i].bytes, orig.data(), orig.size());
+                g_shadow[i].len = (uint32_t)orig.size();
+                MemoryBarrier();
+                g_shadow[i].lo = hooks[i].target_address();
+                InterlockedIncrement(&g_shadow_count);
+            }
             InterlockedExchange(&shared->requests[i].status, ok ? PROBE_AGENT_INSTALLED : PROBE_AGENT_HOOK_FAILED);
         }
     };
@@ -770,6 +793,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_stop(void *) {
     AcquireSRWLockExclusive(&g_install_lock);            // after any install round in progress
     InterlockedExchange(&g_stopping, 1);
     for (int i = 0; i < 2000 && any_inflight(); ++i) Sleep(1);
+    for (auto &sh : g_shadow) if (sh.lo) { sh.lo = 0; InterlockedDecrement(&g_shadow_count); }
     frozen(slot_set{}, [] {
         for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i)
             // Restore the original bytes -- unless the controller saw the module unload

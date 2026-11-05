@@ -1017,6 +1017,215 @@ def check_sidefx(iters=1000, threads=4):
             record(name, False, repr(e))
 
 
+EDGE_ITERS = 5
+# (site, location) -- see examples/edgehunt/edge_driver.cpp
+EDGE_SHAPES = ["rep", "stos", "ripload", "ripcmp", "ripvec", "ripstore", "cpuid", "rdtsc", "syscall", "int2e",
+               "pushf", "popf", "retonly", "thunk", "jump", "faultmid", "x87", "lock", "args"]
+EDGE_X64_ONLY = {"ripload", "ripcmp", "ripvec", "ripstore", "syscall", "int2e"}
+EDGE_LOC = {"rep": "EdgeRepSite", "stos": "EdgeStosSite", "ripload": "EdgeRipLoadSite", "ripcmp": "EdgeRipCmpSite",
+            "ripvec": "EdgeRipVecSite", "ripstore": "EdgeRipStoreSite", "cpuid": "EdgeCpuidSite",
+            "rdtsc": "EdgeRdtscSite", "syscall": "EdgeSyscallSite", "int2e": "EdgeInt2eSite",
+            "pushf": "EdgePushfSite", "popf": "EdgePopfSite", "retonly": "EdgeRetOnlySite",
+            "thunk": "EdgeThunkSite", "jump": "EdgeJumpSite", "faultmid": "EdgeFaultMidSite", "x87": "EdgeX87Site",
+            "lock": "EdgeLockSite", "args": "edge_args10", "mem": "edge_mem_site", "readd": "EdgeReaddA",
+            "leaf": "edge_leaf", "fmt": "edge_fmt_site", "fmtptr": "edge_fmt_site", "cbfault": "EdgeReaddB"}
+# Shapes an inline hook cannot take (a 5-byte jump would run past a ret / into a jump-table
+# target): a clean refusal is the correct inline answer there. (x86's jump-table jmp is 7
+# bytes long, so its hook stays inside the instruction and is accepted.)
+EDGE_INLINE_REFUSED_X64 = {"retonly", "jump"}
+EDGE_INLINE_REFUSED_X86 = {"retonly"}
+
+
+def check_edgehunt():
+    """Edge-case code shapes and argument/memory/log edge cases (examples/edgehunt): ONE
+    callback source under breakpoint, hw and inline. Every hit logs one 'ok' (never FAIL),
+    hit counts are exact, and the target's result row equals the uninstrumented baseline:
+    rep movsb/stosb, RIP-relative loads/stores/compares/AVX, cpuid, rdtsc, raw syscall and
+    int 2e, pushf/popf, a bare ret, a call through a pointer, a jump table, a faulting load
+    inside a framed function caught by the caller's __except, x87, lock cmpxchg, 10 args;
+    get_mem/set_mem on guard/read-only/code/freed/page-crossing/null/wrapping addresses (no
+    side effects, no partial copies, code reads show the program's bytes); invalid send_log
+    formats (%k, %n) logged, never fatal; a faulting callback abandoned the same way on every
+    backend; one-shot probes re-added from a callback every call; two backends on one site."""
+    d, t = exe("edge_driver.exe"), exe("edge_target.exe")
+    if not d or not t:
+        return skip("edgehunt", "edge_driver/edge_target missing")
+    import struct
+    data = Path(t).read_bytes()
+    x86 = struct.unpack_from("<H", data, struct.unpack_from("<I", data, 0x3C)[0] + 4)[0] == 0x14C
+    _, bo = run([t, "--iters", EDGE_ITERS], timeout=60)
+    base = next((x for x in bo if x.get("kind") == "target"), None)
+    record("edgehunt-baseline", base is not None, str(base))
+    if base is None:
+        return
+    K = EDGE_ITERS
+    shapes = [s for s in EDGE_SHAPES if not (x86 and s in EDGE_X64_ONLY)]
+    refused_inline = EDGE_INLINE_REFUSED_X86 if x86 else EDGE_INLINE_REFUSED_X64
+
+    def expected_hits(site):
+        if site in ("faultmid", "rdtsc"):
+            return 2 * K
+        if site == "int2e":
+            return K if base.get("int2e_ok") else 1
+        if site == "syscall":
+            return K if base.get("svc") else 0
+        return {"mem": 1, "fmt": 1, "fmtptr": 1, "leaf": 2}.get(site, K)
+
+    def go(bk, sites, extra=()):
+        r, o = run([d, "--backend", bk, "--sites", ",".join(sites), *extra, "--", t, "--iters", K], timeout=120)
+        msgs = [str(x.get("message", "")) for x in o if x.get("kind") == "probe_log"]
+        tg = next((x for x in o if x.get("kind") == "target"), {})
+        return r, o, msgs, tg
+
+    def common(r, o, msgs, tg):
+        bad = []
+        if r.returncode != 0: bad.append(f"exit={r.returncode}")
+        if report(o).get("error") is not None: bad.append(f"error={report(o).get('error')}")
+        if report(o).get("log_dropped") != 0: bad.append(f"log_dropped={report(o).get('log_dropped')}")
+        diff = {k: (base.get(k), tg.get(k)) for k in set(base) | set(tg) if base.get(k) != tg.get(k)}
+        if diff: bad.append(f"target-vs-baseline={diff}")
+        fails = [m for m in msgs if m.startswith("FAIL")]
+        if fails: bad.append(f"fails={fails[:3]}")
+        return bad
+
+    for bk in ("breakpoint", "hw", "inline"):
+        # code shapes: batches of <= 4 (hw has 4 slots); inline refusals run on their own
+        normal = [s for s in shapes if not (bk == "inline" and s in refused_inline)]
+        for i in range(0, len(normal), 4):
+            batch = normal[i:i + 4]
+            name = f"edgehunt-{bk}-{'+'.join(batch)}"
+            try:
+                r, o, msgs, tg = go(bk, batch)
+                bad = common(r, o, msgs, tg)
+                rows = {p.get("location", "").split("!")[-1]: p for p in probes(o)}
+                for s in batch:
+                    row = rows.get(EDGE_LOC[s], {})
+                    if row.get("hits") != expected_hits(s) or row.get("backend") != bk:
+                        bad.append(f"{s}:hits={row.get('hits')}/{expected_hits(s)} backend={row.get('backend')}")
+                oks = sum(1 for m in msgs if m.startswith("ok "))
+                want = sum(expected_hits(s) for s in batch)
+                if oks != want: bad.append(f"oks={oks}/{want}")
+                record(name, not bad, "; ".join(bad) or f"hits exact, target == baseline")
+            except Exception as e:
+                record(name, False, repr(e))
+        if bk == "inline":
+            for s in sorted(refused_inline):
+                name = f"edgehunt-inline-{s}-refused"
+                try:
+                    r, o = run([d, "--backend", "inline", "--sites", s, "--", t, "--iters", K], timeout=120)
+                    text = r.stdout + r.stderr
+                    tg = next((x for x in o if x.get("kind") == "target"), {})
+                    row = next(iter(probes(o)), {})
+                    refused = "refus" in text.lower() or "unsafe" in text.lower()
+                    clean = refused and (not tg or tg == base) and not row.get("hits")
+                    record(name, clean, f"refused={refused} hits={row.get('hits')} target_ok={not tg or tg == base} exit={r.returncode}")
+                except Exception as e:
+                    record(name, False, repr(e))
+        # memory edge cases (+ the rep site probed, so code reads cross a live probe)
+        name = f"edgehunt-{bk}-mem"
+        try:
+            r, o, msgs, tg = go(bk, ["mem", "rep"])
+            bad = common(r, o, msgs, tg)
+            oks = sorted({m[3:] for m in msgs if m.startswith("ok mem-")})
+            if len(oks) != 12: bad.append(f"mem-oks={len(oks)}/12 {oks}")
+            for k in ("guard_kept", "code_kept", "cross_kept", "ro_kept"):
+                if tg.get(k) != 1: bad.append(f"{k}={tg.get(k)}")
+            record(name, not bad, "; ".join(bad) or "12/12 memory edge cases, no side effects")
+        except Exception as e:
+            record(name, False, repr(e))
+        # log formatting edge cases
+        name = f"edgehunt-{bk}-fmt"
+        try:
+            r, o, msgs, tg = go(bk, ["fmt"])
+            bad = common(r, o, msgs, tg)
+            fm = [m for m in msgs if "fmt-" in m]
+            # %k is not a conversion the UCRT rejects (it prints "k"); %n is (it used to fast-fail
+            # the controller, or the TARGET for inline). Same text on every backend.
+            need = ["fmt-null-s (null) end", "fmt-invalid k end", "[unformattable] fmt-percent-n %n end",
+                    "fmt-trailing ", "fmt-done"]
+            for n_ in need:
+                if n_ not in fm: bad.append(f"missing {n_!r} in {[m[:60] for m in fm]}")
+            wide = [m for m in fm if m.startswith("fmt-wide")]
+            if len(wide) != 1 or not wide[0].endswith("...[truncated]"): bad.append(f"wide={[w[-20:] for w in wide]}")
+            if len(fm) != 6: bad.append(f"records={len(fm)}/6 {fm}")
+            record(name, not bad, "; ".join(bad) or "6 records, invalid formats logged, truncation marked")
+        except Exception as e:
+            record(name, False, repr(e))
+        # %s of a TARGET pointer: inline prints the string; breakpoint/hw callbacks run in the
+        # controller, where it is not a valid pointer -> "[unformattable]" (never a crash)
+        name = f"edgehunt-{bk}-fmtptr"
+        try:
+            r, o, msgs, tg = go(bk, ["fmtptr"])
+            bad = common(r, o, msgs, tg)
+            fm = [m for m in msgs if "fmtptr" in m]
+            ok_text = ["fmtptr hello-from-target"] if bk == "inline" else ["fmtptr hello-from-target", "[unformattable] fmtptr %s"]
+            if len(fm) != 1 or fm[0] not in ok_text: bad.append(f"got={fm}")
+            record(name, not bad, "; ".join(bad) or f"{fm[0]!r}")
+        except Exception as e:
+            record(name, False, repr(e))
+        # a callback that faults: abandoned, hit counted, target unaffected, run continues
+        name = f"edgehunt-{bk}-cbfault"
+        try:
+            r, o, msgs, tg = go(bk, ["cbfault"])
+            bad = common(r, o, msgs, tg)
+            before = sum(1 for m in msgs if m == "ok cbfault-before")
+            row = next(iter(probes(o)), {})
+            if before != K or row.get("hits") != K: bad.append(f"before={before}/{K} hits={row.get('hits')}/{K}")
+            record(name, not bad, "; ".join(bad) or f"{K} faulting callbacks abandoned cleanly")
+        except Exception as e:
+            record(name, False, repr(e))
+        # one-shot probe re-added from a callback on every call (added + retired K times)
+        name = f"edgehunt-{bk}-readd"
+        try:
+            r, o, msgs, tg = go(bk, ["readd"])
+            bad = common(r, o, msgs, tg)
+            a = sum(1 for m in msgs if m == "ok readd-a"); b = sum(1 for m in msgs if m == "ok readd-b")
+            if a != K or b != K: bad.append(f"readd-a={a}/{K} readd-b={b}/{K}")
+            record(name, not bad, "; ".join(bad) or f"{K} adds, {K} one-shot hits")
+        except Exception as e:
+            record(name, False, repr(e))
+        # stacks at depth 0 (a thread's first frame) and in deep recursion (capped)
+        name = f"edgehunt-{bk}-leaf"
+        try:
+            r, o, msgs, tg = go(bk, ["leaf"])
+            bad = common(r, o, msgs, tg)
+            st = {x.get("message"): x.get("stack") or [] for x in o if x.get("kind") == "probe_log"}
+            deep = st.get("leaf depth=0") or []
+            if len([x for x in o if x.get("kind") == "probe_log"]) != 2: bad.append("records!=2")
+            if len(deep) < 16 or not any("edge_recurse" in f for f in deep[1:3]):
+                bad.append(f"deep={len(deep)} {deep[:3]}")
+            record(name, not bad, "; ".join(bad) or f"deep stack {len(deep)} frames")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    # two backends on the same instruction (in both registration orders). An inline hook
+    # cannot be written over a live INT3: breakpoint + inline is refused, with that reason.
+    for pair in ("breakpoint,inline", "inline,breakpoint"):
+        name = f"edgehunt-dual-{pair.replace(',', '+')}-refused"
+        try:
+            r, o = run([d, "--dual", pair, "--", t, "--iters", K], timeout=120)
+            err = str(report(o).get("error") or "")
+            ok = r.returncode != 0 and "software-breakpoint probe" in err
+            record(name, ok, f"exit={r.returncode} error={err[:160]!r}")
+        except Exception as e:
+            record(name, False, repr(e))
+    for pair in ("breakpoint,hw", "hw,breakpoint", "hw,inline", "inline,hw"):
+        name = f"edgehunt-dual-{pair.replace(',', '+')}"
+        try:
+            r, o = run([d, "--dual", pair, "--", t, "--iters", K], timeout=120)
+            msgs = [str(x.get("message", "")) for x in o if x.get("kind") == "probe_log"]
+            tg = next((x for x in o if x.get("kind") == "target"), {})
+            bad = common(r, o, msgs, tg)
+            rows = probes(o)
+            hits = sorted((p.get("backend"), p.get("hits")) for p in rows)
+            want = sorted((b, K) for b in pair.split(","))
+            if hits != want: bad.append(f"probes={hits} want={want}")
+            if sum(1 for m in msgs if m.startswith("ok dual")) != 2 * K: bad.append("oks!=2K")
+            record(name, not bad, "; ".join(bad) or f"both fire {K}x, target == baseline")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
 def lines_until(proc, marker, timeout):
     """Read a child's stdout lines until one contains marker (or timeout). Helper processes
     may inherit the pipe, so never wait for EOF."""
@@ -2269,6 +2478,7 @@ def main():
     if want(check_famous_tls): check_famous_tls()
     if want(check_famous_loader): check_famous_loader()
     if want(check_famous_retval): check_famous_retval()
+    if want(check_edgehunt): check_edgehunt()
     print("-" * 72)
     failed = 0
     for name, status, detail in RESULTS:
