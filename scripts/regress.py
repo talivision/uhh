@@ -3812,11 +3812,17 @@ def check_agent_review():
         base = row(bo)
         r, o = go("prot", ["ntdll.dll!NtProtectVirtualMemory=ar_on_prot"])
         bad = common(r, o, base)
+        # The agent's own code (hook writes: VirtualProtect, run FROZEN) must never run the
+        # callback. The loader's own start/exit of the injected init thread (ntdll calling
+        # itself, outside the agent's code and outside any freeze) is reported, not failed.
         lg = ar_logs(o)
-        agent, prog = lg.get("ar prot agent=1", 0), lg.get("ar prot agent=0", 0)
-        if agent: bad.append(f"{agent} callback(s) ran on the agent's own threads")
+        agent = lg.get("ar prot agent=1 via=other", 0)
+        loader = lg.get("ar prot agent=1 via=ntdll", 0)
+        prog = lg.get("ar prot agent=0 via=other", 0) + lg.get("ar prot agent=0 via=ntdll", 0)
+        if agent: bad.append(f"{agent} callback(s) ran in the agent's own code (logs={lg})")
         if prog < 5: bad.append(f"program calls seen={prog} (want >= 5)")
-        record("agent-own-threads", not bad, "; ".join(bad) or f"row={row(o)} program={prog} agent={agent}")
+        record("agent-own-threads", not bad,
+               "; ".join(bad) or f"row={row(o)} program={prog} agent={agent} agent-thread-loader={loader}")
     except Exception as e:
         record("agent-own-threads", False, repr(e))
 

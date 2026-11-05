@@ -54,5 +54,13 @@ AR_CB void ar_on_prot(probe_context *c) {
     if (g_nqit) g_nqit(GetCurrentThread(), 9 /* ThreadQuerySetWin32StartAddress */, &start, sizeof(start), nullptr);
     const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>((const char *)&__ImageBase + __ImageBase.e_lfanew);
     const uintptr_t lo = (uintptr_t)&__ImageBase, a = (uintptr_t)start;
-    send_log(c, "ar prot agent=%d", a >= lo && a < lo + nt->OptionalHeader.SizeOfImage ? 1 : 0);
+    // Who called NtProtectVirtualMemory: ntdll itself (the loader starting/ending a thread)
+    // or code outside it (VirtualProtect: the hook writes, the program).
+    static const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    const auto *nn = reinterpret_cast<const IMAGE_NT_HEADERS *>((const char *)ntdll + ((const IMAGE_DOS_HEADER *)ntdll)->e_lfanew);
+    uint64_t ret = 0;
+    get_mem(c, get_reg(c, PROBE_REG_SP), &ret, sizeof(void *));
+    const bool via_ntdll = ret >= (uintptr_t)ntdll && ret < (uintptr_t)ntdll + nn->OptionalHeader.SizeOfImage;
+    send_log(c, "ar prot agent=%d via=%s", a >= lo && a < lo + nt->OptionalHeader.SizeOfImage ? 1 : 0,
+             via_ntdll ? "ntdll" : "other");
 }
