@@ -185,6 +185,7 @@ struct probe_session {
     bool detached = false;
     DWORD debug_tid = 0;                       // the thread that launched/attached: owns the debug object
     DWORD in_call_tid = 0;                     // thread currently running a call_func callee
+    std::vector<HANDLE> call_deferred;         // other threads' hits during a call_func: rewound + suspended
     bool skip_continue = false;                // call_func already continued the current event
     uint64_t call_trap = 0;                    // INT3 the callee returns into
     bool initial_break = false;
@@ -3046,9 +3047,42 @@ static void enforce_owned_drs(const probe_session *s, CONTEXT &c) {
     }
 }
 
-// Service a hardware-breakpoint #DB (a single-step exception carrying a DR status
-// bit, not one of our software single-steps). Returns false on error; sets handled
-// when a DR we own fired. RF lets the flagged instruction run once without re-trapping.
+// While one callback's call_func runs its callee, another thread that hits a probe must
+// not run ITS callback now: that callback may call call_func too, and only one call can be
+// in flight (it used to get 0 -- the same callback source failed only under concurrency).
+// Instead the hit is undone -- the thread is put back AT the probe address (an INT3 hit
+// rewinds over the 0xCC; an execute #DB has not run the instruction) and suspended. When
+// the call finishes it is resumed and hits the probe again, normally: counted once, its
+// callback runs with call_func available.
+static bool defer_hit_during_call(probe_session *s, DWORD tid, uint64_t address, bool rewind_ip) {
+    HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, tid);
+    if (!t) return false;
+    CONTEXT w{}; w.ContextFlags = CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS;
+    bool ok = !!GetThreadContext(t, &w);
+    if (ok) {
+        if (rewind_ip) {
+#if defined(_WIN64)
+            w.Rip = address;
+#else
+            w.Eip = (DWORD)address;
+#endif
+        }
+        w.Dr6 = 0;
+        w.EFlags &= ~0x10000u;                   // no RF: the probe must fire again
+        ok = !!SetThreadContext(t, &w);
+    }
+    if (ok && SuspendThread(t) != (DWORD)-1) {
+        try { s->call_deferred.push_back(t); return true; } catch (...) { ResumeThread(t); }
+    }
+    CloseHandle(t);
+    return false;
+}
+
+static void resume_deferred_hits(probe_session *s) {
+    for (HANDLE t : s->call_deferred) { ResumeThread(t); CloseHandle(t); }
+    s->call_deferred.clear();
+}
+
 // ---- Callback memory access (breakpoint/hw callbacks) ---------------------------------
 // The SAME policy as the inline agent's range check, so get_mem/set_mem answer the same on
 // every backend: the whole range must be committed, not PAGE_GUARD / PAGE_NOACCESS, readable
@@ -3171,12 +3205,50 @@ static bool apply_return_from(probe_session *s, Probe *probe, const probe_contex
     return true;
 }
 
+// Service a hardware-breakpoint #DB (a single-step exception carrying a DR status
+// bit, not one of our software single-steps). Returns false on error; sets handled
+// when a DR we own fired. RF lets the flagged instruction run once without re-trapping.
 static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
     handled = false;
     HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
     if (!thread) { set_error(s, win_error("open hw event thread")); return false; }
     CONTEXT native{}; native.ContextFlags = CONTEXT_ALL;
     if (!GetThreadContext(thread, &native)) { CloseHandle(thread); set_error(s, win_error("get hw context")); return false; }
+    if (!(native.Dr6 & 0xF & s->dr_used) && !(native.Dr6 & 0x4000) && !(native.EFlags & 0x100u)) {
+        // A #DB that is neither a trap-flag step (BS clear, TF clear) nor flagged in DR6 for
+        // one of our slots, AT the address of one of our execute probes: ours, but DR6 was
+        // overwritten by the target writing a thread context it captured earlier (Suspend +
+        // GetThreadContext / SetThreadContext round-trip racing this event). Passing it on
+        // killed the target with an unhandled single step; recover the slot from the address.
+#if defined(_WIN64)
+        const uint64_t pc = native.Rip;
+#else
+        const uint64_t pc = native.Eip;
+#endif
+        for (auto &p : s->probes)
+            if (p->active && (p->flags & PROBE_HW) && p->dr_slot >= 0 && !(p->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) &&
+                p->address == pc)
+                native.Dr6 |= (DWORD64)1 << p->dr_slot;
+    }
+    if (s->in_call_tid && event.dwThreadId != s->in_call_tid && (native.Dr6 & 0xF)) {
+        // Only pure execute hits can be replayed (a data watch has already happened).
+        bool exec_only = true;
+#if defined(_WIN64)
+        const uint64_t pc = native.Rip;
+#else
+        const uint64_t pc = native.Eip;
+#endif
+        for (int slot = 0; slot < 4 && exec_only; ++slot) {
+            if (!(native.Dr6 & (1u << slot))) continue;
+            Probe *p = nullptr;
+            for (auto &q : s->probes) if (q->active && (q->flags & PROBE_HW) && q->dr_slot == slot) { p = q.get(); break; }
+            if (!p || p->internal || (p->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) || p->address != pc) exec_only = false;
+        }
+        if (exec_only && s->stepping.find(event.dwThreadId) == s->stepping.end() &&
+            defer_hit_during_call(s, event.dwThreadId, pc, false)) {
+            CloseHandle(thread); handled = true; return true;
+        }
+    }
     // Service EVERY debug-status bit that fired, not just the lowest: two probes can
     // share an address (both B-bits set), and clearing DR6 after handling only one
     // would silently drop the other. Callbacks compose on one context in slot order.
@@ -3441,6 +3513,20 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
                      describe_fault(s, ex, code, address).c_str());
         print_crash_stack(s, event.dwThreadId);
     }
+    // A stray trap-flag step inside our scratch slots with no step in progress: the target
+    // wrote back a context it captured mid-step (see the jump-back after each displaced
+    // copy). Ours, not the target's: drop TF and let the thread run the jump back.
+    if (code == EXCEPTION_SINGLE_STEP && step == stepping.end()) {
+        bool in_scratch = false;
+        for (uint64_t b : s->scratch_blocks) if (address >= b && address < b + 0x10000) { in_scratch = true; break; }
+        if (in_scratch) {
+            HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
+            CONTEXT w{}; w.ContextFlags = CONTEXT_CONTROL;
+            if (t && GetThreadContext(t, &w)) { w.EFlags &= ~0x100u; SetThreadContext(t, &w); }
+            if (t) CloseHandle(t);
+            disposition = DBG_CONTINUE; return true;
+        }
+    }
     if (trace_enabled() && code == EXCEPTION_ACCESS_VIOLATION && ex.NumberParameters >= 2) {
         unsigned char around[24] = {0}; size_t got = 0;
         remote_read(s->pi.hProcess, address - 8, around, sizeof(around), &got);
@@ -3557,6 +3643,10 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     if (!GetThreadContext(thread, &native)) {
         CloseHandle(thread); set_error(s, win_error("get breakpoint context")); return false;
     }
+    if (s->in_call_tid && event.dwThreadId != s->in_call_tid && !probe->internal &&
+        defer_hit_during_call(s, event.dwThreadId, address, true)) {
+        CloseHandle(thread); disposition = DBG_CONTINUE; return true;
+    }
     if (s->entry_reapply && address == s->entry_reapply && !probe->internal) reapply_all_hw(s);
     bool at_entry = s->entry_addr && address == s->entry_addr && !s->entry_seen;
     if (at_entry) s->entry_seen = true;
@@ -3638,6 +3728,23 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             else { int32_t v = (int32_t)nd; std::memcpy(code.data() + probe->riprel_disp_off, &v, sizeof(v)); }
         }
         if (probe->rep_string) code.push_back(0xCC);       // the copy runs to completion, then traps here
+        // Follow the copy with a jump back to the next real instruction. Normally never
+        // executed (the single-step lands us there), but a target that captures a thread's
+        // context while it reports the step (Suspend + GetThreadContext, e.g. a GC or its own
+        // context round-trip) and writes it back after we moved it, resumes the thread HERE:
+        // it must continue correctly instead of running whatever follows in the slot.
+        if (displaced) {
+            const uint64_t back = probe->address + probe->insn_len;
+#if defined(_WIN64)
+            const unsigned char jmp[6] = {0xFF, 0x25, 0, 0, 0, 0};   // jmp [rip+0]; dq back
+            code.insert(code.end(), jmp, jmp + 6);
+            for (int b = 0; b < 8; ++b) code.push_back((unsigned char)(back >> (8 * b)));
+#else
+            const uint32_t rel = (uint32_t)(back - (scratch_addr + code.size() + 5));
+            code.push_back(0xE9);                                     // jmp rel32
+            for (int b = 0; b < 4; ++b) code.push_back((unsigned char)(rel >> (8 * b)));
+#endif
+        }
         size_t wrote = 0;
         if (displaced && (!remote_write(s->pi.hProcess, scratch_addr, code.data(), code.size(), &wrote) ||
                           wrote != code.size())) {
@@ -4176,12 +4283,18 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
                            ? ((uint64_t)memory.PeakWorkingSetSize + (1024 * 1024 - 1)) / (1024 * 1024) : 0;
     uint64_t dropped = (uint64_t)(s->shared ? s->shared->log_dropped : 0) +
                        s->controller_dropped.load(std::memory_order_relaxed);
+    // Inline callbacks still in flight when the target died: ExitProcess/TerminateProcess
+    // kill threads mid-callback (breakpoint/hw callbacks always complete -- the debugger
+    // holds the thread). Their hits are counted; any log they would have sent never existed.
+    uint64_t interrupted = 0;
+    if (s->exited && s->shared)
+        for (const auto &x : s->shared->inflight) interrupted += (uint64_t)(x.value > 0 ? x.value : 0);
     std::fprintf(out, "{\"kind\":\"probe_report\",\"probes\":%llu,\"active\":%llu,"
-                 "\"hits\":%llu,\"overrides\":%llu,\"log_dropped\":%llu,"
+                 "\"hits\":%llu,\"overrides\":%llu,\"log_dropped\":%llu,\"callbacks_interrupted\":%llu,"
                  "\"logs_written\":%llu,\"controller_peak_ws_mb\":%llu,\"app_exit\":%lu,\"error\":",
                  (unsigned long long)visible, (unsigned long long)active,
                  (unsigned long long)hits, (unsigned long long)(s->overrides + (s->shared ? (uint64_t)s->shared->overrides : 0)),
-                 (unsigned long long)dropped,
+                 (unsigned long long)dropped, (unsigned long long)interrupted,
                  (unsigned long long)s->logs_written.load(std::memory_order_relaxed),
                  (unsigned long long)peak_mb, s->exit_code);
     if (s->error.empty()) std::fputs("null", out); else json_string(out, s->error);
@@ -4429,6 +4542,7 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
         ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, disposition);
     }
     s->in_call_tid = 0;
+    resume_deferred_hits(s);                                       // they hit their probes again now
     if (trapped) {
         SetThreadContext(thread, &saved);                          // exactly as it was at the hit
         // The pending trap/fault event on this thread now stands in for the original one.

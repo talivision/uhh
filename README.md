@@ -67,7 +67,9 @@ The writer flushes on idle or within about 10 ms. `send_log_stack` captures only
 return addresses at the hit; the writer resolves them to `module!function+0xoff` (plus
 `file:line` with PDBs), so symbol work never runs in the hit path. `probe_report` catches
 the tail up, then emits only pre-hook/probe/summary records; its summary includes
-`logs_written`, `log_dropped`, and `controller_peak_ws_mb`. See
+`logs_written`, `log_dropped`, `callbacks_interrupted` (inline callbacks cut off mid-run because
+the target process died -- their hits are counted, their logs never existed), and
+`controller_peak_ws_mb`. See
 [`examples/dynwatch`](examples/dynwatch).
 
 ## Backends

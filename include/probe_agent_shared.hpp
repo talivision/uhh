@@ -10,7 +10,7 @@
 #include <cstdio>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 12;
+constexpr uint32_t PROBE_AGENT_VERSION = 13;
 constexpr uint32_t PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH = 1u << 9;   /* agent side only needs this one */   /* == PROBE_UNSAFE_FAST_PATCH (asserted in session.cpp) */
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 128;   /* inline probes per session; the 129th is refused */
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
@@ -104,6 +104,9 @@ struct probe_agent_shared {
     probe_agent_stripe hit_stripes[PROBE_AGENT_MAX_PROBES][PROBE_AGENT_STRIPES];
     probe_agent_request requests[PROBE_AGENT_MAX_PROBES];
     probe_agent_log logs[PROBE_AGENT_LOG_CAP];
+    /* inline callbacks running now (striped by thread). Non-zero after the target exited
+       = callbacks cut off by the process dying (their logs were never produced). */
+    probe_agent_stripe inflight[PROBE_AGENT_STRIPES];
 };
 
 inline uint64_t probe_agent_hits(const probe_agent_shared *sh, uint32_t index) {

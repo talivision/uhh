@@ -151,7 +151,8 @@ add_library(probe_api_agent SHARED
     examples/edgehunt/edge_callbacks.cpp
     examples/famous/detours_simple/simple_callbacks.cpp
     examples/famous/detours_traceapi/traceapi_callbacks.cpp
-    examples/famous/detours_retval/retval_callbacks.cpp)
+    examples/famous/detours_retval/retval_callbacks.cpp
+    examples/hunt/hunt_callbacks.cpp)
 target_include_directories(probe_api_agent PRIVATE include examples/gated_config examples/dynwatch examples/trace examples/memstress)
 target_link_libraries(probe_api_agent PRIVATE safetyhook)
 target_compile_definitions(probe_api_agent PRIVATE BREAKAGE_AGENT_ONLY FRIDA_PARITY_AGENT_ONLY HITCOST_SHARED)
@@ -338,6 +339,14 @@ target_include_directories(edge_driver PRIVATE include)
 target_link_libraries(edge_driver PRIVATE probe_api)
 add_dependencies(edge_driver edge_target probe_api_agent)
 
+# --- edge-case hunter: concurrency / lifecycle stress under gated_config instrumentation --
+add_executable(hunt_target examples/hunt/hunt_target.c)
+add_library(hunt_dll SHARED examples/hunt/hunt_dll.c)
+add_executable(hunt_driver examples/hunt/hunt_driver.cpp examples/hunt/hunt_callbacks.cpp examples/gated_config/callbacks.cpp)
+target_include_directories(hunt_driver PRIVATE include examples/gated_config)
+target_link_libraries(hunt_driver PRIVATE probe_api)
+add_dependencies(hunt_driver hunt_target hunt_dll probe_api_agent)
+
 add_executable(refusal_driver examples/conformance/refusal_driver.cpp)
 target_include_directories(refusal_driver PRIVATE include)
 target_link_libraries(refusal_driver PRIVATE probe_api)
@@ -356,7 +365,7 @@ foreach(d detours_simple detours_traceapi detours_retval)
     add_dependencies(${d} detours_target probe_api_agent)
 endforeach()
 
-foreach(t detours_target detours_simple detours_traceapi detours_retval edge_target edge_driver famous_driver famous_heap_target famous_file_target famous_loader_target famous_tick_target probe_app_cet cet_probe gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
+foreach(t hunt_target hunt_dll hunt_driver detours_target detours_simple detours_traceapi detours_retval edge_target edge_driver famous_driver famous_heap_target famous_file_target famous_loader_target famous_tick_target probe_app_cet cet_probe gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
     target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 endforeach()

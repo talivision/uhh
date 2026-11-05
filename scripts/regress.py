@@ -3015,6 +3015,151 @@ def feed_keystrokes():
     os.dup2(keys.fileno(), 0)        # also the process's STD_INPUT_HANDLE, inherited by children
 
 
+HUNT_READ = "ntdll.dll!NtReadVirtualMemory"
+
+
+def hunt_run(backend, scenario, n, extra=(), timeout=600, readers=None):
+    """hunt_driver (gated_config instrumentation + a stressor) on hunt_target <scenario>.
+    Logs are stream-counted, never retained. readers: exit scenarios' reader threads."""
+    import os
+    d, t = exe("hunt_driver.exe"), exe("hunt_target.exe")
+    st = {"read": 0, "unmapped": 0, "pids": set(), "work": 0, "tid_ok": 0, "tid_bad": 0,
+          "recurse_ok": 0, "other": 0}
+    keep = []
+
+    def on_line(line, _t):
+        if not line.startswith("{"):
+            return
+        try:
+            o = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if o.get("kind") != "probe_log":
+            keep.append(o)
+            return
+        m = str(o.get("message", ""))
+        if m.startswith("read handle="):
+            st["read"] += 1
+            pid = int(m.split(" pid=")[1].split()[0])
+            st["pids"].add(pid)
+            if pid == 0:
+                st["unmapped"] += 1
+        elif m.startswith("work "):
+            st["work"] += 1
+        elif m.startswith("callfunc "):
+            ok = m.startswith("callfunc ok=1 ") and int(m.split("tid=")[1]) == o.get("tid")
+            st["tid_ok" if ok else "tid_bad"] += 1
+        elif m.startswith("recurse ok=1 status=0x0"):
+            st["recurse_ok"] += 1
+        else:
+            st["other"] += 1
+    if readers:
+        os.environ["HUNT_READERS"] = str(readers)
+    try:
+        rc, timed_out = stream_run([d, "--backend", backend, *extra, "--", t, scenario, "--n", n], timeout, on_line)
+    finally:
+        os.environ.pop("HUNT_READERS", None)
+    tg = next((o for o in keep if o.get("kind") == "target"), {})
+    rd = next((o for o in keep if o.get("kind") == "probe" and o.get("location") == HUNT_READ), {})
+    wk = next((o for o in keep if o.get("kind") == "probe" and "HuntWork" in str(o.get("location"))), {})
+    return rc, timed_out, tg, rd, wk, report(keep), st
+
+
+def hunt_selected(name):
+    """UHH_HUNT=sub1,sub2 narrows the hunt cases (debugging aid; default: all)."""
+    import os
+    flt = [x for x in os.environ.get("UHH_HUNT", "").split(",") if x]
+    return not flt or any(x in name for x in flt)
+
+
+HUNT_CASES = [  # (scenario, n, extra driver args ("@" = the backend under test), timeout)
+    ("churn", 100, (), 900), ("pool", 100, (), 600), ("fiber", 50, (), 600), ("apc", 100, (), 600),
+    ("veh", 150, (), 600), ("dll", 60, ("--work-backend", "@"), 900), ("ctx", 3000, (), 600),
+    ("threads", 4, ("--slow-ms", "50"), 600), ("threads", 20, ("--tid",), 600),
+    ("threads", 20, ("--recurse",), 600), ("early", 10, (), 300),
+    ("owndr", 200, (), 300),
+]
+
+
+def check_hunt():
+    """Edge-case hunter (examples/hunt): gated_config's NtOpenProcess map + per-read pid log
+    under concurrency / lifecycle stress, every backend. Every read the target makes must be
+    one hit and one log carrying the target's pid; nothing dropped; the program's own result
+    (reads, verify failures, foreign debug exceptions, checksum) equals an uninstrumented run."""
+    d, t = exe("hunt_driver.exe"), exe("hunt_target.exe")
+    if not d or not t or not exe("hunt_dll.dll"):
+        return skip("hunt", "hunt_driver / hunt_target / hunt_dll missing")
+    _, o = run([t, "threads", "--n", 10], timeout=120)
+    checksum = next((x for x in o if x.get("kind") == "target"), {}).get("checksum")
+    for bk in ("inline", "hw", "breakpoint"):
+        for sc, n, extra, to in HUNT_CASES:
+            extra = tuple(bk if x == "@" else x for x in extra)
+            tag = "-".join(x.lstrip("-") for x in extra if not x.isdigit() and x != bk)
+            name = f"hunt-{sc}{'-' + tag if tag else ''}-{bk}"
+            if not hunt_selected(name):
+                continue
+            try:
+                rc, tmo, tg, rd, wk, rep, st = hunt_run(bk, sc, n, extra, timeout=to)
+                reads = tg.get("reads")
+                want_hits = reads * 2 if (reads and "--recurse" in extra) else reads
+                ok = (not tmo and rc == 0 and reads and tg.get("bad") == 0 and tg.get("foreign") == 0 and
+                      tg.get("checksum") == checksum and rd.get("hits") == want_hits and st["read"] == reads and
+                      st["unmapped"] == 0 and st["pids"] == {tg.get("pid")} and rep.get("log_dropped") == 0 and
+                      rep.get("app_exit") == 0 and st["other"] == 0)
+                if "--work-backend" in extra:
+                    ok = ok and wk.get("hits") == tg.get("work") == st["work"] and tg.get("work") == 4 * n
+                if "--tid" in extra:
+                    ok = ok and st["tid_ok"] == reads and st["tid_bad"] == 0
+                if "--recurse" in extra:
+                    ok = ok and st["recurse_ok"] == reads
+                record(name, ok, f"reads={reads} hits={rd.get('hits')} logs={st['read']} unmapped={st['unmapped']} "
+                                 f"bad={tg.get('bad')} foreign={tg.get('foreign')} early={tg.get('early')} "
+                                 f"dropped={rep.get('log_dropped')} exit={rep.get('app_exit')} rc={rc} timeout={tmo}"
+                                 + (f" work={tg.get('work')}/{wk.get('hits')}/{st['work']}" if wk or tg.get("work") else "")
+                                 + (f" tid_ok={st['tid_ok']} tid_bad={st['tid_bad']}" if "--tid" in extra else "")
+                                 + (f" recurse_ok={st['recurse_ok']}" if "--recurse" in extra else "")
+                                 + (f" other={st['other']}" if st["other"] else "")
+                                 + ("" if ok else f" err={(rep.get('error') or '')[:160]}"))
+            except Exception as e:
+                record(name, False, repr(e))
+        # Process exit racing in-flight callbacks and logs: no hang, the exit code is the
+        # target's, and every hit is a delivered log, an honestly counted drop, or (inline
+        # only: the process killed the thread mid-callback) a reported interrupted callback.
+        for sc, code in (("exit-return", 5), ("exit-process", 6), ("exit-terminate", 7)):
+            name = f"hunt-{sc}-{bk}"
+            if not hunt_selected(name):
+                continue
+            try:
+                # 2 readers on the debug-event backends: 8 starve the exiting thread (below).
+                rc, tmo, tg, rd, wk, rep, st = hunt_run(bk, sc, 300, (), timeout=180,
+                                                        readers=8 if bk == "inline" else 2)
+                hits = rd.get("hits") or 0
+                cut = rep.get("callbacks_interrupted")
+                ok = (not tmo and rep.get("app_exit") == code and hits > 0 and tg.get("bad") == 0 and cut is not None and
+                      st["read"] + (rep.get("log_dropped") or 0) + cut == hits and st["unmapped"] == 0 and
+                      (bk == "inline" or cut == 0))
+                record(name, ok, f"exit={rep.get('app_exit')} hits={hits} logs={st['read']} dropped={rep.get('log_dropped')} "
+                                 f"interrupted={cut} "
+                                 f"reads_at_print={tg.get('reads_at_exit')} rc={rc} timeout={tmo}")
+            except Exception as e:
+                record(name, False, repr(e))
+        # Starvation: 8 threads hitting the probe back to back while main sleeps 300 ms and
+        # calls ExitProcess. Uninstrumented: ~0.3 s. Every debug event freezes the whole
+        # process, so on breakpoint/hw a thread that hits no probe only runs in the gaps
+        # between events (Hunter A finding; see ROADMAP). Bar: exits within 60 s.
+        name = f"hunt-starve-{bk}"
+        if hunt_selected(name):
+            try:
+                t0 = time.perf_counter()
+                rc, tmo, tg, rd, wk, rep, st = hunt_run(bk, "exit-process", 300, (), timeout=60, readers=8)
+                secs = time.perf_counter() - t0
+                ok = not tmo and rep.get("app_exit") == 6
+                record(name, ok, f"exit={rep.get('app_exit')} secs={secs:.1f} hits={(rd or {}).get('hits')} "
+                                 f"reads_at_print={tg.get('reads_at_exit')} timeout={tmo}")
+            except Exception as e:
+                record(name, False, repr(e))
+
+
 def main():
     global BIN
     ap = argparse.ArgumentParser()
@@ -3104,6 +3249,7 @@ def main():
     if want(check_detours_withdll): check_detours_withdll()
     if want(check_detours_retval): check_detours_retval()
     if want(check_detours_stdin): check_detours_stdin()
+    if want(check_hunt): check_hunt()
     print("-" * 72)
     failed = 0
     for name, status, detail in RESULTS:
