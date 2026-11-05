@@ -4386,15 +4386,15 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
                     uint32_t rw = 0, len = 0; hw_rw_len(p->flags, rw, len);
                     set_dr_on_thread(event.u.CreateThread.hThread, p->dr_slot, p->address, true, rw, len);
                 }
-        // A thread born while a thread is HELD for an inline install (the main thread at the
-        // launch entry point -- e.g. a thread started by a TLS callback or DllMain(PROCESS_ATTACH)
-        // -- or a callback's thread after a runtime add) could reach a site before its hook is
-        // in. Hold it from its first instruction (it owns no lock yet) until the same
-        // confirmation releases the others. Only while such a hold is in progress: attach holds
-        // nothing while the agent is injected, and the late-module gates are inherited above.
-        // Never our own agent threads (they do the install).
-        if (s->initial_break && !s->held.empty() && event.dwThreadId != s->remote_tid &&
-            (!s->attached || (s->shared && s->shared->service_ready)) &&
+        // A launched target's thread born while inline installs are outstanding (e.g. started
+        // by a TLS callback or a static DLL's DllMain(PROCESS_ATTACH) during process init,
+        // before the main thread reaches the entry hold) could reach a site before its hook
+        // is in. Hold it from its first instruction (it owns no lock yet) until the same
+        // confirmation releases the others. Attached targets: only while a hold is already in
+        // progress (a callback's runtime add) and the agent is up -- attach holds nothing while
+        // the agent is injected. Never our own agent threads (they do the install).
+        if (s->initial_break && event.dwThreadId != s->remote_tid &&
+            (!s->attached || (!s->held.empty() && s->shared && s->shared->service_ready)) &&
             inline_hold_needed(s) && !agent_thread(s, event.dwThreadId))
             hold_thread(s, event.dwThreadId);
         // Do NOT close hThread: the debug subsystem owns it and closes it itself when the
