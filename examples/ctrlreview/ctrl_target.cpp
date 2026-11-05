@@ -22,6 +22,13 @@
 //   ctrl_target absreuse                absolute INT3 in an unloaded DLL; its address reused (cdx-absreuse)
 //   ctrl_target int3cap [--n N]         N armed INT3s read back with get_mem (cdx-int3cap)
 //   ctrl_target bigcfg                  a dynamic add with a > 64 MiB config (cdx-bigcfg)
+//   ctrl_target shape --shape S [--threads T] [--n N]
+//                                       T threads x N calls of Shape_S_P (probed: a branch / call /
+//                                       ret / loop / pushf / ... shape, ctrl_shapes_*.asm), each
+//                                       followed by its never-probed twin Shape_S_R: the results
+//                                       must match call by call (and a pushed flags image must not
+//                                       carry a trap flag; a push into the stack guard page must
+//                                       grow the stack as without UHH)
 //
 // Each prints one {"kind":"ctrl_result",...} line.
 #define WIN32_LEAN_AND_MEAN
@@ -362,6 +369,79 @@ static int run_bigcfg() {
     const int r = CtrlTock(5);
     std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"bigcfg\",\"r\":%d}\n", r);
     return 0;
+// ---- shape -------------------------------------------------------------------------
+typedef uintptr_t (*ShapeFn)(uint32_t tag);
+extern "C" uintptr_t g_tls_off = 0;   // segjmp: TEB offset of this run's TLS slot
+extern "C" uint32_t g_ssn = 0;        // syscall: NtYieldExecution's service number (x64)
+#define SHAPE(n) extern "C" uintptr_t Shape_##n##_P(uint32_t); extern "C" uintptr_t Shape_##n##_R(uint32_t);
+#define SHAPES_COMMON(X) X(jmp8) X(jmp32) X(jcc8_taken) X(jcc8_not) X(jcc8_alt) X(jcc32_taken) X(call32) X(callmem) \
+    X(ret) X(loop_taken) X(loop_not) X(loopz) X(loopnz) X(jrcxz) X(loop_a32) X(jecxz_a32) X(pushf) X(pushf_guard) X(segjmp)
+SHAPES_COMMON(SHAPE)
+#if defined(_WIN64)
+SHAPE(syscall)
+#endif
+struct ShapeEntry { const char *name; ShapeFn p, r; };
+#define SHAPE_ROW(n) {#n, Shape_##n##_P, Shape_##n##_R},
+static const ShapeEntry g_shapes[] = {
+    SHAPES_COMMON(SHAPE_ROW)
+#if defined(_WIN64)
+    SHAPE_ROW(syscall)
+#endif
+};
+struct ShapeArg { const ShapeEntry *e; uint32_t t, n; uint64_t bad, tf, grow_bad; uintptr_t first_p, first_r; };
+static DWORD WINAPI shape_thread(void *v) {
+    ShapeArg *a = (ShapeArg *)v;
+    const bool guard = !std::strcmp(a->e->name, "pushf_guard");
+    const bool pushf = guard || !std::strcmp(a->e->name, "pushf");
+    for (uint32_t i = 0; i < a->n; ++i) {
+        const uint32_t tag = (a->t << 20) | i;
+        NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
+        void *lim0 = tib->StackLimit;
+        const uintptr_t rp = a->e->p(tag);
+        void *lim1 = tib->StackLimit;
+        const uintptr_t rr = a->e->r(tag);
+        if (guard && !(lim1 < lim0)) ++a->grow_bad;      // the push must have grown the stack
+        if (rp != rr) { if (!a->bad) { a->first_p = rp; a->first_r = rr; } ++a->bad; }
+        if (pushf && (rp & 0x100)) ++a->tf;
+    }
+    return 0;
+}
+static int run_shape(const char *name, int threads, int n) {
+    const ShapeEntry *e = nullptr;
+    for (auto &x : g_shapes) if (!std::strcmp(x.name, name)) e = &x;
+    if (!e) { std::printf("{\"kind\":\"ctrl_result\",\"error\":\"unknown shape\"}\n"); return 1; }
+    const DWORD tls = TlsAlloc();
+    if (tls == TLS_OUT_OF_INDEXES || tls >= 64) { std::printf("{\"kind\":\"ctrl_result\",\"error\":\"tls\"}\n"); return 1; }
+#if defined(_WIN64)
+    g_tls_off = 0x1480 + 8 * tls;                       // TEB.TlsSlots
+    const unsigned char *stub = (const unsigned char *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtYieldExecution");
+    if (stub && stub[0] == 0x4C && stub[1] == 0x8B && stub[2] == 0xD1 && stub[3] == 0xB8) std::memcpy(&g_ssn, stub + 4, 4);
+#else
+    g_tls_off = 0xE10 + 4 * tls;
+#endif
+    std::vector<ShapeArg> args(threads);
+    std::vector<HANDLE> hs;
+    for (int t = 0; t < threads; ++t) {
+        args[t] = ShapeArg{e, (uint32_t)t + 1, (uint32_t)n, 0, 0, 0, 0, 0};
+        // 32 MiB reserve: pushf_guard grows the stack by a page per call (P and R)
+        hs.push_back(CreateThread(nullptr, 32u << 20, shape_thread, &args[t], STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr));
+    }
+    WaitForMultipleObjects((DWORD)hs.size(), hs.data(), TRUE, INFINITE);
+    uint64_t bad = 0, tf = 0, grow_bad = 0; uintptr_t fp = 0, fr = 0;
+    for (auto &a : args) {
+        if (a.bad && !bad) { fp = a.first_p; fr = a.first_r; }
+        bad += a.bad; tf += a.tf; grow_bad += a.grow_bad;
+    }
+    std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"shape\",\"shape\":\"%s\",\"calls\":%d,\"bad\":%llu,"
+                "\"tf\":%llu,\"grow_bad\":%llu,\"first_p\":\"%llx\",\"first_r\":\"%llx\"}\n", name, threads * n,
+                (unsigned long long)bad, (unsigned long long)tf, (unsigned long long)grow_bad,
+                (unsigned long long)fp, (unsigned long long)fr);
+    return 0;
+}
+
+static const char *arg_str(int argc, char **argv, const char *name, const char *def) {
+    for (int i = 2; i + 1 < argc; ++i) if (!std::strcmp(argv[i], name)) return argv[i + 1];
+    return def;
 }
 
 // ---- headcorrupt ---------------------------------------------------------------------
@@ -397,6 +477,8 @@ int main(int argc, char **argv) {
     else if (sc == "absreuse") rc = run_absreuse();
     else if (sc == "int3cap") rc = run_int3cap(arg_int(argc, argv, "--n", 1200));
     else if (sc == "bigcfg") rc = run_bigcfg();
+    else if (sc == "shape") rc = run_shape(arg_str(argc, argv, "--shape", ""), arg_int(argc, argv, "--threads", 8),
+                                           arg_int(argc, argv, "--n", 1000));
     std::fflush(stdout);
     return rc;
 }

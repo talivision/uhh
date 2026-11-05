@@ -68,8 +68,34 @@ identical source under every backend.
 ## Evaluator round 3 (2026-11-05) — open
 - ✅ (#3) detach after a hooked DLL unloaded wrote original bytes to unmapped/reused memory -> agent skips UNLOADED hooks
 - ✅ (#4) call inside the stolen bytes -> refused / hw fallback
-- ⬜ (#1) in-place step of `pushf` leaks TF into the pushed flags (RtlCaptureContext) -> clear TF in the pushed value
-- ⬜ (#2) in-place fallback (branch/call/rep/pushf sites) not exact under threads: missed hits while lifted, double hit via queued INT3
+- ✅ (#1) in-place step of `pushf` leaked TF into the pushed flags (RtlCaptureContext). PUSHF is emulated (flags image
+  without TF); where the CPU must run it (the push lands in the stack's guard page -- emulating it would consume the
+  guard without growing the stack) the in-place step clears our TF in the pushed image at step completion.
+  Baseline `inplace-pushf_guard`: 7360/8000 pushed images carried TF (x86: 6441); now 0, stack grown as without UHH
+- ✅ (#2) in-place fallback not exact under threads. Baseline (8 threads, breakpoint): `ctrl-inplace` 709/24000 hits
+  on x64, 971/24000 on x86; `inplace-loop_a32` 1330/8000 (x86 677), `inplace-jecxz_a32` x86 1242/8000,
+  `inplace-segjmp` 1147/8000 (x86 1400), `inplace-pushf_guard` 7672/8000 (x86 7267), `inplace-syscall` 7968/8000.
+  Now every one exact (hits == logs == distinct tags == calls, results equal to a never-probed twin):
+  - more is emulated: address-size LOOP/LOOPE/LOOPNE (ecx on x64, cx on x86) and JECXZ/JCXZ; every emulated memory
+    access is first checked like the CPU would see it (committed, no PAGE_GUARD, readable/writable) -- before, an
+    emulated push into the stack guard page went through Read/WriteProcessMemory semantics (guard consumed, no growth)
+  - x64 SYSCALL / INT 2E run from a per-site trampoline (`insn; mov rcx, site+2; jmp site+2`, SYSCALL's RCX/R11 as
+    natively, no trap flag, no completion event): the INT3 stays armed for the whole syscall (a blocking syscall used
+    to keep the byte lifted until it returned), nesting (APCs, user-mode callbacks that hit probes) needs nothing;
+    trampolines are never freed (a thread can be blocked in one across a detach)
+  - whatever still steps in place (segment-relative / 16-bit branches, an access that must fault, the displaced-fault
+    re-run, CALL/RET under CET shadow stacks, a REP string op without scratch) runs in an **in-place window**: every
+    other target thread is suspended by the controller while the byte is lifted, and a hit queued just before the
+    window is rewound onto the INT3 and replays after it (counted once). No deadlock: the window covers one
+    instruction (one REP iteration) of the stepping thread, which reports its trap or fault before any other target
+    code runs; instructions that can block in the kernel or leave 32-bit code (SYSCALL/SYSENTER/INT 2E/2B without a
+    trampoline, far transfers, IRET) get no window; a window open for 2 s (the target suspended the stepping thread
+    itself) is released with a warning; our agent's threads are never held (an entry hold waits for them).
+    📄 Under CET the CALL/RET in-place path keeps working as before (the CPU executes them; only the other threads
+    are held meanwhile) -- still unexercised on the VM (`EnableUserShadowStack`=0)
+  - Tests: `inplace-*` (`--only inplace`: jmp rel8/rel32, jcc rel8/rel32 taken / not / data-dependent, call rel32,
+    call [mem], ret, loop taken/not, loopz, loopnz, jrcxz/jecxz, address-size loop and jecxz/jcxz, pushf, pushf into
+    the guard page, gs:/fs:-relative jmp, x64 syscall), `ctrl-inplace` exact
 - 🔧 (#5) inline stack walk bounded by the thread's TEB stack limits + code reads range-checked (never faults); writes always re-validated (read cache kept across hits) -- VM verify pending
 - ✗ (#6) breakpoint/hw call_func hardening: deliberately not pursued (see call_func note above)
 - 🔧 (#7) call_func follows forwarded exports on breakpoint/hw (via the controller's copy of the same system DLL); conformance `call_func-forwarded` -- VM verify pending
@@ -622,9 +648,11 @@ Fixture `examples/ctrlreview` (ctrl_target + ctrl_dll + ONE callback source), re
   the byte lifted; B is set up to run the original at the site, A's step completion re-arms first, B
   executes the INT3 -> its callback ran again (20 duplicates in 24000 calls). Now a thread that is mid
   in-place step and hits the INT3 at its own site is put back and the byte lifted again, no callback.
-  ⬜ Missed hits while the byte is lifted remain (round 3 #2; `ctrl-inplace` reports the count).
-  Test: `ctrl-inplace` (8 threads x 3000 calls through an address-size LOOP, which is neither displaced
-  nor emulated)
+  ✅ Missed hits while the byte is lifted (round 3 #2): fixed -- address-size LOOP is emulated now and
+  every remaining in-place step holds the other threads (in-place window, see round 3 #2); a hit queued
+  before a window is replayed after it, so the duplicate path cannot arise there either.
+  Test: `ctrl-inplace` (8 threads x 3000 calls through an address-size LOOP): exact, x64 709 -> 24000/24000,
+  x86 971 -> 24000/24000 hits
 - ✅ (5) **probe_add_address / probe_watch inside a DLL that unloads were never retired** (UNLOAD_DLL only
   matched module probes by base). Seen: hw slots exhausted after 2-4 load cycles (`probe_watch` -> 0), and
   on reload at the same base every new probe's hits went to the stale first one (hits 0,0,0,0,500).
@@ -848,7 +876,7 @@ abort below 4000 MB available):
   - **Audit (x64; Windows does not enforce user shadow stacks for WoW64/x86 processes):**
     - ✅ Inline, every hit: SafetyHook's mid-hook stub ended `lea rsp,[rsp+8]; pop rsp; ret`, returning to the trampoline through an address it had PUSHED -- a #CP on every inline hit (fatal in strict mode; in compatibility mode at best a kernel fix-up per hit, since stub and trampoline are non-image memory). Fixed: the stub now ends `pop rsp; jmp [trampoline]` (`cmake/patch_safetyhook.cmake` step 3, applied to `third_party/safetyhook`; x64 the same 7 bytes, x86 one byte longer with a relocated `jmp [abs32]`). No `ret` remains on the hook path (the stub's own `call [destination]` is a real call/ret pair).
     - ✅ Inline `set_reg(SP)` (#8): the same patch makes the context's rsp/esp the stack pointer the hooked code resumes with -- nothing is written below the new SP (the old `trampoline_rsp` slot clobbered the saved registers when SP moved down). Re-enabled in `src/probe/agent.cpp`; conformance `sp_moved` now 10/10 on every backend.
-    - ✅ Breakpoint emulation of CALL/RET (`emulate_site`): moves RSP/RIP but not SSP, so the target would #CP at its NEXT real `ret` inside its own CETCOMPAT code (fatal even in compatibility mode). Since 226f131 the emulation is skipped when `ProcessUserShadowStackPolicy.EnableUserShadowStack` is set and the CPU steps CALL/RET in place (JMP/Jcc/LOOP/PUSHF/POPF emulation is unaffected). Regress `cet-ret-breakpoint` (probe on NtOpenProcess's `ret` in probe_app_cet).
+    - ✅ Breakpoint emulation of CALL/RET (`emulate_site`): moves RSP/RIP but not SSP, so the target would #CP at its NEXT real `ret` inside its own CETCOMPAT code (fatal even in compatibility mode). Since 226f131 the emulation is skipped when `ProcessUserShadowStackPolicy.EnableUserShadowStack` is set and the CPU steps CALL/RET in place (JMP/Jcc/LOOP/PUSHF/POPF emulation is unaffected). Regress `cet-ret-breakpoint` (probe on NtOpenProcess's `ret` in probe_app_cet). That in-place CALL/RET step now runs in the in-place window (Evaluator round 3 #2: the other threads are held while the byte is lifted), so it is exact under threads too; the CPU still does the push/pop, so SSP stays consistent. The x64 SYSCALL trampoline has no call/ret (a `jmp [rip]` back), so it does not touch the shadow stack either.
     - ✅ `call_func` on breakpoint/hw (`call_in_target`): the callee is entered by SetThreadContext, so its `ret` to `call_trap` does not match the shadow stack -> #CP inside the callee (a CETCOMPAT system DLL: fatal). Now REFUSED (returns 0, one stderr warning) when the target has shadow stacks; inline `call_func` is a real call and unaffected. A working design for CET (return to the real shadow-stack top under a per-thread DR trap, then restore SSP through `CONTEXT_XSTATE`/`XSTATE_MASK_CET_U`) needs CET hardware to develop.
     - ⬜ SetThreadContext RIP changes (displaced stepping into scratch memory, moving frozen threads onto the trampoline, `call_func` restore, `set_reg`): no `ret` is involved and SSP is never touched (the controller never sets `CONTEXT_XSTATE`), so the CPU check does not apply. Open: Windows' optional `SetContextIpValidation` policy validates a new RIP against the shadow stack / EH-continuation table; whether it applies to a DEBUGGER's cross-process SetThreadContext is unverified. If it does, displaced stepping and the freeze move would be refused under that policy (in-place stepping would still work).
     - ⬜ `BlockNonCetBinaries` policy: the injected `probe_api_agent.dll` is not /CETCOMPAT and would be refused -> no inline backend in such a process. Linking the agent /CETCOMPAT is now plausible (its hook path has no ret-to-pushed-address) but untested.

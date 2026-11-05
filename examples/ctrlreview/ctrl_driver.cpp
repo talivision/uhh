@@ -1,5 +1,5 @@
 // ctrl_driver --scenario fault|faultreg|inplace|absunload|symunload|owndr|owndrx|absreuse|int3cap|
-//                        bigcfg|headcorrupt --backend b
+//                        bigcfg|headcorrupt|shape [--shape S] --backend b
 //             -- <ctrl_target.exe> <scenario> [opts]
 // Instruments ctrl_target for one controller-review finding (see ctrl_target.cpp) with
 // one backend, runs it and prints the target's result, the probe rows and the logs.
@@ -19,6 +19,7 @@ void ctrl_on_tick(probe_context *);
 void ctrl_on_op(probe_context *);
 void ctrl_on_wonce(probe_context *);
 void ctrl_on_bigcfg(probe_context *);
+void ctrl_on_shape(probe_context *);
 }
 struct ctrl_cfg { uint32_t backend; uint32_t pad; };
 
@@ -29,11 +30,12 @@ static uint32_t parse_backend(const char *b) {
 
 int main(int argc, char **argv) {
     uint32_t backend = 0;
-    std::string sc;
+    std::string sc, shape;
     int i = 1;
     for (; i < argc && std::strcmp(argv[i], "--"); ++i) {
         if (!std::strcmp(argv[i], "--backend") && i + 1 < argc) backend = parse_backend(argv[++i]);
         else if (!std::strcmp(argv[i], "--scenario") && i + 1 < argc) sc = argv[++i];
+        else if (!std::strcmp(argv[i], "--shape") && i + 1 < argc) shape = argv[++i];
     }
     if (i + 1 >= argc || !backend || sc.empty()) {
         std::fprintf(stderr, "usage: ctrl_driver --scenario s --backend b -- ctrl_target.exe s [opts]\n");
@@ -60,6 +62,8 @@ int main(int argc, char **argv) {
             ok = probe_add_symbol(s, "ctrl_target.exe!CtrlWatchOnce", ctrl_on_wonce, backend);
         else if (sc == "bigcfg")
             ok = probe_add_symbol(s, "ctrl_target.exe!CtrlBigCfg", ctrl_on_bigcfg, backend);
+        else if (sc == "shape")
+            ok = probe_add_symbol(s, ("ctrl_target.exe!Shape_" + shape + "_P_Insn").c_str(), ctrl_on_shape, backend);
         else { std::fprintf(stderr, "ctrl_driver: unknown scenario %s\n", sc.c_str()); ok = false; }
     }
     ok = ok && probe_launch(s, child.data()) && probe_run(s) && probe_wait_for_exit(s);
