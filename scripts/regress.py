@@ -1864,10 +1864,11 @@ def check_famous_loader(threads=4):
             ll = " ".join(famous_msgs(o, "loadlibraryexw ")).lower()
             ldr = " ".join(famous_msgs(o, "ldrloaddll ")).lower()
             loads_ok = all(n in ll and n in ldr for n in names)
-            other = len(allocs) + len(prots) - sum(alloc_hits) - sum(prot_hits)
+            fp = {f"0x{0x13000 + k * 0x1000:x}" for k in range(threads)} | {f"0x{0x25000 + k * 0x1000:x}" for k in range(threads)}
+            other = [m for m in famous_msgs(o, "rwx-") if famous_kv(m).get("size") not in fp]
             h_ok, h = famous_health(r.returncode, o, bk)
             ok = h_ok and a == base and alloc_hits == [1] * threads and prot_hits == [1] * threads and loads_ok
-            record(name, ok, f"{h} rwx_alloc={alloc_hits} rwx_protect={prot_hits} other_rwx_events={other} "
+            record(name, ok, f"{h} rwx_alloc={alloc_hits} rwx_protect={prot_hits} other_rwx_events={len(other)} {other[:3]} "
                              f"loads_seen={loads_ok} app_same={a == base}")
         except Exception as e:
             record(name, False, repr(e))
@@ -1890,21 +1891,28 @@ def check_famous_retval(threads=4, calls=25):
                base.get("timing_check") == "slow", json.dumps(base))
     except Exception as e:
         return record("famous-retval-baseline", False, repr(e))
+    # Each backend 3x: the return-site probes are added while the workers may still be in
+    # their loader initialisation -- the hardware path once lost them for whole threads
+    # (NtContinue at thread start restored the creation-time debug registers).
     for bk in FAMOUS_BACKENDS:
         name = f"famous-retval-{bk}"
         try:
-            r, o = famous("tick", bk, argv, extra=("--value", "0x1337BEEF"))
-            a = app(o)
-            armed = [m for m in famous_msgs(o, "return-site") if m.endswith("armed")]
-            h_ok, h = famous_health(r.returncode, o, bk)
-            ok = (h_ok and a.get("calls") == total and a.get("forced") == total and a.get("elapsed") == 0 and
-                  a.get("timing_check") == "fast" and a.get("tick64_forced") == 0 and len(armed) >= 2)
-            record(name, ok, f"{h} forced={a.get('forced')}/{total} main={a.get('forced_main')} "
-                             f"workers={a.get('forced_workers')} timing={a.get('timing_check')} "
-                             f"return_sites={len(armed)}")
+            ok, details = True, []
+            for _ in range(3):
+                r, o = famous("tick", bk, argv, extra=("--value", "0x1337BEEF"))
+                a = app(o)
+                armed = [m for m in famous_msgs(o, "return-site") if m.endswith("armed")]
+                h_ok, h = famous_health(r.returncode, o, bk)
+                run_ok = (h_ok and a.get("calls") == total and a.get("forced") == total and a.get("elapsed") == 0 and
+                          a.get("timing_check") == "fast" and a.get("tick64_forced") == 0 and len(armed) >= 2)
+                ok = ok and run_ok
+                if not run_ok or not details:
+                    details.append(f"{h} forced={a.get('forced')}/{total} main={a.get('forced_main')} "
+                                   f"workers={a.get('forced_workers')} timing={a.get('timing_check')} "
+                                   f"return_sites={len(armed)}")
+            record(name, ok, " || ".join(details))
         except Exception as e:
             record(name, False, repr(e))
-
 
 def main():
     global BIN

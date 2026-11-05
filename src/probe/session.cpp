@@ -150,6 +150,7 @@ struct probe_session {
     uint64_t entry_reapply = 0;                // image entry: re-apply DRs on first arrival
     uint64_t entry_addr = 0;                   // image entry point (hold-for-install point)
     bool entry_seen = false;
+    bool thread_start_fixup = false;           // library INT3 at ntdll!RtlUserThreadStart armed
     HANDLE svc_event = nullptr;                // agent service: "install pending requests"
     std::vector<HANDLE> held;                  // threads held until inline installs confirm
     ULONGLONG held_since = 0;                       // slots we have ever owned (stale-#DB filter)
@@ -1192,6 +1193,7 @@ static void hw_rw_len(uint32_t flags, uint32_t &rw, uint32_t &len) {
     len = 3;   // LEN=11 -> 4-byte (dword) watchpoint; the address must be dword-aligned
 }
 
+static void arm_thread_start_fixup(probe_session *s);
 static bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
     if (p.rva > UINT64_MAX - base) { set_error(s, "probe address overflow"); return false; }
     uint64_t address = base + p.rva;
@@ -1232,6 +1234,7 @@ static bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
     std::fprintf(stderr, "probe: active %s -> base=0x%llx addr=0x%llx (hw DR%d, %s)\n",
                  p.location.c_str(), (unsigned long long)base, (unsigned long long)address, slot,
                  rw == 3 ? "watch rw" : rw == 1 ? "watch write" : "execute");
+    arm_thread_start_fixup(s);
     return true;
 }
 
@@ -2046,6 +2049,48 @@ static void arm_entry_fixup(probe_session *s, uint64_t entry) {
         auto p = std::make_unique<Probe>();
         p->location = "<entry>"; p->flags = PROBE_BREAKPOINT | PROBE_ONCE; p->callback = reapply_hw;
         p->rva = entry; p->internal = true;
+        Probe *raw = p.get(); s->probes.push_back(std::move(p));
+        std::string saved = s->error;
+        if (!arm_breakpoint(s, *raw, 0)) { raw->retired = true; s->error = saved; }
+    } catch (...) {}
+}
+
+// The same NtContinue wipe hits EVERY thread, not just the initial one: a thread still in
+// its loader initialisation (LdrInitializeThunk: DLL_THREAD_ATTACH, TLS) when a hardware
+// probe is armed at runtime -- from a callback, or at a later DLL load -- resumes at
+// ntdll!RtlUserThreadStart with the DR image captured when it was created, and never sees
+// that probe (found by examples/famous retval_override: whole worker threads missed a
+// return-site probe added while they were starting). A library-owned breakpoint at
+// RtlUserThreadStart re-applies the active hardware probes to each thread arriving there,
+// i.e. right after its context was restored. Armed the first time a hardware probe is
+// armed while the process is already running.
+static uint64_t resolve_symbol(probe_session *s, const char *symbol);
+static void reapply_hw_thread(probe_session *s, DWORD tid) {
+    if (!s->hw_active) return;
+    HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+    if (!t) return;
+    for (auto &p : s->probes) {
+        if (!p->active || !(p->flags & PROBE_HW)) continue;
+        uint32_t rw = 0, len = 0; hw_rw_len(p->flags, rw, len);
+        set_dr_on_thread(t, p->dr_slot, p->address, true, rw, len);
+    }
+    CloseHandle(t);
+}
+
+static void thread_start_fixup(probe_context *c) {
+    if (probe_session *s = get_session(c)) reapply_hw_thread(s, c->tid);
+}
+
+static void arm_thread_start_fixup(probe_session *s) {
+    if (s->thread_start_fixup || !(s->entry_seen || s->attached)) return;
+    uint64_t at = resolve_symbol(s, "ntdll.dll!RtlUserThreadStart");
+    if (!at) return;
+    s->thread_start_fixup = true;
+    if (Probe *owner = probe_at(s, at)) { (void)owner; return; }   // a user probe owns the site: rare, left as is
+    try {
+        auto p = std::make_unique<Probe>();
+        p->location = "<thread-start>"; p->flags = PROBE_BREAKPOINT; p->callback = thread_start_fixup;
+        p->rva = at; p->internal = true;
         Probe *raw = p.get(); s->probes.push_back(std::move(p));
         std::string saved = s->error;
         if (!arm_breakpoint(s, *raw, 0)) { raw->retired = true; s->error = saved; }
