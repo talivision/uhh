@@ -473,8 +473,9 @@ by itself, nothing dropped), detach while callbacks run / block in call_original
   (the thread's context was redirected to the callee and is never restored); suspensions taken
   inside a single debug event and not yet mirrored when the controller dies (microseconds); the
   guard's VEH and the agent stay in the target after detach (as the inline agent always did);
-  a target's own debugger-free INT3 / single-step at one of our sites while orphaned is taken as
-  ours. A controller-death cleanup raises the agent's FREEZE exception once with no debugger
+  a target's own debugger-free INT3 at one of our sites while orphaned, and any single-step on a
+  thread without debug registers of its own once the controller is gone, are taken as ours
+  (a program single-stepping itself after its controller died would lose those steps). A controller-death cleanup raises the agent's FREEZE exception once with no debugger
   attached: a target VEH sees one 0xE0554848 first-chance exception.
 
 ## Benchmarks

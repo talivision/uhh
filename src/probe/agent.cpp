@@ -1137,6 +1137,16 @@ static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
         for (LONG i = 0; i < n && !ours; ++i) ours = (uint64_t)g_cleared[i] == ip || (uint64_t)g_cleared[i] == at;
     }
     if (!ours) {
+        // A trap-flag step or #DB the dying controller set up that left no trace we can match
+        // (seen on x64: a call_original's in-place run returning after the cleanup). With no
+        // enabled slot of the target's own on this thread nothing else of the program can have
+        // raised it, short of the program single-stepping itself (taken as ours: residual).
+        DWORD own = 0;
+        for (int slot = 0; slot < 4; ++slot)
+            if (!(mask & (1u << slot)) && ((dr.Dr7 >> (slot * 2)) & 3)) own |= 1u << slot;
+        ours = own == 0 && (dr.Dr6 & 0xF & ~mask) == 0;
+    }
+    if (!ours) {
         const uint64_t ip = get_ip(cx);
         LONG n = g.block_count; if (n > (LONG)PROBE_AGENT_GUARD_BLOCKS) n = PROBE_AGENT_GUARD_BLOCKS;
         for (LONG i = 0; i < n && !ours; ++i) ours = g.blocks[i] && ip - g.blocks[i] < 0x10000;
