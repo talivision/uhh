@@ -1508,6 +1508,75 @@ def check_sidefx(iters=1000, threads=4):
             record(name, False, repr(e))
 
 
+TP_MODES = ("noop", "log", "mem", "sys", "callfn", "co")
+TP_PROBES = ("add", "i64", "dbl", "dblarg", "seterr", "std", "align", "fact", "mid", "spawn", "thread", "peek", "ovf")
+
+
+def check_transparency(iters=30):
+    """A hit is invisible to the program (examples/transparency): every probed function has an
+    unprobed twin, both called through one assembly harness, and a probed call must leave
+    exactly what the twin leaves -- return registers (x64 RAX/XMM0; x86 EDX:EAX/ST0), callee-
+    saved GPRs and XMM6-15, the SP after the call (x86 `ret N`), DF, x87 SW/TW, GetLastError,
+    the TEB's LastStatusValue and every other TEB byte -- and a mid-function site (between a
+    `cmp` and the flag snapshot, with a full x87 stack and a pending FCOM result) leaves every
+    GPR, EFLAGS, XMM and the x87 state as its twin does. Every backend, every callback kind:
+    no-op, send_log(+stack), get_mem/get_func_arg/get_reg, Win32+NT calls on the hit thread,
+    call_func (APIs that set the last error; a probed function: counted, no callback),
+    call_original + return_from (int, int64, double return; a double argument; __stdcall;
+    stack alignment; recursion). Plus a thread created by call_func DURING a hit, which runs
+    a probed function. hw: at most 3 probes per run (call_original needs a free DR)."""
+    d, t = exe("tp_driver.exe"), exe("tp_target.exe")
+    if not d or not t:
+        return skip("transparency", "tp_driver/tp_target missing")
+    groups = {"breakpoint": [TP_PROBES], "inline": [TP_PROBES],
+              "hw": [TP_PROBES[i:i + 3] for i in range(0, len(TP_PROBES), 3)]}
+    for bk in ("breakpoint", "hw", "inline"):
+        for mode in TP_MODES:
+            name = f"transparency-{bk}-{mode}"
+            bad = []
+            try:
+                for grp in groups[bk]:
+                    spawn = "spawn" in grp
+                    targs = [t, "--iters", iters] + [f"--{x}" for x in ("spawn", "peek", "ovf") if x in grp]
+                    r, o = run([d, "--backend", bk, "--mode", mode, "--probes", ",".join(grp), "--"] + targs, timeout=300)
+                    tg = next((x for x in o if x.get("kind") == "target"), {})
+                    rep = report(o)
+                    fails = sorted({str(x.get("message", "")) for x in o
+                                    if x.get("kind") == "probe_log" and str(x.get("message", "")).startswith("tp FAIL")})
+                    cold = [p.get("location") for p in probes(o) if not p.get("hits")]
+                    why = []
+                    if r.returncode != 0: why.append(f"rc={r.returncode}")
+                    if not tg: why.append("no target row")
+                    elif tg.get("bad") != 0: why.append(f"bad={tg.get('bad')} first={tg.get('first')!r}")
+                    for x in ("spawn", "peek", "ovf"):
+                        if x in grp and tg.get(x) != 1: why.append(f"{x}={tg.get(x)}")
+                    if fails: why.append(f"cb={fails[:2]}")
+                    if cold: why.append(f"no hits: {cold}")
+                    if rep.get("error") is not None or rep.get("app_exit") != 0 or rep.get("log_dropped") != 0:
+                        why.append(f"report err={rep.get('error')} exit={rep.get('app_exit')} dropped={rep.get('log_dropped')}")
+                    if why:
+                        bad.append(f"[{','.join(grp)}] " + " ".join(why) +
+                                   ("" if r.returncode == 0 else f" stderr={(r.stderr or '')[-200:]!r}"))
+                record(name, not bad, "; ".join(bad) if bad else f"{len(groups[bk])} run(s), iters={iters}, all calls identical to the twin")
+            except Exception as e:
+                record(name, False, repr(e))
+    # Inline, a CPU whose full XSAVE area (every XCR0 feature, e.g. AMX tiles: ~11 KB) exceeds
+    # the agent's save buffer: the live AVX state and MXCSR must still be kept (the agent sizes
+    # the save from the components it saves). UHH_BENCH_XSTATE=amx makes the agent see such a
+    # full-area size on any CPU.
+    name = "transparency-inline-xsave-bigarea"
+    try:
+        env = dict(os.environ, UHH_BENCH_XSTATE="amx")
+        r = subprocess.run([str(a) for a in [d, "--backend", "inline", "--mode", "log", "--probes", "mid", "--", t,
+                                             "--iters", iters]], capture_output=True, text=True, timeout=300, env=env)
+        o = [json.loads(l) for l in r.stdout.splitlines() if l.strip().startswith("{")]
+        tg = next((x for x in o if x.get("kind") == "target"), {})
+        record(name, r.returncode == 0 and tg.get("bad") == 0 and report(o).get("error") is None,
+               f"bad={tg.get('bad')} first={tg.get('first')!r} rc={r.returncode}")
+    except Exception as e:
+        record(name, False, repr(e))
+
+
 EDGE_ITERS = 5
 # (site, location) -- see examples/edgehunt/edge_driver.cpp
 EDGE_SHAPES = ["rep", "stos", "ripload", "ripcmp", "ripvec", "ripstore", "cpuid", "rdtsc", "syscall", "int2e",
@@ -5624,6 +5693,7 @@ def main():
     if want(check_callorig_hunt): check_callorig_hunt()
     if want(check_callconv): check_callconv()
     if want(check_agent_review): check_agent_review()
+    if want(check_transparency): check_transparency()
     if want(check_interrupt): check_interrupt()
     if want(check_agent_crt): check_agent_crt()
     if want(check_oldcrt): check_oldcrt()
