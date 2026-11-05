@@ -118,6 +118,10 @@ int probe_attach(probe_session *, uint32_t pid);
    early as possible. Polls about every millisecond, so the target may run for a few
    milliseconds before the attach lands: instrument what it does after start-up. */
 int probe_attach_new(probe_session *, const char *image_name, uint32_t timeout_ms);
+/* Ctrl+C / Ctrl+Break while probe_run (through probe_wait_for_exit) runs ends the SESSION,
+   not the tool: an attached target is detached (probes removed, it keeps running), a
+   launched one is ended, and probe_run returns normally -- so the caller still flushes the
+   logs and writes its report. A second press gets the default handling. */
 int probe_run(probe_session *);
 /* Waits until all probe_log records are in the session JSONL file and its live stdout
    tail (unless stdout is NUL) has reached the same byte offset. */
