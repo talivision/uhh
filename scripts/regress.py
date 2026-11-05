@@ -1133,7 +1133,7 @@ def check_edgehunt():
             need = ["fmt-null-s (null) end", "[unformattable] fmt-invalid %k end",
                     "[unformattable] fmt-percent-n %n end", "fmt-done"]
             for n_ in need:
-                if n_ not in fm: bad.append(f"missing {n_!r}")
+                if n_ not in fm: bad.append(f"missing {n_!r} in {fm}")
             wide = [m for m in fm if m.startswith("fmt-wide")]
             if len(wide) != 1 or not wide[0].endswith("...[truncated]"): bad.append(f"wide={[w[-20:] for w in wide]}")
             if len(fm) != 6: bad.append(f"records={len(fm)}/6 {fm}")

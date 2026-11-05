@@ -71,7 +71,7 @@ EXPORT int edge_recurse(int n) {
     if (n == 0) return edge_leaf(pad[0]);
     return edge_recurse(n - 1) + pad[1] - n;
 }
-static DWORD WINAPI leaf_thread(void *p) { (void)p; return (DWORD)edge_leaf(0); }
+static DWORD WINAPI leaf_thread(void *p) { (void)p; return (DWORD)edge_leaf(-1); }
 
 static int fault_call(volatile int *p) {
     int r;

@@ -211,6 +211,7 @@ EdgeFaultMid PROC FRAME
     sub rsp, 20h
     .allocstack 20h
     .endprolog
+    mov qword ptr [rsp], 0     ; no stale return address below: a leaf-style unwind from here goes nowhere
     xor eax, eax
 EdgeFaultMidSite::
     mov eax, dword ptr [rcx]
