@@ -3455,6 +3455,15 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
 // image; otherwise the raw address plus the kind of memory (unmapped, reserved, heap/stack
 // /private, mapped file) and, for committed memory, its protection -- e.g. why a write
 // faulted. `module` receives the image's name (empty if none).
+// Local wall-clock time "2026-11-05 15:40:12.345", for crash reports.
+static std::string wall_clock() {
+    SYSTEMTIME st{}; GetLocalTime(&st);
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%04u-%02u-%02u %02u:%02u:%02u.%03u", st.wYear, st.wMonth, st.wDay,
+                  st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    return buf;
+}
+
 static const char *protect_name(DWORD p) {
     switch (p & 0xFF) {
     case PAGE_NOACCESS: return "PAGE_NOACCESS"; case PAGE_READONLY: return "PAGE_READONLY";
@@ -3635,10 +3644,10 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         // The agent's load/init thread faulted. If the target's own unhandled-exception
         // filter swallows it, all we would see is the thread's exit code: keep where it was.
         s->remote_fault = describe_fault(s, ex, code, address);
-        std::fprintf(stderr, "probe: agent thread %s\n", s->remote_fault.c_str());
+        std::fprintf(stderr, "probe: %s agent thread %s\n", wall_clock().c_str(), s->remote_fault.c_str());
     } else if (!event.u.Exception.dwFirstChance && code != PROBE_IPC_CODE) {
         // Unhandled: the target is about to die. Say where, whatever the cause.
-        std::fprintf(stderr, "probe: target crashed: tid=%lu %s\n", (unsigned long)event.dwThreadId,
+        std::fprintf(stderr, "probe: %s target crashed: tid=%lu %s\n", wall_clock().c_str(), (unsigned long)event.dwThreadId,
                      describe_fault(s, ex, code, address).c_str());
         print_crash_stack(s, event.dwThreadId);
     }
