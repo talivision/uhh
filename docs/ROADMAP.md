@@ -392,7 +392,8 @@ every one is probed at entry on breakpoint, hw (groups of 3) and inline in three
 wrap (call_original + return_from(r, n)), replace (return_from(v, n), body skipped) and
 wrongpop (call_original + return_from with a wrong x86 nargs). The callback checks
 get_func_arg/get_reg against what the caller passed. Before the fixes, x86: 9 of 10 checks
-failed; x64: every backend failed in wrap mode for the float function.
+failed (only the uninstrumented baseline passed); x64: hw wrap lost `CcDbl`'s XMM0 result (the
+x64 breakpoint/inline baseline was masked by identical-code folding of the fixture, since fixed).
 - ✅ (CC1) **x86: the high half of an EDX:EAX result was lost on every backend.** return_from
   set EAX only (EDX = the hit's), and call_original's in-place restore put the hit's EDX back:
   `CcI64` wrap returned 0x7777777a for 0x155555557777777a, replace 0x33221107 for
@@ -406,7 +407,7 @@ failed; x64: every backend failed in wrap mode for the float function.
   an EMPTY x87 stack -> NaN/0; x64 `CcDbl` got XMM0 = its own first argument 1.5 instead of
   6.375). Inline x86 left the original's ST0 pushed on the callback's x87 stack (worked only by
   accident with return_from, leaked one x87 slot per call without it); inline x64 restored
-  the hit's XMM0. Now the original's FP state is stashed and applied with return_from (bp/hw:
+  the hit's XMM0 (by code inspection). Now the original's FP state is stashed and applied with return_from (bp/hw:
   the post-call CONTEXT FP area; inline: XMM0 copied into the hook context, x86 x87 via an
   FNSAVE image reloaded after the extended-state restore; the callback itself always runs
   with the hit's x87 state). Without call_original a float result cannot be set (documented).
@@ -420,8 +421,8 @@ failed; x64: every backend failed in wrap mode for the float function.
   (32 x64 stack arguments / 64 x86 slots, bounded by the thread's stack top) whatever nargs
   says; nargs is only a minimum.
 - ✅ (CC5) **Inline call_original did not pass XMM0-5** (coordinator's static review too):
-  x64 `double f(double)` and every __vectorcall float argument arrived as garbage (`CcVec` x86
-  0x7938 for 0x7a4b; x64 `CcDbl`), bp/hw were right. uhh_orig_thunk / call_tramp_x86 load
+  x64 `double f(double)` (by inspection: XMM0-3 were the agent's scratch) and every x86
+  __vectorcall float argument arrived as garbage (`CcVec` 0x7938 for 0x7a4b), bp/hw were right. uhh_orig_thunk / call_tramp_x86 load
   XMM0-5 from the hit's context; x86 also passes EAX (Delphi/Borland `register` convention).
 - ✅ (CC6) **A wrong x86 return_from nargs silently corrupted the caller's ESP** (`wrongpop`:
   cdecl with nargs 2 popped 8 bytes, stdcall with 0 popped none -- on every backend). After
