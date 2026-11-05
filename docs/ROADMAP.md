@@ -373,7 +373,7 @@ with the uninstrumented target and with exact hits / "co" logs / `log_dropped ==
   return address, restored after); only a recursive entry on that thread goes uncounted.
 - Limits (documented in probe_api.h): breakpoint/hw call_original needs one free debug register
   for the call (all 4 taken by hw probes -> refused, unless the hit is itself a hw execute probe,
-  which lends its own slot -- probe_api.h still says "refused"; doc-comment update left to the API owner); probes hit inside the original count but
+  which lends its own slot, as probe_api.h now says); probes hit inside the original count but
   run no callback when they are of the same kind as the caller (inline in inline,
   breakpoint/hw in breakpoint/hw -- including this probe for a recursive function), and fire
   when of the other kind; inline needs nargs >= the real argument count (it builds a new frame;
