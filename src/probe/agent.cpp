@@ -896,17 +896,21 @@ struct HitScope;
    `active` marks this thread, so a probe its callee hits is counted without a callback (see
    call_func_guarded). One mechanism, no separate "in call_func" registry.
    A reused id: a thread killed (TerminateThread, ExitThread) inside a callback leaves its
-   record in the slot. The thread that gets its id next is recognised by `gen`, a number the
-   slot's owner also keeps in its own TEB (a dynamic-TLS slot read and written directly in
-   the TEB: no allocation, valid from the thread's creation, zero for every new thread). A
-   new owner drops the dead thread's record WITHOUT settling it: that hit stays in flight
-   (callbacks_interrupted), and the new thread's own hits run their callbacks. */
+   record in the slot. The next thread with its id must not settle it (that hit stays in
+   flight: callbacks_interrupted) and must run its own callbacks. A new owner is recognised
+   without writing anything the program could see: by its TEB and stack base, compared on
+   every hit, and -- when those are reused too -- by its creation time, read once per new
+   identity and again only when a stale record turns up (a dead owner's, or this thread's
+   own after a non-unwinding longjmp, see hit_scope_live). */
 struct ThreadSlot {
     volatile LONG tid;
     HitScope *active;                    // the hit whose callback this thread is running
     volatile LONG64 *active_cell;        // that hit's hit_stripes cell
     uintptr_t moved_from, moved_to;      // a fault moved out of a trampoline (tramp_veh)
-    uintptr_t gen;                       // the owning thread's generation (see owner_tls)
+    const void *teb;                     // the owner's identity: TEB, stack base, creation time
+    uintptr_t stack;
+    uint64_t born;
+    volatile LONG busy;                  // reading `born`: a probe hit meanwhile passes straight through
 };
 constexpr uint32_t AGENT_THREAD_SLOTS = 4096;
 static ThreadSlot g_threads[AGENT_THREAD_SLOTS];
@@ -921,28 +925,28 @@ static ThreadSlot *thread_slot(DWORD tid, bool claim) {
     }
     return nullptr;                      // 4096 distinct thread ids: this thread runs unguarded
 }
-// The TEB cell of the agent's TLS index (0..63: TEB TlsSlots; -1 when TlsAlloc gave none of
-// those -- owner changes then go unnoticed, as before).
-static DWORD g_owner_tls = TLS_OUT_OF_INDEXES;
-static volatile LONG g_owner_gen;
-static uintptr_t *owner_tls() {
-    if (g_owner_tls >= 64) return nullptr;
-#if defined(_WIN64)
-    return (uintptr_t *)((unsigned char *)NtCurrentTeb() + 0x1480) + g_owner_tls;
-#else
-    return (uintptr_t *)((unsigned char *)NtCurrentTeb() + 0xE10) + g_owner_tls;
-#endif
+// The current thread's creation time (0: unknown). Hits it causes (a probe on
+// NtQueryInformationThread) pass straight through: see ThreadSlot::busy.
+using nt_qit_fn = LONG (NTAPI *)(HANDLE, ULONG, void *, ULONG, ULONG *);
+static nt_qit_fn g_nt_qit;               // ntdll!NtQueryInformationThread, resolved at init
+static uint64_t thread_born(ThreadSlot *ts) {
+    LARGE_INTEGER times[4] = {};         // KERNEL_USER_TIMES: CreateTime first
+    InterlockedExchange(&ts->busy, 1);
+    const bool ok = g_nt_qit && g_nt_qit(GetCurrentThread(), 1 /* ThreadTimes */, times, sizeof(times), nullptr) >= 0;
+    InterlockedExchange(&ts->busy, 0);
+    return ok ? (uint64_t)times[0].QuadPart : 0;
 }
-// This thread's slot, claimed, with a dead previous owner's record dropped (see ThreadSlot).
+// This thread's slot, claimed. A new owner (another TEB or stack: a reused id) drops the dead
+// thread's record without settling it.
 static ThreadSlot *own_thread_slot(DWORD tid) {
     ThreadSlot *ts = thread_slot(tid, true);
-    uintptr_t *cell = owner_tls();
-    if (!ts || !cell) return ts;
-    if (!*cell || *cell != ts->gen) {
-        if (!*cell) *cell = (uintptr_t)(ULONG)InterlockedIncrement(&g_owner_gen);
+    if (!ts) return ts;
+    const NT_TIB *tib = reinterpret_cast<const NT_TIB *>(NtCurrentTeb());
+    if (ts->teb != tib || ts->stack != (uintptr_t)tib->StackBase) {
+        ts->teb = tib; ts->stack = (uintptr_t)tib->StackBase;
         ts->active = nullptr;            // the dead thread's hit: left in flight (interrupted)
         ts->moved_to = 0;
-        ts->gen = *cell;
+        ts->born = thread_born(ts);
     }
     return ts;
 }
@@ -1374,6 +1378,8 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     if (g_agent_threads.has(c.tid)) return false;          // the agent's own work: see g_agent_threads
     const probe_callback cb = callbacks[index];
     if (!cb) return false;
+    ThreadSlot *const ts = own_thread_slot(c.tid);
+    if (ts && ts->busy) return false;                      // the agent's own query: see ThreadSlot
     uint32_t stripe = (c.tid >> 2) & (PROBE_AGENT_STRIPES - 1);
     volatile LONG64 &cell = shared->hit_stripes[index][stripe].value;
     // ONE atomic add counts the hit and marks a callback in flight (see hit_stripes): a thread
@@ -1390,9 +1396,13 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     // what breakpoint/hw do inside call_func. Re-entering recursed until the stack overflowed.
     // The guard is the thread's slot (no TLS: see ThreadSlot); a record left behind by a
     // non-unwinding longjmp is recognised as stale (hit_scope_live) and settled here.
-    ThreadSlot *const ts = own_thread_slot(c.tid);
     if (ts && ts->active && !hit_scope_live(ts->active, c.hit_sp)) {
-        InterlockedExchangeAdd64(ts->active_cell, -PROBE_AGENT_INFLIGHT_ONE);
+        // This thread's own record (a longjmp skipped its settling) -- or, when the TEB and
+        // stack were reused too, a dead thread's: another creation time. That hit stays in
+        // flight (interrupted).
+        const uint64_t now = thread_born(ts);
+        if (!ts->born || !now || now == ts->born) InterlockedExchangeAdd64(ts->active_cell, -PROBE_AGENT_INFLIGHT_ONE);
+        ts->born = now;
         ts->active = nullptr;
     }
     if (ts && ts->active) {
@@ -1838,13 +1848,9 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
             pol.EnableUserShadowStack)
             InterlockedExchange(&uhh_safetyhook_keep_calls, 1);
         g_nt_raise = reinterpret_cast<nt_raise_fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtRaiseException"));
+        g_nt_qit = reinterpret_cast<nt_qit_fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
         veh = AddVectoredExceptionHandler(1, tramp_veh);
         AddVectoredContinueHandler(1, tramp_vch);
-    }
-    if (g_owner_tls == TLS_OUT_OF_INDEXES) {                // once: kept for the agent's lifetime
-        const DWORD ix = TlsAlloc();
-        if (ix < 64) g_owner_tls = ix;
-        else if (ix != TLS_OUT_OF_INDEXES) { TlsFree(ix); g_owner_tls = 64; }
     }
     InterlockedExchange(&g_stopping, 0);   // a new session after a detach: callbacks run again
     resolve_callbacks();
