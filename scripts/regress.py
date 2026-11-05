@@ -1061,29 +1061,77 @@ def check_realworld_targets():
 FRIDA_PY = Path(r"C:\work\fv16\Scripts\python.exe")
 
 
+def run_killable(args, timeout):
+    """Run a command with its output in FILES (never a pipe some grandchild may inherit and
+    hold open) and a hard timeout; on timeout the whole process tree is killed. Returns
+    (returncode or None on timeout, stdout, stderr)."""
+    import tempfile
+    with tempfile.TemporaryFile() as fo, tempfile.TemporaryFile() as fe:
+        p = subprocess.Popen([str(x) for x in args], stdin=subprocess.DEVNULL, stdout=fo, stderr=fe)
+        try:
+            rc = p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], capture_output=True, timeout=30)
+            try:
+                p.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                pass
+            rc = None
+        fo.seek(0); fe.seek(0)
+        return rc, fo.read().decode(errors="replace"), fe.read().decode(errors="replace")
+
+
+FRIDA_COEXIST_CASES = [
+    # (order, UHH backend, uhh_trace flag, expected UHH backend or None = refused, expect a prehook report)
+    ("frida_first", "inline", "fallback-hw", "hw", True),
+    ("frida_first", "inline", "none", None, True),
+    ("frida_first", "inline", "allow-prehooked", "inline", True),
+    ("uhh_first", "inline", "fallback-hw", "inline", False),
+    ("frida_first", "hw", "none", "hw", False),
+    ("uhh_first", "hw", "none", "hw", False),
+    ("frida_first", "breakpoint", "none", "breakpoint", True),     # reported; the INT3 over the jmp still works
+    ("uhh_first", "breakpoint", "none", "breakpoint", False),
+]
+
+
 def check_frida_coexist():
-    """Frida and UHH on the same function, in both orders and on every UHH backend: the
-    target stays correct and BOTH tools see every call. (Needs an interpreter with frida;
+    """Frida and UHH on the same function (probe_app.exe!ReadThunk), in both orders and on
+    every UHH backend: the target stays correct and BOTH tools see every call. Inline over
+    a Frida hook follows UHH's documented pre-hook rules: refused by default (UHH reports
+    the foreign hook and exits; the target and Frida are unaffected), moved to a debug
+    register with PROBE_FALLBACK_HW (uhh_trace --fallback-hw), chained through Frida's
+    detour with PROBE_ALLOW_PREHOOKED. One case at a time, each with a hard deadline;
+    frida_coexist.py kills its children on any failure. (Needs an interpreter with frida;
     on the test VM a frida 16.5.9 venv.)"""
     if not FRIDA_PY.exists() or not exe("uhh_trace.exe") or not exe("probe_app.exe"):
         return skip("frida-coexist", "frida interpreter / uhh_trace / probe_app missing")
     script = Path(__file__).with_name("frida_coexist.py")
-    for order in ("frida_first", "uhh_first"):
-        for bk in ("inline", "hw", "breakpoint"):
-            name = f"frida-coexist-{order}-{bk}"
-            try:
-                r = subprocess.run([str(FRIDA_PY), str(script), "--app", str(exe("probe_app.exe")),
-                                    "--trace", str(exe("uhh_trace.exe")), "--order", order, "--backend", bk],
-                                   capture_output=True, text=True, timeout=300)
-                res = next((json.loads(l) for l in r.stdout.splitlines() if l.startswith('{"kind": "coexist"')), {})
-                total = res.get("total")
-                ok = (total and res.get("app_reads") == total and res.get("frida_hits") == total and
-                      res.get("uhh_hits") == total and res.get("app_exit") == 0)
-                record(name, ok, f"total={total} app={res.get('app_reads')} frida={res.get('frida_hits')} "
-                                 f"uhh={res.get('uhh_hits')}/{res.get('uhh_backend')} prehook={res.get('prehook_reports')} "
-                                 f"exit={res.get('app_exit')}" + ("" if ok else f" err={(r.stderr or '')[-300:]!r} tail={res.get('uhh_stderr_tail')}"))
-            except Exception as e:
-                record(name, False, repr(e))
+    for order, bk, flag, want_bk, want_pre in FRIDA_COEXIST_CASES:
+        name = f"frida-coexist-{order}-{bk}" + ("" if flag in ("none", "fallback-hw") and want_bk else f"-{flag}")
+        try:
+            rc, out, err = run_killable([FRIDA_PY, script, "--app", exe("probe_app.exe"),
+                                         "--trace", exe("uhh_trace.exe"), "--order", order,
+                                         "--backend", bk, "--uhh-flag", flag, "--timeout", "90"], timeout=150)
+            res = next((json.loads(l) for l in out.splitlines() if l.startswith('{"kind": "coexist"')), {})
+            total = res.get("total")
+            target_ok = (bool(total) and res.get("app_reads") == total and res.get("frida_hits") == total and
+                         res.get("app_exit") == 0 and res.get("error") is None)
+            if want_bk is None:      # refused: UHH says why, exits non-zero, nothing else changes
+                uhh_ok = (res.get("uhh_exit") not in (0, None) and "pre-hooked" in str(res.get("uhh_error")) and
+                          not res.get("uhh_hits"))
+            else:
+                uhh_ok = (res.get("uhh_hits") == total and res.get("uhh_backend") == want_bk and
+                          res.get("uhh_exit") == 0)
+            pre_ok = (res.get("prehook_reports", 0) > 0) == want_pre
+            ok = rc == 0 and target_ok and uhh_ok and pre_ok
+            record(name, ok, f"total={total} app={res.get('app_reads')} frida={res.get('frida_hits')} "
+                             f"uhh={res.get('uhh_hits')}/{res.get('uhh_backend')} prehook={res.get('prehook_reports')} "
+                             f"uhh_exit={res.get('uhh_exit')} exit={res.get('app_exit')}" +
+                             ("" if ok else f" rc={rc} error={res.get('error')!r} uhh_error={res.get('uhh_error')!r} "
+                                            f"tail={res.get('uhh_stderr_tail')} app_tail={res.get('app_tail')} "
+                                            f"stderr={err[-300:]!r}"))
+        except Exception as e:
+            record(name, False, repr(e))
 
 
 def check_sidefx(iters=1000, threads=4):

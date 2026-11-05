@@ -8,7 +8,8 @@
 // After the ':' one format character per argument (see trace_callback.h); ':-' counts
 // hits without logging. The backend is exactly the one asked for; --fallback-hw lets an
 // inline probe move to a hardware breakpoint when the site is already hooked by someone
-// else or not inline-safe (PROBE_FALLBACK_HW). Output: the probe report (JSON
+// else or not inline-safe (PROBE_FALLBACK_HW); --allow-prehooked installs an inline probe
+// over another tool's hook anyway, chaining through it (PROBE_ALLOW_PREHOOKED). Output: the probe report (JSON
 // lines); every call is a probe_log record, with a symbolized stack under --stack.
 #include "trace_callback.h"
 #include "../../src/probe/symbols.hpp"

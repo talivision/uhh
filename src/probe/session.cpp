@@ -188,6 +188,7 @@ struct probe_session {
     std::atomic<bool> stop_requested{false};   // probe_close from another thread while probe_run runs
     std::atomic<bool> running{false};          // probe_run is executing (on some thread)
     bool detached = false;
+    bool detaching = false;    // detach() running: no new holds (nothing would release them)
     DWORD debug_tid = 0;                       // the thread that launched/attached: owns the debug object
     DWORD in_call_tid = 0;                     // thread currently running a call_func callee
     std::vector<HANDLE> call_deferred;         // other threads' hits during a call_func: rewound + suspended
@@ -2644,6 +2645,11 @@ static bool agent_thread(probe_session *s, DWORD tid) {
 }
 
 static void hold_thread(probe_session *s, DWORD tid) {
+    // While detaching, the drain dispatches queued events (CREATE_THREADs, gate hits) that
+    // would otherwise place an install hold -- and its release (the agent confirming) may
+    // never come before we let go: the target would be left with suspended threads after
+    // the detach. No hooks are being installed any more anyway.
+    if (s->detaching) return;
     HANDLE t = OpenThread(THREAD_SUSPEND_RESUME, FALSE, tid);
     if (!t) return;
     DWORD prev = SuspendThread(t);
@@ -2897,6 +2903,7 @@ static void ipc_thaw(probe_session *s);
 static void pump(probe_session *s, DWORD ms);
 static void detach(probe_session *s) {
     s->error.clear();
+    s->detaching = true;
     release_held(s, "detach");
     // Agent work in flight (load/init on a remote thread): let it finish first, or its hooks
     // would land AFTER the agent was told to stop -- live hooks in a detached process.
@@ -3030,6 +3037,7 @@ static void detach(probe_session *s) {
     }
     std::fprintf(stderr, "probe: detach: %zu thread(s) frozen;%s\n", frozen.size(),
                  report_tids.empty() ? " all clean" : report_tids.c_str());
+    release_held(s, "detach (late)");                    // belt and braces: never leave a hold behind
     stop_drainer(s);
     if (!s->exited) DebugActiveProcessStop(s->pi.dwProcessId);
     for (HANDLE t : frozen) { ResumeThread(t); CloseHandle(t); }
