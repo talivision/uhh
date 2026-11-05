@@ -109,6 +109,7 @@ struct probe_session {
     std::string writer_error;
     std::thread log_tailer;
     std::mutex tail_mu;
+    std::mutex stdout_mu;                      // whole-line stdout writes: log batches vs report lines
     std::condition_variable tail_changed, tail_caught_up;
     uint64_t log_bytes_written = 0, log_bytes_tailed = 0;
     bool tail_stop = false, tail_failed = false, console_warning = false;
@@ -243,6 +244,7 @@ static void writer_failed(probe_session *s, const std::string &message, uint64_t
     s->queue_flushed.notify_all();
 }
 
+static bool write_stdout_chunk(probe_session *s, const char *bytes, size_t size);
 static bool write_log_batch(probe_session *s, const std::string &bytes, uint64_t records) {
     if (bytes.empty()) return true;
     DWORD wrote = 0;
@@ -257,7 +259,18 @@ static bool write_log_batch(probe_session *s, const std::string &bytes, uint64_t
     {
         std::lock_guard<std::mutex> lock(s->tail_mu);
         s->log_bytes_written += bytes.size();
-        if (!s->tail_enabled) s->log_bytes_tailed = s->log_bytes_written;
+    }
+    // Live output: the SAME batch goes to stdout right away, from this thread (the
+    // separate tailer let stdout fall seconds behind under load). A slow stdout (a
+    // console) back-pressures the producers instead -- nothing is dropped; the file
+    // above is the complete record either way.
+    if (s->tail_enabled && !write_stdout_chunk(s, bytes.data(), bytes.size())) {
+        writer_failed(s, s->tail_error.empty() ? std::string("write probe logs to stdout") : s->tail_error, 0);
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(s->tail_mu);
+        s->log_bytes_tailed = s->log_bytes_written;
     }
     s->tail_changed.notify_one();
     s->tail_caught_up.notify_all();
@@ -352,6 +365,7 @@ static void tail_failed(probe_session *s, const std::string &message) {
 
 static bool write_stdout_chunk(probe_session *s, const char *bytes, size_t size) {
     if (!size) return true;
+    std::lock_guard<std::mutex> out_lock(s->stdout_mu);
     // The driver still owns the CRT FILE*. Empty it before the raw-handle write so its
     // own complete lines cannot remain buffered behind newer tailed log lines.
     if (std::fflush(stdout) != 0) {
@@ -480,7 +494,7 @@ static bool start_log_output(probe_session *s) {
     // the complete file and avoid spending a thread copying bytes into the null device.
     s->tail_enabled = stdout_valid &&
                       !(s->stdout_type == FILE_TYPE_CHAR && !s->stdout_is_console);
-    if (s->tail_enabled) {
+    if (false) {   // (no separate tailer: the writer writes stdout itself)
         s->log_reader = CreateFileW(s->log_path.c_str(), GENERIC_READ,
                                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                     nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -492,7 +506,7 @@ static bool start_log_output(probe_session *s) {
 
     try {
         s->log_writer = std::thread(log_writer_main, s);
-        if (s->tail_enabled) s->log_tailer = std::thread(log_tailer_main, s);
+        (void)log_tailer_main;               // kept for reference; the writer writes stdout directly
     } catch (...) {
         {
             std::lock_guard<std::mutex> lock(s->queue_mu); s->writer_stop = true;
@@ -3578,6 +3592,9 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
     }
     if (s->exited) stop_drainer(s); else drain_agent_logs(s);
     flush_log_writer(s);                         // all probe_log lines precede report records
+    // Report lines and log batches never interleave mid-line on a shared stdout.
+    std::unique_lock<std::mutex> out_lock(s->stdout_mu, std::defer_lock);
+    if (out == stdout) out_lock.lock();
     for (const auto &j : s->prehooks) { std::fputs(j.c_str(), out); std::fputc('\n', out); }
     for (const auto &p : s->probes) {
         if (p->internal) continue;
