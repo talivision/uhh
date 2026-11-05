@@ -1797,11 +1797,13 @@ def check_famous_files(threads=3, chunks=20):
             drv = subprocess.Popen([str(d), "--recipe", "files", "--backend", bk, "--filter", wdir.name,
                                     "--attach-new", "famous_file_target.exe", "--timeout", "30000"],
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            time.sleep(1.0)
+            first = drv.stdout.readline()          # {"kind":"waiting_for"} -- printed just before
+            time.sleep(1.5)                        # the snapshot of already-running instances
             tgt = subprocess.Popen([str(t), str(wdir), "--threads", str(threads), "--chunks", str(chunks),
                                     "--delay-ms", "2500"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             tout, _ = tgt.communicate(timeout=300)
             out, err = drv.communicate(timeout=300)
+            out = first + out
 
             class _R:
                 stderr = err
