@@ -165,6 +165,7 @@ add_library(probe_api_agent SHARED
     examples/dynwatch/dynwatch_callbacks.cpp
     examples/trace/trace_callback.cpp
     examples/conformance/conformance_callbacks.cpp
+    examples/p2edge/p2edge_callbacks.cpp
     bench/hitcost/hitcost_callbacks.cpp
     examples/memstress/memstress_callbacks.cpp
     examples/sidefx/sidefx_callbacks.cpp
@@ -377,6 +378,18 @@ target_include_directories(blog_driver PRIVATE include examples/blogs)
 target_link_libraries(blog_driver PRIVATE probe_api)
 add_dependencies(blog_driver blog_target probe_api_agent)
 
+# --- p2edge: lifecycle edge cases (threads born during the entry hold, a DLL loaded by a
+#     worker thread, hw ONCE / slot reuse / 5th refused) -------------------------------
+add_library(p2edge_early SHARED examples/p2edge/p2edge_early.c)    # static import of p2edge_target
+add_library(p2edge_late SHARED examples/p2edge/p2edge_late.c)      # LoadLibrary'd by a worker thread
+add_executable(p2edge_target examples/p2edge/p2edge_target.c)
+target_link_libraries(p2edge_target PRIVATE p2edge_early)
+add_dependencies(p2edge_target p2edge_late)
+add_executable(p2edge_driver examples/p2edge/p2edge_driver.cpp examples/p2edge/p2edge_callbacks.cpp)
+target_include_directories(p2edge_driver PRIVATE include)
+target_link_libraries(p2edge_driver PRIVATE probe_api)
+add_dependencies(p2edge_driver p2edge_target probe_api_agent)
+
 add_executable(refusal_driver examples/conformance/refusal_driver.cpp)
 target_include_directories(refusal_driver PRIVATE include)
 target_link_libraries(refusal_driver PRIVATE probe_api)
@@ -395,7 +408,7 @@ foreach(d detours_simple detours_traceapi detours_retval)
     add_dependencies(${d} detours_target probe_api_agent)
 endforeach()
 
-foreach(t blog_target blog_driver gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver hunt_target hunt_dll hunt_driver detours_target detours_simple detours_traceapi detours_retval edge_target edge_driver famous_driver famous_heap_target famous_file_target famous_loader_target famous_tick_target probe_app_cet cet_probe)
+foreach(t p2edge_early p2edge_late p2edge_target p2edge_driver blog_target blog_driver gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver hunt_target hunt_dll hunt_driver detours_target detours_simple detours_traceapi detours_retval edge_target edge_driver famous_driver famous_heap_target famous_file_target famous_loader_target famous_tick_target probe_app_cet cet_probe)
     target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 endforeach()
@@ -408,6 +421,6 @@ foreach(t configparse cet_probe hook_edge parity_target watch_target dynwatch_ta
           hitcost_target logstream_target memstress_target patchrace_target sidefx_target
           reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target
           famous_heap_target famous_file_target famous_loader_target famous_tick_target edge_target detours_target
-          hunt_target hunt_dll blog_target)
+          hunt_target hunt_dll blog_target p2edge_target p2edge_early p2edge_late)
     set_property(TARGET ${t} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 endforeach()

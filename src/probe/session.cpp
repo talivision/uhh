@@ -2506,10 +2506,49 @@ static bool open_agent_section(probe_session *s, uint32_t count) {
     return ensure_local_agent(s);
 }
 
+// Every export name of module m at address addr. The linker folds identical functions
+// (/OPT:ICF), so two exported callbacks with the same body share one address and a
+// callback's name (taken from its address) is ambiguous: e.g. two empty callbacks. The
+// agent and the controller name callbacks by export, so each side matches the OTHER
+// side's exports against all aliases instead of trusting the first one.
+static std::vector<std::string> export_names_at(HMODULE m, const void *addr) {
+    std::vector<std::string> out;
+    if (!m || !addr) return out;
+    auto base = reinterpret_cast<const unsigned char *>(m);
+    auto dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return out;
+    auto nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(base + dos->e_lfanew);
+    auto dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dir.VirtualAddress || !dir.Size) return out;
+    auto exports = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY *>(base + dir.VirtualAddress);
+    auto functions = reinterpret_cast<const DWORD *>(base + exports->AddressOfFunctions);
+    auto names = reinterpret_cast<const DWORD *>(base + exports->AddressOfNames);
+    auto ordinals = reinterpret_cast<const WORD *>(base + exports->AddressOfNameOrdinals);
+    const uint64_t rva = (uint64_t)(reinterpret_cast<const unsigned char *>(addr) - base);
+    for (DWORD i = 0; i < exports->NumberOfNames; ++i)
+        if (ordinals[i] < exports->NumberOfFunctions && functions[ordinals[i]] == rva)
+            out.emplace_back(reinterpret_cast<const char *>(base + names[i]));
+    return out;
+}
+
+static HMODULE module_of(const void *addr) {
+    HMODULE m{};
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCSTR>(addr), &m);
+    return m;
+}
+
 static void fill_request(probe_session *s, const Probe &p) {
     auto &request = s->shared->requests[p.agent_index]; request.flags = p.flags;
     request.config_len = (uint32_t)p.config.size();
-    std::memcpy(request.callback, p.callback_export.c_str(), p.callback_export.size() + 1);
+    std::string name = p.callback_export;
+    // The agent resolves the name in ITS module (the same file as s->local_agent): if this
+    // alias is not exported there, send one that is (an identical-code-folded twin).
+    if (s->local_agent && p.callback && !GetProcAddress(s->local_agent, name.c_str()))
+        for (auto &alias : export_names_at(module_of(reinterpret_cast<const void *>(p.callback)),
+                                           reinterpret_cast<const void *>(p.callback)))
+            if (alias.size() < PROBE_AGENT_EXPORT_CAP && GetProcAddress(s->local_agent, alias.c_str())) { name = alias; break; }
+    std::memcpy(request.callback, name.c_str(), name.size() + 1);
     if (!p.config.empty()) std::memcpy(request.config, p.config.data(), p.config.size());
 }
 
@@ -2582,6 +2621,26 @@ static bool inline_unconfirmed(const probe_session *s) {
 static bool inline_hold_needed(const probe_session *s) {
     if (inline_unconfirmed(s)) return true;
     return has_inline(s) && !(s->shared && s->shared->service_ready && s->svc_event);
+}
+
+// A thread of OUR agent (its service thread, started from the agent image): never hold it
+// -- it may own the agent's install lock or be the one that must do the install.
+static bool agent_thread(probe_session *s, DWORD tid) {
+    if (!s->remote_agent) return false;
+    using QueryFn = LONG(NTAPI *)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    static auto query = reinterpret_cast<QueryFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+    HANDLE t = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
+    if (!t || !query) { if (t) CloseHandle(t); return false; }
+    PVOID start = nullptr;
+    LONG st = query(t, 9 /*ThreadQuerySetWin32StartAddress*/, &start, sizeof(start), nullptr);
+    CloseHandle(t);
+    if (st < 0) return false;
+    IMAGE_DOS_HEADER dos{}; IMAGE_NT_HEADERS nt{}; size_t got = 0;
+    if (!remote_read(s->pi.hProcess, s->remote_agent, &dos, sizeof(dos), &got) || got != sizeof(dos) ||
+        !remote_read(s->pi.hProcess, s->remote_agent + (uint32_t)dos.e_lfanew, &nt, sizeof(nt), &got) || got != sizeof(nt))
+        return false;
+    const uint64_t a = (uint64_t)(uintptr_t)start;
+    return a >= s->remote_agent && a < s->remote_agent + nt.OptionalHeader.SizeOfImage;
 }
 
 static void hold_thread(probe_session *s, DWORD tid) {
@@ -3160,6 +3219,12 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
             if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                    reinterpret_cast<LPCSTR>(p->callback), &m))
                 cb = reinterpret_cast<probe_callback>(GetProcAddress(m, req.callback));
+            // Identical-code folding in the agent DLL may have named the callback by a twin
+            // that the controller-side module does not export: try every alias of it.
+            if (!cb && m && s->local_agent)
+                if (auto here = GetProcAddress(s->local_agent, req.callback))
+                    for (auto &alias : export_names_at(s->local_agent, reinterpret_cast<const void *>(here)))
+                        if ((cb = reinterpret_cast<probe_callback>(GetProcAddress(m, alias.c_str())))) break;
             break;
         }
     if (!origin) return false;
@@ -4268,6 +4333,17 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
                     uint32_t rw = 0, len = 0; hw_rw_len(p->flags, rw, len);
                     set_dr_on_thread(event.u.CreateThread.hThread, p->dr_slot, p->address, true, rw, len);
                 }
+        // A thread born while a thread is HELD for an inline install (the main thread at the
+        // launch entry point -- e.g. a thread started by a TLS callback or DllMain(PROCESS_ATTACH)
+        // -- or a callback's thread after a runtime add) could reach a site before its hook is
+        // in. Hold it from its first instruction (it owns no lock yet) until the same
+        // confirmation releases the others. Only while such a hold is in progress: attach holds
+        // nothing while the agent is injected, and the late-module gates are inherited above.
+        // Never our own agent threads (they do the install).
+        if (s->initial_break && !s->held.empty() && event.dwThreadId != s->remote_tid &&
+            (!s->attached || (s->shared && s->shared->service_ready)) &&
+            inline_hold_needed(s) && !agent_thread(s, event.dwThreadId))
+            hold_thread(s, event.dwThreadId);
         // Do NOT close hThread: the debug subsystem owns it and closes it itself when the
         // thread's EXIT_THREAD event is continued. Closing it here made that later close hit
         // whatever handle had reused the value (e.g. a held thread's -> left suspended).
