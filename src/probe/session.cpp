@@ -3384,15 +3384,50 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
 }
 
 // "exception 0xc0000005 at msvcp140.dll+0x1234 (read 0x0)" plus a hint for known causes.
-// "module+0xoff" for an address in a loaded module (nearest base below it), else "0xaddr".
-static std::string module_offset(probe_session *s, uint64_t address, std::string *module = nullptr) {
-    std::string where; uint64_t best = 0;
-    for (const auto &m : s->module_bases)
-        if (m.second <= address && m.second > best) { best = m.second; where = m.first; }
-    if (module) *module = where;
-    char buf[160];
-    if (best) std::snprintf(buf, sizeof(buf), "%s+0x%llx", where.c_str(), (unsigned long long)(address - best));
-    else std::snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)address);
+// What an address in the target IS, from its memory map: "thing.dll+0x41a0" inside a loaded
+// image; otherwise the raw address plus the kind of memory (unmapped, reserved, heap/stack
+// /private, mapped file) and, for committed memory, its protection -- e.g. why a write
+// faulted. `module` receives the image's name (empty if none).
+static const char *protect_name(DWORD p) {
+    switch (p & 0xFF) {
+    case PAGE_NOACCESS: return "PAGE_NOACCESS"; case PAGE_READONLY: return "PAGE_READONLY";
+    case PAGE_READWRITE: return "PAGE_READWRITE"; case PAGE_WRITECOPY: return "PAGE_WRITECOPY";
+    case PAGE_EXECUTE: return "PAGE_EXECUTE"; case PAGE_EXECUTE_READ: return "PAGE_EXECUTE_READ";
+    case PAGE_EXECUTE_READWRITE: return "PAGE_EXECUTE_READWRITE"; case PAGE_EXECUTE_WRITECOPY: return "PAGE_EXECUTE_WRITECOPY";
+    default: return "?";
+    }
+}
+
+static std::string module_offset(probe_session *s, uint64_t address, std::string *module = nullptr,
+                                 bool with_protect = false) {
+    if (module) module->clear();
+    char buf[200];
+    MEMORY_BASIC_INFORMATION m{};
+    if (!s->pi.hProcess || !VirtualQueryEx(s->pi.hProcess, (void *)(uintptr_t)address, &m, sizeof(m))) {
+        std::snprintf(buf, sizeof(buf), "0x%llx (not a valid address)", (unsigned long long)address);
+        return buf;
+    }
+    const uint64_t alloc = (uint64_t)(uintptr_t)m.AllocationBase;
+    if (m.State == MEM_COMMIT && m.Type == MEM_IMAGE) {
+        std::string name;
+        for (const auto &kv : s->module_bases) if (kv.second == alloc) { name = kv.first; break; }
+        if (name.empty()) { char b[32]; std::snprintf(b, sizeof(b), "image@0x%llx", (unsigned long long)alloc); name = b; }
+        if (module) *module = name;
+        std::snprintf(buf, sizeof(buf), "%s+0x%llx", name.c_str(), (unsigned long long)(address - alloc));
+        if (with_protect && (m.Protect & (PAGE_READONLY | PAGE_EXECUTE_READ | PAGE_EXECUTE | PAGE_NOACCESS))) {
+            std::string out = buf;
+            return out + " [" + protect_name(m.Protect) + "]";
+        }
+        return buf;
+    }
+    const char *kind = m.State == MEM_FREE ? "unmapped" : m.State == MEM_RESERVE ? "reserved, not committed"
+                     : m.Type == MEM_MAPPED ? "mapped view" : "private memory (heap/stack/VirtualAlloc)";
+    if (m.State == MEM_COMMIT)
+        std::snprintf(buf, sizeof(buf), "0x%llx (%s, %s%s)", (unsigned long long)address, kind, protect_name(m.Protect),
+                      (m.Protect & PAGE_GUARD) ? "|PAGE_GUARD" : "");
+    else
+        std::snprintf(buf, sizeof(buf), "0x%llx (%s%s)", (unsigned long long)address, kind,
+                      address < 0x10000 ? ", null page" : "");
     return buf;
 }
 
@@ -3402,10 +3437,9 @@ static std::string describe_fault(probe_session *s, const EXCEPTION_RECORD &ex, 
     std::snprintf(buf, sizeof(buf), "exception 0x%08lx at %s", (unsigned long)code, module_offset(s, address, &where).c_str());
     std::string out = buf;
     if (code == EXCEPTION_ACCESS_VIOLATION && ex.NumberParameters >= 2) {
-        std::snprintf(buf, sizeof(buf), " (%s 0x%llx)",
-                      ex.ExceptionInformation[0] == 8 ? "execute" : ex.ExceptionInformation[0] ? "write" : "read",
-                      (unsigned long long)ex.ExceptionInformation[1]);
-        out += buf;
+        const ULONG_PTR kind = ex.ExceptionInformation[0];
+        out += std::string(" (") + (kind == 8 ? "execute" : kind ? "write" : "read") + " of " +
+               module_offset(s, (uint64_t)ex.ExceptionInformation[1], nullptr, true) + ")";
     }
     std::string lower = where;
     for (auto &ch : lower) ch = (char)std::tolower((unsigned char)ch);
