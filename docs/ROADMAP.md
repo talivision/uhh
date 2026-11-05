@@ -389,8 +389,12 @@ Fixture `examples/ctrlreview` (ctrl_target + ctrl_dll + ONE callback source), re
   so **the program's handler never saw its guard violation** (guard=0 of 100). Now: the guard is put back
   before the in-place re-run; a faulted in-place step is remembered per thread -- the restart (INT3 at the
   site with our TF still in the restored context) runs no callback and counts no hit, and if the handler
-  continues elsewhere the one stray trap of our TF is absorbed. 📄 The handler's ContextRecord shows our TF
-  (it is the marker that tells a restart from a new hit; it was visible before too). hw and inline were
+  continues elsewhere the one stray trap of our TF is absorbed. A WOW64 (x86) handler's context comes back
+  WITHOUT our TF (x86 had 400 hits for 200 with the TF test alone): there the restart is the next INT3 at
+  the site with every integer register, SP and the arithmetic flags unchanged since the fault.
+  📄 x64: the handler's ContextRecord shows our TF (the restart marker; it was visible before too).
+  📄 x86: a NEW call that reaches the site with exactly the faulting registers right after the handler
+  unwound would be taken for the restart (not seen; needs identical registers incl. SP). hw and inline were
   already exact. Test: `ctrl-fault-{breakpoint,hw,inline}`
 - ✅ (3) **In-place stepping, several threads: double callback.** Thread B's INT3 hit is queued while A has
   the byte lifted; B is set up to run the original at the site, A's step completion re-arms first, B

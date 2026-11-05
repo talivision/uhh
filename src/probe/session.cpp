@@ -212,8 +212,11 @@ struct probe_session {
     // Threads whose in-place step at a probe site faulted: the fault went to the target with
     // OUR trap flag in its context. If the target's handler continues execution there, the
     // INT3 is hit again (with TF set) -- the same execution restarting, not a new hit; if it
-    // continues elsewhere, the trap flag raises one stray step. thread -> probe site.
-    std::unordered_map<DWORD, uint64_t> refault;
+    // continues elsewhere, the trap flag raises one stray step. thread -> probe site + registers.
+    // A WOW64 (x86) handler's context comes back WITHOUT our trap flag: there the restart is
+    // recognised by the registers instead -- unchanged since the fault (snapshot below).
+    struct Refault { uint64_t site = 0; CONTEXT regs{}; };
+    std::unordered_map<DWORD, Refault> refault;
 };
 
 static bool register_runtime_inline(probe_session *s, Probe &p);
@@ -3795,13 +3798,29 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     uint64_t address = (uint64_t)(uintptr_t)ex.ExceptionAddress;
     bool restart = false;            // this INT3 is a faulted in-place step restarting (see refault)
     if (auto rf = s->refault.find(event.dwThreadId); rf != s->refault.end() && step == stepping.end()) {
-        const uint64_t site = rf->second;
+        const probe_session::Refault was = rf->second;
+        const uint64_t site = was.site;
         s->refault.erase(rf);                              // one event decides
         if (code == EXCEPTION_BREAKPOINT || code == EXCEPTION_SINGLE_STEP) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
-            CONTEXT w{}; w.ContextFlags = CONTEXT_CONTROL;
-            const bool tf = t && GetThreadContext(t, &w) && (w.EFlags & 0x100u);
-            if (tf && code == EXCEPTION_BREAKPOINT && address == site) {
+            CONTEXT w{}; w.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
+            const bool got = t && GetThreadContext(t, &w);
+            const bool tf = got && (w.EFlags & 0x100u);
+            // Without the flag (WOW64): the handler restored the faulting context unchanged --
+            // every integer register, SP and the arithmetic flags as at the fault.
+            const DWORD arith = 0x1 | 0x4 | 0x10 | 0x40 | 0x80 | 0x400 | 0x800;
+#if defined(_WIN64)
+            const bool same = got && w.Rax == was.regs.Rax && w.Rbx == was.regs.Rbx && w.Rcx == was.regs.Rcx &&
+                w.Rdx == was.regs.Rdx && w.Rsi == was.regs.Rsi && w.Rdi == was.regs.Rdi && w.Rbp == was.regs.Rbp &&
+                w.Rsp == was.regs.Rsp && w.R8 == was.regs.R8 && w.R9 == was.regs.R9 && w.R10 == was.regs.R10 &&
+                w.R11 == was.regs.R11 && w.R12 == was.regs.R12 && w.R13 == was.regs.R13 && w.R14 == was.regs.R14 &&
+                w.R15 == was.regs.R15 && (w.EFlags & arith) == (was.regs.EFlags & arith);
+#else
+            const bool same = got && w.Eax == was.regs.Eax && w.Ebx == was.regs.Ebx && w.Ecx == was.regs.Ecx &&
+                w.Edx == was.regs.Edx && w.Esi == was.regs.Esi && w.Edi == was.regs.Edi && w.Ebp == was.regs.Ebp &&
+                w.Esp == was.regs.Esp && (w.EFlags & arith) == (was.regs.EFlags & arith);
+#endif
+            if ((tf || same) && code == EXCEPTION_BREAKPOINT && address == site) {
                 restart = true;                            // same execution: no new hit
             } else if (tf && code == EXCEPTION_SINGLE_STEP) {
                 // The handler continued elsewhere with our trap flag: one instruction ran,
@@ -3959,8 +3978,13 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
                 // in its context. Remember it, to tell a restart of this same execution (the
                 // handler continues at the site: the INT3 again, TF set) from a new hit, and to
                 // absorb the single stray step if the handler continues elsewhere.
-                if (event.u.Exception.dwFirstChance && address == step->second.site)
-                    s->refault[event.dwThreadId] = step->second.site;
+                if (event.u.Exception.dwFirstChance && address == step->second.site) {
+                    probe_session::Refault rf; rf.site = step->second.site;
+                    HANDLE t = OpenThread(THREAD_GET_CONTEXT, FALSE, event.dwThreadId);
+                    rf.regs.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
+                    if (t && GetThreadContext(t, &rf.regs)) s->refault[event.dwThreadId] = rf;
+                    if (t) CloseHandle(t);
+                }
             }
             stepping.erase(step);
         }
