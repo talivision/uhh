@@ -160,7 +160,8 @@ add_library(probe_api_agent SHARED
     examples/famous/detours_retval/retval_callbacks.cpp
     examples/hunt/hunt_callbacks.cpp
     examples/hunt_callorig/co_callbacks.cpp
-    examples/blogs/blog_callbacks.cpp)
+    examples/blogs/blog_callbacks.cpp
+    examples/ctrlreview/ctrl_callbacks.cpp)
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     target_sources(probe_api_agent PRIVATE src/probe/agent_x64.asm)   # uhh_orig_thunk (call_original)
 endif()
@@ -382,6 +383,22 @@ add_executable(blog_driver examples/blogs/blog_driver.cpp examples/blogs/blog_ca
 target_include_directories(blog_driver PRIVATE include examples/blogs)
 target_link_libraries(blog_driver PRIVATE probe_api)
 add_dependencies(blog_driver blog_target probe_api_agent)
+
+# --- controller review fixtures (regress `ctrl-*`, examples/ctrlreview) ------------------
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    set(CTRL_ASM examples/ctrlreview/ctrl_sites_x86.asm)
+else()
+    set(CTRL_ASM examples/ctrlreview/ctrl_sites_x64.asm)
+endif()
+add_executable(ctrl_target examples/ctrlreview/ctrl_target.cpp ${CTRL_ASM})
+target_link_options(ctrl_target PRIVATE /EXPORT:CtrlLoadInsn /EXPORT:CtrlLoopInsn /INCREMENTAL:NO)
+add_library(ctrl_dll SHARED examples/ctrlreview/ctrl_dll.c)
+target_compile_options(ctrl_dll PRIVATE /Zi)
+target_link_options(ctrl_dll PRIVATE /DEBUG /INCREMENTAL:NO)
+add_executable(ctrl_driver examples/ctrlreview/ctrl_driver.cpp examples/ctrlreview/ctrl_callbacks.cpp)
+target_include_directories(ctrl_driver PRIVATE include)
+target_link_libraries(ctrl_driver PRIVATE probe_api)
+add_dependencies(ctrl_driver ctrl_target ctrl_dll probe_api_agent)
 
 add_executable(refusal_driver examples/conformance/refusal_driver.cpp)
 target_include_directories(refusal_driver PRIVATE include)
