@@ -369,6 +369,8 @@ static int run_bigcfg() {
     const int r = CtrlTock(5);
     std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"bigcfg\",\"r\":%d}\n", r);
     return 0;
+}
+
 // ---- shape -------------------------------------------------------------------------
 typedef uintptr_t (*ShapeFn)(uint32_t tag);
 extern "C" uintptr_t g_tls_off = 0;   // segjmp: TEB offset of this run's TLS slot
