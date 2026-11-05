@@ -56,6 +56,7 @@ struct Probe {
     std::vector<unsigned char> config;
     int dr_slot = -1;   // hardware-breakpoint DR register (0-3); -1 if not a HW probe
     bool active = false;
+    bool warned_double_run = false;   // call_original without return_from (warn once)
 };
 
 struct CallbackState {
@@ -173,6 +174,7 @@ struct probe_session {
     bool attach_held = false;                  // attach: threads held once until inline hooks confirmed
     bool call_cet_warned = false;              // call_func refused under CET (warn once)
     int shadow_stack = -1;                     // target has hardware shadow stacks (CET): -1 unknown, 0/1
+    uint64_t ret_gadgets = 0;                  // return_from: `ret` / `ret N` gadgets in the target
     bool warned_cb_fault = false;              // one stderr warning for a faulting controller-side callback
     DWORD cb_tid = 0;                          // thread whose callback / IPC is being serviced (0 = none)
     std::wstring agent_copy;                   // per-session copy of the agent DLL (UHH_SHARED), deleted at close
@@ -3117,6 +3119,57 @@ static void run_callback(probe_session *s, Probe *probe, probe_context *c) {
     }
 }
 
+// return_from resumes the hit thread at a real `ret` (x86 stdcall: `ret N`) with SP at the
+// hit's return address, so the CPU pops the stack and any CET shadow stack together.
+// One page in the target: offset 0 holds C3, offset 4k holds C2 imm16(4k) -- the gadget
+// for `pop` bytes is at base + pop.
+static uint64_t ret_gadget(probe_session *s, uint32_t pop) {
+    if (pop % 4 || pop > 1020) return 0;
+    if (!s->ret_gadgets) {
+        unsigned char code[1024]; std::memset(code, 0xCC, sizeof(code));
+        code[0] = 0xC3;
+        for (uint32_t k = 4; k < sizeof(code); k += 4) { code[k] = 0xC2; code[k + 1] = (unsigned char)k; code[k + 2] = (unsigned char)(k >> 8); }
+        void *mem = VirtualAllocEx(s->pi.hProcess, nullptr, sizeof(code), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        size_t w = 0; DWORD old = 0;
+        if (!mem) return 0;
+        if (!remote_write(s->pi.hProcess, (uint64_t)(uintptr_t)mem, code, sizeof(code), &w) || w != sizeof(code) ||
+            !VirtualProtectEx(s->pi.hProcess, mem, sizeof(code), PAGE_EXECUTE_READ, &old)) {
+            VirtualFreeEx(s->pi.hProcess, mem, 0, MEM_RELEASE); return 0;
+        }
+        FlushInstructionCache(s->pi.hProcess, mem, sizeof(code));
+        s->ret_gadgets = (uint64_t)(uintptr_t)mem;
+        s->scratch_blocks.push_back(s->ret_gadgets);
+    }
+    return s->ret_gadgets + pop;
+}
+// After a callback: apply return_from (resume at the gadget, SP = the hit's) and return
+// true; or warn once when call_original ran but the hit will fall through into the body.
+static bool apply_return_from(probe_session *s, Probe *probe, const probe_context &c, CONTEXT &native) {
+    if (!c.returned) {
+        if (c.called_original && !probe->warned_double_run) {
+            probe->warned_double_run = true;
+            std::fprintf(stderr, "probe: warning: %s: call_original without return_from -- the original runs again "
+                         "on fall-through. Further cases are not reported.\n", probe->location.c_str());
+        }
+        return false;
+    }
+    uint64_t g = ret_gadget(s, c.ret_pop);
+    if (!g) {
+        if (!probe->warned_double_run) {
+            probe->warned_double_run = true;
+            std::fprintf(stderr, "probe: warning: %s: return_from could not be applied (no return gadget); falling through\n",
+                         probe->location.c_str());
+        }
+        return false;
+    }
+#if defined(_WIN64)
+    native.Rip = g; native.Rsp = c.hit_sp;
+#else
+    native.Eip = (DWORD)g; native.Esp = (DWORD)c.hit_sp;
+#endif
+    return true;
+}
+
 static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
     handled = false;
     HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
@@ -3195,6 +3248,7 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
 #else
         native.Esp = (DWORD)context.regs.rsp;
 #endif
+        apply_return_from(s, probe, context, native);               // Rip -> ret gadget, Rsp -> the hit's
     }
     if (!any) {                                                      // none of our DRs fired
         if (trace_enabled())
@@ -3497,6 +3551,19 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
 #else
     native.Esp = (DWORD)context.regs.rsp;
 #endif
+    if (apply_return_from(s, probe, context, native)) {
+        // The body is skipped: resume at the `ret` gadget, the INT3 stays armed (a
+        // one-shot is retired here instead).
+        if ((probe->flags & PROBE_ONCE) && patch(s->pi.hProcess, probe->address, probe->original)) {
+            probe->active = false; probe->retired = true; s->retired_bps.insert(probe->address);
+        }
+        native.ContextFlags = CONTEXT_FULL;
+        bool ok = !!SetThreadContext(thread, &native);
+        CloseHandle(thread);
+        if (!ok) { set_error(s, win_error("resume at return_from")); return false; }
+        if (at_entry && inline_hold_needed(s)) { hold_thread(s, event.dwThreadId); if (!kick_agent(s)) return false; }
+        disposition = DBG_CONTINUE; return true;
+    }
     if (probe->flags & PROBE_ONCE) {
         // One-shot: put the original byte back for good and resume AT the site -- the
         // real instruction runs in place, no single-step needed. Stale hits from other
@@ -4254,7 +4321,8 @@ static uint64_t resolve_symbol(probe_session *s, const char *symbol) {
     s->error = saved; return 0;
 }
 
-static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint64_t *ret, int nargs, const uint64_t *args) {
+static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint64_t *ret, int nargs, const uint64_t *args,
+                          const probe_context *seed = nullptr) {
     if (s->in_call_tid || nargs < 0 || nargs > 8) return 0;           // no nesting
     // Hardware shadow stacks (CET): the callee is entered by SetThreadContext, not a CALL,
     // so its `ret` to call_trap does not match the shadow stack -> #CP in the target
@@ -4278,6 +4346,7 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
     CONTEXT saved{}; saved.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_FLOATING_POINT;
     if (!GetThreadContext(thread, &saved)) { CloseHandle(thread); return 0; }
     CONTEXT w = saved; size_t wrote = 0; bool ok = true;
+    if (seed) to_context(*seed, w);                                    // call_original: the callback's registers
 #if defined(_WIN64)
     uint64_t sp = ((saved.Rsp - 512) & ~(uint64_t)0xF) - 8;           // entry rsp == 8 mod 16
     uint64_t frame[13] = {s->call_trap};                               // ret, shadow x4, stack args
@@ -4367,6 +4436,31 @@ extern "C" int call_func(probe_context *c, const char *symbol, uint64_t *ret, in
     return call_func_args(c, symbol, ret, nargs, args);
 }
 
+// call_original on breakpoint/hw: call_func on the probe's own address with the hit's
+// (possibly modified) registers and arguments. The probe's INT3/DR is hit at once by the
+// calling thread, which is in call_func, so it steps over without re-entering.
+extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
+    auto *st = c ? static_cast<CallbackState *>(c->controller) : nullptr;
+    if (!st || !st->session || !st->tid || !st->probe || nargs < 0 || nargs > 8) return 0;
+    if (st->probe->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) return 0;
+    uint64_t args[8] = {0};
+    for (int i = 0; i < nargs; ++i) args[i] = get_func_arg(c, (size_t)i);
+    uint64_t ret = 0;
+    if (!call_in_target(st->session, st, st->probe->address, &ret, nargs, args, c)) return 0;
+    c->called_original = 1;
+    if (out) *out = ret;
+    return 1;
+}
+extern "C" void return_from(probe_context *c, uint64_t value, int nargs) {
+    if (!c || nargs < 0 || nargs > 255) return;
+#if defined(_WIN64)
+    (void)nargs; c->regs.rax = value; c->ret_pop = 0;
+#else
+    c->regs.rax = (uint32_t)value; c->ret_pop = (uint32_t)nargs * 4;
+#endif
+    c->returned = 1;
+}
+
 extern "C" probe_session *get_session(probe_context *c) {
     auto *state = c ? static_cast<CallbackState *>(c->controller) : nullptr;
     return state ? state->session : nullptr;
@@ -4446,6 +4540,6 @@ extern "C" void send_log_stack(probe_context *c, const char *format, ...) {
 static void vlog_entry(probe_context *c, int stack, const char *format, va_list ap) { log_common(c, stack != 0, format, ap); }
 static const probe_controller_api g_controller_api = {
     get_reg, set_reg, get_func_arg, get_mem, set_mem, vlog_entry, get_config, call_func_args, get_session,
-    probe_add_address, probe_watch, probe_add_symbol, probe_add_symbol_cfg,
+    probe_add_address, probe_watch, probe_add_symbol, probe_add_symbol_cfg, call_original, return_from,
 };
 const probe_controller_api *controller_api_table() { return &g_controller_api; }

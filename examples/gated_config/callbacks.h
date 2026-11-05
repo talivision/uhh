@@ -50,6 +50,9 @@ PROBE_EXAMPLE_EXPORT void enable_reads(probe_context *);
 PROBE_EXAMPLE_EXPORT void enable_reads_mem(probe_context *);
 /* ntdll!NtOpenProcess entry: remember (pid, out-handle pointer). */
 PROBE_EXAMPLE_EXPORT void track_open_process(probe_context *);
+/* ntdll!NtOpenProcess entry, one callback: call_original, record handle -> pid -> name,
+   return_from with the real status (gated_config --open-mode call). */
+PROBE_EXAMPLE_EXPORT void track_open_process_call(probe_context *);
 /* ntdll!NtReadVirtualMemory entry: log handle/pid/addr/size. */
 PROBE_EXAMPLE_EXPORT void log_read(probe_context *);
 }

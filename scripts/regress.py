@@ -201,12 +201,13 @@ def check_gated_off():
         record("gated-off", False, repr(e))
 
 
-def gated(flag_bk, read_bk, threads, reads, timeout=200, log=True, open_bk=None, extra=()):
+def gated(flag_bk, read_bk, threads, reads, timeout=200, log=True, open_bk=None, open_mode=None, target_args=(), extra=()):
     return run([exe("gated_config.exe"), "--flag-backend", flag_bk, "--read-backend", read_bk,
                 *(["--open-backend", open_bk] if open_bk else []),
+                *(["--open-mode", open_mode] if open_mode else []),
                 *([] if log else ["--no-log"]), *extra, FLAG_LOCATION, READ_LOCATION,
                 "--", exe("probe_app.exe"), "--no-wait", "--helpers", HELPERS,
-                "--threads", threads, "--reads", reads], timeout=timeout)
+                "--threads", threads, "--reads", reads, *target_args], timeout=timeout)
 
 
 def read_log_lines(objs):
@@ -833,6 +834,29 @@ def check_conformance():
             record(name, ok, f"fails={fails[:3]} missing={missing} sp_moved={tgt.get('sp_moved')}/10 arg_rewritten={tgt.get('arg_rewritten')} "
                              f"mem_written={tgt.get('mem_written')} stack_ok={stack_ok} later={later}/20 once={once}/1 "
                              f"once_row={once_row.get('hits')}/{once_row.get('active')} watch_row={watch_row.get('hits')}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+def check_callorig():
+    """call_original / return_from on every backend (conformance_driver --callorig): arguments
+    changed before call_original (a register arg and a stack arg) are what the original sees;
+    its return value comes back; return_from's value is what the caller gets; a pure
+    return_from never runs the body and call_original + return_from runs it exactly once;
+    x86 __stdcall return_from(.., 2) leaves the caller's ESP balanced, cdecl uses nargs=0."""
+    d, t = exe("conformance_driver.exe"), exe("conformance_target.exe")
+    if not d or not t:
+        return skip("callorig", "conformance_driver/target missing")
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"callorig-{bk}"
+        try:
+            r, o = run([d, "--callorig", "--backend", bk, "--", t, "--callorig"], timeout=120)
+            msgs = [str(x.get("message", "")) for x in o if x.get("kind") == "probe_log"]
+            fails = sorted({m for m in msgs if m.startswith("FAIL") or "uhh warning" in m})
+            tgt = next((x for x in o if x.get("kind") == "callorig"), {})
+            ok = (r.returncode == 0 and not fails and all(tgt.get(k) == 10 for k in ("args6", "std2", "std2_sp", "cdecl2", "body_ok"))
+                  and report(o).get("error") is None)
+            record(name, ok, f"target={ {k: v for k, v in tgt.items() if k != 'kind'} } fails={fails[:3]} rc={r.returncode}")
         except Exception as e:
             record(name, False, repr(e))
 
@@ -1649,10 +1673,15 @@ def check_gated_map(threads=4, reads=50):
     rx_open = re.compile(r"open pid=(\d+) name=(\S+)$")
     rx_map = re.compile(r"map handle=0x([0-9a-f]+) -> pid=(\d+) name=(\S+)$")
     rx_read = re.compile(r"read handle=0x([0-9a-f]+) pid=(\d+) name=(\S+) ")
-    for open_bk in ("breakpoint", "hw", "inline"):
-        name = f"gated-map-open-{open_bk}"
+    # mode "call": track_open_process_call (call_original + return_from) builds the map in the
+    # open's own callback; "call-k32": the same with probe_app opening through
+    # kernel32!OpenProcess, whose out slot is a short-lived kernelbase local (lazy cannot map it).
+    for open_bk, mode in [(b, m) for m in ("lazy", "call", "call-k32") for b in ("breakpoint", "hw", "inline")]:
+        name = f"gated-map-open-{open_bk}" + ("" if mode == "lazy" else f"-{mode}")
         try:
-            r, o = gated("breakpoint", "inline", threads, reads, open_bk=open_bk)
+            r, o = gated("breakpoint", "inline", threads, reads, open_bk=open_bk,
+                         open_mode=None if mode == "lazy" else "call",
+                         target_args=("--open-via", "kernel32") if mode.endswith("k32") else ())
             truth = {x["handle"]: x["pid"] for x in o if x.get("kind") == "opened"}
             want_pids = helper_pids(o)
             msgs = [str(x.get("message", "")) for x in o if x.get("kind") == "probe_log"]
@@ -3050,6 +3079,7 @@ def main():
     if want(check_ret_probe): check_ret_probe()
     if want(check_gated_map): check_gated_map()
     if want(check_gated_filter): check_gated_filter()
+    if want(check_callorig): check_callorig()
     if want(check_interrupt): check_interrupt()
     if want(check_agent_crt): check_agent_crt()
     if want(check_oldcrt): check_oldcrt()

@@ -31,6 +31,8 @@ typedef struct probe_controller_api {
     int (*watch)(probe_session *, uint64_t, probe_callback, uint32_t);
     int (*add_symbol)(probe_session *, const char *, probe_callback, uint32_t);
     int (*add_symbol_cfg)(probe_session *, const char *, probe_callback, uint32_t, const void *, size_t);
+    int (*call_original)(probe_context *, int, uint64_t *);
+    void (*return_from)(probe_context *, uint64_t, int);
 } probe_controller_api;
 struct probe_context {
     void *config;
@@ -39,4 +41,10 @@ struct probe_context {
     void *backend;
     void *controller;
     uint32_t tid, site;
+    /* call_original / return_from (per hit): the hit's own stack pointer (return_from
+       resumes there, at a `ret`/`ret N` gadget), whether the original already ran, and
+       whether the callback asked to return. */
+    uint64_t hit_sp;
+    uint32_t ret_pop;                 /* x86: bytes the callee pops (nargs * 4) */
+    uint8_t called_original, returned;
 };

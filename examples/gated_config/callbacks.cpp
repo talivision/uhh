@@ -119,8 +119,37 @@ extern "C" void track_open_process(probe_context *c) {
     at(g_opens[slot].pid).store(pid, std::memory_order_release);   // publish (name before pid)
 }
 
+// 2b. The same map in ONE callback, with nothing left for later (gated_config --open-mode
+//     call): run the real NtOpenProcess now (call_original), read the handle it just wrote
+//     to *out -- however short-lived that slot is (kernel32!OpenProcess's local) -- record
+//     handle -> pid -> name, and make the caller see exactly the status it would have
+//     (return_from: the open is not run again). Works for any caller and needs no access
+//     right on the handle (a PROCESS_VM_READ-only handle cannot be asked for its pid later).
+extern "C" void track_open_process_call(probe_context *c) {
+    uint64_t out = get_func_arg(c, 0), cid = get_func_arg(c, 3);
+    uint64_t pid = cid ? read_pointer(c, cid) : 0;     // CLIENT_ID.UniqueProcess (read before the call)
+    uint64_t status = 0;
+    if (!call_original(c, 4, &status)) return;         // could not run it here: fall through (it runs normally)
+    uint64_t handle = (int32_t)status >= 0 && out ? read_pointer(c, out) : 0;
+    if (pid && handle) {
+        char name[sizeof(OpenRecord::name)];
+        image_name_of(pid, name, sizeof(name));
+        send_log(c, "open pid=%llu name=%s", (unsigned long long)pid, name);
+        uint32_t slot = g_open_count.fetch_add(1, std::memory_order_relaxed);
+        if (slot < kMaxOpens) {
+            std::memcpy(g_opens[slot].name, name, sizeof(name));
+            at(g_opens[slot].out).store(out, std::memory_order_relaxed);
+            at(g_opens[slot].handle).store(handle, std::memory_order_relaxed);
+            at(g_opens[slot].pid).store(pid, std::memory_order_release);   // publish (name, handle before pid)
+        }
+        send_log(c, "map handle=0x%llx -> pid=%llu name=%s", (unsigned long long)handle,
+                 (unsigned long long)pid, name);
+    }
+    return_from(c, status, 4);                          // the caller sees exactly what it would have
+}
+
 // 3. Every read through ntdll!NtReadVirtualMemory(handle,
-//    address, buffer, size, done). Optionally filtered to one pid + one address range.
+//    address, buffer, size, done). Optionally filtered by pid and/or address ranges.
 extern "C" void log_read(probe_context *c) {
     auto *cfg = static_cast<const read_log_config *>(get_config(c));
     if (!cfg || cfg->cookie != READ_LOG_COOKIE || !cfg->log) return;

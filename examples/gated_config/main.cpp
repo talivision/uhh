@@ -1,7 +1,7 @@
 // gated_config -- launch a target whose feature ships DISABLED, turn it on from
 // outside, and log every read it then makes.
 //
-//   gated_config [--flag-backend b] [--read-backend b] [--open-backend b] [--no-log]
+//   gated_config [--flag-backend b] [--read-backend b] [--open-backend b] [--open-mode lazy|call] [--no-log]
 //                [--pid P] [--range BASE:SIZE ...] <flag_location> <read_location> -- <target.exe> [args]
 //
 //   e.g. gated_config configparse.dll!ParseConfig+0x16 ntdll.dll!NtReadVirtualMemory -- probe_app.exe
@@ -17,7 +17,7 @@
 #include <cstring>
 
 static int usage() {
-    std::fprintf(stderr, "usage: gated_config [--flag-backend b] [--read-backend b] [--open-backend b] [--no-log] "
+    std::fprintf(stderr, "usage: gated_config [--flag-backend b] [--read-backend b] [--open-backend b] [--open-mode lazy|call] [--no-log] "
                          "[--pid P] [--range BASE:SIZE ...] <flag_location> <read_location> -- <target.exe> [args]\n"
                          "       b = breakpoint | hw | inline\n");
     return 2;
@@ -26,6 +26,7 @@ static int usage() {
 int main(int argc, char **argv) {
     uint32_t flag_backend = PROBE_BREAKPOINT, read_backend = PROBE_INLINE, open_backend = 0, log = 1;
     read_log_config cfg{};
+    bool open_call = false;   // --open-mode call: track_open_process_call (call_original + return_from)
     const char *locations[2] = {}; int nloc = 0, i = 1;
     for (; i < argc && std::strcmp(argv[i], "--"); ++i) {
         if (!std::strcmp(argv[i], "--no-log")) log = 0;
@@ -34,6 +35,10 @@ int main(int argc, char **argv) {
         else if (!std::strcmp(argv[i], "--open-backend") && i + 1 < argc) open_backend = backend_flag(argv[++i]);
         else if (!std::strcmp(argv[i], "--pid") && i + 1 < argc) cfg.pid = std::strtoull(argv[++i], nullptr, 0);
         else if (!std::strcmp(argv[i], "--range") && i + 1 < argc) { if (!add_read_range(&cfg, argv[++i])) return usage(); }
+        else if (!std::strcmp(argv[i], "--open-mode") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (!std::strcmp(m, "call")) open_call = true; else if (std::strcmp(m, "lazy")) return usage();
+        }
         else if (nloc < 2) locations[nloc++] = argv[i];
         else return usage();
     }
@@ -46,7 +51,7 @@ int main(int argc, char **argv) {
     probe_session *s = probe_session_create();
     if (!s) return 1;
     int ok = probe_add_symbol(s, locations[0], enable_reads, flag_backend) &&
-             probe_add_symbol(s, "ntdll.dll!NtOpenProcess", track_open_process, open_backend) &&
+             probe_add_symbol(s, "ntdll.dll!NtOpenProcess", open_call ? track_open_process_call : track_open_process, open_backend) &&
              probe_add_symbol_cfg(s, locations[1], log_read, read_backend, &cfg, sizeof(cfg)) &&
              probe_launch(s, target) && probe_run(s) && probe_wait_for_exit(s);
     probe_report(s, stdout);   // "overrides" = how many times the flag was flipped

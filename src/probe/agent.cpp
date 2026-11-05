@@ -311,6 +311,16 @@ static void agent_log(probe_context *c, bool stack, const char *format, va_list 
     InterlockedExchange64(&rec->seq, pos + 1);                    // publish
 }
 
+// One warning per probe, delivered as a log record (the callback runs inside the target).
+static volatile LONG g_warned[PROBE_AGENT_MAX_PROBES];
+static void warn_log(probe_context *c, const char *format, ...) {
+    va_list ap; va_start(ap, format); agent_log(c, false, format, ap); va_end(ap);
+}
+static void warn_once(probe_context *c, const char *text) {
+    if (!c || c->site >= PROBE_AGENT_MAX_PROBES || InterlockedExchange(&g_warned[c->site], 1)) return;
+    warn_log(c, "uhh warning: %s", text);
+}
+
 extern "C" void send_log(probe_context *c, const char *format, ...) {
     va_list ap; va_start(ap, format);
     if (g_ctrl) g_ctrl->vlog(c, 0, format, ap); else agent_log(c, false, format, ap);
@@ -423,6 +433,91 @@ extern "C" int call_func(probe_context *c, const char *symbol, uint64_t *ret, in
 #endif
 }
 
+/* ---- call_original / return_from (inline). ----
+   call_original: a real call to the hook's trampoline (the overwritten instructions, then a
+   jump back past the hook), so this probe does not fire for it, with the context's argument
+   registers and the hit's stack arguments. return_from: the patched mid-hook stub resumes at
+   Context::rip with rsp at Context::rsp (cmake/patch_safetyhook.cmake, uhh_resume_slot); a
+   return thunk there does `pop rsp; ret` (x86 `pop esp; ret N`) with Context::rsp = the hit's
+   SP, so the hooked function returns to its caller through a REAL ret (CET shadow stacks
+   stay in sync). The thunks live in one executable page allocated at init: slot k (4 bytes,
+   at offset 4k) is `pop esp; ret 4k` (k = 0: `pop esp; ret`), i.e. the thunk for N popped
+   bytes is at base + N. */
+static uint8_t *g_ret_thunks;
+static void make_ret_thunks() {
+    if (g_ret_thunks) return;
+    auto *p = static_cast<uint8_t *>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!p) return;
+    for (uint32_t k = 0; k < 1024; k += 4) {
+        p[k] = 0x5C;                                       // pop rsp / pop esp
+        if (!k) { p[k + 1] = 0xC3; p[k + 2] = p[k + 3] = 0xCC; }
+        else { p[k + 1] = 0xC2; p[k + 2] = (uint8_t)k; p[k + 3] = (uint8_t)(k >> 8); }
+    }
+    DWORD old = 0;
+    if (!VirtualProtect(p, 4096, PAGE_EXECUTE_READ, &old)) { VirtualFree(p, 0, MEM_RELEASE); return; }
+    FlushInstructionCache(GetCurrentProcess(), p, 4096);
+    g_ret_thunks = p;
+}
+
+#if !defined(_WIN64)
+// Push the args, load ECX/EDX (fastcall/thiscall), call, restore ESP: stdcall and cdecl.
+static bool call_tramp_x86(uint32_t target, const uint32_t *args32, int nargs, uint32_t ecx_v, uint32_t edx_v, uint32_t *ret) {
+    uint32_t lo = 0;
+    __try {
+        __asm {
+            mov ebx, esp
+            mov ecx, nargs
+            mov esi, args32
+        push_loop:
+            test ecx, ecx
+            jz do_call
+            dec ecx
+            push dword ptr [esi + ecx*4]
+            jmp push_loop
+        do_call:
+            mov ecx, ecx_v
+            mov edx, edx_v
+            call dword ptr [target]
+            mov esp, ebx
+            mov lo, eax
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    *ret = lo;
+    return true;
+}
+#endif
+
+static void warn_once(probe_context *c, const char *text);
+extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
+    if (g_ctrl) return g_ctrl->call_original(c, nargs, out);
+    auto *state = c ? static_cast<AgentState *>(c->controller) : nullptr;
+    if (!state || !state->shared || state->index >= PROBE_AGENT_MAX_PROBES || nargs < 0 || nargs > 8) return 0;
+    const uint64_t tramp = state->shared->requests[state->index].trampoline;
+    if (!tramp) return 0;
+    uint64_t a[8] = {0};
+    for (int i = 0; i < nargs; ++i) a[i] = get_func_arg(c, (size_t)i);
+    uint64_t r = 0;
+#if defined(_WIN64)
+    if (!call_raw(tramp, a, &r)) return 0;
+#else
+    uint32_t a32[8], r32 = 0; for (int i = 0; i < 8; ++i) a32[i] = (uint32_t)a[i];
+    if (!call_tramp_x86((uint32_t)tramp, a32, nargs, (uint32_t)c->regs.rcx, (uint32_t)c->regs.rdx, &r32)) return 0;
+    r = r32;
+#endif
+    c->called_original = 1;
+    if (out) *out = r;
+    return 1;
+}
+extern "C" void return_from(probe_context *c, uint64_t value, int nargs) {
+    if (g_ctrl) { g_ctrl->return_from(c, value, nargs); return; }
+    if (!c || nargs < 0 || nargs > 255) return;
+#if defined(_WIN64)
+    (void)nargs; c->regs.rax = value; c->ret_pop = 0;
+#else
+    c->regs.rax = (uint32_t)value; c->ret_pop = (uint32_t)nargs * 4;
+#endif
+    c->returned = 1;
+}
 
 /* ---- Control plane from an inline callback: forwarded to the controller. ----
    get_session(c) returns a per-site proxy (so the controller knows which probe's
@@ -542,7 +637,7 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     c.regs.rdx = native.edx; c.regs.rsi = native.esi; c.regs.rdi = native.edi;
     c.regs.rbp = native.ebp; c.regs.rsp = native.esp; c.regs.flags = native.eflags;
 #endif
-    c.regs.pc = sites[index];
+    c.regs.pc = sites[index]; c.hit_sp = c.regs.rsp;
     c.config = shared->requests[index].config_len ? shared->requests[index].config : nullptr;
     c.ops = &local_ops; c.tid = GetCurrentThreadId(); c.site = index; c.controller = &states[index];
     // Count the hit before the call so a faulting callback is still accounted, and run
@@ -583,6 +678,18 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
 #else
     native.esp = (uint32_t)c.regs.rsp;
 #endif
+    if (c.returned && g_ret_thunks) {
+        // return_from: the stub ends `jmp [Context::rip]` with rsp at Context::rsp; the thunk
+        // pops the hit's SP and returns (x86: ret N) to the caller.
+#if defined(_WIN64)
+        native.rsp = c.hit_sp; native.rip = (uintptr_t)(g_ret_thunks + c.ret_pop);
+#else
+        native.esp = (uint32_t)c.hit_sp; native.eip = (uintptr_t)(g_ret_thunks + c.ret_pop);
+#endif
+    } else if (c.returned || c.called_original) {
+        warn_once(&c, c.returned ? "return_from could not be applied (no return thunk); the original runs"
+                                 : "call_original without return_from -- the original runs again on fall-through");
+    }
 }
 
 // Entry point of every inline hit. It runs FIRST, before any C code that might call the
@@ -771,6 +878,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
         if (!shared || shared->magic != PROBE_AGENT_MAGIC || shared->version != PROBE_AGENT_VERSION) return 2;
     }
     if (shared->request_count > PROBE_AGENT_MAX_PROBES) return 3;
+    make_ret_thunks();
     InterlockedExchange(&g_stopping, 0);   // a new session after a detach: callbacks run again
     for (auto &cb : callbacks) cb = nullptr;  // a new session may map slots to other callbacks
     resolve_callbacks();
