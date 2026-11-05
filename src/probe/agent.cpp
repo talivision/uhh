@@ -2,8 +2,11 @@
 #include "probe_log_format.hpp"
 #include "probe_agent_shared.hpp"
 #include <safetyhook.hpp>
+#include <Zydis/Zydis.h>
 #include <array>
+#include <algorithm>
 #include <bitset>
+#include <vector>
 #include <utility>
 #include <cstdarg>
 #include <intrin.h>
@@ -399,22 +402,38 @@ static bool call_raw(uint64_t fn, const uint64_t *a, uint64_t *ret, int nargs) {
 // probe, whose callback calls call_func again... -> STATUS_STACK_OVERFLOW (found by
 // examples/famous heap_tracker). A fixed table, not TLS: it must work on a thread that
 // is still in its loader initialisation.
-static volatile LONG g_in_call_count;
-static volatile LONG g_in_call_tids[64];
-static bool in_call_func(DWORD tid) {
-    if (!g_in_call_count) return false;
-    for (auto &slot : g_in_call_tids) if ((DWORD)slot == tid) return true;
-    return false;
-}
-struct CallFuncScope {
-    volatile LONG *slot = nullptr;
-    CallFuncScope() {
-        const LONG tid = (LONG)GetCurrentThreadId();
-        for (auto &s : g_in_call_tids)
-            if (InterlockedCompareExchange(&s, tid, 0) == 0) { slot = &s; InterlockedIncrement(&g_in_call_count); break; }
+template <size_t N> struct TidSet {
+    volatile LONG count;
+    volatile LONG tids[N];
+    bool has(DWORD tid) const {
+        if (!count) return false;
+        for (auto &slot : tids) if ((DWORD)slot == tid) return true;
+        return false;
     }
-    ~CallFuncScope() { if (slot) { InterlockedExchange(slot, 0); InterlockedDecrement(&g_in_call_count); } }
 };
+template <size_t N> struct TidScope {
+    TidSet<N> &set;
+    volatile LONG *slot = nullptr;
+    explicit TidScope(TidSet<N> &s) : set(s) {
+        const LONG tid = (LONG)GetCurrentThreadId();
+        for (auto &t : set.tids)
+            if (InterlockedCompareExchange(&t, tid, 0) == 0) { slot = &t; InterlockedIncrement(&set.count); break; }
+    }
+    ~TidScope() { if (slot) { InterlockedExchange(slot, 0); InterlockedDecrement(&set.count); } }
+    TidScope(const TidScope &) = delete;
+    TidScope &operator=(const TidScope &) = delete;
+};
+static TidSet<64> g_in_call;
+static bool in_call_func(DWORD tid) { return g_in_call.has(tid); }
+struct CallFuncScope : TidScope<64> { CallFuncScope() : TidScope<64>(g_in_call) {} };
+
+// The agent's OWN threads (the install service thread; the remote threads running init and
+// stop). A probe they hit -- the hook writes call NtProtectVirtualMemory/FlushInstructionCache,
+// trampolines are allocated, ... -- is not program activity: it passes straight through (not
+// counted, no callback). Running the program's callback there was worse than noise: install
+// rounds run while every other thread is FROZEN, so a callback taking a lock a frozen thread
+// holds (heap, loader) stalled the target until the controller's 5 s freeze limit.
+static TidSet<8> g_agent_threads;
 
 extern "C" int call_func(probe_context *c, const char *symbol, uint64_t *ret, int nargs, ...) {
     if (nargs < 0 || nargs > 8) return 0;
@@ -472,13 +491,56 @@ static void make_ret_thunks() {
    x86: the frame-based SEH chain is relinked for the call -- the record of the __try below
    points straight at the hit's first record -- so dispatch and unwind skip the callback's
    frames; its __finally settles the bookkeeping. */
+struct HitScope;
+/* Per-thread agent state WITHOUT implicit TLS. A hit can come on a thread whose TLS does not
+   exist yet (LdrpInitializeThread allocates it: an allocator probe fires there) or is being
+   freed (thread exit), so "this thread is running a callback" -- the re-entrancy guard --
+   cannot live in a thread_local: with no TLS there was no guard, and an allocating callback
+   on the allocator recursed until the stack overflowed. A fixed table keyed by thread id:
+   a thread claims its slot on its first hit and keeps it (a reused id reuses the slot);
+   after the claim only the owning thread touches its slot. */
+struct ThreadSlot {
+    volatile LONG tid;
+    HitScope *active;                    // the hit whose callback this thread is running
+    volatile LONG64 *active_cell;        // that hit's hit_stripes cell
+    uintptr_t moved_from, moved_to;      // a fault moved out of a trampoline (tramp_veh)
+};
+constexpr uint32_t AGENT_THREAD_SLOTS = 4096;
+static ThreadSlot g_threads[AGENT_THREAD_SLOTS];
+static ThreadSlot *thread_slot(DWORD tid, bool claim) {
+    for (uint32_t n = 0; n < AGENT_THREAD_SLOTS; ++n) {
+        ThreadSlot &s = g_threads[((tid >> 2) + n) & (AGENT_THREAD_SLOTS - 1)];
+        const LONG t = s.tid;
+        if (t == (LONG)tid) return &s;
+        if (t) continue;
+        if (!claim) return nullptr;
+        if (InterlockedCompareExchange(&s.tid, (LONG)tid, 0) == 0) return &s;
+    }
+    return nullptr;                      // 4096 distinct thread ids: this thread runs unguarded
+}
+
 struct HitScope {
     volatile LONG64 *cell;          // hit_stripes cell: its in-flight count
-    bool tls;                       // t_in_callback was set for this hit
+    ThreadSlot *slot;               // this thread's slot (null: table full)
     volatile LONG abandoned;
     const void *xmm6;               // x64: the hit's XMM6..XMM15 (safetyhook Context, contiguous)
+    uintptr_t canary;               // (uintptr_t)this ^ HIT_CANARY while the callback runs
+    uint64_t orig_ret;              // call_original: the original's return value...
+    uint32_t orig_pop;              // ...and the stack bytes its `ret N` popped (x86)
 };
+constexpr uintptr_t HIT_CANARY = (uintptr_t)0x5A17C0DEA11CE5EDull;
 static void hit_scope_abandon(HitScope *h);
+// Is h -- this thread's recorded running hit -- still live? A hit nested in a callback runs
+// BELOW the outer callback's frame, on the same stack, with the outer scope intact. A longjmp
+// that does not unwind (x64 jmp_buf.Frame == 0) out of call_original skips every frame in
+// between, so no handler settles the hit: its record outlives its frame. The next hit is
+// then at or above that frame (the longjmp went up), or the memory no longer holds the scope.
+static bool hit_scope_live(const HitScope *h, uint64_t sp) {
+    const NT_TIB *tib = reinterpret_cast<const NT_TIB *>(NtCurrentTeb());
+    const uintptr_t a = (uintptr_t)h, lo = (uintptr_t)tib->StackLimit, hi = (uintptr_t)tib->StackBase;
+    if (a <= sp || a < lo || a + sizeof(HitScope) > hi) return false;   // never read off this stack
+    return h->canary == (a ^ HIT_CANARY);
+}
 
 #if defined(_WIN64)
 struct OrigFrame {                   // layout read by uhh_orig_thunk
@@ -500,8 +562,9 @@ extern "C" EXCEPTION_DISPOSITION uhh_orig_unwind(EXCEPTION_RECORD *rec, void *fr
 struct SehRecord { SehRecord *next; void *handler; };
 // Push the args, load ECX/EDX (fastcall/thiscall), call, restore ESP: stdcall and cdecl.
 static void call_tramp_x86(uint32_t target, const uint32_t *args32, int nargs, uint32_t ecx_v, uint32_t edx_v,
-                           uint32_t *ret, uint32_t hit_sp, HitScope *scope) {
+                           uint32_t *ret, uint32_t *popped, uint32_t hit_sp, HitScope *scope) {
     uint32_t lo = 0;
+    int32_t moved = 0;                   // esp after the call - esp before the pushes
     volatile int normal = 0;
     __try {
         // This function's own record heads the chain here; link it straight to the first
@@ -524,6 +587,9 @@ static void call_tramp_x86(uint32_t target, const uint32_t *args32, int nargs, u
             mov ecx, ecx_v
             mov edx, edx_v
             call dword ptr [target]
+            mov ecx, esp
+            sub ecx, ebx
+            mov moved, ecx
             mov esp, ebx
             mov lo, eax
         }
@@ -533,6 +599,7 @@ static void call_tramp_x86(uint32_t target, const uint32_t *args32, int nargs, u
         if (!normal && scope) hit_scope_abandon(scope);              // unwound past us
     }
     *ret = lo;
+    *popped = (uint32_t)(moved + 4 * nargs);   // the callee's `ret N`: N (cdecl 0)
 }
 #endif
 
@@ -567,12 +634,15 @@ extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
     f.nv[4] = c->regs.r12; f.nv[5] = c->regs.r13; f.nv[6] = c->regs.r14; f.nv[7] = c->regs.r15;
     f.scope = scope; f.xmm6 = scope->xmm6;
     r = uhh_orig_thunk(tramp, a, &f);
+    scope->orig_pop = 0;
 #else
-    uint32_t a32[8], r32 = 0; for (int i = 0; i < 8; ++i) a32[i] = (uint32_t)a[i];
-    call_tramp_x86((uint32_t)tramp, a32, nargs, (uint32_t)c->regs.rcx, (uint32_t)c->regs.rdx, &r32,
+    uint32_t a32[8], r32 = 0, popped = 0; for (int i = 0; i < 8; ++i) a32[i] = (uint32_t)a[i];
+    call_tramp_x86((uint32_t)tramp, a32, nargs, (uint32_t)c->regs.rcx, (uint32_t)c->regs.rdx, &r32, &popped,
                    (uint32_t)c->hit_sp, scope);
     r = r32;
+    scope->orig_pop = popped;
 #endif
+    scope->orig_ret = r;
     c->called_original = 1;
     if (out) *out = r;
     return 1;
@@ -657,12 +727,11 @@ static volatile LONG g_stopping;
 // Callbacks running right now are counted with their hits in the SHARED block (hit_stripes'
 // high bits): what is still in flight when the process dies (ExitProcess kills threads
 // mid-callback) is reported by the controller as callbacks_interrupted.
-static thread_local int t_in_callback;
 // An exception or longjmp left the original (call_original) and is unwinding past this
 // hit's callback: settle what call_mid would have on return (once).
 static void hit_scope_abandon(HitScope *h) {
     if (InterlockedExchange(&h->abandoned, 1)) return;
-    if (h->tls && tls_ready()) t_in_callback = 0;
+    if (h->slot && h->slot->active == h) h->slot->active = nullptr;
     InterlockedExchangeAdd64(h->cell, -PROBE_AGENT_INFLIGHT_ONE);
 }
 static bool any_inflight() {
@@ -729,18 +798,31 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     // target's registers untouched (the callback behaves as a no-op mutation).
     // A hit is a callback run: while being unhooked the hook passes straight through and
     // that pass is NOT counted (else a detach would report hits that have no callback/log).
-    if (g_stopping) return;
-    uint32_t stripe = (GetCurrentThreadId() >> 2) & (PROBE_AGENT_STRIPES - 1);
+    if (g_agent_threads.has(c.tid)) return;          // the agent's own work: see g_agent_threads
+    const probe_callback cb = callbacks[index];
+    if (!cb) return;
+    uint32_t stripe = (c.tid >> 2) & (PROBE_AGENT_STRIPES - 1);
     volatile LONG64 &cell = shared->hit_stripes[index][stripe].value;
     // ONE atomic add counts the hit and marks a callback in flight (see hit_stripes): a thread
     // killed between two separate counters left a hit that was neither logged nor interrupted.
     InterlockedExchangeAdd64(&cell, 1 + PROBE_AGENT_INFLIGHT_ONE);
+    // g_stopping is checked only once this hit is in flight: probe_agent_stop sets it and then
+    // waits for in-flight callbacks, so a hit is either seen by that wait or sees the flag
+    // (both sides use full-barrier interlocked operations). Checked first, a thread between
+    // the check and the add ran its callback after the detach (its IPC then raised an
+    // exception nobody handled, visible to the target).
+    if (g_stopping) { InterlockedExchangeAdd64(&cell, -(1 + PROBE_AGENT_INFLIGHT_ONE)); return; }
     // A probe hit by code the callback itself runs (call_func of a probed function, or a
     // probed API called directly) is counted but does not re-enter a callback -- exactly
     // what breakpoint/hw do inside call_func. Re-entering recursed until the stack overflowed.
-    // (No TLS yet -- a thread in loader init, see region_cache -- means no callback is running
-    // on it; in_call_func covers this thread's call_func whatever its TLS state.)
-    if (in_call_func(GetCurrentThreadId()) || (tls_ready() && t_in_callback)) {
+    // The guard is the thread's slot (no TLS: see ThreadSlot); a record left behind by a
+    // non-unwinding longjmp is recognised as stale (hit_scope_live) and settled here.
+    ThreadSlot *const ts = thread_slot(c.tid, true);
+    if (ts && ts->active && !hit_scope_live(ts->active, c.hit_sp)) {
+        InterlockedExchangeAdd64(ts->active_cell, -PROBE_AGENT_INFLIGHT_ONE);
+        ts->active = nullptr;
+    }
+    if (in_call_func(c.tid) || (ts && ts->active)) {
         InterlockedExchangeAdd64(&cell, -PROBE_AGENT_INFLIGHT_ONE); return;
     }
     // The mid-hook stub preserves GPRs, flags and XMM0-15 only. The callback (and the CRT
@@ -749,17 +831,33 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     // and give C code the ABI-required DF=0.
     // Extended state (MXCSR, AVX/AVX-512) and DF are handled in mid_entry, BEFORE any of
     // this C code runs -- see there.
-    const bool tls = tls_ready();
-    if (tls) t_in_callback = 1;
-    HitScope scope{&cell, tls, 0, nullptr};
+    HitScope scope{&cell, ts, 0, nullptr, 0, 0, 0};
+    scope.canary = (uintptr_t)&scope ^ HIT_CANARY;
 #if defined(_WIN64)
     scope.xmm6 = &native.xmm6;
 #endif
+    if (ts) { ts->active_cell = &cell; ts->active = &scope; }
     c.hit_scope = &scope;
-    bool callback_ok = run_callback(callbacks[index], &c);
-    if (tls) t_in_callback = 0;
+    bool callback_ok = run_callback(cb, &c);
+    if (ts) ts->active = nullptr;
+    scope.canary = 0;
     InterlockedExchangeAdd64(&cell, -PROBE_AGENT_INFLIGHT_ONE);
-    if (!callback_ok) return;
+    if (!callback_ok) {
+        // A faulting callback is a no-op: its register changes are discarded -- unless it had
+        // already run the original (call_original). Falling through would run the original a
+        // SECOND time (a double free / double close), so the hooked function returns to its
+        // caller with return_from's value if one was set, else the original's own result.
+        if (!c.called_original || !g_ret_thunks) return;
+        const uint64_t value = c.returned ? c.regs.rax : scope.orig_ret;
+        const uint32_t pop = c.returned ? c.ret_pop : scope.orig_pop;
+        if (pop % 4 || pop >= 1024) return;
+#if defined(_WIN64)
+        native.rax = value; native.rsp = c.hit_sp; native.rip = (uintptr_t)(g_ret_thunks + pop);
+#else
+        native.eax = (uint32_t)value; native.esp = (uint32_t)c.hit_sp; native.eip = (uintptr_t)(g_ret_thunks + pop);
+#endif
+        return;
+    }
 #if defined(_WIN64)
 #define COPY(a,b) native.a = c.regs.a;
     PROBE_GPRS(COPY)
@@ -833,6 +931,98 @@ static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
     _mm_setcsr(mxcsr);
 }
 
+/* A fault in an instruction the hook RELOCATED into its trampoline (the hooked function's
+   first bytes at the site, e.g. a load inside its own __try) is raised at the trampoline
+   address. x64 dispatch looks handlers up by that address: there is no unwind data for it
+   and the hooked function's own scope tables do not cover it, so the program's handler was
+   never found (unhandled exception / std::terminate). The agent's vectored handler -- the
+   first to run, it only rewrites -- moves such a fault to the original instruction it stands
+   for (same registers: the relocated copy did not execute), so dispatch, unwind and crash
+   reports see the program's own code. If a handler resumes it (EXCEPTION_CONTINUE_EXECUTION),
+   the continue handler moves it back into the trampoline: the site itself holds the hook's
+   jump. Each map is published (tramp != 0) before its hook is enabled. */
+struct TrampMap { volatile uintptr_t tramp; uintptr_t site; uint32_t n; uint8_t t_off[16], o_off[16]; };
+static TrampMap g_tmap[PROBE_AGENT_MAX_PROBES];
+static void map_trampoline(uint32_t i, uintptr_t site, uintptr_t tramp, const std::vector<uint8_t> &orig) {
+    TrampMap &m = g_tmap[i];
+    m.tramp = 0;
+    MemoryBarrier();
+    if (!tramp || orig.empty() || orig.size() > 32) return;
+    ZydisDecoder dec;
+#if defined(_WIN64)
+    ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+#else
+    ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_COMPAT_32, ZYDIS_STACK_WIDTH_32);
+#endif
+    const auto *t = reinterpret_cast<const uint8_t *>(tramp);
+    MEMORY_BASIC_INFORMATION mbi{};        // decode only inside the trampoline's committed block
+    if (!VirtualQuery(t, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return;
+    const uintptr_t tend = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+    uint32_t o = 0, q = 0, n = 0;
+    while (n < 16) {
+        m.t_off[n] = (uint8_t)q; m.o_off[n] = (uint8_t)o; ++n;     // o == size: the jump back = site+len
+        if (o >= orig.size()) break;
+        ZydisDecodedInstruction a{}, b{};
+        if (!ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(&dec, nullptr, orig.data() + o, orig.size() - o, &a)) ||
+            tramp + q >= tend ||
+            !ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(&dec, nullptr, t + q, (size_t)std::min<uintptr_t>(32, tend - tramp - q), &b))) {
+            --n; break;
+        }
+        // A CALL relocated as push + jmp (SafetyHook, uhh_relocate_call_as_jmp) is the last
+        // instruction; its push stands for the call, nothing after it is reached.
+        if (a.mnemonic == ZYDIS_MNEMONIC_CALL && b.mnemonic == ZYDIS_MNEMONIC_PUSH) break;
+        o += a.length; q += b.length;
+        if (q > 200) { --n; break; }
+    }
+    m.site = site; m.n = n;
+    MemoryBarrier();
+    m.tramp = tramp;
+}
+static bool tramp_to_site(uintptr_t ip, uintptr_t *site) {
+    for (auto &m : g_tmap) {
+        const uintptr_t t = m.tramp;
+        if (!t || ip < t || ip - t > 255) continue;
+        for (uint32_t k = 0; k < m.n; ++k)
+            if (t + m.t_off[k] == ip) { *site = m.site + m.o_off[k]; return true; }
+    }
+    return false;
+}
+#if defined(_WIN64)
+#define UHH_IP(ctx) (ctx)->Rip
+#else
+#define UHH_IP(ctx) (ctx)->Eip
+#endif
+using nt_raise_fn = LONG (NTAPI *)(EXCEPTION_RECORD *, CONTEXT *, BOOLEAN);
+static nt_raise_fn g_nt_raise;           // ntdll!NtRaiseException, resolved at init
+static LONG CALLBACK tramp_veh(EXCEPTION_POINTERS *ep) {
+    const DWORD tid = GetCurrentThreadId();
+    const uintptr_t ip = (uintptr_t)UHH_IP(ep->ContextRecord);
+    if (ThreadSlot *ts = thread_slot(tid, false))                       // a new exception (not our re-raise)
+        if (ts->moved_to && (uintptr_t)ep->ExceptionRecord->ExceptionAddress != ts->moved_to) ts->moved_to = 0;
+    uintptr_t site = 0;
+    if ((uintptr_t)ep->ExceptionRecord->ExceptionAddress != ip || !tramp_to_site(ip, &site)) return EXCEPTION_CONTINUE_SEARCH;
+    if (ThreadSlot *ts = thread_slot(tid, true)) { ts->moved_from = ip; ts->moved_to = site; }
+    // RE-RAISE at the original address rather than edit this dispatch: the dispatcher's own
+    // frame keeps a separate copy of the faulting RIP/RSP (its machine frame), which the
+    // unwind to a handler walks through -- edited only in the CONTEXT, the unwind no longer
+    // matched the dispatch and ended in STATUS_BAD_STACK. NtRaiseException starts a fresh
+    // dispatch from the given context (the abandoned one is below its SP, never returned to).
+    EXCEPTION_RECORD rec = *ep->ExceptionRecord;
+    rec.ExceptionAddress = (void *)site;
+    alignas(16) CONTEXT ctx = *ep->ContextRecord;
+    ctx.ContextFlags &= ~(DWORD)0x40;                                   // CONTEXT_XSTATE: no CONTEXT_EX copied
+    UHH_IP(&ctx) = site;
+    if (g_nt_raise) g_nt_raise(&rec, &ctx, TRUE);                       // does not return
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+static LONG CALLBACK tramp_vch(EXCEPTION_POINTERS *ep) {
+    ThreadSlot *ts = thread_slot(GetCurrentThreadId(), false);
+    if (!ts || !ts->moved_to) return EXCEPTION_CONTINUE_SEARCH;
+    if ((uintptr_t)UHH_IP(ep->ContextRecord) == ts->moved_to) UHH_IP(ep->ContextRecord) = ts->moved_from;
+    ts->moved_to = 0;
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 // One entry thunk per request slot (the slot index is baked in), generated at compile time.
 using mid_callback = void (*)(safetyhook::Context &);
 template <uint32_t N> static void mid_thunk(safetyhook::Context &c) { mid_entry(c, N); }
@@ -876,12 +1066,15 @@ static void install_pending() {
 }
 // Resolve every requested callback by name NOW, while no DLL load is in progress, so later
 // install rounds (e.g. for a module that is being loaded right now) never call the loader.
+// Each slot is overwritten in one store (a new session may map it to another callback):
+// clearing them all first left a window in which a hook still live from an earlier session
+// called a null callback (an access violation the target's vectored handlers could see).
 static void resolve_callbacks() {
     uint32_t count = shared->request_count;
     if (count > PROBE_AGENT_MAX_PROBES) count = PROBE_AGENT_MAX_PROBES;
     for (uint32_t i = 0; i < count; ++i) {
         const auto &request = shared->requests[i];
-        if (callbacks[i] || !request.callback[0] || request.config_len > PROBE_AGENT_CONFIG_CAP) continue;
+        if (!request.callback[0] || request.config_len > PROBE_AGENT_CONFIG_CAP) continue;
         char name[PROBE_AGENT_EXPORT_CAP];
         std::memcpy(name, request.callback, sizeof(name)); name[sizeof(name) - 1] = 0;
         callbacks[i] = reinterpret_cast<probe_callback>(GetProcAddress(self_module, name));
@@ -922,6 +1115,7 @@ static void install_pending_locked() {
         if (!hooks[i]) { InterlockedExchange(&request.status, PROBE_AGENT_HOOK_FAILED); continue; }
         request.patch_len = (uint32_t)hooks[i].original_bytes().size();
         request.trampoline = (uint64_t)hooks[i].uhh_trampoline();
+        map_trampoline(i, (uintptr_t)request.site, hooks[i].uhh_trampoline(), hooks[i].original_bytes());
         enabling.set(i);
     }
     if (enabling.none()) return;
@@ -964,6 +1158,7 @@ static bool notify_installed() {
 
 static HANDLE service_event;
 static DWORD WINAPI service_main(void *) {
+    TidScope<8> own(g_agent_threads);
     for (;;) {
         if (WaitForSingleObject(service_event, INFINITE) != WAIT_OBJECT_0) return 1;
         install_pending();
@@ -971,7 +1166,9 @@ static DWORD WINAPI service_main(void *) {
     }
 }
 
+extern "C" volatile long uhh_safetyhook_keep_calls;
 extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
+    TidScope<8> own(g_agent_threads);
     if (!shared) {
         wchar_t name[64]; probe_agent_mapping_name(GetCurrentProcessId(), name);
         mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, name);
@@ -981,8 +1178,19 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
     }
     if (shared->request_count > PROBE_AGENT_MAX_PROBES) return 3;
     make_ret_thunks();
+    static PVOID veh = nullptr;
+    if (!veh) {
+        // Under CET shadow stacks a call in a hook's range is relocated verbatim (a return
+        // through a pushed address would be a #CP): see uhh_relocate_call_as_jmp.
+        PROCESS_MITIGATION_USER_SHADOW_STACK_POLICY pol{};
+        if (GetProcessMitigationPolicy(GetCurrentProcess(), ProcessUserShadowStackPolicy, &pol, sizeof(pol)) &&
+            pol.EnableUserShadowStack)
+            InterlockedExchange(&uhh_safetyhook_keep_calls, 1);
+        g_nt_raise = reinterpret_cast<nt_raise_fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtRaiseException"));
+        veh = AddVectoredExceptionHandler(1, tramp_veh);
+        AddVectoredContinueHandler(1, tramp_vch);
+    }
     InterlockedExchange(&g_stopping, 0);   // a new session after a detach: callbacks run again
-    for (auto &cb : callbacks) cb = nullptr;  // a new session may map slots to other callbacks
     resolve_callbacks();
     install_pending();
     if (service_event) InterlockedExchange(&shared->service_ready, 1);   // thread from an earlier session
@@ -1000,6 +1208,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
 // Unhook without pulling code out from under a thread: stop new callbacks, wait for the
 // ones in flight to finish (bounded), then remove the hooks.
 extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_stop(void *) {
+    TidScope<8> own(g_agent_threads);
     AcquireSRWLockExclusive(&g_install_lock);            // after any install round in progress
     InterlockedExchange(&g_stopping, 1);
     for (int i = 0; i < 2000 && any_inflight(); ++i) Sleep(1);
