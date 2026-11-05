@@ -132,8 +132,16 @@ def exe(name):
     return p if p.exists() else None
 
 
+def live(result):
+    """Each result as it is recorded (timestamped), so a run can be followed in flight;
+    the full table is printed again at the end."""
+    name, status, detail = result
+    print(f"[{time.strftime('%H:%M:%S')}] {status:4}  {name:34} {detail}", flush=True)
+
+
 def record(name, ok, detail=""):
     RESULTS.append((name, "PASS" if ok else "FAIL", detail))
+    live(RESULTS[-1])
 
 
 def skip(name, why):
@@ -142,6 +150,7 @@ def skip(name, why):
     and a SKIP is never counted as a pass."""
     status = "FAIL" if "missing" in why else "SKIP"
     RESULTS.append((name, status, why))
+    live(RESULTS[-1])
 
 
 def probes(objs):
