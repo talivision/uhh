@@ -1031,6 +1031,80 @@ def check_callorig_hunt():
                         q.kill()
 
 
+CC_NAMES = ["CcCdecl0", "CcCdecl3", "CcStd3", "CcStd10", "CcFast4", "CcThisGet", "CcVec", "CcI64", "CcStdI64",
+            "CcS12", "CcS8", "CcDbl", "CcFlt", "CcRetBig", "CcRetBigStd", "CcRet8", "CcHot", "CcIlt",
+            "CcImpThunk", "CcJmpDst"]          # = cc_shared.h's CC_FNS, in id order
+CC_X86_ONLY = {"CcHot"}
+
+
+def check_callconv():
+    """Calling conventions (examples/callconv): ccfix.dll exports one function per x86/x64
+    convention and argument/return shape -- cdecl, stdcall, fastcall, thiscall, vectorcall, 0
+    and 10 arguments, 64-bit arguments (two x86 slots), structs by value, float/double
+    arguments and ST0/XMM0 results, EDX:EAX results, hidden return pointers (cdecl and
+    stdcall), an x86 hot-patch prologue, an incremental-link thunk, an import thunk and a
+    tail-call jmp target. Every one is probed at entry on breakpoint, hw and inline and:
+      wrap      get_func_arg/get_reg are what the caller passed; call_original's *ret is
+                right; return_from(r, n) gives the caller exactly the original's result
+                (EAX, EDX:EAX, ST0, XMM0, struct) and the body ran once;
+      replace   return_from(v, n) without the body: the caller gets v (or the struct the
+                callback wrote through the hidden pointer); float results fall through;
+      wrongpop  call_original + return_from with a WRONG x86 nargs: the stack is still
+                right (the measured pop wins) and the mismatch is warned (x86).
+    cc_target checks every result and, on x86, the bytes popped and EBX/ESI/EDI/EBP. hw
+    probes go in groups of 3 (4 debug registers, one kept free for call_original)."""
+    d, t = exe("cc_driver.exe"), exe("cc_target.exe")
+    if not d or not t:
+        return skip("callconv", "cc_driver/cc_target missing")
+    x86 = "x86" in str(BIN).lower() or "win32" in str(BIN).lower()
+    ids = [i for i, n in enumerate(CC_NAMES) if x86 or n not in CC_X86_ONLY]
+
+    def rows(objs):
+        return [x for x in objs if x.get("kind") == "cct"], next((x for x in objs if x.get("kind") == "cct_sum"), {})
+
+    try:
+        r, o = run([t, "none"], timeout=60)
+        rs, sm = rows(o)
+        bad = [f"{x['name']}: {x['detail']}" for x in rs if not x.get("ok")]
+        record("callconv-baseline", r.returncode == 0 and sm.get("fails") == 0 and len(rs) == len(ids),
+               f"rows={len(rs)}/{len(ids)} bad={bad[:4]} rc={r.returncode}")
+    except Exception as e:
+        record("callconv-baseline", False, repr(e))
+    for bk in ("breakpoint", "hw", "inline"):
+        groups = [ids[k:k + 3] for k in range(0, len(ids), 3)] if bk == "hw" else [ids]
+        for mode in ("wrap", "replace", "wrongpop"):
+            name = f"callconv-{mode}-{bk}"
+            problems, warned = [], 0
+            try:
+                for g in groups:
+                    mask = f"{sum(1 << i for i in g):x}"
+                    r, o = run([d, "--backend", bk, "--mode", mode, "--mask", mask, "--", t, mode, mask], timeout=120)
+                    rs, sm = rows(o)
+                    msgs = [str(x.get("message", "")) for x in o if x.get("kind") == "probe_log"]
+                    hits = {}
+                    for m in msgs:
+                        if m.startswith("cc hit "):
+                            hits[m[7:]] = hits.get(m[7:], 0) + 1
+                    fails = [m for m in msgs if m.startswith("cc FAIL")]
+                    warned += sum(1 for l in (r.stderr.splitlines() + msgs) if "popped" in l and "return_from" in l)
+                    others = [m for m in msgs if "uhh warning" in m and "popped" not in m]
+                    rep = report(o)
+                    want_hits = {CC_NAMES[i]: 1 for i in g}
+                    bad = [f"{x['name']}: {x['detail']}" for x in rs if not x.get("ok")]
+                    if (r.returncode != 0 or sm.get("fails") != 0 or len(rs) != len(ids) or hits != want_hits or fails or
+                            others or rep.get("error") is not None or rep.get("log_dropped") != 0):
+                        problems.append(f"mask={mask} rc={r.returncode} target_bad={bad[:3]} cb_fails={fails[:3]} "
+                                        f"hits={ {k: v for k, v in hits.items() if want_hits.get(k) != v} } "
+                                        f"missing={[k for k in want_hits if k not in hits]} warn={others[:2]} "
+                                        f"err={rep.get('error')} stderr={r.stderr.strip().splitlines()[-2:]}")
+                # x86: the wrong nargs is caught (warned once per probe whose pop it contradicts).
+                if mode == "wrongpop" and x86 and not warned:
+                    problems.append("no 'return_from ... popped' warning for the wrong nargs")
+                record(name, not problems, "; ".join(problems)[:1500] if problems else f"groups={len(groups)} warned={warned}")
+            except Exception as e:
+                record(name, False, repr(e))
+
+
 def check_memstress(threads=8, iters=20000):
     """get_mem/set_mem at scale, every backend: exact values, writes visible, page-crossing
     access, bad addresses failing closed, nothing else in the target's memory touched."""
@@ -3767,6 +3841,7 @@ def main():
     if want(check_gated_filter): check_gated_filter()
     if want(check_callorig): check_callorig()
     if want(check_callorig_hunt): check_callorig_hunt()
+    if want(check_callconv): check_callconv()
     if want(check_interrupt): check_interrupt()
     if want(check_agent_crt): check_agent_crt()
     if want(check_oldcrt): check_oldcrt()
