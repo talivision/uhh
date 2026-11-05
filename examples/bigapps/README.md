@@ -14,7 +14,7 @@ Probes (busy system exports, at most 4 so the hw backend fits):
 CreateFileW for `ws2_32!connect:xSd` (not required to hit: the network service may be out of process).
 
 Each run asserts: the program's own self-check is right (`BIGAPPS_DONE ... bad=0`, or the JS result
-and 40/40 fetches in the dumped DOM) and it exits 0; no `probe: ... target crashed` (second-chance) line
+and 40/40 fetches in the dumped DOM) and it exits 0; no `probe: ... target crashed` (second-chance)
 line; every required probe hit; `log_dropped == 0`; `logs_written ==` the logged probes' hits
 (runs to exit) and every written log reached stdout; after a detach the program keeps working
 (PowerShell keeps ticking, Edge finishes its page) and exits 0.
