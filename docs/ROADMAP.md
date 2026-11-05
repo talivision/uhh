@@ -911,6 +911,37 @@ overflows its stack. Every backend, x64 and x86.
   gets garbage there. Breakpoint/hw run the original in place with the full context and have
   none of these limits. Returning through the program's caller would break the CET shadow stack.
 
+## Test-hardening findings (2026-11-06, Codex test review, `scripts/regress.py` / `scripts/soak.py`)
+18 checks could pass without testing what they claim (each verified against the code; all 18
+real). Each now asserts an independent oracle -- constants and counts computed in Python or
+written out literally, return codes, hits == logs + dropped + interrupted, the target's own
+result values, strict JSON, multisets -- and missing explicitly-selected prerequisites FAIL.
+Checks that now fail are left failing (library code is not changed here):
+- ⬜ (TH1) **`call_func("kernel32!X")` resolves on every backend, but `include/probe_api.h`
+  says it is refused** ("module is matched by its file name WITH extension ... "kernel32!X" is
+  refused"). Portability P1 made every backend refuse it; transparency TR5 (516358d) then made
+  every backend accept it (bare name = `<name>.dll`) without changing the header. The old
+  diff-only `portability-matrix-A` could not see it (all three backends agree);
+  the absolute oracle does: `portability-matrix-A` FAIL, x64 and x86, all three
+  backends: `call_func.no-ext=1 pid=1`, want `0 pid=0`. Decide which is right and make the
+  header and the code agree (then update `portability_expect`).
+- ⬜ (TH2) **A closed stdout makes the session fail**: `logs-stdout-closed-{inline,hw}` -- every
+  log IS in the JSONL file (20000/20000, 2000/2000, per-thread order exact; the report written
+  to a side file says hits == logs_written, dropped 0), but `probe_report.error` = "tail probe
+  logs to stdout (Win32=109/232)" (broken pipe / no process at the other end) and the
+  controller exits 1 (`probe_wait_for_exit` fails). A reader going away (`| head`) is normal
+  use; the complete file means the session did its job. x64 and x86, same errors.
+- ⬜ (TH3) **x86 `get_reg` returns a value no 32-bit register can hold**: after
+  `set_reg(c, r, 0x1_0000_5E0r)` (matrix_callbacks.cpp `pm_on_regs`, deliberately wider than
+  the register) `get_reg(c, r)` = `0x100005e0r` for EAX..EBP on breakpoint, hw AND inline
+  (`portability-matrix-A` x86: `reg.set.0..6`, `return_from.mid-ax` = `100005e00`), while the
+  program sees `0x5e0r` (`target.out` correct). probe_api.h: "Every ID is the full native
+  register: ... EAX..EBP/ESP on x86" -- a read-back must be the register's value (low 32 bits).
+  All backends agree, so the old diff-only check passed.
+- (resolved by the merge of merge-frida, f07e457) `ctrl-inplace` with the exact oracle failed
+  before that merge: hits = logs = 1156 of 24000 calls (x64, breakpoint; round 3 #2: missed
+  while lifted). After the merge: 24000/24000/24000 distinct.
+
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`
 - ✅ Per-log overhead ceilings in the suite (`log-throughput-*`)
