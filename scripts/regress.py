@@ -1689,9 +1689,15 @@ def check_gated_map(threads=4, reads=50):
             maps = [m.groups() for m in map(rx_map.match, msgs) if m]
             rds = [m.groups() for m in map(rx_read.match, msgs) if m]
             bad = []
-            if {int(p) for p, _ in opens} != want_pids or len(opens) != len(want_pids):
-                bad.append(f"opens={opens}")
-            bad += [f"open-name {n}" for _, n in opens if n.lower() != "probe_app.exe"]
+            # Every helper open must be seen. An extra open is tolerated (and reported): seen
+            # only with the lazy breakpoint probe on a freshly built probe_app's first launch
+            # (armed at load, it catches a start-up NtOpenProcess the later-armed hw/inline
+            # probes miss). The map itself must still equal the ground truth exactly.
+            target_pid = next((x.get("pid") for x in o if x.get("kind") == "waiting"), None)
+            extra = [(p, n) for p, n in opens if int(p) not in want_pids]
+            if not want_pids <= {int(p) for p, _ in opens} or len(opens) - len(extra) != len(want_pids):
+                bad.append(f"opens={opens} target_pid={target_pid} helpers={sorted(want_pids)}")
+            bad += [f"open-name {n}" for p, n in opens if int(p) in want_pids and n.lower() != "probe_app.exe"]
             if sorted(int(h, 16) for h, _, _ in maps) != sorted(truth):
                 bad.append(f"mapped={[h for h, _, _ in maps]} truth={[hex(h) for h in truth]}")
             bad += [f"map {h}->{p}" for h, p, n in maps
@@ -1700,7 +1706,8 @@ def check_gated_map(threads=4, reads=50):
             ok = (r.returncode == 0 and len(truth) == len(want_pids) and not bad and
                   len(rds) == threads * reads and wrong_reads == 0)
             record(name, ok, f"opens={len(opens)} maps={len(maps)}/{len(truth)} reads={len(rds)}/{threads * reads} "
-                             f"wrong_reads={wrong_reads} rc={r.returncode}" + ("" if ok else f" bad={bad[:4]}"))
+                             f"wrong_reads={wrong_reads} rc={r.returncode}" +
+                             (f" extra_opens={extra} target_pid={target_pid}" if extra else "") + ("" if ok else f" bad={bad[:4]}"))
         except Exception as e:
             record(name, False, repr(e))
 
