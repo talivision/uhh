@@ -1909,9 +1909,11 @@ def check_gated_map(threads=4, reads=50):
             if not want_pids <= {int(p) for p, _ in opens} or len(opens) - len(extra) != len(want_pids):
                 bad.append(f"opens={opens} target_pid={target_pid} helpers={sorted(want_pids)}")
             bad += [f"open-name {n}" for p, n in opens if int(p) in want_pids and n.lower() != "probe_app.exe"]
-            if sorted(int(h, 16) for h, _, _ in maps) != sorted(truth):
-                bad.append(f"mapped={[h for h, _, _ in maps]} truth={[hex(h) for h in truth]}")
-            bad += [f"map {h}->{p}" for h, p, n in maps
+            # The extra (non-helper) open is mapped too, correctly; compare only the helpers'.
+            helper_maps = [(h, p, n) for h, p, n in maps if int(p) in want_pids]
+            if sorted(int(h, 16) for h, _, _ in helper_maps) != sorted(truth):
+                bad.append(f"mapped={[h for h, _, _ in helper_maps]} truth={[hex(h) for h in truth]}")
+            bad += [f"map {h}->{p}" for h, p, n in helper_maps
                     if truth.get(int(h, 16)) != int(p) or n.lower() != "probe_app.exe"]
             wrong_reads = sum(1 for h, p, n in rds if truth.get(int(h, 16)) != int(p) or n.lower() != "probe_app.exe")
             ok = (r.returncode == 0 and len(truth) == len(want_pids) and not bad and
