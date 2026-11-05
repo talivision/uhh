@@ -136,6 +136,21 @@ void probe_close(probe_session *);
 /* ---- Data plane: take a CONTEXT (this hit's registers and memory). ---- */
 uint64_t get_reg(probe_context *, enum probe_register);
 int set_reg(probe_context *, enum probe_register, uint64_t value);
+/* Integer argument `index` at a function ENTRY probe ([SP] = the return address). The API
+   cannot know the callee's convention, so the index is positional per architecture:
+   x64 (every convention, incl. __vectorcall): the index-th argument -- 0..3 = RCX, RDX, R8, R9,
+     then [RSP+8+8*index]. A float/double among the first four is in XMM<index> (not
+     readable: that index returns the unrelated integer register); a struct of 1/2/4/8 bytes
+     comes by value, any other struct as a pointer to a caller copy; a hidden return pointer
+     (struct results over 8 bytes) is index 0 (member functions: `this` 0, hidden pointer 1)
+     and shifts the rest up by one.
+   x86: the index-th 4-byte STACK slot, [ESP+4+4*index], whatever the convention. Register
+     arguments are not slots -- read them with get_reg: __fastcall ECX, EDX (the first two
+     integer args; index 0 is the third), __thiscall ECX = this (index 0 is the first
+     declared argument), __vectorcall ECX, EDX and XMM0-5 (not readable). A 64-bit integer
+     or double takes two slots (low, high), a float one, a struct by value size/4 slots,
+     and a hidden return pointer (results over 8 bytes) is slot 0.
+   Only meaningful at the entry; mid-function the slots are wherever SP happens to be. */
 uint64_t get_func_arg(probe_context *, size_t index);
 int get_mem(probe_context *, uint64_t address, void *buffer, size_t size);
 int set_mem(probe_context *, uint64_t address, const void *buffer, size_t size);
@@ -157,14 +172,21 @@ const void *get_config(probe_context *);
    holds: avoid functions that need them (e.g. the allocator from inside a malloc hook). */
 int call_func(probe_context *, const char *symbol, uint64_t *ret, int nargs, ...);
 /* Detours-style replacement from an ENTRY probe (a probe on a function's first
-   instruction), same source on every backend.
+   instruction -- also a jmp thunk: an import/incremental-link thunk or tail-call target, and
+   an x86 `mov edi,edi` hot-patch prologue), same source on every backend.
    call_original runs the probed function NOW, on the hit thread, with the CURRENT
    argument registers and stack (including set_reg/set_mem changes the callback made); *ret
-   receives its return register (x64 RAX; x86 EAX, zero-extended). Returns 1 if it ran. This probe does not fire
-   (and counts no hit) for that call. nargs = integer/pointer arguments the function takes
-   (0..8; more than it really takes is harmless, fewer is not): inline copies x64 args 5+ and
-   every x86 STACK argument from the hit's stack into a new call frame (x86 ECX/EDX are passed
-   as they are, for __fastcall / __thiscall). Inline: a real call to the hook's trampoline.
+   receives its integer return register (x64 RAX; x86 EAX, zero-extended -- the high half of
+   an EDX:EAX result is not in *ret, but return_from passes it on, see there). A float/double
+   result (ST0/XMM0) is not in *ret either; return_from passes it on too. Returns 1 if it
+   ran. This probe does not fire (and counts no hit) for that call. nargs = integer/pointer
+   arguments the function takes (0..8); it matters to inline only, and only as a minimum:
+   inline runs the original in a NEW call frame holding a copy of the hit's stack arguments
+   -- every one of the first 32 x64 stack arguments / 64 x86 stack slots (bounded by the top
+   of the thread's stack), plus RCX/RDX/R8/R9 (x64), EAX/ECX/EDX (x86) and XMM0-5 as at the
+   hit -- so >8 arguments, 64-bit/struct/double stack arguments, hidden return pointers and
+   float arguments all arrive as they do on breakpoint/hw. Larger stack arguments
+   (> 256 bytes of them) are cut off on inline. Inline: a real call to the hook's trampoline.
    Breakpoint/hw: the original runs in place on the hit's own stack, from the probe address,
    and a debug register set on that thread only catches its return (needs one of the 4
    debug registers for the duration of the call: a free one, or -- when the hit is itself a
@@ -182,15 +204,30 @@ int call_func(probe_context *, const char *symbol, uint64_t *ret, int nargs, ...
    address (the bytes before it are no CALL); e.g. a probe after a `push`. On 0 the original
    has NOT run: don't return_from, just let the hit fall through.
    return_from makes the probed function return to its caller as soon as the callback
-   ends, with value in AX: the original body is not run (again). Resumes at a real `ret`
-   (x86: `ret nargs*4`) with SP at the hit's return address, so the CPU pops the normal
-   and shadow stacks together (CET-safe on every backend). nargs: the x86 STACK argument
-   count the callee pops (__stdcall: all of them; __fastcall: those after the first two;
-   __thiscall: those after `this`); pass 0 for an x86 __cdecl function (the caller pops);
-   ignored on x64. Refused (no effect, warned once) where call_original is. Register changes
-   the callback made (set_reg) are kept; SP is always the hit's. Calling call_original
-   without return_from lets the original run a second time on fall-through (warned once
-   per probe). See docs/ROADMAP.md, "call_original findings". */
+   ends: the original body is not run (again). Resumes at a real `ret` (x86: `ret nargs*4`)
+   with SP at the hit's return address, so the CPU pops the normal and shadow stacks
+   together (CET-safe on every backend). The caller gets: x64 RAX = value; x86 EAX = the low
+   half of value and EDX = its high half (an __int64 or 8-byte struct result) -- except that
+   after call_original, a value whose high half is 0 leaves EDX as the original returned it,
+   so return_from(c, r, nargs) passes ANY integer result through unchanged (to return a
+   64-bit value with a zero high half there, set_reg(c, PROBE_REG_DX, 0) after return_from).
+   Floating-point results cannot be set: after call_original the caller gets the original's
+   own XMM0 / x87 ST0 (so passing a float/double result through works); without it, it gets
+   whatever XMM0/ST0 hold (garbage -- don't return_from a float function without calling the
+   original). A struct result over 8 bytes is returned through the hidden pointer
+   (get_func_arg(c, 0), x64 member functions 1): write it with set_mem and return_from(c,
+   pointer, nargs). nargs: the x86 STACK argument slots the callee pops -- __stdcall,
+   __thiscall, __fastcall and __vectorcall pop theirs, i.e. every slot get_func_arg can see
+   (__stdcall: all of them, 64-bit/double ones counting 2; __fastcall/__vectorcall: those after
+   the register ones; __thiscall: those after `this`; a hidden return pointer counts 1);
+   pass 0 for an x86 __cdecl (or varargs) function (the caller pops); ignored on x64. The API
+   cannot know the convention: after call_original the count the original REALLY popped
+   (measured) is used and a different nargs is warned once per probe; without call_original
+   a wrong nargs is NOT caught and leaves the caller's ESP off by the difference. Refused
+   (no effect, warned once) where call_original is. Other register changes the callback made
+   (set_reg) are kept; SP is always the hit's. Calling call_original without return_from lets
+   the original run a second time on fall-through (warned once per probe). See
+   docs/ROADMAP.md, "call_original findings" and "Calling-convention findings". */
 int call_original(probe_context *, int nargs, uint64_t *ret);
 void return_from(probe_context *, uint64_t value, int nargs);
 /* The session this callback belongs to, for control-plane calls from a callback. In a

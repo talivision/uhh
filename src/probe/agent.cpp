@@ -578,6 +578,7 @@ static void agent_log(probe_context *c, bool stack, const char *format, va_list 
 
 // One warning per probe, delivered as a log record (the callback runs inside the target).
 static volatile LONG g_warned[PROBE_AGENT_MAX_PROBES];
+static volatile LONG g_warned_pop[PROBE_AGENT_MAX_PROBES];   // return_from's nargs contradicted call_original (x86)
 static void warn_log(probe_context *c, const char *format, ...) {
     va_list ap; va_start(ap, format); agent_log(c, false, format, ap); va_end(ap);
 }
@@ -742,6 +743,14 @@ struct HitScope {
     bool tls;                       // t_in_callback was set for this hit
     volatile LONG abandoned;
     const void *xmm6;               // x64: the hit's XMM6..XMM15 (safetyhook Context, contiguous)
+    const void *xmm0;               // the hit's XMM0..XMM5 (vector/float arguments; safetyhook Context)
+    // call_original's floating-point result, applied by return_from: XMM0 as the original
+    // left it, and (x86) the x87 state with its ST0 result (an FNSAVE image owned by the hook
+    // entry, which reloads it after the extended-state restore).
+    alignas(16) unsigned char xmm0_post[16] = {};
+    bool have_post = false;
+    unsigned char *x87_post = nullptr; // x86: 108-byte FNSAVE buffer (mid_entry's)
+    bool have_x87 = false;
 };
 static void hit_scope_abandon(HitScope *h);
 
@@ -751,22 +760,35 @@ struct OrigFrame {                   // layout read by uhh_orig_thunk
     uint64_t nv[8];                  // rbx rbp rsi rdi r12 r13 r14 r15 at the hit
     HitScope *scope;                 // +0x50
     const void *xmm6;                // +0x58
+    const void *xmm0;                // +0x60 the hit's XMM0..XMM5 (loaded for the call; may be null)
+    unsigned char xmm0_out[16];      // +0x68 XMM0 as the original returned it
 };
-static_assert(offsetof(OrigFrame, scope) == 0x50 && offsetof(OrigFrame, xmm6) == 0x58, "uhh_orig_thunk layout");
-extern "C" uint64_t uhh_orig_thunk(uint64_t fn, const uint64_t *args8, const OrigFrame *frame);
+static_assert(offsetof(OrigFrame, scope) == 0x50 && offsetof(OrigFrame, xmm6) == 0x58 &&
+              offsetof(OrigFrame, xmm0) == 0x60 && offsetof(OrigFrame, xmm0_out) == 0x68, "uhh_orig_thunk layout");
+// args: the 4 register arguments, then UHH_ORIG_STACK_ARGS stack arguments (5th onwards).
+#define UHH_ORIG_STACK_ARGS 32
+extern "C" uint64_t uhh_orig_thunk(uint64_t fn, const uint64_t *args, OrigFrame *frame);
 extern "C" EXCEPTION_DISPOSITION uhh_orig_unwind(EXCEPTION_RECORD *rec, void *frame, CONTEXT *, void *) {
     if (rec && (rec->ExceptionFlags & 0x66) && frame) {           // EXCEPTION_UNWIND: leaving through us
-        auto *h = *reinterpret_cast<HitScope **>(static_cast<unsigned char *>(frame) + 0x68);
+        auto *h = *reinterpret_cast<HitScope **>(static_cast<unsigned char *>(frame) + 0x148);   // uhh_orig_thunk
         if (h) hit_scope_abandon(h);
     }
     return ExceptionContinueSearch;
 }
 #else
 struct SehRecord { SehRecord *next; void *handler; };
-// Push the args, load ECX/EDX (fastcall/thiscall), call, restore ESP: stdcall and cdecl.
-static void call_tramp_x86(uint32_t target, const uint32_t *args32, int nargs, uint32_t ecx_v, uint32_t edx_v,
-                           uint32_t *ret, uint32_t hit_sp, HitScope *scope) {
-    uint32_t lo = 0;
+// FNSAVE/FRSTOR image of the x87 state (108 bytes in 32-bit protected mode).
+static void x87_restore(const unsigned char *img) { __asm { mov eax, img
+                                                            frstor [eax] } }
+// Push the stack slots, load EAX/ECX/EDX (fastcall/thiscall/vectorcall/register conventions)
+// and XMM0-5 (vectorcall), call, and record what the original returned: EDX:EAX, the bytes it
+// popped (its `ret N`), XMM0, and the x87 state holding an ST0 result. The x87 state the
+// callback continues with is the hit's own (nothing pushed): return_from reloads x87_post.
+static void call_tramp_x86(uint32_t target, const uint32_t *args32, int nargs, uint32_t eax_v, uint32_t ecx_v,
+                           uint32_t edx_v, const void *vec_args, uint32_t *ret_lo, uint32_t *ret_hi, int32_t *popped,
+                           unsigned char *vec_out, unsigned char *x87_out, uint32_t hit_sp, HitScope *scope) {
+    uint32_t lo = 0, hi = 0, pb = 0;
+    unsigned char x87_pre[108];
     volatile int normal = 0;
     __try {
         // This function's own record heads the chain here; link it straight to the first
@@ -776,6 +798,19 @@ static void call_tramp_x86(uint32_t target, const uint32_t *args32, int nargs, u
         while (head && head != (SehRecord *)(uintptr_t)0xFFFFFFFF && (uint32_t)(uintptr_t)head <= hit_sp) head = head->next;
         self->next = head;
         __asm {
+            lea eax, x87_pre
+            fnsave [eax]
+            frstor [eax]
+            mov eax, vec_args
+            test eax, eax
+            jz no_xmm
+            movups xmm0, [eax]
+            movups xmm1, [eax+16]
+            movups xmm2, [eax+32]
+            movups xmm3, [eax+48]
+            movups xmm4, [eax+64]
+            movups xmm5, [eax+80]
+        no_xmm:
             mov ebx, esp
             mov ecx, nargs
             mov esi, args32
@@ -786,18 +821,30 @@ static void call_tramp_x86(uint32_t target, const uint32_t *args32, int nargs, u
             push dword ptr [esi + ecx*4]
             jmp push_loop
         do_call:
+            mov edi, esp
+            mov eax, eax_v
             mov ecx, ecx_v
             mov edx, edx_v
             call dword ptr [target]
-            mov esp, ebx
             mov lo, eax
+            mov hi, edx
+            mov eax, esp
+            sub eax, edi
+            mov pb, eax
+            mov esp, ebx
+            mov eax, vec_out
+            movups [eax], xmm0
+            mov eax, x87_out
+            fnsave [eax]
+            lea eax, x87_pre
+            frstor [eax]
         }
         self->next = saved;
         normal = 1;
     } __finally {
         if (!normal && scope) hit_scope_abandon(scope);              // unwound past us
     }
-    *ret = lo;
+    *ret_lo = lo; *ret_hi = hi; *popped = (int32_t)pb;
 }
 #endif
 
@@ -822,22 +869,47 @@ extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
         warn_once(c, "call_original refused: not at a function entry ([SP] is no return address)");
         return 0;
     }
-    uint64_t a[8] = {0};
-    for (int i = 0; i < nargs; ++i) a[i] = get_func_arg(c, (size_t)i);
+    // The original gets the hit's stack arguments as a COPY in a new frame: not just the nargs
+    // the callback named but a window of the hit's stack (up to 32 x64 stack arguments / 64
+    // x86 slots, never past the top of this thread's stack), so a function with more than 8
+    // arguments, 64-bit or struct arguments (several x86 slots) or a hidden return pointer
+    // runs with all of them -- as it does in place on breakpoint/hw.
+    const NT_TIB *tib = reinterpret_cast<const NT_TIB *>(NtCurrentTeb());
+    const uint64_t stack_top = (uint64_t)(uintptr_t)tib->StackBase, stack_low = (uint64_t)(uintptr_t)tib->StackLimit;
+    auto window = [&](uint64_t first, uint64_t slot, int cap) -> int {   // slots readable from first
+        if (first < stack_low || first >= stack_top) return 0;
+        const uint64_t n = (stack_top - first) / slot;
+        return n < (uint64_t)cap ? (int)n : cap;
+    };
     uint64_t r = 0;
 #if defined(_WIN64)
+    uint64_t a[4 + UHH_ORIG_STACK_ARGS] = {0};
+    for (int i = 0; i < nargs; ++i) a[i] = get_func_arg(c, (size_t)i);
+    const int extra = window(c->hit_sp + 0x28, 8, UHH_ORIG_STACK_ARGS);
+    for (int i = 0; i < extra; ++i)
+        if (4 + i >= nargs) a[4 + i] = reinterpret_cast<const uint64_t *>((uintptr_t)(c->hit_sp + 0x28))[i];
     OrigFrame f{};
     f.rip = ret_addr; f.rsp = c->hit_sp + 8;
     f.nv[0] = c->regs.rbx; f.nv[1] = c->regs.rbp; f.nv[2] = c->regs.rsi; f.nv[3] = c->regs.rdi;
     f.nv[4] = c->regs.r12; f.nv[5] = c->regs.r13; f.nv[6] = c->regs.r14; f.nv[7] = c->regs.r15;
-    f.scope = scope; f.xmm6 = scope->xmm6;
+    f.scope = scope; f.xmm6 = scope->xmm6; f.xmm0 = scope->xmm0;
     r = uhh_orig_thunk(tramp, a, &f);
+    std::memcpy(scope->xmm0_post, f.xmm0_out, 16);
 #else
-    uint32_t a32[8], r32 = 0; for (int i = 0; i < 8; ++i) a32[i] = (uint32_t)a[i];
-    call_tramp_x86((uint32_t)tramp, a32, nargs, (uint32_t)c->regs.rcx, (uint32_t)c->regs.rdx, &r32,
-                   (uint32_t)c->hit_sp, scope);
-    r = r32;
+    uint32_t a32[64] = {0}, lo = 0, hi = 0;
+    int32_t popped = -1;
+    for (int i = 0; i < nargs; ++i) a32[i] = (uint32_t)get_func_arg(c, (size_t)i);
+    int n = window(c->hit_sp + 4, 4, 64);
+    for (int i = nargs; i < n; ++i) a32[i] = reinterpret_cast<const uint32_t *>((uintptr_t)(c->hit_sp + 4))[i];
+    if (n < nargs) n = nargs;
+    call_tramp_x86((uint32_t)tramp, a32, n, (uint32_t)c->regs.rax, (uint32_t)c->regs.rcx, (uint32_t)c->regs.rdx,
+                   scope->xmm0, &lo, &hi, &popped, scope->xmm0_post, scope->x87_post, (uint32_t)c->hit_sp, scope);
+    r = lo;
+    c->orig_edx = hi;
+    c->orig_pop = popped;
+    scope->have_x87 = scope->x87_post != nullptr;
 #endif
+    scope->have_post = true;
     c->called_original = 1;
     if (out) *out = r;
     return 1;
@@ -852,7 +924,12 @@ extern "C" void return_from(probe_context *c, uint64_t value, int nargs) {
 #if defined(_WIN64)
     (void)nargs; c->regs.rax = value; c->ret_pop = 0;
 #else
-    c->regs.rax = (uint32_t)value; c->ret_pop = (uint32_t)nargs * 4;
+    uint32_t pop = (uint32_t)nargs * 4;
+    if (probe_x86_return_regs(c, value, &pop) && c->site < PROBE_AGENT_MAX_PROBES &&
+        !InterlockedExchange(&g_warned_pop[c->site], 1))
+        warn_log(c, "uhh warning: return_from nargs=%d but the original popped %d bytes (ret %d); the original's "
+                    "count is used", nargs, (int)c->orig_pop, (int)c->orig_pop);
+    c->ret_pop = pop;
 #endif
     c->returned = 1;
 }
@@ -971,7 +1048,10 @@ static bool run_callback(probe_callback cb, probe_context *c) {
 }
 // Kept out of line so the 4 KiB save area (and its stack probe) costs nothing on the
 // common path.
-static void call_mid(safetyhook::Context &native, uint32_t index) {
+// x87_post (x86): a 108-byte buffer owned by the caller; returns true when it holds the x87
+// state return_from must leave (an ST0 result of call_original), to reload after any
+// extended-state restore.
+static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char *x87_post) {
     probe_context c{};
     /* SafetyHook's Context is Context64 on x64 and Context32 on x86; fill the same
        gospel probe_regs from whichever register image this build captured. */
@@ -994,7 +1074,7 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     // target's registers untouched (the callback behaves as a no-op mutation).
     // A hit is a callback run: while being unhooked the hook passes straight through and
     // that pass is NOT counted (else a detach would report hits that have no callback/log).
-    if (g_stopping) return;
+    if (g_stopping) return false;
     uint32_t stripe = (GetCurrentThreadId() >> 2) & (PROBE_AGENT_STRIPES - 1);
     volatile LONG64 &cell = shared->hit_stripes[index][stripe].value;
     // ONE atomic add counts the hit and marks a callback in flight (see hit_stripes): a thread
@@ -1006,7 +1086,7 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     // (No TLS yet -- a thread in loader init, see region_cache -- means no callback is running
     // on it; in_call_func covers this thread's call_func whatever its TLS state.)
     if (in_call_func(GetCurrentThreadId()) || (tls_ready() && t_in_callback)) {
-        InterlockedExchangeAdd64(&cell, -PROBE_AGENT_INFLIGHT_ONE); return;
+        InterlockedExchangeAdd64(&cell, -PROBE_AGENT_INFLIGHT_ONE); return false;
     }
     // The mid-hook stub preserves GPRs, flags and XMM0-15 only. The callback (and the CRT
     // it calls) may touch x87/MXCSR/YMM/ZMM state -- e.g. vzeroupper -- which the target
@@ -1020,11 +1100,13 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
 #if defined(_WIN64)
     scope.xmm6 = &native.xmm6;
 #endif
+    scope.xmm0 = &native.xmm0;
+    scope.x87_post = x87_post;
     c.hit_scope = &scope;
     bool callback_ok = run_callback(callbacks[index], &c);
     if (tls) t_in_callback = 0;
     InterlockedExchangeAdd64(&cell, -PROBE_AGENT_INFLIGHT_ONE);
-    if (!callback_ok) return;
+    if (!callback_ok) return false;
 #if defined(_WIN64)
 #define COPY(a,b) native.a = c.regs.a;
     PROBE_GPRS(COPY)
@@ -1053,10 +1135,15 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
 #else
         native.esp = (uint32_t)c.hit_sp; native.eip = (uintptr_t)(g_ret_thunks + c.ret_pop);
 #endif
+        // After call_original the caller gets the original's floating-point result too
+        // (XMM0; x86 ST0 through the x87 image the hook entry reloads).
+        if (c.called_original && scope.have_post) std::memcpy(&native.xmm0, scope.xmm0_post, 16);
+        return c.called_original && scope.have_x87;
     } else if (c.returned || c.called_original) {
         warn_once(&c, c.returned ? "return_from could not be applied (no return thunk); the original runs"
                                  : "call_original without return_from -- the original runs again on fall-through");
     }
+    return false;
 }
 
 // Entry point of every inline hit. It runs FIRST, before any C code that might call the
@@ -1066,7 +1153,8 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
 // does not (MXCSR always; AVX/AVX-512 when live, or unconditionally when the CPU cannot
 // report liveness), using intrinsics only -- then run the hit. The stub restores RFLAGS
 // (so the target's DF) on the way out.
-static __declspec(noinline) void mid_entry_saved(safetyhook::Context &native, uint32_t index, uint64_t mask) {
+static __declspec(noinline) bool mid_entry_saved(safetyhook::Context &native, uint32_t index, uint64_t mask,
+                                                  unsigned char *x87_post) {
     alignas(64) unsigned char area[4096];
     __stosb(area + 512, 0, 64);                            // XSAVE header must start clean (no CRT call)
 #if defined(_WIN64)
@@ -1075,27 +1163,43 @@ static __declspec(noinline) void mid_entry_saved(safetyhook::Context &native, ui
     if (g_xs.compact) _xsavec(area, mask); else _xsave(area, mask);
 #endif
     unsigned int mxcsr = _mm_getcsr();
-    call_mid(native, index);
+    const bool x87 = call_mid(native, index, x87_post);
     _mm_setcsr(mxcsr);
 #if defined(_WIN64)
     _xrstor64(area, mask);
 #else
     _xrstor(area, mask);
 #endif
+    return x87;
 }
 
 static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
     __writeeflags(__readeflags() & ~(uintptr_t)0x400);    // DF=0 before ANY C code
+#if defined(_WIN64)
+    unsigned char *x87_post = nullptr;                     // x64 returns floating point in XMM0 only
+#else
+    unsigned char x87_buf[108], *x87_post = x87_buf;       // call_original's x87 state (ST0 result)
+#endif
+    bool x87 = false;
     LONG xmode = shared->xstate_mode;                      // 0 gated (default), 1 none, 2 full (bench knob)
-    if (xmode == 1 || !g_xs.ok) { call_mid(native, index); return; }
-    uint64_t mask = 0;
-    if (xmode == 2) mask = g_xs.mask;
-    else if (g_xs.xinuse) mask = _xgetbv(1) & g_xs.avx_mask;  // only components actually live
-    else mask = g_xs.avx_mask;                             // liveness unknown: keep AVX state
-    if (mask) { mid_entry_saved(native, index, mask); return; }
-    unsigned int mxcsr = _mm_getcsr();                     // the common case: just MXCSR
-    call_mid(native, index);
-    _mm_setcsr(mxcsr);
+    if (xmode == 1 || !g_xs.ok) x87 = call_mid(native, index, x87_post);
+    else {
+        uint64_t mask = 0;
+        if (xmode == 2) mask = g_xs.mask;
+        else if (g_xs.xinuse) mask = _xgetbv(1) & g_xs.avx_mask;  // only components actually live
+        else mask = g_xs.avx_mask;                         // liveness unknown: keep AVX state
+        if (mask) x87 = mid_entry_saved(native, index, mask, x87_post);
+        else {
+            unsigned int mxcsr = _mm_getcsr();             // the common case: just MXCSR
+            x87 = call_mid(native, index, x87_post);
+            _mm_setcsr(mxcsr);
+        }
+    }
+#if !defined(_WIN64)
+    if (x87) x87_restore(x87_post);                        // return_from after call_original: ST0 = its result
+#else
+    (void)x87;
+#endif
 }
 
 // One entry thunk per request slot (the slot index is baked in), generated at compile time.

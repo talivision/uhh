@@ -64,6 +64,7 @@ struct Probe {
     int dr_slot = -1;   // hardware-breakpoint DR register (0-3); -1 if not a HW probe
     bool active = false;
     bool warned_double_run = false;   // call_original without return_from (warn once)
+    bool warned_pop = false;          // x86 return_from nargs contradicted call_original (warn once)
 };
 
 struct CallbackState {
@@ -71,7 +72,17 @@ struct CallbackState {
     Probe *probe;
     DWORD pid = 0, tid = 0;   // the stopped event's thread (call_func runs code on it)
     bool released = false;    // call_original: the original left without returning; the thread runs on
+    // call_original (breakpoint/hw): the floating-point state the original returned with
+    // (XMM0 / x87 ST0 results), which return_from hands to the caller.
+    bool have_post_fp = false;
+    CONTEXT post_fp{};
 };
+// The floating-point parts of a CONTEXT (x86: the x87 save area and the FXSAVE image with XMM).
+#if defined(_WIN64)
+#define UHH_CONTEXT_FP CONTEXT_FLOATING_POINT
+#else
+#define UHH_CONTEXT_FP (CONTEXT_FLOATING_POINT | CONTEXT_EXTENDED_REGISTERS)
+#endif
 
 // A thread mid-single-step over a software breakpoint. displaced == true means the
 // INT3 was left armed and the instruction is running out-of-line (land at address +
@@ -3439,6 +3450,18 @@ static bool apply_return_from(probe_session *s, Probe *probe, const probe_contex
         return false;
     }
     uint64_t g = ret_gadget(s, c.ret_pop);
+    auto *st = static_cast<CallbackState *>(c.controller);
+    if (g && c.called_original && st && st->have_post_fp) {
+        // The caller gets the original's floating-point result too (XMM0, x87 ST0): its whole
+        // FP state as it returned -- nonvolatile parts are the hit's anyway (ABI).
+#if defined(_WIN64)
+        native.FltSave = st->post_fp.FltSave; native.MxCsr = st->post_fp.MxCsr;
+#else
+        native.FloatSave = st->post_fp.FloatSave;
+        std::memcpy(native.ExtendedRegisters, st->post_fp.ExtendedRegisters, sizeof(native.ExtendedRegisters));
+#endif
+        native.ContextFlags |= UHH_CONTEXT_FP;
+    }
     if (!g) {
         if (!probe->warned_double_run) {
             probe->warned_double_run = true;
@@ -4005,7 +4028,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         if ((probe->flags & PROBE_ONCE) && patch(s->pi.hProcess, probe->address, probe->original)) {
             probe->active = false; probe->retired = true; s->retired_bps.insert(probe->address);
         }
-        native.ContextFlags = CONTEXT_FULL;
+        native.ContextFlags = CONTEXT_FULL | UHH_CONTEXT_FP;      // FP: the original's result (see apply_return_from)
         bool ok = !!SetThreadContext(thread, &native);
         CloseHandle(thread);
         if (!ok) { set_error(s, win_error("resume at return_from")); return false; }
@@ -4979,7 +5002,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
     }
     HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, st->tid);
     if (!thread) return 0;
-    CONTEXT saved{}; saved.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_FLOATING_POINT | CONTEXT_DEBUG_REGISTERS;
+    CONTEXT saved{}; saved.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | UHH_CONTEXT_FP | CONTEXT_DEBUG_REGISTERS;
     if (!GetThreadContext(thread, &saved)) { CloseHandle(thread); return 0; }
     int slot = -1;
     for (int k = 0; k < 4 && slot < 0; ++k)
@@ -5045,7 +5068,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
             if (ev.dwThreadId == st->tid && ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT &&
                 ev.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP &&
                 (uint64_t)(uintptr_t)ev.u.Exception.ExceptionRecord.ExceptionAddress == ret_addr) {
-                CONTEXT r{}; r.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+                CONTEXT &r = st->post_fp; r.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | UHH_CONTEXT_FP;
                 if (GetThreadContext(thread, &r)) {
 #if defined(_WIN64)
                     const uint64_t sp = r.Rsp, rax = r.Rax;
@@ -5053,7 +5076,13 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
                     const uint64_t sp = r.Esp, rax = r.Eax;
 #endif
                     if (sp > s->co_sp && sp <= s->co_sp + ptr + 1024) {   // x86 stdcall: ret N popped the args
-                        result = rax; done = true; break;                  // this event now stands in for the hit
+                        result = rax; done = true;                         // this event now stands in for the hit
+                        st->have_post_fp = true;
+#if !defined(_WIN64)
+                        c->orig_edx = r.Edx;                               // an EDX:EAX result's high half
+                        c->orig_pop = (int32_t)(sp - (s->co_sp + ptr));    // the bytes its `ret N` popped
+#endif
+                        break;
                     }
                     r.EFlags |= 0x10000u; SetThreadContext(thread, &r);    // some other return there: run on
                 }
@@ -5104,7 +5133,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
             saved.Dr0 = cur.Dr0; saved.Dr1 = cur.Dr1; saved.Dr2 = cur.Dr2; saved.Dr3 = cur.Dr3; saved.Dr7 = cur.Dr7;
         }
         saved.Dr6 = 0;
-        saved.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_FLOATING_POINT | CONTEXT_DEBUG_REGISTERS;
+        saved.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | UHH_CONTEXT_FP | CONTEXT_DEBUG_REGISTERS;
         SetThreadContext(thread, &saved);              // exactly as it was at the hit
     } else if (!s->exited && !thread_gone) {
         clear_slot(true);
@@ -5145,7 +5174,14 @@ extern "C" void return_from(probe_context *c, uint64_t value, int nargs) {
 #if defined(_WIN64)
     (void)nargs; c->regs.rax = value; c->ret_pop = 0;
 #else
-    c->regs.rax = (uint32_t)value; c->ret_pop = (uint32_t)nargs * 4;
+    uint32_t pop = (uint32_t)nargs * 4;
+    if (probe_x86_return_regs(c, value, &pop) && st->probe && !st->probe->warned_pop) {
+        st->probe->warned_pop = true;
+        std::fprintf(stderr, "probe: warning: %s: return_from nargs=%d but the original popped %d bytes (ret %d); "
+                     "the original's count is used. Further cases are not reported.\n",
+                     st->probe->location.c_str(), nargs, (int)c->orig_pop, (int)c->orig_pop);
+    }
+    c->ret_pop = pop;
 #endif
     c->returned = 1;
 }

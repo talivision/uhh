@@ -48,4 +48,25 @@ struct probe_context {
     uint32_t ret_pop;                 /* x86: bytes the callee pops (nargs * 4) */
     uint8_t called_original, returned;
     void *hit_scope;                  /* inline agent: this hit's in-flight bookkeeping (call_original) */
+    /* x86, set by a successful call_original: EDX as the original returned it (the high half
+       of an EDX:EAX result) and the bytes it popped (its `ret N`, measured). */
+    uint32_t orig_edx;
+    int32_t orig_pop;
 };
+
+#if !defined(_WIN64)
+/* x86 return_from, shared by every backend: EAX = the low half of value; EDX = its high half,
+   or -- when that is 0 and call_original ran -- EDX as the original returned it, so
+   return_from(c, r, n) passes an EDX:EAX (int64 / 8-byte struct) result through unchanged.
+   *pop (nargs * 4 on entry) becomes the count the original really popped when call_original
+   measured one; returns true when that contradicted nargs (the caller warns once). */
+static inline bool probe_x86_return_regs(probe_context *c, uint64_t value, uint32_t *pop) {
+    c->regs.rax = (uint32_t)value;
+    c->regs.rdx = (value >> 32) ? (uint32_t)(value >> 32) : c->called_original ? c->orig_edx : 0;
+    if (!c->called_original || c->orig_pop < 0 || c->orig_pop > 1020 || (c->orig_pop & 3) ||
+        (uint32_t)c->orig_pop == *pop)
+        return false;
+    *pop = (uint32_t)c->orig_pop;
+    return true;
+}
+#endif

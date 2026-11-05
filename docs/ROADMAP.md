@@ -435,6 +435,77 @@ and a .NET P/Invoke script (`ps-truth`) that prints the real handle -> pid of ev
   other agents' builds/tests; free RAM was not sampled at the time, so the cause is unknown.
   The rerun with free RAM logged every 15 s never went below 13.9 GB free (16 GB VM).
 
+## Calling-convention findings (2026-11-06, `examples/callconv`, regress `callconv-*`)
+`ccfix.dll` exports one function per x86/x64 convention and argument/return shape: cdecl,
+stdcall, fastcall, thiscall (a real C++ member), vectorcall (int + double + float args), 0 and
+10 arguments, 64-bit arguments (two x86 slots), structs by value (8 and 12 bytes), float/double
+arguments with ST0/XMM0 results, EDX:EAX results (int64, 8-byte struct), hidden return
+pointers (cdecl and stdcall), an x86 `mov edi,edi` hot-patch prologue, an incremental-link
+thunk (E9 rel32 followed by the next thunk), an import thunk (FF 25 [IAT slot], in the exe)
+and a function entered by a tail-call `jmp`. `cc_target` calls each once -- on x86 through
+`cc_invoke`, which measures the bytes the callee popped and checks EBX/ESI/EDI/EBP -- and
+every one is probed at entry on breakpoint, hw (groups of 3) and inline in three modes:
+wrap (call_original + return_from(r, n)), replace (return_from(v, n), body skipped) and
+wrongpop (call_original + return_from with a wrong x86 nargs). The callback checks
+get_func_arg/get_reg against what the caller passed. Before the fixes, x86: 9 of 10 checks
+failed (only the uninstrumented baseline passed); x64: hw wrap lost `CcDbl`'s XMM0 result (the
+x64 breakpoint/inline baseline was masked by identical-code folding of the fixture, since fixed).
+- ✅ (CC1) **x86: the high half of an EDX:EAX result was lost on every backend.** return_from
+  set EAX only (EDX = the hit's), and call_original's in-place restore put the hit's EDX back:
+  `CcI64` wrap returned 0x7777777a for 0x155555557777777a, replace 0x33221107 for
+  0x7766554433221107, `CcRet8` (8-byte struct) 0x3f for 0x7e0000003f. Now x86 return_from
+  sets EDX = value >> 32, and after call_original a value whose high half is 0 leaves EDX as
+  the original returned it, so `return_from(c, r, n)` passes any integer result through
+  (probe_x86_return_regs, shared by all backends). *ret stays EAX zero-extended (comparisons
+  like `r == 0` keep working on x86).
+- ✅ (CC2) **Floating-point results were lost by return_from after call_original.** bp/hw
+  restored the hit's FP state after the in-place call (x86 `CcDbl`/`CcFlt`: the caller found
+  an EMPTY x87 stack -> NaN/0; x64 `CcDbl` got XMM0 = its own first argument 1.5 instead of
+  6.375). Inline x86 left the original's ST0 pushed on the callback's x87 stack (worked only by
+  accident with return_from, leaked one x87 slot per call without it); inline x64 restored
+  the hit's XMM0 (by code inspection). Now the original's FP state is stashed and applied with return_from (bp/hw:
+  the post-call CONTEXT FP area; inline: XMM0 copied into the hook context, x86 x87 via an
+  FNSAVE image reloaded after the extended-state restore; the callback itself always runs
+  with the hit's x87 state). Without call_original a float result cannot be set (documented).
+- ✅ (CC3) **x86 bp/hw call_original did not restore XMM0-7/MXCSR** (CONTEXT_EXTENDED_REGISTERS
+  was not part of the saved context): a fall-through or second call ran with the original's
+  XMM registers, i.e. corrupted __vectorcall arguments. Saved/restored now.
+- ✅ (CC4) **Inline call_original passed only nargs (<= 8) stack arguments**: `CcStd10` (10
+  args) ran with garbage in args 9-10 (x86 ret 0x6195130b for 0x16fd), and any function with
+  more than 8 x86 slots (64-bit/double/struct arguments) or more than 8 x64 arguments was
+  corrupted -- bp/hw ran them correctly in place. Inline now copies a window of the hit's stack
+  (32 x64 stack arguments / 64 x86 slots, bounded by the thread's stack top) whatever nargs
+  says; nargs is only a minimum.
+- ✅ (CC5) **Inline call_original did not pass XMM0-5** (coordinator's static review too):
+  x64 `double f(double)` (by inspection: XMM0-3 were the agent's scratch) and every x86
+  __vectorcall float argument arrived as garbage (`CcVec` 0x7938 for 0x7a4b), bp/hw were right. uhh_orig_thunk / call_tramp_x86 load
+  XMM0-5 from the hit's context; x86 also passes EAX (Delphi/Borland `register` convention).
+- ✅ (CC6) **A wrong x86 return_from nargs silently corrupted the caller's ESP** (`wrongpop`:
+  cdecl with nargs 2 popped 8 bytes, stdcall with 0 popped none -- on every backend). After
+  call_original the bytes the original really popped are measured (bp/hw: ESP at the return
+  trap; inline: ESP after the call) and used; a contradicting nargs is warned once per probe
+  ("return_from nargs=N but the original popped M bytes"). Without call_original the API
+  cannot know the convention: probe_api.h now spells out which nargs to pass per convention
+  (a wrong one leaves ESP off by the difference -- inherent).
+- 📄 (CC7) get_func_arg's index per convention is now documented in probe_api.h: x64 =
+  argument position (RCX, RDX, R8, R9, stack; float args in XMM are not readable; int args
+  have undefined upper 32 bits; structs other than 1/2/4/8 bytes by pointer; hidden return
+  pointer first); x86 = 4-byte stack slot, register args (fastcall/vectorcall ECX/EDX,
+  thiscall ECX) via get_reg, 64-bit/double = 2 slots, struct = size/4, hidden pointer = slot 0.
+  XMM arguments (x64 floats, vectorcall) have no accessor: the frozen API has none (inherent).
+- ⬜ (CC8) **Inline probes in a DLL the target LoadLibrary's at run time are missed about half
+  the time** (pre-existing; the B-family LOAD_DLL hold above): the hold for the new module
+  ends with "inline install not confirmed within 5 s" / "released 1 held thread(s) (install
+  timeout)", the target runs every call unhooked (hits=0, body ran), and the hooks report
+  "active" only afterwards. Reproducer (2 of 4 x64 runs; also x86 replace/wrongpop-inline):
+  the callconv fixture with ccfix.dll loaded by `LoadLibraryA` instead of a static import,
+  `cc_driver --backend inline --mode wrongpop -- cc_target.exe wrongpop`. The callconv
+  checks now import ccfix.dll statically so they test conventions, not this race; the race
+  needs its own fix (hold only for the install itself, see the B entry).
+- ✅ Thunks and prologues need nothing special: a probe on an import thunk (FF 25), an
+  incremental-link thunk (E9, next thunk directly after) and a tail-call target sees the
+  caller's return address at [SP], so get_func_arg, call_original and return_from (`ret 12`)
+  work as on the real function, on every backend; the x86 hot-patch prologue likewise.
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`
 - ✅ Per-log overhead ceilings in the suite (`log-throughput-*`)

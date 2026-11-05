@@ -177,6 +177,7 @@ add_library(probe_api_agent SHARED
     examples/famous/detours_retval/retval_callbacks.cpp
     examples/hunt/hunt_callbacks.cpp
     examples/hunt_callorig/co_callbacks.cpp
+    examples/callconv/cc_callbacks.cpp
     examples/blogs/blog_callbacks.cpp)
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     target_sources(probe_api_agent PRIVATE src/probe/agent_x64.asm)   # uhh_orig_thunk (call_original)
@@ -403,6 +404,29 @@ add_executable(co_driver examples/hunt_callorig/co_driver.cpp examples/hunt_call
 target_include_directories(co_driver PRIVATE include)
 target_link_libraries(co_driver PRIVATE probe_api)
 add_dependencies(co_driver co_target probe_api_agent)
+
+# --- calling conventions: get_func_arg / call_original / return_from per convention (regress `callconv`) --
+# ccfix.dll exports one function per x86/x64 convention and argument/return shape (plus an
+# incremental-link thunk, a tail-call jmp and an x86 hot-patch prologue); cc_target calls
+# each once (x86: through cc_invoke, which measures the bytes the callee popped).
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    set(CCFIX_ASM examples/callconv/ccfix_x86.asm)
+    set(CCT_ASM examples/callconv/cc_target_x86.asm)
+    set(CCFIX_EXPORTS /EXPORT:CcHot /EXPORT:CcIlt /EXPORT:CcIltNext /EXPORT:CcTail /EXPORT:CcStd3T /EXPORT:CcJmpDst)
+else()
+    set(CCFIX_ASM examples/callconv/ccfix_x64.asm)
+    set(CCT_ASM examples/callconv/cc_target_x64.asm)
+    set(CCFIX_EXPORTS /EXPORT:CcIlt /EXPORT:CcIltNext /EXPORT:CcTail /EXPORT:CcStd3T /EXPORT:CcJmpDst)
+endif()
+add_library(ccfix SHARED examples/callconv/ccfix.cpp ${CCFIX_ASM})
+target_link_options(ccfix PRIVATE ${CCFIX_EXPORTS} /INCREMENTAL:NO /OPT:NOICF)   # no folding of identical bodies (CcCdecl3/CcStd3 on x64)
+add_executable(cc_target examples/callconv/cc_target.cpp ${CCT_ASM})
+target_link_options(cc_target PRIVATE /EXPORT:CcImpThunk /INCREMENTAL:NO)
+target_link_libraries(cc_target PRIVATE ccfix)        # a static import: mapped before the first install round
+add_executable(cc_driver examples/callconv/cc_driver.cpp examples/callconv/cc_callbacks.cpp)
+target_include_directories(cc_driver PRIVATE include)
+target_link_libraries(cc_driver PRIVATE probe_api)
+add_dependencies(cc_driver cc_target probe_api_agent)
 
 # --- blog replicas: API-monitor scenarios from well-known write-ups (examples/blogs) ----
 add_executable(blog_target examples/blogs/blog_target.c)
