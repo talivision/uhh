@@ -18,6 +18,11 @@ CTRL_EXPORT void ctrl_on_loop(probe_context *c) {
     send_log(c, "tag=%llx", (unsigned long long)(get_reg(c, PROBE_REG_DX) & 0xFFFFFFFFu));
 }
 
+// inplace-* shapes: EDX holds the call's unique tag at every probed shape instruction.
+CTRL_EXPORT void ctrl_on_shape(probe_context *c) {
+    send_log(c, "tag=%llx", (unsigned long long)(get_reg(c, PROBE_REG_DX) & 0xFFFFFFFFu));
+}
+
 CTRL_EXPORT void ctrl_on_work(probe_context *c) { (void)c; }
 CTRL_EXPORT void ctrl_on_watch(probe_context *c) { (void)c; }
 

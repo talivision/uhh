@@ -48,6 +48,7 @@ Checks:
 Missing binaries (an example not built) are reported as SKIP, not FAIL.
 """
 import argparse
+import collections
 import json
 import math
 import os
@@ -4835,6 +4836,57 @@ def _realapps_one(name, drv, argv, kind, cols, bk, base, stem, x86, after=None):
     if warn:
         detail += f" stderr={warn[:2]}"
     record(name, ok, detail[:1500])
+INPLACE_SHAPES = ["jmp8", "jmp32", "jcc8_taken", "jcc8_not", "jcc8_alt", "jcc32_taken", "call32", "callmem", "ret",
+                  "loop_taken", "loop_not", "loopz", "loopnz", "jrcxz", "loop_a32", "jecxz_a32", "pushf",
+                  "pushf_guard", "segjmp", "syscall"]
+
+
+def check_inplace_shapes():
+    """inplace-<shape> (docs/ROADMAP.md "Evaluator round 3" #1/#2): software breakpoint on every
+    instruction shape that cannot be stepped out-of-line (relative jmp/jcc rel8/rel32 taken and
+    not, call rel32 / call [mem], ret, loop/loopz/loopnz/jrcxz incl. address-size forms, pushf
+    with a normal stack and into the stack guard page, a segment-relative indirect jmp, x64
+    syscall). 8 threads x 1000 calls each (examples/ctrlreview ctrl_target `shape`): hits ==
+    logs == distinct tags == calls, every result equal to the never-probed twin's, no trap flag
+    in a pushed flags image, and the guard-page push grew the stack as without UHH."""
+    d, t = exe("ctrl_driver.exe"), exe("ctrl_target.exe")
+    if not d or not t:
+        return skip("inplace", "ctrl_driver/ctrl_target missing")
+    x86 = pe_is_x86(t)
+    T, n = 8, 1000
+    for sh in INPLACE_SHAPES:
+        if sh == "syscall" and x86:
+            continue                                     # no 32-bit syscall instruction
+        name = f"inplace-{sh}"
+        try:
+            r, o = run([d, "--scenario", "shape", "--shape", sh, "--backend", "breakpoint", "--",
+                        t, "shape", "--shape", sh, "--threads", T, "--n", n], timeout=300)
+            bad = []
+            if r.returncode != 0: bad.append(f"exit={r.returncode}")
+            rep = report(o)
+            if rep.get("error") is not None: bad.append(f"error={rep.get('error')}")
+            if rep.get("log_dropped", 0) != 0: bad.append(f"log_dropped={rep.get('log_dropped')}")
+            if rep.get("app_exit") != 0: bad.append(f"app_exit={rep.get('app_exit')}")
+            res = next((x for x in o if x.get("kind") == "ctrl_result"), {})
+            rows = [x for x in o if x.get("kind") == "probe"]
+            logs = [x for x in famous_objs(r, o) if x.get("kind") == "probe_log"]
+            hits = sum(x.get("hits", 0) for x in rows)
+            tags = collections.Counter(str(x.get("message", "")) for x in logs)
+            calls = T * n
+            if res.get("calls") != calls: bad.append(f"target={res}")
+            if hits != calls: bad.append(f"hits={hits}")
+            if len(logs) != calls: bad.append(f"logs={len(logs)}")
+            if len(tags) != calls: bad.append(f"distinct={len(tags)}")
+            if res.get("bad"): bad.append(f"result_differs={res.get('bad')} (first probed={res.get('first_p')} "
+                                          f"reference={res.get('first_r')})")
+            if res.get("tf"): bad.append(f"tf_in_pushed_flags={res.get('tf')}")
+            if res.get("grow_bad"): bad.append(f"stack_not_grown={res.get('grow_bad')}")
+            record(name, not bad, (" ".join(bad) + " " if bad else "") +
+                   f"calls={calls} hits={hits} logs={len(logs)} distinct={len(tags)}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
 def check_ctrl_review():
     """Controller review findings (examples/ctrlreview, docs/ROADMAP.md "Controller review
     findings"), each reproduced by its own fixture:
@@ -4842,9 +4894,8 @@ def check_ctrl_review():
         (VEH just retries) and the target CONTINUEs execution: one hit per execution (as
         inline), the VEH sees every fault (the guard one too), never our trap flag, and no
         stray single-step.
-      ctrl-inplace: 8 threads through an instruction the software breakpoint steps in place
-        (address-size LOOP): no call is reported twice (the re-armed INT3 must not re-fire for
-        a thread whose own hit was already queued).
+      ctrl-inplace: 8 threads x 3000 calls through an address-size LOOP (once stepped in place):
+        hits == logs == distinct tags == calls (none missed while a byte was lifted, none twice).
       ctrl-absunload-<b>: probe_add_address / probe_watch inside a DLL that unloads and
         reloads 5 times: every absolute probe is retired at its unload (exactly N hits each,
         none attributed to an old probe, no debug-register slot leak).
@@ -4895,21 +4946,25 @@ def check_ctrl_review():
         except Exception as e:
             record(name, False, repr(e))
 
-    # Finding 3: in-place stepping with many threads -> no double callback for one call.
+    # Finding 3 / round 3 #2: 8 threads through a site the breakpoint once stepped in place
+    # (address-size LOOP): every call counted once -- none missed while a byte was lifted,
+    # none reported twice.
     try:
         T, n = 8, 3000
         r, o, res, logs, rows = go("inplace", "breakpoint", ["--threads", T, "--n", n], timeout=300)
         bad = common(r, o)
-        seen, dups = set(), 0
-        for x in logs:
-            m = str(x.get("message", ""))
-            if m in seen: dups += 1
-            seen.add(m)
+        logs = [x for x in famous_objs(r, o) if x.get("kind") == "probe_log"]
+        hits = sum(x.get("hits", 0) for x in rows)
+        tags = collections.Counter(str(x.get("message", "")) for x in logs)
+        dups = sum(c - 1 for c in tags.values() if c > 1)
+        calls = T * n
+        if hits != calls: bad.append(f"hits={hits}")
+        if len(logs) != calls: bad.append(f"logs={len(logs)}")
+        if len(tags) != calls: bad.append(f"distinct={len(tags)}")
         if dups: bad.append(f"duplicate_callbacks={dups}")
         if res.get("bad") != 0: bad.append(f"target_bad={res.get('bad')}")
-        missed = T * n - len(seen)
         record("ctrl-inplace", not bad, (" ".join(bad) + " " if bad else "") +
-               f"calls={T * n} distinct={len(seen)} (missed while lifted: {missed}, ROADMAP round 3 #2)")
+               f"calls={calls} hits={hits} logs={len(logs)} distinct={len(tags)}")
     except Exception as e:
         record("ctrl-inplace", False, repr(e))
 
@@ -5092,6 +5147,7 @@ def main():
     if args.soak_minutes > 0:
         if want(check_soak): check_soak(args.soak_minutes)
     if want(check_ctrl_review): check_ctrl_review()
+    if want(check_inplace_shapes): check_inplace_shapes()
     print("-" * 72)
     failed = 0
     for name, status, detail in RESULTS:
