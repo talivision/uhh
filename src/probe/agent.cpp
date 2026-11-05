@@ -2,6 +2,7 @@
 #include "probe_log_format.hpp"
 #include "probe_agent_shared.hpp"
 #include <safetyhook.hpp>
+#include <tlhelp32.h>
 #include <array>
 #include <bitset>
 #include <utility>
@@ -888,10 +889,28 @@ static void resolve_callbacks() {
     }
 }
 
+// Keep the module holding an inline site loaded while its hook is built and written: a DLL the
+// target unloads right then (FreeLibrary on another thread) unmapped the site under
+// create_mid -- an access violation on the agent's thread that killed the target. A site in
+// an image that cannot be pinned is being unloaded (or gone): skip it this round. A site
+// outside any image (dynamic code) is used only while it is committed memory.
+static bool pin_site(uint64_t site, HMODULE &pin) {
+    pin = nullptr;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery((void *)(uintptr_t)site, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
+    if (mbi.Type != MEM_IMAGE) return true;
+    return GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)(uintptr_t)site, &pin) && pin;
+}
+
 static void install_pending_locked() {
+    // The controller already let go (detach while this round's remote thread could not run,
+    // e.g. the loader lock was held): never hook a target nobody is attached to.
+    if (shared->controller_gone) return;
     uint32_t count = shared->request_count;
     if (count > PROBE_AGENT_MAX_PROBES) count = PROBE_AGENT_MAX_PROBES;
     slot_set enabling;
+    HMODULE pins[PROBE_AGENT_MAX_PROBES] = {};
+    struct Unpin { HMODULE *p; ~Unpin() { for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i) if (p[i]) FreeLibrary(p[i]); } } unpin{pins};
     for (uint32_t i = 0; i < count; ++i) {
         auto &request = shared->requests[i];
         if (!request.site || request.status != PROBE_AGENT_PENDING) continue;
@@ -906,6 +925,7 @@ static void install_pending_locked() {
         if (!callbacks[i]) {
             InterlockedExchange(&request.status, PROBE_AGENT_CALLBACK_MISSING); continue;
         }
+        if (!pin_site(request.site, pins[i])) continue;   // its module is going away: stays pending
         if (InterlockedCompareExchange(&request.status, PROBE_AGENT_INSTALLING, PROBE_AGENT_PENDING) != PROBE_AGENT_PENDING)
             continue;
         sites[i] = request.site; states[i] = {shared, i}; proxies[i].site = i;
@@ -928,6 +948,7 @@ static void install_pending_locked() {
     auto enable = [&](const slot_set &which) {
         for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i) {
             if (!which[i]) continue;
+            if (shared->controller_gone) { InterlockedExchange(&shared->requests[i].status, PROBE_AGENT_HOOK_FAILED); continue; }
             const bool ok = hooks[i].enable().has_value();
             const auto &orig = hooks[i].original_bytes();
             if (ok && !g_shadow[i].lo && orig.size() <= sizeof(g_shadow[i].bytes)) {
@@ -962,12 +983,148 @@ static bool notify_installed() {
     return raise_ipc(&req);
 }
 
+// ---- Controller-death guard (see probe_agent_guard) ----------------------------------------
+using NtQipFn = LONG(NTAPI *)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+static NtQipFn g_ntqip;
+static HANDLE g_guard_wake;           // auto-reset: re-check (new session / a trap was taken)
+static HANDLE g_ctl;                  // the controller process (owned here once taken)
+static volatile LONG g_orphan_cleaned;
+static bool no_debug_port() {         // nobody is debugging us (any more)
+    ULONG_PTR port = 1;
+    return g_ntqip && g_ntqip(GetCurrentProcess(), 7 /*ProcessDebugPort*/, &port, sizeof(port), nullptr) >= 0 && port == 0;
+}
+static bool guard_orphaned() { return shared && shared->guard.enabled && no_debug_port(); }
+static void set_ip(CONTEXT *c, uint64_t ip) {
+#if defined(_WIN64)
+    c->Rip = ip;
+#else
+    c->Eip = (DWORD)ip;
+#endif
+}
+static uint64_t get_ip(const CONTEXT *c) {
+#if defined(_WIN64)
+    return c->Rip;
+#else
+    return c->Eip;
+#endif
+}
+static void restore_byte(uint64_t at, unsigned char original) {
+    __try {
+        volatile unsigned char *p = (volatile unsigned char *)(uintptr_t)at;
+        if (*p != 0xCC || original == 0xCC) return;
+        DWORD old = 0;
+        if (!VirtualProtect((void *)p, 1, PAGE_EXECUTE_READWRITE, &old)) return;
+        *p = original;
+        VirtualProtect((void *)p, 1, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), (void *)p, 1);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+static void clear_dr_slots(CONTEXT &c, DWORD mask) {
+    for (int slot = 0; slot < 4; ++slot) {
+        if (!(mask & (1u << slot))) continue;
+        c.Dr7 &= ~((decltype(c.Dr7))3 << (slot * 2)) & ~((decltype(c.Dr7))0xF << (16 + slot * 4));
+        switch (slot) { case 0: c.Dr0 = 0; break; case 1: c.Dr1 = 0; break; case 2: c.Dr2 = 0; break; default: c.Dr3 = 0; }
+    }
+    c.Dr6 = 0;
+}
+static bool tid_listed(const uint32_t *list, LONG count, DWORD tid) {
+    if (count > (LONG)PROBE_AGENT_GUARD_TIDS) count = PROBE_AGENT_GUARD_TIDS;
+    for (LONG i = 0; i < count; ++i) if (list[i] == tid) return true;
+    return false;
+}
+// First in line for every exception, but acts only on OUR traps once no debugger is attached
+// (a live controller handles them before any handler in the target sees them).
+static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
+    const DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code != EXCEPTION_BREAKPOINT && code != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+    if (!guard_orphaned()) return EXCEPTION_CONTINUE_SEARCH;
+    auto &g = shared->guard;
+    CONTEXT *cx = ep->ContextRecord;
+    const uint64_t at = (uint64_t)(uintptr_t)ep->ExceptionRecord->ExceptionAddress;
+    if (code == EXCEPTION_BREAKPOINT) {
+        LONG n = g.bp_count; if (n > (LONG)PROBE_AGENT_GUARD_BPS) n = PROBE_AGENT_GUARD_BPS;
+        for (LONG i = 0; i < n; ++i)
+            if (g.bps[i].address == at) {
+                restore_byte(at, (unsigned char)g.bps[i].original);
+                set_ip(cx, at);                                   // run the original instruction
+                if (g_guard_wake) SetEvent(g_guard_wake);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    CONTEXT dr{}; dr.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    GetThreadContext(GetCurrentThread(), &dr);
+    const DWORD mask = (DWORD)g.dr_mask & 0xF;
+    bool ours = (dr.Dr6 & mask) != 0 || tid_listed(g.step_tids, g.step_count, GetCurrentThreadId());
+    if (!ours) {   // DR6 is not always reported: an enabled slot of ours at this very address
+        const uint64_t ip = get_ip(cx);
+        const uint64_t a[4] = {(uint64_t)dr.Dr0, (uint64_t)dr.Dr1, (uint64_t)dr.Dr2, (uint64_t)dr.Dr3};
+        for (int slot = 0; slot < 4 && !ours; ++slot)
+            ours = (mask & (1u << slot)) && ((dr.Dr7 >> (slot * 2)) & 3) && (a[slot] == ip || a[slot] == at);
+    }
+    if (!ours) {
+        const uint64_t ip = get_ip(cx);
+        LONG n = g.block_count; if (n > (LONG)PROBE_AGENT_GUARD_BLOCKS) n = PROBE_AGENT_GUARD_BLOCKS;
+        for (LONG i = 0; i < n && !ours; ++i) ours = g.blocks[i] && ip - g.blocks[i] < 0x10000;
+    }
+    if (!ours) return EXCEPTION_CONTINUE_SEARCH;
+    // A DR hit (execute: not yet run; data: already done) or the end of a step we started:
+    // drop our debug registers and the trap flag, and carry on from here. (A displaced step
+    // continues in its out-of-line copy, which jumps back to the code after the site.)
+    clear_dr_slots(dr, mask);
+    dr.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    SetThreadContext(GetCurrentThread(), &dr);
+    if ((cx->ContextFlags & CONTEXT_DEBUG_REGISTERS) == CONTEXT_DEBUG_REGISTERS) clear_dr_slots(*cx, mask);
+    cx->EFlags &= ~0x100u;
+    if (g_guard_wake) SetEvent(g_guard_wake);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_stop(void *);
+// The controller is gone and left its state behind: undo all of it, once.
+static void guard_cleanup() {
+    if (InterlockedExchange(&g_orphan_cleaned, 1)) return;
+    auto &g = shared->guard;
+    InterlockedExchange(&shared->controller_gone, 1);          // logs: nobody will read them
+    LONG n = g.bp_count; if (n > (LONG)PROBE_AGENT_GUARD_BPS) n = PROBE_AGENT_GUARD_BPS;
+    for (LONG i = 0; i < n; ++i) if (g.bps[i].address) restore_byte(g.bps[i].address, (unsigned char)g.bps[i].original);
+    const DWORD mask = (DWORD)g.dr_mask & 0xF, self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        THREADENTRY32 te{}; te.dwSize = sizeof(te);
+        for (BOOL more = Thread32First(snap, &te); more; more = Thread32Next(snap, &te)) {
+            if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+            HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, te.th32ThreadID);
+            if (!t) continue;
+            if (SuspendThread(t) != (DWORD)-1) {              // no heap / lock use while it is suspended
+                CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS | CONTEXT_CONTROL;
+                if (GetThreadContext(t, &c)) {
+                    clear_dr_slots(c, mask);
+                    if (tid_listed(g.step_tids, g.step_count, te.th32ThreadID)) c.EFlags &= ~0x100u;
+                    SetThreadContext(t, &c);
+                }
+                ResumeThread(t);
+            }
+            if (tid_listed(g.held_tids, g.held_count, te.th32ThreadID)) ResumeThread(t);   // the controller's hold
+            CloseHandle(t);
+        }
+        CloseHandle(snap);
+    }
+    probe_agent_stop(nullptr);                                  // inline hooks out (no-op without any)
+}
 static HANDLE service_event;
 static DWORD WINAPI service_main(void *) {
     for (;;) {
-        if (WaitForSingleObject(service_event, INFINITE) != WAIT_OBJECT_0) return 1;
-        install_pending();
-        notify_installed();
+        // Take a new session's controller handle (the old one, if any, is no longer ours to watch).
+        if (HANDLE h = (HANDLE)(uintptr_t)InterlockedExchange64(&shared->guard.controller_process, 0)) {
+            if (g_ctl) CloseHandle(g_ctl);
+            g_ctl = h;
+        }
+        HANDLE waits[3] = {service_event, g_guard_wake, g_ctl};
+        DWORD w = WaitForMultipleObjects(g_ctl ? 3 : 2, waits, FALSE, INFINITE);
+        if (w == WAIT_OBJECT_0) { install_pending(); notify_installed(); continue; }
+        if (w == WAIT_OBJECT_0 + 2) { CloseHandle(g_ctl); g_ctl = nullptr; }
+        else if (w == WAIT_FAILED) { if (g_ctl) { CloseHandle(g_ctl); g_ctl = nullptr; } else return 1; }
+        if (guard_orphaned()) guard_cleanup();
     }
 }
 
@@ -981,6 +1138,13 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
     }
     if (shared->request_count > PROBE_AGENT_MAX_PROBES) return 3;
     make_ret_thunks();
+    if (!g_guard_wake) {                   // controller-death guard: once per process
+        g_ntqip = reinterpret_cast<NtQipFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+        g_guard_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        AddVectoredExceptionHandler(1, guard_veh);
+    }
+    InterlockedExchange(&g_orphan_cleaned, 0);   // a new session: guard it afresh
+    if (g_guard_wake) SetEvent(g_guard_wake);    // the service thread takes the new controller handle
     InterlockedExchange(&g_stopping, 0);   // a new session after a detach: callbacks run again
     for (auto &cb : callbacks) cb = nullptr;  // a new session may map slots to other callbacks
     resolve_callbacks();

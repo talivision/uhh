@@ -3719,7 +3719,10 @@ def lc_selected(name):
 class LcTarget:
     """lifecycle_target with its stdin as a command channel and stdout collected."""
 
-    def __init__(self, *args):
+    def __init__(self, *args, pace=1):
+        # Paced (1 ms sleep per iteration: ~64 iterations/s per thread at the default timer
+        # resolution): a few thousand hits/s at most, so hw/breakpoint runs never load the VM.
+        args = ("--pace-ms", pace) + tuple(args)
         self.p = subprocess.Popen([str(exe("lifecycle_target.exe")), *map(str, args)], stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         self.out = Lines(self.p.stdout)
@@ -3904,7 +3907,7 @@ def lc_detach_cases(cfgname, cfg):
              ("longcb", ("--threads", 4, "--slow-every", 2, "--slow-ms", 2500), ("--read-sleep-ms", 2500), 1.0, {})]
     for ms in (0, 5, 30, 120):
         cases.append((f"early-{ms}", ("--threads", 4, "--dll", "--churn"), ("--detach-after-ms", ms), None,
-                      {"work": cfg["read"]}))
+                      {"work": "breakpoint" if cfg["read"] == "hw" else cfg["read"]}))   # hw: keep a DR free
     for case, targs, dargs, wait_s, more in cases:
         name = f"lifecycle-detach-{case}-{cfgname}"
         if not lc_selected(name):
@@ -3928,7 +3931,8 @@ def lc_detach_cases(cfgname, cfg):
             a = tg.quit()
             ok = fin_ok and d.p.returncode == 0 and ok_logs and lc_clean(c) and c2.get("flips") == 0 and lc_clean(a) and a.get("rc") == 0
             record(name, ok, f"detach_took={took:.1f}s logs={d.logs} final={fin} {lc_brief(c)} flips_after={c2.get('flips')} "
-                             f"exit={a.get('rc')}" + ("" if ok else f" driver_rc={d.p.returncode} err={d.errors()} unhandled={tg.unhandled()}"))
+                             f"exit={a.get('rc')}" + ("" if ok else f" driver_rc={d.p.returncode} err={d.errors()} unhandled={tg.unhandled()} "
+                                         f"stderr_tail={[l[:140] for l in d.err.lines if not l.startswith('probe: active')][-14:]}"))
         except Exception as e:
             record(name, False, repr(e))
         finally:
@@ -4043,7 +4047,10 @@ def lc_controller_killed(cfgname, cfg):
         n += 1
         tg = d = None
         try:
-            tg = LcTarget("--threads", 4, "--churn", "--slow-every", 20, "--slow-ms", 20)
+            # Inline only (no debug events per hit): flat out, so the agent's 4096-slot log ring
+            # fills within the wait below -- an orphaned producer spinning on it is a hang.
+            tg = LcTarget("--threads", 4, "--churn", "--slow-every", 20, "--slow-ms", 20,
+                          pace=0 if cfgname == "inline" else 1)
             d = LcDriver(tg.pid, cfg)
             if when.startswith("active"):
                 d.wait_attached(); d.wait_active(timeout=30)

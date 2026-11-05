@@ -22,6 +22,8 @@
  *   lock N -> a thread holds the LOADER LOCK for N ms ({"kind":"locked"} once held): a tool's
  *             remote thread (agent load / init) cannot even start meanwhile
  *   quit   -> stop, join, final check, {"kind":"app",...}, exit 0 (1 on any error)
+ * --pace-ms P: every worker (and the churner) sleeps P ms per iteration -- a bounded hit rate
+ * (the shared test VM must not run hardware breakpoints flat out for long).
  * --ms-signed-only: from start-up on, only Microsoft-signed DLLs may load (process mitigation
  * policy): an injected agent is refused, so a tool's session fails mid-attach.
  * Any unhandled exception is printed as {"kind":"unhandled",...} before the process dies.
@@ -47,7 +49,7 @@ static unsigned char g_pattern[64];
 static volatile LONG g_stop, g_errors, g_flips, g_slow_calls, g_churned, g_dll_cycles, g_work;
 static volatile LONG64 g_iters;
 static char g_first_error[160];
-static LONG g_slow_every = 0, g_slow_ms = 50;
+static LONG g_slow_every = 0, g_slow_ms = 50, g_pace_ms = 0;
 
 static void error(const char *what) {
     if (InterlockedIncrement(&g_errors) == 1) _snprintf_s(g_first_error, sizeof(g_first_error), _TRUNCATE, "%s", what);
@@ -86,7 +88,7 @@ static void iteration(LONG64 k) {
 
 static DWORD WINAPI worker(void *arg) {
     LONG64 k = 0; (void)arg;
-    while (!g_stop) iteration(++k);
+    while (!g_stop) { iteration(++k); if (g_pace_ms) Sleep((DWORD)g_pace_ms); }
     return 0;
 }
 
@@ -99,6 +101,7 @@ static DWORD WINAPI churner(void *arg) {
         if (!t) { error("CreateThread failed"); Sleep(10); continue; }
         WaitForSingleObject(t, INFINITE); CloseHandle(t);
         InterlockedIncrement(&g_churned);
+        if (g_pace_ms) Sleep((DWORD)g_pace_ms);
     }
     return 0;
 }
@@ -223,9 +226,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--churn")) churn = 1;
         else if (!strcmp(argv[i], "--dll")) dll = 1;
         else if (!strcmp(argv[i], "--ms-signed-only")) ms_only = 1;
+        else if (!strcmp(argv[i], "--pace-ms") && i + 1 < argc) g_pace_ms = atol(argv[++i]);
         else if (!strcmp(argv[i], "--slow-every") && i + 1 < argc) g_slow_every = atol(argv[++i]);
         else if (!strcmp(argv[i], "--slow-ms") && i + 1 < argc) g_slow_ms = atol(argv[++i]);
-        else { fprintf(stderr, "usage: lifecycle_target [--threads N] [--churn] [--dll] [--slow-every K] [--slow-ms M]\n"); return 2; }
+        else { fprintf(stderr, "usage: lifecycle_target [--threads N] [--churn] [--dll] [--slow-every K] [--slow-ms M] [--pace-ms P] [--ms-signed-only]\n"); return 2; }
     }
     if (threads < 1 || threads > 64) threads = 4;
     for (int i = 0; i < 64; ++i) g_pattern[i] = (unsigned char)(i * 7 + 3);

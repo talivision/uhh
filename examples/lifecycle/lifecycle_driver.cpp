@@ -32,7 +32,7 @@ int main(int argc, char **argv) {
     uint32_t pid = (uint32_t)std::strtoul(argv[1], nullptr, 0);
     uint32_t open_b = PROBE_INLINE, close_b = PROBE_INLINE, read_b = PROBE_INLINE, flag_b = PROBE_INLINE,
              slow_b = 0, work_b = 0;
-    unsigned long detach_ms = 0; bool detach_stdin = false;
+    unsigned long detach_ms = 0; bool detach_stdin = false, detach_timed = false;
     hunt_config cfg{};
     cfg.read = read_log_config{READ_LOG_COOKIE, 1, 0, 0, {}};
     for (int i = 2; i < argc; ++i) {
@@ -44,7 +44,7 @@ int main(int argc, char **argv) {
         else if (!std::strcmp(argv[i], "--slow")) val(slow_b);
         else if (!std::strcmp(argv[i], "--work")) val(work_b);
         else if (!std::strcmp(argv[i], "--read-sleep-ms") && i + 1 < argc) cfg.slow_ms = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
-        else if (!std::strcmp(argv[i], "--detach-after-ms") && i + 1 < argc) detach_ms = std::strtoul(argv[++i], nullptr, 0);
+        else if (!std::strcmp(argv[i], "--detach-after-ms") && i + 1 < argc) detach_ms = std::strtoul(argv[++i], nullptr, 0), detach_timed = true;
         else if (!std::strcmp(argv[i], "--detach-on-stdin")) detach_stdin = true;
         else { std::fprintf(stderr, "lifecycle_driver: unknown option %s\n", argv[i]); return 2; }
     }
@@ -60,7 +60,7 @@ int main(int argc, char **argv) {
              (!slow_b || probe_add_symbol(s, "lifecycle_target.exe!lc_slow", lc_slow_cb, slow_b)) &&
              (!work_b || probe_add_symbol(s, "hunt_dll.dll!HuntWork", hunt_work_cb, work_b));
     if (!ok) { probe_report(s, stdout); probe_close(s); return 1; }
-    if (!detach_ms && !detach_stdin) {
+    if (!detach_timed && !detach_stdin) {
         ok = probe_attach(s, pid);
         if (ok) { std::printf("{\"kind\":\"attached\",\"pid\":%lu}\n", (unsigned long)pid); std::fflush(stdout); }
         ok = ok && probe_run(s) && probe_wait_for_exit(s);
