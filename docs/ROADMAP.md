@@ -463,6 +463,12 @@ by itself, nothing dropped), detach while callbacks run / block in call_original
   wait) were dropped (controller_gone set at once). The controller now keeps draining until no
   callback is in flight (bounded 15 s) before telling producers nobody listens.
   `lifecycle-detach-longcb-*`
+- ✅ (L10) The debug register a breakpoint/hw call_original borrows to catch the return was not
+  counted as ours: the detach's final pass and the guard did not clear it (x86: its address stayed
+  on every worker after detach; controller killed mid-call: 0x80000004 at the return address).
+  It now joins the owned slots; with no slot left enabled the DR7 exact bits (LE/GE, which WOW64
+  leaves set) are cleared too. Note: on WOW64 a zeroed address in a DISABLED slot is not always
+  propagated -- inert (never fires); the target reports it as `dr_stale`, not as a breakpoint.
 - Residual / by design: a breakpoint/hw call_func running in the target when the controller dies
   (the thread's context was redirected to the callee and is never restored); suspensions taken
   inside a single debug event and not yet mirrored when the controller dies (microseconds); the
