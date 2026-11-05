@@ -29,6 +29,21 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
     message(FATAL_ERROR "UHH requires an x64 or x86 (Win32) target")
 endif()
 
+# --- Build speed (no effect on generated code) ---------------------------------------
+# Visual Studio generator: compile a project's sources in parallel (/MP), let MSBuild
+# schedule cl.exe across projects (MultiToolTask, capped at the core count overall),
+# and build independent projects in parallel even under a plain
+# `cmake --build build-x64 --config Release` (MSBuild reads Directory.Build.rsp from
+# the solution's directory). Ninja (scripts/build.ps1) is parallel by itself.
+option(UHH_PARALLEL_MSBUILD "Parallel MSBuild/cl.exe for the Visual Studio generator" ON)
+if(CMAKE_GENERATOR MATCHES "^Visual Studio" AND UHH_PARALLEL_MSBUILD)
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/MP>)
+    list(APPEND CMAKE_VS_GLOBALS "UseMultiToolTask=true" "EnforceProcessCountAcrossBuilds=true")
+    file(WRITE "${CMAKE_BINARY_DIR}/Directory.Build.rsp" "-maxCpuCount\n")
+elseif(EXISTS "${CMAKE_BINARY_DIR}/Directory.Build.rsp")
+    file(REMOVE "${CMAKE_BINARY_DIR}/Directory.Build.rsp")
+endif()
+
 enable_language(ASM_MASM)
 # x86 links use /SAFESEH: every object must declare its exception handlers, and MASM only
 # marks an object as SAFESEH-compatible when assembled with /safeseh (LNK2026 otherwise,
