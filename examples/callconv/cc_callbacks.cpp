@@ -13,6 +13,17 @@
 
 struct cc_cfg { uint32_t mode, id; };
 
+// What the replace-mode callback returns instead (integer-class results only: return_from
+// cannot set a floating-point return register). cc_target checks these against its own
+// literal table, not this formula.
+static uint64_t cc_replacement(int id) {
+    switch (CC_FNS[id].kind) {
+    case CC_K_I64: return 0x7766554433221100ull + (uint64_t)id;
+    case CC_K_S8: return ((uint64_t)(id * 10 + 2) << 32) | (uint64_t)(id * 10 + 1);
+    default: return 0x5EED0000u + (uint32_t)id;
+    }
+}
+
 #define CC_CB extern "C" __declspec(dllexport)
 
 static bool arg_is(probe_context *c, const char *name, size_t i, uint64_t want) {
@@ -108,7 +119,11 @@ CC_CB void cc_on_entry(probe_context *c) {
     check_args(c, id);
     const bool floaty = f.kind == CC_K_DBL || f.kind == CC_K_FLT;
     const int pop_args = f.pop86 / 4;                     // return_from's nargs (x86 stack arguments popped)
-    const int nargs = f.nslots < 8 ? f.nslots : 8;        // call_original's nargs (at most 8)
+#if defined(_WIN64)
+    const int nargs = f.co64;                             // call_original's nargs: every argument (CcStd10: 10)
+#else
+    const int nargs = f.co86;                             // x86: the stack slots (register args go as at the hit)
+#endif
     if (k->mode == CCM_REPLACE) {
         if (floaty) return;                               // cannot set ST0/XMM0: let it run
         uint64_t v = cc_replacement(id);

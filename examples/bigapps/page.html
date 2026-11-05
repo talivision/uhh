@@ -7,7 +7,7 @@
      network I/O) for the whole run. -->
 <div id="js">pending</div>
 <div id="fetched">FETCHED=0</div>
-<div id="async">ASYNC=0</div>
+<div id="async">ASYNC ok=0 fail=0 sent=0</div>
 <div id="slow">SLOW=pending</div>
 <script>
 function work(n) { let h = 0; for (let i = 0; i < n; i++) h = (h * 31 + (i ^ (i >> 3))) | 0; return h; }
@@ -26,13 +26,22 @@ for (let i = 0; i < FETCHES; i++) {
 }
 document.getElementById('fetched').textContent = 'FETCHED=' + got;
 // While /slow (below) blocks the parser, timers still run: keep the browser's network,
-// IPC and allocator busy for the whole hold (each request is a new loopback connection).
-let asyncGot = 0, asyncI = 0;
-setInterval(() => {
-  const i = asyncI++;
-  fetch('/data?i=' + i, {cache: 'no-store'}).then(x => x.text()).then(t => {
-    if (t === 'data' + i) document.getElementById('async').textContent = 'ASYNC=' + (++asyncGot);
-  }).catch(() => {});
+// IPC and allocator busy during the hold with a BOUNDED set of ASYNC_N requests (one per
+// 100 ms; the server sizes ASYNC_N to the first half of the hold), each a new loopback
+// connection. Every one is counted as ok or fail: the suite requires ok=ASYNC_N fail=0.
+const ASYNC_N = __ASYNC_N__;
+let asyncOk = 0, asyncFail = 0, asyncSent = 0;
+function showAsync() {
+  document.getElementById('async').textContent = 'ASYNC ok=' + asyncOk + ' fail=' + asyncFail + ' sent=' + asyncSent;
+}
+const asyncTimer = setInterval(() => {
+  if (asyncSent >= ASYNC_N) { clearInterval(asyncTimer); return; }
+  const i = asyncSent++;
+  fetch('/data?i=' + i, {cache: 'no-store'})
+    .then(x => x.ok ? x.text() : Promise.reject(new Error('status ' + x.status)))
+    .then(t => { if (t === 'data' + i) asyncOk++; else asyncFail++; showAsync(); },
+          () => { asyncFail++; showAsync(); });
+  showAsync();
 }, 100);
 </script>
 <!-- Parser-blocking script streamed slowly: the load event (and --dump-dom) waits for all of
