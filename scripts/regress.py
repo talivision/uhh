@@ -3178,6 +3178,33 @@ BLOG_RUNS = {   # scenario -> (target args, fields that must equal the baseline)
 SHELL_LINK_CLSID = "{00021401-0000-0000-C000-000000000046}"
 
 
+def blog_run(args, timeout):
+    """run() for the blog checks, safe against a HANG: on timeout the whole tree is killed
+    (the target inherits the driver's pipes, so killing only the driver would leave
+    communicate() waiting forever) and TimeoutExpired carries what was printed so far."""
+    p = subprocess.Popen([str(a) for a in args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         errors="replace")
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        subprocess.run(["taskkill", "/f", "/t", "/pid", str(p.pid)], capture_output=True)
+        subprocess.run(["taskkill", "/f", "/im", "blog_target.exe"], capture_output=True)
+        try:
+            out, err = p.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            out, err = "", ""
+        raise subprocess.TimeoutExpired(p.args, timeout, out, err)
+    objs = []
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                objs.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return subprocess.CompletedProcess(p.args, p.returncode, out, err), objs
+
+
 def blog_target_json(objs):
     return next((o for o in objs if o.get("kind") == "target"), {})
 
@@ -3279,7 +3306,7 @@ def check_blog_replicas():
     for scn in want_scn:
         targs, fields = BLOG_RUNS[scn]
         try:
-            _, bo = run([t, scn, *targs], timeout=300)
+            _, bo = blog_run([t, scn, *targs], timeout=120)
             base = blog_target_json(bo)
             if scn == "registry":
                 blog_registry_gone(base.get("pid"))
@@ -3289,8 +3316,9 @@ def check_blog_replicas():
             record(f"blog-{scn}-baseline", False, repr(e)); continue
         for bk in want_bk:
             name = f"blog-{scn}-{bk}"
+            print(f"  .. {name}", file=sys.stderr, flush=True)
             try:
-                r, o = run([d, "--scenario", scn, "--backend", bk, "--", t, scn, *targs], timeout=600)
+                r, o = blog_run([d, "--scenario", scn, "--backend", bk, "--", t, scn, *targs], timeout=300)
                 tgt, rep = blog_target_json(o), report(o)
                 msgs = [str(x.get("message", "")) for x in o if x.get("kind") == "probe_log"]
                 diff = {f: (base.get(f), tgt.get(f)) for f in fields if base.get(f) != tgt.get(f)}
@@ -3308,6 +3336,15 @@ def check_blog_replicas():
                        f"err={(rep.get('error') or '')[:160]}" +
                        ("" if generic else f" probes={[(p.get('location'), p.get('backend'), p.get('active'), p.get('hits')) for p in prs]}"
                                            f" stderr={(r.stderr or '')[-300:]!r}"))
+            except subprocess.TimeoutExpired as e:
+                # A hang is a bug: say where it stopped (last lines of the driver's output).
+                out, err = e.stdout or "", e.stderr or ""
+                record(name, False, f"HANG (>{e.timeout}s) stdout_tail={out.strip().splitlines()[-3:]} "
+                                    f"stderr_tail={err.strip().splitlines()[-4:]}")
+                if scn == "registry":
+                    subprocess.run(["powershell", "-NoProfile", "-Command",
+                                    "Get-ChildItem HKCU:\\Software | ?{ $_.PSChildName -like 'UHHBlogTest_*' } | "
+                                    "Remove-Item -Recurse -Force"], capture_output=True)
             except Exception as e:
                 record(name, False, repr(e))
 
@@ -3336,6 +3373,7 @@ def check_blog_pwsh_attach():
     want_bk = [x for x in _os.environ.get("UHH_BLOG_BACKENDS", "").split(",") if x] or ["breakpoint", "hw", "inline"]
     for bk in want_bk:
         name = f"blog-pwsh-attach-detach-{bk}"
+        print(f"  .. {name}", file=sys.stderr, flush=True)
         target = None
         try:
             target = subprocess.Popen([str(ps), "-NoProfile", "-NonInteractive", "-Command", script],
