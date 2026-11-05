@@ -184,6 +184,9 @@ extern "C" int set_reg(probe_context *c, enum probe_register reg, uint64_t value
     // Inline set_reg(SP) is honoured: the (patched) SafetyHook stub resumes with
     // `pop rsp; jmp [trampoline]`, loading the context's rsp -- see call_mid.
     uint64_t *slot = register_slot(c, reg); if (!slot) return 0;
+#if !defined(_WIN64)
+    value = (uint32_t)value;   // x86: the register keeps the low 32 bits; get_reg says so (TH3)
+#endif
     if (*slot != value) {
         *slot = value;
         auto *state = static_cast<AgentState *>(c->controller);

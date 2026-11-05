@@ -4,6 +4,7 @@
 #include "probe_log_format.hpp"
 #include "probe_agent_shared.hpp"
 #include <cerrno>
+#include <cstdlib>
 #include <cwchar>
 #include <cctype>
 #include <cstdarg>
@@ -157,6 +158,7 @@ struct probe_session {
     std::condition_variable tail_changed, tail_caught_up;
     uint64_t log_bytes_written = 0, log_bytes_tailed = 0;
     bool tail_stop = false, tail_failed = false, console_warning = false;
+    bool live_output_closed = false;           // stdout's reader went away: a warning, not an error
     std::string tail_error;
     // probe_launch: when the controller's stdout/stderr is a pipe or file, the target gets
     // its own pipe and a forwarder copies its bytes out line-wise (see forward_main), so
@@ -526,19 +528,51 @@ static void tail_failed(probe_session *s, const std::string &message) {
     s->tail_caught_up.notify_all();
 }
 
+// The reader of the controller's stdout went away (the pipe was closed: `| head`). Normal use,
+// not a session failure: the live tail stops, every log still goes to the session JSONL file
+// (the complete record), and probe_report says "live_output_closed":true. Any other stdout
+// failure stays an error.
+static bool reader_gone(DWORD e) {
+    return e == ERROR_BROKEN_PIPE || e == ERROR_NO_DATA || e == ERROR_PIPE_NOT_CONNECTED;
+}
+static void tail_closed(probe_session *s, DWORD e) {
+    {
+        std::lock_guard<std::mutex> lock(s->tail_mu);
+        if (s->tail_failed) return;
+        s->tail_failed = true;                     // ends the live tail only
+        s->live_output_closed = true;
+    }
+    std::fprintf(stderr, "probe: warning: live output closed (Win32=%lu); every log still goes to the session log file\n",
+                 (unsigned long)e);
+    s->tail_caught_up.notify_all();
+}
+// A raw write to stdout failed (GetLastError still set by WriteFile).
+static void tail_write_failed(probe_session *s, const char *what) {
+    DWORD e = GetLastError();
+    if (reader_gone(e)) { tail_closed(s, e); return; }
+    SetLastError(e);
+    tail_failed(s, win_error(what));
+}
+// fflush(stdout) failed: the CRT keeps the Win32 error in _doserrno.
+static void tail_flush_failed(probe_session *s) {
+    unsigned long e = 0;
+    if (_get_doserrno(&e) == 0 && reader_gone((DWORD)e)) { tail_closed(s, (DWORD)e); return; }
+    tail_failed(s, "flush controller stdout before probe logs");
+}
+
 static bool write_stdout_chunk(probe_session *s, const char *bytes, size_t size) {
     if (!size) return true;
     std::lock_guard<std::mutex> out_lock(s->stdout_mu);
     // The driver still owns the CRT FILE*. Empty it before the raw-handle write so its
     // own complete lines cannot remain buffered behind newer tailed log lines.
     if (std::fflush(stdout) != 0) {
-        tail_failed(s, "flush controller stdout before probe logs"); return false;
+        tail_flush_failed(s); return false;
     }
     DWORD wrote = 0;
     auto started = std::chrono::steady_clock::now();
     if (s->stdout_handle == nullptr || s->stdout_handle == INVALID_HANDLE_VALUE || size > MAXDWORD ||
         !WriteFile(s->stdout_handle, bytes, (DWORD)size, &wrote, nullptr) || (size_t)wrote != size) {
-        tail_failed(s, win_error("tail probe logs to stdout")); return false;
+        tail_write_failed(s, "tail probe logs to stdout"); return false;
     }
     if (s->stdout_is_console && std::chrono::steady_clock::now() - started >= std::chrono::seconds(1))
         warn_console_once(s);
@@ -576,7 +610,7 @@ static void tail_catch_up_locked(probe_session *s, const char *fresh, size_t fre
         if (!fresh_size) fresh_end = s->log_bytes_written;
     }
     if (tailed >= fresh_end) return;
-    if (std::fflush(stdout) != 0) { tail_failed(s, "flush controller stdout before probe logs"); return; }
+    if (std::fflush(stdout) != 0) { tail_flush_failed(s); return; }
     const uint64_t file_end = fresh_end - fresh_size;
     while (tailed < file_end) {
         char buffer[64 * 1024];
@@ -585,13 +619,13 @@ static void tail_catch_up_locked(probe_session *s, const char *fresh, size_t fre
         if (!ReadFile(s->log_reader, buffer, want, &got, &at) || !got) {
             tail_failed(s, win_error("replay probe log file to stdout")); return;
         }
-        if (!write_all(s->stdout_handle, buffer, got)) { tail_failed(s, win_error("tail probe logs to stdout")); return; }
+        if (!write_all(s->stdout_handle, buffer, got)) { tail_write_failed(s, "tail probe logs to stdout"); return; }
         tailed += got;
     }
     if (tailed < fresh_end) {
         size_t skip = (size_t)(fresh_size - (fresh_end - tailed));
         if (!write_all(s->stdout_handle, fresh + skip, fresh_size - skip)) {
-            tail_failed(s, win_error("tail probe logs to stdout")); return;
+            tail_write_failed(s, "tail probe logs to stdout"); return;
         }
         tailed = fresh_end;
     }
@@ -616,6 +650,7 @@ static bool forward_emit(probe_session *s, probe_session::StdForward *f, const c
         std::lock_guard<std::mutex> out_lock(s->stdout_mu);
         std::fflush(stdout);                            // the driver's own complete lines first
         ok = write_all(f->dst, bytes, size);
+        if (!ok) { DWORD e = GetLastError(); if (reader_gone(e)) tail_closed(s, e); }   // stdout's reader left
         s->out_midline = ok && bytes[size - 1] != '\n';
         if (ok) tail_catch_up_locked(s, nullptr, 0, 0);  // records that waited for this newline
     }
@@ -757,7 +792,7 @@ static void forward_finish(probe_session *s) {
     if (s->out_midline && behind) {
         std::fflush(stdout);
         if (write_all(s->stdout_handle, "\n", 1)) s->out_midline = false;
-        else tail_failed(s, win_error("tail probe logs to stdout"));
+        else tail_write_failed(s, "tail probe logs to stdout");
     }
     tail_catch_up_locked(s, nullptr, 0, 0);
 }
@@ -5736,14 +5771,20 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
     uint64_t interrupted = 0;
     if (s->exited && s->shared)
         interrupted = probe_agent_inflight(s->shared);
+    bool live_closed;
+    {
+        std::lock_guard<std::mutex> lock(s->tail_mu);
+        live_closed = s->live_output_closed;
+    }
     std::fprintf(out, "{\"kind\":\"probe_report\",\"probes\":%llu,\"active\":%llu,"
                  "\"hits\":%llu,\"overrides\":%llu,\"log_dropped\":%llu,\"callbacks_interrupted\":%llu,"
-                 "\"logs_written\":%llu,\"controller_peak_ws_mb\":%llu,\"app_exit\":%lu,\"error\":",
+                 "\"logs_written\":%llu,\"controller_peak_ws_mb\":%llu,\"app_exit\":%lu,"
+                 "\"live_output_closed\":%s,\"error\":",
                  (unsigned long long)visible, (unsigned long long)active,
                  (unsigned long long)hits, (unsigned long long)(s->overrides + (s->shared ? (uint64_t)s->shared->overrides : 0)),
                  (unsigned long long)dropped, (unsigned long long)interrupted,
                  (unsigned long long)s->logs_written.load(std::memory_order_relaxed),
-                 (unsigned long long)peak_mb, s->exit_code);
+                 (unsigned long long)peak_mb, s->exit_code, live_closed ? "true" : "false");
     if (s->error.empty()) std::fputs("null", out); else json_string(out, s->error);
     std::fputs("}\n", out); std::fflush(out);
 }
@@ -5851,7 +5892,11 @@ extern "C" uint64_t get_reg(probe_context *c, enum probe_register reg) {
 
 extern "C" int set_reg(probe_context *c, enum probe_register reg, uint64_t value) {
     uint64_t *slot = register_slot(c, reg); if (!slot) return 0;
+#if defined(_WIN64)
     uint64_t next = value;
+#else
+    uint64_t next = (uint32_t)value;   // x86: the register keeps the low 32 bits; get_reg says so (TH3)
+#endif
     if (*slot != next) {
         *slot = next;
         auto *state = static_cast<CallbackState *>(c->controller);
