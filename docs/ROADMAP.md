@@ -616,11 +616,11 @@ Before the fixes, x64 differed in 18 keys (A: 10, B: 2, C: every target row -- t
 - Evidence: before the fixes x64 differed in 18 keys and x86 in 21 (P1-P10 above; plus
   `portability-matrix-C` lost every target row on breakpoint/hw because the session died on the
   throw); after them `portability-matrix-{A,B,C}` and `portability-documented` pass on x64 and x86.
-- ⬜ Open (seen on the x86 run of this branch, not caused by a portability change): `edgehunt-
-  {breakpoint,hw}-fmtptr` expects `[unformattable] fmtptr %s` for a TARGET pointer printed with
+- ✅ (seen on the x86 run of this branch, not caused by a portability change): `edgehunt-
+  {breakpoint,hw}-fmtptr` expected `[unformattable] fmtptr %s` for a TARGET pointer printed with
   `%s` in a controller callback, but on x86 the same address can be mapped in the controller too
-  and then prints the controller's bytes (`fmtptr W..}j`) -- the B10 behaviour itself; the
-  check's expectation is address-layout dependent.
+  and then prints the controller's bytes (`fmtptr W..}j`) -- the B10 behaviour itself. The check
+  now accepts either outcome on breakpoint/hw (exactly one record, run unaffected).
 - 📄 (D1) Win32 calls made directly by a callback act on the process the callback runs in
   (`GetCurrentProcessId() == target pid`: breakpoint/hw 0, inline 1). Portable: `call_func`
   `kernel32.dll!GetCurrentProcessId` / `GetCurrentThreadId`; target memory only via get/set_mem.
