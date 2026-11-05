@@ -3699,6 +3699,458 @@ def check_blog_pwsh_attach():
                 target.kill()
 
 
+# ---- lifecycle (examples/lifecycle) -------------------------------------------------------
+# One probe per gated_config role on the ntdll stubs + the mid-function flag site + a probe
+# that blocks inside call_original, under each backend and mixed.
+LC_CONFIGS = {
+    "breakpoint": dict(open="breakpoint", close="breakpoint", read="breakpoint", flag="breakpoint", slow="breakpoint"),
+    # hw: 3 debug registers; the 4th stays free for call_original's return catch
+    "hw":         dict(open="hw", close="breakpoint", read="hw", flag="hw", slow="breakpoint"),
+    "inline":     dict(open="inline", close="inline", read="inline", flag="inline", slow="inline"),
+    "mixed":      dict(open="hw", close="breakpoint", read="inline", flag="breakpoint", slow="inline"),
+}
+
+
+def lc_selected(name):
+    sel = os.environ.get("UHH_LC", "")
+    return not sel or any(x in name for x in sel.split(","))
+
+
+class LcTarget:
+    """lifecycle_target with its stdin as a command channel and stdout collected."""
+
+    def __init__(self, *args):
+        self.p = subprocess.Popen([str(exe("lifecycle_target.exe")), *map(str, args)], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        self.out = Lines(self.p.stdout)
+        ready = self.out.wait_for(lambda l: '"kind":"ready"' in l, 30)
+        if not ready:
+            raise RuntimeError("lifecycle_target not ready")
+        self.pid = json.loads(ready)["pid"]
+
+    def _cmd(self, word, kind, timeout=60):
+        n = sum(1 for l in self.out.lines if f'"kind":"{kind}"' in l)
+        if self.p.poll() is not None:
+            return {"dead": self.p.returncode, "unhandled": self.unhandled()}
+        try:
+            self.p.stdin.write(word + "\n"); self.p.stdin.flush()
+        except OSError:
+            return {"dead": self.p.poll(), "unhandled": self.unhandled()}
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            got = [l for l in self.out.lines if f'"kind":"{kind}"' in l]
+            if len(got) > n:
+                return json.loads(got[n])
+            if self.p.poll() is not None:
+                return {"dead": self.p.returncode, "unhandled": self.unhandled()}
+            time.sleep(0.05)
+        return {"hung": True}
+
+    def check(self):
+        return self._cmd("check", "check")
+
+    def reset(self):
+        return self._cmd("reset", "reset")
+
+    def quit(self):
+        a = self._cmd("quit", "app", timeout=120)
+        try:
+            self.p.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            pass
+        a["rc"] = self.p.poll()
+        return a
+
+    def unhandled(self):
+        return [l for l in self.out.lines if '"unhandled"' in l][:2]
+
+    def kill(self):
+        if self.p.poll() is None:
+            self.p.kill()
+
+
+def lc_clean(c, attached_ok=False):
+    """A check line that says the target is exactly as before any tool came."""
+    return (not c.get("dead") and not c.get("hung") and c.get("code_diff") == 0 and c.get("dr_dirty") == 0 and
+            c.get("errors") == 0 and (attached_ok or c.get("debugger") == 0))
+
+
+def lc_brief(c):
+    if c.get("dead") is not None or c.get("hung"):
+        return f"DEAD/HUNG {c}"
+    return (f"code_diff={c.get('code_diff')} {c.get('code_bad') or ''} dr_dirty={c.get('dr_dirty')} {c.get('dr_bad') or ''} "
+            f"dbg={c.get('debugger')} errors={c.get('errors')} {c.get('first_error') or ''} flips={c.get('flips')} "
+            f"agent={c.get('agent_loaded')}").replace("  ", " ")
+
+
+class LcDriver:
+    """lifecycle_driver: stdout probe_log lines are only COUNTED (never kept)."""
+
+    def __init__(self, pid, cfg, *extra, group=False):
+        args = [str(exe("lifecycle_driver.exe")), str(pid)]
+        for k in ("open", "close", "read", "flag", "slow", "work"):
+            args += [f"--{k}", cfg.get(k, "none")]
+        args += [str(x) for x in extra]
+        self.probes = sum(1 for k in ("open", "close", "read", "flag", "slow", "work") if cfg.get(k, "none") != "none")
+        self.p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                  creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if group else 0)
+        self.logs, self.other, self.cv = 0, [], threading.Condition()
+        self.t = threading.Thread(target=self._pump, daemon=True); self.t.start()
+        self.err = Lines(self.p.stderr)
+
+    def _pump(self):
+        for line in self.p.stdout:
+            with self.cv:
+                if line.startswith('{"kind":"probe_log"'):
+                    self.logs += 1
+                else:
+                    self.other.append(line.rstrip("\r\n"))
+                self.cv.notify_all()
+
+    def wait_attached(self, timeout=30):
+        with self.cv:
+            return self.cv.wait_for(lambda: any('"kind":"attached"' in l for l in self.other), timeout)
+
+    def wait_active(self, n=None, timeout=60):
+        n = self.probes if n is None else n
+        return self.err.wait_for(lambda l: sum(1 for x in self.err.lines if x.startswith("probe: active ")) >= n, timeout) is not None
+
+    def wait_logs(self, n, timeout=30):
+        with self.cv:
+            return self.cv.wait_for(lambda: self.logs >= n, timeout)
+
+    def detach(self):
+        self.p.stdin.write("\n"); self.p.stdin.flush()
+
+    def finish(self, timeout=90):
+        try:
+            self.p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return False
+        self.t.join(timeout=30); self.err.t.join(timeout=30)
+        return True
+
+    def final(self):
+        """(hits, logs_written, log_dropped) from probe_close's 'probe: detached:' line, or None."""
+        m = next((re.search(r"probe: detached: hits=(\d+) logs_written=(\d+) log_dropped=(\d+)", l) for l in self.err.lines
+                  if l.startswith("probe: detached:")), None)
+        return tuple(int(x) for x in m.groups()) if m else None
+
+    def errors(self):
+        return [l[:160] for l in self.err.lines if "error" in l.lower() or "warning" in l.lower() or "failed" in l][:4]
+
+    def kill(self):
+        if self.p.poll() is None:
+            self.p.kill()
+
+
+def lc_logs_ok(d):
+    """Every log the session wrote reached stdout, none was dropped."""
+    f = d.final()
+    return f is not None and f[1] == d.logs and f[2] == 0, f
+
+
+def lc_reattach(cfgname, cfg, cycles=20):
+    """attach -> detach -> re-attach, `cycles` times, to the same busy process (4 workers + a
+    thread-churner: threads are born while attached). After EVERY detach: the code bytes of
+    every probed site equal the pre-attach snapshot, no thread (incl. those created while
+    attached) has a debug register or the trap flag set, no debugger, no flip after the detach,
+    no program error; every log written reached stdout and none was dropped."""
+    name = f"lifecycle-reattach-{cfgname}"
+    tg, bad, logs_total = None, [], 0
+    try:
+        tg = LcTarget("--threads", 4, "--churn", "--slow-every", 50, "--slow-ms", 5)
+        import random
+        rnd = random.Random(1234)
+        for k in range(cycles):
+            d = LcDriver(tg.pid, cfg, "--detach-on-stdin")
+            try:
+                if not d.wait_attached() or not d.wait_active():
+                    bad.append(f"c{k}: not active err={d.errors()}"); d.kill(); break
+                time.sleep(rnd.uniform(0.05, 0.4))
+                d.detach()
+                if not d.finish():
+                    bad.append(f"c{k}: driver did not finish detaching"); break
+            finally:
+                d.kill()
+            ok_logs, fin = lc_logs_ok(d)
+            logs_total += d.logs
+            c = tg.check()
+            tg.reset(); time.sleep(0.2); c2 = tg.check()
+            if not ok_logs or not lc_clean(c) or c2.get("flips") != 0 or d.p.returncode != 0:
+                bad.append(f"c{k}: rc={d.p.returncode} logs={d.logs} final={fin} {lc_brief(c)} flips_after={c2.get('flips')}")
+                if c.get("dead") is not None or c.get("hung"):
+                    break
+        a = tg.quit()
+        ok = not bad and lc_clean(a) and a.get("rc") == 0 and a.get("churned", 0) > 0
+        record(name, ok, f"cycles={cycles} logs={logs_total} iterations={a.get('iterations')} churned={a.get('churned')} "
+                         f"final_rc={a.get('rc')} {lc_brief(a)}" + ("" if ok else f" bad={bad[:3]}"))
+    except Exception as e:
+        record(name, False, repr(e) + f" bad={bad[:3]}")
+    finally:
+        if tg:
+            tg.kill()
+
+
+def lc_detach_cases(cfgname, cfg):
+    """Detach at awkward moments, each on a fresh target, each followed by the cleanliness check:
+       midcb   -- every read callback sleeps 300 ms and lc_slow blocks 1.5 s inside call_original
+                  (breakpoint/hw: threads stopped at a hit / mid call; inline: in the callback and
+                  inside the trampoline) when the detach comes;
+       longcb  -- callbacks longer than the agent's in-flight wait (2.5 s);
+       early-N -- probe_close N ms after the attach completed (agent load / install / FREEZE in
+                  flight), with a module that keeps loading/unloading and a pending probe in it."""
+    cases = [("midcb", ("--threads", 4, "--slow-every", 3, "--slow-ms", 1500), ("--read-sleep-ms", 300), 1.5, {}),
+             ("longcb", ("--threads", 4, "--slow-every", 2, "--slow-ms", 2500), ("--read-sleep-ms", 2500), 1.0, {})]
+    for ms in (0, 5, 30, 120):
+        cases.append((f"early-{ms}", ("--threads", 4, "--dll", "--churn"), ("--detach-after-ms", ms), None,
+                      {"work": cfg["read"]}))
+    for case, targs, dargs, wait_s, more in cases:
+        name = f"lifecycle-detach-{case}-{cfgname}"
+        if not lc_selected(name):
+            continue
+        tg = d = None
+        try:
+            tg = LcTarget(*targs)
+            dcfg = dict(cfg, **more)
+            d = LcDriver(tg.pid, dcfg, *(dargs + (("--detach-on-stdin",) if wait_s is not None else ())))
+            if wait_s is not None:
+                if not d.wait_attached() or not d.wait_active():
+                    raise RuntimeError(f"not active: {d.errors()}")
+                time.sleep(wait_s)
+                d.detach()
+            t0 = time.time()
+            fin_ok = d.finish(timeout=120)
+            took = time.time() - t0
+            ok_logs, fin = lc_logs_ok(d)
+            c = tg.check()
+            tg.reset(); time.sleep(0.3); c2 = tg.check()
+            a = tg.quit()
+            ok = fin_ok and d.p.returncode == 0 and ok_logs and lc_clean(c) and c2.get("flips") == 0 and lc_clean(a) and a.get("rc") == 0
+            record(name, ok, f"detach_took={took:.1f}s logs={d.logs} final={fin} {lc_brief(c)} flips_after={c2.get('flips')} "
+                             f"exit={a.get('rc')}" + ("" if ok else f" driver_rc={d.p.returncode} err={d.errors()} unhandled={tg.unhandled()}"))
+        except Exception as e:
+            record(name, False, repr(e))
+        finally:
+            if d: d.kill()
+            if tg: tg.kill()
+
+
+def lc_target_dies(cfgname, cfg):
+    """The target dies (TerminateProcess) N ms into the attach / agent injection / install, or
+    right after a detach was requested: the controller must notice, end its session and exit on
+    its own (no hang, no crash) with every log it wrote delivered and none dropped."""
+    bad, n = [], 0
+    for when in (0, 2, 10, 40, 150, 600, "detach"):
+        n += 1
+        tg = d = None
+        try:
+            tg = LcTarget("--threads", 4, "--churn")
+            d = LcDriver(tg.pid, cfg, "--detach-on-stdin")
+            if when == "detach":
+                d.wait_attached(); d.wait_active(timeout=30)
+                d.detach(); time.sleep(0.005)
+            else:
+                time.sleep(when / 1000.0)
+            tg.kill()
+            if not d.finish(timeout=10):
+                d.detach()                                  # the session may still wait for its detach cue
+            fin_ok = d.finish(timeout=60)
+            rc = d.p.returncode
+            dropped = (d.final() or (0, 0, 0))[2]
+            if not fin_ok or rc not in (0, 1) or dropped:
+                bad.append(f"kill@{when}: finished={fin_ok} rc={rc} dropped={dropped} err={d.errors()}")
+        except Exception as e:
+            bad.append(f"kill@{when}: {e!r}")
+        finally:
+            if d: d.kill()
+            if tg: tg.kill()
+    name = f"lifecycle-target-dies-{cfgname}"
+    record(name, not bad, f"cases={n}" + (f" bad={bad[:3]}" if bad else ""))
+
+
+def lc_two_controllers(cfgname, cfg):
+    """A second controller attaching to a target the first one holds must fail cleanly (fast,
+    with an error) and leave the first session working; the first then detaches cleanly."""
+    name = f"lifecycle-two-controllers-{cfgname}"
+    tg = a = b = None
+    try:
+        tg = LcTarget("--threads", 4)
+        a = LcDriver(tg.pid, cfg, "--detach-on-stdin")
+        if not a.wait_attached() or not a.wait_active():
+            raise RuntimeError(f"first not active: {a.errors()}")
+        b = LcDriver(tg.pid, cfg)
+        b_done = b.finish(timeout=30)
+        b_err = [l for l in b.err.lines if "attach" in l.lower() or "error" in l.lower()][:2]
+        before = a.logs; time.sleep(1.0); grew = a.logs > before
+        mid = tg.check()
+        a.detach(); a_done = a.finish()
+        ok_logs, fin = lc_logs_ok(a)
+        c = tg.check(); tg.reset(); time.sleep(0.2); fl = tg.check()
+        q = tg.quit()
+        ok = (b_done and b.p.returncode != 0 and grew and mid.get("debugger") == 1 and a_done and a.p.returncode == 0
+              and ok_logs and lc_clean(c) and fl.get("flips") == 0 and lc_clean(q) and q.get("rc") == 0)
+        record(name, ok, f"second_rc={b.p.returncode} second_err={[x[:100] for x in b_err]} "
+                         f"first_kept_logging={grew} first_logs={a.logs} final={fin} {lc_brief(c)} exit={q.get('rc')}")
+    except Exception as e:
+        record(name, False, repr(e))
+    finally:
+        for x in (a, b, tg):
+            if x: x.kill()
+
+
+def lc_interrupt(cfgname, cfg):
+    """Ctrl+Break at random points of an attach session (before/while attaching, while the
+    agent loads and hooks install, mid-run): the tool exits by itself, and the target is left
+    exactly as before (no leftover code change / debug register / debugger) and runs on."""
+    import signal
+    bad, n = [], 0
+    for when in (0.0, 0.01, 0.05, 0.15, 0.4, 1.0, "active"):
+        n += 1
+        tg = d = None
+        try:
+            tg = LcTarget("--threads", 4, "--churn")
+            d = LcDriver(tg.pid, cfg, group=True)
+            if when == "active":
+                d.wait_attached(); d.wait_active(timeout=30); time.sleep(0.3)
+            else:
+                time.sleep(when)
+            d.p.send_signal(signal.CTRL_BREAK_EVENT)
+            fin_ok = d.finish(timeout=60)
+            time.sleep(0.3)
+            c = tg.check()
+            if not fin_ok or not lc_clean(c):
+                bad.append(f"ctrl@{when}: finished={fin_ok} rc={d.p.returncode} {lc_brief(c)}")
+        except Exception as e:
+            bad.append(f"ctrl@{when}: {e!r}")
+        finally:
+            if d: d.kill()
+            if tg:
+                a = tg.quit() if tg.p.poll() is None else {"rc": tg.p.returncode}
+                if a.get("rc") != 0 and not any(x.startswith(f"ctrl@{when}") for x in bad):
+                    bad.append(f"ctrl@{when}: target exit={a.get('rc')} {lc_brief(a)}")
+                tg.kill()
+    record(f"lifecycle-interrupt-{cfgname}", not bad, f"cases={n}" + (f" bad={bad[:3]}" if bad else ""))
+
+
+def lc_controller_killed(cfgname, cfg):
+    """The controller is killed (TerminateProcess) while attached, mid-run with every probe live
+    and logging: the TARGET must survive -- keep running, never fault, never hang, make no
+    error -- and, once the controller is gone, be left with no live hook / INT3 / debug register
+    (it would die or misbehave at its next hit otherwise)."""
+    bad, n = [], 0
+    for when in ("active", "active+0.5", "early-0.05", "early-0.3"):
+        n += 1
+        tg = d = None
+        try:
+            tg = LcTarget("--threads", 4, "--churn", "--slow-every", 20, "--slow-ms", 20)
+            d = LcDriver(tg.pid, cfg)
+            if when.startswith("active"):
+                d.wait_attached(); d.wait_active(timeout=30)
+                d.wait_logs(200, timeout=10)
+                time.sleep(float(when.split("+")[1]) if "+" in when else 0.0)
+            else:
+                time.sleep(float(when.split("-")[1]))
+            d.kill(); d.finish(timeout=30)
+            time.sleep(3.0)                                    # the target runs on, alone
+            c = tg.check()
+            time.sleep(1.0)
+            c2 = tg.check()
+            progressed = (c2.get("iterations") or 0) > (c.get("iterations") or 0)
+            if not lc_clean(c2) or not progressed:
+                bad.append(f"kill@{when}: progressed={progressed} {lc_brief(c2)} unhandled={tg.unhandled()}")
+            a = tg.quit()
+            if a.get("rc") != 0 and not any(x.startswith(f"kill@{when}") for x in bad):
+                bad.append(f"kill@{when}: exit={a.get('rc')} {lc_brief(a)} unhandled={tg.unhandled()}")
+        except Exception as e:
+            bad.append(f"kill@{when}: {e!r}")
+        finally:
+            if d: d.kill()
+            if tg: tg.kill()
+    record(f"lifecycle-controller-killed-{cfgname}", not bad, f"cases={n}" + (f" bad={bad[:3]}" if bad else ""))
+
+
+def lc_agent_refused(cfgname, cfg):
+    """The session fails in the middle of an attach (here: the target only admits Microsoft-
+    signed DLLs, so the inline agent cannot load) while other probes are already armed: the
+    controller must let go of the target ON ITS DEBUG THREAD before it returns (INT3s restored,
+    DRs cleared, debugger detached) -- not leave live traps behind a dead event loop -- and
+    every log it wrote must be delivered. The target runs on, untouched, and exits cleanly."""
+    if "inline" not in cfg.values():
+        return
+    name = f"lifecycle-agent-refused-{cfgname}"
+    tg = d = None
+    try:
+        tg = LcTarget("--threads", 4, "--ms-signed-only")
+        d = LcDriver(tg.pid, cfg)
+        fin_ok = d.finish(timeout=60)
+        refused = any("LoadLibraryW failed" in l or "agent" in l.lower() and "fail" in l.lower() for l in d.err.lines)
+        time.sleep(2.0)
+        c = tg.check()
+        a = tg.quit()
+        rep = report([json.loads(l) for l in d.other if l.startswith("{")])
+        ok = (fin_ok and d.p.returncode == 1 and refused and lc_clean(c) and lc_clean(a) and a.get("rc") == 0
+              and rep.get("log_dropped") == 0)
+        record(name, ok, f"driver_rc={d.p.returncode} refused={refused} logs={d.logs} dropped={rep.get('log_dropped')} "
+                         f"{lc_brief(c)} exit={a.get('rc')}" + ("" if ok else f" err={d.errors()} unhandled={tg.unhandled()}"))
+    except Exception as e:
+        record(name, False, repr(e))
+    finally:
+        if d: d.kill()
+        if tg: tg.kill()
+
+
+def lc_install_stuck(cfgname, cfg):
+    """Detach while the agent's remote work cannot run: the target holds its loader lock, so the
+    agent init thread a re-attach starts cannot even begin before the detach gives up waiting
+    for it. When the lock is released later that stale init must NOT install hooks into the
+    (by then detached) target: its code bytes stay original and it runs on correctly."""
+    if "inline" not in cfg.values():
+        return
+    name = f"lifecycle-install-stuck-{cfgname}"
+    tg = d0 = d = None
+    try:
+        tg = LcTarget("--threads", 4)
+        d0 = LcDriver(tg.pid, cfg, "--detach-on-stdin")         # first session: the agent gets loaded
+        if not d0.wait_attached() or not d0.wait_active():
+            raise RuntimeError(f"first session not active: {d0.errors()}")
+        d0.detach(); d0.finish()
+        tg.p.stdin.write("lock 9000\n"); tg.p.stdin.flush()
+        if not tg.out.wait_for(lambda l: '"kind":"locked"' in l, 10):
+            raise RuntimeError("target did not take its loader lock")
+        d = LcDriver(tg.pid, cfg, "--detach-after-ms", 1000)
+        fin_ok = d.finish(timeout=60)
+        unlocked = tg.out.wait_for(lambda l: '"kind":"unlocked"' in l, 30) is not None
+        time.sleep(2.0)
+        c = tg.check()
+        a = tg.quit()
+        ok = fin_ok and unlocked and lc_clean(c) and lc_clean(a) and a.get("rc") == 0
+        record(name, ok, f"driver_rc={d.p.returncode} finished={fin_ok} {lc_brief(c)} exit={a.get('rc')}"
+                         + ("" if ok else f" err={d.errors()} unhandled={tg.unhandled()} "
+                                          f"detach_lines={[l[:120] for l in d.err.lines if 'detach' in l or 'remote' in l][:4]}"))
+    except Exception as e:
+        record(name, False, repr(e))
+    finally:
+        for x in (d0, d, tg):
+            if x: x.kill()
+
+
+def check_lifecycle():
+    """Lifecycle edge cases (examples/lifecycle) under every backend and mixed: repeated
+    attach/detach/re-attach, detach at awkward moments, the target dying under the controller,
+    two controllers, Ctrl+Break at random points, the controller being killed. UHH_LC=substr
+    narrows it (e.g. UHH_LC=reattach,inline)."""
+    if not exe("lifecycle_driver.exe") or not exe("lifecycle_target.exe") or not exe("hunt_dll.dll"):
+        return skip("lifecycle", "lifecycle_driver / lifecycle_target / hunt_dll missing")
+    for cfgname, cfg in LC_CONFIGS.items():
+        for fn in (lc_reattach, lc_detach_cases, lc_target_dies, lc_two_controllers, lc_interrupt, lc_controller_killed,
+                   lc_agent_refused, lc_install_stuck):
+            tag = fn.__name__[3:].replace("_", "-")
+            if fn is lc_detach_cases or lc_selected(f"lifecycle-{tag}-{cfgname}"):
+                fn(cfgname, cfg)
+
+
+
 def main():
     global BIN
     ap = argparse.ArgumentParser()
@@ -3793,6 +4245,7 @@ def main():
     if want(check_hunt): check_hunt()
     if want(check_blog_replicas): check_blog_replicas()
     if want(check_blog_pwsh_attach): check_blog_pwsh_attach()
+    if want(check_lifecycle): check_lifecycle()
     print("-" * 72)
     failed = 0
     for name, status, detail in RESULTS:
