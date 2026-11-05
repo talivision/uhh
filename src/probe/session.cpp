@@ -2359,6 +2359,7 @@ static bool vet_pending_inline(probe_session *s);
 static bool kick_agent(probe_session *s) {
     if (s->shared && s->shared->service_ready && s->svc_event) {     // persistent service thread
         if (!vet_pending_inline(s)) return false;
+        if (trace_enabled()) std::fprintf(stderr, "  kick service\n");
         SetEvent(s->svc_event); return true;
     }
     if (s->remote_work != probe_session::REMOTE_NONE) return true;   // picked up when it finishes
@@ -2812,6 +2813,7 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
         probe_ipc_request head{}; size_t n = 0;
         if (remote_read(s->pi.hProcess, (uint64_t)ex.ExceptionInformation[0], &head, offsetof(probe_ipc_request, address), &n) &&
             n == offsetof(probe_ipc_request, address) && (head.op == PROBE_IPC_FREEZE || head.op == PROBE_IPC_THAW)) {
+            if (trace_enabled()) std::fprintf(stderr, "  ipc op=%u tid=%lu (freeze/thaw)\n", head.op, (unsigned long)event.dwThreadId);
             uint64_t mask = 0; size_t m = 0;
             remote_read(s->pi.hProcess, (uint64_t)ex.ExceptionInformation[0] + offsetof(probe_ipc_request, address), &mask, sizeof(mask), &m);
             if (head.op == PROBE_IPC_THAW) { if (s->ipc_freezer == event.dwThreadId) ipc_thaw(s); return true; }

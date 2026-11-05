@@ -367,9 +367,10 @@ def check_attach(threads, reads):
                   appl.get("successful_reads") == W * R and logs == want and dropped == 0 and not wrong)
             record(name, ok, f"override={rep.get('overrides')} read_hits={rd.get('hits')}/{W * R} "
                              f"logged={logs} want_logged={want} dropped={dropped} wrong_pid={len(wrong)} "
-                             f"rc={att.returncode}")
+                             f"rc={att.returncode}" + ("" if ok else
+                             f" err={(rep.get('error') or '')[:120]} stderr_tail={[l[:160] for l in aerr.lines if 'remote' in l or 'ipc' in l or 'hold' in l or 'active' in l or 'release' in l or 'warn' in l or 'kick' in l or 'resolved' in l][-30:]}"))
         except Exception as e:
-            record(name, False, repr(e))
+            record(name, False, repr(e) + (f" stderr_tail={[l[:120] for l in aerr.lines[-6:]]}" if 'aerr' in locals() else ""))
         finally:
             for pr in procs:              # only the processes this check started
                 if pr.poll() is None:
