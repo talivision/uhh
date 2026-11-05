@@ -2077,6 +2077,37 @@ static bool arm_module(probe_session *s, const std::string &module, uint64_t bas
 // still active at exactly that site: after detach, PROBE_ONCE retirement or an unload
 // (where another module may now live at the address) the original byte must stay.
 static Probe *probe_at(probe_session *s, uint64_t address);
+// Is `copy` (read at `at`, starting with an INT3) the other tool's relocation of probe p's
+// site? Its bytes after the INT3 must be the site's own following bytes, verbatim, up to a
+// jump back into the original function at exactly the offset reached (the shape every
+// trampoline has: relocated prologue + jmp site+n); or, without such a jump in view, at
+// least 8 matching bytes.
+static bool is_relocated_copy(const unsigned char *copy, size_t got, uint64_t at, const Probe &p) {
+    ZydisDecoder dec; zydis_init(dec);
+    size_t k = 1;
+    while (k < got) {
+        ZydisDecodedInstruction insn; ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+        if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, copy + k, got - k, &insn, ops))) break;
+        if (insn.mnemonic == ZYDIS_MNEMONIC_JMP && insn.operand_count_visible >= 1 && k >= 2) {
+            ZyanU64 target = 0;
+            if (ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+                ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&insn, &ops[0], at + k, &target)))
+                return target == p.address + k;                 // back to the same offset: our site's copy
+            if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY && insn.length == 6 && k + 6 + sizeof(void *) <= got &&
+                ops[0].mem.base == ZYDIS_REGISTER_RIP && ops[0].mem.disp.value == 0) {   // jmp [rip+0]; dq target
+                uint64_t dest = 0; std::memcpy(&dest, copy + k + 6, sizeof(void *));
+                return dest == p.address + k;
+            }
+            return false;
+        }
+        if (k - 1 + insn.length > p.follow.size() || std::memcmp(copy + k, p.follow.data() + (k - 1), insn.length) != 0)
+            return false;                                       // not the site's bytes, verbatim
+        k += insn.length;
+        if (k > 8) return true;                                 // long verbatim run: same code
+    }
+    return false;
+}
+
 // A hit on an adopted copy (see adopt_relocated_breakpoint) counts for the probe it stands in for.
 static void count_hit(Probe *p) {
     ++p->hits;
@@ -2104,8 +2135,10 @@ static Probe *adopt_relocated_breakpoint(probe_session *s, uint64_t at) {
         if (!p.active || !(p.flags & PROBE_BREAKPOINT) || p.alias_of || p.internal || p.follow.size() < 4) continue;
         unsigned char now = 0; size_t one = 0;
         if (!remote_read(s->pi.hProcess, p.address, &now, 1, &one) || one != 1 || now == 0xcc) continue;   // still ours
-        const size_t need = std::min<size_t>({p.follow.size(), got - 1, (size_t)8});
-        if (std::memcmp(copy + 1, p.follow.data(), need) != 0) continue;
+        if (trace_enabled())
+            std::fprintf(stderr, "  relocated? %s site_now=0x%02x copy=%s follow=%s\n", p.location.c_str(), now,
+                         hex_bytes(copy, got).c_str(), hex_bytes(p.follow.data(), p.follow.size()).c_str());
+        if (!is_relocated_copy(copy, got, at, p)) continue;
         auto a = std::make_unique<Probe>();
         a->location = p.location + " (relocated copy)";
         a->flags = p.flags & ~PROBE_ONCE; a->callback = p.callback; a->callback_export = p.callback_export;
