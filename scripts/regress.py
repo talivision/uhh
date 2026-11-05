@@ -181,12 +181,12 @@ def check_gated_off():
         record("gated-off", False, repr(e))
 
 
-def gated(flag_bk, read_bk, threads, reads, timeout=200, log=True, open_bk=None):
+def gated(flag_bk, read_bk, threads, reads, timeout=200, log=True, open_bk=None, target_args=()):
     return run([exe("gated_config.exe"), "--flag-backend", flag_bk, "--read-backend", read_bk,
                 *(["--open-backend", open_bk] if open_bk else []),
                 *([] if log else ["--no-log"]), FLAG_LOCATION, READ_LOCATION,
                 "--", exe("probe_app.exe"), "--no-wait", "--helpers", HELPERS,
-                "--threads", threads, "--reads", reads], timeout=timeout)
+                "--threads", threads, "--reads", reads, *target_args], timeout=timeout)
 
 
 def read_log_lines(objs):
@@ -1273,6 +1273,32 @@ def check_ret_probe(threads=2, reads=50):
             record(name, False, repr(e))
 
 
+def check_handle_map(threads=4, reads=500, decoys=5000):
+    """(C11) The example handle->pid map has no silent cap: probe_app first opens and closes
+    ITSELF `decoys` times (far more than the old 1024-record limit; the handle values are
+    reused over and over), then opens the helpers. Every helper read must still be logged
+    with its helper's pid (unmapped == 0) -- open and read probe on the same backend, and
+    across backends through UHH_SHARED."""
+    if not exe("gated_config.exe"):
+        return skip("handle-map", "gated_config.exe missing")
+    want = threads * reads
+    for open_bk, read_bk in (("breakpoint", "breakpoint"), ("hw", "hw"), ("inline", "inline"),
+                             ("breakpoint", "inline")):
+        name = f"handle-map open={open_bk} read={read_bk}"
+        try:
+            r, o = gated("breakpoint", read_bk, threads, reads, timeout=400, open_bk=open_bk,
+                         target_args=("--decoy-opens", decoys))
+            rd, op = read_probe(o), open_probe(o)
+            logs, dropped = read_logs(o)
+            ok = (r.returncode == 0 and rd.get("hits") == want and logs == want and dropped == 0 and
+                  op.get("hits") == decoys + HELPERS and unmapped(o) == 0 and logged_pids(o) == helper_pids(o))
+            record(name, ok, f"open_hits={op.get('hits')}/{decoys + HELPERS} read_hits={rd.get('hits')}/{want} "
+                             f"logs={logs} dropped={dropped} unmapped={unmapped(o)} "
+                             f"pids_ok={logged_pids(o) == helper_pids(o)} err={(report(o).get('error') or '')[:100]}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
 def check_shared_mix(threads=8, reads=1000):
     """UHH_SHARED: the open probe and the read probe on DIFFERENT backends -- one runs in
     the controller, the other inside the target -- still build and use ONE handle->pid
@@ -1643,6 +1669,7 @@ def main():
     if want(check_emulated_sites): check_emulated_sites()
     if want(check_ret_probe): check_ret_probe()
     if want(check_shared_mix): check_shared_mix()
+    if want(check_handle_map): check_handle_map()
     if want(check_gated_mem): check_gated_mem()
     if want(check_forwarded_probe): check_forwarded_probe()
     if want(check_crash_logs): check_crash_logs()
