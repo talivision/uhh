@@ -109,7 +109,8 @@ add_library(probe_api_agent SHARED
     examples/conformance/conformance_callbacks.cpp
     bench/hitcost/hitcost_callbacks.cpp
     examples/memstress/memstress_callbacks.cpp
-    examples/sidefx/sidefx_callbacks.cpp)
+    examples/sidefx/sidefx_callbacks.cpp
+    examples/edgehunt/edge_callbacks.cpp)
 target_include_directories(probe_api_agent PRIVATE include examples/gated_config examples/dynwatch examples/trace examples/memstress)
 target_link_libraries(probe_api_agent PRIVATE safetyhook)
 target_compile_definitions(probe_api_agent PRIVATE BREAKAGE_AGENT_ONLY FRIDA_PARITY_AGENT_ONLY HITCOST_SHARED)
@@ -265,12 +266,32 @@ foreach(rw reentrancy_target thread_stress_target antitamper_target antidebug_ta
     target_link_options(${rw} PRIVATE /DEBUG)
 endforeach()
 
+# --- edgehunt: unusual code shapes / argument and memory edge cases, every backend ------
+set(EDGE_SITES EdgeRepSite EdgeStosSite EdgeCpuidSite EdgeRdtscSite EdgePushfSite EdgePopfSite
+    EdgeRetOnlySite EdgeThunkSite EdgeJumpSite EdgeFaultMidSite EdgeX87Site EdgeLockSite EdgeDualSite
+    EdgeReaddA EdgeReaddB)
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    set(EDGE_ASM examples/edgehunt/edge_sites_x86.asm)
+else()
+    set(EDGE_ASM examples/edgehunt/edge_sites_x64.asm)
+    list(APPEND EDGE_SITES EdgeRipLoadSite EdgeRipCmpSite EdgeRipVecSite EdgeRipStoreSite EdgeSyscallSite EdgeInt2eSite)
+endif()
+list(TRANSFORM EDGE_SITES PREPEND "/EXPORT:" OUTPUT_VARIABLE EDGE_EXPORTS)
+add_executable(edge_target examples/edgehunt/edge_target.c ${EDGE_ASM})
+target_link_options(edge_target PRIVATE ${EDGE_EXPORTS} /INCREMENTAL:NO)
+target_compile_options(edge_target PRIVATE $<$<COMPILE_LANGUAGE:C>:/Zi>)
+target_link_options(edge_target PRIVATE /DEBUG)
+add_executable(edge_driver examples/edgehunt/edge_driver.cpp examples/edgehunt/edge_callbacks.cpp)
+target_include_directories(edge_driver PRIVATE include)
+target_link_libraries(edge_driver PRIVATE probe_api)
+add_dependencies(edge_driver edge_target probe_api_agent)
+
 add_executable(refusal_driver examples/conformance/refusal_driver.cpp)
 target_include_directories(refusal_driver PRIVATE include)
 target_link_libraries(refusal_driver PRIVATE probe_api)
 add_dependencies(refusal_driver hitcost_target)
 
-foreach(t gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
+foreach(t edge_target edge_driver gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
     target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 endforeach()

@@ -1,6 +1,7 @@
 // Public x64 breakpoint + inline backends. The debug API binds event consumption
 // to the launching thread, so probe_run owns the event loop through exit.
 #include "win_common.hpp"
+#include "probe_log_format.hpp"
 #include "probe_agent_shared.hpp"
 #include <cerrno>
 #include <cctype>
@@ -47,6 +48,9 @@ struct Probe {
     uint32_t insn_len = 0;
     bool displaced_ok = false;
     int riprel_disp_off = -1;
+    // REP/REPE/REPNE string instruction: the trap flag fires after EVERY iteration, so it
+    // is run out-of-line WITHOUT single-stepping, ended by an INT3 placed after the copy.
+    bool rep_string = false;
     probe_callback callback = nullptr;
     uint32_t flags = 0;
     std::vector<unsigned char> config;
@@ -72,6 +76,8 @@ struct StepState {
     uint64_t site = 0;
     uint32_t insn_len = 0;
     uint64_t scratch = 0;   // the out-of-line copy's slot (displaced steps)
+    bool tail_int3 = false; // displaced copy ends at an INT3 (scratch + insn_len), no trap flag
+    bool rep_string = false;// REP string op: an in-place step continues until it leaves the site
 };
 
 // One log line, optionally with a raw stack snapshot (return addresses only). Frames
@@ -161,6 +167,7 @@ struct probe_session {
     bool launched = false, ran = false, exited = false, gate_sent = false;
     bool attach_held = false;                  // attach: threads held once until inline hooks confirmed
     int shadow_stack = -1;                     // target has hardware shadow stacks (CET): -1 unknown, 0/1
+    bool warned_cb_fault = false;              // one stderr warning for a faulting controller-side callback
     DWORD cb_tid = 0;                          // thread whose callback / IPC is being serviced (0 = none)
     std::wstring agent_copy;                   // per-session copy of the agent DLL (UHH_SHARED), deleted at close
     std::vector<DWORD> pending_hold;           // callers of a runtime inline add: hold until it lands
@@ -1118,7 +1125,7 @@ static bool emulate_site(probe_session *s, const Probe &p, CONTEXT &c) {
 // RIP-relative disp32 to retarget in the out-of-line copy. Control-flow instructions
 // return displaced_ok=false so the caller uses the in-place fallback.
 static bool decode_site(const unsigned char *bytes, size_t n, uint32_t &len,
-                        bool &displaced_ok, int &riprel_off) {
+                        bool &displaced_ok, int &riprel_off, bool *rep_string = nullptr) {
     ZydisDecoder dec;
 #if defined(_WIN64)
     ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
@@ -1129,6 +1136,7 @@ static bool decode_site(const unsigned char *bytes, size_t n, uint32_t &len,
     ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
     if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, bytes, n, &insn, ops))) return false;
     len = insn.length; riprel_off = -1; displaced_ok = true;
+    if (rep_string) *rep_string = false;
     if (insn.meta.branch_type != ZYDIS_BRANCH_TYPE_NONE ||
         insn.meta.category == ZYDIS_CATEGORY_CALL || insn.meta.category == ZYDIS_CATEGORY_RET ||
         insn.meta.category == ZYDIS_CATEGORY_COND_BR || insn.meta.category == ZYDIS_CATEGORY_UNCOND_BR) {
@@ -1146,10 +1154,13 @@ static bool decode_site(const unsigned char *bytes, size_t n, uint32_t &len,
             displaced_ok = false; return true;
         default: break;
     }
-    // REP/REPE/REPNE string ops single-step one iteration at a time; stepped out-of-line
-    // we would force RIP past after a single pass and truncate the operation.
+    // REP/REPE/REPNE string ops: the trap flag fires after EACH iteration, so neither a
+    // trap-flag step out-of-line (truncates the operation) nor in place (the re-armed INT3
+    // fires the callback again for every remaining iteration, with RCX counting down) is
+    // right. The caller runs them out-of-line to completion, ended by a trailing INT3.
     if (insn.attributes & (ZYDIS_ATTRIB_HAS_REP | ZYDIS_ATTRIB_HAS_REPE | ZYDIS_ATTRIB_HAS_REPNE)) {
-        displaced_ok = false; return true;
+        if (rep_string) *rep_string = true; else displaced_ok = false;
+        return true;
     }
     // RIP-relative memory operand (x64): record the disp32 so the copy can be retargeted.
     for (int i = 0; i < insn.operand_count; ++i) {
@@ -1249,25 +1260,25 @@ static bool arm_breakpoint(probe_session *s, Probe &p, uint64_t base) {
             // re-apply still happens (entry_reapply) when this probe first fires.
             std::memcpy(buf, owner->orig_insn.data(), owner->orig_insn.size());
             owner->active = false; owner->retired = true;
-            uint32_t len = 0; bool disp_ok = false; int riprel = -1;
-            if (!decode_site(buf, sizeof(buf), len, disp_ok, riprel) || len == 0 || len > sizeof(buf)) {
+            uint32_t len = 0; bool disp_ok = false, rep_str = false; int riprel = -1;
+            if (!decode_site(buf, sizeof(buf), len, disp_ok, riprel, &rep_str) || len == 0 || len > sizeof(buf)) {
                 set_error(s, "could not decode probe site instruction"); return false;
             }
             p.original = buf[0]; p.orig_insn.assign(buf, buf + len);
-            p.insn_len = len; p.displaced_ok = disp_ok; p.riprel_disp_off = riprel;
+            p.insn_len = len; p.displaced_ok = disp_ok; p.riprel_disp_off = riprel; p.rep_string = rep_str;
             p.base = base; p.address = address; p.active = true;
             s->retired_bps.erase(address);
             return true;
         }
         set_error(s, "pre-hooked INT3 sites are unsupported by this breakpoint backend"); return false;
     }
-    uint32_t len = 0; bool disp_ok = false; int riprel = -1;
-    if (!decode_site(buf, sizeof(buf), len, disp_ok, riprel) || len == 0 || len > sizeof(buf)) {
+    uint32_t len = 0; bool disp_ok = false, rep_str = false; int riprel = -1;
+    if (!decode_site(buf, sizeof(buf), len, disp_ok, riprel, &rep_str) || len == 0 || len > sizeof(buf)) {
         set_error(s, "could not decode probe site instruction"); return false;
     }
     p.original = buf[0];
     p.orig_insn.assign(buf, buf + len);
-    p.insn_len = len; p.displaced_ok = disp_ok; p.riprel_disp_off = riprel;
+    p.insn_len = len; p.displaced_ok = disp_ok; p.riprel_disp_off = riprel; p.rep_string = rep_str;
     if (!patch(s->pi.hProcess, address, 0xcc)) {
         set_error(s, win_error("arm software breakpoint")); return false;
     }
@@ -2888,6 +2899,77 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
 // Service a hardware-breakpoint #DB (a single-step exception carrying a DR status
 // bit, not one of our software single-steps). Returns false on error; sets handled
 // when a DR we own fired. RF lets the flagged instruction run once without re-trapping.
+// ---- Callback memory access (breakpoint/hw callbacks) ---------------------------------
+// The SAME policy as the inline agent's range check, so get_mem/set_mem answer the same on
+// every backend: the whole range must be committed, not PAGE_GUARD / PAGE_NOACCESS, readable
+// (and writable for set_mem) -- checked BEFORE any byte moves, so a failure has no partial
+// effect. Plain Read/WriteProcessMemory differ: WriteProcessMemory silently makes code
+// pages writable (a set_mem into .text succeeded under breakpoint/hw, failed inline), and a
+// range running into an inaccessible page was half-copied. Reads also show the ORIGINAL
+// byte where a software breakpoint is armed (the program's code, not UHH's INT3).
+static bool remote_range_ok(HANDLE h, uint64_t a, size_t n, bool write) {
+    if (!n) return true;
+    if (a + n < a) return false;
+#if !defined(_WIN64)
+    if (a + n > 0x100000000ull) return false;
+#endif
+    const uint64_t end = a + n;
+    while (a < end) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQueryEx(h, (const void *)(uintptr_t)a, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
+        const DWORD prot = mbi.Protect & 0xFF;
+        if ((mbi.Protect & PAGE_GUARD) || prot == PAGE_NOACCESS || prot == 0) return false;
+        const bool w = prot == PAGE_READWRITE || prot == PAGE_WRITECOPY || prot == PAGE_EXECUTE_READWRITE ||
+                       prot == PAGE_EXECUTE_WRITECOPY;
+        const bool r = w || prot == PAGE_READONLY || prot == PAGE_EXECUTE_READ;
+        if (!r || (write && !w)) return false;
+        a = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+    }
+    return true;
+}
+static int callback_read(void *backend, uint64_t a, void *b, size_t n, size_t *done) {
+    auto *s = static_cast<probe_session *>(backend);
+    *done = 0;
+    if (!n) return 1;
+    if (!remote_range_ok(s->pi.hProcess, a, n, false)) return 0;
+    if (!remote_read(s->pi.hProcess, a, b, n, done) || *done != n) return 0;
+    for (auto &p : s->probes)                           // our INT3s read as the original bytes
+        if (p->active && (p->flags & PROBE_BREAKPOINT) && !p->orig_insn.empty() && p->address >= a && p->address < a + n &&
+            static_cast<unsigned char *>(b)[p->address - a] == 0xCC)
+            static_cast<unsigned char *>(b)[p->address - a] = p->original;
+    return 1;
+}
+static int callback_write(void *backend, uint64_t a, const void *b, size_t n, size_t *done) {
+    auto *s = static_cast<probe_session *>(backend);
+    *done = 0;
+    if (!n) return 1;
+    if (!remote_range_ok(s->pi.hProcess, a, n, true)) return 0;
+    return remote_write(s->pi.hProcess, a, b, n, done);
+}
+static const probe_ops callback_ops = {callback_read, callback_write};
+
+// Runs a breakpoint/hw callback in the controller under SEH, the way the inline agent runs
+// it inside the target: a callback that faults (a bad pointer, a target address used as a
+// controller pointer, ...) is abandoned -- the hit still counts, its register changes are
+// discarded, the target continues -- instead of killing the controller (and with it the
+// target). C++ exceptions are left to the caller's handlers.
+static bool seh_callback(probe_callback cb, probe_context *c, DWORD *code) {
+    __try { cb(c); return true; }
+    __except (GetExceptionCode() == 0xE06D7363u ? EXCEPTION_CONTINUE_SEARCH
+                                                : (*code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER)) { return false; }
+}
+static void run_callback(probe_session *s, Probe *probe, probe_context *c) {
+    const probe_regs before = c->regs;
+    DWORD code = 0;
+    if (seh_callback(probe->callback, c, &code)) return;
+    c->regs = before;                                   // no write-back, as inline
+    if (!s->warned_cb_fault) {
+        s->warned_cb_fault = true;
+        std::fprintf(stderr, "probe: warning: callback for %s raised 0x%08lx; abandoned (hit counted, no register "
+                     "changes applied). Further faults are not reported.\n", probe->location.c_str(), (unsigned long)code);
+    }
+}
+
 static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
     handled = false;
     HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
@@ -2927,13 +3009,13 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
         if (!(probe->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) && hit_pc != probe->address) {
             any = true; continue;                                    // stale: slot was reassigned
         }
-        probe_context context = from_context(native, probe_index(s, probe), hit_pc, &remote_ops, s->pi.hProcess);
+        probe_context context = from_context(native, probe_index(s, probe), hit_pc, &callback_ops, s);
         context.config = probe->config.empty() ? nullptr : probe->config.data();
         context.tid = event.dwThreadId;
         CallbackState state{s, probe, event.dwProcessId, event.dwThreadId}; context.controller = &state;
         if (event.dwThreadId == s->in_call_tid) { ++probe->hits; continue; }   // inside call_func: no re-entry
         s->cb_tid = event.dwThreadId;
-        try { probe->callback(&context); s->cb_tid = 0; }
+        try { run_callback(s, probe, &context); s->cb_tid = 0; }
         catch (const std::exception &e) { CloseHandle(thread); set_error(s, std::string("probe callback: ") + e.what()); return false; }
         catch (...) { CloseHandle(thread); set_error(s, "probe callback threw an unknown exception"); return false; }
         ++probe->hits;
@@ -2973,6 +3055,28 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     if (code == 0x4000001Eu /*STATUS_WX86_SINGLE_STEP*/) code = EXCEPTION_SINGLE_STEP;
     else if (code == 0x4000001Fu /*STATUS_WX86_BREAKPOINT*/) code = EXCEPTION_BREAKPOINT;
     disposition = DBG_EXCEPTION_NOT_HANDLED;
+    // A REP string instruction ran out-of-line to completion and reached the INT3 placed
+    // after its copy: land on the instruction after the probe site (no trap flag was used).
+    if (code == EXCEPTION_BREAKPOINT) {
+        auto st = stepping.find(event.dwThreadId);
+        const uint64_t at = (uint64_t)(uintptr_t)ex.ExceptionAddress;
+        if (st != stepping.end() && st->second.tail_int3 && st->second.scratch &&
+            at == st->second.scratch + st->second.insn_len) {
+            HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
+            CONTEXT w{}; w.ContextFlags = CONTEXT_CONTROL;
+            bool ok = t && GetThreadContext(t, &w);
+#if defined(_WIN64)
+            w.Rip = st->second.site + st->second.insn_len;
+#else
+            w.Eip = (DWORD)(st->second.site + st->second.insn_len);
+#endif
+            ok = ok && SetThreadContext(t, &w);
+            if (t) CloseHandle(t);
+            if (!ok) { set_error(s, win_error("complete out-of-line string instruction")); return false; }
+            stepping.erase(st);
+            disposition = DBG_CONTINUE; return true;
+        }
+    }
     // The loader's initial breakpoint -- but only if it is not one of OUR INT3s: a probe
     // can fire during loader initialisation (e.g. ntdll!NtCreateFile from the shim engine),
     // before the loader breakpoint, and must be handled as a probe hit, not swallowed.
@@ -3061,7 +3165,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             ok = ok && SetThreadContext(t, &w);
             if (t) CloseHandle(t);
             if (!ok) { set_error(s, win_error("re-run faulting displaced instruction")); return false; }
-            if (owner) step->second.displaced = false; else stepping.erase(step);
+            if (owner) { step->second.displaced = false; step->second.tail_int3 = false; } else stepping.erase(step);
             disposition = DBG_CONTINUE; return true;
         }
     }
@@ -3089,14 +3193,34 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         // The stepped instruction (displaced or in place) may itself have touched a
         // watched address: then this #DB carries B-bits as well as BS. Service those
         // hardware hits first (their callbacks run, DR6 is cleared), then finish the step.
+        bool hw_hit = false;
         if (s->hw_active || s->dr_ever) {
             CONTEXT dr{}; dr.ContextFlags = CONTEXT_DEBUG_REGISTERS;
             if (GetThreadContext(thread, &dr) && (dr.Dr6 & 0xF)) {
                 bool handled = false;
                 if (!handle_hw(s, event, handled)) { CloseHandle(thread); return false; }
+                hw_hit = handled;
             }
         }
+        if (step->second.tail_int3) {
+            // No trap flag is set for a string instruction running out-of-line: this #DB is a
+            // watchpoint it touched (serviced above) -- the copy keeps running to its INT3.
+            CloseHandle(thread);
+            if (hw_hit) { disposition = DBG_CONTINUE; return true; }
+            return true;                                   // not ours: pass it through
+        }
         bool ok = !!GetThreadContext(thread, &native);
+        if (ok && !step->second.displaced && step->second.rep_string &&
+            (uint64_t)EMU_IP(native) == step->second.site) {
+            // An in-place REP string step traps after each iteration: keep stepping (INT3
+            // still lifted, trap flag kept) until the instruction completes, so the callback
+            // runs once per execution, as on every other backend.
+            native.EFlags |= 0x100u;
+            ok = !!SetThreadContext(thread, &native);
+            CloseHandle(thread);
+            if (!ok) { set_error(s, win_error("continue string instruction step")); return false; }
+            disposition = DBG_CONTINUE; return true;
+        }
         if (step->second.displaced) {
             // The instruction ran out-of-line; the INT3 was never lifted, so there is
             // nothing to re-arm — just land on the instruction after the probe site.
@@ -3125,13 +3249,13 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     bool at_entry = s->entry_addr && address == s->entry_addr && !s->entry_seen;
     if (at_entry) s->entry_seen = true;
     probe_context context = from_context(native, probe_index(s, probe),
-                                         address, &remote_ops, s->pi.hProcess);
+                                         address, &callback_ops, s);
     context.config = probe->config.empty() ? nullptr : probe->config.data();
     context.tid = event.dwThreadId;
     CallbackState state{s, probe, event.dwProcessId, event.dwThreadId}; context.controller = &state;
     s->cb_tid = event.dwThreadId;
     if (event.dwThreadId != s->in_call_tid)          // a probe hit INSIDE call_func's callee: step over it
-    try { probe->callback(&context); s->cb_tid = 0; }
+    try { run_callback(s, probe, &context); s->cb_tid = 0; }
     catch (const std::exception &e) {
         CloseHandle(thread); set_error(s, std::string("probe callback: ") + e.what()); return false;
     } catch (...) {
@@ -3188,6 +3312,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             if (nd < INT32_MIN || nd > INT32_MAX) displaced = false;
             else { int32_t v = (int32_t)nd; std::memcpy(code.data() + probe->riprel_disp_off, &v, sizeof(v)); }
         }
+        if (probe->rep_string) code.push_back(0xCC);       // the copy runs to completion, then traps here
         size_t wrote = 0;
         if (displaced && (!remote_write(s->pi.hProcess, scratch_addr, code.data(), code.size(), &wrote) ||
                           wrote != code.size())) {
@@ -3216,7 +3341,8 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         native.Eip = (DWORD)probe->address;
 #endif
     }
-    native.EFlags |= 0x100u;
+    const bool tail = displaced && probe->rep_string;
+    if (!tail) native.EFlags |= 0x100u;
     // Preserve debug registers: the callback may have armed a hardware probe/watchpoint on
     // THIS thread (probe_watch/probe_add_at); writing CONTEXT_ALL with the pre-callback DR
     // image would clobber it. CONTEXT_FULL writes control/integer/segment only.
@@ -3229,7 +3355,8 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         std::fprintf(stderr, "  setup tid=%lu displaced=%d scratch=0x%llx rip=0x%llx\n",
                      (unsigned long)event.dwThreadId, displaced,
                      (unsigned long long)scratch_addr, (unsigned long long)(displaced ? scratch_addr : probe->address));
-    stepping[event.dwThreadId] = StepState{probe, displaced, probe->address, probe->insn_len, displaced ? scratch_addr : 0};
+    stepping[event.dwThreadId] = StepState{probe, displaced, probe->address, probe->insn_len, displaced ? scratch_addr : 0,
+                                           tail, probe->rep_string};
     if (at_entry && inline_hold_needed(s)) { hold_thread(s, event.dwThreadId); if (!kick_agent(s)) return false; }
     disposition = DBG_CONTINUE; return true;
 }
@@ -3997,12 +4124,9 @@ static std::string symbolize(probe_session *s, uint64_t addr) {
 static void log_common(probe_context *c, bool stack, const char *format, va_list ap) {
     if (!format) return;
     char line[PROBE_AGENT_LOG_TEXT_CAP];                      // the same limit inline uses
-    int n = std::vsnprintf(line, sizeof(line), format, ap);
-    if (n < 0) return; line[sizeof(line) - 1] = 0;
-    if ((size_t)n >= sizeof(line)) {                          // truncated: say so, never silently
-        static const char mark[] = "...[truncated]";
-        std::memcpy(line + sizeof(line) - sizeof(mark), mark, sizeof(mark));
-    }
+    // Same formatter as the agent: truncation marked, an invalid format or a faulting
+    // argument logged as "[unformattable] <format>" -- never dropped, never fatal.
+    if (!uhh_format_log(line, sizeof(line), format, ap)) return;
     auto *state = c ? static_cast<CallbackState *>(c->controller) : nullptr;
     if (!state || !state->session) { std::fprintf(stderr, "probe: %s\n", line); return; }
     try {
