@@ -1333,6 +1333,7 @@ static bool notify_installed() {
 
 static HANDLE service_event;
 static volatile LONG service_running;   // service_main has started (past its loader init)
+static HANDLE service_up;               // set by service_main once it runs (init waits for it)
 // The service thread reports itself ready only from HERE, i.e. once it runs its own code:
 // a new thread first goes through the loader's thread initialisation (LdrInitializeThunk ->
 // DLL_THREAD_ATTACH for every module), which waits while another thread is in the middle of
@@ -1344,6 +1345,7 @@ static volatile LONG service_running;   // service_main has started (past its lo
 static DWORD WINAPI service_main(void *) {
     InterlockedExchange(&service_running, 1);
     InterlockedExchange(&shared->service_ready, 1);
+    if (service_up) SetEvent(service_up);
     notify_installed();
     for (;;) {
         if (WaitForSingleObject(service_event, INFINITE) != WAIT_OBJECT_0) return 1;
@@ -1373,8 +1375,18 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
         wchar_t name[64]; probe_agent_service_name(GetCurrentProcessId(), name);
         service_event = OpenEventW(SYNCHRONIZE, FALSE, name);
         if (service_event) {
+            service_up = CreateEventW(nullptr, TRUE, FALSE, nullptr);
             HANDLE t = CreateThread(nullptr, 0, service_main, nullptr, 0, nullptr);
-            if (t) CloseHandle(t);              // service_ready: set by the thread itself, once running
+            // service_ready is set by the thread itself, once running. Init does not finish
+            // (so the controller reports nothing "active" and releases nothing) before then:
+            // a DLL with inline sites loaded right after -- e.g. at once after an attach --
+            // would otherwise find no service thread to install it. Nothing the controller
+            // holds can own the loader here (launch: the entry hold; attach: no hold), so the
+            // wait is short; bounded anyway (the thread then reports ready when it gets there).
+            if (t) {
+                CloseHandle(t);
+                if (service_up) WaitForSingleObject(service_up, 5000);
+            }
         }
     }
     return 0;
