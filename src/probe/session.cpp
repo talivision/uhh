@@ -4130,8 +4130,10 @@ static void start_drainer(probe_session *s) {
 }
 
 // After the target has exited no producer can still be mid-publish, so records published
-// beyond a slot that was claimed but never published (its producer died at exit) are
-// recovered, and each such slot is counted as dropped -- never lost silently.
+// beyond a slot that was claimed but never published are recovered. Such a slot belongs to a
+// producer killed by the exit in the middle of its callback (a slot is claimed and published
+// inside send_log): that callback is already counted in callbacks_interrupted, so the slot is
+// not counted again as dropped -- logs + log_dropped + callbacks_interrupted == hits.
 static void drain_final(probe_session *s) {
     if (!s->shared) return;
     drain_agent_logs(s);
@@ -4141,7 +4143,7 @@ static void drain_final(probe_session *s) {
     LONG64 head = sh->log_head;
     for (LONG64 pos = sh->log_tail; pos < head; ++pos) {
         auto &rec = sh->logs[(uint64_t)pos % PROBE_AGENT_LOG_CAP];
-        if (rec.seq != pos + 1) { InterlockedIncrement(&sh->log_dropped); continue; }
+        if (rec.seq != pos + 1) continue;                 // its producer died mid-callback (see above)
         try {
             LogRecord r;
             rec.text[PROBE_AGENT_LOG_TEXT_CAP - 1] = 0;
