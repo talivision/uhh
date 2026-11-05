@@ -39,10 +39,15 @@ u64 EdgeSyscall(u64 service);
 u64 EdgeInt2e(u64 service);
 #endif
 
+// Every C-level site writes a volatile sink so the compiler can neither drop nor hoist the
+// calls (they would otherwise be pure functions with unused results).
+static volatile intptr_t g_sink;
+
 // ---- C-level sites: arguments, memory edge cases, log formatting, deep stacks ----------
 EXPORT intptr_t edge_args10(intptr_t a0, intptr_t a1, intptr_t a2, intptr_t a3, intptr_t a4,
                             intptr_t a5, intptr_t a6, intptr_t a7, intptr_t a8, intptr_t a9) {
-    return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9;
+    g_sink = a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9;
+    return g_sink;
 }
 
 // Addresses the memory callback probes (all filled by the target, read via get_func_arg(0)).
@@ -55,12 +60,12 @@ struct edge_mem {
     u64 rw;         // ordinary RW buffer
     u64 site;       // EdgeRepSite: code a probe sits on (F3 A4 originally)
 };
-EXPORT int edge_mem_site(struct edge_mem *m) { return m->rw != 0; }
+EXPORT int edge_mem_site(struct edge_mem *m) { g_sink = (intptr_t)m->rw; return g_sink != 0; }
 
-EXPORT int edge_fmt_site(const char *s) { return s[0]; }
+EXPORT int edge_fmt_site(const char *s) { g_sink = s[0]; return (int)g_sink; }
 
 static volatile LONG g_leaf_calls;
-EXPORT int edge_leaf(int depth) { InterlockedIncrement(&g_leaf_calls); return depth; }
+EXPORT int edge_leaf(int depth) { InterlockedIncrement(&g_leaf_calls); g_sink = depth; return depth; }
 EXPORT int edge_recurse(int n) {
     volatile int pad[4] = {n, n, n, n};
     if (n == 0) return edge_leaf(pad[0]);
@@ -176,7 +181,7 @@ int main(int argc, char **argv) {
 #endif
     }
     // memory edge cases (once), then check the target saw no side effect
-    edge_mem_site(&m);
+    g_sink = edge_mem_site(&m);
     MEMORY_BASIC_INFORMATION mbi = {0};
     VirtualQuery(g, &mbi, sizeof(mbi));
     int guard_kept = (mbi.Protect & PAGE_GUARD) != 0;
@@ -184,10 +189,10 @@ int main(int argc, char **argv) {
     int cross_kept = 1; for (int i = 0; i < 8; ++i) cross_kept &= two[page - 8 + i] == 0x22;
     int ro_kept = ro[0] == 0x11;
     // log formatting edge cases (once)
-    edge_fmt_site("hello-from-target");
+    g_sink = edge_fmt_site("hello-from-target");
     // deep recursion and a thread whose first frame is the probed function
     g_leaf_calls = 0;
-    edge_recurse(200);
+    g_sink = edge_recurse(200);
     HANDLE th = CreateThread(NULL, 0, leaf_thread, NULL, 0, NULL);
     if (th) { WaitForSingleObject(th, INFINITE); CloseHandle(th); }
 

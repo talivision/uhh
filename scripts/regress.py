@@ -1187,8 +1187,18 @@ def check_edgehunt():
         except Exception as e:
             record(name, False, repr(e))
 
-    # two backends on the same instruction
-    for pair in ("breakpoint,hw", "hw,breakpoint", "breakpoint,inline", "inline,breakpoint", "hw,inline"):
+    # two backends on the same instruction (in both registration orders). An inline hook
+    # cannot be written over a live INT3: breakpoint + inline is refused, with that reason.
+    for pair in ("breakpoint,inline", "inline,breakpoint"):
+        name = f"edgehunt-dual-{pair.replace(',', '+')}-refused"
+        try:
+            r, o = run([d, "--dual", pair, "--", t, "--iters", K], timeout=120)
+            err = str(report(o).get("error") or "")
+            ok = r.returncode != 0 and "software-breakpoint probe" in err
+            record(name, ok, f"exit={r.returncode} error={err[:160]!r}")
+        except Exception as e:
+            record(name, False, repr(e))
+    for pair in ("breakpoint,hw", "hw,breakpoint", "hw,inline", "inline,hw"):
         name = f"edgehunt-dual-{pair.replace(',', '+')}"
         try:
             r, o = run([d, "--dual", pair, "--", t, "--iters", K], timeout=120)

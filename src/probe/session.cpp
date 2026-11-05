@@ -1784,13 +1784,28 @@ static bool patch_in_code_section(probe_session *s, uint64_t base, uint64_t lo, 
 static bool inline_site_unsafe(probe_session *s, const Probe &p, std::string &why) {
     unsigned char b[32] = {}; size_t n = 0;
     if (!remote_read(s->pi.hProcess, p.address, b, sizeof(b), &n) || n < 5) return false;
+    // Decode the PROGRAM's bytes: our own INT3s read as the instruction they replace.
+    uint64_t own_bp = UINT64_MAX;
+    for (auto &q : s->probes)
+        if (q->active && (q->flags & PROBE_BREAKPOINT) && !q->orig_insn.empty() && q->address >= p.address &&
+            q->address < p.address + n && b[q->address - p.address] == 0xCC) {
+            b[q->address - p.address] = q->original;
+            own_bp = std::min(own_bp, q->address);
+        }
     int64_t call_end = -1; bool code_after_exit = false; size_t exit_at = 0;
     const uint32_t len = inline_patch_len(b, n, &call_end, &code_after_exit, &exit_at);
     if (!len) return false;
     char buf[320];
     std::string reason;          // "<N>-byte hook would be written across <what> at +0xK"
     std::string secname;
-    if (p.base && !patch_in_code_section(s, p.base, p.address, p.address + len, secname)) {
+    if (own_bp < p.address + len) {
+        // The hook would relocate a live UHH INT3 into its trampoline, where it would no
+        // longer be recognised (an unknown breakpoint in the target).
+        std::snprintf(buf, sizeof(buf), "%u-byte hook would be written over a software-breakpoint probe at +0x%llx "
+                      "(probe that instruction with one of breakpoint / inline, or use hw with either)",
+                      len, (unsigned long long)(own_bp - p.address));
+        reason = buf;
+    } else if (p.base && !patch_in_code_section(s, p.base, p.address, p.address + len, secname)) {
         std::snprintf(buf, sizeof(buf), "%u-byte hook would be written across the end of section %s", len, secname.c_str());
         reason = buf;
     } else if (code_after_exit) {
@@ -2018,7 +2033,16 @@ static bool still_armed(probe_session *s, uint64_t site) {
     return p && (p->flags & PROBE_BREAKPOINT);
 }
 
+// The active SOFTWARE-BREAKPOINT probe at an address (the owner of an INT3 there). Other
+// backends may probe the same address too (hw + breakpoint on one instruction): an INT3
+// must never be attributed to them -- that ran the hw callback a second time and then
+// "re-armed" the site with the hw probe's (zero) original byte, corrupting the code.
 static Probe *probe_at(probe_session *s, uint64_t address) {
+    for (auto &p : s->probes)
+        if (p->active && p->address == address && (p->flags & PROBE_BREAKPOINT)) return p.get();
+    return nullptr;
+}
+static Probe *probe_any_at(probe_session *s, uint64_t address) {
     for (auto &p : s->probes) if (p->active && p->address == address) return p.get();
     return nullptr;
 }
@@ -3119,7 +3143,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         // A trap at the address of a hardware probe we have RELEASED, raised before the
         // release reached this thread (its debug status no longer names the slot): ours,
         // stale. Clear our slots on the thread, step over with RF, and swallow it.
-        if (s->retired_hw.count(address) && !probe_at(s, address)) {
+        if (s->retired_hw.count(address) && !probe_any_at(s, address)) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
             CONTEXT w{}; w.ContextFlags = CONTEXT_DEBUG_REGISTERS | CONTEXT_CONTROL;
             if (t && GetThreadContext(t, &w)) {
