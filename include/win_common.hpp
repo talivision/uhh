@@ -51,6 +51,28 @@ inline void to_context(const probe_context &c, CONTEXT &w) {
 #endif
     /* PC/SP and flags are read-only in this first common contract. */
 }
+/* call_original / return_from are only meaningful from a probe on a function's FIRST
+   instruction, where [SP] is the caller's return address. A cheap, arch-neutral test: the
+   bytes before that address must end with a CALL encoding (E8 rel32, FF /2 in its register,
+   [reg], [reg+disp8/32], SIB and RIP/absolute forms; a REX prefix before FF /2 is ignored).
+   pre = the 8 bytes immediately before the candidate return address. A false "no" refuses
+   the call (safe: the original simply runs natively); a false "yes" needs a random stack
+   word that happens to follow a call instruction. */
+inline bool looks_like_return_site(const unsigned char pre[8]) {
+    const unsigned char *p = pre + 8;
+    auto ff2 = [](unsigned char m) { return ((m >> 3) & 7) == 2; };
+    if (p[-5] == 0xE8) return true;                                                     // call rel32
+    if (p[-2] == 0xFF && ff2(p[-1]) && ((p[-1] >> 6) == 3 ||                            // call reg
+        ((p[-1] >> 6) == 0 && (p[-1] & 7) != 4 && (p[-1] & 7) != 5))) return true;      // call [reg]
+    if (p[-3] == 0xFF && ff2(p[-2]) && (((p[-2] >> 6) == 1 && (p[-2] & 7) != 4) ||      // call [reg+d8]
+        ((p[-2] >> 6) == 0 && (p[-2] & 7) == 4 && (p[-1] & 7) != 5))) return true;      // call [sib]
+    if (p[-4] == 0xFF && ff2(p[-3]) && (p[-3] >> 6) == 1 && (p[-3] & 7) == 4) return true;   // call [sib+d8]
+    if (p[-6] == 0xFF && ff2(p[-5]) && (((p[-5] >> 6) == 2 && (p[-5] & 7) != 4) ||      // call [reg+d32]
+        (p[-5] & 0xC7) == 5)) return true;                                              // call [rip/abs32]
+    if (p[-7] == 0xFF && ff2(p[-6]) && (((p[-6] >> 6) == 2 && (p[-6] & 7) == 4) ||      // call [sib+d32]
+        ((p[-6] >> 6) == 0 && (p[-6] & 7) == 4 && (p[-5] & 7) == 5))) return true;      // call [idx*s+d32]
+    return false;
+}
 inline bool callback_export_name(probe_callback callback, std::string &name) {
     HMODULE module{};
     if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |

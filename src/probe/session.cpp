@@ -8,6 +8,7 @@
 #include <cstdarg>
 #include <climits>
 #include <memory>
+#include <type_traits>
 #include <string>
 #include <unordered_map>
 #include <map>
@@ -69,6 +70,7 @@ struct CallbackState {
     probe_session *session;
     Probe *probe;
     DWORD pid = 0, tid = 0;   // the stopped event's thread (call_func runs code on it)
+    bool released = false;    // call_original: the original left without returning; the thread runs on
 };
 
 // A thread mid-single-step over a software breakpoint. displaced == true means the
@@ -194,6 +196,13 @@ struct probe_session {
     std::vector<HANDLE> call_deferred;         // other threads' hits during a call_func: rewound + suspended
     bool skip_continue = false;                // call_func already continued the current event
     uint64_t call_trap = 0;                    // INT3 the callee returns into
+    // call_original in flight (breakpoint/hw, see call_original): the probe address the call
+    // starts at, the hit's SP, whether the breakpoint entry pass is still pending (the call's
+    // own first INT3 execution: not a hit), and whether the thread was seen OUTSIDE the call
+    // (a hit at or above the hit's SP: it left by exception/longjmp without returning).
+    uint64_t co_addr = 0, co_sp = 0;
+    bool co_entry_pending = false, co_left = false;
+    bool co_warned_entry = false, co_warned_dr = false, co_warned_left = false;
     bool initial_break = false;
     std::unordered_map<DWORD, StepState> stepping;   // threads mid single-step
 };
@@ -3369,6 +3378,9 @@ static int callback_write(void *backend, uint64_t a, const void *b, size_t n, si
 }
 static const probe_ops callback_ops = {callback_read, callback_write};
 
+// Raised by call_original (breakpoint/hw) to end a callback whose original left without
+// returning (it raised, longjmp'd or ran past the call timeout): the thread runs on natively.
+static const DWORD UHH_CALL_RELEASED = 0xE0554843u;
 // Runs a breakpoint/hw callback in the controller under SEH, the way the inline agent runs
 // it inside the target: a callback that faults (a bad pointer, a target address used as a
 // controller pointer, ...) is abandoned -- the hit still counts, its register changes are
@@ -3384,6 +3396,7 @@ static void run_callback(probe_session *s, Probe *probe, probe_context *c) {
     DWORD code = 0;
     if (seh_callback(probe->callback, c, &code)) return;
     c->regs = before;                                   // no write-back, as inline
+    if (code == UHH_CALL_RELEASED) return;              // call_original ended the callback (see there)
     if (!s->warned_cb_fault) {
         s->warned_cb_fault = true;
         std::fprintf(stderr, "probe: warning: callback for %s raised 0x%08lx; abandoned (hit counted, no register "
@@ -3545,12 +3558,25 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
         context.config = probe->config.empty() ? nullptr : probe->config.data();
         context.tid = event.dwThreadId;
         CallbackState state{s, probe, event.dwProcessId, event.dwThreadId}; context.controller = &state;
-        if (event.dwThreadId == s->in_call_tid) { count_hit(probe); continue; }   // inside call_func: no re-entry
+        if (event.dwThreadId == s->in_call_tid) {                                 // inside call_func: no re-entry
+            if (s->co_addr && !(probe->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW))) {
+#if defined(_WIN64)
+                const uint64_t sp = native.Rsp;
+#else
+                const uint64_t sp = native.Esp;
+#endif
+                if (sp >= s->co_sp && defer_hit_during_call(s, event.dwThreadId, hit_pc, false)) {
+                    s->co_left = true; CloseHandle(thread); handled = true; return true;   // left the call (see breakpoint)
+                }
+            }
+            count_hit(probe); continue;
+        }
         s->cb_tid = event.dwThreadId;
         try { run_callback(s, probe, &context); s->cb_tid = 0; }
         catch (const std::exception &e) { CloseHandle(thread); set_error(s, std::string("probe callback: ") + e.what()); return false; }
         catch (...) { CloseHandle(thread); set_error(s, "probe callback threw an unknown exception"); return false; }
         count_hit(probe);
+        if (state.released) { CloseHandle(thread); s->skip_continue = true; handled = true; return true; }
         if (probe->flags & PROBE_ONCE) release_hw(s, *probe);
         to_context(context, native);                                 // fold each callback's changes forward
 #if defined(_WIN64)
@@ -3931,6 +3957,22 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         defer_hit_during_call(s, event.dwThreadId, address, true)) {
         CloseHandle(thread); disposition = DBG_CONTINUE; return true;
     }
+    bool co_pass = false;                            // call_original's own entry pass: not a hit
+    if (s->co_addr && event.dwThreadId == s->in_call_tid && !probe->internal) {
+#if defined(_WIN64)
+        const uint64_t sp = native.Rsp;
+#else
+        const uint64_t sp = native.Esp;
+#endif
+        if (s->co_entry_pending && address == s->co_addr && sp == s->co_sp) {
+            s->co_entry_pending = false; co_pass = true;
+        } else if (sp >= s->co_sp && defer_hit_during_call(s, event.dwThreadId, address, true)) {
+            // The call_original thread is back at (or above) the hit's frame without having
+            // returned: the original was left by an exception or longjmp. This hit is a NEW
+            // one -- rewind it; it is serviced normally once the call is released.
+            s->co_left = true; CloseHandle(thread); disposition = DBG_CONTINUE; return true;
+        }
+    }
     if (s->entry_reapply && address == s->entry_reapply && !probe->internal) reapply_all_hw(s);
     bool at_entry = s->entry_addr && address == s->entry_addr && !s->entry_seen;
     if (at_entry) s->entry_seen = true;
@@ -3947,7 +3989,10 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     } catch (...) {
         CloseHandle(thread); set_error(s, "probe callback threw an unknown exception"); return false;
     }
-    count_hit(probe);
+    if (!co_pass) count_hit(probe);
+    if (state.released) {        // call_original released the thread: it runs on, nothing to write back
+        CloseHandle(thread); s->skip_continue = true; return true;
+    }
     to_context(context, native);
 #if defined(_WIN64)
     native.Rsp = context.regs.rsp;
@@ -4901,23 +4946,180 @@ extern "C" int call_func(probe_context *c, const char *symbol, uint64_t *ret, in
     return call_func_args(c, symbol, ret, nargs, args);
 }
 
-// call_original on breakpoint/hw: call_func on the probe's own address with the hit's
-// (possibly modified) registers and arguments. The probe's INT3/DR is hit at once by the
-// calling thread, which is in call_func, so it steps over without re-entering.
+// call_original on breakpoint/hw: the original runs IN PLACE -- on the hit's own stack, from
+// the probe address, with the callback's registers -- exactly as the program would have run
+// it, returning to its real return address. A debug register set on THIS thread only, at
+// that return address, stops it there (SP just above the hit's: the matching return); the
+// thread is then put back at the hit, so the callback continues and return_from applies.
+// Nothing on the stack is rewritten, so an exception or longjmp inside the original unwinds
+// natively into the program's own handlers (and CET shadow stacks stay in sync). Such an
+// exit -- the thread seen at or above the hit's frame without having returned -- RELEASES
+// the call: the thread runs on, the program sees exactly what it would have seen, and the
+// rest of the callback is abandoned (as on inline, where the exception propagates through
+// the callback). The probe's own entry is passed through without counting a hit; probes
+// hit inside the original are counted but run no callback; other threads' hits wait.
+static bool hit_is_function_entry(probe_context *c, uint64_t *ret_addr) {
+    uint64_t r = 0; unsigned char pre[8];
+    if (!get_mem(c, c->hit_sp, &r, sizeof(void *)) || r < 8 || !get_mem(c, r - 8, pre, sizeof(pre))) return false;
+    if (ret_addr) *ret_addr = r;
+    return looks_like_return_site(pre);
+}
+static void co_warn(bool &flag, const Probe *probe, const char *text) {
+    if (flag) return;
+    flag = true;
+    std::fprintf(stderr, "probe: warning: %s: %s. Further cases are not reported.\n", probe->location.c_str(), text);
+}
+static int call_original_in_place(probe_session *s, CallbackState *st, probe_context *c, uint64_t *out) {
+    Probe *probe = st->probe;
+    const uint64_t ptr = sizeof(void *);
+    uint64_t ret_addr = 0;
+    if (!hit_is_function_entry(c, &ret_addr)) {
+        co_warn(s->co_warned_entry, probe, "call_original refused: not at a function entry ([SP] is no return address)");
+        return 0;
+    }
+    HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, st->tid);
+    if (!thread) return 0;
+    CONTEXT saved{}; saved.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_FLOATING_POINT | CONTEXT_DEBUG_REGISTERS;
+    if (!GetThreadContext(thread, &saved)) { CloseHandle(thread); return 0; }
+    int slot = -1;
+    for (int k = 0; k < 4 && slot < 0; ++k)
+        if (!(s->dr_used & (1u << k)) && !((saved.Dr7 >> (k * 2)) & 3)) slot = k;
+    if (slot < 0) {
+        CloseHandle(thread);
+        co_warn(s->co_warned_dr, probe, "call_original refused: needs one free debug register (all 4 in use)");
+        return 0;
+    }
+    CONTEXT w = saved;
+    to_context(*c, w);                                                 // the callback's registers
+    auto *dr = slot == 0 ? &w.Dr0 : slot == 1 ? &w.Dr1 : slot == 2 ? &w.Dr2 : &w.Dr3;   // DWORD64 / DWORD
+    *dr = (std::remove_reference_t<decltype(*dr)>)ret_addr;
+    w.Dr7 = (decltype(w.Dr7))((w.Dr7 & ~((DWORD64)0xF << (16 + slot * 4))) | ((DWORD64)1 << (slot * 2)));   // execute, local
+    w.Dr6 = 0;
+#if defined(_WIN64)
+    w.Rip = probe->address; w.Rsp = c->hit_sp;
+#else
+    w.Eip = (DWORD)probe->address; w.Esp = (DWORD)c->hit_sp;
+#endif
+    w.EFlags &= ~0x100u;
+    if (probe->flags & PROBE_HW) w.EFlags |= 0x10000u;                 // RF: the entry's own DR stays quiet once
+    w.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS;
+    if (!SetThreadContext(thread, &w)) { CloseHandle(thread); return 0; }
+    s->dr_used |= (uint8_t)(1u << slot);                               // reserved: no probe arms it meanwhile
+    s->in_call_tid = st->tid; s->co_addr = probe->address; s->co_sp = c->hit_sp;
+    s->co_entry_pending = !(probe->flags & PROBE_HW); s->co_left = false;
+    auto clear_slot = [&](bool running) {
+        if (running && SuspendThread(thread) == (DWORD)-1) return;
+        set_dr_on_thread(thread, slot, 0, false);
+        if (running) ResumeThread(thread);
+    };
+    if (!ContinueDebugEvent(st->pid, st->tid, DBG_CONTINUE)) {
+        saved.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS;
+        SetThreadContext(thread, &saved);
+        s->dr_used &= (uint8_t)~(1u << slot); s->in_call_tid = 0; s->co_addr = 0;
+        CloseHandle(thread); return 0;
+    }
+    bool done = false, thread_gone = false;
+    const char *why = "the original left without returning (exception or longjmp)";
+    uint64_t result = 0;
+    ULONGLONG until = GetTickCount64() + 5000, next_poll = GetTickCount64() + 20;
+    DEBUG_EVENT ev{};
+    while (!s->exited && !s->co_left && !thread_gone) {
+        if (WaitForDebugEvent(&ev, 20)) {
+            if (continue_foreign_event(s, ev)) continue;
+            if (ev.dwThreadId == st->tid && ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT &&
+                ev.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP &&
+                (uint64_t)(uintptr_t)ev.u.Exception.ExceptionRecord.ExceptionAddress == ret_addr) {
+                CONTEXT r{}; r.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+                if (GetThreadContext(thread, &r)) {
+#if defined(_WIN64)
+                    const uint64_t sp = r.Rsp, rax = r.Rax;
+#else
+                    const uint64_t sp = r.Esp, rax = r.Eax;
+#endif
+                    if (sp > s->co_sp && sp <= s->co_sp + ptr + 1024) {   // x86 stdcall: ret N popped the args
+                        result = rax; done = true; break;                  // this event now stands in for the hit
+                    }
+                    r.EFlags |= 0x10000u; SetThreadContext(thread, &r);    // some other return there: run on
+                }
+                ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
+                continue;
+            }
+            if (ev.dwThreadId == st->tid && ev.dwDebugEventCode == EXIT_THREAD_DEBUG_EVENT) {
+                thread_gone = true; why = "the thread exited inside the original";
+            }
+            DWORD disposition = DBG_CONTINUE;
+            dispatch_event(s, ev, disposition);                            // everything else as usual
+            if (s->skip_continue) s->skip_continue = false;
+            else ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, disposition);
+        }
+        const ULONGLONG now = GetTickCount64();
+        if (now >= next_poll && !s->co_left && !thread_gone && !s->exited) {
+            // Left without a probe hit to show it (e.g. an exception caught by the caller):
+            // the thread is above the hit's frame and not at the return address.
+            next_poll = now + 20;
+            if (SuspendThread(thread) != (DWORD)-1) {
+                CONTEXT r{}; r.ContextFlags = CONTEXT_CONTROL;
+                if (GetThreadContext(thread, &r)) {
+#if defined(_WIN64)
+                    const uint64_t sp = r.Rsp, pc = r.Rip;
+#else
+                    const uint64_t sp = r.Esp, pc = r.Eip;
+#endif
+                    if (sp >= s->co_sp + ptr && pc != ret_addr) s->co_left = true;
+                }
+                ResumeThread(thread);
+            }
+        }
+        if (!done && now > until && !s->co_left) {
+            s->co_left = true; why = "the original did not return within 5 s (released, it runs on)";
+        }
+    }
+    s->in_call_tid = 0; s->co_addr = 0; s->co_entry_pending = false; s->co_left = false;
+    if (done) {
+        CONTEXT cur{}; cur.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (GetThreadContext(thread, &cur)) {          // keep any DR armed meanwhile, drop ours
+            cur.Dr7 = (decltype(cur.Dr7))(cur.Dr7 & ~(((DWORD64)3 << (slot * 2)) | ((DWORD64)0xF << (16 + slot * 4))));
+            saved.Dr0 = cur.Dr0; saved.Dr1 = cur.Dr1; saved.Dr2 = cur.Dr2; saved.Dr3 = cur.Dr3; saved.Dr7 = cur.Dr7;
+        }
+        saved.Dr6 = 0;
+        saved.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_FLOATING_POINT | CONTEXT_DEBUG_REGISTERS;
+        SetThreadContext(thread, &saved);              // exactly as it was at the hit
+    } else if (!s->exited && !thread_gone) {
+        clear_slot(true);
+    }
+    s->dr_used &= (uint8_t)~(1u << slot);
+    resume_deferred_hits(s);                           // they hit their probes again now
+    CloseHandle(thread);
+    if (done) {
+        c->called_original = 1;
+        if (out) *out = result;
+        return 1;
+    }
+    // Released: the original ran (or runs on) natively, and the program sees exactly its
+    // outcome. There is no stopped thread left to write back to; end the callback here.
+    st->released = true;
+    s->skip_continue = true;
+    if (!s->exited) co_warn(s->co_warned_left, probe, why);
+    RaiseException(UHH_CALL_RELEASED, 0, 0, nullptr);
+    return 0;
+}
 extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
     auto *st = c ? static_cast<CallbackState *>(c->controller) : nullptr;
-    if (!st || !st->session || !st->tid || !st->probe || nargs < 0 || nargs > 8) return 0;
+    if (!st || !st->session || !st->tid || !st->probe || nargs < 0 || nargs > 8 || st->released) return 0;
     if (st->probe->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) return 0;
-    uint64_t args[8] = {0};
-    for (int i = 0; i < nargs; ++i) args[i] = get_func_arg(c, (size_t)i);
-    uint64_t ret = 0;
-    if (!call_in_target(st->session, st, st->probe->address, &ret, nargs, args, c)) return 0;
-    c->called_original = 1;
-    if (out) *out = ret;
-    return 1;
+    if (st->session->in_call_tid) return 0;                            // no nesting
+    return call_original_in_place(st->session, st, c, out);
 }
 extern "C" void return_from(probe_context *c, uint64_t value, int nargs) {
     if (!c || nargs < 0 || nargs > 255) return;
+    auto *st = static_cast<CallbackState *>(c->controller);
+    if (!st || st->released) return;
+    if (!hit_is_function_entry(c, nullptr)) {
+        if (st->session && st->probe)
+            co_warn(st->session->co_warned_entry, st->probe,
+                    "return_from refused: not at a function entry ([SP] is no return address)");
+        return;
+    }
 #if defined(_WIN64)
     (void)nargs; c->regs.rax = value; c->ret_pop = 0;
 #else
