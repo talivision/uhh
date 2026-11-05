@@ -1280,11 +1280,8 @@ def find_old_msvcp():
     is64 = struct.unpack_from("<H", d, pe + 4)[0] == 0x8664
     roots = [Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio",
              Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Microsoft Visual Studio"]
-    for root in roots:
-        for cand in sorted(root.glob("*/*/VC/Tools/Llvm/x64/bin/msvcp140.dll" if is64 else
-                                     "*/*/VC/Tools/Llvm/bin/msvcp140.dll")):
-            return cand
-    return None
+    pattern = "*/*/VC/Tools/Llvm/x64/bin/msvcp140.dll" if is64 else "*/*/VC/Tools/Llvm/bin/msvcp140.dll"
+    return next((c for root in roots for c in sorted(root.glob(pattern))), None)
 
 
 def check_oldcrt(calls=2000):
@@ -1322,6 +1319,44 @@ def check_oldcrt(calls=2000):
                 record(name, False, repr(e))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def check_gated_map(threads=4, reads=50):
+    """The NtOpenProcess probe logs every open with the pid and its image name, and the map
+    it builds is handle -> pid -> name exactly as the target produced it: probe_app prints
+    the real handle each open returned ({"kind":"opened"}), and every `map` and `read` line
+    must agree with that ground truth (no handle-slot, stale or partial mapping). Each open
+    backend is mixed with an inline read probe (the map is UHH_SHARED across backends)."""
+    if not exe("gated_config.exe"):
+        return skip("gated-map", "gated_config.exe missing")
+    rx_open = re.compile(r"open pid=(\d+) name=(\S+)$")
+    rx_map = re.compile(r"map handle=0x([0-9a-f]+) -> pid=(\d+) name=(\S+)$")
+    rx_read = re.compile(r"read handle=0x([0-9a-f]+) pid=(\d+) name=(\S+) ")
+    for open_bk in ("breakpoint", "hw", "inline"):
+        name = f"gated-map-open-{open_bk}"
+        try:
+            r, o = gated("breakpoint", "inline", threads, reads, open_bk=open_bk)
+            truth = {x["handle"]: x["pid"] for x in o if x.get("kind") == "opened"}
+            want_pids = helper_pids(o)
+            msgs = [str(x.get("message", "")) for x in o if x.get("kind") == "probe_log"]
+            opens = [m.groups() for m in map(rx_open.match, msgs) if m]
+            maps = [m.groups() for m in map(rx_map.match, msgs) if m]
+            rds = [m.groups() for m in map(rx_read.match, msgs) if m]
+            bad = []
+            if {int(p) for p, _ in opens} != want_pids or len(opens) != len(want_pids):
+                bad.append(f"opens={opens}")
+            bad += [f"open-name {n}" for _, n in opens if n.lower() != "probe_app.exe"]
+            if sorted(int(h, 16) for h, _, _ in maps) != sorted(truth):
+                bad.append(f"mapped={[h for h, _, _ in maps]} truth={[hex(h) for h in truth]}")
+            bad += [f"map {h}->{p}" for h, p, n in maps
+                    if truth.get(int(h, 16)) != int(p) or n.lower() != "probe_app.exe"]
+            wrong_reads = sum(1 for h, p, n in rds if truth.get(int(h, 16)) != int(p) or n.lower() != "probe_app.exe")
+            ok = (r.returncode == 0 and len(truth) == len(want_pids) and not bad and
+                  len(rds) == threads * reads and wrong_reads == 0)
+            record(name, ok, f"opens={len(opens)} maps={len(maps)}/{len(truth)} reads={len(rds)}/{threads * reads} "
+                             f"wrong_reads={wrong_reads} rc={r.returncode}" + ("" if ok else f" bad={bad[:4]}"))
+        except Exception as e:
+            record(name, False, repr(e))
 
 
 def check_agent_crt():
@@ -1812,6 +1847,7 @@ def main():
     if want(check_patch_race): check_patch_race()
     if want(check_emulated_sites): check_emulated_sites()
     if want(check_ret_probe): check_ret_probe()
+    if want(check_gated_map): check_gated_map()
     if want(check_agent_crt): check_agent_crt()
     if want(check_oldcrt): check_oldcrt()
     if want(check_cet): check_cet()

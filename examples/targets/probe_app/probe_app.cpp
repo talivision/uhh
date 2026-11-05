@@ -278,6 +278,10 @@ int main(int argc, char **argv) try {
     double elapsed_ns = 0;
     if (parsed.reads_enabled) {
         open_helpers(helpers);
+        for (auto &h : helpers)      // ground truth for the handle -> pid map tools build
+            std::printf("{\"kind\":\"opened\",\"pid\":%lu,\"handle\":%llu}\n", h.hello.pid,
+                        (unsigned long long)(uintptr_t)h.read_handle);
+        std::fflush(stdout);
         elapsed_ns = run_reads(helpers, threads, reads, results);
     }
     uint64_t success = 0, checksum = 0;

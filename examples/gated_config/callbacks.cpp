@@ -3,6 +3,9 @@
 // (breakpoint / hw) and on many target threads at once (inline, inside the target).
 #include "callbacks.h"
 #include <atomic>
+#include <windows.h>
+#include <winternl.h>
+#pragma comment(lib, "ntdll.lib")
 
 // 1. Turn the disabled feature on. At configparse.dll!ParseConfig+0x16 the freshly
 //    parsed reads_enabled is in EAX and is about to be stored: make it 1. The library
@@ -25,10 +28,9 @@ extern "C" void enable_reads_mem(probe_context *c) {
     }
 }
 
-// 2. Handle -> pid map, built from ntdll!NtOpenProcess (PHANDLE out, ACCESS_MASK,
+// 2. Handle -> pid -> name map, built from ntdll!NtOpenProcess (PHANDLE out, ACCESS_MASK,
 //    POBJECT_ATTRIBUTES, PCLIENT_ID): the syscall stub every OpenProcess path ends in.
-//    It uses the same backend as the read probe: the map must live where the read
-//    callback runs. At ENTRY the pid is known (cid->UniqueProcess)
+//    At ENTRY the pid is known (cid->UniqueProcess)
 //    but the handle is not yet: it is written to *out by the kernel. So remember the
 //    out pointer and dereference it LAZILY, the first time a read uses a handle we have
 //    not seen -- by then the open has long returned.
@@ -37,6 +39,7 @@ struct OpenRecord {
     std::atomic<uint64_t> pid{0};       // 0 = slot not published yet
     std::atomic<uint64_t> out{0};       // where the open writes the handle
     std::atomic<uint64_t> handle{0};    // 0 = not resolved yet
+    char name[64];                      // image name of pid, written before pid is published
 };
 constexpr uint32_t kMaxOpens = 1024;
 // UHH_SHARED: the map is ONE piece of memory for every backend -- the open probe and the
@@ -51,13 +54,34 @@ uint64_t read_pointer(probe_context *c, uint64_t address) {
     return get_mem(c, address, &value, sizeof(value)) ? (uint64_t)value : 0;
 }
 
-// pid the handle was opened for, or 0 if no open we saw produced it. One pass, NEWEST
+// Image name of a pid ("probe_app.exe"), without opening the process: an open here would
+// re-enter the very NtOpenProcess probe this runs in. SystemProcessIdInformation (88) asks
+// the kernel by pid; it works the same in the controller (breakpoint/hw) and in the target
+// (inline). "?" if the process is gone or the query fails.
+constexpr auto SystemProcessIdInformation = (SYSTEM_INFORMATION_CLASS)88;
+struct SYSTEM_PROCESS_ID_INFORMATION { HANDLE ProcessId; UNICODE_STRING ImageName; };
+
+void image_name_of(uint64_t pid, char *out, size_t cap) {
+    wchar_t path[512];
+    SYSTEM_PROCESS_ID_INFORMATION info{(HANDLE)(uintptr_t)pid, {0, sizeof(path), path}};
+    size_t n = 0;
+    if (NtQuerySystemInformation(SystemProcessIdInformation, &info, sizeof(info), nullptr) >= 0) {
+        size_t len = info.ImageName.Length / sizeof(wchar_t), start = 0;
+        for (size_t i = 0; i < len; ++i) if (path[i] == L'\\') start = i + 1;
+        for (size_t i = start; i < len && n + 1 < cap; ++i)
+            out[n++] = path[i] < 0x80 ? (char)path[i] : '?';
+    }
+    if (!n && cap > 1) out[n++] = '?';
+    out[n] = 0;
+}
+
+// The open that produced `handle` (or nullptr if no open we saw produced it). One pass, NEWEST
 // open first: a resolved record is compared directly; an unresolved one is resolved by
 // dereferencing its out-pointer. Newest-first means a handle value reused after a close
 // maps to the open that produced it most recently. A record resolved concurrently by
 // another thread is still matched (re-read after a lost CAS).
-uint64_t pid_of(probe_context *c, uint64_t handle) {
-    if (!handle) return 0;
+const OpenRecord *open_of(probe_context *c, uint64_t handle) {
+    if (!handle) return nullptr;
     uint32_t n = g_open_count.load(std::memory_order_acquire);
     if (n > kMaxOpens) n = kMaxOpens;
     for (uint32_t k = n; k-- > 0;) {
@@ -65,12 +89,17 @@ uint64_t pid_of(probe_context *c, uint64_t handle) {
         uint64_t pid = r.pid.load(std::memory_order_acquire);
         if (!pid) continue;                                    // claimed, not yet published
         uint64_t h = r.handle.load(std::memory_order_acquire);
-        if (h) { if (h == handle) return pid; continue; }
+        if (h) { if (h == handle) return &r; continue; }
         if (read_pointer(c, r.out.load(std::memory_order_relaxed)) != handle) continue;
         uint64_t expected = 0;
-        if (r.handle.compare_exchange_strong(expected, handle) || expected == handle) return pid;
+        if (r.handle.compare_exchange_strong(expected, handle)) {   // first resolution: log it once
+            send_log(c, "map handle=0x%llx -> pid=%llu name=%s", (unsigned long long)handle,
+                     (unsigned long long)pid, r.name);
+            return &r;
+        }
+        if (expected == handle) return &r;
     }
-    return 0;
+    return nullptr;
 }
 }  // namespace
 
@@ -78,10 +107,14 @@ extern "C" void track_open_process(probe_context *c) {
     uint64_t out = get_func_arg(c, 0), cid = get_func_arg(c, 3);
     uint64_t pid = cid ? read_pointer(c, cid) : 0;     // CLIENT_ID.UniqueProcess
     if (!out || !pid) return;
+    char name[sizeof(OpenRecord::name)];
+    image_name_of(pid, name, sizeof(name));
+    send_log(c, "open pid=%llu name=%s", (unsigned long long)pid, name);
     uint32_t slot = g_open_count.fetch_add(1, std::memory_order_relaxed);
     if (slot >= kMaxOpens) return;
+    std::memcpy(g_opens[slot].name, name, sizeof(name));
     g_opens[slot].out.store(out, std::memory_order_relaxed);
-    g_opens[slot].pid.store(pid, std::memory_order_release);   // publish
+    g_opens[slot].pid.store(pid, std::memory_order_release);   // publish (name before pid)
 }
 
 // 3. Every read through ntdll!NtReadVirtualMemory(handle,
@@ -90,8 +123,9 @@ extern "C" void log_read(probe_context *c) {
     auto *cfg = static_cast<const read_log_config *>(get_config(c));
     if (!cfg || cfg->cookie != READ_LOG_COOKIE || !cfg->log) return;
     uint64_t handle = get_func_arg(c, 0), addr = get_func_arg(c, 1), size = get_func_arg(c, 3);
-    uint64_t pid = pid_of(c, handle);
+    const OpenRecord *r = open_of(c, handle);
+    uint64_t pid = r ? r->pid.load(std::memory_order_relaxed) : 0;
     if (cfg->filter && (pid != cfg->pid || addr < cfg->base || addr - cfg->base >= cfg->size)) return;
-    send_log(c, "read handle=0x%llx pid=%llu addr=0x%llx size=%llu", (unsigned long long)handle,
-             (unsigned long long)pid, (unsigned long long)addr, (unsigned long long)size);
+    send_log(c, "read handle=0x%llx pid=%llu name=%s addr=0x%llx size=%llu", (unsigned long long)handle,
+             (unsigned long long)pid, r ? r->name : "?", (unsigned long long)addr, (unsigned long long)size);
 }
