@@ -3946,6 +3946,71 @@ def check_late_dll_worker():
             record(name, False, repr(e))
 
 
+LD_CALLS, LD_NSITES, LD_HV_ID = 300, 8, 100     # examples/latedll/latedll_shared.h
+
+
+def check_latedll(reps=10):
+    """Probes in DLLs the target LoadLibrary's at RUN time (examples/latedll): registered
+    before launch, and the target calls every probed function LD_CALLS times the moment the
+    load returns -- from the main thread (`main`), from a worker thread (`worker`), and from
+    inside a DllMain that itself LoadLibrary's the probed DLL, calls every site and starts a
+    thread under the loader lock (`dllmain`). Eight inline sites outnumber the debug
+    registers. On breakpoint, hw, inline and mixed (inline + breakpoint + hw in one session),
+    `reps` runs each: every call is counted (probe hits == the bodies' own counts == the
+    scenario's), every hit logged once ("ld <id>"), nothing dropped, no install timeout, exit 0.
+    (The miss this guards: the LOAD_DLL install was "not confirmed within 5 s", the thread was
+    released and every call ran unhooked -- ROADMAP CC8 / B5.)"""
+    d, t = exe("latedll_driver.exe"), exe("latedll_target.exe")
+    if not d or not t:
+        return record("latedll", False, "latedll_driver/latedll_target missing")
+    for scen in ("main", "worker", "dllmain"):
+        for bk in ("inline", "breakpoint", "hw", "mixed"):
+            name = f"latedll-{scen}-{bk}"
+            bad, secs = [], []
+            try:
+                for rep in range(reps):
+                    t0 = time.time()
+                    r, o = run([d, "--backend", bk, "--", t, scen], timeout=90)
+                    secs.append(time.time() - t0)
+                    tg = next((x for x in o if x.get("kind") == "latedll"), {})
+                    drv = next((x for x in o if x.get("kind") == "latedll_driver"), {})
+                    rep_ = report(o)
+                    calls, want = tg.get("calls") or [], tg.get("want") or []
+                    nsites = 2 if bk == "hw" else LD_NSITES
+                    exp = {k: want[k] for k in range(nsites)} if len(want) == LD_NSITES else {}
+                    got_calls = {k: calls[k] for k in range(nsites)} if len(calls) == LD_NSITES else {}
+                    if scen == "dllmain":
+                        exp[LD_HV_ID] = tg.get("want_hv")
+                        got_calls[LD_HV_ID] = tg.get("hv")
+                    hits = {}
+                    for p in probes(o):
+                        loc = str(p.get("location", ""))
+                        m = re.search(r"!(LdSite(\d)|HvSite)$", loc)
+                        if m:
+                            hits[int(m.group(2)) if m.group(2) else LD_HV_ID] = p.get("hits")
+                    logs = {}
+                    for x in o:
+                        if x.get("kind") == "probe_log" and str(x.get("message", "")).startswith("ld "):
+                            k = int(str(x["message"])[3:])
+                            logs[k] = logs.get(k, 0) + 1
+                    timeout = "not confirmed" in r.stderr or "install timeout" in r.stderr
+                    good = (r.returncode == 0 and tg.get("rc") == 0 and exp and got_calls == exp and
+                            hits == exp and logs == exp and drv.get("run_ok") == 1 and
+                            rep_.get("error") is None and rep_.get("log_dropped") == 0 and not timeout)
+                    if not good:
+                        bad.append(f"rep{rep}: rc={r.returncode}/{tg.get('rc')} "
+                                   f"hits={ {k: v for k, v in hits.items() if exp.get(k) != v} } "
+                                   f"logs={ {k: v for k, v in logs.items() if exp.get(k) != v} } "
+                                   f"missing={[k for k in exp if k not in hits or k not in logs]} "
+                                   f"body={ {k: v for k, v in got_calls.items() if exp.get(k) != v} } "
+                                   f"timeout={timeout} err={rep_.get('error')} dropped={rep_.get('log_dropped')} "
+                                   f"stderr={tail(r, 4)}")
+                record(name, not bad, ("; ".join(bad)[:1500] if bad else
+                                       f"{reps}/{reps} exact, max {max(secs):.1f}s"))
+            except Exception as e:
+                record(name, False, repr(e))
+
+
 def check_hw_once_slots(threads=4, calls=1000):
     """Hardware PROBE_ONCE, distinctly: HwSite exec HW|ONCE and g_w1 watch RW|ONCE each fire
     exactly once while 4 threads hammer them (an exec HW and a WRITE watch on the same sites
@@ -4834,6 +4899,7 @@ def main():
     if want(check_blog_pwsh_attach): check_blog_pwsh_attach()
     if want(check_entry_hold_threads): check_entry_hold_threads()
     if want(check_late_dll_worker): check_late_dll_worker()
+    if want(check_latedll): check_latedll()
     if want(check_hw_once_slots): check_hw_once_slots()
     if want(check_prehook_chain): check_prehook_chain()
     if want(check_stacks): check_stacks()
