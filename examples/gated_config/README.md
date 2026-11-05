@@ -49,13 +49,17 @@ holding the handle when the read happens: `probe_app` calls `NtOpenProcess` dire
 with `out` pointing at a long-lived variable. **Limitation:** through
 `kernel32!OpenProcess` the out pointer is a stack local inside KernelBase that is reused
 as soon as `OpenProcess` returns, so a lazily dereferenced pointer can read garbage; such
-reads log `pid=0`. Capturing the handle at the stub's return instead is on the roadmap. The callbacks are lock-free, so the same source runs on the controller's
+reads log `pid=0`. `--open-mode call` removes that limitation: `track_open_process_call`
+runs the real `NtOpenProcess` from its entry callback (`call_original`), reads the handle
+from `*out` while it is certainly valid, records handle -> pid -> name at once, and returns
+the real status to the caller (`return_from`) -- one callback, any caller, every backend.
+Regress `gated-map-open-*-call-k32` runs it against `probe_app --open-via kernel32`. The callbacks are lock-free, so the same source runs on the controller's
 debug loop (breakpoint / hw) and on many target threads at once (inline).
 
 ## Usage
 
 ```
-gated_config [--flag-backend b] [--read-backend b] [--no-log]
+gated_config [--flag-backend b] [--read-backend b] [--open-backend b] [--open-mode lazy|call] [--no-log]
              <flag_location> <read_location> -- <target.exe> [target args]
 ```
 
