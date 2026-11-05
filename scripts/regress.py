@@ -192,10 +192,10 @@ def check_gated_off():
         record("gated-off", False, repr(e))
 
 
-def gated(flag_bk, read_bk, threads, reads, timeout=200, log=True, open_bk=None):
+def gated(flag_bk, read_bk, threads, reads, timeout=200, log=True, open_bk=None, extra=()):
     return run([exe("gated_config.exe"), "--flag-backend", flag_bk, "--read-backend", read_bk,
                 *(["--open-backend", open_bk] if open_bk else []),
-                *([] if log else ["--no-log"]), FLAG_LOCATION, READ_LOCATION,
+                *([] if log else ["--no-log"]), *extra, FLAG_LOCATION, READ_LOCATION,
                 "--", exe("probe_app.exe"), "--no-wait", "--helpers", HELPERS,
                 "--threads", threads, "--reads", reads], timeout=timeout)
 
@@ -1589,6 +1589,44 @@ def check_interrupt(threads=4, reads=100_000):
             for q in procs:
                 if q.poll() is None:
                     q.kill()
+
+
+def check_gated_filter(threads=4, reads=200):
+    """gated_config --range: only reads whose address is in one of the ranges are logged, and
+    exactly those. One unfiltered run learns the helpers' buffer base (the same address in
+    every run: same image), then one range and two ranges are compared with the prediction
+    from probe_app's deterministic read pattern (read i -> helper i % N, base + 64*((i//N)%4)).
+    The --pid filter (helper pids are new on every launch) is covered by attach-*."""
+    if not exe("gated_config.exe"):
+        return skip("gated-filter", "gated_config.exe missing")
+    W, R, N = int(threads), int(reads), HELPERS
+    rx = re.compile(r"read handle=0x[0-9a-f]+ pid=(\d+) name=\S+ addr=0x([0-9a-f]+) ")
+    for bk in ("inline", "breakpoint", "hw"):
+        try:
+            r, o = gated("breakpoint", bk, W, R)
+            helpers = sorted((x for x in o if x.get("kind") == "helper"), key=lambda x: x["index"])
+            h0 = helpers[0]
+            b = h0["base"]   # helper buffers sit at the same address in every run (same image)
+            cases = {
+                "one-range": (["--range", f"{b + 64}:64"], lambda a: b + 64 <= a < b + 128),
+                "two-ranges": (["--range", f"{b}:64", "--range", f"{hex(b + 192)}:0x40"],
+                               lambda a: b <= a < b + 64 or b + 192 <= a < b + 256),
+            }
+            for label, (args, keep) in cases.items():
+                name = f"gated-filter-{label}-{bk}"
+                r, o = gated("breakpoint", bk, W, R, extra=args)
+                hs = sorted((x for x in o if x.get("kind") == "helper"), key=lambda x: x["index"])
+                want = 0
+                for i in range(W * R):
+                    h = hs[i % N]
+                    want += keep(h["base"] + 64 * ((i // N) % 4))
+                got = [m.groups() for m in map(rx.match, read_log_lines(o)) if m]
+                rd = read_probe(o)
+                ok = (r.returncode == 0 and want > 0 and len(got) == want and rd.get("hits") == W * R and
+                      all(keep(int(a, 16)) for _, a in got))
+                record(name, ok, f"logged={len(got)} want={want} read_hits={rd.get('hits')}/{W * R} rc={r.returncode}")
+        except Exception as e:
+            record(f"gated-filter-{bk}", False, repr(e))
 
 
 def check_gated_map(threads=4, reads=50):
@@ -3002,6 +3040,7 @@ def main():
     if want(check_emulated_sites): check_emulated_sites()
     if want(check_ret_probe): check_ret_probe()
     if want(check_gated_map): check_gated_map()
+    if want(check_gated_filter): check_gated_filter()
     if want(check_interrupt): check_interrupt()
     if want(check_agent_crt): check_agent_crt()
     if want(check_oldcrt): check_oldcrt()

@@ -127,7 +127,13 @@ extern "C" void log_read(probe_context *c) {
     uint64_t handle = get_func_arg(c, 0), addr = get_func_arg(c, 1), size = get_func_arg(c, 3);
     OpenRecord *r = open_of(c, handle);
     uint64_t pid = r ? at(r->pid).load(std::memory_order_relaxed) : 0;
-    if (cfg->filter && (pid != cfg->pid || addr < cfg->base || addr - cfg->base >= cfg->size)) return;
+    if (cfg->pid && pid != cfg->pid) return;
+    if (cfg->nranges) {
+        bool in = false;
+        for (uint32_t k = 0; k < cfg->nranges && k < READ_LOG_MAX_RANGES && !in; ++k)
+            in = addr - cfg->ranges[k].base < cfg->ranges[k].size;   // unsigned: also addr < base
+        if (!in) return;
+    }
     send_log(c, "read handle=0x%llx pid=%llu name=%s addr=0x%llx size=%llu", (unsigned long long)handle,
              (unsigned long long)pid, r ? r->name : "?", (unsigned long long)addr, (unsigned long long)size);
 }
