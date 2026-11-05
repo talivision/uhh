@@ -379,6 +379,47 @@ with the uninstrumented target and with exact hits / "co" logs / `log_dropped ==
   Ctrl+Break while a call_original is in flight complete that call first (`callorig-hunt-
   {detach,ctrlbreak}-*`).
 
+## Controller review findings (static review of src/probe/session.cpp, 2026-11-05)
+Fixture `examples/ctrlreview` (ctrl_target + ctrl_dll + ONE callback source), regress `ctrl-*`
+(`--only ctrl-`). Every finding below was first reproduced by its check on the unfixed code (x64).
+- ✅ (2) **Faulting probed instruction, target handler CONTINUEs** (lazy commit in a VEH, guard pages).
+  Breakpoint: the displaced copy faults, the instruction re-runs in place with TF; its fault went to the
+  program with the INT3 re-armed, so the handler's restart hit the INT3 again -> **two callbacks for one
+  execution** (300 hits for 200 executions); and a PAGE_GUARD fault was consumed by the out-of-line copy,
+  so **the program's handler never saw its guard violation** (guard=0 of 100). Now: the guard is put back
+  before the in-place re-run; a faulted in-place step is remembered per thread -- the restart (INT3 at the
+  site with our TF still in the restored context) runs no callback and counts no hit, and if the handler
+  continues elsewhere the one stray trap of our TF is absorbed. 📄 The handler's ContextRecord shows our TF
+  (it is the marker that tells a restart from a new hit; it was visible before too). hw and inline were
+  already exact. Test: `ctrl-fault-{breakpoint,hw,inline}`
+- ✅ (3) **In-place stepping, several threads: double callback.** Thread B's INT3 hit is queued while A has
+  the byte lifted; B is set up to run the original at the site, A's step completion re-arms first, B
+  executes the INT3 -> its callback ran again (20 duplicates in 24000 calls). Now a thread that is mid
+  in-place step and hits the INT3 at its own site is put back and the byte lifted again, no callback.
+  ⬜ Missed hits while the byte is lifted remain (round 3 #2; `ctrl-inplace` reports the count).
+  Test: `ctrl-inplace` (8 threads x 3000 calls through an address-size LOOP, which is neither displaced
+  nor emulated)
+- ✅ (5) **probe_add_address / probe_watch inside a DLL that unloads were never retired** (UNLOAD_DLL only
+  matched module probes by base). Seen: hw slots exhausted after 2-4 load cycles (`probe_watch` -> 0), and
+  on reload at the same base every new probe's hits went to the stale first one (hits 0,0,0,0,500).
+  Now absolute probes whose address lies in the unloading image (SizeOfImage recorded at load) are retired
+  for good: DR released, agent hook marked UNLOADED, INT3 forgotten. Test: `ctrl-absunload-*`
+- ✅ (6) **Deferred stack symbolization raced UNLOAD_DLL**: frames captured before an unload were written
+  as raw hex once dbghelp had dropped the module (3-12 of 6000 on breakpoint/hw, 5934 of 6000 inline --
+  the ring is drained later). Now the unregister travels through the log queue behind every record
+  captured before the unload (the agent ring is drained into the queue first); a module loading over a
+  range still held waits for the writer to pass that point. Test: `ctrl-symunload-*`
+- ✅ (7) **The target's own debug registers** (SetThreadContext on itself, caught by its VEH): arm_hw only
+  looked at one thread's DR7 and took a slot another thread owned (the target's watch never fired again);
+  a slot UHH had once used and released was swallowed by handle_hw (`dr_ever`) and cleared by
+  enforce_owned_drs. Now a slot enabled on a thread that is not ours and does not hold an address we
+  released is the target's: never taken (any thread, also for inline gates), never cleared, its #DB
+  passed on (also when it shares the #DB with one of ours), and never inferred as ours. 📄 A target that
+  overwrites DR7 wholesale over a slot UHH is using cannot keep both; detach still clears every
+  `dr_ever` slot (detach path owned elsewhere). Test: `ctrl-owndr-*`
+- ✅ (8) **drain_final trusted log_head from shared memory**: a target writing a huge value hung the
+  controller at exit. The loop is clamped to one ring (tail + PROBE_AGENT_LOG_CAP). Test: `ctrl-headclamp`
+
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`
 - ✅ Per-log overhead ceilings in the suite (`log-throughput-*`)
