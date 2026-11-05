@@ -8,6 +8,10 @@
 //                        then T threads log M records each (timed)
 //   --mode wedge-suspend the same, but the producer is left SUSPENDED (the app's own
 //                        SuspendThread) for the whole second phase, then resumed
+//   --mode wedge-exit    the producer is caught the same way, then the process calls
+//                        ExitProcess(7) -- which kills it there -- and the exiting thread
+//                        logs --count more records from a TLS callback at DLL_PROCESS_DETACH
+//                        (more than the ring holds: they must get past the dead slot)
 //   --mode exit          T threads flood LogSiteA; main calls ExitProcess(7) after --ms
 //   --mode selfterm      the same with TerminateProcess(self, 7)
 //   --mode gate          print {"kind":"waiting","pid":N}, wait for a line on stdin, then T
@@ -70,6 +74,27 @@ static bool claimed_unpublished(const probe_agent_shared *sh) {
     return false;
 }
 
+// Process-detach logging (wedge-exit): runs on the exiting thread after ExitProcess has
+// killed every other thread.
+static volatile LONG g_detach_logs;
+static void NTAPI logs_tls_callback(PVOID, DWORD reason, PVOID) {
+    if (reason == DLL_PROCESS_DETACH && g_detach_logs)
+        for (int i = 0; i < g_detach_logs; ++i) LogSiteA(0xA, (unsigned)i);
+}
+#if defined(_WIN64)
+#pragma comment(linker, "/INCLUDE:_tls_used")
+#pragma comment(linker, "/INCLUDE:logs_tls_callback_ptr")
+#pragma const_seg(".CRT$XLB")
+extern "C" const PIMAGE_TLS_CALLBACK logs_tls_callback_ptr = logs_tls_callback;
+#pragma const_seg()
+#else
+#pragma comment(linker, "/INCLUDE:__tls_used")
+#pragma comment(linker, "/INCLUDE:_logs_tls_callback_ptr")
+#pragma data_seg(".CRT$XLB")
+extern "C" PIMAGE_TLS_CALLBACK logs_tls_callback_ptr = logs_tls_callback;
+#pragma data_seg()
+#endif
+
 static int run_phase2() {
     HANDLE h[64]; int n = g_threads > 64 ? 64 : g_threads;
     ULONGLONG t0 = GetTickCount64();
@@ -79,7 +104,7 @@ static int run_phase2() {
     return (int)(GetTickCount64() - t0);
 }
 
-static int wedge(bool kill) {
+static int wedge(bool kill, bool exit_after = false) {
     probe_agent_shared *sh = map_ring();
     if (!sh) { printf("{\"kind\":\"app\",\"error\":\"no shared ring\"}\n"); return 3; }
     HANDLE w = CreateThread(nullptr, 0, forever_thread, nullptr, 0, nullptr);
@@ -91,6 +116,13 @@ static int wedge(bool kill) {
         CONTEXT cx{}; cx.ContextFlags = CONTEXT_CONTROL; GetThreadContext(w, &cx);
         if (claimed_unpublished(sh)) { wedged = 1; break; }
         ResumeThread(w);
+    }
+    if (exit_after) {
+        printf("{\"kind\":\"app\",\"mode\":\"wedge-exit\",\"wedged\":%d,\"tries\":%d,\"detach_logs\":%d}\n",
+               wedged, tries, g_count);
+        fflush(stdout);
+        InterlockedExchange(&g_detach_logs, g_count);
+        ExitProcess(7);                                       // kills w inside its claimed slot
     }
     if (wedged && kill) { TerminateThread(w, 99); WaitForSingleObject(w, INFINITE); }
     int ms = run_phase2();
@@ -146,6 +178,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(mode, "wedge-kill")) return wedge(true);
+    if (!strcmp(mode, "wedge-exit")) return wedge(true, true);
     if (!strcmp(mode, "wedge-suspend")) return wedge(false);
     if (!strcmp(mode, "exit") || !strcmp(mode, "selfterm")) {
         for (int t = 0; t < g_threads; ++t) CloseHandle(CreateThread(nullptr, 0, forever_thread, nullptr, 0, nullptr));

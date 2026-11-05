@@ -3819,27 +3819,38 @@ def check_logs_wedge(threads=4, count=3000):
     instant through the shared ring and freezes the thread there):
       kill:    TerminateThread there. Its slot can never be published.
       suspend: the program's own SuspendThread, held while the other threads log.
-    Either way the others' logs must keep flowing live (no 2-s stalls, all of them delivered
-    while the target runs) and nothing may be dropped; the killed callback is accounted as
-    interrupted: hits == logs + callbacks_interrupted exactly."""
+      exit:    ExitProcess kills it there, and the exiting thread then logs more records than
+               the ring holds from a TLS callback at DLL_PROCESS_DETACH (the hang case: every
+               later log used to wait behind the dead slot forever).
+    The others' logs must keep flowing live (no stalls, all delivered while the target runs),
+    nothing may be dropped, and the killed callback is accounted as interrupted:
+    hits == logs + callbacks_interrupted exactly."""
     if not exe("logs_driver.exe") or not exe("logs_target.exe"):
         return skip("logs-wedge", "logs_driver/logs_target missing")
-    for mode in ("kill", "suspend"):
+    for mode in ("kill", "suspend", "exit"):
         name = f"logs-wedge-{mode}"
         try:
-            r, o, bad = logs_run("inline", "none", ["--mode", f"wedge-{mode}", "--threads", threads, "--count", count],
-                                 timeout=400)
+            n = 6000 if mode == "exit" else count
+            r, o, bad = logs_run("inline", "none", ["--mode", f"wedge-{mode}", "--threads", threads, "--count", n],
+                                 timeout=180)
             a, rep = app(o), report(o)
             hits = next(iter(probes(o)), {}).get("hits")
             logs = sum(1 for x in o if x.get("kind") == "probe_log" and str(x.get("message", "")).startswith("o "))
             interrupted = rep.get("callbacks_interrupted")
-            ok = (r.returncode == 0 and a.get("wedged") == 1 and a.get("phase2_calls") == threads * count and
-                  (a.get("phase2_ms") or 1e9) < 10000 and a.get("undelivered_after_phase2") == 0 and
-                  rep.get("log_dropped") == 0 and interrupted == (1 if mode == "kill" else 0) and
-                  hits == logs + interrupted)
-            record(name, ok, f"wedged={a.get('wedged')} phase2={a.get('phase2_calls')}/{threads * count} in "
-                             f"{a.get('phase2_ms')}ms undelivered_live={a.get('undelivered_after_phase2')} hits={hits} "
-                             f"logs={logs} interrupted={interrupted} dropped={rep.get('log_dropped')} rc={r.returncode}")
+            if mode == "exit":
+                live_ok = rep.get("app_exit") == 7
+                detail = f"exit={rep.get('app_exit')}"
+            else:
+                live_ok = (r.returncode == 0 and a.get("phase2_calls") == threads * count and
+                           (a.get("phase2_ms") or 1e9) < 10000 and a.get("undelivered_after_phase2") == 0)
+                detail = (f"phase2={a.get('phase2_calls')}/{threads * count} in {a.get('phase2_ms')}ms "
+                          f"undelivered_live={a.get('undelivered_after_phase2')}")
+            ok = (live_ok and a.get("wedged") == 1 and rep.get("log_dropped") == 0 and
+                  interrupted == (0 if mode == "suspend" else 1) and hits is not None and hits == logs + interrupted)
+            record(name, ok, f"wedged={a.get('wedged')} {detail} hits={hits} logs={logs} interrupted={interrupted} "
+                             f"dropped={rep.get('log_dropped')} rc={r.returncode}")
+        except subprocess.TimeoutExpired:
+            record(name, False, "session HUNG (180 s): logging stalled behind the unpublished slot")
         except Exception as e:
             record(name, False, repr(e))
 
