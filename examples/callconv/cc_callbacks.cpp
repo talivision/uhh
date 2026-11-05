@@ -104,7 +104,7 @@ CC_CB void cc_on_entry(probe_context *c) {
     const bool floaty = f.kind == CC_K_DBL || f.kind == CC_K_FLT;
     const int pop_args = f.pop86 / 4;                     // return_from's nargs (x86 stack arguments popped)
     const int nargs = f.nslots < 8 ? f.nslots : 8;        // call_original's nargs (at most 8)
-    if (k->mode == CC_REPLACE) {
+    if (k->mode == CCM_REPLACE) {
         if (floaty) return;                               // cannot set ST0/XMM0: let it run
         uint64_t v = cc_replacement(id);
         if (f.kind == CC_K_PTR) {                         // fill the caller's buffer, return its address
@@ -116,7 +116,7 @@ CC_CB void cc_on_entry(probe_context *c) {
         return_from(c, v, pop_args);
         return;
     }
-    if (k->mode != CC_WRAP && k->mode != CC_WRONGPOP) return;
+    if (k->mode != CCM_WRAP && k->mode != CCM_WRONGPOP) return;
     uint64_t r = 0;
     if (!call_original(c, nargs, &r)) { send_log(c, "cc FAIL %s call_original refused", f.name); return; }
     // *ret is the integer return register: x64 RAX; x86 EAX zero-extended.
@@ -128,6 +128,6 @@ CC_CB void cc_on_entry(probe_context *c) {
         send_log(c, "cc FAIL %s call_original ret=0x%llx", f.name, (unsigned long long)r);
 #endif
     int pop = pop_args;
-    if (k->mode == CC_WRONGPOP) pop = pop_args ? 0 : 2;  // the wrong x86 stack-argument count
+    if (k->mode == CCM_WRONGPOP) pop = pop_args ? 0 : 2;  // the wrong x86 stack-argument count
     return_from(c, r, pop);
 }

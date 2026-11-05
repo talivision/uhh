@@ -14,7 +14,7 @@ enum cc_id {
     CC_N
 };
 enum cc_kind { CC_K_INT, CC_K_I64, CC_K_DBL, CC_K_FLT, CC_K_PTR, CC_K_S8 };
-enum cc_mode { CC_NONE = 0, CC_WRAP = 1, CC_REPLACE = 2, CC_WRONGPOP = 3 };
+enum cc_mode { CCM_NONE = 0, CCM_WRAP = 1, CCM_REPLACE = 2, CCM_WRONGPOP = 3 };
 
 struct cc_fn {
     const char *module, *name;

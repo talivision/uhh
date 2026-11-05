@@ -24,8 +24,8 @@ int main(int argc, char **argv) {
                : !std::strcmp(b, "breakpoint") ? PROBE_BREAKPOINT : 0;
         } else if (!std::strcmp(argv[i], "--mode") && i + 1 < argc) {
             const char *m = argv[++i];
-            mode = !std::strcmp(m, "wrap") ? CC_WRAP : !std::strcmp(m, "replace") ? CC_REPLACE
-                 : !std::strcmp(m, "wrongpop") ? CC_WRONGPOP : !std::strcmp(m, "none") ? CC_NONE : 99;
+            mode = !std::strcmp(m, "wrap") ? CCM_WRAP : !std::strcmp(m, "replace") ? CCM_REPLACE
+                 : !std::strcmp(m, "wrongpop") ? CCM_WRONGPOP : !std::strcmp(m, "none") ? CCM_NONE : 99;
         } else if (!std::strcmp(argv[i], "--mask") && i + 1 < argc) {
             mask = (uint32_t)std::strtoul(argv[++i], nullptr, 16);
         }

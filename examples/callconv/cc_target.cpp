@@ -29,7 +29,7 @@ static void row(const char *name, bool ok, const char *detail) {
 
 int main(int argc, char **argv) {
     const char *m = argc > 1 ? argv[1] : "none";
-    const int mode = !strcmp(m, "wrap") ? CC_WRAP : !strcmp(m, "replace") ? CC_REPLACE : !strcmp(m, "wrongpop") ? CC_WRONGPOP : CC_NONE;
+    const int mode = !strcmp(m, "wrap") ? CCM_WRAP : !strcmp(m, "replace") ? CCM_REPLACE : !strcmp(m, "wrongpop") ? CCM_WRONGPOP : CCM_NONE;
     const uint32_t mask = argc > 2 ? (uint32_t)strtoul(argv[2], nullptr, 16) : 0xFFFFFFFFu;
     HMODULE h = LoadLibraryA("ccfix.dll");
     if (!h) { printf("{\"kind\":\"cct_sum\",\"fails\":1,\"error\":\"LoadLibrary ccfix.dll\"}\n"); return 1; }
@@ -44,9 +44,9 @@ int main(int argc, char **argv) {
 #endif
         void *fn = id == CC_IMP ? (void *)&CcImpThunk : id == CC_JMPDST ? tail : (void *)GetProcAddress(h, f.name);
         if (!fn || !body || !g_pfn_std3t || !g_pfn_jmp) { row(f.name, false, "GetProcAddress"); continue; }
-        const bool probed = mode != CC_NONE && ((mask >> id) & 1);
+        const bool probed = mode != CCM_NONE && ((mask >> id) & 1);
         const bool floaty = f.kind == CC_K_DBL || f.kind == CC_K_FLT;
-        const bool replaced = probed && mode == CC_REPLACE && !floaty;     // the body must not run
+        const bool replaced = probed && mode == CCM_REPLACE && !floaty;     // the body must not run
         const long before = *body;
         cc_s16 big{};                                                       // hidden return buffer
         int64_t got = 0; double gotd = 0; bool have_d = false;
