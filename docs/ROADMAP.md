@@ -321,6 +321,51 @@ PowerShell + detach) under every backend, against an uninstrumented baseline.
   p50 1 us / p99 10 us, 0 missed frames; hw p50 ~220 us / p99 ~520 us, breakpoint p50
   ~300 us / p99 ~660 us, a few frames over budget -- belongs in the backend table.
 
+## Real-app findings (2026-11-05, `examples/realapps`, regress `realapps-*`)
+The flagship callbacks (`track_open_process` / `forget_closed_handle` / `log_read`, unchanged
+from gated_config) applied by `realapps_driver` to real programs that open other processes
+and read their memory, launched and attached, under breakpoint / hw / inline, x64 and x86
+(System32 vs SysWOW64). Ground truth: uninstrumented runs right before and after each
+instrumented one (rows identical in both, about processes alive for the whole run, must be
+unchanged), a 20 ms Toolhelp poll (every logged pid/name must be a process that existed),
+and a .NET P/Invoke script (`ps-truth`) that prints the real handle -> pid of every read.
+- ✅ No library or example bug found: every run had read logs == read-probe hits,
+  log_dropped 0, callbacks_interrupted 0, no wrong pid/name, output identical to the plain
+  runs, no refused inline site (ntdll stubs on both arches). Scale: `Get-Process | % Modules`
+  x64 = ~330k reads over ~100 pids per run (breakpoint ~60-80 s, hw ~40 s, inline ~6-10 s);
+  `tasklist /m` x64 = ~20k reads over ~110 pids.
+- ✅ Handles that never went through NtOpenProcess read as `pid=0 name=?`, never as another
+  process: CreateProcess's `hProcess`, a DuplicateHandle copy, the -1 pseudo-handle -- also
+  when the duplicate is reissued the value of a just-closed mapped handle (NtClose clears the
+  slot), and a reopen that gets the same value maps to the new pid (`ps-truth*`, 3-6 reused
+  values per run).
+- (inherent) What a launched program reads is not always in that program: `tasklist /v`
+  opens ~100-120 processes but reads none (token/session queries only); `wmic process`
+  opens 4 and reads 0 -- the enumeration runs in WmiPrvSE.exe, a different process (attach
+  to it to see those reads); `cmd /c tasklist` shows 0 opens: the debugger follows only the
+  launched process (DEBUG_ONLY_THIS_PROCESS), not its children -- launch the child itself.
+- (inherent, x86) A 32-bit program reading a 64-bit process does not go through the 32-bit
+  `ntdll!NtReadVirtualMemory`: SysWOW64 `Get-Process | % Modules` opens ~190 processes but
+  logs reads of only the ~5 32-bit ones (the rest fail inside WoW64 or use
+  `NtWow64ReadVirtualMemory64`, which the example does not probe). SysWOW64 `tasklist /m`
+  opens nothing at all and takes ~2 min even uninstrumented (x64: ~1 s), so the suite runs
+  it on x86 under breakpoint only.
+- ⬜ (open, 1 row in ~40 list runs) x64 `tasklist /m` under inline once printed `N/A` as the
+  module list of another agent's `lifecycle_target.exe` (alive for the whole run; both plain
+  runs listed its 6 modules). N/A = tasklist got no module list for that process; no read of
+  that pid was logged, so the open or the first query failed. Not reproduced in 12 further
+  runs (4 x every backend, identical opens/reads per backend). Likely that target was being
+  attached/held by its own test at that instant; the check now prints, for a changed row,
+  whether the instrumented program opened/read that pid, to settle it next time.
+- (note, test-side) a helper read immediately after CreateProcess fails with
+  ERROR_PARTIAL_COPY (299, kernel32 not mapped yet) -- the plain run raced, the slower
+  instrumented run did not. `ps-truth` now waits for the helpers' loader first.
+- (note) the shared VM froze during the first x86 pass (black screen, guest paging at
+  ~3 MB/s, SSH dead for ~40 min). This suite was running 32-bit `tasklist /m` /
+  `Get-Process | % Modules` then (under 1 GB of controller/target memory, x86) alongside
+  other agents' builds/tests; free RAM was not sampled at the time, so the cause is unknown.
+  The rerun with free RAM logged every 15 s never went below 13.9 GB free (16 GB VM).
+
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`
 - ✅ Per-log overhead ceilings in the suite (`log-throughput-*`)

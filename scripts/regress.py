@@ -3603,7 +3603,7 @@ def _realapps_scenarios(sysdir):
         ("tasklist-m", [sysdir / "tasklist.exe", "/m", "/fo", "csv", "/nh"], "csv", (None, 1)),
         ("tasklist-v", [sysdir / "tasklist.exe", "/v", "/fo", "csv", "/nh"], "csv", ((0, 1, 2, 3, 6), 1)),
         ("wmic", [sysdir / "wbem" / "WMIC.exe", "process", "get", "Name,ProcessId,ExecutablePath", "/format:csv"], "lines", (None, -1)),
-        ("cmd-tasklist", [sysdir / "cmd.exe", "/c", "tasklist /m /fo csv /nh"], "csv", (None, 1)),
+        ("cmd-tasklist", [sysdir / "cmd.exe", "/c", "tasklist /fo csv /nh"], "csv", ((0, 1, 2, 3), 1)),
         ("ps-modules", psargs + ["Get-Process | sort Id | % { try { '{0},{1},{2}' -f $_.Id,$_.ProcessName,"
                                  "(($_.Modules | % ModuleName) -join ';') } catch {} }"], "lines", (None, 0)),
         ("ps-fileversion", psargs + ["Get-Process -FileVersionInfo -EA SilentlyContinue | % { $_.FileName } | sort"],
@@ -3711,10 +3711,11 @@ def _row_alive(row, cols, alive_pids, alive_names):
         return False
 
 
-def _run_plain(argv, outp, timeout=300, stdin=None):
+def _run_plain(argv, outp, timeout=900, stdin=None):
+    t0 = time.perf_counter()
     with open(outp, "wb") as fo, open(str(outp) + ".err", "wb") as fe:
         p = subprocess.run([str(a) for a in argv], stdout=fo, stderr=fe, stdin=stdin or subprocess.DEVNULL, timeout=timeout)
-    return p.returncode, Path(outp).read_bytes()
+    return p.returncode, Path(outp).read_bytes(), time.perf_counter() - t0
 
 
 _RX_OPEN = re.compile(r"open pid=(\d+) name=(\S+)$")
@@ -3726,14 +3727,14 @@ def _realapps_verify_logs(objs, seen):
     """Every read's (pid, name) must be a process that existed (per Toolhelp); pid 0 must
     say name=?; a mapped read's handle must have been mapped to that pid by an open line."""
     msgs = [str(o.get("message", "")) for o in objs if o.get("kind") == "probe_log"]
-    maps, reads, opens, other, bad, unverified = {}, [], 0, [], [], set()
+    maps, reads, opens, other, bad, unverified = {}, [], [], [], [], set()
     for m in msgs:
         if (g := _RX_READ.match(m)):
             reads.append((int(g[1], 16), int(g[2]), g[3], int(g[4], 16), int(g[5])))
         elif (g := _RX_MAP.match(m)):
             maps.setdefault(int(g[1], 16), set()).add(int(g[2]))
-        elif _RX_OPEN.match(m):
-            opens += 1
+        elif (g := _RX_OPEN.match(m)):
+            opens.append(int(g[1]))
         else:
             other.append(m)
     pids = set()
@@ -3768,7 +3769,7 @@ def check_realapps():
     x86 = struct.unpack_from("<H", data, struct.unpack_from("<I", data, 0x3C)[0] + 4)[0] == 0x14C
     sysdir = Path(r"C:\Windows\SysWOW64") if x86 else SYS32
     only = [x for x in os.environ.get("UHH_REALAPPS_ONLY", "").split(",") if x]
-    bks = [x for x in os.environ.get("UHH_REALAPPS_BACKENDS", "").split(",") if x] or ["breakpoint", "hw", "inline"]
+    env_bks = [x for x in os.environ.get("UHH_REALAPPS_BACKENDS", "").split(",") if x]
     work = Path(tempfile.mkdtemp(prefix="uhh_realapps_"))
     for scen, argv, kind, cols in _realapps_scenarios(sysdir):
         if only and scen not in only:
@@ -3777,6 +3778,9 @@ def check_realapps():
             skip(f"realapps-{scen}", f"{argv[0]} not on this system")
             continue
         base = None
+        bks = env_bks or ["breakpoint", "hw", "inline"]
+        if x86 and scen == "tasklist-m" and not env_bks:
+            bks = ["breakpoint"]   # 32-bit tasklist /m takes ~2 min even uninstrumented (and opens nothing)
         for bk in bks:
             name = f"realapps-{scen}-{bk}"
             print(f"  .. {name}", file=sys.stderr, flush=True)
@@ -3855,7 +3859,8 @@ def _realapps_one(name, drv, argv, kind, cols, bk, base, stem, x86, after=None):
     ok = ((drc == 0 or (drc == 1 and prc == plain_rc != 0)) and rep.get("error") is None and rep.get("log_dropped") == 0 and rep.get("callbacks_interrupted") == 0
           and read_hits == len(reads) and len(other) == 0 and not bad
           and all(p.get("active") for p in pr.values()) and len(pr) == 3)
-    detail = (f"{secs:.1f}s rc={drc} app_exit={prc} opens={opens} reads={len(reads)}/{read_hits} unmapped={unmapped} "
+    plain_s = f"(plain {base[0][2]:.1f}s) " if base else ""
+    detail = (f"{secs:.1f}s {plain_s}rc={drc} app_exit={prc} opens={len(opens)} reads={len(reads)}/{read_hits} unmapped={unmapped} "
               f"pids={len(pids)} unverified={sorted(unverified)[:4]} dropped={rep.get('log_dropped')} "
               f"intr={rep.get('callbacks_interrupted')}")
     if kind in ("csv", "lines"):
@@ -3863,11 +3868,18 @@ def _realapps_one(name, drv, argv, kind, cols, bk, base, stem, x86, after=None):
                   if _row_alive(r, cols, alive_pids, alive_names)}
         mine = set(_realapps_rows(prog_out, kind, cols))
         missing = sorted(stable - mine)
-        ok = ok and not missing and prc == plain_rc and len(stable) > 3
+        # A 32-bit Get-Process -FileVersionInfo lists only the few 32-bit processes: >= 1 row.
+        ok = ok and not missing and prc == plain_rc and len(stable) >= 1
         detail += f" stable_rows={len(stable)} missing={len(missing)} exit={prc}/{base[0][0]}"
         if missing:
             m0 = missing[0]
             key = ",".join(m0.split(",")[:2])
+            if cols and isinstance(cols[1], int):
+                try:   # did the instrumented program even get a handle to that process?
+                    kp = int(m0.split(",")[cols[1]].strip('"'))
+                    detail += f" [pid {kp}: opened={kp in opens} reads={sum(1 for r in reads if r[1] == kp)}]"
+                except (ValueError, IndexError):
+                    pass
             twin = next((r for r in mine if r.startswith(key)), None)
             if twin:   # show only where the row differs
                 ma, tb = m0.split(";"), twin.split(";")
