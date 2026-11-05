@@ -555,8 +555,7 @@ foreach(t configparse cet_probe hook_edge parity_target watch_target dynwatch_ta
           famous_heap_target famous_file_target famous_loader_target famous_tick_target edge_target detours_target co_target
           hunt_target hunt_dll blog_target p2edge_target p2edge_early p2edge_late
           latedll_target latedll_fix latedll_heavy
-          stacks_target)
-          hunt_target hunt_dll blog_target filetrace_target flagfeature flagflip_target regtrace_target)
+          stacks_target filetrace_target flagfeature flagflip_target regtrace_target)
     set_property(TARGET ${t} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 endforeach()
 
