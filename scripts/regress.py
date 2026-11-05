@@ -2853,22 +2853,19 @@ DT_HW_GROUPS = ("CreateFileW,ReadFile,WriteFile,CloseHandle",
 
 
 def dt_split(stdout):
-    """Split a driver's stdout into UHH records and the TARGET's own output. The target
-    inherits the controller's stdout, and the live log tail writes whole records -- but a
-    target that writes a partial line (reg.exe does; so does unbuffered UCRT stdout) gets a
-    record spliced into the middle of its line. Rebuild the target's text by cutting every
-    record out of the line it landed in."""
+    """Split a driver's stdout into JSON records (UHH's and the target's own) and the
+    TARGET's text. UHH forwards a launched target's output line-wise, so every record is a
+    whole line of its own -- a record spliced into one of the target's lines (reg.exe and
+    unbuffered UCRT stdout write partial lines; ROADMAP D2) stays text and fails the check."""
     objs, text = [], []
     for line in stdout.splitlines():
-        cut = line.find('{"kind":')
-        if cut < 0:
-            text.append(line + "\n")
-            continue
-        text.append(line[:cut])
-        try:
-            objs.append(json.loads(line[cut:]))
-        except json.JSONDecodeError:
-            text.append(line[cut:] + "\n")
+        if line.startswith('{"kind":'):
+            try:
+                objs.append(json.loads(line))
+                continue
+            except json.JSONDecodeError:
+                pass
+        text.append(line + "\n")
     return objs, "".join(text)
 
 
@@ -4028,6 +4025,160 @@ def blog_crypto_naive_hw(d, t, targs, base, fields, rounds=3):
             return record(name, ok, f"round={i + 1}/{rounds} refused_logs={refused} rng_ret_logs={rets}/{tgt.get('genrandom')} "
                                     f"vs_baseline={'same' if not diff else diff} rc={r.returncode} exit={rep.get('app_exit')} "
                                     f"stray_db={[l for l in (r.stderr or '').splitlines() if 'not ours' in l][:1]}")
+
+
+# ---- forwarded target stdout/stderr (ROADMAP D2/F8) ----------------------------------------
+# A launched target writes into its own pipe and UHH forwards its bytes line-wise, so the live
+# log records never land inside one of its lines -- whatever the target writes: one byte per
+# WriteFile, unbuffered UCRT, 4 KiB CRT chunks, binary bytes, a prompt without a newline.
+
+STDOUT_PROBES = ("KernelBase.dll!WriteFile:xxd", "KernelBase.dll!GetFileAttributesA:s")
+
+
+def stdout_capture(args, answer=None, prompt=None, merge=False, timeout=300):
+    """Run with binary pipes, pumped by threads. With `prompt`, `answer` goes to stdin only
+    once stdout holds the prompt -- a target waiting for that answer hangs unless the prompt
+    reached the reader without its newline. Returns (rc, out, err, prompt_seen, seconds)
+    where seconds is how long the process itself ran (not until its pipes closed)."""
+    p = subprocess.Popen([str(a) for a in args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT if merge else subprocess.PIPE)
+    bufs = {"out": bytearray(), "err": bytearray()}
+
+    def pump(stream, key):
+        while True:
+            b = stream.read1(65536)
+            if not b:
+                break
+            bufs[key] += b
+
+    pumps = [threading.Thread(target=pump, args=(p.stdout, "out"), daemon=True)]
+    if not merge:
+        pumps.append(threading.Thread(target=pump, args=(p.stderr, "err"), daemon=True))
+    for t in pumps:
+        t.start()
+    t0 = time.time()
+    seen = None
+    if prompt is not None:
+        seen = False
+        while time.time() - t0 < 120 and p.poll() is None:
+            if prompt in bufs["out"]:
+                seen = True
+                break
+            time.sleep(0.01)
+    try:
+        if answer is not None:
+            p.stdin.write(answer)
+        p.stdin.close()
+    except OSError:
+        pass
+    try:
+        p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        subprocess.run(["taskkill", "/f", "/t", "/pid", str(p.pid)], capture_output=True)
+        p.wait()
+    secs = time.time() - t0
+    for t in pumps:
+        t.join(timeout=30)
+    return p.returncode, bytes(bufs["out"]), bytes(bufs["err"]), seen, secs
+
+
+def stdout_lines(data):
+    parts = data.split(b"\n")
+    return [x + b"\n" for x in parts[:-1]] + ([parts[-1]] if parts[-1] else [])
+
+
+def stdout_split(data):
+    """(records, target bytes, strays): every whole line that is a UHH record is taken out;
+    what is left must be the target's exact bytes. strays: records found anywhere else."""
+    recs, keep = [], []
+    for line in stdout_lines(data):
+        if line.startswith(b'{"kind":"probe') and line.endswith(b"\n"):
+            try:
+                recs.append(json.loads(line))
+                continue
+            except ValueError:
+                pass
+        keep.append(line)
+    rest = b"".join(keep)
+    return recs, rest, rest.count(b'{"kind":"probe')
+
+
+def stdout_strip_diag(data):
+    """The controller's own stderr lines (probe: ...) out of a stderr stream."""
+    return b"".join(l for l in stdout_lines(data) if not l.startswith(b"probe: "))
+
+
+def stdout_first_diff(a, b):
+    i = next((k for k in range(min(len(a), len(b))) if a[k] != b[k]), min(len(a), len(b)))
+    return f"len {len(a)} vs {len(b)}, first diff @{i}: {a[max(0, i - 30):i + 30]!r} vs {b[max(0, i - 30):i + 30]!r}"
+
+
+def check_stdout_forward():
+    """stdout-*: a launched target's stdout/stderr bytes reach the consumer exactly (compared
+    with an uninstrumented run) while probes on its every WriteFile and on a busy worker
+    thread log at a high rate; every record is intact on its own line; a prompt without a
+    newline shows promptly; stdout+stderr as one stream (2>&1) keep their order; a grandchild
+    holding the pipe does not keep the controller waiting."""
+    tr, t = exe("uhh_trace.exe"), exe("stdout_target.exe")
+    if not tr or not t:
+        return skip("stdout", "uhh_trace/stdout_target missing")
+    probes_args = [a for p in STDOUT_PROBES for a in ("-p", p)]
+    try:
+        brc, bout, berr, bseen, _ = stdout_capture([t, "run", "--prompt"], answer=b"go\n", prompt=b"prompt> ")
+        ok = brc == 0 and bseen and bout.endswith(b"END stdout_target\n") and b"answer=go," in bout
+        record("stdout-baseline", ok, f"rc={brc} prompt_seen={bseen} stdout={len(bout)}B stderr={len(berr)}B")
+        mrc, mout, _, _, _ = stdout_capture([t, "mixed"], merge=True)
+        record("stdout-mixed-baseline", mrc == 0 and mout.endswith(b"END mixed\n"), f"rc={mrc} bytes={len(mout)}")
+    except Exception as e:
+        return record("stdout-baseline", False, repr(e))
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"stdout-{bk}"
+        print(f"  .. {name}", file=sys.stderr, flush=True)
+        try:
+            rc, out, err, seen, secs = stdout_capture([tr, "--backend", bk, *probes_args, "--", t, "run", "--prompt"],
+                                                      answer=b"go\n", prompt=b"prompt> ")
+            recs, text, strays = stdout_split(out)
+            logs = [r for r in recs if r.get("kind") == "probe_log"]
+            rep = next((r for r in recs if r.get("kind") == "probe_report"), {})
+            writes = sum(str(r.get("message", "")).startswith("WriteFile(") for r in logs)
+            errtext = stdout_strip_diag(err)
+            ok = (rc == 0 and rep.get("error") is None and rep.get("app_exit") == 0 and rep.get("log_dropped") == 0 and
+                  len(logs) == rep.get("logs_written") and strays == 0 and seen and text == bout and errtext == berr and
+                  writes >= 2000)
+            record(name, ok, f"logs={len(logs)}/{rep.get('logs_written')} writefile_logs={writes} strays={strays} "
+                             f"prompt_seen={seen} stdout_same={text == bout} stderr_same={errtext == berr} rc={rc} "
+                             f"exit={rep.get('app_exit')} dropped={rep.get('log_dropped')} {secs:.1f}s err={rep.get('error')}" +
+                             ("" if text == bout else " stdout: " + stdout_first_diff(text, bout)) +
+                             ("" if errtext == berr else " stderr: " + stdout_first_diff(errtext, berr)))
+        except Exception as e:
+            record(name, False, repr(e))
+        name = f"stdout-mixed-{bk}"
+        try:
+            rc, out, _, _, secs = stdout_capture([tr, "--backend", bk, "-p", STDOUT_PROBES[0], "--", t, "mixed"], merge=True)
+            recs, text, strays = stdout_split(out)
+            text = stdout_strip_diag(text)
+            logs = [r for r in recs if r.get("kind") == "probe_log"]
+            rep = next((r for r in recs if r.get("kind") == "probe_report"), {})
+            ok = (rc == 0 and rep.get("error") is None and rep.get("log_dropped") == 0 and
+                  len(logs) == rep.get("logs_written") and len(logs) > 500 and strays == 0 and text == mout)
+            record(name, ok, f"logs={len(logs)}/{rep.get('logs_written')} strays={strays} same_order={text == mout} rc={rc} "
+                             f"{secs:.1f}s" + ("" if text == mout else " " + stdout_first_diff(text, mout)))
+        except Exception as e:
+            record(name, False, repr(e))
+    name = "stdout-grandchild"
+    try:
+        rc, out, err, _, secs = stdout_capture([tr, "--backend", "breakpoint", "-p", STDOUT_PROBES[0], "--", t, "orphan"],
+                                               timeout=120)
+        m = re.search(rb"grandchild (\d+)\n", out)
+        if m:
+            subprocess.run(["taskkill", "/f", "/pid", m.group(1).decode()], capture_output=True)
+        recs, _, strays = stdout_split(out)
+        rep = next((r for r in recs if r.get("kind") == "probe_report"), {})
+        ok = rc == 0 and bool(m) and secs < 15 and rep.get("app_exit") == 0 and strays == 0
+        record(name, ok, f"controller_exit_after={secs:.1f}s (grandchild holds the pipe 20 s) rc={rc} "
+                         f"grandchild={bool(m)} exit={rep.get('app_exit')}")
+    except Exception as e:
+        record(name, False, repr(e))
 
 
 def check_blog_replicas():
@@ -5521,6 +5672,7 @@ def main():
     if want(check_detours_retval): check_detours_retval()
     if want(check_detours_stdin): check_detours_stdin()
     if want(check_hunt): check_hunt()
+    if want(check_stdout_forward): check_stdout_forward()
     if want(check_blog_replicas): check_blog_replicas()
     if want(check_blog_pwsh_attach): check_blog_pwsh_attach()
     if want(check_entry_hold_threads): check_entry_hold_threads()

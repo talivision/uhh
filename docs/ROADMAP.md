@@ -221,7 +221,7 @@ breakpoint/hw/inline on x64+x86, compared with the uninstrumented run (`regress.
 - ⬜ (F5) `call_func` from a breakpoint/hw callback returns 0 while another thread's callback is inside one (no nesting: the other thread's event is dispatched inside the first call). A Process.mainModule lookup via call_func silently skips that racing call; famous_common.h falls back to walking to the PE header. Library options: document in probe_api.h, or defer (replay) other threads' probe hits during a call
 - ✗ (F6) HW budget: a recipe needing one return probe per call site exceeds the 4 debug registers when unfiltered (NtCreateFile is called from several KernelBase sites, CreateDirectory among them) -> clean `too many hardware probes` refusal. By design; the recipe's Procmon-style `--filter` keeps it to one site. Documented in the recipe README
 - ✗ (F7) Observer effect: with inline probes, writing a hook makes the patched bytes PAGE_EXECUTE_READWRITE through the target's own NtProtectVirtualMemory (seen by an RWX watcher installed earlier: `rwx-protect size=0x8` in KernelBase); breakpoint/hw patch from the controller and are invisible. Documented (loader_rwx README)
-- ⬜ (F8) The live log tail shares the target's inherited stdout: a target writing partial lines (cmd `type`) interleaves with tail lines mid-line, corrupting both for a line-based reader. The session JSONL file is unaffected (the famous checks read logs from it). Options: document; or tail to stderr/another handle when the target inherits stdout
+- ✅ (F8, fixed with D2: a launched target writing to a pipe/file gets its own pipe, forwarded line-wise; regress `stdout-*`) The live log tail shares the target's inherited stdout: a target writing partial lines (cmd `type`) interleaves with tail lines mid-line, corrupting both for a line-based reader. The session JSONL file is unaffected (the famous checks read logs from it). Options: document; or tail to stderr/another handle when the target inherits stdout
 
 ## Detours-replica findings (examples/famous/detours_*, 2026-11-05)
 Replicas of Microsoft Detours' simple / traceapi / withdll / retval samples on real system
@@ -235,7 +235,15 @@ binaries (cmd, reg, sort), multi-threaded targets, launch vs attach, attach mid-
   gated_config flow (not a contained fix -- user's call: e.g. inherit stdin by default and make the
   gate keystroke opt-in, or forward the controller's stdin after the keystroke and close at EOF).
   Test: `detours-launch-stdin-*` (FAILS today: hang).
-- ⬜ (D2) **Live log tail splices records into the target's own stdout lines.** The child inherits
+- ✅ (D2, fixed: when the controller's stdout/stderr is a pipe or a file, probe_launch gives the
+  target its own pipe(s) and a forwarder thread copies the bytes out a complete line at a time;
+  log records are written only at a line boundary -- while the target sits inside an unfinished
+  line (partial flushed after ~50 ms idle) they stay in the log file and are replayed at its
+  next newline, so the writer never blocks on the target. 2>&1 shares one pipe (order kept). A
+  console stays inherited (interactive targets keep GetConsoleMode). Grandchildren holding the
+  pipe: drained with a bounded wait at target exit. Only exception: a target that ENDS inside
+  a line with records still to follow gets a "\n" before them. `dt_split` now splits whole
+  lines only; regress `stdout-*`) **Live log tail splices records into the target's own stdout lines.** The child inherits
   the controller's stdout; records are written whole, but a target that writes partial lines
   (reg.exe writes `ProductName` and the padding separately; unbuffered UCRT stdout writes one
   character per WriteFile) gets `{"kind":"probe_log",...}` inserted mid-line, so its output as read

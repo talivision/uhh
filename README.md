@@ -61,6 +61,11 @@ waits instead of dropping logs or growing memory. A background tailer copies new
 lines to controller stdout with raw-handle writes (up to 64 KiB each), flushing the
 driver's CRT stdout first. This keeps the target decoupled from a slow console while logs
 remain live; redirecting stdout to `NUL` disables tailing and leaves the complete file.
+A launched target whose stdout/stderr would be a pipe or a file gets its own pipe instead,
+and UHH forwards its bytes unchanged a line at a time: every record stays a whole line of
+its own, even when the target writes one byte per `WriteFile`, 4 KiB CRT chunks, binary
+data or a prompt without a newline (shown after ~50 ms idle; records wait for its next
+newline). A console stays inherited, so interactive targets keep their console.
 If a console tail falls behind for more than about a second, UHH prints a one-time
 redirect-to-file-or-pipe performance warning on stderr.
 The writer flushes on idle or within about 10 ms. `send_log_stack` captures only raw
