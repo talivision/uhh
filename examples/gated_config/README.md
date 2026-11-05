@@ -16,15 +16,14 @@ without rebuilding the target, editing its config, or patching its files:
    to store "enabled" as if its config had said so. The probe is registered before
    the DLL exists in the process; it stays pending and arms when the DLL loads.
 2. **Observe the path you enabled.** One callback on `ntdll.dll!NtOpenProcess`
-   (`track_open_process_call`) runs the real open with `call_original`, so the new handle
+   (`track_open_process`) runs the real open with `call_original`, so the new handle
    (`*out`) and the pid (`CLIENT_ID`) are both in hand at once, records handle -> pid ->
    name (image name from the kernel by pid, without opening it), logs
    `open pid=.. name=..` and `map handle=0x.. -> pid=.. name=..`, and returns the real
    status with `return_from`. The pid cannot be recovered from the handle later (helpers
    are opened with only `PROCESS_VM_READ`), so it is captured at the open -- for any
    caller, including `kernel32!OpenProcess` whose output slot dies as it returns.
-   `--open-mode lazy` instead remembers the output pointer at entry and reads it at the
-   first read through an unknown handle (only valid while that pointer lives). `log_read` on
+ `log_read` on
    `ntdll.dll!NtReadVirtualMemory` logs every read as
    `read handle=0x.. pid=.. name=.. addr=0x.. size=..`. Regress `gated-map` checks every
    map and read line against the handle the target's open really returned. Both are the ntdll syscall stubs, so every
@@ -46,52 +45,15 @@ offset against the map on every run.
 
 ### Handle -> pid
 
-At `NtOpenProcess(PHANDLE out, access, attributes, CLIENT_ID *cid)` entry the pid is
-known (`cid->UniqueProcess`) but the handle is not: the kernel writes it to `*out`
-during the call. `track_open_process` remembers `(pid, out)`; when `log_read` meets a
-handle it has not seen, it dereferences the remembered `out` pointers with `get_mem`
-to find which open produced it, and caches the answer. This relies on `*out` still
-holding the handle when the read happens: `probe_app` calls `NtOpenProcess` directly
-with `out` pointing at a long-lived variable. **Limitation:** through
-`kernel32!OpenProcess` the out pointer is a stack local inside KernelBase that is reused
-as soon as `OpenProcess` returns, so a lazily dereferenced pointer can read garbage; such
-reads log `pid=0`. Capturing the handle at the stub's return instead is on the roadmap. The callbacks are lock-free, so the same source runs on the controller's
-debug loop (breakpoint / hw) and on many target threads at once (inline).
-
-## Usage
-
-```
-gated_config [--flag-backend b] [--read-backend b] [--no-log]
-             <flag_location> <read_location> -- <target.exe> [target args]
-```
-
-- `b` = `breakpoint` | `hw` | `inline`. Defaults: flag `breakpoint`, reads `inline`.
-  The NtOpenProcess probe uses the read backend, so its map lives in the same address
-  space as `log_read` (the controller for breakpoint/hw, the target for inline).
-- Locations are UHH location strings: `module!Export+0xOFF` or `module+0xRVA`.
-- `--no-log`: count hits only (used to measure per-log overhead).
-
-```powershell
-$bin = "build-x64\Release"     # or build-x86\Release
-& "$bin\gated_config.exe" configparse.dll!ParseConfig+0x16 ntdll.dll!NtReadVirtualMemory `
-    -- "$bin\probe_app.exe" --no-wait --helpers 4 --threads 8 --reads 1000
-```
-
-Output (JSON lines): probe_app's `helper` / `waiting` / `app` lines, then one
-`probe_log` per read, then the report. Expected: `"overrides":1` in `probe_report`
-(the flag was flipped once), the `ntdll.dll!NtReadVirtualMemory` probe's `hits` equal to
-`threads * reads`, the app's `successful_reads` the same, one log per read with a
-non-zero `pid`, and `"log_dropped":0`. Without the flag probe (run `probe_app.exe
---no-wait` alone) the app line shows `"reads_enabled":0,"opened":0,"successful_reads":0`.
-
-`--no-wait` only skips probe_app's own keystroke wait; UHH holds a launched target at
-its entry point until inline probes are installed, so no read is missed either way.
-
-## Tested by
-
-`scripts/regress.py`: `sites`, `gated-off`, `mix flag=* read=*` (all 9 backend
-pairs), `exact-*` (hits == logs == reads, no unmapped pid, no drops),
-`log-throughput-*`, and the opt-in `volume-*`.
+A read carries only a handle, and a handle opened with just `PROCESS_VM_READ` cannot be
+asked for its pid. The pid exists only at the open (`cid->UniqueProcess` of
+`NtOpenProcess(PHANDLE out, access, attributes, CLIENT_ID *cid)`), the handle only after
+it. `track_open_process` therefore runs the open itself with `call_original`, reads the
+handle from `*out` right away, records handle -> pid -> name, and hands the caller the real
+status with `return_from` (the open is not run again). This works for every caller,
+including `kernel32!OpenProcess`, whose `out` is a short-lived local. If `call_original` is
+refused (breakpoint/hw on a CET shadow-stack target), the open runs normally and is logged
+as `unmapped`.
 
 ### Inline hooks on ntdll syscall stubs
 

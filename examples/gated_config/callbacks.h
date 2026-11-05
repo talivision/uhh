@@ -48,11 +48,9 @@ extern "C" {
 PROBE_EXAMPLE_EXPORT void enable_reads(probe_context *);
 /* configparse.dll!ParseConfig+0x18: the flag is already stored at [BX]; rewrite it 0 -> 1. */
 PROBE_EXAMPLE_EXPORT void enable_reads_mem(probe_context *);
-/* ntdll!NtOpenProcess entry: remember (pid, out-handle pointer). */
+/* ntdll!NtOpenProcess: runs the open (call_original), records handle -> pid -> name, and
+   returns its status (return_from). */
 PROBE_EXAMPLE_EXPORT void track_open_process(probe_context *);
-/* ntdll!NtOpenProcess entry, one callback: call_original, record handle -> pid -> name,
-   return_from with the real status (gated_config --open-mode call). */
-PROBE_EXAMPLE_EXPORT void track_open_process_call(probe_context *);
 /* ntdll!NtReadVirtualMemory entry: log handle/pid/addr/size. */
 PROBE_EXAMPLE_EXPORT void log_read(probe_context *);
 }

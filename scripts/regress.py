@@ -201,10 +201,9 @@ def check_gated_off():
         record("gated-off", False, repr(e))
 
 
-def gated(flag_bk, read_bk, threads, reads, timeout=200, log=True, open_bk=None, open_mode=None, target_args=(), extra=()):
+def gated(flag_bk, read_bk, threads, reads, timeout=200, log=True, open_bk=None, target_args=(), extra=()):
     return run([exe("gated_config.exe"), "--flag-backend", flag_bk, "--read-backend", read_bk,
                 *(["--open-backend", open_bk] if open_bk else []),
-                *(["--open-mode", open_mode] if open_mode else []),
                 *([] if log else ["--no-log"]), *extra, FLAG_LOCATION, READ_LOCATION,
                 "--", exe("probe_app.exe"), "--no-wait", "--helpers", HELPERS,
                 "--threads", threads, "--reads", reads, *target_args], timeout=timeout)
@@ -1673,15 +1672,14 @@ def check_gated_map(threads=4, reads=50):
     rx_open = re.compile(r"open pid=(\d+) name=(\S+)$")
     rx_map = re.compile(r"map handle=0x([0-9a-f]+) -> pid=(\d+) name=(\S+)$")
     rx_read = re.compile(r"read handle=0x([0-9a-f]+) pid=(\d+) name=(\S+) ")
-    # mode "call": track_open_process_call (call_original + return_from) builds the map in the
-    # open's own callback; "call-k32": the same with probe_app opening through
-    # kernel32!OpenProcess, whose out slot is a short-lived kernelbase local (lazy cannot map it).
-    for open_bk, mode in [(b, m) for m in ("lazy", "call", "call-k32") for b in ("breakpoint", "hw", "inline")]:
-        name = f"gated-map-open-{open_bk}" + ("" if mode == "lazy" else f"-{mode}")
+    # track_open_process runs the open (call_original) and records handle -> pid -> name in
+    # the open's own callback. "k32": probe_app opens through kernel32!OpenProcess, whose
+    # out slot is a short-lived kernelbase local -- mapped all the same.
+    for open_bk, via in [(b, v) for v in ("ntdll", "k32") for b in ("breakpoint", "hw", "inline")]:
+        name = f"gated-map-open-{open_bk}" + ("-k32" if via == "k32" else "")
         try:
             r, o = gated("breakpoint", "inline", threads, reads, open_bk=open_bk,
-                         open_mode="lazy" if mode == "lazy" else "call",
-                         target_args=("--open-via", "kernel32") if mode.endswith("k32") else ())
+                         target_args=("--open-via", "kernel32") if via == "k32" else ())
             truth = {x["handle"]: x["pid"] for x in o if x.get("kind") == "opened"}
             want_pids = helper_pids(o)
             msgs = [str(x.get("message", "")) for x in o if x.get("kind") == "probe_log"]
@@ -1690,9 +1688,8 @@ def check_gated_map(threads=4, reads=50):
             rds = [m.groups() for m in map(rx_read.match, msgs) if m]
             bad = []
             # Every helper open must be seen. An extra open is tolerated (and reported): seen
-            # only with the lazy breakpoint probe on a freshly built probe_app's first launch
-            # (armed at load, it catches a start-up NtOpenProcess the later-armed hw/inline
-            # probes miss). The map itself must still equal the ground truth exactly.
+            # once with a breakpoint probe (armed at load) on a freshly built probe_app's first
+            # launch -- a start-up NtOpenProcess of its own. The map must equal the ground truth.
             target_pid = next((x.get("pid") for x in o if x.get("kind") == "waiting"), None)
             extra = [(p, n) for p, n in opens if int(p) not in want_pids]
             if not want_pids <= {int(p) for p, _ in opens} or len(opens) - len(extra) != len(want_pids):

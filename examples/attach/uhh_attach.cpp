@@ -5,7 +5,7 @@
 //
 // Three probes, the callbacks shared with gated_config (examples/gated_config):
 //   configparse.dll!ParseConfig+0x16   <flag-backend>  enable_reads: parsed flag 0 -> 1
-//   ntdll.dll!NtOpenProcess            <backend>       track_open_process: handle -> pid map
+//   ntdll.dll!NtOpenProcess            <backend>       track_open_process: handle -> pid -> name map (call_original)
 //   ntdll.dll!NtReadVirtualMemory      <backend>       log_read: only pid P, only [BASE, BASE+SIZE)
 // The handle -> pid map is UHH_SHARED (see examples/gated_config/callbacks.cpp), so it is
 // one map whichever process each callback runs in.

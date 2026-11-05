@@ -12,7 +12,7 @@ its files or its config:
 | Probe | Backend | Callback | What it does |
 |---|---|---|---|
 | `configparse.dll!ParseConfig+0x16` | breakpoint | `enable_reads` | the parsed flag is in EAX just before it is stored: 0 -> 1, so the disabled path runs |
-| `ntdll.dll!NtOpenProcess` | `--backend` | `track_open_process` | handle -> pid map: pid from `CLIENT_ID` (arg 3), remember the out-handle pointer (arg 0) |
+| `ntdll.dll!NtOpenProcess` | `--backend` | `track_open_process` | runs the open (`call_original`), records handle -> pid -> name, returns its status (`return_from`) |
 | `ntdll.dll!NtReadVirtualMemory` | `--backend` | `log_read` | log only reads whose handle maps to pid P and whose address is in `[BASE, BASE+SIZE)` |
 
 `configparse.dll` is not loaded yet when `uhh_attach` attaches (the target loads it
@@ -20,13 +20,9 @@ after the keystroke), so the flag breakpoint stays pending and arms when the DLL
 loads. `ntdll` and `probe_app.exe` are already loaded, so those probes arm right after
 the attach.
 
-**Handle -> pid.** A read only carries a handle. At `NtOpenProcess` entry the pid is
-known but the handle is not yet written, so `track_open_process` records `(pid, out
-pointer)`. The first time `log_read` sees a handle it does not know, it dereferences
-the remembered out pointers (`get_mem`) to find the open that produced it, then
-caches it. probe_app opens each helper with `NtOpenProcess` into a long-lived
-variable, so the pointer still holds the handle when the reads start (see
-gated_config's README for why `kernel32!OpenProcess` would not do here).
+**Handle -> pid.** A read only carries a handle. `track_open_process` runs the open itself
+(`call_original`), reads the new handle and records it with the pid from `CLIENT_ID`, then
+returns the real status (`return_from`) -- see gated_config's README.
 
 The open and read probes must use the **same backend**: the map lives with the
 callbacks (in `uhh_attach` for breakpoint/hw, inside the target's injected
