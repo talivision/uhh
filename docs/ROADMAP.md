@@ -356,9 +356,9 @@ PowerShell + detach) under every backend, against an uninstrumented baseline.
 - ⬜ [fan-out] Stability on real large apps (important): browsers / heavily multi-threaded / JIT processes under all backends
 - ⬜ [fan-out, Codex] Docs: quickstart, API reference, per-backend limitations table, troubleshooting
 - 🔧 Inline cap raised to 128 per session (user: 128 is enough; error beyond) -- compile-time thunk table, per-request FREEZE flag; refusal test uses the 129th -- VM verify pending
-- ⬜ Follow child processes: write docs/child-processes.md -- strategies + robust API options for the user to choose from (during the soak test)
+- 🔧 Follow child processes: design written -- [docs/child-processes.md](child-processes.md) (strategies with VM measurements from `bench/child_follow`, API options A-D, recommendation: ProcessDebugFlags inheritance + `probe_follow_children` + `get_pid`); **user to choose the API**, then implement
 - ⬜ (maybe) CI on GitHub Actions; (maybe) CMake package + versioned release zip
-- ⬜ (very last) Soak test: hours under load; handles/memory/threads flat
+- 🔧 (very last) Soak test: hours under load; handles/memory/threads flat -- `scripts/soak.py` (phases mixed / hw / breakpoint / attach-detach cycles, per-minute samples to CSV, exactness + checksum + growth verdict), opt-in `regress.py --soak-minutes N`; probe_app `--pace`. x64 mixed 30 min PASS (57.6M reads, all logged, flat); see the branch report for the rest
 - ✗ Controller-crash self-unhook (user: the analyst sees the controller died and restarts the target; not worth the cost)
 - ✗ Named-object hardening (user: unlikely; a clash fails loudly)
 
