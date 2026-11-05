@@ -97,7 +97,32 @@ if os.name == "nt":
     K32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
     K32.Module32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MODULEENTRY32W)]
     K32.Module32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MODULEENTRY32W)]
+    K32.K32GetPerformanceInfo.argtypes = [ctypes.c_void_p, wintypes.DWORD]
 INVALID_HANDLE = ctypes.c_void_p(-1).value
+
+
+class PERFORMANCE_INFORMATION(ctypes.Structure):
+    _fields_ = [("cb", wintypes.DWORD), ("CommitTotal", ctypes.c_size_t), ("CommitLimit", ctypes.c_size_t),
+                ("CommitPeak", ctypes.c_size_t), ("PhysicalTotal", ctypes.c_size_t),
+                ("PhysicalAvailable", ctypes.c_size_t), ("SystemCache", ctypes.c_size_t),
+                ("KernelTotal", ctypes.c_size_t), ("KernelPaged", ctypes.c_size_t),
+                ("KernelNonpaged", ctypes.c_size_t), ("PageSize", ctypes.c_size_t),
+                ("HandleCount", wintypes.DWORD), ("ProcessCount", wintypes.DWORD), ("ThreadCount", wintypes.DWORD)]
+
+
+def system_memory():
+    """Whole-machine numbers (MB): the VM froze twice during the hw phase with the system out of
+    memory while UHH's own processes stayed flat -- so kernel pools and available RAM are
+    sampled too, and a phase is aborted before the machine runs out."""
+    pi = PERFORMANCE_INFORMATION(); pi.cb = ctypes.sizeof(pi)
+    if not K32.K32GetPerformanceInfo(ctypes.byref(pi), pi.cb):
+        return None
+    mb = lambda pages: round(pages * pi.PageSize / 2**20)
+    return {"avail_mb": mb(pi.PhysicalAvailable), "commit_mb": mb(pi.CommitTotal), "nonpaged_mb": mb(pi.KernelNonpaged),
+            "paged_mb": mb(pi.KernelPaged), "sys_handles": pi.HandleCount}
+
+
+MIN_AVAIL_MB = 1536     # abort a phase below this (the shared VM must never be starved)
 
 
 def thread_counts():
@@ -207,14 +232,15 @@ READ_RE = re.compile(rb"read handle=0x([0-9a-f]+) pid=(\d+) name=([^ ]+) addr=0x
 
 
 class Sampler:
-    def __init__(self, out_csv, every, procs, log_path_fn, extra_fn=None):
+    def __init__(self, out_csv, every, procs, log_path_fn, extra_fn=None, on_low_memory=None):
         self.samples, self.every, self.procs = [], every, procs
+        self.on_low_memory, self.low_memory = on_low_memory, None
         self.log_path_fn, self.extra_fn = log_path_fn, extra_fn
         self.stop = threading.Event()
         self.f = open(out_csv, "w", newline="")
         self.w = csv.writer(self.f)
         self.w.writerow(["t_s"] + [f"{who}_{k}" for who in procs for k in ("private_mb", "ws_mb", "handles", "threads")]
-                        + ["log_mb", "extra"])
+                        + ["log_mb", "avail_mb", "commit_mb", "nonpaged_mb", "paged_mb", "sys_handles", "extra"])
         self.t0 = time.time()
         self.t = threading.Thread(target=self._run, daemon=True)
 
@@ -232,15 +258,23 @@ class Sampler:
         except OSError:
             s["log_mb"] = None
         s["extra"] = self.extra_fn() if self.extra_fn else ""
+        s["sys"] = system_memory() or {}
         self.samples.append(s)
+        if s["sys"].get("avail_mb", 1 << 30) < MIN_AVAIL_MB and not self.low_memory:
+            self.low_memory = s["sys"]
+            say(f"ABORT: system available memory {s['sys']} below {MIN_AVAIL_MB} MB")
+            if self.on_low_memory:
+                self.on_low_memory()
         row = [s["t"]]
         for who in self.procs:
             m = s[who] or {}
             row += [m.get("private_mb"), m.get("ws_mb"), m.get("handles"), m.get("threads")]
-        self.w.writerow(row + [s["log_mb"], s["extra"]]); self.f.flush()
+        sy = s["sys"]
+        self.w.writerow(row + [s["log_mb"]] + [sy.get(k) for k in ("avail_mb", "commit_mb", "nonpaged_mb", "paged_mb",
+                                                                   "sys_handles")] + [s["extra"]]); self.f.flush()
         say("sample t=%5.0fs " % s["t"] + " ".join(
             f"{who}[priv={m['private_mb']}MB ws={m['ws_mb']}MB h={m['handles']} thr={m['threads']}]"
-            for who, m in ((w, s[w]) for w in self.procs) if m) + f" log={s['log_mb']}MB {s['extra']}")
+            for who, m in ((w, s[w]) for w in self.procs) if m) + f" log={s['log_mb']}MB {s['extra']} sys={sy}")
 
     def _run(self):
         while not self.stop.wait(self.every):
@@ -317,7 +351,7 @@ def launch_phase(bin_dir, phase, minutes, threads, pace, out_dir, sample_s, max_
         proc.kill()
         return {"phase": phase, "ok": False, "detail": "target never reached its gate", "stderr": state["stderr"][-20:]}
     sampler = Sampler(out_dir / f"{phase}.csv", sample_s, {"ctl": lambda: ctl, "tgt": lambda: target_proc[0]},
-                      lambda: state["log"], lambda: f"reads_logged={state['reads']}")
+                      lambda: state["log"], lambda: f"reads_logged={state['reads']}", on_low_memory=proc.kill)
     sampler.take()                      # t=0: at the gate, before the flag flips
     sampler.start()
     t0 = time.time()
@@ -357,7 +391,11 @@ def launch_phase(bin_dir, phase, minutes, threads, pace, out_dir, sample_s, max_
              rep.get("callbacks_interrupted") == 0 and rep.get("error") is None and rep.get("overrides", 0) >= 1)
     lines_ok = file_lines == rep.get("logs_written") and state["reads"] + state["other_logs"] == rep.get("logs_written")
     checksum_ok = app.get("checksum") == base.get("checksum") and base.get("successful_reads") == total
-    ok = proc.returncode == 0 and exact and not wrong and lines_ok and checksum_ok and steady
+    sysg = {k: (round(sampler.samples[-1]["sys"].get(k, 0) - sampler.samples[len(sampler.samples) // 2]["sys"].get(k, 0))
+                if len(sampler.samples) >= 4 and sampler.samples[-1].get("sys") else 0)
+            for k in ("nonpaged_mb", "paged_mb", "commit_mb", "sys_handles")}
+    ok = (proc.returncode == 0 and exact and not wrong and lines_ok and checksum_ok and steady and
+          not sampler.low_memory)
     first = sampler.samples[1] if len(sampler.samples) > 1 else (sampler.samples[0] if sampler.samples else {})
     last = sampler.samples[-1] if sampler.samples else {}
     result = {
@@ -371,7 +409,8 @@ def launch_phase(bin_dir, phase, minutes, threads, pace, out_dir, sample_s, max_
         "wrong_lines": sum(wrong.values()), "wrong_examples": [(hex(k[0]), k[1], k[2].decode()) for k in list(wrong)[:4]],
         "checksum": app.get("checksum"), "baseline_checksum": base.get("checksum"), "exit": proc.returncode,
         "overrides": rep.get("overrides"), "controller_peak_ws_mb": rep.get("controller_peak_ws_mb"),
-        "error": rep.get("error"), "growth_2nd_half": gr, "first_sample": first, "last_sample": last,
+        "error": rep.get("error"), "growth_2nd_half": gr, "system_growth_2nd_half": sysg,
+        "aborted_low_memory": sampler.low_memory, "first_sample": first, "last_sample": last,
         "samples": len(sampler.samples),
     }
     if state["log"] and ok:
@@ -458,7 +497,7 @@ def attach_phase(bin_dir, minutes, threads, pace, out_dir, sample_s, attach_ms, 
     tp = Proc(target.pid)
     cycles = []
     sampler = Sampler(out_dir / "attach.csv", sample_s, {"tgt": lambda: tp}, lambda: None,
-                      lambda: f"cycles={len(cycles)} agents={agent_modules(target.pid)}")
+                      lambda: f"cycles={len(cycles)} agents={agent_modules(target.pid)}", on_low_memory=target.kill)
     sampler.take()
     sampler.start()
     target.stdin.write(b"\n"); target.stdin.flush()       # reads start (no instrumentation yet)
@@ -466,7 +505,7 @@ def attach_phase(bin_dir, minutes, threads, pace, out_dir, sample_s, attach_ms, 
     order = ("inline", "hw", "breakpoint")
     deadline = time.time() + minutes * 60
     t0 = time.time()
-    while time.time() < deadline and target.poll() is None:
+    while time.time() < deadline and target.poll() is None and not sampler.low_memory:
         bk = order[len(cycles) % len(order)]
         c = attach_cycle(bin_dir, target.pid, bk, attach_ms)
         c["i"] = len(cycles)
@@ -503,7 +542,7 @@ def attach_phase(bin_dir, minutes, threads, pace, out_dir, sample_s, attach_ms, 
     all_cycles_ok = bool(cycles) and all(c["ok"] for c in cycles)
     checksum_ok = (app.get("checksum") == base.get("checksum") and app.get("successful_reads") == total ==
                    base.get("successful_reads"))
-    ok = all_cycles_ok and checksum_ok and target.returncode == 0 and not unhandled and steady
+    ok = all_cycles_ok and checksum_ok and target.returncode == 0 and not unhandled and steady and not sampler.low_memory
     by_bk = {}
     for c in cycles:
         b = by_bk.setdefault(c["backend"], {"cycles": 0, "ok": 0, "hits": 0, "logs": 0})
@@ -513,6 +552,7 @@ def attach_phase(bin_dir, minutes, threads, pace, out_dir, sample_s, attach_ms, 
             "failed_cycles": [c for c in cycles if not c["ok"]][:3], "successful_reads": app.get("successful_reads"),
             "total": total, "checksum": app.get("checksum"), "baseline_checksum": base.get("checksum"),
             "target_exit": target.returncode, "unhandled": unhandled, "growth_2nd_half": gr,
+            "aborted_low_memory": sampler.low_memory,
             "agent_modules_first_last": (agents[0], agents[-1]) if agents else None,
             "target_after_first_cycle": per_cycle[0] if per_cycle else None,
             "target_after_last_cycle": per_cycle[-1] if per_cycle else None}
