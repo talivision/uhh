@@ -159,7 +159,11 @@ add_library(probe_api_agent SHARED
     examples/famous/detours_traceapi/traceapi_callbacks.cpp
     examples/famous/detours_retval/retval_callbacks.cpp
     examples/hunt/hunt_callbacks.cpp
+    examples/hunt_callorig/co_callbacks.cpp
     examples/blogs/blog_callbacks.cpp)
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    target_sources(probe_api_agent PRIVATE src/probe/agent_x64.asm)   # uhh_orig_thunk (call_original)
+endif()
 target_include_directories(probe_api_agent PRIVATE include examples/gated_config examples/dynwatch examples/trace examples/memstress examples/blogs)
 target_link_libraries(probe_api_agent PRIVATE safetyhook)
 target_compile_definitions(probe_api_agent PRIVATE BREAKAGE_AGENT_ONLY FRIDA_PARITY_AGENT_ONLY HITCOST_SHARED)
@@ -354,6 +358,23 @@ target_include_directories(hunt_driver PRIVATE include examples/gated_config)
 target_link_libraries(hunt_driver PRIVATE probe_api)
 add_dependencies(hunt_driver hunt_target hunt_dll probe_api_agent)
 
+# --- call_original / return_from edge-case hunt (regress `callorig-hunt`) -----------------
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    set(CO_ASM examples/hunt_callorig/co_sites_x86.asm)
+    set(CO_EXPORTS /EXPORT:CoMidPush /EXPORT:CoPrologue /EXPORT:CoCallPrologue /EXPORT:CoThis)
+else()
+    set(CO_ASM examples/hunt_callorig/co_sites_x64.asm)
+    set(CO_EXPORTS /EXPORT:CoMidPush /EXPORT:CoPrologue /EXPORT:CoCallPrologue)
+endif()
+add_executable(co_target examples/hunt_callorig/co_target.cpp ${CO_ASM})
+target_link_options(co_target PRIVATE ${CO_EXPORTS} /INCREMENTAL:NO)
+# /EHs without c: extern "C" originals DO throw here (the caller's catch must not be elided).
+target_compile_options(co_target PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/EHc->)
+add_executable(co_driver examples/hunt_callorig/co_driver.cpp examples/hunt_callorig/co_callbacks.cpp)
+target_include_directories(co_driver PRIVATE include)
+target_link_libraries(co_driver PRIVATE probe_api)
+add_dependencies(co_driver co_target probe_api_agent)
+
 # --- blog replicas: API-monitor scenarios from well-known write-ups (examples/blogs) ----
 add_executable(blog_target examples/blogs/blog_target.c)
 target_compile_options(blog_target PRIVATE /W4)
@@ -380,7 +401,7 @@ foreach(d detours_simple detours_traceapi detours_retval)
     add_dependencies(${d} detours_target probe_api_agent)
 endforeach()
 
-foreach(t blog_target blog_driver gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver hunt_target hunt_dll hunt_driver detours_target detours_simple detours_traceapi detours_retval edge_target edge_driver famous_driver famous_heap_target famous_file_target famous_loader_target famous_tick_target probe_app_cet cet_probe)
+foreach(t blog_target blog_driver gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver hunt_target hunt_dll hunt_driver detours_target detours_simple detours_traceapi detours_retval edge_target edge_driver co_target co_driver famous_driver famous_heap_target famous_file_target famous_loader_target famous_tick_target probe_app_cet cet_probe)
     target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 endforeach()
@@ -392,7 +413,7 @@ endforeach()
 foreach(t configparse cet_probe hook_edge parity_target watch_target dynwatch_target conformance_target
           hitcost_target logstream_target memstress_target patchrace_target sidefx_target
           reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target
-          famous_heap_target famous_file_target famous_loader_target famous_tick_target edge_target detours_target
+          famous_heap_target famous_file_target famous_loader_target famous_tick_target edge_target detours_target co_target
           hunt_target hunt_dll blog_target)
     set_property(TARGET ${t} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 endforeach()
