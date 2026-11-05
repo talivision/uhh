@@ -459,11 +459,57 @@ static void make_ret_thunks() {
     g_ret_thunks = p;
 }
 
-#if !defined(_WIN64)
+/* An exception (or longjmp) inside the original must reach the PROGRAM's handlers, exactly
+   as without the probe, and must not run the original a second time. So call_original
+   swallows nothing: the unwind goes from the original straight to the hooked function's
+   caller, skipping the callback, the agent and the hook stub, which have no unwind data of
+   their own (the rest of the callback does not run -- the same on every backend).
+   x64: uhh_orig_thunk (agent_x64.asm) calls the trampoline from a frame whose unwind data is
+   a MACHINE FRAME holding the hit's return address and caller SP, plus the hit's nonvolatile
+   GPRs and XMM6-15: the unwinder steps from the thunk directly to the caller, as if the
+   hooked function had returned. Its language handler (uhh_orig_unwind) settles this hit's
+   bookkeeping when the unwind passes it.
+   x86: the frame-based SEH chain is relinked for the call -- the record of the __try below
+   points straight at the hit's first record -- so dispatch and unwind skip the callback's
+   frames; its __finally settles the bookkeeping. */
+struct HitScope {
+    volatile LONG64 *cell;          // hit_stripes cell: its in-flight count
+    bool tls;                       // t_in_callback was set for this hit
+    volatile LONG abandoned;
+    const void *xmm6;               // x64: the hit's XMM6..XMM15 (safetyhook Context, contiguous)
+};
+static void hit_scope_abandon(HitScope *h);
+
+#if defined(_WIN64)
+struct OrigFrame {                   // layout read by uhh_orig_thunk
+    uint64_t rip, rsp;               // the hit's return address, and the caller's SP after it
+    uint64_t nv[8];                  // rbx rbp rsi rdi r12 r13 r14 r15 at the hit
+    HitScope *scope;                 // +0x50
+    const void *xmm6;                // +0x58
+};
+static_assert(offsetof(OrigFrame, scope) == 0x50 && offsetof(OrigFrame, xmm6) == 0x58, "uhh_orig_thunk layout");
+extern "C" uint64_t uhh_orig_thunk(uint64_t fn, const uint64_t *args8, const OrigFrame *frame);
+extern "C" EXCEPTION_DISPOSITION uhh_orig_unwind(EXCEPTION_RECORD *rec, void *frame, CONTEXT *, void *) {
+    if (rec && (rec->ExceptionFlags & 0x66) && frame) {           // EXCEPTION_UNWIND: leaving through us
+        auto *h = *reinterpret_cast<HitScope **>(static_cast<unsigned char *>(frame) + 0x68);
+        if (h) hit_scope_abandon(h);
+    }
+    return ExceptionContinueSearch;
+}
+#else
+struct SehRecord { SehRecord *next; void *handler; };
 // Push the args, load ECX/EDX (fastcall/thiscall), call, restore ESP: stdcall and cdecl.
-static bool call_tramp_x86(uint32_t target, const uint32_t *args32, int nargs, uint32_t ecx_v, uint32_t edx_v, uint32_t *ret) {
+static void call_tramp_x86(uint32_t target, const uint32_t *args32, int nargs, uint32_t ecx_v, uint32_t edx_v,
+                           uint32_t *ret, uint32_t hit_sp, HitScope *scope) {
     uint32_t lo = 0;
+    volatile int normal = 0;
     __try {
+        // This function's own record heads the chain here; link it straight to the first
+        // record that belongs to the program (above the hit's SP) for the call.
+        SehRecord *self = (SehRecord *)(uintptr_t)__readfsdword(0);
+        SehRecord *saved = self->next, *head = saved;
+        while (head && head != (SehRecord *)(uintptr_t)0xFFFFFFFF && (uint32_t)(uintptr_t)head <= hit_sp) head = head->next;
+        self->next = head;
         __asm {
             mov ebx, esp
             mov ecx, nargs
@@ -481,27 +527,50 @@ static bool call_tramp_x86(uint32_t target, const uint32_t *args32, int nargs, u
             mov esp, ebx
             mov lo, eax
         }
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+        self->next = saved;
+        normal = 1;
+    } __finally {
+        if (!normal && scope) hit_scope_abandon(scope);              // unwound past us
+    }
     *ret = lo;
-    return true;
 }
 #endif
+
+// The hit is at a function entry: [SP] is a return address (see looks_like_return_site).
+static bool hit_is_function_entry(probe_context *c, uint64_t *ret_addr) {
+    uint64_t r = 0; unsigned char pre[8];
+    if (!get_mem(c, c->hit_sp, &r, sizeof(void *)) || r < 8 || !get_mem(c, r - 8, pre, sizeof(pre))) return false;
+    if (ret_addr) *ret_addr = r;
+    return looks_like_return_site(pre);
+}
 
 static void warn_once(probe_context *c, const char *text);
 extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
     if (g_ctrl) return g_ctrl->call_original(c, nargs, out);
     auto *state = c ? static_cast<AgentState *>(c->controller) : nullptr;
     if (!state || !state->shared || state->index >= PROBE_AGENT_MAX_PROBES || nargs < 0 || nargs > 8) return 0;
+    auto *scope = static_cast<HitScope *>(c->hit_scope);
     const uint64_t tramp = state->shared->requests[state->index].trampoline;
-    if (!tramp) return 0;
+    if (!tramp || !scope) return 0;
+    uint64_t ret_addr = 0;
+    if (!hit_is_function_entry(c, &ret_addr)) {
+        warn_once(c, "call_original refused: not at a function entry ([SP] is no return address)");
+        return 0;
+    }
     uint64_t a[8] = {0};
     for (int i = 0; i < nargs; ++i) a[i] = get_func_arg(c, (size_t)i);
     uint64_t r = 0;
 #if defined(_WIN64)
-    if (!call_raw(tramp, a, &r)) return 0;
+    OrigFrame f{};
+    f.rip = ret_addr; f.rsp = c->hit_sp + 8;
+    f.nv[0] = c->regs.rbx; f.nv[1] = c->regs.rbp; f.nv[2] = c->regs.rsi; f.nv[3] = c->regs.rdi;
+    f.nv[4] = c->regs.r12; f.nv[5] = c->regs.r13; f.nv[6] = c->regs.r14; f.nv[7] = c->regs.r15;
+    f.scope = scope; f.xmm6 = scope->xmm6;
+    r = uhh_orig_thunk(tramp, a, &f);
 #else
     uint32_t a32[8], r32 = 0; for (int i = 0; i < 8; ++i) a32[i] = (uint32_t)a[i];
-    if (!call_tramp_x86((uint32_t)tramp, a32, nargs, (uint32_t)c->regs.rcx, (uint32_t)c->regs.rdx, &r32)) return 0;
+    call_tramp_x86((uint32_t)tramp, a32, nargs, (uint32_t)c->regs.rcx, (uint32_t)c->regs.rdx, &r32,
+                   (uint32_t)c->hit_sp, scope);
     r = r32;
 #endif
     c->called_original = 1;
@@ -511,6 +580,10 @@ extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
 extern "C" void return_from(probe_context *c, uint64_t value, int nargs) {
     if (g_ctrl) { g_ctrl->return_from(c, value, nargs); return; }
     if (!c || nargs < 0 || nargs > 255) return;
+    if (!hit_is_function_entry(c, nullptr)) {
+        warn_once(c, "return_from refused: not at a function entry ([SP] is no return address)");
+        return;
+    }
 #if defined(_WIN64)
     (void)nargs; c->regs.rax = value; c->ret_pop = 0;
 #else
@@ -585,6 +658,13 @@ static volatile LONG g_stopping;
 // high bits): what is still in flight when the process dies (ExitProcess kills threads
 // mid-callback) is reported by the controller as callbacks_interrupted.
 static thread_local int t_in_callback;
+// An exception or longjmp left the original (call_original) and is unwinding past this
+// hit's callback: settle what call_mid would have on return (once).
+static void hit_scope_abandon(HitScope *h) {
+    if (InterlockedExchange(&h->abandoned, 1)) return;
+    if (h->tls && tls_ready()) t_in_callback = 0;
+    InterlockedExchangeAdd64(h->cell, -PROBE_AGENT_INFLIGHT_ONE);
+}
 static bool any_inflight() {
     if (!shared) return false;
     return probe_agent_inflight(shared) != 0;
@@ -671,6 +751,11 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     // this C code runs -- see there.
     const bool tls = tls_ready();
     if (tls) t_in_callback = 1;
+    HitScope scope{&cell, tls, 0, nullptr};
+#if defined(_WIN64)
+    scope.xmm6 = &native.xmm6;
+#endif
+    c.hit_scope = &scope;
     bool callback_ok = run_callback(callbacks[index], &c);
     if (tls) t_in_callback = 0;
     InterlockedExchangeAdd64(&cell, -PROBE_AGENT_INFLIGHT_ONE);

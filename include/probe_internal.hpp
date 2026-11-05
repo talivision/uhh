@@ -47,4 +47,5 @@ struct probe_context {
     uint64_t hit_sp;
     uint32_t ret_pop;                 /* x86: bytes the callee pops (nargs * 4) */
     uint8_t called_original, returned;
+    void *hit_scope;                  /* inline agent: this hit's in-flight bookkeeping (call_original) */
 };

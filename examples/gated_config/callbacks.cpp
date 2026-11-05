@@ -111,7 +111,7 @@ extern "C" void track_open_process(probe_context *c) {
     uint64_t out = get_func_arg(c, 0), cid = get_func_arg(c, 3);
     uint64_t pid = cid ? read_pointer(c, cid) : 0;     // CLIENT_ID.UniqueProcess (read before the call)
     uint64_t status = 0;
-    if (!call_original(c, 4, &status)) {                // refused (breakpoint/hw under CET): the open
+    if (!call_original(c, 4, &status)) {                // refused (no free debug register on hw): the open
         send_log(c, "open pid=%llu unmapped: call_original refused", (unsigned long long)pid);
         return;                                         // runs normally, but its handle stays unknown
     }

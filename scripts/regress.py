@@ -876,6 +876,161 @@ def check_callorig():
             record(name, False, repr(e))
 
 
+CO_CASES = ("recurse", "cppthrow", "seh", "longjmp", "threads", "mid", "nargs", "conv", "retaddr",
+            "prologue", "nested", "vslow")
+
+
+def co_expect(case, base, x86):
+    """The target row a callorig-hunt case must print under instrumentation (from the
+    uninstrumented row), the exact probe hits and the exact "co ..." log counts."""
+    row, hits, logs = dict(base), {}, {}
+    if case == "recurse":
+        hits = {"co_fact": 40}; logs = {"co fact": 5, "co fact-done": 5}
+    elif case == "cppthrow":
+        hits = {"co_throw": 10, "co_after": 3}; logs = {"co throw": 10, "co throw-done": 5, "co after": 3}
+    elif case == "seh":
+        hits = {"co_seh": 9, "co_after": 3}; logs = {"co seh": 9, "co seh-done": 3, "co after": 3}
+    elif case == "longjmp":
+        hits = {"co_jump": 10, "co_after": 3}; logs = {"co jump": 10, "co jump-done": 5, "co after": 3}
+    elif case == "threads":
+        hits = {"co_add": 4800}; logs = {"co add": 4800, "co add-done": 4800}
+    elif case == "mid":
+        hits = {"CoMidPush+0x1": 5}; logs = {"co mid ok=0": 5}
+    elif case == "nargs":
+        row["sum"] = base["sum"] + 20 * 1000
+        hits = {"co_add": 20}; logs = {"co nargs": 20, "co nargs-done": 20}
+    elif case == "conv":
+        row["fast"] = base["fast"] + 5
+        row["args8"] = base["args8"] + 8 * sum(100 - (8 + i) for i in range(5))
+        hits = {"co_fast": 5, "co_args8": 5}
+        logs = {"co fast": 5, "co fast-done": 5, "co args8": 5, "co args8-done": 5}
+        if x86:
+            row["this"] = base["this"] + 5
+            hits["CoThis"] = 5; logs.update({"co this": 5, "co this-done": 5})
+    elif case == "retaddr":
+        hits = {"co_ret": 6}; logs = {"co ret": 6, "co ret-done": 6}
+    elif case == "prologue":
+        row["sum"] = 77 * 5
+        hits = {"CoPrologue": 5}; logs = {"co prologue": 5}
+    elif case == "nested":
+        hits = {"co_outer": 6, "co_inner": 6}; logs = {"co outer": 6, "co outer-done": 6, "co inner": 0}
+    elif case == "vslow":   # an original running past the 5 s call limit (breakpoint/hw: released)
+        hits = {"co_vslow": 1, "co_after": 3}; logs = {"co vslow": 1, "co vslow-done": 1, "co after": 3}
+    return row, hits, logs
+
+
+def check_callorig_hunt():
+    """call_original / return_from edge cases (examples/hunt_callorig), every backend: a
+    recursive original; C++ throw, SEH raise/AV and longjmp out of the original (the target's
+    own handler gets it, the body runs once, later probes on the same thread still fire);
+    16 threads on one probe; mid-function refusal; nargs larger than real; x86 fastcall /
+    thiscall and x64 8 args; a probe at the return-to address; return_from over a callee-
+    saved prologue; a probe inside the original (same backend: counted, no callback; another
+    backend: fires); detach and Ctrl+Break while call_original is in flight. Each run's target
+    row is compared with the uninstrumented run; hits and "co" logs are exact; nothing dropped."""
+    d, t = exe("co_driver.exe"), exe("co_target.exe")
+    if not d or not t:
+        return skip("callorig-hunt", "co_driver/co_target missing")
+    x86 = "x86" in str(BIN).lower() or "win32" in str(BIN).lower()
+
+    def co_row(objs):
+        return next((x for x in objs if x.get("kind") == "co"), {})
+
+    def co_logs(objs):
+        cnt = {}
+        for x in objs:
+            m = str(x.get("message", ""))
+            if x.get("kind") == "probe_log" and m.startswith("co "):
+                cnt[m] = cnt.get(m, 0) + 1
+        return cnt
+
+    def hits_by(objs):
+        out = {}
+        for p in probes(objs):
+            loc = str(p.get("location", ""))
+            out[loc.split("!", 1)[-1] if "!" in loc else loc] = p.get("hits")
+        return out
+
+    bases = {}
+    for case in CO_CASES + ("slow",):
+        r, o = run([t, case], timeout=60)
+        bases[case] = co_row(o)
+    runs = [(c, bk, bk) for c in CO_CASES for bk in ("breakpoint", "hw", "inline")]
+    runs += [("nested", a, b) for a, b in (("breakpoint", "inline"), ("inline", "breakpoint"), ("hw", "inline"))]
+    for case, bk, inner in runs:
+        name = f"callorig-hunt-{case}-{bk}" + (f"+{inner}" if inner != bk else "")
+        try:
+            r, o = run([d, "--backend", bk, "--inner-backend", inner, "--case", case, "--", t, case], timeout=300)
+            base = bases[case]
+            want_row, want_hits, want_logs = co_expect(case, base, x86)
+            if case == "nested" and inner != bk:
+                want_logs["co inner"] = 6
+            if case == "vslow" and bk != "inline":
+                want_logs["co vslow-done"] = 0      # released: the callback ends, the program is unaffected
+            row, logs, hb, rep = co_row(o), co_logs(o), hits_by(o), report(o)
+            row.pop("kind", None); want_row.pop("kind", None)
+            got_logs = {k: logs.get(k, 0) for k in want_logs}
+            extra = sorted(k for k in logs if k not in want_logs and not (case == "retaddr" and k == "co retsite"))
+            ok = (bool(base) and row == want_row and all(hb.get(k) == v for k, v in want_hits.items()) and
+                  got_logs == want_logs and not extra and rep.get("log_dropped") == 0 and
+                  rep.get("callbacks_interrupted", 0) == 0 and rep.get("error") is None and
+                  rep.get("app_exit") == 0 and r.returncode == 0)
+            if case == "retaddr":   # the return-site probe: one log per hit, every return after it arms
+                rs = next((v for k, v in hb.items() if k.startswith("0x") or k not in ("co_ret",)), None)
+                ok = ok and rs is not None and rs == logs.get("co retsite", 0) and rs >= 5
+            record(name, ok, f"row={row} want={want_row} hits={hb} logs={got_logs} extra={extra[:3]} "
+                             f"dropped={rep.get('log_dropped')} intr={rep.get('callbacks_interrupted')} "
+                             f"err={rep.get('error')} rc={r.returncode}")
+        except Exception as e:
+            record(name, False, repr(e))
+    # Detach (probe_close from another thread) and Ctrl+Break while call_original is in flight:
+    # the attached target finishes every call correctly, unhooked from then on.
+    import signal
+    for bk in ("breakpoint", "hw", "inline"):
+        for how in ("detach", "ctrlbreak"):
+            name = f"callorig-hunt-{how}-{bk}"
+            procs = []
+            try:
+                tgt = subprocess.Popen([str(t), "slow", "--wait"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, text=True)
+                procs.append(tgt)
+                tout = Lines(tgt.stdout)
+                w = tout.wait_for(lambda l: '"kind":"waiting"' in l, 30)
+                if not w:
+                    raise RuntimeError("target never reached its gate")
+                args = [str(d), "--backend", bk, "--case", "slow", "--attach", str(json.loads(w)["pid"])]
+                if how == "detach":
+                    args += ["--detach-after", "1300"]
+                att = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                       creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+                procs.append(att)
+                aout, aerr = Lines(att.stdout), Lines(att.stderr)
+                if not aerr.wait_for(lambda l: l.startswith("probe: active co_target.exe!co_slow"), 60):
+                    raise RuntimeError("co_slow never became active")
+                tgt.stdin.write("x"); tgt.stdin.flush()
+                if how == "ctrlbreak":
+                    if not aout.wait_for(lambda l: '"message":"co slow"' in l, 30):
+                        raise RuntimeError("no call_original was logged")
+                    time.sleep(0.1)                         # mid-way through a 250 ms original
+                    att.send_signal(signal.CTRL_BREAK_EVENT)
+                att.wait(timeout=120)
+                tgt.wait(timeout=120)
+                row = co_row(tout.objs()); row.pop("kind", None)
+                want = dict(bases["slow"]); want.pop("kind", None)
+                # The session must really have ended mid-run: some calls instrumented, not all 12.
+                started = sum(1 for l in aout.lines if '"message":"co slow"' in l)
+                ok = (att.returncode == 0 and tgt.returncode == 0 and row == want and bool(want) and
+                      1 <= started < 12)
+                record(name, ok, f"row={row} want={want} tool_rc={att.returncode} target_rc={tgt.returncode} "
+                                 f"instrumented_calls={started}/12")
+            except Exception as e:
+                record(name, False, repr(e))
+            finally:
+                for q in procs:
+                    if q.poll() is None:
+                        q.kill()
+
+
 def check_memstress(threads=8, iters=20000):
     """get_mem/set_mem at scale, every backend: exact values, writes visible, page-crossing
     access, bad addresses failing closed, nothing else in the target's memory touched."""
@@ -3609,6 +3764,7 @@ def main():
     if want(check_gated_map): check_gated_map()
     if want(check_gated_filter): check_gated_filter()
     if want(check_callorig): check_callorig()
+    if want(check_callorig_hunt): check_callorig_hunt()
     if want(check_interrupt): check_interrupt()
     if want(check_agent_crt): check_agent_crt()
     if want(check_oldcrt): check_oldcrt()

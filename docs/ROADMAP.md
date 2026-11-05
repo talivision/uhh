@@ -321,6 +321,49 @@ PowerShell + detach) under every backend, against an uninstrumented baseline.
   p50 1 us / p99 10 us, 0 missed frames; hw p50 ~220 us / p99 ~520 us, breakpoint p50
   ~300 us / p99 ~660 us, a few frames over budget -- belongs in the backend table.
 
+## call_original findings (2026-11-05, `examples/hunt_callorig`, regress `callorig-hunt-*`)
+Edge-case hunt on `call_original` / `return_from`, every backend x x64/x86, each run compared
+with the uninstrumented target and with exact hits / "co" logs / `log_dropped == 0`.
+- ✅ (CO1) **breakpoint/hw counted call_original's own entry as a hit** (N calls -> 2N hits, inline
+  N; broke logs+dropped+interrupted == hits). The call now starts with RF set (hw) / passes the
+  entry INT3 once without counting (breakpoint). Test: `callorig-hunt-recurse-*` (exact 40 hits).
+- ✅ (CO2) **inline call_original swallowed the original's exceptions** (`__except(EXECUTE_HANDLER)`
+  around the call): the C++ throw / SEH raise / AV never reached the program's handler, the
+  callback got 0 and the hit fell through, running the original a SECOND time. Breakpoint/hw
+  abandoned the call and re-ran it from the hit too, and a longjmp out of the original left the
+  controller waiting 5 s and then RESET the thread to the hit (x64: the unwind through the
+  fake call_trap return address could not even work). Now, on every backend, an exception or
+  longjmp out of the original goes to the program's own handler exactly as without the probe,
+  the body runs once, and the rest of the callback is abandoned (Detours semantics):
+  inline x64 calls the trampoline from `uhh_orig_thunk` (agent_x64.asm) whose unwind data is a
+  machine frame + the hit's nonvolatiles, so the unwinder steps straight to the hooked
+  function's caller; inline x86 relinks the SEH chain past the callback for the call; both
+  settle the hit's bookkeeping (in-flight count, re-entry flag) when the unwind passes.
+  Breakpoint/hw run the original IN PLACE (hit's own stack, real return address) and catch its
+  return with a debug register set on that thread only; a thread seen above the hit's frame
+  without having returned (poll, or a probe hit there) releases the call. Tests:
+  `callorig-hunt-{cppthrow,seh,longjmp}-*` (the same thread's later probes still fire).
+- ✅ (CO3) **return_from / call_original from a non-entry probe** returned through a saved register
+  (`push rbx` -> ret to rbx). Both are now refused (warned once) unless [SP] at the hit is a
+  return address (the bytes before it encode a CALL). Test: `callorig-hunt-mid-*`.
+- ✅ (CO4) **breakpoint/hw call_original past 5 s RESET the thread to the hit** while the original
+  was still running (a blocked read, a long wait): its partial effects were then repeated. The
+  call is now released instead (the original runs on to its real caller; the callback ends).
+- ✅ (CO5) breakpoint/hw call_original is no longer refused under CET shadow stacks (nothing on the
+  stack is rewritten any more).
+- Limits (documented in probe_api.h): breakpoint/hw call_original needs one free debug register
+  for the call (all 4 taken by hw probes -> refused); probes hit inside the original count but
+  run no callback when they are of the same kind as the caller (inline in inline,
+  breakpoint/hw in breakpoint/hw -- including this probe for a recursive function), and fire
+  when of the other kind; inline needs nargs >= the real argument count (it builds a new frame;
+  breakpoint/hw run in place and ignore it); x86 return_from nargs = the callee's STACK
+  arguments (fastcall: after the first two, thiscall: after `this`); set_reg of nonvolatile
+  registers before call_original reaches the original on breakpoint/hw only; the abandoned
+  rest of a callback does not destroy its C++ locals; an exception the original handles
+  INTERNALLY is invisible on every backend (call_original returns normally). Detach /
+  Ctrl+Break while a call_original is in flight complete that call first (`callorig-hunt-
+  {detach,ctrlbreak}-*`).
+
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`
 - ✅ Per-log overhead ceilings in the suite (`log-throughput-*`)

@@ -161,20 +161,35 @@ int call_func(probe_context *, const char *symbol, uint64_t *ret, int nargs, ...
    call_original runs the probed function NOW, on the hit thread, with the CURRENT
    argument registers and stack (including set_reg/set_mem changes the callback made); *ret
    receives its return register (x64 RAX; x86 EAX, zero-extended). Returns 1 if it ran. This probe does not fire
-   for that call. nargs = integer/pointer arguments the function takes (0..8): x64 args 5+
-   and every x86 argument are copied from the hit's stack into the new call frame. Inline:
-   a real call to the hook's trampoline (other probes inside the callee fire normally).
-   Breakpoint/hw: as call_func (other probes inside the callee do not re-enter callbacks;
-   refused -- returns 0 with one warning -- when the target has CET shadow stacks). On 0
-   the original has NOT run: don't return_from, just let the hit fall through.
+   (and counts no hit) for that call. nargs = integer/pointer arguments the function takes
+   (0..8; more than it really takes is harmless, fewer is not): inline copies x64 args 5+ and
+   every x86 STACK argument from the hit's stack into a new call frame (x86 ECX/EDX are passed
+   as they are, for __fastcall / __thiscall). Inline: a real call to the hook's trampoline.
+   Breakpoint/hw: the original runs in place on the hit's own stack, from the probe address,
+   and a debug register set on that thread only catches its return (needs one of the 4
+   debug registers free for the duration of the call; refused -- 0, one warning --
+   otherwise). Probes hit INSIDE the original: those of the same kind (inline inside an
+   inline call; breakpoint/hw inside a breakpoint/hw call) -- this one included, for a
+   recursive function -- count their hits but run no callback; probes of the other kind fire
+   normally. On breakpoint/hw other threads' hits wait until the call ends.
+   An exception or longjmp out of the original goes to the PROGRAM's own handlers exactly as
+   without the probe: the body ran once, and the rest of the callback does not run (on every
+   backend; the callback cannot catch it, and its C++ locals are not destroyed). The same
+   holds on breakpoint/hw for an original that has not returned after 5 s (the call is
+   released and runs on; the callback ends) and for a thread that exits inside it.
+   Refused (0, warned once) when the hit is not at a function entry -- [SP] is not a return
+   address (the bytes before it are no CALL); e.g. a probe after a `push`. On 0 the original
+   has NOT run: don't return_from, just let the hit fall through.
    return_from makes the probed function return to its caller as soon as the callback
    ends, with value in AX: the original body is not run (again). Resumes at a real `ret`
    (x86: `ret nargs*4`) with SP at the hit's return address, so the CPU pops the normal
-   and shadow stacks together (CET-safe on every backend). nargs: x86 __stdcall argument
-   count (the callee pops nargs*4 bytes); pass 0 for an x86 __cdecl function (the caller
-   pops); ignored on x64. Register changes the callback made (set_reg) are kept; SP is
-   always the hit's. Calling call_original without return_from lets the original run a
-   second time on fall-through (warned once per probe). */
+   and shadow stacks together (CET-safe on every backend). nargs: the x86 STACK argument
+   count the callee pops (__stdcall: all of them; __fastcall: those after the first two;
+   __thiscall: those after `this`); pass 0 for an x86 __cdecl function (the caller pops);
+   ignored on x64. Refused (no effect, warned once) where call_original is. Register changes
+   the callback made (set_reg) are kept; SP is always the hit's. Calling call_original
+   without return_from lets the original run a second time on fall-through (warned once
+   per probe). See docs/ROADMAP.md, "call_original findings". */
 int call_original(probe_context *, int nargs, uint64_t *ret);
 void return_from(probe_context *, uint64_t value, int nargs);
 /* The session this callback belongs to, for control-plane calls from a callback. In a
