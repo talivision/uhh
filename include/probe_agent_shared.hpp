@@ -10,7 +10,7 @@
 #include <cstdio>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 18;
+constexpr uint32_t PROBE_AGENT_VERSION = 19;
 constexpr uint32_t PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH = 1u << 9;   /* agent side only needs this one */   /* == PROBE_UNSAFE_FAST_PATCH (asserted in session.cpp) */
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 128;   /* inline probes per session; the 129th is refused */
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
@@ -116,6 +116,29 @@ struct probe_ipc_request {
     uint64_t config, config_len;          /* probe_add_symbol_cfg */
 };
 
+/* Controller-death guard (ATTACH sessions). A debugger killed while attached (TerminateProcess,
+   crash) is detached by the kernel with its INT3s still in the code, its debug registers still
+   armed and possibly threads it had suspended: the target would die at its next hit. The
+   controller mirrors that state here after every debug event (the armed INT3s and their
+   original bytes are the INT3 table, probe_agent_shared::int3, kept for every session with a
+   channel); the agent (loaded into every attached target) owns a vectored handler that takes
+   each such trap as ours -- restores the byte / clears the DR / ends the step -- and its service
+   thread, woken when the controller process ends, cleans everything up: original bytes back,
+   our DR slots and steps cleared on every thread, held threads resumed, inline hooks removed. */
+constexpr uint32_t PROBE_AGENT_GUARD_TIDS = 256;
+constexpr uint32_t PROBE_AGENT_GUARD_BLOCKS = 64;
+struct probe_agent_guard {
+    volatile LONG64 controller_process; /* handle IN THE TARGET (SYNCHRONIZE) to the controller; the agent takes it (-> 0) */
+    volatile LONG enabled;              /* tables are live: a session is attached (0 after a clean detach) */
+    volatile LONG dr_mask;              /* DR slots the controller owns or has owned */
+    volatile LONG step_count, held_count, block_count;
+    uint32_t step_tids[PROBE_AGENT_GUARD_TIDS];        /* threads mid single-step (trap flag ours) */
+    uint32_t held_tids[PROBE_AGENT_GUARD_TIDS];        /* threads the controller holds suspended (once each):
+                                                          install holds, hook-write freezes, call_func
+                                                          deferrals, in-place step windows */
+    uint64_t blocks[PROBE_AGENT_GUARD_BLOCKS];         /* 64 KiB out-of-line step blocks */
+};
+
 /* Hit counting and in-flight tracking are striped over cache-line-separated counters
    (indexed by thread id) so threads hitting the same probe do not contend on one line.
    Exact: the controller sums the stripes. */
@@ -148,6 +171,7 @@ struct probe_agent_shared {
     volatile LONG int3_seq;
     volatile LONG int3_count;
     probe_agent_int3 int3[PROBE_AGENT_INT3_CAP];
+    probe_agent_guard guard;
 };
 
 constexpr LONG64 PROBE_AGENT_INFLIGHT_ONE = 1LL << 48;   /* one running callback in a hit_stripes cell */

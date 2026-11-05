@@ -179,6 +179,7 @@ add_library(probe_api_agent SHARED
     examples/hunt/hunt_callbacks.cpp
     examples/hunt_callorig/co_callbacks.cpp
     examples/callconv/cc_callbacks.cpp
+    examples/lifecycle/lifecycle_callbacks.cpp
     examples/blogs/blog_callbacks.cpp
     examples/latedll/latedll_callbacks.cpp
     examples/ctrlreview/ctrl_callbacks.cpp
@@ -403,6 +404,14 @@ target_include_directories(hunt_driver PRIVATE include examples/gated_config)
 target_link_libraries(hunt_driver PRIVATE probe_api)
 add_dependencies(hunt_driver hunt_target hunt_dll probe_api_agent)
 
+# --- lifecycle: attach / detach / re-attach / close / Ctrl+C / controller death (regress `lifecycle-*`) --
+add_executable(lifecycle_target examples/lifecycle/lifecycle_target.c)
+add_executable(lifecycle_driver examples/lifecycle/lifecycle_driver.cpp examples/lifecycle/lifecycle_callbacks.cpp
+    examples/hunt/hunt_callbacks.cpp examples/gated_config/callbacks.cpp)
+target_include_directories(lifecycle_driver PRIVATE include examples/gated_config)
+target_link_libraries(lifecycle_driver PRIVATE probe_api)
+add_dependencies(lifecycle_driver lifecycle_target hunt_dll configparse probe_api_agent)
+
 # --- call_original / return_from edge-case hunt (regress `callorig-hunt`) -----------------
 if(CMAKE_SIZEOF_VOID_P EQUAL 4)
     set(CO_ASM examples/hunt_callorig/co_sites_x86.asm)
@@ -580,7 +589,7 @@ foreach(d detours_simple detours_traceapi detours_retval)
     add_dependencies(${d} detours_target probe_api_agent)
 endforeach()
 
-foreach(t tp_target tp_driver latedll_target latedll_fix latedll_heavy latedll_driver stacks_target stacks_driver p2edge_early p2edge_late p2edge_target p2edge_driver blog_target blog_driver gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver hunt_target hunt_dll hunt_driver detours_target detours_simple detours_traceapi detours_retval edge_target edge_driver co_target co_driver famous_driver famous_heap_target famous_file_target famous_loader_target famous_tick_target probe_app_cet cet_probe
+foreach(t tp_target tp_driver latedll_target latedll_fix latedll_heavy latedll_driver stacks_target stacks_driver p2edge_early p2edge_late p2edge_target p2edge_driver blog_target blog_driver gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver hunt_target hunt_dll hunt_driver lifecycle_target lifecycle_driver detours_target detours_simple detours_traceapi detours_retval edge_target edge_driver co_target co_driver famous_driver famous_heap_target famous_file_target famous_loader_target famous_tick_target probe_app_cet cet_probe
           filetrace filetrace_target flagflip flagfeature flagflip_target regtrace regtrace_target)
     target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
@@ -594,7 +603,7 @@ foreach(t configparse cet_probe hook_edge parity_target watch_target dynwatch_ta
           hitcost_target logstream_target memstress_target patchrace_target sidefx_target
           reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target
           famous_heap_target famous_file_target famous_loader_target famous_tick_target edge_target detours_target co_target
-          hunt_target hunt_dll blog_target p2edge_target p2edge_early p2edge_late
+          hunt_target hunt_dll lifecycle_target blog_target p2edge_target p2edge_early p2edge_late
           latedll_target latedll_fix latedll_heavy
           stacks_target filetrace_target flagfeature flagflip_target regtrace_target stdout_target tp_target)
     set_property(TARGET ${t} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")

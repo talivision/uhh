@@ -248,7 +248,11 @@ struct probe_session {
     std::atomic<bool> stop_requested{false};   // probe_close from another thread while probe_run runs
     std::atomic<bool> running{false};          // probe_run is executing (on some thread)
     bool detached = false;
-    bool detaching = false;    // detach() running: no new holds (nothing would release them)
+    bool detaching = false;                    // detach() running: no new holds, arming, gates or agent work
+    bool detached_hooks = false;               // detach removed the inline hooks (stop_drainer may settle)
+    bool guard_ready = false;                  // attach: controller-death guard up (or given up): arm breakpoint/hw
+    ULONGLONG guard_since = 0;
+    bool agent_init_started = false;           // this session started the agent's init
     DWORD debug_tid = 0;                       // the thread that launched/attached: owns the debug object
     DWORD in_call_tid = 0;                     // thread currently running a call_func callee
     std::vector<HANDLE> call_deferred;         // other threads' hits during a call_func: rewound + suspended
@@ -1139,6 +1143,11 @@ static bool has_inline(const probe_session *s) {
     for (const auto &p : s->probes) if (p->flags & PROBE_INLINE) return true;
     return false;
 }
+// The agent goes into every ATTACHED target: besides inline hooks it is the controller-death
+// guard (probe_agent_shared.hpp). Breakpoint/hw probes of an attach arm once it is up, so a
+// controller that dies at any point never leaves an unguarded trap behind.
+static bool guard_pending(const probe_session *s) { return s->attached && s->shared && !s->guard_ready; }
+static bool needs_agent(const probe_session *s) { return has_inline(s) || (s->attached && s->shared); }
 
 // ---- UHH_SHARED: one callbacks DLL file, loaded by controller and target ---------------
 static bool image_has_section(const unsigned char *base, const char *name) {
@@ -1903,7 +1912,10 @@ static bool arm_breakpoint(probe_session *s, Probe &p, uint64_t base) {
     if (!decode_site(buf, sizeof(buf), len, disp_ok, riprel, &rep_str) || len == 0 || len > sizeof(buf)) {
         set_error(s, "could not decode probe site instruction"); return false;
     }
-    if (s->shared && int3_armed(s) >= PROBE_AGENT_INT3_CAP) {   // the agent's copy must hold every one
+    // The agent's copy must hold every one (an inline get_mem masks them). Without inline
+    // probes (an attach's channel carries only the guard) no limit applies: past the cap the
+    // guard covers the first PROBE_AGENT_INT3_CAP only.
+    if (s->shared && has_inline(s) && int3_armed(s) >= PROBE_AGENT_INT3_CAP) {
         set_error(s, "too many software breakpoints armed alongside inline probes (max " +
                      std::to_string(PROBE_AGENT_INT3_CAP) + ")");
         return false;
@@ -2710,10 +2722,15 @@ static bool arm_probe(probe_session *s, Probe &item, uint64_t base) {
 // front). A probe added at runtime -- possibly pending on a module that loads much
 // later -- only reports its failure and retires; the run and other probes continue.
 static bool arm_module(probe_session *s, const std::string &module, uint64_t base) {
+    // Detaching: a module loading while the detach drains its last events must not get a
+    // fresh INT3 / debug register / hook after everything was removed (seen: a DLL that
+    // reloaded during the drain kept its new INT3 and the detached target died on it).
+    if (s->detaching) return true;
     bool all_ok = true;
     for (size_t i = 0; i < s->probes.size(); ++i) {
         Probe &item = *s->probes[i];
         if (item.active || item.retired || item.address || !iequals(item.module, module)) continue;
+        if (!(item.flags & PROBE_INLINE) && guard_pending(s)) continue;   // armed by guard_set_ready
         std::string saved = s->error;
         bool ok = false;
         try { ok = arm_probe(s, item, base); }
@@ -2726,6 +2743,41 @@ static bool arm_module(probe_session *s, const std::string &module, uint64_t bas
         all_ok = false;   // keep arming the module's other probes; the session still fails
     }
     return all_ok;
+}
+
+// The guard is up (or will not come): arm the breakpoint/hw probes held back until now.
+static void guard_sync(probe_session *s);
+static bool guard_set_ready(probe_session *s, const char *why) {
+    if (s->guard_ready) return true;
+    s->guard_ready = true;
+    if (why) std::fprintf(stderr, "probe: warning: controller-death guard unavailable (%s): "
+                                  "breakpoint/hw probes armed without it\n", why);
+    bool ok = true;
+    std::vector<std::pair<std::string, uint64_t>> mods(s->module_bases.begin(), s->module_bases.end());
+    for (auto &m : mods) ok = arm_module(s, m.first, m.second) && ok;
+    guard_sync(s);
+    return ok;
+}
+
+static void guard_sync(probe_session *s) {
+    if (!s->attached || !s->shared || s->detached) return;
+    // (Armed INT3s: the INT3 table, kept current by sync_int3_table.)
+    auto &g = s->shared->guard;
+    uint32_t n = 0;
+    for (auto &kv : s->stepping) if (n < PROBE_AGENT_GUARD_TIDS) g.step_tids[n++] = kv.first;
+    g.step_count = (LONG)n;
+    n = 0;
+    for (const auto *list : {&s->held, &s->ipc_frozen, &s->call_deferred})
+        for (HANDLE t : *list) if (n < PROBE_AGENT_GUARD_TIDS) g.held_tids[n++] = GetThreadId(t);
+    for (const auto &e : s->inplace_suspended)          // an in-place step window's suspensions
+        if (n < PROBE_AGENT_GUARD_TIDS) g.held_tids[n++] = e.first;
+    g.held_count = (LONG)n;
+    n = 0;
+    for (uint64_t b : s->scratch_blocks) if (n < PROBE_AGENT_GUARD_BLOCKS) g.blocks[n++] = b;
+    g.block_count = (LONG)n;
+    g.dr_mask = s->dr_ever | s->dr_used;          // incl. a call_original's return-catch slot
+    MemoryBarrier();
+    g.enabled = 1;
 }
 
 // A lifted (in-place) breakpoint byte may only be re-armed while a breakpoint probe is
@@ -3191,7 +3243,7 @@ extern "C" int probe_watch(probe_session *s, uint64_t address, probe_callback cb
 }
 
 static bool open_agent_section(probe_session *s, uint32_t count) {
-    if (int3_armed(s) > PROBE_AGENT_INT3_CAP) {          // the agent's INT3 copy could not hold them all
+    if (count && int3_armed(s) > PROBE_AGENT_INT3_CAP) { // the agent's INT3 copy could not hold them all
         set_error(s, "too many software breakpoints armed alongside inline probes (max " +
                      std::to_string(PROBE_AGENT_INT3_CAP) + ")");
         return false;
@@ -3219,6 +3271,12 @@ static bool open_agent_section(probe_session *s, uint32_t count) {
     // Benchmark-only knob (not API): compare inline extended-state handling strategies.
     if (const char *m = std::getenv("UHH_BENCH_XSTATE"))
         s->shared->xstate_mode = !std::strcmp(m, "none") ? 1 : !std::strcmp(m, "full") ? 2 : 0;
+    if (s->attached) {          // the agent's guard waits on this handle (closes it itself)
+        HANDLE dup = nullptr;
+        if (DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), s->pi.hProcess, &dup, SYNCHRONIZE, FALSE, 0))
+            s->shared->guard.controller_process = (LONG64)(uintptr_t)dup;
+        s->guard_since = GetTickCount64();
+    }
     start_drainer(s);
     wchar_t svc[64]; probe_agent_service_name(s->pi.dwProcessId, svc);
     s->svc_event = CreateEventW(nullptr, FALSE, FALSE, svc);
@@ -3256,7 +3314,7 @@ static bool create_agent_channel(probe_session *s) {
                 s->probes[i]->agent_index = count++;
             }
     }
-    if (!count) return true;
+    if (!count && !s->attached) return true;
     if (count > PROBE_AGENT_MAX_PROBES) { set_error(s, "too many inline probes"); return false; }
     if (!open_agent_section(s, count)) return false;
     for (const auto &p : s->probes) if (p->flags & PROBE_INLINE) fill_request(s, *p);
@@ -3363,6 +3421,7 @@ static void hold_thread(probe_session *s, DWORD tid) {
 // and resumes straight into the hook once it is in. No call is missed, nothing waits on
 // the loader. Falls back to the old hold when the debug registers are all taken.
 static bool arm_gates_for_pending(probe_session *s) {
+    if (s->detaching) return true;                 // no new gates (nor holds) while letting go
     std::vector<uint64_t> sites;
     for (auto &p : s->probes)
         if ((p->flags & PROBE_INLINE) && p->address && !p->active && !p->retired) {
@@ -3433,6 +3492,7 @@ static bool vet_pending_inline(probe_session *s);
 
 // Start (or queue) agent work for pending inline requests.
 static bool kick_agent(probe_session *s) {
+    if (s->detaching) return true;                 // the session is letting go: install nothing more
     if (s->shared && s->shared->service_ready && s->svc_event) {     // persistent service thread
         if (trace_enabled()) std::fprintf(stderr, "  vet start t=%llu\n", (unsigned long long)GetTickCount64());
         if (!vet_pending_inline(s)) return false;
@@ -3535,6 +3595,14 @@ extern "C" int probe_attach(probe_session *s, uint32_t pid) {
     s->pi.hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
     if (!s->pi.hProcess) { set_error(s, win_error("open target process")); return 0; }
     if (!same_bitness(s, s->pi.hProcess)) { CloseHandle(s->pi.hProcess); s->pi.hProcess = nullptr; return 0; }
+    // Kill-on-exit OFF before the attach exists: DebugActiveProcess creates the thread's debug
+    // object with kill-on-close set, so a controller ended in between (Ctrl+C during the
+    // attach) took the target down with it (exit 0xC0000354). Create the object first.
+    {
+        using ConnectFn = LONG(NTAPI *)();
+        auto connect = reinterpret_cast<ConnectFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "DbgUiConnectToDbg"));
+        if (connect && connect() >= 0) DebugSetProcessKillOnExit(FALSE);
+    }
     if (!DebugActiveProcess(pid)) {
         set_error(s, win_error("attach debugger")); CloseHandle(s->pi.hProcess); s->pi.hProcess = nullptr; return 0;
     }
@@ -3542,9 +3610,16 @@ extern "C" int probe_attach(probe_session *s, uint32_t pid) {
     s->debug_tid = GetCurrentThreadId();
     s->pi.dwProcessId = pid;
     s->attached = true; s->launched = true; s->inline_ready = true;
-    if (!start_log_output(s)) { DebugActiveProcessStop(pid); return 0; }
+    // A failure below lets go of the target at once and leaves the session NOT attached: a
+    // probe_close (from any thread) then has nothing to detach and no probe_run to wait for.
+    auto fail = [&] {
+        DebugActiveProcessStop(pid);
+        s->attached = s->launched = false; s->debug_tid = 0;
+        return 0;
+    };
+    if (!start_log_output(s)) return fail();
     { std::string which; s->sym_ready = uhh_sym::init(s->pi.hProcess, which); }
-    if (!create_agent_channel(s)) { DebugActiveProcessStop(pid); return 0; }
+    if (!create_agent_channel(s)) return fail();
     return 1;
 }
 
@@ -3629,6 +3704,11 @@ static void ipc_thaw(probe_session *s);
 static void pump(probe_session *s, DWORD ms);
 static void detach(probe_session *s) {
     s->error.clear();
+    // From here on nothing may start new agent work, arm anything, gate or hold a thread: the
+    // event pumping below dispatches events (an agent load completing, a DLL with pending
+    // sites loading, the initial breakpoint) that would otherwise start an init AFTER the stop
+    // -- hooks installed into the target we are detaching from (seen: Ctrl+C 50 ms into an
+    // inline attach left every hook live) -- or re-hold threads the agent's work then waits on.
     s->detaching = true;
     release_held(s, "detach");
     // Agent work in flight (load/init on a remote thread): let it finish first, or its hooks
@@ -3636,7 +3716,18 @@ static void detach(probe_session *s) {
     for (ULONGLONG until = GetTickCount64() + 5000;
          s->remote_work != probe_session::REMOTE_NONE && !s->exited && GetTickCount64() < until; )
         pump(s, 20);
-    if (s->remote_agent && s->local_agent && s->remote_work == probe_session::REMOTE_NONE) {
+    if (s->remote_work != probe_session::REMOTE_NONE && s->shared) {
+        // Still not done (e.g. the target holds its loader lock, so the remote thread cannot
+        // even start). It may run after we are gone: tell the agent the session is over, so a
+        // late init installs nothing into the detached target.
+        std::fprintf(stderr, "probe: detach: agent work still pending after 5 s; it will install nothing\n");
+        InterlockedExchange(&s->shared->controller_gone, 1);
+    }
+    // The stop runs even then: an init that already wrote hooks but cannot finish (its thread
+    // exit waits on the loader) would otherwise leave them live. If the stop cannot run within
+    // the wait either, it runs whenever the target lets it -- then without us (the agent
+    // freezes in-process for a session that is over).
+    if (s->remote_agent && s->local_agent) {
         auto local_stop = reinterpret_cast<uintptr_t>(GetProcAddress(s->local_agent, "probe_agent_stop"));
         if (local_stop) {
             uint64_t remote_stop = s->remote_agent + local_stop - reinterpret_cast<uintptr_t>(s->local_agent);
@@ -3645,6 +3736,7 @@ static void detach(probe_session *s) {
             if (t) {                                   // keep dispatching until it has run
                 ULONGLONG until = GetTickCount64() + 5000;
                 while (!s->exited && WaitForSingleObject(t, 0) == WAIT_TIMEOUT && GetTickCount64() < until) pump(s, 20);
+                s->detached_hooks = WaitForSingleObject(t, 0) == WAIT_OBJECT_0;
                 CloseHandle(t);
             }
         }
@@ -3679,12 +3771,19 @@ static void detach(probe_session *s) {
     // surface after we let go. With every probe already removed nothing new can trap, so
     // run until the queue has been quiet for 200 ms: everything in flight lands here.
     for (HANDLE t : frozen) ResumeThread(t);
+    // Only EXCEPTIONS are what this waits for: a target that keeps creating threads or
+    // loading DLLs never goes quiet in thread/module events (that kept a detach busy for
+    // minutes), so those are handled but do not extend the wait -- and the whole drain is
+    // bounded in time as well (an exception-heavy target of its own).
     int drained_logged = 0;
-    for (int guard = 0, quiet = 0; guard < 100000 && !s->exited && quiet < 4; ++guard) {
+    const ULONGLONG drain_until = GetTickCount64() + 5000;
+    ULONGLONG last_exception = GetTickCount64();
+    for (int guard = 0; guard < 100000 && !s->exited && GetTickCount64() < drain_until &&
+                        GetTickCount64() - last_exception < 200; ++guard) {
         DEBUG_EVENT ev{};
-        if (!WaitForDebugEvent(&ev, 50)) { ++quiet; continue; }
+        if (!WaitForDebugEvent(&ev, 50)) continue;
         if (continue_foreign_event(s, ev)) continue;
-        quiet = 0;
+        if (ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) last_exception = GetTickCount64();
         if (ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT && drained_logged < 24) {
             ++drained_logged;
             std::fprintf(stderr, "probe: detach-drain tid=%lu code=0x%lx addr=0x%llx first=%lu\n",
@@ -3749,6 +3848,9 @@ static void detach(probe_session *s) {
             switch (slot) { case 0: w.Dr0 = 0; break; case 1: w.Dr1 = 0; break; case 2: w.Dr2 = 0; break; default: w.Dr3 = 0; }
         }
         w.Dr6 = 0;
+        // No slot left enabled: drop the exact-match bits too (WOW64 leaves LE set once a DR was
+        // used, seen as dr7=0x100 on every thread of a detached 32-bit target).
+        if (!(w.Dr7 & 0xFF)) w.Dr7 &= ~(decltype(w.Dr7))0x300;
         w.EFlags &= ~0x100u;
         BOOL set_ok = SetThreadContext(t, &w);
         CONTEXT v{}; v.ContextFlags = CONTEXT_DEBUG_REGISTERS;
@@ -3767,6 +3869,14 @@ static void detach(probe_session *s) {
     release_held(s, "detach (late)");                    // belt and braces: never leave a hold behind
     // No PROBE_IPC_LOG may be raised once the debugger is gone (it would reach the program).
     if (s->shared) { InterlockedExchange(&s->shared->log_ipc, 0); InterlockedExchange(&s->shared->ring_stalled, 0); }
+    if (s->shared) {            // everything is restored: the guard has nothing left to protect
+        auto &g = s->shared->guard;
+        g.enabled = 0; g.step_count = g.held_count = g.block_count = 0;
+        MemoryBarrier();
+        // Its handle to us, if the agent never took it (no agent loaded): close it in the target.
+        if (HANDLE h = (HANDLE)(uintptr_t)InterlockedExchange64(&g.controller_process, 0))
+            DuplicateHandle(s->pi.hProcess, h, nullptr, nullptr, 0, FALSE, DUPLICATE_CLOSE_SOURCE);
+    }
     if (!s->exited) DebugActiveProcessStop(s->pi.dwProcessId);
     for (HANDLE t : frozen) { ResumeThread(t); CloseHandle(t); }
     // The final drain runs with the threads RUNNING: one the freeze caught between claiming a
@@ -5148,6 +5258,7 @@ static bool start_remote(probe_session *s, LPTHREAD_START_ROUTINE entry,
 }
 
 static bool start_agent_load(probe_session *s) {
+    if (s->detaching) return true;                 // never inject into a target we are leaving
     if (s->remote_work != probe_session::REMOTE_NONE || s->remote_agent) return true;
     HMODULE local_kernel = GetModuleHandleW(L"kernel32.dll");
     auto local_load = reinterpret_cast<uintptr_t>(GetProcAddress(local_kernel, "LoadLibraryW"));
@@ -5205,10 +5316,12 @@ static bool vet_pending_inline(probe_session *s) {
 }
 
 static bool start_agent_init(probe_session *s) {
+    if (s->detaching) return true;                 // an init now would hook a target we are leaving
     if (s->remote_work != probe_session::REMOTE_NONE || !s->remote_agent || !s->local_agent) {
         set_error(s, "inline agent is not ready for initialization"); return false;
     }
     if (!vet_pending_inline(s)) return false;
+    s->agent_init_started = true;
     // Nothing to install yet: still run init once if the agent's service thread is not up --
     // it is what installs hooks in modules that load later (whose loading thread holds the
     // loader lock, so no new thread could do it then).
@@ -5260,7 +5373,9 @@ static bool complete_remote_thread(probe_session *s, DWORD result) {
             VirtualFreeEx(s->pi.hProcess, s->remote_path, 0, MEM_RELEASE); s->remote_path = nullptr;
         }
         if (result == 0 || !s->remote_agent) {
-            set_error(s, "LoadLibraryW failed for probe_api_agent.dll" + (s->remote_fault.empty() ? std::string() : ": " + s->remote_fault));
+            const std::string why = "LoadLibraryW failed for probe_api_agent.dll" + (s->remote_fault.empty() ? std::string() : ": " + s->remote_fault);
+            if (!has_inline(s)) return guard_set_ready(s, why.c_str());
+            set_error(s, why);
             return false;
         }
         return start_agent_init(s);
@@ -5268,11 +5383,14 @@ static bool complete_remote_thread(probe_session *s, DWORD result) {
     if (work == probe_session::REMOTE_INIT_AGENT) {
         if (result != 0) {
             char code[16]; std::snprintf(code, sizeof(code), "0x%lx", (unsigned long)result);
-            set_error(s, std::string("probe_agent_init failed (code=") + code + ")" +
-                         (s->remote_fault.empty() ? std::string() : ": " + s->remote_fault));
+            const std::string why = std::string("probe_agent_init failed (code=") + code + ")" +
+                                    (s->remote_fault.empty() ? std::string() : ": " + s->remote_fault);
+            if (!has_inline(s)) return guard_set_ready(s, why.c_str());
+            set_error(s, why);
             return false;
         }
         if (!accept_agent_install(s)) return false;
+        if (!guard_set_ready(s, nullptr)) return false;
         // Requests registered while that round ran (runtime inline adds) go next.
         if (agent_has_pending(s)) return kick_agent(s);
         // Release only once the service thread runs too (it reports itself with an
@@ -5450,6 +5568,22 @@ static void drain_final(probe_session *s) {
 }
 
 static void stop_drainer(probe_session *s) {
+    // Detached from a live target: its hooks are gone, but a callback that was already running
+    // (e.g. blocked in call_original longer than the agent's 2 s unhook wait) may still log.
+    // Keep draining until none is in flight (bounded) BEFORE telling producers nobody listens,
+    // so its logs are delivered rather than dropped.
+    if (s->shared && !s->exited && s->drainer.joinable()) {
+        MemoryBarrier();
+        if (const uint64_t running = probe_agent_inflight(s->shared))
+            std::fprintf(stderr, "probe: %s: %llu callback(s) still running; delivering their logs\n",
+                         s->detached_hooks ? "detach" : "close", (unsigned long long)running);
+    }
+    if (s->shared && s->detached_hooks && !s->exited && s->drainer.joinable()) {
+        for (ULONGLONG until = GetTickCount64() + 15000; GetTickCount64() < until; Sleep(5)) {
+            MemoryBarrier();
+            if (!probe_agent_inflight(s->shared) && s->shared->log_head == s->shared->log_tail) break;
+        }
+    }
     if (s->shared) {
         InterlockedExchange(&s->shared->log_ipc, 0);
         InterlockedExchange(&s->shared->ring_stalled, 0);
@@ -5485,7 +5619,7 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
     case CREATE_THREAD_DEBUG_EVENT:
         s->threads.insert(event.dwThreadId);
         if (s->ipc_freezer) ipc_freeze_thread(s, event.dwThreadId);   // born during a hook write: hold it too
-        if (event.u.CreateThread.hThread)                      // new thread inherits the gates
+        if (event.u.CreateThread.hThread && !s->detaching)     // new thread inherits the gates
             for (auto &g : s->gates) set_dr_on_thread(event.u.CreateThread.hThread, g.second, g.first, true);
         if (s->hw_active && event.u.CreateThread.hThread)     // new thread inherits the DRs
             for (auto &p : s->probes)
@@ -5557,6 +5691,20 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
     }
     case UNLOAD_DLL_DEBUG_EVENT: {
         uint64_t base = (uint64_t)(uintptr_t)event.u.UnloadDll.lpBaseOfDll;
+        // The unmapping thread reports AFTER the view is gone, so another thread can map the
+        // same DLL again at the same base and report ITS load first. Seen under load/unload
+        // churn: the late unload then retired probes just armed in the NEW instance -- its
+        // INT3 / hook stayed in live code, was never removed at detach, and the detached
+        // target died on it (0x80000003). An image mapped at this base right now means this
+        // unload is stale: keep the probes (and the module) as they are.
+        {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQueryEx(s->pi.hProcess, (void *)(uintptr_t)base, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
+                mbi.Type == MEM_IMAGE && (uint64_t)(uintptr_t)mbi.AllocationBase == base) {
+                if (trace_enabled()) std::fprintf(stderr, "  stale unload at 0x%llx ignored\n", (unsigned long long)base);
+                break;
+            }
+        }
         sym_unload(s, base);
         uint64_t size = 0;
         if (auto sz = s->module_sizes.find(base); sz != s->module_sizes.end()) { size = sz->second; s->module_sizes.erase(sz); }
@@ -5614,15 +5762,19 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
         //  while a held thread that owns the loader lock blocked the agent's LoadLibrary and
         //  froze the target until the install timeout (seen attaching to PowerShell). The
         //  hook write itself is safe without it: FREEZE suspends every thread for the patch.)
-        if (ok && s->initial_break && has_inline(s) && !s->remote_agent &&
-            s->remote_work == probe_session::REMOTE_NONE)
-            ok = start_agent_load(s);
+        if (ok && s->initial_break && needs_agent(s) && s->remote_work == probe_session::REMOTE_NONE &&
+            (!s->remote_agent || (s->attached && !s->agent_init_started))) {
+            // (Re-attach: the agent is still loaded from an earlier session -- just init it.)
+            ok = !s->remote_agent ? start_agent_load(s) : start_agent_init(s);
+            if (!ok && !has_inline(s)) { std::string why = s->error; s->error.clear(); ok = guard_set_ready(s, why.c_str()); }
+        }
         break;
     case EXIT_PROCESS_DEBUG_EVENT:
         ipc_thaw(s);
         s->exit_code = event.u.ExitProcess.dwExitCode; s->exited = true; break;
     default: break;
     }
+    if (!s->exited) guard_sync(s);
     return ok;
 }
 
@@ -5692,6 +5844,8 @@ extern "C" int probe_run(probe_session *s) {
             break;
         }
         drain_agent_logs(s);
+        if (guard_pending(s) && s->guard_since && GetTickCount64() - s->guard_since > 5000 &&
+            !guard_set_ready(s, "agent not ready within 5 s")) break;
         if (!s->held.empty() && GetTickCount64() - s->held_since > 5000) {
             // Never wedge the target: an install that does not confirm in 5 s is reported
             // and the threads run on (the affected probes simply stay inactive).
@@ -5700,7 +5854,11 @@ extern "C" int probe_run(probe_session *s) {
             release_held(s, "install timeout");
         }
         if (!WaitForDebugEvent(&event, 20)) {                         // short: also polls stop requests
-            if (GetLastError() == ERROR_SEM_TIMEOUT) { inplace_watchdog(s); continue; }   // idle: drain and wait again
+            if (GetLastError() == ERROR_SEM_TIMEOUT) {      // idle: drain and wait again
+                inplace_watchdog(s);
+                if (!s->exited) guard_sync(s);              // holds released outside an event
+                continue;
+            }
             set_error(s, win_error("wait for debug event")); break;
         }
         if (continue_foreign_event(s, event)) continue;
@@ -5711,6 +5869,18 @@ extern "C" int probe_run(probe_session *s) {
             set_error(s, win_error("continue debug event")); ok = false;
         }
         if (!ok) break;
+    }
+    // An attached target is still running and the loop is leaving for some other reason
+    // than a detach (an error: agent load/init failure, a failed context get/set or debug
+    // wait): let go of it HERE, on the thread that owns the debug object -- INT3s restored,
+    // debug registers cleared, inline hooks removed, logs drained -- instead of leaving live
+    // traps behind a dead event loop (the target would freeze at its next debug event and die
+    // when the controller exits) for a probe_close on a thread that cannot detach.
+    if (s->attached && !s->exited && !s->detached && s->pi.hProcess) {
+        const std::string why = s->error;
+        std::fprintf(stderr, "probe: session failed (%s): detaching from the target\n", why.c_str());
+        detach(s); s->detached = true;
+        if (!why.empty()) s->error = why;
     }
     release_held(s, "session end");
     stop_drainer(s);
@@ -6210,6 +6380,8 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
     w.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS;
     if (!SetThreadContext(thread, &w)) { CloseHandle(thread); return 0; }
     s->dr_used |= (uint8_t)(1u << slot);                               // reserved: no probe arms it meanwhile
+    s->dr_ever |= (uint8_t)(1u << slot);                               // ours: detach / the guard clear it too
+    guard_sync(s);                                                     // mirrored BEFORE the thread runs with it
     s->in_call_tid = st->tid; s->co_addr = probe->address; s->co_sp = c->hit_sp;
     s->co_entry_pending = !(probe->flags & PROBE_HW); s->co_left = false;
     auto clear_slot = [&](bool running) {
