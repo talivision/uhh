@@ -2885,6 +2885,38 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
     return true;
 }
 
+// Write the debug-register state the session wants into a thread's context: every slot
+// this session has ever owned is set to its active probe (address + DR7 enable/RW/LEN)
+// or cleared if released. Slots never owned (the target's own) are left alone.
+// Why: a DR change made with SetThreadContext while that thread is blocked with its own
+// debug event still QUEUED behind the one being handled (two threads hitting probes at
+// once) can be lost -- seen as a hw probe added from a callback (e.g. a return-address
+// probe) that never fires on that thread. Re-asserting our slots at the thread's own
+// event repairs it before it runs on.
+static void enforce_owned_drs(const probe_session *s, CONTEXT &c) {
+    for (int slot = 0; slot < 4; ++slot) {
+        if (!(s->dr_ever & (1u << slot))) continue;
+        const Probe *owner = nullptr;
+        for (const auto &p : s->probes)
+            if (p->active && (p->flags & PROBE_HW) && p->dr_slot == slot) { owner = p.get(); break; }
+        const DWORD64 ln = (DWORD64)1 << (slot * 2), fieldmask = (DWORD64)0xF << (16 + slot * 4);
+        DWORD64 dr7 = c.Dr7;
+        if (owner) {
+            uint32_t rw = 0, len = 0; hw_rw_len(owner->flags, rw, len);
+            switch (slot) {
+            case 0: c.Dr0 = (decltype(c.Dr0))owner->address; break;
+            case 1: c.Dr1 = (decltype(c.Dr1))owner->address; break;
+            case 2: c.Dr2 = (decltype(c.Dr2))owner->address; break;
+            default: c.Dr3 = (decltype(c.Dr3))owner->address; break;
+            }
+            dr7 = (dr7 & ~fieldmask) | ln | ((DWORD64)(((len & 3u) << 2) | (rw & 3u)) << (16 + slot * 4));
+        } else if (!(s->dr_used & (1u << slot))) {
+            dr7 &= ~(ln | fieldmask);
+        }
+        c.Dr7 = (decltype(c.Dr7))dr7;
+    }
+}
+
 // Service a hardware-breakpoint #DB (a single-step exception carrying a DR status
 // bit, not one of our software single-steps). Returns false on error; sets handled
 // when a DR we own fired. RF lets the flagged instruction run once without re-trapping.
@@ -2958,6 +2990,13 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
         if (GetThreadContext(thread, &dr)) {
             native.Dr0 = dr.Dr0; native.Dr1 = dr.Dr1; native.Dr2 = dr.Dr2; native.Dr3 = dr.Dr3; native.Dr7 = dr.Dr7;
         }
+    }
+    {                              // repair a DR write lost while this thread's event was queued
+        const auto d7 = native.Dr7, d0 = native.Dr0, d1 = native.Dr1, d2 = native.Dr2, d3 = native.Dr3;
+        enforce_owned_drs(s, native);
+        if (d7 != native.Dr7 || d0 != native.Dr0 || d1 != native.Dr1 || d2 != native.Dr2 || d3 != native.Dr3)
+            std::fprintf(stderr, "probe: repaired hardware breakpoint state on thread %lu (dr7 0x%llx -> 0x%llx)\n",
+                         (unsigned long)event.dwThreadId, (unsigned long long)d7, (unsigned long long)native.Dr7);
     }
     native.Dr6 &= ~consumed;     // clear only the status bits of slots we own
     if (!SetThreadContext(thread, &native)) { CloseHandle(thread); set_error(s, win_error("resume hw breakpoint")); return false; }

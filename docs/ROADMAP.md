@@ -128,9 +128,17 @@ binaries (cmd, reg, sort), multi-threaded targets, launch vs attach, attach mid-
   happens in practice. Inline is unaffected. Clean failure (returns 0), but surprising: the doc
   says "other threads keep running" without saying their callbacks cannot call_func meanwhile.
   Test: `detours-retval-callfunc-{breakpoint,hw}`. Relates to (#6) (hardening not pursued).
-- ⬜ (D4) **hw return probe added at runtime missed every return of one thread** (27/36 returns, all
-  9 misses on one worker thread; entry probe hw too). Under investigation -- see
-  `detours-retval-hw` (it records missing tids and per-thread entry counts).
+- ✅ (D4) **A hw probe armed from a callback never fired on threads that were hitting a probe at
+  the same moment.** hw entry probe on CreateFileW, return-address probe added (hw) from the
+  first entry callback; 4 threads start together: 18/36 and 27/36 returns seen, every miss on
+  the 1-2 threads whose own entry #DB was queued while the DR was written (their entries all
+  trapped). The SetThreadContext from `arm_hw` to a thread whose debug event is still queued
+  behind the one being handled does not stick. Fix: `handle_hw` re-asserts every slot the
+  session owns (address + DR7 bits; released slots cleared) in the context it writes back at the
+  thread's own event (`enforce_owned_drs`; logs "repaired hardware breakpoint state").
+  `detours-retval-hw` 36/36 since. (Still open in principle for a thread whose queued event is
+  not a hw hit, e.g. a software breakpoint in a mixed session: those paths write CONTEXT_FULL
+  and do not re-assert DRs.)
 - ⬜ (D5) (code reading, not reproduced) absolute-address inline probes (`probe_add_address(...,
   PROBE_INLINE)`, e.g. a return site) are vetted with `base == 0`, which skips the function-bounds /
   branch-target part of the inline site check (`analyse_site` and the block walk both need a base):

@@ -1983,6 +1983,7 @@ def check_detours_retval(threads=4, iters=3):
             record(name, ok, f"returns logged={sum(got_h.values())}/{sum(truth.values())} handles_equal={got_h == truth_h} "
                              f"errors_equal={not (got - truth)} errors_seen={dict(errs)} "
                              f"return_probes={[(p.get('backend'), p.get('hits')) for p in ret_probes]} "
+                             f"dr_repairs={(r.stderr or '').count('repaired hardware breakpoint state')} "
                              f"strays={strays[:3]} target_errors={tg.get('errors')} dropped={rep.get('log_dropped')} "
                              f"err={(rep.get('error') or '')[:160]}" +
                              ("" if ok else f" missing={list(missing.items())[:3]} missing_tids={missing_tids} "
