@@ -112,24 +112,39 @@ static bool addressable(uint64_t a, size_t n) {
     return a <= 0xFFFFFFFFull && (uint64_t)n <= 0x100000000ull - a;
 #endif
 }
-// The program's byte under each armed breakpoint-backend INT3 (shared->int3, see there).
+// The program's byte under each armed breakpoint-backend INT3 (shared->int3, see there):
+// EVERY one in [a, a + n), as breakpoint/hw show them. The table is sorted by address, so the
+// entries in range are one run found by binary search: O(log count + hits in range). They
+// are applied in batches, each read under the seqlock and applied only once validated; a
+// rewrite in between restarts the scan (a byte already restored is no longer 0xCC, so
+// redoing a batch is harmless).
 static void overlay_int3(uint64_t a, void *buffer, size_t n) {
+    auto *out = static_cast<uint8_t *>(buffer);
     for (int attempt = 0; attempt < 64; ++attempt) {
         const LONG seq = shared->int3_seq;
         if (seq & 1) { YieldProcessor(); continue; }
         MemoryBarrier();
         LONG count = shared->int3_count;
         if (count > (LONG)PROBE_AGENT_INT3_CAP) count = PROBE_AGENT_INT3_CAP;
-        struct { uint64_t at; uint8_t b; } fix[64]; int nfix = 0;
-        for (LONG i = 0; i < count && nfix < 64; ++i) {
-            const uint64_t x = shared->int3[i].address;
-            if (x >= a && x - a < n) fix[nfix++] = {x, shared->int3[i].original};
+        LONG lo = 0, hi = count;                           // first entry at or above a
+        while (lo < hi) {
+            const LONG mid = lo + (hi - lo) / 2;
+            if (shared->int3[mid].address < a) lo = mid + 1; else hi = mid;
         }
-        MemoryBarrier();
-        if (shared->int3_seq != seq) continue;
-        for (int k = 0; k < nfix; ++k)
-            if (static_cast<uint8_t *>(buffer)[fix[k].at - a] == 0xCC) static_cast<uint8_t *>(buffer)[fix[k].at - a] = fix[k].b;
-        return;
+        bool torn = false;
+        while (!torn) {
+            struct { uint64_t at; uint8_t b; } fix[64]; int nfix = 0;
+            for (; lo < count && nfix < 64; ++lo) {
+                const uint64_t x = shared->int3[lo].address;
+                if (x < a || x - a >= n) break;
+                fix[nfix++] = {x, shared->int3[lo].original};
+            }
+            MemoryBarrier();
+            if (shared->int3_seq != seq) { torn = true; break; }
+            for (int k = 0; k < nfix; ++k)
+                if (out[fix[k].at - a] == 0xCC) out[fix[k].at - a] = fix[k].b;
+            if (nfix < 64) return;                         // the run ended
+        }
     }
 }
 static int local_read(void *, uint64_t address, void *buffer, size_t size, size_t *done) {

@@ -5549,8 +5549,9 @@ def check_cdx_review():
       cdx-absreuse-<b>: an absolute software breakpoint in a DLL that unloads; the address is
         reused by new memory holding a real 0xCC: get_mem must read 0xCC (the agent's INT3
         table kept the stale entry and showed the old original byte inline).
-      cdx-int3cap-<b>: 1200 armed software breakpoints; the last 16 read back with get_mem: the
-        program's bytes on every backend (inline saw 0xCC past the 1024th).
+      cdx-int3cap-<b>: 1200 armed software breakpoints, all read back with ONE get_mem: the
+        program's bytes on every backend, no 0xCC (inline saw 0xCC past the 1024th, and one
+        inline read masked at most 64).
       cdx-bigcfg-<b>: a dynamic add from a callback with a config over 64 MiB: accepted on every
         backend (inline refused it)."""
     d, t, dll = exe("ctrl_driver.exe"), exe("ctrl_target.exe"), exe("ctrl_dll.dll")
@@ -5620,7 +5621,7 @@ def check_cdx_review():
             res, logs, rows, bad = go("int3cap", bk, ["--n", n], timeout=300)
             if f"op arm ok={n}/{n}" not in logs: bad.append(f"arm={[m for m in logs if 'arm' in m]}")
             peek = [m for m in logs if m.startswith("op peek")]
-            if peek != ["op peek r=1 cc=0 n=16 first=90"]: bad.append(f"peek={peek} (want no 0xCC in the last 16)")
+            if peek != [f"op peek r=1 cc=0 n={n} first=90"]: bad.append(f"peek={peek} (want no 0xCC in all {n})")
             record(name, not bad, " ".join(bad) or f"{n} breakpoints, {peek[0]}")
         except Exception as e:
             record(name, False, repr(e))
