@@ -1245,6 +1245,27 @@ def ntopen_ret_site(t):
     return (None if off is None else f"ntdll.dll!NtOpenProcess+0x{off:x}"), stub
 
 
+def pe_cetcompat(path):
+    """True when the PE's extended DLL characteristics (debug directory entry type 20,
+    IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS) carry CET_COMPAT (0x1) -- what /CETCOMPAT sets."""
+    import struct
+    d = Path(path).read_bytes()
+    pe = struct.unpack_from("<I", d, 0x3C)[0]
+    nsec, optsz = struct.unpack_from("<H", d, pe + 6)[0], struct.unpack_from("<H", d, pe + 20)[0]
+    opt = pe + 24
+    dd = opt + (112 if struct.unpack_from("<H", d, opt)[0] == 0x20B else 96)
+    rva, size = struct.unpack_from("<II", d, dd + 6 * 8)
+    secs = [struct.unpack_from("<IIII", d, opt + optsz + 40 * i + 8) for i in range(nsec)]  # vsize, va, rawsize, raw
+    def off(r):
+        return next((raw + r - va for vs, va, rs, raw in secs if va <= r < va + max(vs, rs)), None)
+    o = off(rva) if rva else None
+    for i in range(size // 28 if o is not None else 0):
+        typ, dsz, _, raw = struct.unpack_from("<IIII", d, o + 28 * i + 12)
+        if typ == 20 and dsz >= 4:
+            return bool(struct.unpack_from("<I", d, raw)[0] & 1)
+    return False
+
+
 def check_cet(threads=8, reads=500):
     """Intel CET shadow stacks. cet_probe (linked /CETCOMPAT) reports what this machine
     gives such a process: CPUID CET_SS, the OS CET_U state, the process's
@@ -1261,6 +1282,12 @@ def check_cet(threads=8, reads=500):
     pr_exe, tgt, gc, t = exe("cet_probe.exe"), exe("probe_app_cet.exe"), exe("gated_config.exe"), exe("uhh_trace.exe")
     if not pr_exe or not tgt or not gc or not t:
         return skip("cet", "cet_probe/probe_app_cet/gated_config/uhh_trace missing")
+    try:
+        flags = {n: pe_cetcompat(BIN / n) for n in ("probe_app_cet.exe", "cet_probe.exe", "probe_app.exe")}
+        record("cet-image", flags["probe_app_cet.exe"] and flags["cet_probe.exe"] and not flags["probe_app.exe"],
+               " ".join(f"{n}:CETCOMPAT={v}" for n, v in flags.items()))
+    except Exception as e:
+        record("cet-image", False, repr(e))
     enforced = None
     try:
         r, o = run([pr_exe], timeout=60)
