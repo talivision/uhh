@@ -145,6 +145,7 @@ struct probe_session {
     // and no re-arm race: exact under threads for any instruction, up to 4 slots.
     std::unordered_set<DWORD> threads;
     uint8_t dr_used = 0;
+    std::vector<std::pair<uint64_t, int>> gates; // (inline site, DR slot): hw gates until its hook is confirmed
     uint8_t dr_ever = 0;
     uint8_t dr_next = 0;                       // next DR slot to try (rotation)
     uint64_t entry_reapply = 0;                // image entry: re-apply DRs on first arrival
@@ -2346,7 +2347,69 @@ static void hold_thread(probe_session *s, DWORD tid) {
     if (trace_enabled()) std::fprintf(stderr, "  hold t=%llu\n", (unsigned long long)GetTickCount64());
 }
 
+// ---- Inline-install gates ------------------------------------------------------------
+// A module with inline sites that loads while the target runs: rather than park the
+// LOADING thread (it holds loader state the agent's install can need -- that deadlocked
+// until the hold timed out), put a hardware execute breakpoint on each pending site.
+// Whoever reaches a site before its hook is confirmed is held THERE (no loader locks),
+// and resumes straight into the hook once it is in. No call is missed, nothing waits on
+// the loader. Falls back to the old hold when the debug registers are all taken.
+static bool arm_gates_for_pending(probe_session *s) {
+    std::vector<uint64_t> sites;
+    for (auto &p : s->probes)
+        if ((p->flags & PROBE_INLINE) && p->address && !p->active && !p->retired) {
+            bool gated = false;
+            for (auto &g : s->gates) if (g.first == p->address) gated = true;
+            if (!gated) sites.push_back(p->address);
+        }
+    std::vector<int> slots;
+    for (int slot = 0; slot < 4 && slots.size() < sites.size(); ++slot)
+        if (!(s->dr_used & (1u << slot))) slots.push_back(slot);
+    if (slots.size() < sites.size()) return false;           // not enough DRs: caller holds instead
+    for (size_t i = 0; i < sites.size(); ++i) {
+        const int slot = slots[i];
+        for (DWORD tid : s->threads) {
+            HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+            if (t) { set_dr_on_thread(t, slot, sites[i], true); CloseHandle(t); }
+        }
+        s->dr_used |= (uint8_t)(1u << slot); s->dr_ever |= (uint8_t)(1u << slot);
+        s->gates.push_back({sites[i], slot});
+        if (trace_enabled()) std::fprintf(stderr, "  gate 0x%llx DR%d\n", (unsigned long long)sites[i], slot);
+    }
+    return true;
+}
+
+static void clear_gates(probe_session *s) {
+    for (auto &g : s->gates) {
+        for (DWORD tid : s->threads) {
+            HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+            if (t) { set_dr_on_thread(t, g.second, 0, false); CloseHandle(t); }
+        }
+        s->dr_used &= (uint8_t)~(1u << g.second);
+        s->retired_hw.insert(g.first);                       // a #DB already in flight is stale
+    }
+    s->gates.clear();
+}
+
+// A gate fired: hold this thread at the site until the hook is confirmed.
+static bool handle_gate(probe_session *s, const DEBUG_EVENT &event) {
+    if (s->gates.empty()) return false;
+    HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
+    if (!thread) return false;
+    CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS;
+    bool hit = false;
+    if (GetThreadContext(thread, &c)) {
+        for (auto &g : s->gates)
+            if (c.Dr6 & (1u << g.second)) { hit = true; c.Dr6 &= ~(DWORD64)(1u << g.second); }
+        if (hit) { c.EFlags |= 0x10000u; SetThreadContext(thread, &c); }   // RF: run the site once resumed
+    }
+    CloseHandle(thread);
+    if (hit) hold_thread(s, event.dwThreadId);
+    return hit;
+}
+
 static void release_held(probe_session *s, const char *why) {
+    clear_gates(s);                                          // hooks confirmed (or giving up): gates go first
     if (s->held.empty()) return;
     for (HANDLE t : s->held) {
         DWORD prev = ResumeThread(t);
@@ -3007,6 +3070,9 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         std::fprintf(stderr, "EV code=0x%lx tid=%lu addr=0x%llx step=%d probe=%d\n",
                      (unsigned long)code, (unsigned long)event.dwThreadId,
                      (unsigned long long)address, step != stepping.end(), probe != nullptr);
+    if (code == EXCEPTION_SINGLE_STEP && step == stepping.end() && !s->gates.empty() && handle_gate(s, event)) {
+        disposition = DBG_CONTINUE; return true;
+    }
     if (code == EXCEPTION_SINGLE_STEP && step == stepping.end() && (s->hw_active || s->dr_ever)) {
         bool handled = false;
         if (!handle_hw(s, event, handled)) return false;
@@ -3477,6 +3543,8 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
     case CREATE_THREAD_DEBUG_EVENT:
         s->threads.insert(event.dwThreadId);
         if (s->ipc_freezer) ipc_freeze_thread(s, event.dwThreadId);   // born during a hook write: hold it too
+        if (event.u.CreateThread.hThread)                      // new thread inherits the gates
+            for (auto &g : s->gates) set_dr_on_thread(event.u.CreateThread.hThread, g.second, g.first, true);
         if (s->hw_active && event.u.CreateThread.hThread)     // new thread inherits the DRs
             for (auto &p : s->probes)
                 if (p->active && (p->flags & PROBE_HW)) {
@@ -3518,9 +3586,10 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
         if (!s->held.empty()) s->held_since = GetTickCount64();   // symbol work above may have been slow
         if (ok && agent_has_pending(s)) {
             if (s->shared->service_ready && s->svc_event) {
-                // This thread holds the loader lock: keep it (and so the new module's
-                // code) parked until the agent's service thread confirms the hooks.
-                hold_thread(s, event.dwThreadId);
+                // Gate the new sites with debug registers and let the loading thread run on
+                // (it holds loader state the install may need). Only if no DR is free, park
+                // the loading thread as before.
+                if (!arm_gates_for_pending(s)) hold_thread(s, event.dwThreadId);
                 ok = kick_agent(s);
             } else if (s->remote_agent && s->remote_work == probe_session::REMOTE_NONE) {
                 ok = start_agent_init(s);
