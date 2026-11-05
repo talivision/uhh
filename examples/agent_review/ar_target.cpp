@@ -43,12 +43,12 @@ AR_EXPORT intptr_t ar_faulter(intptr_t x) {
 // Mid-function call sites (the probe is ON the call): a callee exception caught by the caller...
 AR_EXPORT intptr_t ar_mid_cpp(intptr_t x) {
     volatile intptr_t pre = x * 2;
-    intptr_t r = ar_thrower(x + pre - x - x + x);
+    intptr_t r = ar_thrower(pre - x);
     return r + pre;
 }
 AR_EXPORT intptr_t ar_mid_seh(intptr_t x) {
     volatile intptr_t pre = x * 2;
-    intptr_t r = ar_faulter(x + pre - x - x + x);
+    intptr_t r = ar_faulter(pre - x);
     return r + pre;
 }
 // ...and by the hooked function itself.

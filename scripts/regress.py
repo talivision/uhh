@@ -3812,12 +3812,11 @@ def check_agent_review():
         base = row(bo)
         r, o = go("prot", ["ntdll.dll!NtProtectVirtualMemory=ar_on_prot"])
         bad = common(r, o, base)
-        stacks = [x.get("stack") or [] for x in o if x.get("kind") == "probe_log" and x.get("message") == "ar prot"]
-        agent = [s for s in stacks if any("probe_api_agent" in str(f) for f in s)]
-        prog = [s for s in stacks if any(str(f).startswith("ar_target") for f in s)]
-        if agent: bad.append(f"{len(agent)} callback(s) on the agent's own threads, e.g. {agent[0][:6]}")
-        if len(prog) < 5: bad.append(f"program calls seen={len(prog)} (want >= 5)")
-        record("agent-own-threads", not bad, "; ".join(bad) or f"row={row(o)} logs={len(stacks)} program={len(prog)}")
+        lg = ar_logs(o)
+        agent, prog = lg.get("ar prot agent=1", 0), lg.get("ar prot agent=0", 0)
+        if agent: bad.append(f"{agent} callback(s) ran on the agent's own threads")
+        if prog < 5: bad.append(f"program calls seen={prog} (want >= 5)")
+        record("agent-own-threads", not bad, "; ".join(bad) or f"row={row(o)} program={prog} agent={agent}")
     except Exception as e:
         record("agent-own-threads", False, repr(e))
 

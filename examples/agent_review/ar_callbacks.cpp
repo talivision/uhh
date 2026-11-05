@@ -43,5 +43,16 @@ AR_CB void ar_on_jump(probe_context *c) {
 }
 AR_CB void ar_on_after(probe_context *c) { send_log(c, "ar after"); }
 
-// prot: the stack says who called NtProtectVirtualMemory.
-AR_CB void ar_on_prot(probe_context *c) { send_log_stack(c, "ar prot"); }
+// prot: is this hit on one of the agent's own threads (started at an address inside this
+// module: probe_agent_init/stop, the service thread)? No stack capture here: the loader calls
+// NtProtectVirtualMemory while holding the function-table lock a stack walk needs.
+extern "C" IMAGE_DOS_HEADER __ImageBase;
+using nqit_fn = LONG (NTAPI *)(HANDLE, ULONG, void *, ULONG, ULONG *);
+static const nqit_fn g_nqit = reinterpret_cast<nqit_fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+AR_CB void ar_on_prot(probe_context *c) {
+    void *start = nullptr;
+    if (g_nqit) g_nqit(GetCurrentThread(), 9 /* ThreadQuerySetWin32StartAddress */, &start, sizeof(start), nullptr);
+    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>((const char *)&__ImageBase + __ImageBase.e_lfanew);
+    const uintptr_t lo = (uintptr_t)&__ImageBase, a = (uintptr_t)start;
+    send_log(c, "ar prot agent=%d", a >= lo && a < lo + nt->OptionalHeader.SizeOfImage ? 1 : 0);
+}
