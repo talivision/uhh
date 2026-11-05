@@ -1109,7 +1109,11 @@ static bool tid_listed(const uint32_t *list, LONG count, DWORD tid) {
 static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
     const DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (code != EXCEPTION_BREAKPOINT && code != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
-    if (!guard_orphaned()) return EXCEPTION_CONTINUE_SEARCH;
+    // A live controller handles every trap of its own before any handler here runs, so one of
+    // OURS reaching this handler means the controller is gone -- even if the kernel has not yet
+    // cleared the debug port (a thread released from a dying debugger's event can get here
+    // first). Only the broad single-step rule below waits for the port to be gone.
+    if (!shared || !shared->guard.enabled) return EXCEPTION_CONTINUE_SEARCH;
     auto &g = shared->guard;
     CONTEXT *cx = ep->ContextRecord;
     const uint64_t at = (uint64_t)(uintptr_t)ep->ExceptionRecord->ExceptionAddress;
@@ -1136,7 +1140,7 @@ static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
         LONG n = g_cleared_n; if (n > 64) n = 64;
         for (LONG i = 0; i < n && !ours; ++i) ours = (uint64_t)g_cleared[i] == ip || (uint64_t)g_cleared[i] == at;
     }
-    if (!ours) {
+    if (!ours && no_debug_port()) {
         // A trap-flag step or #DB the dying controller set up that left no trace we can match
         // (seen on x64: a call_original's in-place run returning after the cleanup). With no
         // enabled slot of the target's own on this thread nothing else of the program can have
