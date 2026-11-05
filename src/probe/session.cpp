@@ -841,6 +841,15 @@ static void restore_original(HANDLE process, uint64_t address, unsigned char ori
         patch(process, address, original);
 }
 
+// Re-arm our INT3 after an in-place step -- only if the site still holds the byte we lifted.
+// Anything else means another hooking tool wrote there meanwhile: leave its bytes alone.
+static bool rearm_breakpoint(HANDLE process, uint64_t address, unsigned char original) {
+    unsigned char now = 0; SIZE_T got = 0;
+    if (!ReadProcessMemory(process, (void *)(uintptr_t)address, &now, 1, &got) || got != 1) return false;
+    if (now == 0xcc) return true;                         // already armed
+    return now == original && patch(process, address, 0xcc);
+}
+
 static bool parse_hex(const char *number, uint64_t &out) {
     if (!number || !*number) return false;
     for (const char *d = number; *d; ++d) if (!std::isxdigit((unsigned char)*d)) return false;
@@ -2205,7 +2214,11 @@ static Probe *adopt_relocated_breakpoint(probe_session *s, uint64_t at) {
         Probe *raw = a.get();
         s->probes.push_back(std::move(a));                              // returns before the loop goes on
         std::string saved = s->error;
-        if (!arm_breakpoint(s, *raw, 0)) { raw->retired = true; s->error = saved; return nullptr; }
+        if (!arm_breakpoint(s, *raw, 0)) {                   // the copy now holds the real byte:
+            raw->retired = true; s->error = saved;               // rewind onto it (stale-INT3 path)
+            s->retired_bps.insert(at);
+            return nullptr;
+        }
         std::fprintf(stderr, "probe: %s was re-hooked by another tool that relocated our breakpoint to 0x%llx; "
                              "following it there\n", p.location.c_str(), (unsigned long long)at);
         return raw;
@@ -3744,7 +3757,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             bool ok = t && GetThreadContext(t, &w);
             bool armed = still_armed(s, step->second.site);
             Probe *owner = armed ? probe_at(s, step->second.site) : nullptr;
-            if (ok && owner) ok = patch(s->pi.hProcess, step->second.site, owner->original);
+            if (ok && owner) restore_original(s->pi.hProcess, step->second.site, owner->original);
 #if defined(_WIN64)
             w.Rip = step->second.site;
 #else
@@ -3770,7 +3783,8 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         // later stray single-step can't teleport it to site+insn_len; re-arm the byte
         // if the step was in-place. Pass the exception through unchanged.
         if (step != stepping.end()) {
-            if (!step->second.displaced && still_armed(s, step->second.site)) patch(s->pi.hProcess, step->second.site, 0xcc);
+            if (!step->second.displaced && still_armed(s, step->second.site))
+                rearm_breakpoint(s->pi.hProcess, step->second.site, probe_at(s, step->second.site)->original);
             stepping.erase(step);
         }
         return true;
@@ -3820,7 +3834,8 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             native.Eip = (DWORD)next;
 #endif
         } else if (ok) {
-            if (still_armed(s, step->second.site)) ok = patch(s->pi.hProcess, step->second.site, 0xcc);   // in-place: re-arm
+            if (still_armed(s, step->second.site))                                                     // in-place: re-arm
+                rearm_breakpoint(s->pi.hProcess, step->second.site, probe_at(s, step->second.site)->original);
         }
         native.EFlags &= ~0x100u;
 #if defined(_WIN64)
@@ -4264,7 +4279,8 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
         auto it = s->stepping.find(event.dwThreadId);
         if (ok && it != s->stepping.end()) {
             // Only the in-place path lifted the byte; a displaced step left it armed.
-            if (!it->second.displaced && still_armed(s, it->second.site)) ok = patch(s->pi.hProcess, it->second.site, 0xcc);
+            if (!it->second.displaced && still_armed(s, it->second.site))
+                rearm_breakpoint(s->pi.hProcess, it->second.site, probe_at(s, it->second.site)->original);
             s->stepping.erase(it);
             if (!ok) set_error(s, win_error("re-arm probe after thread exit"));
         }
@@ -4358,10 +4374,22 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
 static std::atomic<int> g_ctrl_sessions{0};
 static std::atomic<bool> g_ctrl_hit{false};
 
+// probe_run loops still running (any session); g_runs_done is set when the last one has let
+// go of its target (detached / ended) after a ctrl event.
+static std::atomic<int> g_ctrl_runs{0};
+static HANDLE g_runs_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+
 static BOOL WINAPI on_console_ctrl(DWORD type) {
     const bool mine = g_ctrl_sessions.load() > 0 && !g_ctrl_hit.exchange(true);
     if (trace_enabled()) std::fprintf(stderr, "  console ctrl %lu sessions=%d -> %s\n", (unsigned long)type,
                                       g_ctrl_sessions.load(), mine ? "session stop" : "default");
+    // Console closed / logoff / shutdown: Windows ends this process as soon as the handler
+    // returns, which would leave an attached target with live INT3s, debug registers and
+    // hooks (it dies at its next hit). Hold the handler until probe_run has let go (the
+    // system allows ~5 s for CTRL_CLOSE).
+    if (mine && (type == CTRL_CLOSE_EVENT || type == CTRL_LOGOFF_EVENT || type == CTRL_SHUTDOWN_EVENT) &&
+        g_ctrl_runs.load() > 0 && g_runs_done)
+        WaitForSingleObject(g_runs_done, 4500);
     return mine;
 }
 
@@ -4388,6 +4416,7 @@ extern "C" int probe_run(probe_session *s) {
     s->running = true;                     // before `ran`: probe_close waits on (ran && !running)
     s->ran = true;
     ctrl_enter(s);
+    if (g_ctrl_runs.fetch_add(1) == 0 && g_runs_done) ResetEvent(g_runs_done);
     DEBUG_EVENT event{};
     while (!s->exited) {
         if (g_ctrl_hit && !s->interrupted) {
@@ -4428,6 +4457,7 @@ extern "C" int probe_run(probe_session *s) {
     if (!s->exited && s->pi.hProcess && !s->attached) TerminateProcess(s->pi.hProcess, 3);
     if (s->exited && has_inline(s) && !s->inline_ready) set_error(s, "target exited before inline probes were ready");
     int result = (s->exited || s->detached) && s->error.empty();
+    if (g_ctrl_runs.fetch_sub(1) == 1 && g_runs_done) SetEvent(g_runs_done);   // a closing console may go on
     s->running = false;                                   // last touch of s on this thread
     return result;
 }

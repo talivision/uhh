@@ -127,6 +127,18 @@ extern "C" void track_open_process(probe_context *c) {
     return_from(c, status, 4);                          // the caller sees exactly what it would have
 }
 
+// 2b. ntdll!NtClose(handle): forget a mapped handle when it is closed. Windows reuses handle
+//     values, and process handles also come from places this map never sees (CreateProcess's
+//     hProcess, DuplicateHandle, inheritance): a stale slot would label such a handle with
+//     the pid of whatever was opened under that value before. A value cannot be reissued
+//     before its close completes, so clearing at the close's entry never hits a newer record.
+extern "C" void forget_closed_handle(probe_context *c) {
+    const uint64_t handle = get_func_arg(c, 0);
+    if (!handle) return;
+    OpenRecord &slot = slot_of(handle);
+    if (at(slot.handle).load(std::memory_order_acquire) == handle) at(slot.pid).store(0, std::memory_order_release);
+}
+
 // 3. Every read through ntdll!NtReadVirtualMemory(handle,
 //    address, buffer, size, done). Optionally filtered by pid and/or address ranges.
 extern "C" void log_read(probe_context *c) {

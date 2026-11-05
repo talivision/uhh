@@ -51,6 +51,8 @@ PROBE_EXAMPLE_EXPORT void enable_reads_mem(probe_context *);
 /* ntdll!NtOpenProcess: runs the open (call_original), records handle -> pid -> name, and
    returns its status (return_from). */
 PROBE_EXAMPLE_EXPORT void track_open_process(probe_context *);
+/* ntdll!NtClose: forget the handle (values are reused). */
+PROBE_EXAMPLE_EXPORT void forget_closed_handle(probe_context *);
 /* ntdll!NtReadVirtualMemory entry: log handle/pid/addr/size. */
 PROBE_EXAMPLE_EXPORT void log_read(probe_context *);
 }

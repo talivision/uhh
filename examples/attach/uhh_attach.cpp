@@ -38,6 +38,7 @@ int main(int argc, char **argv) {
     if (!s) return 1;
     int ok = probe_add_symbol(s, "configparse.dll!ParseConfig+0x16", enable_reads, flag_backend) &&
              probe_add_symbol(s, "ntdll.dll!NtOpenProcess", track_open_process, backend) &&
+             probe_add_symbol(s, "ntdll.dll!NtClose", forget_closed_handle, backend) &&
              probe_add_symbol_cfg(s, "ntdll.dll!NtReadVirtualMemory", log_read, backend, &cfg, sizeof(cfg)) &&
              probe_attach(s, target);
     if (ok) {
