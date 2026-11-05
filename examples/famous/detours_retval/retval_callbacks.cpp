@@ -90,7 +90,10 @@ extern "C" DRETVAL_EXPORT void dretval_on_entry(probe_context *c) {
     if (!slot) { send_log(c, "pending table full"); return; }
     memcpy(slot->name, path, sizeof(path));
     InterlockedExchange64(&slot->key, key);
-    ensure_return_probe(c, ret, cfg->return_flags);
+    const bool armed = ensure_return_probe(c, ret, cfg->return_flags);
+    if (cfg->log_entry)
+        send_log(c, "entry \"%s\" sp=0x%llx ret=0x%llx armed=%d", path, (unsigned long long)sp,
+                 (unsigned long long)ret, armed ? 1 : 0);
 }
 
 extern "C" DRETVAL_EXPORT void dretval_on_return(probe_context *c) {

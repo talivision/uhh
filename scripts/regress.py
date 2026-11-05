@@ -1941,27 +1941,52 @@ def check_detours_retval(threads=4, iters=3):
     for bk, extra in (("breakpoint", []), ("hw", []), ("inline", []), ("inline", ["--fallback-hw"])):
         name = f"detours-retval-{bk}{'-fallback' if extra else ''}"
         try:
-            r, o, _ = dt_run([d, "--backend", bk, *extra, "--", tg_exe, "api", "--threads", threads, "--iters", iters,
-                        "--dir", wd], timeout=600)
-            truth = Counter((x["name"], int(x["handle"], 16), x["error"]) for x in o if x.get("kind") == "open")
-            got, strays = Counter(), []
-            for m in dt_logs(o):
+            r, o, _ = dt_run([d, "--backend", bk, *extra, "--log-entry", "--", tg_exe, "api", "--threads", threads,
+                              "--iters", iters, "--dir", wd], timeout=600)
+            opens = [x for x in o if x.get("kind") == "open"]
+            truth = Counter((x["name"], int(x["handle"], 16), x["error"]) for x in opens)
+            tid_of = {}
+            for x in opens:
+                tid_of.setdefault((x["name"], int(x["handle"], 16)), set()).add(x.get("tid"))
+            got, got_h, strays, cf_fail = Counter(), Counter(), [], 0
+            entries = Counter()
+            for x in o:
+                if x.get("kind") != "probe_log":
+                    continue
+                m = x.get("message", "")
                 mm = re.match(r'CreateFileW\("([^"]*)"\) -> handle=0x([0-9a-f]+) error=(-?\d+)', m)
                 if mm and mm.group(1).startswith("uhhdt-"):
-                    got[(mm.group(1), int(mm.group(2), 16), int(mm.group(3)))] += 1
-                elif not mm:
+                    key = (mm.group(1), int(mm.group(2), 16))
+                    got_h[key] += 1
+                    if int(mm.group(3)) == -1:
+                        cf_fail += 1                  # call_func refused: the error is unknown
+                    else:
+                        got[(*key, int(mm.group(3)))] += 1
+                elif m.startswith('entry "') and "uhhdt-" in m:
+                    entries[x.get("tid")] += 1
+                elif not mm and not m.startswith("entry "):
                     strays.append(m)
+            truth_h = Counter((n, h) for (n, h, _) in truth.elements())
             tg, rep = dt_target(o), report(o)
             ret_probes = [p for p in probes(o) if p.get("location", "").startswith("0x")]
             errs = Counter(e for (_, _, e) in truth.elements())
+            missing = truth_h - got_h
+            missing_tids = sorted({t for k in missing for t in tid_of.get(k, ())})
             ok = (r.returncode == 0 and tg.get("errors") == 0 and sum(truth.values()) == tg.get("creates") and
-                  got == truth and not strays and len(ret_probes) >= 1 and rep.get("log_dropped") == 0 and
-                  rep.get("error") is None)
-            record(name, ok, f"returns logged={sum(got.values())}/{sum(truth.values())} equal={got == truth} "
-                             f"errors_seen={dict(errs)} return_probes={[(p.get('backend'), p.get('hits')) for p in ret_probes]} "
+                  got_h == truth_h and not (got - truth) and not strays and len(ret_probes) >= 1 and
+                  rep.get("log_dropped") == 0 and rep.get("error") is None)
+            record(name, ok, f"returns logged={sum(got_h.values())}/{sum(truth.values())} handles_equal={got_h == truth_h} "
+                             f"errors_equal={not (got - truth)} errors_seen={dict(errs)} "
+                             f"return_probes={[(p.get('backend'), p.get('hits')) for p in ret_probes]} "
                              f"strays={strays[:3]} target_errors={tg.get('errors')} dropped={rep.get('log_dropped')} "
                              f"err={(rep.get('error') or '')[:160]}" +
-                             ("" if ok else f" missing={list((truth - got).items())[:3]} extra={list((got - truth).items())[:3]}" + dt_tail(r)))
+                             ("" if ok else f" missing={list(missing.items())[:3]} missing_tids={missing_tids} "
+                                            f"entries_by_tid={dict(entries)} extra={list((got - truth).items())[:3]}" + dt_tail(r)))
+            if bk != "inline":
+                # call_func from a breakpoint/hw callback while ANOTHER thread's call_func is in
+                # flight is refused ("no nesting" is session-wide): GetLastError unknown.
+                record(f"detours-retval-callfunc-{bk}", cf_fail == 0,
+                       f"call_func failures={cf_fail}/{sum(got_h.values())} (concurrent returns on 4 threads)")
         except Exception as e:
             record(name, False, repr(e))
     # A real program: cmd.exe types one file that exists and one that does not.
