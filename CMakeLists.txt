@@ -107,6 +107,7 @@ add_library(probe_api_agent SHARED
     examples/dynwatch/dynwatch_callbacks.cpp
     examples/trace/trace_callback.cpp
     examples/conformance/conformance_callbacks.cpp
+    examples/p2edge/edge_callbacks.cpp
     bench/hitcost/hitcost_callbacks.cpp
     examples/memstress/memstress_callbacks.cpp
     examples/sidefx/sidefx_callbacks.cpp)
@@ -265,12 +266,24 @@ foreach(rw reentrancy_target thread_stress_target antitamper_target antidebug_ta
     target_link_options(${rw} PRIVATE /DEBUG)
 endforeach()
 
+# --- p2edge: lifecycle edge cases (threads born during the entry hold, a DLL loaded by a
+#     worker thread, hw ONCE / slot reuse / 5th refused) -------------------------------
+add_library(edge_early SHARED examples/p2edge/edge_early.c)      # static import of edge_target
+add_library(edge_late SHARED examples/p2edge/edge_late.c)        # LoadLibrary'd by a worker thread
+add_executable(edge_target examples/p2edge/edge_target.c)
+target_link_libraries(edge_target PRIVATE edge_early)
+add_dependencies(edge_target edge_late)
+add_executable(edge_driver examples/p2edge/edge_driver.cpp examples/p2edge/edge_callbacks.cpp)
+target_include_directories(edge_driver PRIVATE include)
+target_link_libraries(edge_driver PRIVATE probe_api)
+add_dependencies(edge_driver edge_target probe_api_agent)
+
 add_executable(refusal_driver examples/conformance/refusal_driver.cpp)
 target_include_directories(refusal_driver PRIVATE include)
 target_link_libraries(refusal_driver PRIVATE probe_api)
 add_dependencies(refusal_driver hitcost_target)
 
-foreach(t gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
+foreach(t edge_early edge_late edge_target edge_driver gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
     target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 endforeach()

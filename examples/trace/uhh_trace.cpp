@@ -1,6 +1,6 @@
 // uhh_trace -- trace calls to any exported function of any program.
 //
-//   uhh_trace [--backend inline|breakpoint|hw] [--fallback-hw] [--allow-unsafe-site] [--stack] [--unsafe-fast-patch]
+//   uhh_trace [--backend inline|breakpoint|hw] [--fallback-hw] [--allow-unsafe-site] [--allow-prehooked] [--stack] [--unsafe-fast-patch]
 //             -p "KernelBase.dll!CreateFileW:Wxx" [-p ...] -- program.exe [args...]
 //   uhh_trace ... --attach <pid>          (instrument an already-running process)
 //   uhh_trace ... --attach-new <image> [--timeout ms]   (attach to the next NEW instance)
@@ -174,7 +174,7 @@ static int list_symbols(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     if (argc > 1 && !std::strcmp(argv[1], "--list")) return list_symbols(argc, argv);
-    uint32_t backend = PROBE_BREAKPOINT; bool stack = false, unsafe_fast_patch = false, fallback_hw = false, allow_unsafe_site = false; unsigned long attach_pid = 0, detach_ms = 0;
+    uint32_t backend = PROBE_BREAKPOINT; bool stack = false, unsafe_fast_patch = false, fallback_hw = false, allow_unsafe_site = false, allow_prehooked = false; unsigned long attach_pid = 0, detach_ms = 0;
     const char *attach_new = nullptr; unsigned long attach_timeout = 0;
     std::vector<trace_config> cfgs; std::vector<std::string> locs;
     int i = 1;
@@ -184,6 +184,7 @@ int main(int argc, char **argv) {
         if (!std::strcmp(argv[i], "--unsafe-fast-patch")) { unsafe_fast_patch = true; continue; }
         if (!std::strcmp(argv[i], "--fallback-hw")) { fallback_hw = true; continue; }
         if (!std::strcmp(argv[i], "--allow-unsafe-site")) { allow_unsafe_site = true; continue; }
+        if (!std::strcmp(argv[i], "--allow-prehooked")) { allow_prehooked = true; continue; }
         if (!std::strcmp(argv[i], "--attach") && i + 1 < argc) { attach_pid = std::strtoul(argv[++i], nullptr, 0); continue; }
         if (!std::strcmp(argv[i], "--detach-after-ms") && i + 1 < argc) { detach_ms = std::strtoul(argv[++i], nullptr, 0); continue; }
         if (!std::strcmp(argv[i], "--attach-new") && i + 1 < argc) { attach_new = argv[++i]; continue; }
@@ -218,6 +219,7 @@ int main(int argc, char **argv) {
     uint32_t flags = backend | (backend == PROBE_INLINE && fallback_hw ? static_cast<uint32_t>(PROBE_FALLBACK_HW) : 0u);
     if (unsafe_fast_patch && backend == PROBE_INLINE) flags |= PROBE_UNSAFE_FAST_PATCH;
     if (allow_unsafe_site && backend == PROBE_INLINE) flags |= PROBE_ALLOW_UNSAFE_SITE;
+    if (allow_prehooked && backend == PROBE_INLINE) flags |= PROBE_ALLOW_PREHOOKED;   // chain onto a foreign hook
     int ok = 1;
     for (size_t k = 0; k < cfgs.size(); ++k) {
         cfgs[k].stack = stack ? 1 : 0;

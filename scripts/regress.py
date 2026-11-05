@@ -1579,6 +1579,163 @@ def check_realworld():
                 record(label, False, repr(e))
 
 
+EDGE_CALLS = 2000          # examples/p2edge: calls per site / thread in --hold and --late
+
+
+def edge_run(mode, backend, targs=(), timeout=300):
+    d, t = exe("edge_driver.exe"), exe("edge_target.exe")
+    r, o = run([d, "--mode", mode, "--backend", backend, "--", t, f"--{mode}", *targs], timeout=timeout)
+    edge = next((x for x in o if x.get("kind") == "edge"), {})
+    drv = next((x for x in o if x.get("kind") == "edge_driver"), {})
+    return r, o, edge, drv
+
+
+def probe_hits(objs, suffix):
+    return [p.get("hits") for p in probes(objs) if p.get("location", "").endswith(suffix)]
+
+
+def tail(r, n=6):
+    return " | ".join(r.stderr.strip().splitlines()[-n:])
+
+
+def check_entry_hold_threads(trials=3):
+    """Threads started during the entry hold: edge_target's TLS callback and edge_early.dll's
+    DllMain(PROCESS_ATTACH) each start a thread that calls its site EDGE_CALLS times at once,
+    before main() runs (UHH holds the main thread at the entry point until the inline hooks
+    are in). Every call must be seen: hits == the target's own counts, on every backend.
+    Inline repeats (the miss was a race: such threads ran unheld while the hooks went in)."""
+    if not exe("edge_driver.exe") or not exe("edge_target.exe"):
+        return skip("entry-hold-threads", "edge_driver/edge_target missing")
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"entry-hold-threads-{bk}"
+        try:
+            details, ok = [], True
+            for _ in range(trials if bk == "inline" else 1):
+                r, o, edge, drv = edge_run("hold", bk)
+                tls, early = probe_hits(o, "!TlsSite"), probe_hits(o, "!EarlySite")
+                rep = report(o)
+                good = (edge.get("tls_calls") == EDGE_CALLS and edge.get("early_calls") == EDGE_CALLS and
+                        tls == [EDGE_CALLS] and early == [EDGE_CALLS] and drv.get("run_ok") == 1 and
+                        rep.get("error") is None and rep.get("app_exit") == 0)
+                ok = ok and good
+                details.append(f"tls={tls}/{edge.get('tls_calls')} early={early}/{edge.get('early_calls')}"
+                               + ("" if good else f" err={rep.get('error')} stderr={tail(r)}"))
+            record(name, ok, "; ".join(details))
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+def check_late_dll_worker():
+    """A DLL loaded LATER by a NON-main thread: edge_late.dll!LateSite, registered before
+    launch on <backend>, hits exactly from its first call (EDGE_CALLS). Its callback issues
+    probe_add_address(LateNext, PROBE_INLINE) at the first hit (forwarded over IPC from an
+    inline callback); LateNext is then called EDGE_CALLS times by the same thread and
+    EDGE_CALLS by a new thread: all 2*EDGE_CALLS seen."""
+    if not exe("edge_driver.exe") or not exe("edge_target.exe"):
+        return skip("late-dll-worker", "edge_driver/edge_target missing")
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"late-dll-worker-{bk}"
+        try:
+            r, o, edge, drv = edge_run("late", bk)
+            late = probe_hits(o, "!LateSite")
+            added = [p for p in probes(o) if p.get("location", "").startswith("0x")]
+            msgs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
+            rep = report(o)
+            ok = (edge.get("worker_rc") == 0 and edge.get("late_calls") == EDGE_CALLS and
+                  edge.get("next_calls") == 2 * EDGE_CALLS and late == [EDGE_CALLS] and
+                  msgs == ["add_inline=1"] and len(added) == 1 and added[0].get("backend") == "inline" and
+                  added[0].get("hits") == 2 * EDGE_CALLS and drv.get("run_ok") == 1 and rep.get("error") is None)
+            record(name, ok, f"LateSite={late}/{edge.get('late_calls')} "
+                             f"added={[(a.get('backend'), a.get('hits')) for a in added]}/{edge.get('next_calls')} "
+                             f"logs={msgs[:3]} rc={edge.get('worker_rc')}"
+                             + ("" if ok else f" err={rep.get('error')} stderr={tail(r)}"))
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+def check_hw_once_slots(threads=4, calls=1000):
+    """Hardware PROBE_ONCE, distinctly: HwSite exec HW|ONCE and g_w1 watch RW|ONCE each fire
+    exactly once while 4 threads hammer them (an exec HW and a WRITE watch on the same sites
+    count every call). With those 4 slots in use a 5th hw probe is refused at setup and, from
+    a callback (marker probe on breakpoint / inline), at runtime. After both ONCE probes
+    retired, the marker reuses their two slots (an exec probe and a write watch, both exact)
+    and a further add is refused again."""
+    if not exe("edge_driver.exe") or not exe("edge_target.exe"):
+        return skip("hw-once-slots", "edge_driver/edge_target missing")
+    total = threads * calls
+    for marker in ("breakpoint", "inline"):
+        name = f"hw-once-slots-{marker}"
+        try:
+            r, o, edge, drv = edge_run("hw", marker, ("--threads", threads, "--calls", calls))
+            by = [(p.get("location", ""), p.get("hits")) for p in probes(o)]
+            site = [h for l, h in by if l.endswith("!HwSite")]
+            w1 = [h for l, h in by if l.endswith("!g_w1")]
+            added = [h for l, h in by if l.startswith("0x")]
+            msgs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
+            rep = report(o)
+            ok = (site == [1, total] and w1 == [1, total] and added == [total, total] and
+                  drv.get("setup_fifth") == 0 and msgs == ["markA fifth=0", "markB hw=1 watch=1 fifth=0"] and
+                  edge.get("w1") == total and edge.get("w2") == total and
+                  drv.get("run_ok") == 1 and rep.get("error") is None)
+            record(name, ok, f"HwSite[once,all]={site} g_w1[rw-once,write]={w1} reused={added}/{total} "
+                             f"setup_fifth={drv.get('setup_fifth')} logs={msgs}"
+                             + ("" if ok else f" err={rep.get('error')} stderr={tail(r)}"))
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+def check_prehook_chain(threads=4, reads=500):
+    """PROBE_ALLOW_PREHOOKED with inline asserted: attach to probe_app --prehook (its own
+    SafetyHook detour already sits on ReadThunk) and chain an INLINE probe on top. Both the
+    foreign hook and the UHH callback see every call and nothing changes for the target:
+    its prehook_calls == UHH hits == logs == reads, checksum == a run without UHH."""
+    t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
+    if not t or not a:
+        return skip("prehook-chain", "uhh_trace/probe_app missing")
+    target = None
+    total = threads * reads
+    common = ["--prehook", "--helpers", "1", "--threads", str(threads), "--reads", str(reads),
+              "--config", "reads_enabled=1"]
+    try:
+        _, bo = run([a, "--no-wait", *common], timeout=300)
+        base = app(bo)
+        target = subprocess.Popen([str(a), *common], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True)
+        tl = Lines(target.stdout)
+        if not tl.wait_for(lambda l: '"waiting"' in l, 60):
+            raise RuntimeError("target never reached its gate")
+        tracer = subprocess.Popen([str(t), "--backend", "inline", "--allow-prehooked", "--attach", str(target.pid),
+                                   "-p", "probe_app.exe!ReadThunk:xxxx"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        tout, terr = Lines(tracer.stdout), Lines(tracer.stderr)
+        if not terr.wait_for(lambda l: l.startswith("probe: active probe_app.exe!ReadThunk"), 60):
+            raise RuntimeError("probe never became active: " + " | ".join(terr.lines[-6:]))
+        target.stdin.write("\n"); target.stdin.flush()
+        target.wait(timeout=300)
+        tracer.wait(timeout=120)
+        res = app(tl.objs())
+        objs = tout.objs()
+        terr.t.join(timeout=30)
+        pre = [x for x in objs if x.get("kind") == "prehook"]
+        pr = next((x for x in probes(objs) if x.get("location", "").endswith("!ReadThunk")), {})
+        logs = sum(1 for x in objs if x.get("kind") == "probe_log")
+        rep = report(objs)
+        ok = (bool(pre) and pr.get("backend") == "inline" and pr.get("hits") == total and logs == total and
+              res.get("prehook_calls") == total and res.get("successful_reads") == total and
+              res.get("checksum") == base.get("checksum") and base.get("prehook_calls") == total and
+              target.returncode == 0 and rep.get("log_dropped") == 0)
+        record("prehook-chain-inline", ok,
+               f"prehook_reports={len(pre)} backend={pr.get('backend')} uhh_hits={pr.get('hits')} logs={logs} "
+               f"foreign_hook_calls={res.get('prehook_calls')} reads={res.get('successful_reads')}/{total} "
+               f"checksum_same={res.get('checksum') == base.get('checksum')} exit={target.returncode}"
+               + ("" if ok else " stderr=" + " | ".join(terr.lines[-8:])))
+    except Exception as e:
+        record("prehook-chain-inline", False, repr(e))
+    finally:
+        if target and target.poll() is None:
+            target.kill()
+
+
 def main():
     global BIN
     ap = argparse.ArgumentParser()
@@ -1649,6 +1806,10 @@ def main():
     if want(check_attach_new): check_attach_new()
     if want(check_refusals): check_refusals()
     if want(check_hotpatch_prologue): check_hotpatch_prologue()
+    if want(check_entry_hold_threads): check_entry_hold_threads()
+    if want(check_late_dll_worker): check_late_dll_worker()
+    if want(check_hw_once_slots): check_hw_once_slots()
+    if want(check_prehook_chain): check_prehook_chain()
     print("-" * 72)
     failed = 0
     for name, status, detail in RESULTS:

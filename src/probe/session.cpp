@@ -3483,6 +3483,16 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
                     uint32_t rw = 0, len = 0; hw_rw_len(p->flags, rw, len);
                     set_dr_on_thread(event.u.CreateThread.hThread, p->dr_slot, p->address, true, rw, len);
                 }
+        // A thread born while inline installs are outstanding (e.g. started by a TLS
+        // callback or DllMain(PROCESS_ATTACH) while the main thread is held at the entry
+        // point, or during an attach / runtime-add hold) could reach a site before its hook
+        // is in. Hold it from its first instruction (it owns no lock yet) until the same
+        // confirmation releases the others. Never our own agent threads (they do the
+        // install); never threads reported before the initial break (loader workers, and
+        // the threads an attach enumerates, which the attach hold covers).
+        if (s->initial_break && event.dwThreadId != s->remote_tid && has_safe_inline(s) &&
+            inline_hold_needed(s) && !agent_thread(s, event.dwThreadId))
+            hold_thread(s, event.dwThreadId);
         // Do NOT close hThread: the debug subsystem owns it and closes it itself when the
         // thread's EXIT_THREAD event is continued. Closing it here made that later close hit
         // whatever handle had reused the value (e.g. a held thread's -> left suspended).
