@@ -1296,6 +1296,28 @@ def check_shared_mix(threads=8, reads=1000):
             record(name, False, repr(e))
 
 
+def check_forwarded_probe():
+    """A probe on a FORWARDED export (kernel32!HeapAlloc -> ntdll!RtlAllocateHeap) lands on
+    the forward target, on every backend; the target is unaffected."""
+    t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
+    if not t or not a:
+        return skip("forwarded-probe", "uhh_trace/probe_app missing")
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"forwarded-probe-{bk}"
+        try:
+            r, objs = run([t, "--backend", bk, "-p", "kernel32.dll!HeapAlloc:-", "--",
+                           a, "--no-wait", "--helpers", 2, "--threads", 2, "--reads", 50,
+                           "--config", "reads_enabled=1"], timeout=300)
+            pr = next((x for x in objs if x.get("kind") == "probe"), {})
+            res = next((x for x in objs if x.get("kind") == "app"), {})
+            ok = (r.returncode == 0 and (pr.get("hits") or 0) > 0 and pr.get("backend") == bk and
+                  res.get("successful_reads") == 100 and report(objs).get("error") is None)
+            record(name, ok, f"hits={pr.get('hits')} backend={pr.get('backend')} reads={res.get('successful_reads')} "
+                             f"err={(report(objs).get('error') or '')[:100]}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
 def check_crash_logs(n=5000):
     """Log delivery when the TARGET crashes: after n probed calls (one log each) it dies
     with an unhandled access violation. Every log must still arrive -- for inline they
@@ -1589,6 +1611,7 @@ def main():
     if want(check_emulated_sites): check_emulated_sites()
     if want(check_ret_probe): check_ret_probe()
     if want(check_shared_mix): check_shared_mix()
+    if want(check_forwarded_probe): check_forwarded_probe()
     if want(check_crash_logs): check_crash_logs()
     if want(check_attach_new): check_attach_new()
     if want(check_refusals): check_refusals()

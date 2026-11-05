@@ -160,6 +160,7 @@ struct probe_session {
     int hw_active = 0;
     bool launched = false, ran = false, exited = false, gate_sent = false;
     bool attach_held = false;                  // attach: threads held once until inline hooks confirmed
+    int shadow_stack = -1;                     // target has hardware shadow stacks (CET): -1 unknown, 0/1
     DWORD cb_tid = 0;                          // thread whose callback / IPC is being serviced (0 = none)
     std::wstring agent_copy;                   // per-session copy of the agent DLL (UHH_SHARED), deleted at close
     std::vector<DWORD> pending_hold;           // callers of a runtime inline add: hold until it lands
@@ -674,6 +675,22 @@ static bool module_of(const void *address, HMODULE &m) {
                               reinterpret_cast<LPCSTR>(address), &m) != 0;
 }
 
+// A forwarded export (kernel32!HeapAlloc -> ntdll!RtlAllocateHeap, or into an API set):
+// follow it the way the loader does, through THIS process's copy of the same system DLL
+// (controller and target are the same bitness, so they load the same files), then map the
+// final function onto the target's module of the same name. 0 = not resolvable.
+static uint64_t forwarded_export_target(probe_session *s, const std::string &module, const std::string &name) {
+    HMODULE m = GetModuleHandleA(module.c_str());
+    if (!m) m = LoadLibraryExA(module.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    FARPROC f = m ? GetProcAddress(m, name.c_str()) : nullptr;
+    HMODULE owner{};
+    if (!f || !module_of(reinterpret_cast<const void *>(f), owner)) return 0;
+    std::string owner_name = module_name_from_module(owner);
+    for (auto &kv : s->module_bases)
+        if (iequals(kv.first, owner_name)) return kv.second + (uint64_t)((uintptr_t)f - (uintptr_t)owner);
+    return 0;
+}
+
 static std::wstring sibling_agent_path() {
     wchar_t path[MAX_PATH]; DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
     if (!n || n >= MAX_PATH) return L"probe_api_agent.dll";
@@ -968,6 +985,21 @@ static bool emu_cond(ZydisMnemonic m, DWORD f) {
 
 // Executes the instruction at `site` on `c`. Returns true when emulated (c updated,
 // memory written); false = not handled, take the stepping path instead.
+// Hardware-enforced shadow stacks (Intel CET, /CETCOMPAT): an emulated CALL/RET would move
+// the normal stack but not the shadow stack, so the target would fault at its next real ret.
+// Such targets get CALL/RET stepped by the CPU (in-place path) instead.
+static bool target_has_shadow_stack(probe_session *s) {
+    if (s->shadow_stack < 0) {
+        s->shadow_stack = 0;
+        PROCESS_MITIGATION_USER_SHADOW_STACK_POLICY pol{};
+        using GetPolicyFn = BOOL(WINAPI *)(HANDLE, PROCESS_MITIGATION_POLICY, PVOID, SIZE_T);
+        auto get = reinterpret_cast<GetPolicyFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetProcessMitigationPolicy"));
+        if (get && s->pi.hProcess && get(s->pi.hProcess, ProcessUserShadowStackPolicy, &pol, sizeof(pol)))
+            s->shadow_stack = pol.EnableUserShadowStack ? 1 : 0;
+    }
+    return s->shadow_stack == 1;
+}
+
 static bool emulate_site(probe_session *s, const Probe &p, CONTEXT &c) {
     if (p.orig_insn.empty()) return false;
     ZydisDecoder dec;
@@ -1026,8 +1058,10 @@ static bool emulate_site(probe_session *s, const Probe &p, CONTEXT &c) {
         case ZYDIS_MNEMONIC_JMP:
             ok = target(t); if (ok) EMU_IP(c) = (decltype(EMU_IP(c)))t; break;
         case ZYDIS_MNEMONIC_CALL:
+            if (target_has_shadow_stack(s)) break;          // the CPU must push the shadow stack itself
             ok = target(t) && push(next, ptr); if (ok) EMU_IP(c) = (decltype(EMU_IP(c)))t; break;
         case ZYDIS_MNEMONIC_RET:
+            if (target_has_shadow_stack(s)) break;          // ... and pop it
             if (in.operand_count_visible > 1) break;
             ok = pop(v, ptr);
             if (ok && in.operand_count_visible == 1 && ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE)
@@ -1898,7 +1932,15 @@ static bool arm_probe(probe_session *s, Probe &item, uint64_t base) {
     // and a module loaded later is held at its LOAD_DLL event. Inline stays inline.)
     if (!item.export_name.empty()) {
         uint64_t exp = 0;
-        if (!resolve_export(s, base, item.export_name, exp)) {
+        const bool exported = resolve_export(s, base, item.export_name, exp);
+        if (!exported && s->error.find("forwarded") != std::string::npos) {
+            // A forwarded export: probe the function it forwards to (in its own module).
+            uint64_t target = forwarded_export_target(s, item.module, item.export_name);
+            if (!target) { s->error += " (and its target module is not loaded in the target yet)"; return false; }
+            s->error.clear();
+            exp = target - base;                       // may point into another module: base + rva is absolute
+            std::fprintf(stderr, "probe: %s is forwarded -> 0x%llx\n", item.location.c_str(), (unsigned long long)target);
+        } else if (!exported) {
             // Not exported: try the module's symbols (PDB beside the image, or a symbol
             // server via _NT_SYMBOL_PATH) -- internal functions by name.
             uint64_t addr = 0; std::string saved = s->error;
@@ -3759,16 +3801,8 @@ static uint64_t resolve_symbol(probe_session *s, const char *symbol) {
                     const bool forwarded = s->error.find("forwarded") != std::string::npos;
                     s->error = saved;
                     if (!forwarded) return 0;
-                    HMODULE m = GetModuleHandleA(tmp.module.c_str());
-                    if (!m) m = LoadLibraryExA(tmp.module.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-                    FARPROC f = m ? GetProcAddress(m, tmp.export_name.c_str()) : nullptr;
-                    HMODULE owner{};
-                    if (!f || !module_of(reinterpret_cast<const void *>(f), owner)) return 0;
-                    std::string owner_name = module_name_from_module(owner);
-                    for (auto &kw : s->module_bases)
-                        if (iequals(kw.first, owner_name))
-                            return kw.second + (uint64_t)((uintptr_t)f - (uintptr_t)owner) + tmp.sym_offset;
-                    return 0;
+                    uint64_t target = forwarded_export_target(s, tmp.module, tmp.export_name);
+                    return target ? target + tmp.sym_offset : 0;
                 }
                 rva = exp + tmp.sym_offset;
             }
