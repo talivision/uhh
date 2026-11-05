@@ -1800,7 +1800,10 @@ static bool inline_site_unsafe(probe_session *s, const Probe &p, std::string &wh
             reason = buf;
         }
     }
-    if (reason.empty() && a.func_start && !a.indirect_jumps.empty() && !a.tables) {
+    // Unresolved indirect jumps make MID-function sites unverifiable. At the function's own
+    // start they do not: a switch/jump table targets case labels in the body, never the
+    // entry's first bytes (direct back-edges to the entry were checked above).
+    if (reason.empty() && a.func_start && a.func_start != p.address && !a.indirect_jumps.empty() && !a.tables) {
         std::snprintf(buf, sizeof(buf), "%u-byte hook cannot be verified: the function has an indirect jump at 0x%llx "
                       "with unknown targets", len, (unsigned long long)a.indirect_jumps.front());
         reason = buf;

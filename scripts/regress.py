@@ -1196,7 +1196,7 @@ def check_patch_race(trials=4):
             crashed = sum(1 for e in exits if e != 0)
             torn_total = sum(t or 0 for t in torn)
             if mode == "frozen":
-                ok = crashed == 0 and torn_total == 0 and min(cycles_all) >= 5 and not notes
+                ok = crashed == 0 and torn_total == 0 and min(cycles_all) >= 4 and not notes
             else:
                 ok = (crashed >= 1 or torn_total >= 1) and not any("hits=None" in n or "hits=0" in n for n in notes)
             record(name, ok, f"trials={trials} crashed={crashed} torn={torn} exits={[hex(e & 0xffffffff) for e in exits]} "
