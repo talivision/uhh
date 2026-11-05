@@ -36,7 +36,9 @@ Uninstrumented: no call returns `0x1337BEEF` and the check says `slow`. Instrume
 every backend: all 127 calls (`forced_workers` per thread, `forced_main`) return the forced
 value, `elapsed == 0`, the check says `fast`, and `GetTickCount64` (the control) is unchanged.
 
-This recipe found a hardware-backend bug: return-site probes added at runtime while
-worker threads were still in their loader initialisation were lost for those whole
-threads (thread start restores the creation-time debug registers). Fixed in the library;
-`famous-retval-hw` runs three times to keep it fixed.
+This recipe found two hardware-backend bugs, both fixed in the library: return-site
+probes added at runtime while worker threads were still in their loader initialisation
+were lost for those whole threads (thread start restores the creation-time debug
+registers), and arming a probe could wipe another thread's pending hit status so the hit
+reached the target as an unhandled single-step. `famous-retval-hw` runs three times to keep
+both fixed.

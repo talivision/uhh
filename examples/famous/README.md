@@ -47,9 +47,19 @@ return-site probe was refused:
 
 ## What the replicas found in UHH
 
-See "Frida-replica findings" in [docs/ROADMAP.md](../../docs/ROADMAP.md). In short: the
-hardware backend lost runtime-added probes on threads that were still starting
-(fixed in the library, `famous-retval-hw`); hardware recipes that need a return probe
-per call site run out of the four debug registers unless filtered (by design, documented
-per recipe); the inline backend's own RWX trampoline allocation is visible to an RWX
-watcher (observer effect, documented).
+Details and status in "Frida-replica findings" in [docs/ROADMAP.md](../../docs/ROADMAP.md).
+Fixed in the library (each with a regression check here):
+
+- **hw**: probes armed at runtime were lost for whole threads still in their loader
+  initialisation (thread start restores the creation-time debug registers) --
+  `famous-retval-hw`.
+- **hw**: arming a probe could zero a pending hit's DR6 status on another thread; the hit
+  was then passed to the target as an unhandled STATUS_SINGLE_STEP -- `famous-retval-hw`.
+- **inline**: an allocator probe whose callback uses `call_func` crashed the target (TLS
+  used before a starting thread had it; `call_func`'s own allocations re-entered the probe
+  until the stack overflowed) -- `famous-heap-inline-reentry`.
+
+Documented limits: hardware recipes that need a return probe per call site run out of the
+four debug registers unless filtered (file monitor); the inline backend's hook writes are
+visible to an RWX watcher (loader_rwx); the live log tail shares the target's stdout, so
+the checks read the logs from the session JSONL file.

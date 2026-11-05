@@ -43,8 +43,10 @@ Expected on every backend: exactly one `rwx-alloc` per worker fingerprint size, 
 `rwx-protect` per worker fingerprint size, all three names in both the `loadlibraryexw` and
 `ldrloaddll` logs, and the target's output (`jit_ok == 2*threads`) unchanged.
 
-**Observer effect (inline backend):** the inline agent itself allocates executable
-trampoline memory inside the target after the hooks go in, and an RWX watcher sees it
-(the check prints it as `other_rwx_events`). Breakpoint and hardware probes modify the
-target from the controller process (`VirtualProtectEx`/`WriteProcessMemory`), which never
-passes through the target's own `NtProtectVirtualMemory`, so they are invisible here.
+**Observer effect (inline backend):** writing an inline hook makes the patched bytes
+`PAGE_EXECUTE_READWRITE` for a moment through the target's own `NtProtectVirtualMemory`, so
+an RWX watcher that is already installed sees UHH's later hook writes (observed:
+`rwx-protect size=0x8` inside KernelBase; the check prints it as `other_rwx_events`).
+Breakpoint and hardware probes patch the target from the controller process
+(`VirtualProtectEx`/`WriteProcessMemory`), which never passes through the target's own
+`NtProtectVirtualMemory`, so they are invisible here.
