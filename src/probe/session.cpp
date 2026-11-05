@@ -160,7 +160,9 @@ struct probe_session {
     std::vector<HANDLE> ipc_frozen;            // threads suspended for an agent hook write (FREEZE..THAW)
     DWORD ipc_freezer = 0;                     // the agent thread doing that write (0 = no freeze)
     int hw_active = 0;
-    bool launched = false, ran = false, exited = false, gate_sent = false;
+    bool launched = false, exited = false, gate_sent = false;
+    bool interrupted = false, ctrl_counted = false;   // Ctrl+C ended this session / counted in g_ctrl_sessions
+    std::atomic<bool> ran{false};              // probe_run has started (read by probe_close on any thread)
     bool attach_held = false;                  // attach: threads held once until inline hooks confirmed
     bool call_cet_warned = false;              // call_func refused under CET (warn once)
     int shadow_stack = -1;                     // target has hardware shadow stacks (CET): -1 unknown, 0/1
@@ -3695,6 +3697,33 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
     return ok;
 }
 
+// Ctrl+C / Ctrl+Break / console close while a session runs (probe_run through
+// probe_wait_for_exit) ends the SESSION, not the tool: probe_run lets go of the target --
+// an attached one is detached (probes removed, it keeps running), a launched one ended --
+// and returns normally, so the caller still flushes the logs and writes its report. A
+// second press, or one while no session runs, gets the default handling (the tool exits).
+static std::atomic<int> g_ctrl_sessions{0};
+static std::atomic<bool> g_ctrl_hit{false};
+
+static BOOL WINAPI on_console_ctrl(DWORD type) {
+    const bool mine = g_ctrl_sessions.load() > 0 && !g_ctrl_hit.exchange(true);
+    if (trace_enabled()) std::fprintf(stderr, "  console ctrl %lu sessions=%d -> %s\n", (unsigned long)type,
+                                      g_ctrl_sessions.load(), mine ? "session stop" : "default");
+    return mine;
+}
+
+static void ctrl_enter(probe_session *s) {
+    static const BOOL installed = SetConsoleCtrlHandler(on_console_ctrl, TRUE);
+    if (trace_enabled()) std::fprintf(stderr, "  console ctrl handler installed=%d err=%lu\n", installed, GetLastError());
+    if (!s->ctrl_counted) { s->ctrl_counted = true; g_ctrl_sessions.fetch_add(1); }
+}
+
+static void ctrl_leave(probe_session *s) {
+    if (!s->ctrl_counted) return;
+    s->ctrl_counted = false;
+    if (g_ctrl_sessions.fetch_sub(1) == 1) g_ctrl_hit = false;   // the next session starts clean
+}
+
 extern "C" int probe_run(probe_session *s) {
     if (!s || !s->launched) { if (s) set_error(s, "session is not launched"); return 0; }
     if (s->ran) { set_error(s, "session already ran"); return 0; }
@@ -3703,10 +3732,16 @@ extern "C" int probe_run(probe_session *s) {
         set_error(s, "probe_run must be called on the thread that called probe_launch/probe_attach");
         return 0;
     }
+    s->running = true;                     // before `ran`: probe_close waits on (ran && !running)
     s->ran = true;
-    s->running = true;
+    ctrl_enter(s);
     DEBUG_EVENT event{};
     while (!s->exited) {
+        if (g_ctrl_hit && !s->interrupted) {
+            s->interrupted = true; s->stop_requested = true;
+            std::fprintf(stderr, "probe: interrupted: %s\n", s->attached
+                         ? "detaching (probes removed, the target keeps running)" : "ending the target");
+        }
         if (s->stop_requested) {
             // probe_close was called on another thread. The debug API binds the debug object
             // to THIS thread, so the detach (or termination) happens here.
@@ -3748,7 +3783,8 @@ extern "C" int probe_wait_for_exit(probe_session *s) {
     if (!s || !s->ran) { if (s) set_error(s, "session has not been run"); return 0; }
     if (s->exited) stop_drainer(s);             // includes recovery past a dead producer's ring slot
     flush_log_writer(s);
-    return s->exited && s->error.empty() && s->exit_code == 0;
+    ctrl_leave(s);
+    return s->error.empty() && (s->interrupted || (s->exited && s->exit_code == 0));
 }
 
 static void json_string(FILE *out, const std::string &value) {
@@ -3803,18 +3839,23 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
 
 extern "C" void probe_close(probe_session *s) {
     if (!s) return;
-    if (s->running) {
-        // probe_run is executing on another thread: ask it to detach/stop (it owns the
-        // debug object) and wait for it to finish before tearing the session down.
+    // probe_run is executing on another thread -- or is about to: the session was launched
+    // or attached there and its probe_run has not started yet (e.g. Ctrl+C right after the
+    // attach). Either way that thread owns the debug object: ask it to detach/stop and wait
+    // for it to finish before tearing the session down.
+    const bool owner_elsewhere = s->launched && !s->exited && s->debug_tid &&
+                                 s->debug_tid != GetCurrentThreadId();
+    if (s->running || (owner_elsewhere && !s->ran)) {
         s->stop_requested = true;
         // Wait until probe_run has really returned: tearing the session down (or detaching
         // from this thread, which does not own the debug object) while it still runs would
         // be a use-after-free. A slow detach is reported, never cut short.
-        for (ULONGLONG start = GetTickCount64(), warned = 0; s->running; Sleep(10)) {
+        for (ULONGLONG start = GetTickCount64(), warned = 0; s->running || !s->ran; Sleep(10)) {
             ULONGLONG waited = (GetTickCount64() - start) / 15000;
             if (waited > warned) { warned = waited; std::fprintf(stderr, "probe: close: still waiting for probe_run to stop (%llus)\n", waited * 15); }
         }
     }
+    ctrl_leave(s);                         // closed without probe_wait_for_exit
     if (s->detached) {
         // already detached by probe_run
     } else if (s->attached && !s->exited && s->pi.hProcess) {

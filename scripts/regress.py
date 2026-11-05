@@ -1321,6 +1321,59 @@ def check_oldcrt(calls=2000):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def check_interrupt(threads=4, reads=100_000):
+    """Ctrl+C / Ctrl+Break on uhh_attach mid-run DETACHES instead of killing the tool: it
+    prints the report and exits 0, and the target -- unhooked from that moment -- carries on
+    and completes every read with no error (nothing of the instrumentation left behind)."""
+    a, p = exe("uhh_attach.exe"), exe("probe_app.exe")
+    if not a or not p:
+        return skip("interrupt", "uhh_attach/probe_app missing")
+    import signal
+    W, R, N = int(threads), int(reads), HELPERS
+    for bk in ("inline", "hw", "breakpoint"):
+        name = f"interrupt-detach-{bk}"
+        procs = []
+        try:
+            tgt = subprocess.Popen([str(p), "--helpers", str(N), "--threads", str(W), "--reads", str(R)],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            procs.append(tgt)
+            tout = Lines(tgt.stdout)
+            waiting = tout.wait_for(lambda l: '"kind":"waiting"' in l, 30)
+            if not waiting:
+                raise RuntimeError("target never reached its gate")
+            h = next(json.loads(l) for l in tout.lines if '"kind":"helper"' in l)
+            att = subprocess.Popen([str(a), str(json.loads(waiting)["pid"]), "--pid", str(h["pid"]),
+                                    "--range", f"{h['base']}:{h['size']}", "--backend", bk, "--flag-backend", bk],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+            procs.append(att)
+            aout, aerr = Lines(att.stdout), Lines(att.stderr)
+            if not aout.wait_for(lambda l: '"kind":"attached"' in l, 30):
+                raise RuntimeError("uhh_attach did not attach")
+            for loc in (OPEN_LOCATION, READ_LOCATION):
+                if not aerr.wait_for(lambda l, loc=loc: l.startswith(f"probe: active {loc} "), 30):
+                    raise RuntimeError(f"{loc} never became active")
+            tgt.stdin.write("x"); tgt.stdin.flush()
+            if not aout.wait_for(lambda l: '"message":"read handle=' in l, 60):
+                raise RuntimeError("no read was logged before the interrupt")
+            att.send_signal(signal.CTRL_BREAK_EVENT)
+            att.wait(timeout=60)
+            tgt.wait(timeout=300)
+            o, appl = aout.objs(), app(tout.objs())
+            interrupted = any("interrupted" in l for l in aerr.lines)
+            ok = (att.returncode == 0 and interrupted and bool(report(o)) and tgt.returncode == 0 and
+                  appl.get("successful_reads") == W * R)
+            record(name, ok, f"tool_rc={att.returncode} interrupted={interrupted} report={bool(report(o))} "
+                             f"target_rc={tgt.returncode} reads={appl.get('successful_reads')}/{W * R} "
+                             f"logged_before={len(read_log_lines(o))}")
+        except Exception as e:
+            record(name, False, repr(e))
+        finally:
+            for q in procs:
+                if q.poll() is None:
+                    q.kill()
+
+
 def check_gated_map(threads=4, reads=50):
     """The NtOpenProcess probe logs every open with the pid and its image name, and the map
     it builds is handle -> pid -> name exactly as the target produced it: probe_app prints
@@ -1848,6 +1901,7 @@ def main():
     if want(check_emulated_sites): check_emulated_sites()
     if want(check_ret_probe): check_ret_probe()
     if want(check_gated_map): check_gated_map()
+    if want(check_interrupt): check_interrupt()
     if want(check_agent_crt): check_agent_crt()
     if want(check_oldcrt): check_oldcrt()
     if want(check_cet): check_cet()
