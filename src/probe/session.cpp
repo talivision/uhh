@@ -4183,6 +4183,8 @@ static void sync_int3_table(probe_session *s) {
         if (int3_entry(*p) && n < (LONG)PROBE_AGENT_INT3_CAP) {
             sh->int3[n].address = p->address; sh->int3[n].original = p->original; ++n;
         }
+    // Sorted by address: the agent finds the entries in a read's range by binary search.
+    std::sort(sh->int3, sh->int3 + n, [](const probe_agent_int3 &x, const probe_agent_int3 &y) { return x.address < y.address; });
     sh->int3_count = n;
     MemoryBarrier();
     InterlockedIncrement(&sh->int3_seq);

@@ -10,10 +10,11 @@
 #include <vector>
 
 #define CB(n) extern "C" void n(probe_context *);
-CB(ar_on_site) CB(ar_on_fault_ret) CB(ar_on_fault_noret) CB(ar_on_alloc) CB(ar_on_jump) CB(ar_on_after) CB(ar_on_prot)
+CB(ar_on_site) CB(ar_on_fault_ret) CB(ar_on_fault_noret) CB(ar_on_alloc) CB(ar_on_jump) CB(ar_on_after) CB(ar_on_prot) CB(ar_on_cf) CB(ar_on_cf_inner)
 static const struct { const char *name; probe_callback fn; } k_callbacks[] = {
     {"ar_on_site", ar_on_site}, {"ar_on_fault_ret", ar_on_fault_ret}, {"ar_on_fault_noret", ar_on_fault_noret},
     {"ar_on_alloc", ar_on_alloc}, {"ar_on_jump", ar_on_jump}, {"ar_on_after", ar_on_after}, {"ar_on_prot", ar_on_prot},
+    {"ar_on_cf", ar_on_cf}, {"ar_on_cf_inner", ar_on_cf_inner},
 };
 
 int main(int argc, char **argv) {

@@ -112,24 +112,39 @@ static bool addressable(uint64_t a, size_t n) {
     return a <= 0xFFFFFFFFull && (uint64_t)n <= 0x100000000ull - a;
 #endif
 }
-// The program's byte under each armed breakpoint-backend INT3 (shared->int3, see there).
+// The program's byte under each armed breakpoint-backend INT3 (shared->int3, see there):
+// EVERY one in [a, a + n), as breakpoint/hw show them. The table is sorted by address, so the
+// entries in range are one run found by binary search: O(log count + hits in range). They
+// are applied in batches, each read under the seqlock and applied only once validated; a
+// rewrite in between restarts the scan (a byte already restored is no longer 0xCC, so
+// redoing a batch is harmless).
 static void overlay_int3(uint64_t a, void *buffer, size_t n) {
+    auto *out = static_cast<uint8_t *>(buffer);
     for (int attempt = 0; attempt < 64; ++attempt) {
         const LONG seq = shared->int3_seq;
         if (seq & 1) { YieldProcessor(); continue; }
         MemoryBarrier();
         LONG count = shared->int3_count;
         if (count > (LONG)PROBE_AGENT_INT3_CAP) count = PROBE_AGENT_INT3_CAP;
-        struct { uint64_t at; uint8_t b; } fix[64]; int nfix = 0;
-        for (LONG i = 0; i < count && nfix < 64; ++i) {
-            const uint64_t x = shared->int3[i].address;
-            if (x >= a && x - a < n) fix[nfix++] = {x, shared->int3[i].original};
+        LONG lo = 0, hi = count;                           // first entry at or above a
+        while (lo < hi) {
+            const LONG mid = lo + (hi - lo) / 2;
+            if (shared->int3[mid].address < a) lo = mid + 1; else hi = mid;
         }
-        MemoryBarrier();
-        if (shared->int3_seq != seq) continue;
-        for (int k = 0; k < nfix; ++k)
-            if (static_cast<uint8_t *>(buffer)[fix[k].at - a] == 0xCC) static_cast<uint8_t *>(buffer)[fix[k].at - a] = fix[k].b;
-        return;
+        bool torn = false;
+        while (!torn) {
+            struct { uint64_t at; uint8_t b; } fix[64]; int nfix = 0;
+            for (; lo < count && nfix < 64; ++lo) {
+                const uint64_t x = shared->int3[lo].address;
+                if (x < a || x - a >= n) break;
+                fix[nfix++] = {x, shared->int3[lo].original};
+            }
+            MemoryBarrier();
+            if (shared->int3_seq != seq) { torn = true; break; }
+            for (int k = 0; k < nfix; ++k)
+                if (out[fix[k].at - a] == 0xCC) out[fix[k].at - a] = fix[k].b;
+            if (nfix < 64) return;                         // the run ended
+        }
     }
 }
 static int local_read(void *, uint64_t address, void *buffer, size_t size, size_t *done) {
@@ -783,13 +798,8 @@ static bool executable(uint64_t a) {
     return p == PAGE_EXECUTE || p == PAGE_EXECUTE_READ || p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
 }
 
-// Threads currently inside call_func (resolution included). Probes they hit there do not
-// run callbacks -- the documented call_func contract, which the breakpoint/hw path already
-// kept. Without it an inline allocator probe whose callback calls call_func recursed
-// forever: GetModuleHandle/GetProcAddress (and many callees) allocate, which hits the
-// probe, whose callback calls call_func again... -> STATUS_STACK_OVERFLOW (found by
-// examples/famous heap_tracker). A fixed table, not TLS: it must work on a thread that
-// is still in its loader initialisation.
+// A fixed set of thread ids (not TLS: it must work on a thread that is still in its loader
+// initialisation). A scope registers the current thread for its lifetime.
 template <size_t N> struct TidSet {
     volatile LONG count;
     volatile LONG tids[N];
@@ -811,9 +821,6 @@ template <size_t N> struct TidScope {
     TidScope(const TidScope &) = delete;
     TidScope &operator=(const TidScope &) = delete;
 };
-static TidSet<64> g_in_call;
-static bool in_call_func(DWORD tid) { return g_in_call.has(tid); }
-struct CallFuncScope : TidScope<64> { CallFuncScope() : TidScope<64>(g_in_call) {} };
 
 // The agent's OWN threads (the install service thread; the remote threads running init and
 // stop). A probe they hit -- the hook writes call NtProtectVirtualMemory/FlushInstructionCache,
@@ -823,6 +830,7 @@ struct CallFuncScope : TidScope<64> { CallFuncScope() : TidScope<64>(g_in_call) 
 // holds (heap, loader) stalled the target until the controller's 5 s freeze limit.
 static TidSet<8> g_agent_threads;
 
+static bool call_func_guarded(probe_context *c);
 extern "C" int call_func(probe_context *c, const char *symbol, uint64_t *ret, int nargs, ...) {
     if (nargs < 0 || nargs > 8) return 0;
     uint64_t a[8] = {0};
@@ -830,7 +838,7 @@ extern "C" int call_func(probe_context *c, const char *symbol, uint64_t *ret, in
     for (int i = 0; i < nargs; ++i) a[i] = va_arg(ap, uint64_t);
     va_end(ap);
     if (g_ctrl) return g_ctrl->call_func_args(c, symbol, ret, nargs, a);
-    CallFuncScope scope;
+    if (!call_func_guarded(c)) return 0;
     uint64_t fn = agent_resolve(symbol);
     if (!fn || !executable(fn)) return 0;
 #if defined(_WIN64)
@@ -886,12 +894,26 @@ struct HitScope;
    cannot live in a thread_local: with no TLS there was no guard, and an allocating callback
    on the allocator recursed until the stack overflowed. A fixed table keyed by thread id:
    a thread claims its slot on its first hit and keeps it (a reused id reuses the slot);
-   after the claim only the owning thread touches its slot. */
+   after the claim only the owning thread touches its slot.
+   The slot is also the call_func guard: call_func runs only inside a callback, i.e. while
+   `active` marks this thread, so a probe its callee hits is counted without a callback (see
+   call_func_guarded). One mechanism, no separate "in call_func" registry.
+   A reused id: a thread killed (TerminateThread, ExitThread) inside a callback leaves its
+   record in the slot. The next thread with its id must not settle it (that hit stays in
+   flight: callbacks_interrupted) and must run its own callbacks. A new owner is recognised
+   without writing anything the program could see: by its TEB and stack base, compared on
+   every hit, and -- when those are reused too -- by its creation time, read once per new
+   identity and again only when a stale record turns up (a dead owner's, or this thread's
+   own after a non-unwinding longjmp, see hit_scope_live). */
 struct ThreadSlot {
     volatile LONG tid;
     HitScope *active;                    // the hit whose callback this thread is running
     volatile LONG64 *active_cell;        // that hit's hit_stripes cell
     uintptr_t moved_from, moved_to;      // a fault moved out of a trampoline (tramp_veh)
+    const void *teb;                     // the owner's identity: TEB, stack base, creation time
+    uintptr_t stack;
+    uint64_t born;
+    volatile LONG busy;                  // reading `born`: a probe hit meanwhile passes straight through
 };
 constexpr uint32_t AGENT_THREAD_SLOTS = 4096;
 static ThreadSlot g_threads[AGENT_THREAD_SLOTS];
@@ -905,6 +927,31 @@ static ThreadSlot *thread_slot(DWORD tid, bool claim) {
         if (InterlockedCompareExchange(&s.tid, (LONG)tid, 0) == 0) return &s;
     }
     return nullptr;                      // 4096 distinct thread ids: this thread runs unguarded
+}
+// The current thread's creation time (0: unknown). Hits it causes (a probe on
+// NtQueryInformationThread) pass straight through: see ThreadSlot::busy.
+using nt_qit_fn = LONG (NTAPI *)(HANDLE, ULONG, void *, ULONG, ULONG *);
+static nt_qit_fn g_nt_qit;               // ntdll!NtQueryInformationThread, resolved at init
+static uint64_t thread_born(ThreadSlot *ts) {
+    LARGE_INTEGER times[4] = {};         // KERNEL_USER_TIMES: CreateTime first
+    InterlockedExchange(&ts->busy, 1);
+    const bool ok = g_nt_qit && g_nt_qit(GetCurrentThread(), 1 /* ThreadTimes */, times, sizeof(times), nullptr) >= 0;
+    InterlockedExchange(&ts->busy, 0);
+    return ok ? (uint64_t)times[0].QuadPart : 0;
+}
+// This thread's slot, claimed. A new owner (another TEB or stack: a reused id) drops the dead
+// thread's record without settling it.
+static ThreadSlot *own_thread_slot(DWORD tid) {
+    ThreadSlot *ts = thread_slot(tid, true);
+    if (!ts) return ts;
+    const NT_TIB *tib = reinterpret_cast<const NT_TIB *>(NtCurrentTeb());
+    if (ts->teb != tib || ts->stack != (uintptr_t)tib->StackBase) {
+        ts->teb = tib; ts->stack = (uintptr_t)tib->StackBase;
+        ts->active = nullptr;            // the dead thread's hit: left in flight (interrupted)
+        ts->moved_to = 0;
+        ts->born = thread_born(ts);
+    }
+    return ts;
 }
 
 // The thread's last NT status (TEB LastStatusValue), beside GetLastError.
@@ -955,6 +1002,22 @@ static bool hit_scope_live(const HitScope *h, uint64_t sp) {
     const uintptr_t a = (uintptr_t)h, lo = (uintptr_t)tib->StackLimit, hi = (uintptr_t)tib->StackBase;
     if (a <= sp || a < lo || a + sizeof(HitScope) > hi) return false;   // never read off this stack
     return h->canary == (a ^ HIT_CANARY);
+}
+
+// Inline call_func runs its callee only while this thread's slot marks it as running c's
+// callback: a probe the callee hits (resolution included: GetModuleHandle/GetProcAddress
+// allocate) is then counted without re-entering a callback -- the documented contract, which
+// breakpoint/hw keep too. Unguarded, an allocator probe whose callback calls call_func
+// recursed until STATUS_STACK_OVERFLOW (examples/famous heap_tracker). A thread without a
+// slot (the table is full) has no guard: call_func is refused with a warning, never run
+// unguarded.
+static volatile LONG g_warned_call[PROBE_AGENT_MAX_PROBES];
+static bool call_func_guarded(probe_context *c) {
+    const auto *h = c ? static_cast<const HitScope *>(c->hit_scope) : nullptr;
+    if (h && h->slot && h->slot->active == h && (DWORD)h->slot->tid == GetCurrentThreadId()) return true;
+    if (c && c->site < PROBE_AGENT_MAX_PROBES && !InterlockedExchange(&g_warned_call[c->site], 1))
+        warn_log(c, "uhh warning: call_func refused: no recursion guard for this thread (agent thread table full)");
+    return false;
 }
 
 constexpr int kOrigMaxArgs = 16;              // call_original's argument limit (probe_api.h)
@@ -1318,6 +1381,8 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     if (g_agent_threads.has(c.tid)) return false;          // the agent's own work: see g_agent_threads
     const probe_callback cb = callbacks[index];
     if (!cb) return false;
+    ThreadSlot *const ts = own_thread_slot(c.tid);
+    if (ts && ts->busy) return false;                      // the agent's own query: see ThreadSlot
     uint32_t stripe = (c.tid >> 2) & (PROBE_AGENT_STRIPES - 1);
     volatile LONG64 &cell = shared->hit_stripes[index][stripe].value;
     // ONE atomic add counts the hit and marks a callback in flight (see hit_stripes): a thread
@@ -1334,12 +1399,16 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     // what breakpoint/hw do inside call_func. Re-entering recursed until the stack overflowed.
     // The guard is the thread's slot (no TLS: see ThreadSlot); a record left behind by a
     // non-unwinding longjmp is recognised as stale (hit_scope_live) and settled here.
-    ThreadSlot *const ts = thread_slot(c.tid, true);
     if (ts && ts->active && !hit_scope_live(ts->active, c.hit_sp)) {
-        InterlockedExchangeAdd64(ts->active_cell, -PROBE_AGENT_INFLIGHT_ONE);
+        // This thread's own record (a longjmp skipped its settling) -- or, when the TEB and
+        // stack were reused too, a dead thread's: another creation time. That hit stays in
+        // flight (interrupted).
+        const uint64_t now = thread_born(ts);
+        if (!ts->born || !now || now == ts->born) InterlockedExchangeAdd64(ts->active_cell, -PROBE_AGENT_INFLIGHT_ONE);
+        ts->born = now;
         ts->active = nullptr;
     }
-    if (in_call_func(c.tid) || (ts && ts->active)) {
+    if (ts && ts->active) {
         InterlockedExchangeAdd64(&cell, -PROBE_AGENT_INFLIGHT_ONE); return false;
     }
     // The mid-hook stub preserves GPRs, flags and XMM0-15 only. The callback (and the CRT
@@ -1567,7 +1636,7 @@ static LONG CALLBACK tramp_veh(EXCEPTION_POINTERS *ep) {
         if (ts->moved_to && (uintptr_t)ep->ExceptionRecord->ExceptionAddress != ts->moved_to) ts->moved_to = 0;
     uintptr_t site = 0;
     if ((uintptr_t)ep->ExceptionRecord->ExceptionAddress != ip || !tramp_to_site(ip, &site)) return EXCEPTION_CONTINUE_SEARCH;
-    if (ThreadSlot *ts = thread_slot(tid, true)) { ts->moved_from = ip; ts->moved_to = site; }
+    if (ThreadSlot *ts = own_thread_slot(tid)) { ts->moved_from = ip; ts->moved_to = site; }
     // RE-RAISE at the original address rather than edit this dispatch: the dispatcher's own
     // frame keeps a separate copy of the faulting RIP/RSP (its machine frame), which the
     // unwind to a handler walks through -- edited only in the CONTEXT, the unwind no longer
@@ -1782,6 +1851,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
             pol.EnableUserShadowStack)
             InterlockedExchange(&uhh_safetyhook_keep_calls, 1);
         g_nt_raise = reinterpret_cast<nt_raise_fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtRaiseException"));
+        g_nt_qit = reinterpret_cast<nt_qit_fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
         veh = AddVectoredExceptionHandler(1, tramp_veh);
         AddVectoredContinueHandler(1, tramp_vch);
     }

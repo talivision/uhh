@@ -51,7 +51,8 @@ struct probe_agent_request {
    The table holds EVERY armed breakpoint: in a session with the inline channel the controller
    refuses to arm more than PROBE_AGENT_INT3_CAP (documented in probe_api.h). It was 1024 and
    silently truncated: past it an inline get_mem read 0xCC where breakpoint/hw read the
-   program's byte (v18). 1 MiB of the section, touched only as far as it is used. */
+   program's byte (v18). Sorted by address (the agent binary-searches a read's range and
+   masks every INT3 in it). 1 MiB of the section, touched only as far as it is used. */
 constexpr uint32_t PROBE_AGENT_INT3_CAP = 65536;
 struct probe_agent_int3 { uint64_t address; uint8_t original; uint8_t pad[7]; };
 

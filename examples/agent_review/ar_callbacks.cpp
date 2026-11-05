@@ -64,3 +64,20 @@ AR_CB void ar_on_prot(probe_context *c) {
     send_log(c, "ar prot agent=%d via=%s", a >= lo && a < lo + nt->OptionalHeader.SizeOfImage ? 1 : 0,
              via_ntdll ? "ntdll" : "other");
 }
+
+// cfkill / cfmany (regress `callfunc-*`): call_func from an inline callback. A probe the
+// callee hits is counted without a callback (no "ar cf-inner" from inside call_func).
+AR_CB void ar_on_cf(probe_context *c) {
+    const uint64_t x = get_func_arg(c, 0);
+    uint64_t r = 0;
+    if (x == 1) {                                       // the victim: killed inside the callee
+        call_func(c, "ar_target.exe!ar_cf_block", &r, 0);
+        send_log(c, "ar cf-unblocked");
+    } else if (x >= 1000) {
+        const int ok = call_func(c, "ar_target.exe!ar_cf_gate", &r, 1, x);
+        send_log(c, "ar cf-many ok=%d good=%d", ok, (uint32_t)r == (uint32_t)(x * 3) ? 1 : 0);
+    } else {
+        send_log(c, "ar cf");
+    }
+}
+AR_CB void ar_on_cf_inner(probe_context *c) { send_log(c, "ar cf-inner"); }
