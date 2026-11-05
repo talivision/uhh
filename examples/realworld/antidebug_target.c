@@ -77,6 +77,7 @@ int main(int argc, char **argv)
     uint64_t elapsed_ticks;
     uint64_t frequency_ticks;
     uint64_t timed_fn_ns;
+    BOOL debugger_seen;
 
     for (argument = 1; argument < argc; ++argument) {
         if (strcmp(argv[argument], "--no-wait") == 0) {
@@ -134,12 +135,18 @@ int main(int argc, char **argv)
            sizeof(nt_global_flag));
     peb_nt_global_flag = (nt_global_flag & 0x70U) != 0U;
 
+    /* The anti-debug response: any indicator -> a DIFFERENT path. timed_fn still runs (so
+       the probe sees it) but with -1, the "debugger seen" marker, instead of 17. */
+    debugger_seen = IsDebuggerPresent() || remote_debugger || (status_port >= 0 && debug_port != 0U) ||
+                    (status_object >= 0 && debug_object != NULL) || (status_flags >= 0 && debug_flags == 0U) ||
+                    peb_being_debugged || peb_nt_global_flag;
+
     if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0 ||
         !QueryPerformanceCounter(&start)) {
         (void)fprintf(stderr, "performance counter initialization failed\n");
         return 7;
     }
-    (void)timed_fn(17);
+    (void)timed_fn(debugger_seen ? -1 : 17);
     if (!QueryPerformanceCounter(&end) || end.QuadPart < start.QuadPart) {
         (void)fprintf(stderr, "performance counter measurement failed\n");
         return 7;
@@ -154,13 +161,13 @@ int main(int argc, char **argv)
                  "\"is_debugger_present\":%s,\"remote_debugger_present\":%s,"
                  "\"debug_port\":%s,\"debug_object_handle\":%s,"
                  "\"debug_flags_zero\":%s,\"peb_being_debugged\":%s,"
-                 "\"peb_nt_global_flag_heap_debug\":%s,\"timed_fn_ns\":%llu}\n",
+                 "\"peb_nt_global_flag_heap_debug\":%s,\"timed_fn_ns\":%llu,\"path\":\"%s\"}\n",
                  json_bool(IsDebuggerPresent()), json_bool(remote_debugger),
                  json_bool(status_port >= 0 && debug_port != 0U),
                  json_bool(status_object >= 0 && debug_object != NULL),
                  json_bool(status_flags >= 0 && debug_flags == 0U),
                  json_bool(peb_being_debugged), json_bool(peb_nt_global_flag),
-                 (unsigned long long)timed_fn_ns);
+                 (unsigned long long)timed_fn_ns, debugger_seen ? "debugger" : "clean");
     (void)fflush(stdout);
     return 0;
 }

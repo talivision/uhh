@@ -64,10 +64,16 @@ code is zero; `phase_a == many * calls`, `phase_b == 32 * calls`, `phase_c == 25
 ## `antitamper_target.c`
 
 Hook point: `guarded_fn(int)`. Before the stdin gate, the target records FNV-1a
-checksums of its mapped `.text` section and the first 32 bytes of `guarded_fn`. It checks
-both again immediately after release, halfway through the calls, and after all calls.
-A helper thread suspends the main thread halfway through and reads its debug-register
-context; `debug_registers_seen` is true when `Dr7` is nonzero.
+checksums of its mapped `.text` section and the first 32 bytes of `guarded_fn`. Right
+after release, and again halfway through the calls, it checks for instrumentation:
+both checksums, the first 8 bytes of `guarded_fn` against the executable FILE on disk
+(`fn_disk_ok`; catches a patch made before the in-memory baseline), and the main
+thread's DR7 read by a helper thread through `GetThreadContext`
+(`debug_registers_seen`).
+
+**Tamper response:** from the first detection on, the target takes a different path:
+`guarded_fn` is still called `N` times, but with `-1` instead of the loop index, and
+the summary says `"path":"tampered"` with what detected it and when.
 
 CLI:
 
@@ -75,25 +81,31 @@ CLI:
 antitamper_target.exe [--calls N] [--no-wait]
 ```
 
-`--calls` defaults to 100. The exact result is:
-
 ```json
-{"kind":"target","name":"antitamper","calls":N,"text_ok":true|false,"fn_bytes_ok":true|false,"text_changed_at":"none|before|middle|after","debug_registers_seen":true|false}
+{"kind":"target","name":"antitamper","calls":N,"text_ok":B,"fn_bytes_ok":B,"text_changed_at":"none|before|middle|after","debug_registers_seen":B,"fn_disk_ok":B,"path":"clean|tampered","detected_by":"none|code|debug_registers|code+debug_registers","detected_at":"none|before|middle"}
 ```
 
-Harness assertion depends on hook type. With no hook, require `text_ok` and
-`fn_bytes_ok` true, `text_changed_at == "none"`, and `debug_registers_seen == false`.
-For a persistent inline or `INT3` patch installed while waiting, require a code checksum
-failure (normally `text_changed_at == "before"`). For a hardware breakpoint, require
-the code checksums to remain true and `debug_registers_seen == true`. In all cases,
-require exit code zero and `calls == N`.
+What each backend makes visible (asserted by `regress.py`, `antitamper-*`):
+
+| Run | Code bytes changed | DR7 set | Result |
+|---|---|---|---|
+| no UHH (baseline) | no | no | `clean`, `guarded_fn(i)` |
+| breakpoint (INT3) | yes: `0xCC` at the probe, vs disk | no | `tampered`, `code` at `before`, every call `guarded_fn(-1)` |
+| inline | yes: the hook's jump, vs disk | no | `tampered`, `code` at `before`, every call `guarded_fn(-1)` |
+| hw | **no** | yes | `tampered`, `debug_registers` at `before`, every call `guarded_fn(-1)` |
+
+The in-memory `.text` checksum alone does NOT see the INT3 or the inline hook: both are
+in place before the target takes its baseline (launch arms them at process creation /
+holds the entry point until the hooks are in). Only the disk comparison does.
 
 ## `antidebug_target.c`
 
-Hook point: `timed_fn(int)`. This target reports common debugger indicators but never
-changes behavior because of them. `NtQueryInformationProcess` is resolved dynamically
-from `ntdll`; the PEB address comes from `ProcessBasicInformation`. The
-`peb_nt_global_flag_heap_debug` field represents `(NtGlobalFlag & 0x70) != 0`.
+Hook point: `timed_fn(int)`. The target reads common debugger indicators
+(`IsDebuggerPresent`, `CheckRemoteDebuggerPresent`, `NtQueryInformationProcess` debug
+port / debug object / debug flags, PEB `BeingDebugged` and `NtGlobalFlag & 0x70`).
+
+**Anti-debug response:** if any indicator is set it takes a different path: `timed_fn`
+is called with `-1` instead of `17`, and the summary says `"path":"debugger"`.
 
 CLI:
 
@@ -101,18 +113,18 @@ CLI:
 antidebug_target.exe [--no-wait]
 ```
 
-The exact result is:
-
 ```json
-{"kind":"target","name":"antidebug","is_debugger_present":true|false,"remote_debugger_present":true|false,"debug_port":true|false,"debug_object_handle":true|false,"debug_flags_zero":true|false,"peb_being_debugged":true|false,"peb_nt_global_flag_heap_debug":true|false,"timed_fn_ns":N}
+{"kind":"target","name":"antidebug","is_debugger_present":B,"remote_debugger_present":B,"debug_port":B,"debug_object_handle":B,"debug_flags_zero":B,"peb_being_debugged":B,"peb_nt_global_flag_heap_debug":B,"timed_fn_ns":N,"path":"clean|debugger"}
 ```
 
-Harness assertion: exit code is zero, every named check is a JSON boolean, and
-`timed_fn_ns` is a nonnegative JSON integer. A baseline no-debugger run should report
-all seven booleans false. Instrumented runs should assert the expected visibility policy
-for the particular backend rather than treating any one anti-debug signal as universally
-required. A harness breakpointing `timed_fn` may additionally compare `timed_fn_ns`
-against a separately measured baseline threshold.
+What each backend makes visible (asserted by `regress.py`, `antidebug-*`): a baseline
+run reports every indicator false and `clean`. UHH launches (and attaches to) every
+target as a **debugger**, whatever the backend: breakpoint and hw need it for their
+exceptions, and inline's controller is the same debugger. So under breakpoint, hw and
+inline the debugger is visible: `IsDebuggerPresent`, the remote check, debug port,
+debug object, debug flags and PEB `BeingDebugged` are all true, the target takes the
+`debugger` path and the probe logs `timed_fn(-1)`. (`NtGlobalFlag`'s heap-debug bits
+are reported, not asserted.) UHH deliberately does not hide the debugger.
 
 ## `exceptions_target.cpp`
 

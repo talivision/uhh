@@ -63,6 +63,15 @@ uint64_t read_pointer(probe_context *c, uint64_t address) {
     return get_mem(c, address, &value, sizeof(value)) ? (uint64_t)value : 0;
 }
 
+uint64_t table_lookup(Resolved &slot, uint64_t handle) {   // (open number + 1) << 32 | pid, or 0
+    for (int tries = 0; tries < 4; ++tries) {                  // a consistent (handle, open_pid) pair
+        const uint64_t v = slot.open_pid.load(std::memory_order_acquire);
+        const bool same = slot.handle.load(std::memory_order_acquire) == handle;
+        if (slot.open_pid.load(std::memory_order_acquire) == v) return same ? v : 0;
+    }
+    return 0;
+}
+
 // pid the handle was opened for, or 0 if no open we saw produced it. The table answers
 // directly, unless an open NEWER than the one it remembers is still pending: those are
 // checked newest first (each costs one read of its out-pointer), so a handle value reused
@@ -70,12 +79,7 @@ uint64_t read_pointer(probe_context *c, uint64_t address) {
 uint64_t pid_of(probe_context *c, uint64_t handle) {
     if (!handle) return 0;
     Resolved &slot = g_by_handle[(handle >> 2) % kHandleSlots];
-    uint64_t known = 0;
-    for (int tries = 0; tries < 4; ++tries) {                  // a consistent (handle, open_pid) pair
-        const uint64_t v = slot.open_pid.load(std::memory_order_acquire);
-        const bool same = slot.handle.load(std::memory_order_acquire) == handle;
-        if (slot.open_pid.load(std::memory_order_acquire) == v) { known = same ? v : 0; break; }
-    }
+    const uint64_t known = table_lookup(slot, handle);
     const uint32_t since = (uint32_t)(known >> 32);           // opens below this are older
     const uint32_t n = g_open_count.load(std::memory_order_acquire);
     for (uint32_t k = n; k-- > since && n - k <= kPending;) {
@@ -89,7 +93,9 @@ uint64_t pid_of(probe_context *c, uint64_t handle) {
         r.pid.compare_exchange_strong(expected, 0);            // resolved: leave the ring
         return pid;
     }
-    return known & 0xffffffffu;
+    // Look again: another thread may have resolved this handle meanwhile (it fills the
+    // table BEFORE clearing the pending entry we then skipped).
+    return table_lookup(slot, handle) & 0xffffffffu;
 }
 }  // namespace
 

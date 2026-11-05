@@ -491,9 +491,11 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     // the callback under SEH so an access violation (or any exception) inside user code
     // cannot take down the target. On a fault we skip register write-back, leaving the
     // target's registers untouched (the callback behaves as a no-op mutation).
+    // A hit is a callback run: while being unhooked the hook passes straight through and
+    // that pass is NOT counted (else a detach would report hits that have no callback/log).
+    if (g_stopping) return;
     uint32_t stripe = (GetCurrentThreadId() >> 2) & (PROBE_AGENT_STRIPES - 1);
     InterlockedIncrement64(&shared->hit_stripes[index][stripe].value);
-    if (g_stopping) return;                                // being unhooked: pass straight through
     InterlockedIncrement(&g_inflight[stripe].value);
     // The mid-hook stub preserves GPRs, flags and XMM0-15 only. The callback (and the CRT
     // it calls) may touch x87/MXCSR/YMM/ZMM state -- e.g. vzeroupper -- which the target

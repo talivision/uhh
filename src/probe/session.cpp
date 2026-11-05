@@ -38,6 +38,7 @@ struct Probe {
     bool vetted = false;       // pre-hook check done for this inline install
     uint64_t rva = 0, base = 0, address = 0, hits = 0;
     uint32_t agent_index = UINT32_MAX;
+    uint32_t patch_len = 0;    // inline: bytes the hook overwrites at address (set when vetted)
     unsigned char original = 0;
     // Software-breakpoint displaced stepping: the full original instruction so it can
     // be executed out-of-line while the INT3 stays armed (no re-arm race, no thread
@@ -1767,6 +1768,7 @@ static bool patch_in_code_section(probe_session *s, uint64_t base, uint64_t lo, 
 //   [entry]    a function start, branch target, return point or switch-table target is inside it
 //   [indirect] the function has an indirect jump whose targets cannot be resolved
 //   [section]  the patch runs past the end of the executable section
+//   [reloc]    a rel8-only branch (jrcxz/jecxz/loop*) inside it cannot be relocated
 // (Threads executing inside the patch when it is written are handled by the freeze.)
 // Not visible to any static check: jumps into this function from OTHER code.
 static bool inline_site_unsafe(probe_session *s, const Probe &p, std::string &why) {
@@ -1789,6 +1791,28 @@ static bool inline_site_unsafe(probe_session *s, const Probe &p, std::string &wh
         std::snprintf(buf, sizeof(buf), "%u-byte hook would be written across a call's return point at +0x%llx",
                       len, (unsigned long long)call_end);
         reason = buf;
+    }
+    if (reason.empty()) {
+        // [reloc] jrcxz/jecxz/loop* exist only with a rel8 displacement: copied into a
+        // trampoline they cannot reach their target (the hook engine does not rewrite them).
+        ZydisDecoder dec;
+#if defined(_WIN64)
+        ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+#else
+        ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_COMPAT_32, ZYDIS_STACK_WIDTH_32);
+#endif
+        ZydisDecodedInstruction in{};
+        for (size_t off = 0; off < len && ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(&dec, nullptr, b + off, n - off, &in));
+             off += in.length) {
+            const ZydisMnemonic m = in.mnemonic;
+            if (m == ZYDIS_MNEMONIC_JCXZ || m == ZYDIS_MNEMONIC_JECXZ || m == ZYDIS_MNEMONIC_JRCXZ ||
+                m == ZYDIS_MNEMONIC_LOOP || m == ZYDIS_MNEMONIC_LOOPE || m == ZYDIS_MNEMONIC_LOOPNE) {
+                std::snprintf(buf, sizeof(buf), "%u-byte hook would relocate %s at +0x%zx (rel8-only branch: cannot be "
+                              "relocated)", len, ZydisMnemonicGetString(m), off);
+                reason = buf;
+                break;
+            }
+        }
     }
     SiteAnalysis a;
     if (p.base) analyse_site(s, p.base, p.address, a);
@@ -1874,10 +1898,43 @@ static bool inline_site_unsafe(probe_session *s, const Probe &p, std::string &wh
     return true;
 }
 
+// Two inline hooks whose patches overlap corrupt each other: the second decodes (and
+// relocates) the first one's jump bytes, and removing either restores bytes under the
+// other. Same address included. Never overridable: refused, or hw with PROBE_FALLBACK_HW.
+static bool inline_overlaps_probe(probe_session *s, Probe &p, std::string &why) {
+    unsigned char b[32] = {}; size_t n = 0; int64_t call_end = -1; bool after_exit = false;
+    if (remote_read(s->pi.hProcess, p.address, b, sizeof(b), &n) && n >= 5)
+        p.patch_len = inline_patch_len(b, n, &call_end, &after_exit);
+    const uint64_t lo = p.address, hi = p.address + (p.patch_len ? p.patch_len : 5);
+    for (const auto &o : s->probes) {
+        if (!(o->flags & PROBE_INLINE) || o->retired || !o->address || o->agent_index == p.agent_index) continue;
+        const uint64_t olo = o->address, ohi = o->address + (o->patch_len ? o->patch_len : 5);
+        if (olo < hi && lo < ohi) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf), "its %llu-byte hook would overlap the hook of inline probe %s at 0x%llx",
+                          (unsigned long long)(hi - lo), o->location.c_str(), (unsigned long long)olo);
+            why = buf;
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool vet_site(probe_session *s, Probe &p, bool &moved_to_hw) {
     moved_to_hw = false;
     if (p.flags & PROBE_HW) return true;
     std::string inner;
+    if ((p.flags & PROBE_INLINE) && inline_overlaps_probe(s, p, inner)) {
+        if (p.flags & PROBE_FALLBACK_HW) {
+            p.flags = (p.flags & ~(uint32_t)PROBE_INLINE) | PROBE_HW; moved_to_hw = true;
+            std::fprintf(stderr, "probe: %s -> hardware fallback (%s)\n", p.location.c_str(), inner.c_str());
+            return true;
+        }
+        std::string msg = "inline probe " + p.location + " refused: " + inner + ".";
+        std::fprintf(stderr, "probe: %s\n", msg.c_str());
+        set_error(s, msg);
+        return false;
+    }
     if ((p.flags & PROBE_INLINE) && inline_site_unsafe(s, p, inner)) {
         if (p.flags & PROBE_ALLOW_UNSAFE_SITE) {
             std::fprintf(stderr, "probe: warning: inline probe %s: %s (installed: PROBE_ALLOW_UNSAFE_SITE)\n",
@@ -1929,6 +1986,7 @@ static bool arm_probe(probe_session *s, Probe &item, uint64_t base) {
         bool moved = false;
         if (!vet_site(s, view, moved)) { item.retired = true; return false; }
         if (moved) item.flags = view.flags;                // pre-hooked -> hw (PROBE_FALLBACK_HW)
+        item.patch_len = view.patch_len;                   // later inline probes must not overlap it
     }
     // (No "late inline -> hardware" rule: launch holds the main thread at the entry point
     // until the agent is ready, attach holds every thread until the hooks are confirmed,
@@ -3705,7 +3763,7 @@ extern "C" void probe_close(probe_session *s) {
     if (s->detached) {
         // already detached by probe_run
     } else if (s->attached && !s->exited && s->pi.hProcess) {
-        detach(s);
+        detach(s); s->detached = true;
     } else if (s->launched && !s->exited && s->pi.hProcess) {
         for (auto &p : s->probes)
             if (p->active && (p->flags & PROBE_BREAKPOINT)) patch(s->pi.hProcess, p->address, p->original);
@@ -3726,6 +3784,19 @@ extern "C" void probe_close(probe_session *s) {
     }
     stop_drainer(s);
     stop_log_output(s);                         // symbolization needs dbghelp and the process handle
+    if (s->detached) {
+        // The final counts AFTER the detach (a report taken before probe_close races the
+        // still-running target): every hit, and every log already written out.
+        uint64_t hits = 0;
+        for (auto &p : s->probes) {
+            if (s->shared && (p->flags & PROBE_INLINE)) p->hits = probe_agent_hits(s->shared, p->agent_index);
+            if (!p->internal) hits += p->hits;
+        }
+        std::fprintf(stderr, "probe: detached: hits=%llu logs_written=%llu log_dropped=%llu\n",
+                     (unsigned long long)hits, (unsigned long long)s->logs_written.load(std::memory_order_relaxed),
+                     (unsigned long long)((uint64_t)(s->shared ? s->shared->log_dropped : 0) +
+                                          s->controller_dropped.load(std::memory_order_relaxed)));
+    }
     if (s->pi.hProcess)
         for (uint64_t b : s->scratch_blocks) VirtualFreeEx(s->pi.hProcess, (void *)(uintptr_t)b, 0, MEM_RELEASE);
     if (s->sym_ready) uhh_sym::cleanup(s->pi.hProcess);

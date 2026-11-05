@@ -674,32 +674,48 @@ def check_stream_order():
 
 
 def check_breakage():
-    d = exe("breakage_driver.exe")
-    if not d or not exe("hook_edge.exe"):
+    """(C16) Hostile inline sites: every row has ONE required outcome -- the target behaves
+    exactly as uninstrumented (each probe hit once, the target's own result check passes:
+    exit 0), or UHH refuses the probe cleanly with a reason (no hit, target not corrupted).
+    Any other outcome (wrong return, fault, missed/double hit) fails. The uninstrumented
+    baseline of every case must exit 0 too, so 'exit 0' really means 'same as without UHH'."""
+    d, h = exe("breakage_driver.exe"), exe("hook_edge.exe")
+    if not d or not h:
         return skip("breakage", "breakage_driver/hook_edge missing")
-    expected = {
+    required = {
         ("ShortSite", "breakpoint"): "pass", ("ShortSite", "hw"): "pass",
         ("PrehookSite", "breakpoint"): "pass", ("PrehookSite", "hw"): "pass",
         ("UnrelocSite", "breakpoint"): "pass", ("UnrelocSite", "hw"): "pass",
         ("StackSite", "breakpoint"): "pass", ("StackSite", "hw"): "pass",
         ("StackInsideSite", "breakpoint"): "pass", ("StackInsideSite", "hw"): "pass",
+        ("ShortSite", "inline"): "refused",                    # 5 bytes would run past the ret
+        ("PrehookSite", "inline"): "pass",                     # PROBE_ALLOW_PREHOOKED: chains (1017)
+        ("PrehookSite", "inline-default"): "pass",             # E9 also on disk: chained like ALLOW_PREHOOKED
+        ("PrehookSite", "inline-fallback"): "pass",            # -> hw
+        ("UnrelocSite", "inline"): "refused",                  # jrcxz/jecxz: rel8-only, not relocatable
+        ("StackSite+StackSite", "inline"): "refused",          # second hook at the same address
+        ("StackSite+StackInsideSite", "inline"): "refused",    # inner site inside the outer patch
     }
     try:
+        for case in ("short", "prehook", "unreloc", "stack"):
+            b = subprocess.run([str(h), "--case", case], input=b"x", capture_output=True, timeout=60)
+            record(f"breakage-baseline-{case}", b.returncode == 0, f"uninstrumented exit={b.returncode}")
         r = rvas("hook_edge.map", "ShortSite", "PrehookSite", "UnrelocSite", "StackSite", "StackInsideSite")
-        _, o = run([d, exe("hook_edge.exe"), r["ShortSite"], r["PrehookSite"], r["UnrelocSite"], r["StackSite"], r["StackInsideSite"]],
-                   timeout=180)
-        bad = []
-        for row in o:
-            key = (row.get("site"), row.get("backend"))
-            want = expected.get(key)
-            if want and row.get("verdict") != want:
-                bad.append(f"{key}={row.get('verdict')}!={want} row={json.dumps(row)[:400]}")
-        # The 10 breakpoint/hw controls MUST all pass; inline rows are observational.
-        controls = [row for row in o if row.get("backend") in ("breakpoint", "hw")]
-        ok = len(controls) == 10 and all(row.get("verdict") == "pass" for row in controls) and not bad
-        record("breakage-controls", ok, f"controls={len(controls)}/10 bad={bad}")
+        res, o = run([d, h, r["ShortSite"], r["PrehookSite"], r["UnrelocSite"], r["StackSite"], r["StackInsideSite"]],
+                     timeout=300)
+        rows = {(row.get("site"), row.get("backend")): row for row in o if "verdict" in row}
+        for key, want in required.items():
+            row = rows.get(key, {})
+            ok = row.get("verdict") == want and row.get("required") == want
+            if want == "refused":
+                ok = ok and "refused" in (row.get("error") or "")
+            record(f"breakage {key[0]}/{key[1]}", ok,
+                   f"verdict={row.get('verdict')} want={want} hits={row.get('hits')} exit={row.get('app_exit')} "
+                   f"err={(row.get('error') or '')[:160]}")
+        record("breakage-driver", res.returncode == 0 and len(rows) == len(required),
+               f"rc={res.returncode} rows={len(rows)}/{len(required)}")
     except Exception as e:
-        record("breakage-controls", False, repr(e))
+        record("breakage-driver", False, repr(e))
 
 
 def check_frida_parity():
@@ -934,28 +950,65 @@ def check_realworld_targets():
                                                    f"backend={pr.get('backend')} dropped={report(o).get('log_dropped')}")
         except Exception as e:
             record("reentrancy-inline-malloc", False, repr(e))
-    # Tamper/debugger visibility: measured and asserted to match the documented signature.
+    # (C6) Tamper/debugger visibility. Both targets take a DIFFERENT path when they detect
+    # instrumentation (the probed function is then called with -1 instead of its normal
+    # argument). Asserted per backend against an uninstrumented baseline run:
+    #   anti-tamper: INT3 (breakpoint) and inline change code bytes (seen vs the file on
+    #     disk); hw changes no code byte but sets DR7 (seen via GetThreadContext).
+    #   anti-debug: UHH launches every session as a debugger, so breakpoint, hw AND inline
+    #     (whose controller is the debugger) are all visible. UHH does not hide it.
+    def path_logs(o, fn):
+        return [str(x.get("message")) for x in o if x.get("kind") == "probe_log" and str(x.get("message", "")).startswith(fn + "(")]
     x = exe("antitamper_target.exe")
     if x:
-        for bk, code_changes, dr_seen in (("breakpoint", True, False), ("inline", True, False), ("hw", False, True)):
+        calls = 100
+        try:
+            br = subprocess.run([str(x), "--no-wait", "--calls", str(calls)], capture_output=True, text=True, timeout=60)
+            base = next((json.loads(l) for l in br.stdout.splitlines() if l.startswith("{")), {})
+            ok = (br.returncode == 0 and base.get("path") == "clean" and base.get("detected_by") == "none" and
+                  base.get("fn_disk_ok") is True and base.get("debug_registers_seen") is False)
+            record("antitamper-baseline", ok, f"path={base.get('path')} detected_by={base.get('detected_by')} "
+                                              f"fn_disk_ok={base.get('fn_disk_ok')} dr_seen={base.get('debug_registers_seen')}")
+        except Exception as e:
+            record("antitamper-baseline", False, repr(e))
+        for bk, by in (("breakpoint", "code"), ("inline", "code"), ("hw", "debug_registers")):
             try:
-                r, o, tg = trace_run(x, ["antitamper_target.exe!guarded_fn:d"], bk, ("--calls", "100"))
-                ok = (r.returncode == 0 and tg.get("calls") == 100 and
-                      (tg.get("fn_disk_ok") is (not code_changes)) and (tg.get("debug_registers_seen") is dr_seen))
-                record(f"antitamper-{bk}", ok, f"fn_disk_ok={tg.get('fn_disk_ok')} fn_bytes_ok={tg.get('fn_bytes_ok')} text_ok={tg.get('text_ok')} "
-                                               f"dr_seen={tg.get('debug_registers_seen')} (expected code_changes={code_changes})")
+                r, o, tg = trace_run(x, ["antitamper_target.exe!guarded_fn:d"], bk, ("--calls", str(calls)))
+                pr = next(iter(probes(o)), {})
+                logs = path_logs(o, "guarded_fn")
+                neg = sum(m in ("guarded_fn(-1)", "guarded_fn(4294967295)") for m in logs)   # int -1 (x64: ecx only)
+                ok = (r.returncode == 0 and tg.get("calls") == calls and pr.get("backend") == bk and
+                      tg.get("path") == "tampered" and tg.get("detected_by") == by and tg.get("detected_at") == "before" and
+                      pr.get("hits") == calls and len(logs) == calls and neg == calls)
+                record(f"antitamper-{bk}", ok, f"path={tg.get('path')} detected_by={tg.get('detected_by')}@{tg.get('detected_at')} "
+                                               f"(want {by}@before) fn_disk_ok={tg.get('fn_disk_ok')} dr_seen={tg.get('debug_registers_seen')} "
+                                               f"hits={pr.get('hits')}/{calls} logs_-1={neg}")
             except Exception as e:
                 record(f"antitamper-{bk}", False, repr(e))
     x = exe("antidebug_target.exe")
     if x:
+        keys = ("is_debugger_present", "remote_debugger_present", "debug_port", "debug_object_handle",
+                "debug_flags_zero", "peb_being_debugged", "peb_nt_global_flag_heap_debug")
         try:
-            r, o, tg = trace_run(x, ["antidebug_target.exe!timed_fn:d"], "hw")
-            keys = ("is_debugger_present", "remote_debugger_present", "debug_port", "debug_object_handle",
-                    "debug_flags_zero", "peb_being_debugged", "peb_nt_global_flag_heap_debug")
-            ok = r.returncode == 0 and all(isinstance(tg.get(k), bool) for k in keys)
-            record("antidebug-measured", ok, " ".join(f"{k}={tg.get(k)}" for k in keys))
+            br = subprocess.run([str(x), "--no-wait"], capture_output=True, text=True, timeout=60)
+            base = next((json.loads(l) for l in br.stdout.splitlines() if l.startswith("{")), {})
+            ok = br.returncode == 0 and base.get("path") == "clean" and all(base.get(k) is False for k in keys)
+            record("antidebug-baseline", ok, f"path={base.get('path')} " + " ".join(f"{k}={base.get(k)}" for k in keys))
         except Exception as e:
-            record("antidebug-measured", False, repr(e))
+            record("antidebug-baseline", False, repr(e))
+        for bk in ("breakpoint", "hw", "inline"):
+            try:
+                r, o, tg = trace_run(x, ["antidebug_target.exe!timed_fn:d"], bk)
+                pr = next(iter(probes(o)), {})
+                logs = path_logs(o, "timed_fn")
+                seen = ("is_debugger_present", "remote_debugger_present", "debug_port", "debug_object_handle",
+                        "debug_flags_zero", "peb_being_debugged")
+                ok = (r.returncode == 0 and pr.get("backend") == bk and tg.get("path") == "debugger" and
+                      all(tg.get(k) is True for k in seen) and pr.get("hits") == 1 and logs in (["timed_fn(-1)"], ["timed_fn(4294967295)"]))
+                record(f"antidebug-{bk}", ok, f"path={tg.get('path')} logs={logs} " +
+                       " ".join(f"{k}={tg.get(k)}" for k in keys))
+            except Exception as e:
+                record(f"antidebug-{bk}", False, repr(e))
 
 
 FRIDA_PY = Path(r"C:\work\fv16\Scripts\python.exe")
@@ -1033,7 +1086,10 @@ def check_detach():
     """Detach while the target keeps running (probe_close from another thread while
     probe_run runs): the target must finish every read with the SAME checksum as an
     uninstrumented run -- a leftover INT3 or debug register would crash it once no
-    debugger is attached, and a half-removed hook would corrupt results."""
+    debugger is attached, and a half-removed hook would corrupt results. Several threads log
+    while the detach happens: every hit up to the detach has its log delivered (the logs on
+    the tracer's stdout == the final hit count probe_close prints after the detach ==
+    logs_written), and none is dropped."""
     t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
     if not t or not a:
         return skip("detach", "uhh_trace/probe_app missing")
@@ -1042,7 +1098,7 @@ def check_detach():
         name = f"detach-{bk}"
         target = None
         try:
-            threads = 2
+            threads = 4
             total = threads * reads
             _, bo = run([a, "--no-wait", "--threads", threads, "--reads", reads, "--config", "reads_enabled=1"],
                         timeout=600)
@@ -1070,13 +1126,16 @@ def check_detach():
             unhandled = [l for l in terr.splitlines() if '"unhandled"' in l][:2]
             tobjs = [json.loads(l) for l in rest if l.strip().startswith("{")]
             res = next((o for o in tobjs if o.get("kind") == "app"), {})
-            objs = [json.loads(l) for l in out.splitlines() if l.startswith("{")]
-            pr = next((o for o in objs if o.get("kind") == "probe"), {})
+            logs = sum(1 for l in tout.lines if l.startswith('{"kind":"probe_log"'))
+            objs = [json.loads(l) for l in out.splitlines() if l.startswith("{") and not l.startswith('{"kind":"probe_log"')]
             detached = any(o.get("kind") == "detached" for o in objs)
-            mid_run = 0 < (pr.get("hits") or 0) < total
+            fin = re.search(r"probe: detached: hits=(\d+) logs_written=(\d+) log_dropped=(\d+)", err)
+            hits, written, dropped = (int(x) for x in fin.groups()) if fin else (None, None, None)
+            mid_run = 0 < (hits or 0) < total
             ok = (detached and mid_run and target.returncode == 0 and res.get("successful_reads") == total and
-                  res.get("checksum") == base.get("checksum"))
-            record(name, ok, f"hits_before_detach={pr.get('hits')}/{total} detached={detached} exit={target.returncode} "
+                  res.get("checksum") == base.get("checksum") and logs == hits == written and dropped == 0)
+            record(name, ok, f"hits={hits}/{total} logs={logs} written={written} dropped={dropped} threads={threads} "
+                             f"detached={detached} exit={target.returncode} "
                              f"reads={res.get('successful_reads')} checksum_same={res.get('checksum') == base.get('checksum')}"
                              + ("" if ok else f" target_unhandled={unhandled} detach_line=" +
                                 " | ".join(l for l in err.strip().splitlines() if "detach" in l)[:1200]))
@@ -1373,76 +1432,84 @@ def check_gated_mem(threads=8, reads=1000):
             record(name, False, repr(e))
 
 
-def check_crash_logs(n=5000):
-    """Log delivery when the TARGET crashes: after n probed calls (one log each) it dies
-    with an unhandled access violation. Every log must still arrive -- for inline they
-    sit in the shared ring at the moment of death -- and none may be counted as dropped."""
+def check_crash_logs(n=5000, threads=4):
+    """Log delivery when the TARGET crashes: several threads log on every probed call; the
+    first to reach n calls dies with an unhandled access violation while the others are
+    still logging. Every hit counted must have its log delivered (logs == hits, at least
+    n) -- for inline they sit in the shared ring at the moment of death -- and none may be
+    counted as dropped. Single-thread run too: exactly n."""
     d, t = exe("hitcost_driver.exe"), exe("hitcost_target.exe")
     if not d or not t:
         return skip("crash-logs", "hitcost driver/target missing")
     for bk in ("inline", "hw", "breakpoint"):
-        try:
-            _, o = run([d, "--backend", bk, "--method", "send_log", "--", t, "--calls", n * 10, "--threads", 1,
-                        "--crash-after", n], timeout=300)
-            rep = report(o)
-            logs = sum(1 for x in o if x.get("kind") == "probe_log" and str(x.get("message", "")).startswith("hit "))
-            pr = next(iter(probes(o)), {})
-            ok = (rep.get("app_exit") == 0xC0000005 and pr.get("hits") == n and logs == n and rep.get("log_dropped") == 0)
-            record(f"crash-logs-{bk}", ok, f"exit=0x{(rep.get('app_exit') or 0):x} hits={pr.get('hits')} logs={logs}/{n} "
-                                           f"dropped={rep.get('log_dropped')}")
-        except Exception as e:
-            record(f"crash-logs-{bk}", False, repr(e))
+        for nt in (1, threads):
+            name = f"crash-logs-{bk}" + ("" if nt == 1 else f"-{nt}t")
+            try:
+                _, o = run([d, "--backend", bk, "--method", "send_log", "--", t, "--calls", n * 10, "--threads", nt,
+                            "--crash-after", n], timeout=300)
+                rep = report(o)
+                logs = sum(1 for x in o if x.get("kind") == "probe_log" and str(x.get("message", "")).startswith("hit "))
+                tids = {x.get("tid") for x in o if x.get("kind") == "probe_log"}
+                pr = next(iter(probes(o)), {})
+                hits = pr.get("hits") or 0
+                ok = (rep.get("app_exit") == 0xC0000005 and logs == hits and rep.get("log_dropped") == 0 and
+                      (hits == n if nt == 1 else hits >= n and len(tids) == nt))
+                record(name, ok, f"exit=0x{(rep.get('app_exit') or 0):x} hits={hits} logs={logs} (n={n}) "
+                                 f"threads_logging={len(tids)}/{nt} dropped={rep.get('log_dropped')}")
+            except Exception as e:
+                record(name, False, repr(e))
 
 
-def check_attach_new():
-    """probe_attach_new: ignore an already-running instance, attach to the NEXT one started,
-    observe all of its reads; and fail cleanly (error, non-zero exit) on timeout."""
+def check_attach_new(threads=2, reads=500):
+    """probe_attach_new, every backend, on ntdll!NtReadVirtualMemory: ignore an already-running
+    instance (the decoy), attach to the NEXT one started, observe all of its reads; and fail
+    cleanly (error, non-zero exit) on timeout. No fixed sleeps: the target is started once
+    the tracer reports its snapshot of running instances ('probe: waiting for a new'), and
+    its gate is released once the tracer reports the probe live ('probe: active'). The gate
+    stays: attach_new polls, so without it some reads could run before the attach lands."""
     t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
     if not t or not a:
         return skip("attach-new", "uhh_trace/probe_app missing")
-    import re, time
-    decoy = target = None
-    try:
-        decoy = subprocess.Popen([str(a), "--config", "reads_enabled=1"], stdin=subprocess.PIPE,
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        time.sleep(0.5)
-        tracer = subprocess.Popen([str(t), "--backend", "hw", "--attach-new", "probe_app.exe", "--timeout", "20000",
-                                   "-p", "probe_app.exe!ReadThunk:xxxx"],
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        time.sleep(1.0)
-        threads, reads = 2, 500
-        target = subprocess.Popen([str(a), "--threads", str(threads), "--reads", str(reads), "--config", "reads_enabled=1"],
-                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        time.sleep(2.0)                                          # attach lands while it waits at its gate
-        target.stdin.write(b"\n"); target.stdin.flush()
-        t_app = time.time()
-        lines_until(target, '"kind":"app"', 120)                 # keep its pipe drained
-        t_app = time.time() - t_app
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"attach-new-{bk}"
+        decoy = target = tracer = None
         try:
-            out, err = tracer.communicate(timeout=180)           # returns when the target exits
-        except subprocess.TimeoutExpired:
-            tracer.kill(); out, err = tracer.communicate()
-        try:
+            decoy = subprocess.Popen([str(a), "--config", "reads_enabled=1"], stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            # The decoy (and the helper processes it starts, also probe_app.exe) must all exist
+            # before the tracer's snapshot: wait for its gate line, printed after its helpers.
+            if not any('"waiting"' in l for l in lines_until(decoy, '"waiting"', 60)):
+                raise RuntimeError("decoy never reached its gate")
+            tracer = subprocess.Popen([str(t), "--backend", bk, "--attach-new", "probe_app.exe", "--timeout", "60000",
+                                       "-p", "ntdll.dll!NtReadVirtualMemory:-"],
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            tout, terr = Lines(tracer.stdout), Lines(tracer.stderr)
+            if not terr.wait_for(lambda l: l.startswith("probe: waiting for a new probe_app.exe"), 60):
+                raise RuntimeError("tracer never took its snapshot")
+            target = subprocess.Popen([str(a), "--threads", str(threads), "--reads", str(reads),
+                                       "--config", "reads_enabled=1"],
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if not terr.wait_for(lambda l: l.startswith("probe: active ntdll.dll!NtReadVirtualMemory"), 120):
+                raise RuntimeError("probe never became active")
+            target.stdin.write(b"\n"); target.stdin.flush()
+            lines_until(target, '"kind":"app"', 120)                 # keep its pipe drained
+            tracer.wait(timeout=180)                                 # returns when the target exits
             target.wait(timeout=60)
-        except subprocess.TimeoutExpired:
-            pass
-        err = (err or "") + f" | secs_to_app_line={t_app:.1f}"
-        m = re.search(r"new probe_app\.exe pid (\d+)", err or "")
-        objs = [json.loads(l) for l in out.splitlines() if l.startswith("{")]
-        pr = next((o for o in objs if o.get("kind") == "probe"), {})
-        ok = (m is not None and int(m.group(1)) == target.pid and pr.get("hits") == threads * reads and
-              target.returncode == 0)
-        if not ok:
-            err = f"target_rc={target.returncode} | " + (err or "")
-        record("attach-new", ok, f"attached_pid={m.group(1) if m else None} target_pid={target.pid} "
-                                 f"decoy_pid={decoy.pid} hits={pr.get('hits')}/{threads * reads}"
-                                 + ("" if ok else " stderr=" + " | ".join((err or "").strip().splitlines()[:8])))
-    except Exception as e:
-        record("attach-new", False, repr(e))
-    finally:
-        for p_ in (decoy, target):
-            if p_ and p_.poll() is None:
-                p_.kill()
+            err = "\n".join(terr.lines)
+            m = re.search(r"new probe_app\.exe pid (\d+)", err)
+            pr = next((o for o in tout.objs() if o.get("kind") == "probe"), {})
+            ok = (m is not None and int(m.group(1)) == target.pid and pr.get("hits") == threads * reads and
+                  pr.get("backend") == bk and target.returncode == 0 and tracer.returncode == 0)
+            record(name, ok, f"attached_pid={m.group(1) if m else None} target_pid={target.pid} decoy_pid={decoy.pid} "
+                             f"backend={pr.get('backend')} hits={pr.get('hits')}/{threads * reads} "
+                             f"rc={tracer.returncode}/{target.returncode}"
+                             + ("" if ok else " stderr=" + " | ".join(err.strip().splitlines()[-8:])))
+        except Exception as e:
+            record(name, False, repr(e))
+        finally:
+            for p_ in (decoy, target, tracer):
+                if p_ and p_.poll() is None:
+                    p_.kill()
     try:
         r, o = run([t, "--attach-new", "no_such_process_uhh.exe", "--timeout", "1500", "-p", "x.dll!y"], timeout=60)
         ok = r.returncode != 0 and "no new no_such_process_uhh.exe appeared" in (r.stderr or "")
