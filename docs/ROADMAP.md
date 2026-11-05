@@ -127,7 +127,11 @@ binaries (cmd, reg, sort), multi-threaded targets, launch vs attach, attach mid-
   return-value probes on 4 threads (GetLastError via call_func at every CreateFileW return) this
   happens in practice. Inline is unaffected. Clean failure (returns 0), but surprising: the doc
   says "other threads keep running" without saying their callbacks cannot call_func meanwhile.
-  Test: `detours-retval-callfunc-{breakpoint,hw}`. Relates to (#6) (hardening not pursued).
+  Test: `detours-retval-callfunc-{breakpoint,hw}` (intermittent: 0-2 of 36 refused per run, seen
+  on x64 and x86, both backends). Relates to (#6) (hardening not pursued). A fix would need either
+  a nested-call stack in `call_in_target` (an outer call's trap arriving inside the inner wait
+  must be recorded, its thread restored and suspended, and the outer told not to continue it) or
+  suspending the other threads during a call (changes the documented "other threads keep running").
 - ✅ (D4) **A hw probe armed from a callback never fired on threads that were hitting a probe at
   the same moment.** hw entry probe on CreateFileW, return-address probe added (hw) from the
   first entry callback; 4 threads start together: 18/36 and 27/36 returns seen, every miss on

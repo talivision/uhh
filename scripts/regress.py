@@ -1777,7 +1777,13 @@ def check_detours_traceapi(threads=4, iters=5):
     # Real programs. 32-bit drivers launch the SysWOW64 copies through System32 redirection.
     content = wd / "uhhdt-type.txt"
     content.write_text("UHHDT-TYPE-CONTENT line one\nline two\n")
-    cmd_exe, reg_exe = str(SYS32 / "cmd.exe"), str(SYS32 / "reg.exe")
+    # The uninstrumented baseline must run the SAME bitness as the traced program: a 32-bit
+    # driver gets the SysWOW64 copies, and 32-bit reg.exe reads the WOW64 registry view
+    # (HKLM\SOFTWARE\WOW6432Node: a different ProductName on this VM).
+    import struct
+    raw = Path(d).read_bytes()
+    sysdir = Path(r"C:\Windows\SysWOW64") if struct.unpack_from("<H", raw, struct.unpack_from("<I", raw, 0x3C)[0] + 4)[0] == 0x14C else SYS32
+    cmd_exe, reg_exe = str(sysdir / "cmd.exe"), str(sysdir / "reg.exe")
     key = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
     programs = (
         ("type", [cmd_exe, "/d", "/c", "type", str(content)],
