@@ -210,7 +210,9 @@ int call_func(probe_context *, const char *symbol, uint64_t *ret, int nargs, ...
    an EDX:EAX result is not in *ret, but return_from passes it on, see there). A float/double
    result (ST0/XMM0) is not in *ret either; return_from passes it on too. Returns 1 if it
    ran. This probe does not fire (and counts no hit) for that call. nargs = integer/pointer
-   arguments the function takes (0..8); it matters to inline only, and only as a minimum:
+   arguments the function takes (0..16, e.g. 11 for NtCreateFile); it matters to inline only, and
+   only as a minimum (register arguments always go as at the hit: a method with no other
+   arguments is called with nargs 0):
    inline runs the original in a NEW call frame holding a copy of the hit's stack arguments
    -- every one of the first 32 x64 stack arguments / 64 x86 stack slots (bounded by the top
    of the thread's stack), plus RCX/RDX/R8/R9 (x64), EAX/ECX/EDX (x86) and XMM0-5 as at the

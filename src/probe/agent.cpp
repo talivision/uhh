@@ -852,6 +852,7 @@ extern "C" EXCEPTION_DISPOSITION uhh_orig_unwind(EXCEPTION_RECORD *rec, void *fr
     return ExceptionContinueSearch;
 }
 #else
+constexpr int kOrigMaxArgs = 16;              // call_original's argument limit (probe_api.h)
 struct SehRecord { SehRecord *next; void *handler; };
 // FNSAVE/FRSTOR image of the x87 state (108 bytes in 32-bit protected mode).
 static void x87_restore(const unsigned char *img) { __asm { mov eax, img
@@ -936,7 +937,8 @@ static void warn_once(probe_context *c, const char *text);
 extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
     if (g_ctrl) return g_ctrl->call_original(c, nargs, out);
     auto *state = c ? static_cast<AgentState *>(c->controller) : nullptr;
-    if (!state || !state->shared || state->index >= PROBE_AGENT_MAX_PROBES || nargs < 0 || nargs > 8) return 0;
+    if (!state || !state->shared || state->index >= PROBE_AGENT_MAX_PROBES) return 0;
+    if (nargs < 0 || nargs > kOrigMaxArgs) { warn_once(c, "call_original refused: nargs must be 0..16"); return 0; }
     auto *scope = static_cast<HitScope *>(c->hit_scope);
     const uint64_t tramp = state->shared->requests[state->index].trampoline;
     if (!tramp || !scope) return 0;
@@ -960,7 +962,9 @@ extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
     uint64_t r = 0;
 #if defined(_WIN64)
     uint64_t a[4 + UHH_ORIG_STACK_ARGS] = {0};
-    for (int i = 0; i < nargs; ++i) a[i] = get_func_arg(c, (size_t)i);
+    // The register arguments always go as the hit had them (as on breakpoint/hw, which run the
+    // original in place): a method called with nargs 0 still gets `this` (RCX).
+    for (int i = 0; i < (nargs > 4 ? nargs : 4); ++i) a[i] = get_func_arg(c, (size_t)i);
     const int extra = window(c->hit_sp + 0x28, 8, UHH_ORIG_STACK_ARGS);
     for (int i = 0; i < extra; ++i)
         if (4 + i >= nargs) a[4 + i] = reinterpret_cast<const uint64_t *>((uintptr_t)(c->hit_sp + 0x28))[i];

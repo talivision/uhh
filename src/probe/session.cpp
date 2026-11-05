@@ -219,7 +219,7 @@ struct probe_session {
     // (a hit at or above the hit's SP: it left by exception/longjmp without returning).
     uint64_t co_addr = 0, co_sp = 0;
     bool co_entry_pending = false, co_left = false;
-    bool co_warned_entry = false, co_warned_dr = false, co_warned_left = false;
+    bool co_warned_entry = false, co_warned_dr = false, co_warned_left = false, co_warned_nargs = false;
     bool initial_break = false;
     std::unordered_map<DWORD, StepState> stepping;   // threads mid single-step
     // Threads whose in-place step at a probe site faulted: the fault went to the target with
@@ -5424,7 +5424,10 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
 }
 extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
     auto *st = c ? static_cast<CallbackState *>(c->controller) : nullptr;
-    if (!st || !st->session || !st->tid || !st->probe || nargs < 0 || nargs > 8 || st->released) return 0;
+    if (!st || !st->session || !st->tid || !st->probe || st->released) return 0;
+    if (nargs < 0 || nargs > 16) {                                     // same contract as inline
+        co_warn(st->session->co_warned_nargs, st->probe, "call_original refused: nargs must be 0..16"); return 0;
+    }
     if (st->probe->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) return 0;
     if (st->session->in_call_tid) return 0;                            // no nesting
     return call_original_in_place(st->session, st, c, out);
