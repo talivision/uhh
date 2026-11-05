@@ -2,7 +2,10 @@
 // well-known instrumentation write-up does, on any backend:
 //
 //   blog_driver --scenario crypto|registry|net|spawn|com|game --backend breakpoint|hw|inline
-//               [--no-log] -- <program> [args...]
+//               [--no-log] [--naive] -- <program> [args...]
+//
+// --naive (crypto): also capture BCryptGenRandom's nested self-call, as a first-cut
+// monitor would -- on hw that asks for a 5th debug register from inside a callback.
 //
 // Output: the target's own stdout, then probe_report (JSON lines). The callbacks
 // (blog_callbacks.cpp) are the same source under every backend.
@@ -56,7 +59,7 @@ const std::vector<site> *sites_for(const char *scenario) {
 
 int usage() {
     std::fprintf(stderr, "usage: blog_driver --scenario crypto|registry|net|spawn|com|game "
-                         "--backend breakpoint|hw|inline [--no-log] -- <program> [args...]\n");
+                         "--backend breakpoint|hw|inline [--no-log] [--naive] -- <program> [args...]\n");
     return 2;
 }
 
@@ -65,12 +68,13 @@ int usage() {
 int main(int argc, char **argv) {
     const char *scenario = nullptr;
     uint32_t backend = 0;
-    bool log = true;
+    bool log = true, naive = false;
     int i = 1;
     for (; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--")) { ++i; break; }
         if (!std::strcmp(argv[i], "--scenario") && i + 1 < argc) { scenario = argv[++i]; continue; }
         if (!std::strcmp(argv[i], "--no-log")) { log = false; continue; }
+        if (!std::strcmp(argv[i], "--naive")) { naive = true; continue; }
         if (!std::strcmp(argv[i], "--backend") && i + 1 < argc) {
             const char *b = argv[++i];
             backend = !std::strcmp(b, "breakpoint") ? PROBE_BREAKPOINT : !std::strcmp(b, "hw") ? PROBE_HW
@@ -82,7 +86,7 @@ int main(int argc, char **argv) {
     const std::vector<site> *sites = scenario ? sites_for(scenario) : nullptr;
     if (!sites || !backend || i >= argc) return usage();
 
-    const blog_config config{BLOG_COOKIE, backend, log ? 1u : 0u, 0u};
+    const blog_config config{BLOG_COOKIE, backend, log ? 1u : 0u, naive ? BLOG_NAIVE : 0u};
     probe_session *s = probe_session_create();
     if (!s) return 1;
     int ok = 1;

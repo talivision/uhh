@@ -3292,6 +3292,30 @@ def blog_scenario_ok(scn, bk, tgt, msgs, objs):
     return False, "unknown scenario"
 
 
+def blog_crypto_naive_hw(d, t, targs, base, fields, rounds=3):
+    """The first-cut crypto monitor on hw: BCryptGenRandom re-enters itself, so the
+    callback asks for a 5th debug register (a return probe inside bcrypt) from inside a
+    callback while other threads are trapped on the entry. The request must be refused
+    cleanly and the target must not notice -- it used to die with an unhandled
+    STATUS_SINGLE_STEP (a queued #DB whose DR6 was lost when DR3 was armed)."""
+    name = "blog-crypto-naive-hw"
+    print(f"  .. {name}", file=sys.stderr, flush=True)
+    for i in range(rounds):
+        r, o = blog_run([d, "--scenario", "crypto", "--backend", "hw", "--naive", "--", t, "crypto", *targs], timeout=300)
+        tgt, rep = blog_target_json(o), report(o)
+        msgs = [str(x.get("message", "")) for x in o if x.get("kind") == "probe_log"]
+        refused = sum("REFUSED" in m for m in msgs)
+        rets = sum(m.startswith("BCryptGenRandom ret ") for m in msgs)
+        diff = {f: (base.get(f), tgt.get(f)) for f in fields if base.get(f) != tgt.get(f)}
+        ok = (r.returncode == 0 and rep.get("app_exit") == 0 and not diff and refused >= 1 and
+              rets == tgt.get("genrandom") and rep.get("log_dropped") == 0 and rep.get("error") is None and
+              "not ours passed to the target" not in (r.stderr or ""))
+        if not ok or i == rounds - 1:
+            return record(name, ok, f"round={i + 1}/{rounds} refused_logs={refused} rng_ret_logs={rets}/{tgt.get('genrandom')} "
+                                    f"vs_baseline={'same' if not diff else diff} rc={r.returncode} exit={rep.get('app_exit')} "
+                                    f"stray_db={[l for l in (r.stderr or '').splitlines() if 'not ours' in l][:1]}")
+
+
 def check_blog_replicas():
     """Blog replicas: crypto-API monitor, registry Run-key monitor, DNS/socket logger,
     process-creation tracker, COM CLSID logger, game-loop frame probe -- each against an
@@ -3336,6 +3360,8 @@ def check_blog_replicas():
                        f"err={(rep.get('error') or '')[:160]}" +
                        ("" if generic else f" probes={[(p.get('location'), p.get('backend'), p.get('active'), p.get('hits')) for p in prs]}"
                                            f" stderr={(r.stderr or '')[-300:]!r}"))
+                if scn == "crypto" and bk == "hw":
+                    blog_crypto_naive_hw(d, t, targs, base, fields)
             except subprocess.TimeoutExpired as e:
                 # A hang is a bug: say where it stopped (last lines of the driver's output).
                 out, err = e.stdout or "", e.stderr or ""

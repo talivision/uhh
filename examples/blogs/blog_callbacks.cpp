@@ -142,6 +142,15 @@ BLOG_EXPORT void blog_on_genrandom(probe_context *c) {
     uint32_t flags = k ? k->backend : PROBE_BREAKPOINT;
     if (flags & PROBE_INLINE) flags |= PROBE_FALLBACK_HW;   // a return site may not be inline-safe
     AcquireSRWLockExclusive(&g_rng_lock);
+    // BCryptGenRandom re-enters ITSELF (the export calls the export again, same buffer and
+    // size): a naive monitor counts every call twice and needs a second return probe
+    // inside bcrypt.dll. Only the outermost call is captured: a pending entry slightly
+    // ABOVE this SP is this thread's outer call (stacks of different threads are far
+    // apart). BLOG_NAIVE keeps the naive behaviour (it reaches the hw 4-slot limit).
+    const bool naive = k && (k->flags & BLOG_NAIVE);
+    if (!naive)
+        for (const auto &p : g_pending)
+            if (p.sp > sp && p.sp - sp < 0x4000) { ReleaseSRWLockExclusive(&g_rng_lock); return; }
     for (auto &p : g_pending) if (!p.sp) { p.sp = sp; p.buf = buf; break; }
     bool known = false;
     for (uint64_t s : g_ret_sites) known = known || s == ret;

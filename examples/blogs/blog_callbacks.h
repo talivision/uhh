@@ -14,8 +14,9 @@ struct blog_config {
     uint32_t cookie;    /* BLOG_COOKIE */
     uint32_t backend;   /* PROBE_* of the entry probe: dynamic return probes use the same */
     uint32_t log;       /* 0 = count only (game: measure the bare per-hit cost) */
-    uint32_t reserved;
+    uint32_t flags;     /* BLOG_NAIVE */
 };
+#define BLOG_NAIVE 1u   /* crypto: capture nested BCryptGenRandom calls too (needs a 5th hw slot) */
 
 // crypto (ransomware-detection write-ups)
 BLOG_EXPORT void blog_on_bcrypt_encrypt(probe_context *c);
