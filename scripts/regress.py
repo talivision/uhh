@@ -1024,8 +1024,10 @@ EDGE_LOC = {"rep": "EdgeRepSite", "stos": "EdgeStosSite", "ripload": "EdgeRipLoa
             "lock": "EdgeLockSite", "args": "edge_args10", "mem": "edge_mem_site", "readd": "EdgeReaddA",
             "leaf": "edge_leaf", "fmt": "edge_fmt_site", "fmtptr": "edge_fmt_site", "cbfault": "EdgeReaddB"}
 # Shapes an inline hook cannot take (a 5-byte jump would run past a ret / into a jump-table
-# target): a clean refusal is the correct inline answer there.
-EDGE_INLINE_REFUSED = {"retonly", "jump"}
+# target): a clean refusal is the correct inline answer there. (x86's jump-table jmp is 7
+# bytes long, so its hook stays inside the instruction and is accepted.)
+EDGE_INLINE_REFUSED_X64 = {"retonly", "jump"}
+EDGE_INLINE_REFUSED_X86 = {"retonly"}
 
 
 def check_edgehunt():
@@ -1052,6 +1054,7 @@ def check_edgehunt():
         return
     K = EDGE_ITERS
     shapes = [s for s in EDGE_SHAPES if not (x86 and s in EDGE_X64_ONLY)]
+    refused_inline = EDGE_INLINE_REFUSED_X86 if x86 else EDGE_INLINE_REFUSED_X64
 
     def expected_hits(site):
         if site in ("faultmid", "rdtsc"):
@@ -1081,7 +1084,7 @@ def check_edgehunt():
 
     for bk in ("breakpoint", "hw", "inline"):
         # code shapes: batches of <= 4 (hw has 4 slots); inline refusals run on their own
-        normal = [s for s in shapes if not (bk == "inline" and s in EDGE_INLINE_REFUSED)]
+        normal = [s for s in shapes if not (bk == "inline" and s in refused_inline)]
         for i in range(0, len(normal), 4):
             batch = normal[i:i + 4]
             name = f"edgehunt-{bk}-{'+'.join(batch)}"
@@ -1100,7 +1103,7 @@ def check_edgehunt():
             except Exception as e:
                 record(name, False, repr(e))
         if bk == "inline":
-            for s in sorted(EDGE_INLINE_REFUSED):
+            for s in sorted(refused_inline):
                 name = f"edgehunt-inline-{s}-refused"
                 try:
                     r, o = run([d, "--backend", "inline", "--sites", s, "--", t, "--iters", K], timeout=120)
@@ -1130,10 +1133,12 @@ def check_edgehunt():
             r, o, msgs, tg = go(bk, ["fmt"])
             bad = common(r, o, msgs, tg)
             fm = [m for m in msgs if "fmt-" in m]
-            need = ["fmt-null-s (null) end", "[unformattable] fmt-invalid %k end",
-                    "[unformattable] fmt-percent-n %n end", "fmt-done"]
+            # %k is not a conversion the UCRT rejects (it prints "k"); %n is (it used to fast-fail
+            # the controller, or the TARGET for inline). Same text on every backend.
+            need = ["fmt-null-s (null) end", "fmt-invalid k end", "[unformattable] fmt-percent-n %n end",
+                    "fmt-trailing ", "fmt-done"]
             for n_ in need:
-                if n_ not in fm: bad.append(f"missing {n_!r} in {fm}")
+                if n_ not in fm: bad.append(f"missing {n_!r} in {[m[:60] for m in fm]}")
             wide = [m for m in fm if m.startswith("fmt-wide")]
             if len(wide) != 1 or not wide[0].endswith("...[truncated]"): bad.append(f"wide={[w[-20:] for w in wide]}")
             if len(fm) != 6: bad.append(f"records={len(fm)}/6 {fm}")

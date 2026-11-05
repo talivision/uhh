@@ -12,12 +12,13 @@
 typedef unsigned long long u64;
 #define EXPORT __declspec(dllexport) __declspec(noinline)
 
-u64 EdgeRep(void *dst, const void *src);
-u64 EdgeStos(void *dst);
-u64 EdgeCpuid(void);
-u64 EdgeRdtsc(void);
-u64 EdgePushf(void);
-u64 EdgePopf(uintptr_t flags);
+// Register-width results (EAX on x86, RAX on x64).
+uintptr_t EdgeRep(void *dst, const void *src);
+uintptr_t EdgeStos(void *dst);
+uintptr_t EdgeCpuid(void);
+uintptr_t EdgeRdtsc(void);
+uintptr_t EdgePushf(void);
+uintptr_t EdgePopf(uintptr_t flags);
 void EdgeRetOnly(void);
 int EdgeThunk(void);
 int EdgeJump(int idx);
@@ -55,7 +56,7 @@ struct edge_mem {
     u64 guard;      // PAGE_READWRITE | PAGE_GUARD
     u64 ro;         // PAGE_READONLY, bytes 0x11
     u64 code;       // EdgeCodePad: PAGE_EXECUTE_READ, never executed
-    u64 freed;      // released
+    u64 freed;      // decommitted (the reservation is kept, so nothing else can be mapped there)
     u64 cross;      // 8 bytes before a PAGE_NOACCESS page (RW page then no access)
     u64 rw;         // ordinary RW buffer
     u64 site;       // EdgeRepSite: code a probe sits on (F3 A4 originally)
@@ -108,12 +109,14 @@ int main(int argc, char **argv) {
     unsigned char *g = (unsigned char *)VirtualAlloc(NULL, page, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE | PAGE_GUARD);
     unsigned char *ro = (unsigned char *)VirtualAlloc(NULL, page, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     unsigned char *fr = (unsigned char *)VirtualAlloc(NULL, page, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    // (A RELEASED region can be handed out again before the probe reads it -- UHH's own
+    // allocations in the target are an example -- so the test keeps it reserved.)
     unsigned char *two = (unsigned char *)VirtualAlloc(NULL, 2 * page, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     static unsigned char rwbuf[64];
     DWORD old = 0;
     if (!g || !ro || !fr || !two) return 10;
     memset(ro, 0x11, page); VirtualProtect(ro, page, PAGE_READONLY, &old);
-    VirtualFree(fr, 0, MEM_RELEASE);
+    VirtualFree(fr, page, MEM_DECOMMIT);
     memset(two, 0x22, page); VirtualProtect(two + page, page, PAGE_NOACCESS, &old);
     m.guard = (u64)(uintptr_t)g; m.ro = (u64)(uintptr_t)ro; m.code = (u64)(uintptr_t)EdgeCodePad;
     m.freed = (u64)(uintptr_t)fr; m.cross = (u64)(uintptr_t)(two + page - 8); m.rw = (u64)(uintptr_t)rwbuf;
@@ -131,7 +134,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < 100; ++i) src[i] = (unsigned char)(i * 7 + k);
         memset(dst, 0, sizeof(dst));
         T("EdgeRep");
-        u64 left = EdgeRep(dst, src);
+        u64 left = (u64)EdgeRep(dst, src);
         rep_sum += left + (memcmp(dst, src, 100) == 0 ? 1 : 1000) + dst[100];
         memset(dst, 0, sizeof(dst));
         T("EdgeStos");
