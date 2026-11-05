@@ -947,7 +947,7 @@ real). Each now asserts an independent oracle -- constants and counts computed i
 written out literally, return codes, hits == logs + dropped + interrupted, the target's own
 result values, strict JSON, multisets -- and missing explicitly-selected prerequisites FAIL.
 Checks that now fail are left failing (library code is not changed here):
-- ⬜ (TH1) **`call_func("kernel32!X")` resolves on every backend, but `include/probe_api.h`
+- ✅ (TH1, resolved: accepted everywhere; header and oracle updated) **`call_func("kernel32!X")` resolves on every backend, but `include/probe_api.h`
   says it is refused** ("module is matched by its file name WITH extension ... "kernel32!X" is
   refused"). Portability P1 made every backend refuse it; transparency TR5 (516358d) then made
   every backend accept it (bare name = `<name>.dll`) without changing the header. The old

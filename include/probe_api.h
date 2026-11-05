@@ -207,7 +207,8 @@ const void *get_config(probe_context *);
    of microseconds, so cache results. The callee runs with whatever locks the hit thread
    holds: avoid functions that need them (e.g. the allocator from inside a malloc hook).
    The symbol grammar is the same on every backend: the module is matched by its file name
-   WITH extension (a directory part is ignored; "kernel32!X" is refused), offsets are "+0x"
+   (a directory part is ignored; a name without extension means "<name>.dll", so
+   "kernel32!X" == "kernel32.dll!X"), offsets are "+0x"
    hex only; an unknown module/export, nargs outside 0..8 or an address that is no committed
    executable memory returns 0 without calling anything. One difference: a callee that raises
    an exception -- even one it handles itself -- is abandoned at that exception on

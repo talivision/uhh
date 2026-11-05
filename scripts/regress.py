@@ -937,7 +937,7 @@ def portability_expect(phase, x86):
                   "mem.set.rw": "1", "mem.set.high": "0", "mem.set.null-buf": "0",
                   "target.w_rw": "a5a5a5a5", "target.head_intact": "1",
                   "call_func.plain": "1 pid=1", "call_func.upper": "1 pid=1", "call_func.path": "1 pid=1",
-                  "call_func.off-hex": "1 pid=1", "call_func.no-ext": "0 pid=0", "call_func.off-no-0x": "0 pid=0",
+                  "call_func.off-hex": "1 pid=1", "call_func.no-ext": "1 pid=1", "call_func.off-no-0x": "0 pid=0",
                   "call_func.off-bad": "0 pid=0", "call_func.no-module": "0 pid=0", "call_func.no-export": "0 pid=0",
                   "call_func.empty-export": "0 pid=0", "call_func.empty-module": "0 pid=0",
                   "call_func.nargs9": "0", "call_func.nargs-neg": "0", "call_func.null-symbol": "0",
