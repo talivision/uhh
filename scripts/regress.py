@@ -132,6 +132,13 @@ def exe(name):
     return p if p.exists() else None
 
 
+
+def pe_is_x86(path):
+    """True for a 32-bit (i386) PE image: the arch from the header, never from a path."""
+    data = Path(path).read_bytes()
+    return struct.unpack_from("<H", data, struct.unpack_from("<I", data, 0x3C)[0] + 4)[0] == 0x14C
+
+
 def live(result):
     """Each result as it is recorded (timestamped), so a run can be followed in flight;
     the full table is printed again at the end."""
@@ -931,7 +938,7 @@ def check_callorig_hunt():
     d, t = exe("co_driver.exe"), exe("co_target.exe")
     if not d or not t:
         return skip("callorig-hunt", "co_driver/co_target missing")
-    x86 = "x86" in str(BIN).lower() or "win32" in str(BIN).lower()
+    x86 = pe_is_x86(t)
 
     def co_row(objs):
         return next((x for x in objs if x.get("kind") == "co"), {})
@@ -1056,8 +1063,7 @@ def check_callconv():
     d, t = exe("cc_driver.exe"), exe("cc_target.exe")
     if not d or not t:
         return skip("callconv", "cc_driver/cc_target missing")
-    data = Path(t).read_bytes()          # the arch from the PE header (a path can say anything)
-    x86 = struct.unpack_from("<H", data, struct.unpack_from("<I", data, 0x3C)[0] + 4)[0] == 0x14C
+    x86 = pe_is_x86(t)
     ids = [i for i, n in enumerate(CC_NAMES) if x86 or n not in CC_X86_ONLY]
 
     def rows(objs):
