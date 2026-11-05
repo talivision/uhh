@@ -40,6 +40,27 @@ else()
 endif()
 
 include(FetchContent)
+# Offline by default: SafetyHook (pre-patched) and Zydis/Zycore are vendored in third_party/
+# and FetchContent is pointed at them -- no git, no network. UHH_VENDORED_DEPS=OFF fetches
+# the same tags from GitHub instead (and applies the SafetyHook patch at fetch time).
+option(UHH_VENDORED_DEPS "Build SafetyHook and Zydis from third_party/ (no network)" ON)
+if(UHH_VENDORED_DEPS)
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/safetyhook/CMakeLists.txt" OR
+       NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/zydis/dependencies/zycore/CMakeLists.txt")
+        message(FATAL_ERROR "UHH_VENDORED_DEPS=ON but third_party/ is incomplete (see third_party/README.md)")
+    endif()
+    set(FETCHCONTENT_SOURCE_DIR_SAFETYHOOK "${CMAKE_CURRENT_SOURCE_DIR}/third_party/safetyhook" CACHE PATH "" FORCE)
+    set(FETCHCONTENT_SOURCE_DIR_ZYDIS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/zydis" CACHE PATH "" FORCE)
+else()
+    unset(FETCHCONTENT_SOURCE_DIR_SAFETYHOOK CACHE)
+    unset(FETCHCONTENT_SOURCE_DIR_ZYDIS CACHE)
+endif()
+set(ZYDIS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(ZYDIS_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(ZYDIS_BUILD_MAN OFF CACHE BOOL "" FORCE)
+set(ZYDIS_BUILD_DOXYGEN OFF CACHE BOOL "" FORCE)
+set(ZYCORE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(SAFETYHOOK_BUILD_TEST OFF CACHE BOOL "" FORCE)
 set(SAFETYHOOK_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(SAFETYHOOK_BUILD_DOCS OFF CACHE BOOL "" FORCE)

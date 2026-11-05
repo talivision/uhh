@@ -95,8 +95,9 @@ and activate on load.
 
 ## Build
 
-Requires Windows, Visual Studio 2022 (MSVC) and CMake. SafetyHook and Zydis are
-fetched automatically.
+Requires Windows, Visual Studio 2022 (MSVC) and CMake -- nothing else, and **no network**:
+SafetyHook and Zydis are vendored in `third_party/` (see `third_party/README.md`) and used by
+default. Pass `-DUHH_VENDORED_DEPS=OFF` to fetch the same tags from GitHub instead.
 
 ```sh
 # x64
