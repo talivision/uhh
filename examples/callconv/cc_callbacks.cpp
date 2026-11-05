@@ -16,7 +16,12 @@ struct cc_cfg { uint32_t mode, id; };
 #define CC_CB extern "C" __declspec(dllexport)
 
 static bool arg_is(probe_context *c, const char *name, size_t i, uint64_t want) {
-    const uint64_t got = get_func_arg(c, i);
+    uint64_t got = get_func_arg(c, i);
+#if defined(_WIN64)
+    // An int argument fills only the low 32 bits of its register/slot; the upper half is
+    // whatever was there (the caller writes `mov dword ptr [rsp+20h], ...`).
+    if (want <= 0xFFFFFFFFull) got = (uint32_t)got;
+#endif
     if (got == want) return true;
     send_log(c, "cc FAIL %s get_func_arg(%u)=0x%llx want 0x%llx", name, (unsigned)i,
              (unsigned long long)got, (unsigned long long)want);
