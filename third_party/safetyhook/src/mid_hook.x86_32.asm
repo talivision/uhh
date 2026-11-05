@@ -50,9 +50,8 @@ pop ecx
 pop ebx
 pop eax
 pop ebp
-lea esp, [esp+4] ; skip original esp
-pop esp
-ret
+pop esp ; uhh_resume_jmp: the context's esp (writable)
+jmp dword [trampoline] ; no ret: CET shadow stacks
 
 destination:
 dd 0

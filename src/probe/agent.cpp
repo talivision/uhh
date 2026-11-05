@@ -102,10 +102,8 @@ extern "C" uint64_t get_reg(probe_context *c, enum probe_register reg) {
 }
 extern "C" int set_reg(probe_context *c, enum probe_register reg, uint64_t value) {
     if (g_ctrl) return g_ctrl->set_reg(c, reg, value);
-    // Inline: the stack pointer cannot be changed yet -- SafetyHook's resume path keeps the
-    // saved registers just below it, so moving it would corrupt them. Refuse honestly
-    // (returns 0, nothing changes, nothing counted). Fix tracked: patch the resume stub.
-    if (reg == PROBE_REG_SP) return 0;
+    // Inline set_reg(SP) is honoured: the (patched) SafetyHook stub resumes with
+    // `pop rsp; jmp [trampoline]`, loading the context's rsp -- see call_mid.
     uint64_t *slot = register_slot(c, reg); if (!slot) return 0;
     if (*slot != value) {
         *slot = value;
@@ -513,6 +511,16 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     native.ecx = (uint32_t)c.regs.rcx; native.edx = (uint32_t)c.regs.rdx;
     native.esi = (uint32_t)c.regs.rsi; native.edi = (uint32_t)c.regs.rdi;
     native.ebp = (uint32_t)c.regs.rbp;
+#endif
+    // set_reg(SP): the patched resume stub (cmake/patch_safetyhook.cmake, uhh_resume_jmp)
+    // ends `pop rsp; jmp [trampoline]`, so the context's rsp IS the stack pointer the
+    // hooked code resumes with -- nothing is written to the stack (moving SP down cannot
+    // clobber the saved registers) and there is no `ret` to a pushed address (CET shadow
+    // stacks never see the hook).
+#if defined(_WIN64)
+    native.rsp = c.regs.rsp;
+#else
+    native.esp = (uint32_t)c.regs.rsp;
 #endif
 }
 

@@ -23,6 +23,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <immintrin.h>
 #include <tlhelp32.h>
 #include <atomic>
 #include <cstdio>
@@ -283,14 +284,22 @@ int main(int argc, char **argv) try {
     for (auto &r : results) { require(r.error.empty(), r.error); success += r.success; checksum += r.checksum; }
     uint64_t hook_calls = prehook_calls.load();
     prehook.reset();
+    // CET: RDSSP reads the shadow-stack pointer, and is a NOP (leaves 0) when this thread
+    // has no shadow stack -- the /CETCOMPAT build (probe_app_cet) reports whether the CPU
+    // and OS actually enforced one for this run.
+#if defined(_WIN64)
+    const uint64_t ssp = _rdsspq();
+#else
+    const uint64_t ssp = _rdsspd();
+#endif
     std::printf("{\"kind\":\"app\",\"reads_enabled\":%u,\"helpers\":%llu,\"opened\":%llu,\"threads\":%llu,"
                 "\"reads_per_thread\":%llu,\"successful_reads\":%llu,\"checksum\":%llu,\"elapsed_ns\":%.0f,"
-                "\"prehook\":%s,\"prehook_calls\":%llu,\"configparse_base\":%llu}\n",
+                "\"prehook\":%s,\"prehook_calls\":%llu,\"configparse_base\":%llu,\"shadow_stack\":%s}\n",
                 parsed.reads_enabled, (unsigned long long)helper_count,
                 (unsigned long long)(parsed.reads_enabled ? helper_count : 0), (unsigned long long)threads,
                 (unsigned long long)reads, (unsigned long long)success, (unsigned long long)checksum, elapsed_ns,
                 existing_hook ? "true" : "false", (unsigned long long)hook_calls,
-                (unsigned long long)(uintptr_t)dll);
+                (unsigned long long)(uintptr_t)dll, ssp ? "true" : "false");
     std::fflush(stdout);
     return 0;
 } catch (const std::exception &e) { std::fprintf(stderr, "probe_app: %s\n", e.what()); return 1; }

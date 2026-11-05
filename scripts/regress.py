@@ -806,7 +806,7 @@ def check_conformance():
             once_row = next((p for p in hw_rows if p.get("active") is False), {})
             watch_row = next((p for p in hw_rows if p.get("active") is True), {})
             ok = (not fails and not missing and tgt.get("arg_rewritten") == 10 and tgt.get("mem_written") == 10 and
-                  tgt.get("sp_moved") == (0 if bk == "inline" else 10) and   # inline: set_reg(SP) refused (roadmap)
+                  tgt.get("sp_moved") == 10 and   # set_reg(SP) honoured on every backend
                   stack_ok and report(o).get("error") is None and report(o).get("log_dropped") == 0 and
                   later == 20 and once == 1 and once_row.get("hits") == 1 and watch_row.get("hits") == 3 and
                   len(hw_rows) == 2)
@@ -1232,6 +1232,114 @@ def check_emulated_sites(threads=8, calls=20000):
                 record(name, False, repr(e))
 
 
+def ntopen_ret_site(t):
+    """ntdll!NtOpenProcess+off of the stub's `ret` (decoded from the DLL file of t's arch)."""
+    import struct
+    data = Path(t).read_bytes()
+    x86 = struct.unpack_from("<H", data, struct.unpack_from("<I", data, 0x3C)[0] + 4)[0] == 0x14C
+    nt = Path(r"C:\Windows\SysWOW64\ntdll.dll") if x86 else SYS32 / "ntdll.dll"
+    stub = pe_export_bytes(nt, "NtOpenProcess", 32) or b""
+    anchor_bytes, ret_ops = (b"\xff\xd2", (0xC2, 0xC3)) if x86 else (b"\x0f\x05", (0xC3,))
+    i = stub.find(anchor_bytes)
+    off = next((k for k in range(i + len(anchor_bytes), len(stub)) if stub[k] in ret_ops), None) if i >= 0 else None
+    return (None if off is None else f"ntdll.dll!NtOpenProcess+0x{off:x}"), stub
+
+
+def pe_cetcompat(path):
+    """True when the PE's extended DLL characteristics (debug directory entry type 20,
+    IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS) carry CET_COMPAT (0x1) -- what /CETCOMPAT sets."""
+    import struct
+    d = Path(path).read_bytes()
+    pe = struct.unpack_from("<I", d, 0x3C)[0]
+    nsec, optsz = struct.unpack_from("<H", d, pe + 6)[0], struct.unpack_from("<H", d, pe + 20)[0]
+    opt = pe + 24
+    dd = opt + (112 if struct.unpack_from("<H", d, opt)[0] == 0x20B else 96)
+    rva, size = struct.unpack_from("<II", d, dd + 6 * 8)
+    secs = [struct.unpack_from("<IIII", d, opt + optsz + 40 * i + 8) for i in range(nsec)]  # vsize, va, rawsize, raw
+    def off(r):
+        return next((raw + r - va for vs, va, rs, raw in secs if va <= r < va + max(vs, rs)), None)
+    o = off(rva) if rva else None
+    for i in range(size // 28 if o is not None else 0):
+        typ, dsz, _, raw = struct.unpack_from("<IIII", d, o + 28 * i + 12)
+        if typ == 20 and dsz >= 4:
+            return bool(struct.unpack_from("<I", d, raw)[0] & 1)
+    return False
+
+
+def check_cet(threads=8, reads=500):
+    """Intel CET shadow stacks. cet_probe (linked /CETCOMPAT) reports what this machine
+    gives such a process: CPUID CET_SS, the OS CET_U state, the process's
+    ProcessUserShadowStackPolicy, and RDSSP (non-zero only when a shadow stack is ACTIVE).
+    Then the gated_config scenario runs on probe_app_cet (the same target linked
+    /CETCOMPAT) with flag, open and read probes all on ONE backend, for each backend:
+    flag flipped once, every read hit and logged, nothing dropped, the target's checksum
+    equal to an uninstrumented CET run, and the target's own RDSSP agreeing with
+    cet_probe (so a pass on a CET machine is a pass WITH the shadow stack enforced).
+    cet-ret-breakpoint probes NtOpenProcess's `ret` with a software breakpoint: emulating
+    that ret would desync the shadow stack, so on a CET target UHH must step it for real.
+    The detail of every row says whether CET was enforced; on a machine without CET these
+    rows prove only that /CETCOMPAT targets work, not the CET behaviour."""
+    pr_exe, tgt, gc, t = exe("cet_probe.exe"), exe("probe_app_cet.exe"), exe("gated_config.exe"), exe("uhh_trace.exe")
+    if not pr_exe or not tgt or not gc or not t:
+        return skip("cet", "cet_probe/probe_app_cet/gated_config/uhh_trace missing")
+    try:
+        flags = {n: pe_cetcompat(BIN / n) for n in ("probe_app_cet.exe", "cet_probe.exe", "probe_app.exe")}
+        record("cet-image", flags["probe_app_cet.exe"] and flags["cet_probe.exe"] and not flags["probe_app.exe"],
+               " ".join(f"{n}:CETCOMPAT={v}" for n, v in flags.items()))
+    except Exception as e:
+        record("cet-image", False, repr(e))
+    enforced = None
+    try:
+        r, o = run([pr_exe], timeout=60)
+        info = next((x for x in o if x.get("kind") == "cet_probe"), {})
+        enforced = info.get("enforced")
+        pol = info.get("policy", {})
+        record("cet-probe", r.returncode == 0 and enforced is not None and info.get("policy_ok") == 1,
+               f"arch={info.get('arch')} vendor={info.get('vendor')} hypervisor={info.get('hypervisor')} "
+               f"build={info.get('windows_build')} cpuid_cet_ss={info.get('cpuid_cet_ss')} "
+               f"cpuid_cet_ibt={info.get('cpuid_cet_ibt')} os_cet_u={info.get('os_cet_u')} "
+               f"ENFORCED={enforced} policy={{{', '.join(f'{k}={v}' for k, v in pol.items() if v)}}}")
+    except Exception as e:
+        record("cet-probe", False, repr(e))
+    total = int(threads) * int(reads)
+    base = {}
+    try:
+        _, bo = run([tgt, "--no-wait", "--threads", threads, "--reads", reads, "--config", "reads_enabled=1"], timeout=120)
+        base = app(bo)
+    except Exception:
+        pass
+    for bk in ("breakpoint", "inline", "hw"):
+        name = f"cet-gated-{bk}"
+        try:
+            r, o = run([gc, "--flag-backend", bk, "--read-backend", bk, "--open-backend", bk, FLAG_LOCATION, READ_LOCATION,
+                        "--", tgt, "--no-wait", "--helpers", HELPERS, "--threads", threads, "--reads", reads], timeout=300)
+            rep, rd, a = report(o), read_probe(o), app(o)
+            logs, dropped = read_logs(o)
+            same = (base.get("checksum") is not None and a.get("checksum") == base.get("checksum")
+                    and a.get("successful_reads") == base.get("successful_reads") == total)
+            ok = (r.returncode == 0 and rep.get("overrides") == 1 and rd.get("hits") == total and rd.get("backend") == bk
+                  and logs == total and dropped == 0 and unmapped(o) == 0 and rep.get("error") is None and same
+                  and a.get("shadow_stack") == enforced)
+            record(name, ok, f"cet_enforced={enforced} target_ssp={a.get('shadow_stack')} override={rep.get('overrides')} "
+                             f"hits={rd.get('hits')}/{total} logs={logs} dropped={dropped} checksum_same={same} "
+                             f"rc={r.returncode} err={(rep.get('error') or '')[:120]} stderr={r.stderr.strip()[-160:]!r}")
+        except Exception as e:
+            record(name, False, repr(e))
+    site, stub = ntopen_ret_site(t)
+    if site is None:
+        return record("cet-ret-breakpoint", False, f"no ret found in NtOpenProcess stub: {stub.hex()}")
+    try:
+        r, o = run([t, "--backend", "breakpoint", "-p", f"{site}:x", "--", tgt, "--no-wait", "--helpers", HELPERS,
+                    "--threads", 2, "--reads", 50, "--config", "reads_enabled=1"], timeout=300)
+        a, pr = app(o), next((x for x in o if x.get("kind") == "probe"), {})
+        ok = (r.returncode == 0 and a.get("opened") == HELPERS and a.get("successful_reads") == 100
+              and pr.get("backend") == "breakpoint" and pr.get("hits") == HELPERS and a.get("shadow_stack") == enforced)
+        record("cet-ret-breakpoint", ok, f"cet_enforced={enforced} site={site} hits={pr.get('hits')}/{HELPERS} "
+                                         f"opened={a.get('opened')} reads={a.get('successful_reads')} rc={r.returncode}")
+    except Exception as e:
+        record("cet-ret-breakpoint", False, repr(e))
+
+
 def check_ret_probe(threads=2, reads=50):
     """A probe on a function's own `ret` -- the natural way to see a return (no special
     flag): ntdll!NtOpenProcess's ret, found by decoding the stub in the DLL file. probe_app
@@ -1241,17 +1349,9 @@ def check_ret_probe(threads=2, reads=50):
     t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
     if not t or not a:
         return skip("ret-probe", "uhh_trace/probe_app missing")
-    import struct
-    data = Path(t).read_bytes()
-    x86 = struct.unpack_from("<H", data, struct.unpack_from("<I", data, 0x3C)[0] + 4)[0] == 0x14C
-    nt = Path(r"C:\Windows\SysWOW64\ntdll.dll") if x86 else SYS32 / "ntdll.dll"
-    stub = pe_export_bytes(nt, "NtOpenProcess", 32) or b""
-    anchor_bytes, ret_ops = (b"\xff\xd2", (0xC2, 0xC3)) if x86 else (b"\x0f\x05", (0xC3,))
-    i = stub.find(anchor_bytes)
-    off = next((k for k in range(i + len(anchor_bytes), len(stub)) if stub[k] in ret_ops), None) if i >= 0 else None
-    if off is None:
+    site, stub = ntopen_ret_site(t)
+    if site is None:
         return record("ret-probe", False, f"no ret found in NtOpenProcess stub: {stub.hex()}")
-    site = f"ntdll.dll!NtOpenProcess+0x{off:x}"
     helpers = 4
     for bk, extra in (("breakpoint", []), ("hw", []), ("inline", []), ("inline", ["--fallback-hw"])):
         name = f"ret-probe-{bk}{'-fallback' if extra else ''}"
@@ -1642,6 +1742,7 @@ def main():
     if want(check_patch_race): check_patch_race()
     if want(check_emulated_sites): check_emulated_sites()
     if want(check_ret_probe): check_ret_probe()
+    if want(check_cet): check_cet()
     if want(check_shared_mix): check_shared_mix()
     if want(check_gated_mem): check_gated_mem()
     if want(check_forwarded_probe): check_forwarded_probe()

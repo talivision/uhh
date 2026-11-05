@@ -85,6 +85,17 @@ target_include_directories(probe_app PRIVATE examples/targets/configparse)
 target_link_libraries(probe_app PRIVATE safetyhook)
 target_link_options(probe_app PRIVATE ${READ_THUNK_EXPORT} "/MAP:$<TARGET_FILE_DIR:probe_app>/probe_app.map")
 
+# Intel CET (hardware shadow stacks): the same target linked /CETCOMPAT, so Windows gives it
+# a user shadow stack on CET hardware (Tiger Lake+ / Zen 3+, x64; WoW64 is not enforced),
+# and cet_probe, which reports whether this machine actually enforces one (regress `cet-*`).
+add_executable(probe_app_cet examples/targets/probe_app/probe_app.cpp ${READ_SITE_ASM})
+target_include_directories(probe_app_cet PRIVATE examples/targets/configparse)
+target_link_libraries(probe_app_cet PRIVATE safetyhook)
+target_link_options(probe_app_cet PRIVATE ${READ_THUNK_EXPORT} /CETCOMPAT)
+add_dependencies(probe_app_cet configparse)
+add_executable(cet_probe examples/cet/cet_probe.c)
+target_link_options(cet_probe PRIVATE /CETCOMPAT)
+
 # Hostile entry sequences and a real pre-existing E9 detour for the breakage demo.
 add_executable(hook_edge examples/breakage/hook_edge.c ${BREAKAGE_ASM})
 target_link_options(hook_edge PRIVATE "/MAP:$<TARGET_FILE_DIR:hook_edge>/hook_edge.map")
@@ -270,7 +281,7 @@ target_include_directories(refusal_driver PRIVATE include)
 target_link_libraries(refusal_driver PRIVATE probe_api)
 add_dependencies(refusal_driver hitcost_target)
 
-foreach(t gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
+foreach(t probe_app_cet cet_probe gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
     target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 endforeach()

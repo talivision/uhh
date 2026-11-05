@@ -161,6 +161,7 @@ struct probe_session {
     int hw_active = 0;
     bool launched = false, ran = false, exited = false, gate_sent = false;
     bool attach_held = false;                  // attach: threads held once until inline hooks confirmed
+    bool call_cet_warned = false;              // call_func refused under CET (warn once)
     int shadow_stack = -1;                     // target has hardware shadow stacks (CET): -1 unknown, 0/1
     DWORD cb_tid = 0;                          // thread whose callback / IPC is being serviced (0 = none)
     std::wstring agent_copy;                   // per-session copy of the agent DLL (UHH_SHARED), deleted at close
@@ -3917,6 +3918,17 @@ static uint64_t resolve_symbol(probe_session *s, const char *symbol) {
 
 static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint64_t *ret, int nargs, const uint64_t *args) {
     if (s->in_call_tid || nargs < 0 || nargs > 8) return 0;           // no nesting
+    // Hardware shadow stacks (CET): the callee is entered by SetThreadContext, not a CALL,
+    // so its `ret` to call_trap does not match the shadow stack -> #CP in the target
+    // (fatal in strict mode and when the callee's module is CETCOMPAT). Refuse cleanly
+    // rather than risk the target; inline call_func (a real call) is unaffected.
+    if (target_has_shadow_stack(s)) {
+        if (!s->call_cet_warned) {
+            s->call_cet_warned = true;
+            std::fprintf(stderr, "probe: call_func refused on breakpoint/hw: target has hardware shadow stacks (CET)\n");
+        }
+        return 0;
+    }
     if (!s->call_trap) {
         void *mem = VirtualAllocEx(s->pi.hProcess, nullptr, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
         unsigned char cc = 0xcc; size_t w = 0;
