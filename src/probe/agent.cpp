@@ -841,6 +841,16 @@ template <size_t... I> static constexpr std::array<mid_callback, sizeof...(I)> m
     return {{ &mid_thunk<(uint32_t)I>... }};
 }
 static constexpr auto mid_callbacks = make_mid_thunks(std::make_index_sequence<PROBE_AGENT_MAX_PROBES>{});
+struct HookOp { uint32_t index; uint64_t site; bool ok; };
+static void build_hook(void *p) {
+    auto *op = static_cast<HookOp *>(p);
+    hooks[op->index] = safetyhook::create_mid((void *)(uintptr_t)op->site, mid_callbacks[op->index],
+                                              safetyhook::MidHook::StartDisabled);
+}
+static void enable_hook(void *p) {
+    auto *op = static_cast<HookOp *>(p);
+    op->ok = hooks[op->index].enable().has_value();
+}
 
 // Run fn with every other thread of the target suspended by the controller (FREEZE/THAW
 // IPC; the controller is a debugger, so the raise is serviced synchronously). While frozen,
@@ -850,14 +860,50 @@ static constexpr auto mid_callbacks = make_mid_thunks(std::make_index_sequence<P
 // thread could hold. Without a controller (never in UHH) SafetyHook's own trap is used.
 extern "C" volatile long uhh_safetyhook_frozen;
 using slot_set = std::bitset<PROBE_AGENT_MAX_PROBES>;
+// Controller gone (guard cleanup): nobody can freeze the target for us, and SafetyHook's own
+// trap path makes the site page non-executable -- on an ntdll stub page that faults the
+// installer itself (the target died 0xC0000005). Freeze in-process instead: take the process
+// heap lock FIRST (so no thread we suspend can be holding it while SafetyHook allocates),
+// suspend every other thread, write, resume. Only ever used to REMOVE hooks: no thread can be
+// strictly inside a 5-byte jmp, so none needs moving.
+static volatile LONG g_self_freeze;
+struct SelfFreeze {
+    static constexpr size_t CAP = 4096;
+    HANDLE t[CAP]; size_t n = 0; bool active = false;
+    void freeze() {
+        HeapLock(GetProcessHeap());
+        active = true;
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap == INVALID_HANDLE_VALUE) return;
+        THREADENTRY32 te{}; te.dwSize = sizeof(te);
+        const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+        for (BOOL more = Thread32First(snap, &te); more && n < CAP; more = Thread32Next(snap, &te)) {
+            if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+            HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, te.th32ThreadID);
+            if (!h) continue;
+            if (SuspendThread(h) == (DWORD)-1) { CloseHandle(h); continue; }
+            CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
+            GetThreadContext(h, &c);                       // waits until it is really stopped
+            t[n++] = h;
+        }
+        CloseHandle(snap);
+    }
+    ~SelfFreeze() {
+        for (size_t i = 0; i < n; ++i) { ResumeThread(t[i]); CloseHandle(t[i]); }
+        if (active) HeapUnlock(GetProcessHeap());
+    }
+};
 template <class F> static void frozen(const slot_set &enabling, F &&fn) {
     for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i)          // tell the controller which ranges change
         InterlockedExchange(&shared->requests[i].enabling, enabling[i] ? 1 : 0);
     probe_ipc_request req{};
     req.op = PROBE_IPC_FREEZE; req.origin_site = UINT32_MAX; req.address = enabling.any() ? 1 : 0;
     const bool held = raise_ipc(&req) && req.result == 1;
-    if (held) InterlockedExchange(&uhh_safetyhook_frozen, 1);
+    SelfFreeze self;
+    if (!held && enabling.none() && (g_self_freeze || shared->controller_gone)) self.freeze();   // removal with no controller
+    if (held || self.active) InterlockedExchange(&uhh_safetyhook_frozen, 1);
     fn();
+    if (self.active) InterlockedExchange(&uhh_safetyhook_frozen, 0);
     if (held) {
         InterlockedExchange(&uhh_safetyhook_frozen, 0);
         probe_ipc_request thaw{};
@@ -889,17 +935,22 @@ static void resolve_callbacks() {
     }
 }
 
-// Keep the module holding an inline site loaded while its hook is built and written: a DLL the
-// target unloads right then (FreeLibrary on another thread) unmapped the site under
-// create_mid -- an access violation on the agent's thread that killed the target. A site in
-// an image that cannot be pinned is being unloaded (or gone): skip it this round. A site
-// outside any image (dynamic code) is used only while it is committed memory.
-static bool pin_site(uint64_t site, HMODULE &pin) {
-    pin = nullptr;
+// A DLL the target unloads (FreeLibrary on another thread) while its inline site is being
+// hooked: create_mid read the unmapped site -- an access violation on the agent's thread that
+// killed the target. (Pinning the module is not an option: the loader can be blocked by a
+// thread the controller holds mid-load, and the install must never wait on the loader.) So
+// a site that is not mapped executable code right now is skipped (stays pending), and the
+// build and the write are SEH-guarded: an unmap racing them fails that one hook, nothing else.
+// SafetyHook reads the site only outside its allocator lock; a hook whose write faulted is
+// abandoned in place (never touched again).
+static bool site_mapped(uint64_t site) {
     MEMORY_BASIC_INFORMATION mbi{};
-    if (!VirtualQuery((void *)(uintptr_t)site, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
-    if (mbi.Type != MEM_IMAGE) return true;
-    return GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)(uintptr_t)site, &pin) && pin;
+    return VirtualQuery((void *)(uintptr_t)site, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
+           (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+}
+static bool seh_run(void (*fn)(void *), void *ctx) {
+    __try { fn(ctx); return true; }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) { return false; }
 }
 
 static void install_pending_locked() {
@@ -909,8 +960,6 @@ static void install_pending_locked() {
     uint32_t count = shared->request_count;
     if (count > PROBE_AGENT_MAX_PROBES) count = PROBE_AGENT_MAX_PROBES;
     slot_set enabling;
-    HMODULE pins[PROBE_AGENT_MAX_PROBES] = {};
-    struct Unpin { HMODULE *p; ~Unpin() { for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i) if (p[i]) FreeLibrary(p[i]); } } unpin{pins};
     for (uint32_t i = 0; i < count; ++i) {
         auto &request = shared->requests[i];
         if (!request.site || request.status != PROBE_AGENT_PENDING) continue;
@@ -925,7 +974,7 @@ static void install_pending_locked() {
         if (!callbacks[i]) {
             InterlockedExchange(&request.status, PROBE_AGENT_CALLBACK_MISSING); continue;
         }
-        if (!pin_site(request.site, pins[i])) continue;   // its module is going away: stays pending
+        if (!site_mapped(request.site)) continue;          // its module is going away: stays pending
         if (InterlockedCompareExchange(&request.status, PROBE_AGENT_INSTALLING, PROBE_AGENT_PENDING) != PROBE_AGENT_PENDING)
             continue;
         sites[i] = request.site; states[i] = {shared, i}; proxies[i].site = i;
@@ -937,8 +986,11 @@ static void install_pending_locked() {
             new SafetyHookMid(std::move(hooks[i]));
         }
         // Build the trampoline now (allocates); write the jump later, frozen.
-        hooks[i] = safetyhook::create_mid((void *)(uintptr_t)request.site, mid_callbacks[i],
-                                          safetyhook::MidHook::StartDisabled);
+        HookOp build{i, request.site, false};
+        if (!seh_run(build_hook, &build)) {              // unmapped under us: retry when it loads again
+            new (&hooks[i]) SafetyHookMid();
+            InterlockedExchange(&request.status, PROBE_AGENT_PENDING); continue;
+        }
         if (!hooks[i]) { InterlockedExchange(&request.status, PROBE_AGENT_HOOK_FAILED); continue; }
         request.patch_len = (uint32_t)hooks[i].original_bytes().size();
         request.trampoline = (uint64_t)hooks[i].uhh_trampoline();
@@ -949,7 +1001,13 @@ static void install_pending_locked() {
         for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i) {
             if (!which[i]) continue;
             if (shared->controller_gone) { InterlockedExchange(&shared->requests[i].status, PROBE_AGENT_HOOK_FAILED); continue; }
-            const bool ok = hooks[i].enable().has_value();
+            HookOp op{i, 0, false};
+            if (!site_mapped(sites[i])) { InterlockedExchange(&shared->requests[i].status, PROBE_AGENT_PENDING); continue; }
+            if (!seh_run(enable_hook, &op)) {            // unmapped mid-write: abandon that hook object
+                new (&hooks[i]) SafetyHookMid();
+                InterlockedExchange(&shared->requests[i].status, PROBE_AGENT_PENDING); continue;
+            }
+            const bool ok = op.ok;
             const auto &orig = hooks[i].original_bytes();
             if (ok && !g_shadow[i].lo && orig.size() <= sizeof(g_shadow[i].bytes)) {
                 std::memcpy(g_shadow[i].bytes, orig.data(), orig.size());
@@ -1088,6 +1146,13 @@ static void guard_cleanup() {
     LONG n = g.bp_count; if (n > (LONG)PROBE_AGENT_GUARD_BPS) n = PROBE_AGENT_GUARD_BPS;
     for (LONG i = 0; i < n; ++i) if (g.bps[i].address) restore_byte(g.bps[i].address, (unsigned char)g.bps[i].original);
     const DWORD mask = (DWORD)g.dr_mask & 0xF, self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    {   // this thread too (the controller armed its DRs like every other thread's)
+        CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (GetThreadContext(GetCurrentThread(), &c)) { clear_dr_slots(c, mask); SetThreadContext(GetCurrentThread(), &c); }
+    }
+    // Twice: a thread the dying debugger had stopped at an event can be released with the
+    // debug registers it was stopped with, after the first pass.
+    for (int pass = 0; pass < 2; ++pass, Sleep(200)) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snap != INVALID_HANDLE_VALUE) {
         THREADENTRY32 te{}; te.dwSize = sizeof(te);
@@ -1104,12 +1169,15 @@ static void guard_cleanup() {
                 }
                 ResumeThread(t);
             }
-            if (tid_listed(g.held_tids, g.held_count, te.th32ThreadID)) ResumeThread(t);   // the controller's hold
+            if (!pass && tid_listed(g.held_tids, g.held_count, te.th32ThreadID)) ResumeThread(t);   // the controller's hold
             CloseHandle(t);
         }
         CloseHandle(snap);
     }
+    }
+    InterlockedExchange(&g_self_freeze, 1);                     // no controller to freeze for us
     probe_agent_stop(nullptr);                                  // inline hooks out (no-op without any)
+    InterlockedExchange(&g_self_freeze, 0);
 }
 static HANDLE service_event;
 static DWORD WINAPI service_main(void *) {
@@ -1164,6 +1232,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
 // Unhook without pulling code out from under a thread: stop new callbacks, wait for the
 // ones in flight to finish (bounded), then remove the hooks.
 extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_stop(void *) {
+    if (!shared) return 0;                               // loaded but never initialised: nothing to undo
     AcquireSRWLockExclusive(&g_install_lock);            // after any install round in progress
     InterlockedExchange(&g_stopping, 1);
     for (int i = 0; i < 2000 && any_inflight(); ++i) Sleep(1);

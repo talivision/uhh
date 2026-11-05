@@ -3932,7 +3932,7 @@ def lc_detach_cases(cfgname, cfg):
             ok = fin_ok and d.p.returncode == 0 and ok_logs and lc_clean(c) and c2.get("flips") == 0 and lc_clean(a) and a.get("rc") == 0
             record(name, ok, f"detach_took={took:.1f}s logs={d.logs} final={fin} {lc_brief(c)} flips_after={c2.get('flips')} "
                              f"exit={a.get('rc')}" + ("" if ok else f" driver_rc={d.p.returncode} err={d.errors()} unhandled={tg.unhandled()} "
-                                         f"stderr_tail={[l[:140] for l in d.err.lines if not l.startswith('probe: active')][-14:]}"))
+                                         f"stderr_tail={[l[:200] for l in d.err.lines if not l.startswith('probe: active') and 'detach-drain' not in l][-8:]}"))
         except Exception as e:
             record(name, False, repr(e))
         finally:

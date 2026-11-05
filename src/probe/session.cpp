@@ -2199,7 +2199,7 @@ static void guard_sync(probe_session *s) {
     n = 0;
     for (uint64_t b : s->scratch_blocks) if (n < PROBE_AGENT_GUARD_BLOCKS) g.blocks[n++] = b;
     g.block_count = (LONG)n;
-    g.dr_mask = s->dr_ever;
+    g.dr_mask = s->dr_ever | s->dr_used;          // incl. a call_original's return-catch slot
     MemoryBarrier();
     g.enabled = 1;
 }
@@ -2656,6 +2656,7 @@ static bool inline_hold_needed(const probe_session *s) {
 }
 
 static void hold_thread(probe_session *s, DWORD tid) {
+    if (s->detaching) return;                      // a detach releases holds; it never takes new ones
     HANDLE t = OpenThread(THREAD_SUSPEND_RESUME, FALSE, tid);
     if (!t) return;
     DWORD prev = SuspendThread(t);
@@ -2675,6 +2676,7 @@ static void hold_thread(probe_session *s, DWORD tid) {
 // and resumes straight into the hook once it is in. No call is missed, nothing waits on
 // the loader. Falls back to the old hold when the debug registers are all taken.
 static bool arm_gates_for_pending(probe_session *s) {
+    if (s->detaching) return true;                 // no new gates (nor holds) while letting go
     std::vector<uint64_t> sites;
     for (auto &p : s->probes)
         if ((p->flags & PROBE_INLINE) && p->address && !p->active && !p->retired) {
@@ -2925,17 +2927,18 @@ static void ipc_thaw(probe_session *s);
 static void pump(probe_session *s, DWORD ms);
 static void detach(probe_session *s) {
     s->error.clear();
+    // From here on nothing may start new agent work, arm anything, gate or hold a thread: the
+    // event pumping below dispatches events (an agent load completing, a DLL with pending
+    // sites loading, the initial breakpoint) that would otherwise start an init AFTER the stop
+    // -- hooks installed into the target we are detaching from (seen: Ctrl+C 50 ms into an
+    // inline attach left every hook live) -- or re-hold threads the agent's work then waits on.
+    s->detaching = true;
     release_held(s, "detach");
     // Agent work in flight (load/init on a remote thread): let it finish first, or its hooks
     // would land AFTER the agent was told to stop -- live hooks in a detached process.
     for (ULONGLONG until = GetTickCount64() + 5000;
          s->remote_work != probe_session::REMOTE_NONE && !s->exited && GetTickCount64() < until; )
         pump(s, 20);
-    // From here on nothing may start new agent work: the drain below dispatches events (an
-    // agent load completing, a DLL with pending inline sites loading, the initial breakpoint)
-    // that would otherwise start an init AFTER the stop -- hooks installed into the target
-    // we are detaching from (seen: Ctrl+C 50 ms into an inline attach left every hook live).
-    s->detaching = true;
     if (s->remote_work != probe_session::REMOTE_NONE && s->shared) {
         // Still not done (e.g. the target holds its loader lock, so the remote thread cannot
         // even start). It may run after we are gone: tell the agent the session is over, so a
@@ -2943,7 +2946,11 @@ static void detach(probe_session *s) {
         std::fprintf(stderr, "probe: detach: agent work still pending after 5 s; it will install nothing\n");
         InterlockedExchange(&s->shared->controller_gone, 1);
     }
-    if (s->remote_agent && s->local_agent && s->remote_work == probe_session::REMOTE_NONE) {
+    // The stop runs even then: an init that already wrote hooks but cannot finish (its thread
+    // exit waits on the loader) would otherwise leave them live. If the stop cannot run within
+    // the wait either, it runs whenever the target lets it -- then without us (the agent
+    // freezes in-process for a session that is over).
+    if (s->remote_agent && s->local_agent) {
         auto local_stop = reinterpret_cast<uintptr_t>(GetProcAddress(s->local_agent, "probe_agent_stop"));
         if (local_stop) {
             uint64_t remote_stop = s->remote_agent + local_stop - reinterpret_cast<uintptr_t>(s->local_agent);
@@ -4399,6 +4406,12 @@ static void stop_drainer(probe_session *s) {
     // (e.g. blocked in call_original longer than the agent's 2 s unhook wait) may still log.
     // Keep draining until none is in flight (bounded) BEFORE telling producers nobody listens,
     // so its logs are delivered rather than dropped.
+    if (s->shared && !s->exited && s->drainer.joinable()) {
+        MemoryBarrier();
+        if (const uint64_t running = probe_agent_inflight(s->shared))
+            std::fprintf(stderr, "probe: %s: %llu callback(s) still running; delivering their logs\n",
+                         s->detached_hooks ? "detach" : "close", (unsigned long long)running);
+    }
     if (s->shared && s->detached_hooks && !s->exited && s->drainer.joinable()) {
         for (ULONGLONG until = GetTickCount64() + 15000; GetTickCount64() < until; Sleep(5)) {
             MemoryBarrier();
@@ -4429,7 +4442,7 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
     case CREATE_THREAD_DEBUG_EVENT:
         s->threads.insert(event.dwThreadId);
         if (s->ipc_freezer) ipc_freeze_thread(s, event.dwThreadId);   // born during a hook write: hold it too
-        if (event.u.CreateThread.hThread)                      // new thread inherits the gates
+        if (event.u.CreateThread.hThread && !s->detaching)     // new thread inherits the gates
             for (auto &g : s->gates) set_dr_on_thread(event.u.CreateThread.hThread, g.second, g.first, true);
         if (s->hw_active && event.u.CreateThread.hThread)     // new thread inherits the DRs
             for (auto &p : s->probes)

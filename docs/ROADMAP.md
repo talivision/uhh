@@ -379,6 +379,98 @@ with the uninstrumented target and with exact hits / "co" logs / `log_dropped ==
   Ctrl+Break while a call_original is in flight complete that call first (`callorig-hunt-
   {detach,ctrlbreak}-*`).
 
+## Lifecycle findings (2026-11-06, `examples/lifecycle`, regress `lifecycle-*`)
+Target `lifecycle_target` checks ITSELF on command: the code bytes of every probe-able site
+(ntdll!NtOpenProcess/NtReadVirtualMemory/NtClose, configparse!ParseConfig incl. the mid-function
+flag site +0x16, its own lc_slow/hunt_read) against a snapshot taken before any tool came, the
+debug registers and trap flag of EVERY thread (incl. threads born while attached: a churner keeps
+creating them), IsDebuggerPresent, flips seen after a detach, and every read verified.
+`lifecycle_driver` attaches gated_config's callbacks (flag flip, NtOpenProcess map via
+call_original, NtClose, every read logged) plus a probe blocking inside call_original
+(lc_slow) and one in a DLL that keeps loading/unloading (hunt_dll!HuntWork), under breakpoint,
+hw, inline and mixed. Checks per config: `reattach` (20 attach/detach cycles to one busy
+process), `detach-{midcb,longcb,early-N}`, `target-dies`, `two-controllers`, `interrupt`
+(Ctrl+Break at 7 points from before the attach to mid-run), `controller-killed`, and (inline,
+mixed) `agent-refused`, `install-stuck`. `UHH_LC=substr` narrows. The target is paced (1 ms per
+iteration) so breakpoint/hw runs stay at a few hundred hits/s on the shared VM.
+Clean from the start: `two-controllers` (the second attach fails with Win32 87 before touching
+anything; the first session is undisturbed), `target-dies` (the target killed 0..600 ms into the
+attach / agent load / install or right after a detach request: the controller ends its session
+by itself, nothing dropped), detach while callbacks run / block in call_original.
+- ✅ (L1) Controller killed while attached (TerminateProcess, crash, Ctrl+C before the console
+  handler exists): the kernel detaches with kill-on-exit off, but UHH's state stayed in the
+  target. breakpoint/hw: INT3s and debug registers live -> the target died at its next hit
+  (0x80000003 / 0x80000004, every run); inline: hooks live and every producer spun forever on
+  the full log ring (nobody drains it; the 2 s give-up counts only while the drainer heartbeat
+  moves) -> the target HUNG. Fixed: a controller-death guard. The agent is now injected into
+  every ATTACHED target (breakpoint/hw-only too; launch is unchanged -- a launched target dies
+  with its controller by design). The controller mirrors its state into the shared section
+  after every debug event (armed INT3s + original bytes, DR slots owned, threads mid-step,
+  threads it holds suspended, step blocks) and hands the agent a SYNCHRONIZE handle to itself.
+  A first-in-line VEH takes our traps once the process has no debug port (restore the byte /
+  clear our DRs / end the step, continue); the agent's service thread, woken when the
+  controller process ends, restores every INT3, clears our DR slots and steps on every thread
+  (twice: a thread released from a dead debugger's event can come back with its old DRs; and its
+  own), resumes threads the controller held, sets controller_gone (logs drop, counted) and removes
+  the inline hooks with an in-process freeze (heap lock taken first, all other threads suspended:
+  SafetyHook's own unfrozen path makes the ntdll stub page non-executable and faulted the
+  installer, 0xC0000005). Breakpoint/hw probes of an attach arm only once the guard is up (agent
+  init done, or given up after 5 s / on load failure, with a warning), so no unguarded trap ever
+  exists. `lifecycle-controller-killed-*`
+- ✅ (L2) Ctrl+C (or any controller death) between DebugActiveProcess and
+  DebugSetProcessKillOnExit(FALSE): the debug object is created kill-on-close, so the target was
+  killed with it (exit 0xC0000354, seen twice in 7 Ctrl+Break timings on hw). Now the thread's
+  debug object is created first (DbgUiConnectToDbg) and kill-on-exit turned off before the
+  attach. `lifecycle-interrupt-*`
+- ✅ (L3) Detach never finished on a target that keeps creating threads or loading DLLs (36 s ..
+  > 120 s, breakpoint/hw; also Ctrl+Break): the post-restore drain waited for 200 ms without ANY
+  debug event. Now only exceptions extend it, and it is bounded (5 s). `lifecycle-detach-early-*`,
+  `lifecycle-reattach-*`, `lifecycle-interrupt-*`
+- ✅ (L4) Events dispatched DURING a detach armed things after they had been removed: a DLL
+  reloading during the drain got a fresh INT3 (the detached target died 0x80000003 at
+  hunt_dll!HuntWork), a new thread inherited inline-install gates (DRs left after detach), the
+  initial breakpoint / an agent load completing started an agent init AFTER the stop (Ctrl+C
+  50-150 ms into an inline attach left every hook live in the detached target), and a held-
+  thread fallback re-held threads the in-flight agent work then waited on. A `detaching` flag
+  set at the start of detach stops arming, gating, holding and any new agent work.
+  `lifecycle-detach-early-*`, `lifecycle-interrupt-*`
+- ✅ (L5) Inline install racing a module unload: create_mid read the site of a DLL another thread
+  had just unloaded -> access violation on the agent's thread -> the TARGET died (0xC0000005,
+  3 of 4 early detaches on inline/mixed with DLL churn). The agent now skips a site that is not
+  mapped executable code (stays pending until its module loads again) and SEH-guards the build
+  and the write: an unmap racing them fails that one hook (abandoned, never touched again).
+  Pinning the module was tried and rejected: GetModuleHandleEx/FreeLibrary wait on the loader,
+  which a thread held mid-load (no DR free for gates) blocks -- the install then stalled past the
+  detach's 5 s wait. `lifecycle-detach-early-*-{inline,mixed}`
+- ✅ (L6) Stale UNLOAD_DLL (reported after the same DLL was mapped again at the same base and its
+  LOAD handled) retired the probe just armed in the NEW instance: its INT3 was never removed at
+  detach. An image mapped at that base when the unload is processed now means the event is stale
+  and is ignored (also the A8 ordering). `lifecycle-detach-early-*-breakpoint`
+- ✅ (L7, review A) probe_run leaving its loop on an error (agent load/init failure, a failed
+  context get/set or debug wait) left the attached target with live INT3s/DRs and no event loop
+  (it froze at its next debug event and died when the controller exited), and set controller_gone
+  with hooks still live; a probe_close from another thread then "detached" from a thread that
+  does not own the debug object. Now probe_run detaches on its own (debug) thread before leaving
+  (the error is kept), and probe_attach failures leave the session un-attached (probe_close used to
+  wait forever for a probe_run that never came). Reproduced with a target that admits only
+  Microsoft-signed DLLs (the agent is refused mid-attach). `lifecycle-agent-refused-{inline,mixed}`
+- ✅ (L8, review B) Detach with agent load/init still in flight after 5 s (the target holds its
+  loader lock, so the remote thread cannot even start) skipped the agent stop; the stale init ran
+  later and hooked the detached target (seen: it died 0xC0000005). Now the detach marks the
+  session over first (controller_gone) and the agent installs nothing for a session that is over.
+  `lifecycle-install-stuck-{inline,mixed}`
+- ✅ (L9) Logs of inline callbacks still running at detach (longer than the agent's 2 s unhook
+  wait) were dropped (controller_gone set at once). The controller now keeps draining until no
+  callback is in flight (bounded 15 s) before telling producers nobody listens.
+  `lifecycle-detach-longcb-*`
+- Residual / by design: a breakpoint/hw call_func running in the target when the controller dies
+  (the thread's context was redirected to the callee and is never restored); suspensions taken
+  inside a single debug event and not yet mirrored when the controller dies (microseconds); the
+  guard's VEH and the agent stay in the target after detach (as the inline agent always did);
+  a target's own debugger-free INT3 / single-step at one of our sites while orphaned is taken as
+  ours. A controller-death cleanup raises the agent's FREEZE exception once with no debugger
+  attached: a target VEH sees one 0xE0554848 first-chance exception.
+
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`
 - ✅ Per-log overhead ceilings in the suite (`log-throughput-*`)
