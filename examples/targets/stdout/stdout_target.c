@@ -7,7 +7,7 @@
      stdout_target run [--prompt]   all phases; --prompt reads a line from stdin at the prompt
      stdout_target mixed            stdout and stderr partial lines interleaved (for 2>&1)
      stdout_target orphan           start a grandchild that keeps the stdout/stderr handles
-                                    open for 20 s, print its pid, exit
+                                    open for 10 s, print its pid, exit
      stdout_target sleep <ms>       (the grandchild)
    The output is deterministic: an uninstrumented run is the ground truth. */
 #include <windows.h>
@@ -90,7 +90,7 @@ static int mixed(void) {
 static int orphan(void) {
     wchar_t self[MAX_PATH], cmd[MAX_PATH + 32];
     GetModuleFileNameW(NULL, self, MAX_PATH);
-    _snwprintf(cmd, sizeof cmd / sizeof *cmd, L"\"%s\" sleep 20000", self);
+    _snwprintf(cmd, sizeof cmd / sizeof *cmd, L"\"%s\" sleep 10000", self);
     STARTUPINFOW si = {sizeof si}; PROCESS_INFORMATION pi;
     if (!CreateProcessW(self, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) return 2;
     char line[64]; snprintf(line, sizeof line, "grandchild %lu\n", pi.dwProcessId);

@@ -4166,19 +4166,22 @@ def check_stdout_forward():
         except Exception as e:
             record(name, False, repr(e))
     name = "stdout-grandchild"
+    m = None
     try:
         rc, out, err, _, secs = stdout_capture([tr, "--backend", "breakpoint", "-p", STDOUT_PROBES[0], "--", t, "orphan"],
                                                timeout=120)
         m = re.search(rb"grandchild (\d+)\n", out)
-        if m:
-            subprocess.run(["taskkill", "/f", "/pid", m.group(1).decode()], capture_output=True)
         recs, _, strays = stdout_split(out)
         rep = next((r for r in recs if r.get("kind") == "probe_report"), {})
-        ok = rc == 0 and bool(m) and secs < 15 and rep.get("app_exit") == 0 and strays == 0
-        record(name, ok, f"controller_exit_after={secs:.1f}s (grandchild holds the pipe 20 s) rc={rc} "
+        ok = rc == 0 and bool(m) and secs < 8 and rep.get("app_exit") == 0 and strays == 0
+        record(name, ok, f"controller_exit_after={secs:.1f}s (grandchild holds the pipe 10 s) rc={rc} "
                          f"grandchild={bool(m)} exit={rep.get('app_exit')}")
     except Exception as e:
         record(name, False, repr(e))
+    finally:
+        # never leave the grandchild behind: it holds inherited pipes (the harness's too)
+        if m:
+            subprocess.run(["taskkill", "/f", "/pid", m.group(1).decode()], capture_output=True)
 
 
 def check_blog_replicas():
