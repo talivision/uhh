@@ -1599,8 +1599,11 @@ def main():
         product. The suite runs hundreds of sessions (some with 20M logs), so it deletes the
         files it produced after each check; a file still open by a live session is skipped."""
         d = Path(_os.environ.get("TEMP", ".")) / "uhh" / "logs"
+        import time as _t
         for f in d.glob("uhh-*.jsonl") if d.is_dir() else []:
             try:
+                if _t.time() - f.stat().st_mtime < 600:
+                    continue          # recent: may belong to a suite running in parallel (other arch)
                 f.unlink()
             except OSError:
                 pass
