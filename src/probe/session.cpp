@@ -3070,6 +3070,9 @@ static void detach(probe_session *s) {
             switch (slot) { case 0: w.Dr0 = 0; break; case 1: w.Dr1 = 0; break; case 2: w.Dr2 = 0; break; default: w.Dr3 = 0; }
         }
         w.Dr6 = 0;
+        // No slot left enabled: drop the exact-match bits too (WOW64 leaves LE set once a DR was
+        // used, seen as dr7=0x100 on every thread of a detached 32-bit target).
+        if (!(w.Dr7 & 0xFF)) w.Dr7 &= ~(decltype(w.Dr7))0x300;
         w.EFlags &= ~0x100u;
         BOOL set_ok = SetThreadContext(t, &w);
         CONTEXT v{}; v.ContextFlags = CONTEXT_DEBUG_REGISTERS;
@@ -5090,6 +5093,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
     w.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS;
     if (!SetThreadContext(thread, &w)) { CloseHandle(thread); return 0; }
     s->dr_used |= (uint8_t)(1u << slot);                               // reserved: no probe arms it meanwhile
+    s->dr_ever |= (uint8_t)(1u << slot);                               // ours: detach / the guard clear it too
     s->in_call_tid = st->tid; s->co_addr = probe->address; s->co_sp = c->hit_sp;
     s->co_entry_pending = !(probe->flags & PROBE_HW); s->co_left = false;
     auto clear_slot = [&](bool running) {

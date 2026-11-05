@@ -1083,6 +1083,7 @@ static void clear_dr_slots(CONTEXT &c, DWORD mask) {
         c.Dr7 &= ~((decltype(c.Dr7))3 << (slot * 2)) & ~((decltype(c.Dr7))0xF << (16 + slot * 4));
         switch (slot) { case 0: c.Dr0 = 0; break; case 1: c.Dr1 = 0; break; case 2: c.Dr2 = 0; break; default: c.Dr3 = 0; }
     }
+    if (mask && !(c.Dr7 & 0xFF)) c.Dr7 &= ~(decltype(c.Dr7))0x300;   // no slot left: exact bits off too
     c.Dr6 = 0;
 }
 static bool tid_listed(const uint32_t *list, LONG count, DWORD tid) {

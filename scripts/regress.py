@@ -3782,7 +3782,7 @@ def lc_brief(c):
     if c.get("dead") is not None or c.get("hung"):
         return f"DEAD/HUNG {c}"
     return (f"code_diff={c.get('code_diff')} {c.get('code_bad') or ''} dr_dirty={c.get('dr_dirty')} {c.get('dr_bad') or ''} "
-            f"dbg={c.get('debugger')} errors={c.get('errors')} {c.get('first_error') or ''} flips={c.get('flips')} "
+            f"dr_stale={c.get('dr_stale')} dbg={c.get('debugger')} errors={c.get('errors')} {c.get('first_error') or ''} flips={c.get('flips')} "
             f"agent={c.get('agent_loaded')}").replace("  ", " ")
 
 

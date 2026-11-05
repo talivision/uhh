@@ -46,6 +46,7 @@ typedef void (*HuntWorkFn)(void (*)(void), volatile LONG *);
 
 static NtReadFn g_ntread; static NtOpenFn g_ntopen; static NtCloseFn g_ntclose; static ParseFn g_parse;
 static unsigned char g_pattern[64];
+static volatile LONG g_dr_stale;
 static volatile LONG g_stop, g_errors, g_flips, g_slow_calls, g_churned, g_dll_cycles, g_work;
 static volatile LONG64 g_iters;
 static char g_first_error[160];
@@ -137,17 +138,23 @@ static int thread_dirty(HANDLE t, char *why, size_t cap) {
     CONTEXT c; memset(&c, 0, sizeof(c));
     c.ContextFlags = CONTEXT_DEBUG_REGISTERS | CONTEXT_CONTROL;
     if (!GetThreadContext(t, &c)) return 0;
-    if ((c.Dr7 & 0xFF) || c.Dr0 || c.Dr1 || c.Dr2 || c.Dr3 || (c.EFlags & 0x100)) {
-        _snprintf_s(why, cap, _TRUNCATE, "dr7=0x%llx dr0=0x%llx tf=%d", (unsigned long long)c.Dr7,
-                    (unsigned long long)c.Dr0, (int)((c.EFlags >> 8) & 1));
+    /* A breakpoint is an ENABLED slot (DR7 L0-3/G0-3) or the trap flag. An address left in a
+       disabled slot never fires (WOW64 does not propagate a zeroed address of a disabled slot):
+       counted separately as "stale", for information. */
+    if ((c.Dr7 & 0xFF) || (c.EFlags & 0x100)) {
+        _snprintf_s(why, cap, _TRUNCATE, "dr7=0x%llx dr0=0x%llx dr1=0x%llx dr2=0x%llx dr3=0x%llx tf=%d",
+                    (unsigned long long)c.Dr7, (unsigned long long)c.Dr0, (unsigned long long)c.Dr1,
+                    (unsigned long long)c.Dr2, (unsigned long long)c.Dr3, (int)((c.EFlags >> 8) & 1));
         return 1;
     }
+    if (c.Dr0 || c.Dr1 || c.Dr2 || c.Dr3 || (c.Dr7 & 0x300)) InterlockedIncrement(&g_dr_stale);
     return 0;
 }
 
 static void check(const char *kind) {
     char code_bad[256] = "", dr_bad[256] = "", why[96];
     int code_diff = 0, dr_dirty = 0, threads = 0;
+    InterlockedExchange(&g_dr_stale, 0);
     for (int i = 0; i < NSITES; ++i)
         if (g_site[i] && memcmp(g_snap[i], g_site[i], sizeof(g_snap[i]))) {
             ++code_diff;
@@ -181,10 +188,10 @@ static void check(const char *kind) {
           _snprintf_s(dr_bad + n, sizeof(dr_bad) - n, _TRUNCATE, "%s%lu:%s", n ? "," : "", te.th32ThreadID, why); }
     }
     CloseHandle(snap);
-    printf("{\"kind\":\"%s\",\"code_diff\":%d,\"code_bad\":\"%s\",\"dr_dirty\":%d,\"dr_bad\":\"%s\",\"threads\":%d,"
+    printf("{\"kind\":\"%s\",\"code_diff\":%d,\"code_bad\":\"%s\",\"dr_dirty\":%d,\"dr_bad\":\"%s\",\"dr_stale\":%ld,\"threads\":%d,"
            "\"debugger\":%d,\"agent_loaded\":%d,\"iterations\":%lld,\"errors\":%ld,\"first_error\":\"%s\","
            "\"flips\":%ld,\"slow_calls\":%ld,\"churned\":%ld,\"dll_cycles\":%ld}\n",
-           kind, code_diff, code_bad, dr_dirty, dr_bad, threads, IsDebuggerPresent() ? 1 : 0,
+           kind, code_diff, code_bad, dr_dirty, dr_bad, g_dr_stale, threads, IsDebuggerPresent() ? 1 : 0,
            GetModuleHandleA("probe_api_agent.dll") != NULL, (long long)g_iters, g_errors, g_first_error,
            g_flips, g_slow_calls, g_churned, g_dll_cycles);
     fflush(stdout);
