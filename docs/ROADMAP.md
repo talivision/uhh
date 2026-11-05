@@ -100,6 +100,17 @@ identical source under every backend.
 - ⬜ Log sink speed (simple): UHH logs/s to NUL vs a plain writer's rate into a file; one manual console run. Bar: UHH is never the bottleneck.
 - ✗ (C10) helpers in probe_app: requested by the user; (C18) asm configparse: deliberate stable symbol+offset (add a PDB-local compiled variant later); (C19) _NT_SYMBOL_PATH is the requested symbol mechanism (tests may clear it)
 
+## Frida-replica findings (examples/famous, 2026-11-05)
+Classic Frida / API Monitor / Procmon recipes re-done on UHH (`examples/famous`), each one
+callback source under breakpoint/hw/inline on x64+x86, compared with the uninstrumented
+run (`regress.py --only famous`).
+- 🔧 (F1) HW: a hardware probe armed at RUNTIME (from a callback, or at a later DLL load) was lost for whole threads that were still in loader initialisation: thread start ends in NtContinue with the creation-time context, debug registers included (same mechanism as the initial-thread entry fixup). Found by `famous-retval-hw` (return-site probes added while workers start: whole workers 0/25 overridden, 3/3 runs). Fix: library-owned INT3 at `ntdll!RtlUserThreadStart`, armed the first time a hw probe is armed after entry/attach, re-applies the active DRs to each arriving thread. Test: `famous-retval-hw` x3 -- VM verify pending
+- ⬜ (F2) Same wipe class, not yet covered: a thread inside exception dispatch (between the kernel capturing its CONTEXT and NtContinue/RtlRestoreContext) when a hw probe is armed resumes with the old DRs
+- ⬜ (F3) One `famous-retval-hw` run exited rc=1 (before F1's fix); cause not captured -- rerun to see whether it persists
+- ✗ (F4) HW budget: recipes needing a return probe per call site (file monitor unfiltered: NtCreateFile is called from several KernelBase sites) exceed the 4 debug registers -> clean `too many hardware probes` refusal. By design; the recipe's Procmon-style `--filter` keeps it to one site. Documented in the recipe README
+- ✗ (F5) Observer effect: with inline probes, the agent's own executable trampoline memory shows up in an RWX watcher (`NtAllocateVirtualMemory`/`NtProtectVirtualMemory` in the target); breakpoint/hw write from the controller and are invisible. Documented (loader_rwx README)
+- ⬜ (F6) `call_func` from a breakpoint/hw callback returns 0 while another thread's callback is inside one (no nesting: the other thread's event is dispatched inside the first call). A recipe that resolves Process.mainModule with call_func would silently skip that racing call; famous_common.h falls back to walking to the PE header of the address. Library options: document in probe_api.h, or defer (replay) other threads' probe hits during a call
+
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`
 - ✅ Per-log overhead ceilings in the suite (`log-throughput-*`)

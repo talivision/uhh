@@ -83,20 +83,45 @@ struct famous_module {
     std::atomic<uint64_t> size{0};
 };
 
-// [base, base+size) of the target's main image, from PEB->ImageBaseAddress. One
-// call_func the first time (cached in the shared state).
-static inline bool famous_main_module(probe_context *c, famous_module &m, uint64_t &base, uint64_t &size) {
+// The PE image mapped at `b`: SizeOfImage and whether it is an EXE (not IMAGE_FILE_DLL).
+static inline bool famous_image_at(probe_context *c, uint64_t b, uint32_t &image, bool &is_exe) {
+    uint16_t mz = 0; uint32_t lfanew = 0, sig = 0; uint16_t chars = 0;
+    if (!get_mem(c, b, &mz, 2) || mz != 0x5a4d || !get_mem(c, b + 0x3c, &lfanew, 4) || lfanew > 0x1000 ||
+        !get_mem(c, b + lfanew, &sig, 4) || sig != 0x4550 || !get_mem(c, b + lfanew + 0x16, &chars, 2) ||
+        !get_mem(c, b + lfanew + 0x50, &image, 4) || !image)
+        return false;
+    is_exe = (chars & 0x2000) == 0;                        // IMAGE_FILE_DLL clear
+    return true;
+}
+
+// [base, base+size) of the target's main image, from PEB->ImageBaseAddress: one call_func
+// the first time, cached in the shared state. call_func can fail on the breakpoint/hw
+// backends when another thread's callback is already inside one (calls do not nest);
+// then the image containing `hint` (an address the caller cares about) is found by
+// walking down the 64 KiB allocation boundaries to its PE header -- if that image is an
+// EXE it is the main module.
+static inline bool famous_main_module(probe_context *c, famous_module &m, uint64_t &base, uint64_t &size,
+                                      uint64_t hint = 0) {
     size = m.size.load(std::memory_order_acquire);
     base = m.base.load(std::memory_order_relaxed);
     if (size) return true;
+    uint64_t b = 0;
+    uint32_t image = 0;
+    bool is_exe = false;
     uint64_t peb = 0;
-    if (!call_func(c, "ntdll.dll!RtlGetCurrentPeb", &peb, 0) || !peb) return false;
-    if (famous_x86) peb &= 0xffffffffull;
-    bool ok = false;
-    uint64_t b = famous_read_ptr(c, peb + (famous_x86 ? 0x8 : 0x10), &ok);
-    uint32_t lfanew = 0, image = 0;
-    if (!ok || !b || !get_mem(c, b + 0x3c, &lfanew, 4) || !get_mem(c, b + lfanew + 0x50, &image, 4) || !image)
-        return false;
+    if (call_func(c, "ntdll.dll!RtlGetCurrentPeb", &peb, 0) && peb) {
+        if (famous_x86) peb &= 0xffffffffull;
+        bool ok = false;
+        b = famous_read_ptr(c, peb + (famous_x86 ? 0x8 : 0x10), &ok);
+        if (!ok || !b || !famous_image_at(c, b, image, is_exe)) return false;
+    } else {
+        if (!hint) return false;
+        bool found = false;
+        for (uint64_t at = hint & ~0xffffull, n = 0; n < 512 && at; ++n, at -= 0x10000) {
+            if (famous_image_at(c, at, image, is_exe) && hint - at < image) { found = true; b = at; break; }
+        }
+        if (!found || !is_exe) return false;           // not in the EXE: unknown for now
+    }
     m.base.store(b, std::memory_order_relaxed);
     m.size.store(image, std::memory_order_release);
     base = b; size = image;
@@ -105,7 +130,7 @@ static inline bool famous_main_module(probe_context *c, famous_module &m, uint64
 
 static inline bool famous_in_main(probe_context *c, famous_module &m, uint64_t address) {
     uint64_t base = 0, size = 0;
-    return famous_main_module(c, m, base, size) && address >= base && address - base < size;
+    return famous_main_module(c, m, base, size, address) && address >= base && address - base < size;
 }
 
 // ---- onLeave: one return-site probe per distinct call site ------------------------------
