@@ -1582,9 +1582,10 @@ def check_realworld():
 HUNT_READ = "ntdll.dll!NtReadVirtualMemory"
 
 
-def hunt_run(backend, scenario, n, extra=(), timeout=600):
+def hunt_run(backend, scenario, n, extra=(), timeout=600, readers=None):
     """hunt_driver (gated_config instrumentation + a stressor) on hunt_target <scenario>.
-    Logs are stream-counted, never retained."""
+    Logs are stream-counted, never retained. readers: exit scenarios' reader threads."""
+    import os
     d, t = exe("hunt_driver.exe"), exe("hunt_target.exe")
     st = {"read": 0, "unmapped": 0, "pids": set(), "work": 0, "tid_ok": 0, "tid_bad": 0,
           "recurse_ok": 0, "other": 0}
@@ -1616,7 +1617,12 @@ def hunt_run(backend, scenario, n, extra=(), timeout=600):
             st["recurse_ok"] += 1
         else:
             st["other"] += 1
-    rc, timed_out = stream_run([d, "--backend", backend, *extra, "--", t, scenario, "--n", n], timeout, on_line)
+    if readers:
+        os.environ["HUNT_READERS"] = str(readers)
+    try:
+        rc, timed_out = stream_run([d, "--backend", backend, *extra, "--", t, scenario, "--n", n], timeout, on_line)
+    finally:
+        os.environ.pop("HUNT_READERS", None)
     tg = next((o for o in keep if o.get("kind") == "target"), {})
     rd = next((o for o in keep if o.get("kind") == "probe" and o.get("location") == HUNT_READ), {})
     wk = next((o for o in keep if o.get("kind") == "probe" and "HuntWork" in str(o.get("location"))), {})
@@ -1688,7 +1694,9 @@ def check_hunt():
             if not hunt_selected(name):
                 continue
             try:
-                rc, tmo, tg, rd, wk, rep, st = hunt_run(bk, sc, 300, (), timeout=300)
+                # 2 readers on the debug-event backends: 8 starve the exiting thread (below).
+                rc, tmo, tg, rd, wk, rep, st = hunt_run(bk, sc, 300, (), timeout=180,
+                                                        readers=8 if bk == "inline" else 2)
                 hits = rd.get("hits") or 0
                 cut = rep.get("callbacks_interrupted")
                 ok = (not tmo and rep.get("app_exit") == code and hits > 0 and tg.get("bad") == 0 and cut is not None and
@@ -1697,6 +1705,21 @@ def check_hunt():
                 record(name, ok, f"exit={rep.get('app_exit')} hits={hits} logs={st['read']} dropped={rep.get('log_dropped')} "
                                  f"interrupted={cut} "
                                  f"reads_at_print={tg.get('reads_at_exit')} rc={rc} timeout={tmo}")
+            except Exception as e:
+                record(name, False, repr(e))
+        # Starvation: 8 threads hitting the probe back to back while main sleeps 300 ms and
+        # calls ExitProcess. Uninstrumented: ~0.3 s. Every debug event freezes the whole
+        # process, so on breakpoint/hw a thread that hits no probe only runs in the gaps
+        # between events (Hunter A finding; see ROADMAP). Bar: exits within 60 s.
+        name = f"hunt-starve-{bk}"
+        if hunt_selected(name):
+            try:
+                t0 = time.perf_counter()
+                rc, tmo, tg, rd, wk, rep, st = hunt_run(bk, "exit-process", 300, (), timeout=60, readers=8)
+                secs = time.perf_counter() - t0
+                ok = not tmo and rep.get("app_exit") == 6
+                record(name, ok, f"exit={rep.get('app_exit')} secs={secs:.1f} hits={(rd or {}).get('hits')} "
+                                 f"reads_at_print={tg.get('reads_at_exit')} timeout={tmo}")
             except Exception as e:
                 record(name, False, repr(e))
 

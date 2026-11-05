@@ -81,6 +81,58 @@ identical source under every backend.
 - ✅ probe_close waits for probe_run to return (warns every 15 s), never tears down underneath it
 - ⬜ frida_coexist hangs (found again 2026-11-05)
 
+## Hunter A findings (2026-11-05) — concurrency / lifecycle edge cases
+Driver `hunt_driver` + target `hunt_target` (`examples/hunt`): gated_config's own callbacks
+(NtOpenProcess handle->pid map, every NtReadVirtualMemory logged with its pid) under a stressor;
+suite `check_hunt` (`hunt-<scenario>-<backend>`; `UHH_HUNT=substr` narrows it). Clean on every
+backend: thread churn (1.6k short-lived threads), thread-pool work/timers/timer-queue, fibers,
+APCs, VEH + SEH filter + handler, DLL load/unload churn with a probe inside the DLL, TLS/DllMain
+reads, a slow (50 ms) callback under 32 threads.
+- ✅ (A1) inline: a callback whose call_func reaches the probed function (or that calls a probed
+  API directly) re-entered its own callback until the stack overflowed (target died 0xC0000005).
+  Now a per-thread guard: the nested hit is counted, no callback -- the breakpoint/hw call_func
+  rule. `hunt-threads-recurse-*` (hits == 2 x reads, every call_func ok)
+- ✅ (A2) breakpoint/hw: call_func returned 0 whenever ANOTHER thread hit a probe while a call was
+  running (its callback ran nested inside the call and was refused) -- ~10% of calls at 32
+  threads; the same callback source worked under inline. Now that other thread's hit is undone
+  (INT3: rewound to the site; execute #DB: not yet executed) and the thread held until the call
+  returns, then it hits again normally. Data-watch hits are not replayable and still run nested.
+  If the callee needs a lock a held thread owns, the call times out (5 s) as before.
+  `hunt-threads-tid-*` (call_func(GetCurrentThreadId) == the hit's tid), `hunt-threads-recurse-*`
+- ✅ (A3) inline: process exit (return from main / ExitProcess / TerminateProcess) kills threads
+  mid-callback: their hits were counted but their logs never existed and nothing said so
+  (logs < hits, log_dropped 0). The in-flight counter now lives in the shared block and the report
+  carries `callbacks_interrupted`; logs + log_dropped + callbacks_interrupted == hits exactly.
+  Breakpoint/hw always complete callbacks (0). `hunt-exit-{return,process,terminate}-*`
+- 🔧 (A4) breakpoint/hw + a target that round-trips its own threads' contexts (SuspendThread +
+  GetThreadContext + SetThreadContext, as GCs/profilers do): a context captured while the thread
+  sat in a UHH debug event and written back after UHH resumed it undoes UHH's fix-up.
+  Fixed: displaced step (resumed into the scratch slot -> ran garbage -> AV): every displaced copy
+  is now followed by a jump back to site+len and a stray TF step inside the scratch slots is
+  swallowed; hw (DR6 overwritten -> unhandled single step killed the target 0x80000004): a #DB at
+  one of our execute addresses with no DR6/BS/TF is recovered as ours.
+  Open (no contained fix): breakpoint -- a context captured at the INT3 trap (pc = site+1) written
+  back resumes the thread one byte into the original instruction (seen: 1-2 wrong reads in 3M);
+  hw -- the stale context has RF clear, so the same call is reported twice (+5 hits in 2M).
+  Inline unaffected. `hunt-ctx-{breakpoint,hw}` FAIL by design until fixed
+- ⬜ (A5) breakpoint/hw starvation: every debug event freezes the whole process, so with 8 threads
+  hitting a probe back to back, a thread that hits nothing runs only in the gaps. Seen: main's
+  Sleep(300)+exit taking 4 s typically and >180 s in ~1 of 6 runs (main measured still inside one
+  fprintf). Program results stay correct; wall-clock does not. Options: one event per hit instead
+  of two (emulate simple displaced instructions such as `mov r10, rcx` instead of single-stepping
+  them), or a fairness throttle that briefly holds a thread that hits continuously.
+  `hunt-starve-*` (exit within 60 s; flaky-fails on breakpoint/hw until fixed); exit checks use 2
+  readers on breakpoint/hw so they test exit correctness, not starvation
+- ⬜ (A6) inline misses calls made BEFORE the image entry point (TLS callbacks at process attach,
+  static-import DllMain): hooks are installed at the entry hold. Breakpoint/hw see them. In
+  gated_config terms an NtOpenProcess in a TLS callback is never mapped, so every later read logs
+  pid=0. Needs an earlier install point (e.g. load the agent from the loader breakpoint) -- design
+  change. `hunt-early-inline` FAIL by design
+- ⬜ (A7) hw: the target arming its OWN debug registers (SetThreadContext DR0/DR7 on its threads,
+  handled in its VEH) shares DR0-3 with UHH's hardware probes: the target's own breakpoint stopped
+  firing. Breakpoint/inline pass the target's #DB through untouched. Document per-backend, or pick
+  slots the thread does not use. `hunt-owndr-hw` FAIL by design
+
 ## Codex workaround audit (2026-11-05) — triaged
 - ✗ (C1) handle->pid through kernel32!OpenProcess: example-callback design, not a library issue (user, 2026-11-05); documented in the gated_config README
 - ⬜ (C11) example handle map: no silent 1024 cap

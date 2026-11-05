@@ -501,7 +501,7 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     // probed API called directly) is counted but does not re-enter a callback -- exactly
     // what breakpoint/hw do inside call_func. Re-entering recursed until the stack overflowed.
     if (t_in_callback) return;
-    InterlockedIncrement(&shared->inflight[stripe].value);
+    InterlockedIncrement64(&shared->inflight[stripe].value);
     // The mid-hook stub preserves GPRs, flags and XMM0-15 only. The callback (and the CRT
     // it calls) may touch x87/MXCSR/YMM/ZMM state -- e.g. vzeroupper -- which the target
     // could be relying on at a mid-function site. Save and restore the full extended state
@@ -511,7 +511,7 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     t_in_callback = 1;
     bool callback_ok = run_callback(callbacks[index], &c);
     t_in_callback = 0;
-    InterlockedDecrement(&shared->inflight[stripe].value);
+    InterlockedDecrement64(&shared->inflight[stripe].value);
     if (!callback_ok) return;
 #if defined(_WIN64)
 #define COPY(a,b) native.a = c.regs.a;

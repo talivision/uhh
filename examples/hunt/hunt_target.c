@@ -71,6 +71,9 @@ static void init_reads(void) {
 static volatile LONG g_tls_on;
 static void NTAPI hunt_tls(PVOID mod, DWORD reason, PVOID r) {
     (void)mod; (void)r;
+    if (reason == DLL_PROCESS_DETACH && getenv("HUNT_TRACE_EXIT")) {
+        DWORD w; WriteFile(GetStdHandle(STD_ERROR_HANDLE), "[tls-process-detach]\n", 21, &w, NULL);
+    }
     if (reason == DLL_PROCESS_ATTACH) {
         if (strstr(GetCommandLineA(), " early")) { init_reads(); hunt_read(); InterlockedIncrement(&g_early); }
     }
@@ -92,6 +95,7 @@ PIMAGE_TLS_CALLBACK hunt_tls_ptr = hunt_tls;
 #endif
 
 static DWORD g_n = 0;
+static void trace_atexit(void) { DWORD w; WriteFile(GetStdHandle(STD_ERROR_HANDLE), "[atexit]\n", 9, &w, NULL); }
 static HANDLE spawn(LPTHREAD_START_ROUTINE fn, void *arg) {
     HANDLE t = CreateThread(NULL, 0, fn, arg, 0, NULL);
     if (!t) { fprintf(stderr, "CreateThread failed %lu\n", GetLastError()); ExitProcess(90); }
@@ -283,10 +287,13 @@ int main(int argc, char **argv) {
         }
         g_stop = 1; join(r, 2);
     } else if (!strncmp(sc, "exit-", 5)) {
-        for (int i = 0; i < 8; ++i) CloseHandle(spawn(reader_until_stop, NULL));
+        const char *rd = getenv("HUNT_READERS");
+        int readers = rd ? atoi(rd) : 8;
+        for (int i = 0; i < readers; ++i) CloseHandle(spawn(reader_until_stop, NULL));
         Sleep(g_n);
         printf("{\"kind\":\"target\",\"scenario\":\"%s\",\"reads_at_exit\":%ld,\"bad\":%ld}\n", sc, g_reads, g_bad);
         fflush(stdout);
+        if (getenv("HUNT_TRACE_EXIT")) { atexit(trace_atexit); fprintf(stderr, "[main-leaving tid=%lu]\n", GetCurrentThreadId()); }
         if (!strcmp(sc, "exit-process")) ExitProcess(6);
         if (!strcmp(sc, "exit-terminate")) TerminateProcess(GetCurrentProcess(), 7);
         return 5;

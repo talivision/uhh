@@ -2931,6 +2931,22 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
     if (!thread) { set_error(s, win_error("open hw event thread")); return false; }
     CONTEXT native{}; native.ContextFlags = CONTEXT_ALL;
     if (!GetThreadContext(thread, &native)) { CloseHandle(thread); set_error(s, win_error("get hw context")); return false; }
+    if (!(native.Dr6 & 0xF & s->dr_used) && !(native.Dr6 & 0x4000) && !(native.EFlags & 0x100u)) {
+        // A #DB that is neither a trap-flag step (BS clear, TF clear) nor flagged in DR6 for
+        // one of our slots, AT the address of one of our execute probes: ours, but DR6 was
+        // overwritten by the target writing a thread context it captured earlier (Suspend +
+        // GetThreadContext / SetThreadContext round-trip racing this event). Passing it on
+        // killed the target with an unhandled single step; recover the slot from the address.
+#if defined(_WIN64)
+        const uint64_t pc = native.Rip;
+#else
+        const uint64_t pc = native.Eip;
+#endif
+        for (auto &p : s->probes)
+            if (p->active && (p->flags & PROBE_HW) && p->dr_slot >= 0 && !(p->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) &&
+                p->address == pc)
+                native.Dr6 |= (DWORD64)1 << p->dr_slot;
+    }
     if (s->in_call_tid && event.dwThreadId != s->in_call_tid && (native.Dr6 & 0xF)) {
         // Only pure execute hits can be replayed (a data watch has already happened).
         bool exec_only = true;
@@ -3082,6 +3098,20 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
                 w.EFlags |= 0x10000u;                                  // RF: run the instruction once
                 SetThreadContext(t, &w);
             }
+            if (t) CloseHandle(t);
+            disposition = DBG_CONTINUE; return true;
+        }
+    }
+    // A stray trap-flag step inside our scratch slots with no step in progress: the target
+    // wrote back a context it captured mid-step (see the jump-back after each displaced
+    // copy). Ours, not the target's: drop TF and let the thread run the jump back.
+    if (code == EXCEPTION_SINGLE_STEP && step == stepping.end()) {
+        bool in_scratch = false;
+        for (uint64_t b : s->scratch_blocks) if (address >= b && address < b + 0x10000) { in_scratch = true; break; }
+        if (in_scratch) {
+            HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
+            CONTEXT w{}; w.ContextFlags = CONTEXT_CONTROL;
+            if (t && GetThreadContext(t, &w)) { w.EFlags &= ~0x100u; SetThreadContext(t, &w); }
             if (t) CloseHandle(t);
             disposition = DBG_CONTINUE; return true;
         }
@@ -3247,6 +3277,23 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             int64_t nd = (int64_t)disp + (int64_t)(probe->address - scratch_addr);
             if (nd < INT32_MIN || nd > INT32_MAX) displaced = false;
             else { int32_t v = (int32_t)nd; std::memcpy(code.data() + probe->riprel_disp_off, &v, sizeof(v)); }
+        }
+        // Follow the copy with a jump back to the next real instruction. Normally never
+        // executed (the single-step lands us there), but a target that captures a thread's
+        // context while it reports the step (Suspend + GetThreadContext, e.g. a GC or its own
+        // context round-trip) and writes it back after we moved it, resumes the thread HERE:
+        // it must continue correctly instead of running whatever follows in the slot.
+        if (displaced) {
+            const uint64_t back = probe->address + probe->insn_len;
+#if defined(_WIN64)
+            const unsigned char jmp[6] = {0xFF, 0x25, 0, 0, 0, 0};   // jmp [rip+0]; dq back
+            code.insert(code.end(), jmp, jmp + 6);
+            for (int b = 0; b < 8; ++b) code.push_back((unsigned char)(back >> (8 * b)));
+#else
+            const uint32_t rel = (uint32_t)(back - (scratch_addr + code.size() + 5));
+            code.push_back(0xE9);                                     // jmp rel32
+            for (int b = 0; b < 4; ++b) code.push_back((unsigned char)(rel >> (8 * b)));
+#endif
         }
         size_t wrote = 0;
         if (displaced && (!remote_write(s->pi.hProcess, scratch_addr, code.data(), code.size(), &wrote) ||
