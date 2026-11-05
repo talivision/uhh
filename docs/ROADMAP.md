@@ -379,6 +379,11 @@ with the uninstrumented target and with exact hits / "co" logs / `log_dropped ==
   Ctrl+Break while a call_original is in flight complete that call first (`callorig-hunt-
   {detach,ctrlbreak}-*`).
 
+## Controller static review (2026-11-05) — known limits, not fixed by design
+- [ ] **call_func under contention (breakpoint/hw).** While a callback's `call_func` runs in the target, other threads that hit probes are parked; if one of them holds a lock the callee needs, the call times out after 5 s and the callee is abandoned mid-wait (SRW/CS wait blocks on a reused stack, locks it took never released). A first-chance exception inside the callee (C++ throw/catch, SEH probing) also abandons it. `call_original` is not affected (the thread runs on). Owner decision: no call_func hijack hardening -- use call_func only on lock-free, non-throwing callees; prefer `call_original`.
+- [ ] **Unhandled-exception filters under breakpoint/hw.** A process under the debug API never runs its `SetUnhandledExceptionFilter` filter (the kernel routes to the debugger; second chance then ends the process). Crash reporters/recovery filters behave differently than without UHH. Every session (inline too) is a debugger, so this is inherent. Owner decision: no debug-port masking.
+- Other findings (TF leak on re-faulting site, in-place double-fire, absolute probes across unload, deferred symbolisation vs unload, target-owned DRs, drain_final bound, error-exit detach) are being fixed with `ctrl-*` / `lifecycle-*` checks.
+
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`
 - ✅ Per-log overhead ceilings in the suite (`log-throughput-*`)
