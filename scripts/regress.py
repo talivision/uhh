@@ -1578,6 +1578,443 @@ def check_realworld():
             except Exception as e:
                 record(label, False, repr(e))
 
+# ---- Microsoft Detours samples replicated on UHH (examples/famous/detours_*) --------------
+# Every check compares the instrumented run against the uninstrumented one (the target's own
+# ground truth) and the trace against what the target says it did, under every backend.
+
+DT_BACKENDS = ("breakpoint", "hw", "inline")
+# hw has 4 debug registers: the traceapi set is traced in groups of at most 4.
+DT_HW_GROUPS = ("CreateFileW,ReadFile,WriteFile,CloseHandle",
+                "RegOpenKeyExW,RegQueryValueExW,LoadLibraryW,LoadLibraryExW",
+                "CreateProcessInternalW")
+
+
+def dt_split(stdout):
+    """Split a driver's stdout into UHH records and the TARGET's own output. The target
+    inherits the controller's stdout, and the live log tail writes whole records -- but a
+    target that writes a partial line (reg.exe does; so does unbuffered UCRT stdout) gets a
+    record spliced into the middle of its line. Rebuild the target's text by cutting every
+    record out of the line it landed in."""
+    objs, text = [], []
+    for line in stdout.splitlines():
+        cut = line.find('{"kind":')
+        if cut < 0:
+            text.append(line + "\n")
+            continue
+        text.append(line[:cut])
+        try:
+            objs.append(json.loads(line[cut:]))
+        except json.JSONDecodeError:
+            text.append(line[cut:] + "\n")
+    return objs, "".join(text)
+
+
+def dt_run(args, timeout=300, feed=None):
+    r = subprocess.run([str(a) for a in args], capture_output=True, text=True, timeout=timeout, input=feed)
+    objs, text = dt_split(r.stdout)
+    return r, objs, text
+
+
+def dt_logs(objs):
+    return [o.get("message", "") for o in objs if o.get("kind") == "probe_log"]
+
+
+def dt_target(objs):
+    return next((o for o in objs if o.get("kind") == "target"), {})
+
+
+def dt_dir():
+    d = Path(tempfile.gettempdir()) / "uhhdt"
+    d.mkdir(exist_ok=True)
+    return d
+
+
+def dt_tail(r, n=6):
+    return " stderr_tail=" + " | ".join(l[:200] for l in (r.stderr or "").strip().splitlines()[-n:])
+
+
+def check_detours_simple(threads=4, rounds=25):
+    """Detours 'simple' (SleepEx counter): every Sleep/SleepEx the target made is logged once,
+    with the requested milliseconds; the target's own results equal an uninstrumented run."""
+    d, tg_exe = exe("detours_simple.exe"), exe("detours_target.exe")
+    if not d or not tg_exe:
+        return skip("detours-simple", "detours_simple/detours_target missing")
+    targs = ["sleep", "--threads", threads, "--rounds", rounds]
+    try:
+        _, bo, _ = dt_run([tg_exe, *targs], timeout=120)
+        base = dt_target(bo)
+    except Exception as e:
+        return record("detours-simple-baseline", False, repr(e))
+    keys = ("sleep_calls", "sleepex_calls", "total_requested_ms", "alertable_ret", "apc_runs", "errors")
+    for bk in DT_BACKENDS:
+        name = f"detours-simple-{bk}"
+        try:
+            r, o, _ = dt_run([d, "--backend", bk, "--", tg_exe, *targs], timeout=300)
+            tg, rep, logs = dt_target(o), report(o), dt_logs(o)
+            sx = [re.match(r"SleepEx\((\d+), (\d+)\)$", m) for m in logs if m.startswith("SleepEx(")]
+            sl = [re.match(r"Sleep\((\d+)\)$", m) for m in logs if m.startswith("Sleep(")]
+            sx_ms, sl_ms = sum(int(m.group(1)) for m in sx if m), sum(int(m.group(1)) for m in sl if m)
+            alertable = sum(1 for m in sx if m and m.group(2) != "0")
+            hits = {p.get("location"): p.get("hits") for p in probes(o)}
+            same = all(tg.get(k) == base.get(k) for k in keys)
+            ok = (r.returncode == 0 and same and base.get("errors") == 0 and base.get("alertable_ret") == 192 and
+                  len(sl) == base.get("sleep_calls") and
+                  len(sx) == base.get("sleep_calls", 0) + base.get("sleepex_calls", 0) and
+                  sx_ms == base.get("total_requested_ms") and alertable == threads * rounds + 1 and
+                  hits.get("KernelBase.dll!SleepEx") == len(sx) and hits.get("kernel32.dll!Sleep") == len(sl) and
+                  rep.get("log_dropped") == 0 and rep.get("app_exit") == 0 and rep.get("error") is None)
+            record(name, ok, f"Sleep logs={len(sl)}/{base.get('sleep_calls')} SleepEx logs={len(sx)}/"
+                             f"{base.get('sleep_calls', 0) + base.get('sleepex_calls', 0)} ms={sx_ms}/{base.get('total_requested_ms')} "
+                             f"(Sleep ms={sl_ms}) alertable={alertable}/{threads * rounds + 1} hits={hits} "
+                             f"target_same={same} alert_ret={tg.get('alertable_ret')} dropped={rep.get('log_dropped')} "
+                             f"exit={rep.get('app_exit')} err={(rep.get('error') or '')[:160]}" + ("" if ok else dt_tail(r)))
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+def dt_api_expect(tg):
+    """Workload lines the traceapi trace must contain, from the target's own counts."""
+    n = tg.get("threads", 0) * tg.get("iters", 0)
+    return {
+        "create_always": n, "open_existing": 2 * n, "writes": tg.get("writes"), "reads": tg.get("reads"),
+        "regopen": tg.get("regopens"), "regquery": tg.get("regqueries"), "loadlib": tg.get("loads"), "process": 1,
+    }
+
+
+def dt_api_seen(logs):
+    """Count the workload's calls in a traceapi trace (startup noise is not 'uhhdt-')."""
+    c = {"create_always": 0, "open_existing": 0, "writes": 0, "reads": 0, "regopen": 0, "regquery": 0,
+         "loadlib": 0, "loadlibex": 0, "process": 0, "close": 0}
+    for m in logs:
+        if m.startswith("CreateFileW(") and "uhhdt-" in m:
+            c["create_always" if m.endswith("disp=2)") else "open_existing"] += 1
+        elif m.startswith("WriteFile(") and ', 1337, "UHHDT-PAYLOAD-' in m:
+            c["writes"] += 1
+        elif m.startswith("ReadFile(") and m.endswith(", 1337)"):
+            c["reads"] += 1
+        elif m.startswith('RegOpenKeyExW(HKLM, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion"'):
+            c["regopen"] += 1
+        elif m.startswith("RegQueryValueExW(") and m.endswith(', "ProductName")'):
+            c["regquery"] += 1
+        elif m == 'LoadLibraryW("version.dll")':
+            c["loadlib"] += 1
+        elif m.startswith('LoadLibraryExW("version.dll"'):
+            c["loadlibex"] += 1
+        elif m.startswith("CreateProcessInternalW(") and "/d /c exit 7" in m:
+            c["process"] += 1
+        elif m.startswith("CloseHandle("):
+            c["close"] += 1
+    return c
+
+
+def dt_groups(bk):
+    return DT_HW_GROUPS if bk == "hw" else (None,)
+
+
+def dt_kinds(group):
+    """Which dt_api_seen keys a probe group can see."""
+    if group is None:
+        return None
+    g = group.split(",")
+    keys = set()
+    if "CreateFileW" in g: keys |= {"create_always", "open_existing"}
+    if "WriteFile" in g: keys.add("writes")
+    if "ReadFile" in g: keys.add("reads")
+    if "RegOpenKeyExW" in g: keys.add("regopen")
+    if "RegQueryValueExW" in g: keys.add("regquery")
+    if "LoadLibraryW" in g: keys.add("loadlib")
+    if "CreateProcessInternalW" in g: keys.add("process")
+    return keys
+
+
+def check_detours_traceapi(threads=4, iters=5):
+    """Detours 'traceapi': file/registry/process/module APIs traced with decoded arguments,
+    on detours_target (exact: the trace holds exactly the calls the target says it made, plus
+    the one pre-workload registry read) and on real system programs (cmd type, reg query,
+    cmd spawning cmd): their output and exit code equal an uninstrumented run."""
+    d, tg_exe = exe("detours_traceapi.exe"), exe("detours_target.exe")
+    if not d or not tg_exe:
+        return skip("detours-traceapi", "detours_traceapi/detours_target missing")
+    wd = dt_dir()
+    targs = ["api", "--threads", threads, "--iters", iters, "--dir", wd]
+    try:
+        _, bo, _ = dt_run([tg_exe, *targs], timeout=120)
+        base = dt_target(bo)
+    except Exception as e:
+        return record("detours-traceapi-baseline", False, repr(e))
+    want = dt_api_expect(base)
+    want["regopen"] += 1; want["regquery"] += 1            # the ground-truth read before the workload
+    keys = ("creates", "writes", "reads", "closes", "regopens", "regqueries", "loads", "child_exit", "product", "errors")
+    for bk in (*DT_BACKENDS, "mix"):
+        for group in dt_groups(bk):
+            name = f"detours-traceapi-{bk}" + (f"-g{DT_HW_GROUPS.index(group) + 1}" if group else "")
+            try:
+                cmd = [d, "--backend", bk] + (["--only", group] if group else []) + ["--", tg_exe, *targs]
+                r, o, _ = dt_run(cmd, timeout=600)
+                tg, rep, logs = dt_target(o), report(o), dt_logs(o)
+                seen = dt_api_seen(logs)
+                kinds = dt_kinds(group) or set(want)
+                bad = {k: (seen[k], want[k]) for k in kinds if seen[k] != want[k]}
+                hits = sum(p.get("hits") or 0 for p in probes(o))
+                same = all(tg.get(k) == base.get(k) for k in keys)
+                lle_ok = group is not None and "LoadLibraryExW" not in group or seen["loadlibex"] >= want["loadlib"]
+                close_ok = group is not None and "CloseHandle" not in group or seen["close"] >= base.get("closes", 0)
+                backends = sorted({p.get("backend") for p in probes(o)})
+                ok = (r.returncode == 0 and same and base.get("errors") == 0 and not bad and lle_ok and close_ok and
+                      hits == len(logs) and rep.get("log_dropped") == 0 and rep.get("app_exit") == 0 and
+                      rep.get("error") is None and (bk != "mix" or backends == ["breakpoint", "hw", "inline"]))
+                record(name, ok, f"mismatch(seen,want)={bad} closes={seen['close']}>={base.get('closes')} "
+                                 f"loadlibex={seen['loadlibex']} logs={len(logs)} hits={hits} backends={backends} "
+                                 f"target_same={same} dropped={rep.get('log_dropped')} exit={rep.get('app_exit')} "
+                                 f"err={(rep.get('error') or '')[:160]}" + ("" if ok else dt_tail(r)))
+            except Exception as e:
+                record(name, False, repr(e))
+    # Real programs. 32-bit drivers launch the SysWOW64 copies through System32 redirection.
+    content = wd / "uhhdt-type.txt"
+    content.write_text("UHHDT-TYPE-CONTENT line one\nline two\n")
+    cmd_exe, reg_exe = str(SYS32 / "cmd.exe"), str(SYS32 / "reg.exe")
+    key = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+    programs = (
+        ("type", [cmd_exe, "/d", "/c", "type", str(content)],
+         lambda logs: any(m.startswith("CreateFileW(") and "uhhdt-type.txt" in m for m in logs) and
+                      any(m.startswith("ReadFile(") for m in logs), "CreateFileW,ReadFile,WriteFile,CloseHandle"),
+        ("reg", [reg_exe, "query", key, "/v", "ProductName"],
+         lambda logs: any(m.startswith("RegOpenKeyExW(HKLM, \"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\"") for m in logs) and
+                      any(m.startswith("RegQueryValueExW(") and "ProductName" in m for m in logs),
+         "RegOpenKeyExW,RegQueryValueExW,LoadLibraryW,LoadLibraryExW"),
+        ("spawn", [cmd_exe, "/d", "/c", f"{cmd_exe} /d /c exit 3"],
+         lambda logs: any(m.startswith("CreateProcessInternalW(") and "exit 3" in m for m in logs),
+         "CreateProcessInternalW"),
+    )
+    for label, argv, check, hw_group in programs:
+        try:
+            br = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+            base_out = [l for l in br.stdout.splitlines() if l.strip()]
+        except Exception as e:
+            record(f"detours-traceapi-{label}-baseline", False, repr(e)); continue
+        for bk in (*DT_BACKENDS, "mix"):
+            name = f"detours-traceapi-{label}-{bk}"
+            try:
+                cmd = [d, "--backend", bk] + (["--only", hw_group] if bk == "hw" else []) + ["--", *argv]
+                r, o, text = dt_run(cmd, timeout=300)
+                rep, logs = report(o), dt_logs(o)
+                out = [l for l in text.splitlines() if l.strip()]
+                hits = sum(p.get("hits") or 0 for p in probes(o))
+                ok = (out == base_out and rep.get("app_exit") == br.returncode and check(logs) and
+                      hits == len(logs) and rep.get("log_dropped") == 0 and rep.get("error") is None)
+                record(name, ok, f"output_same={out == base_out} exit={rep.get('app_exit')}/{br.returncode} "
+                                 f"trace_ok={check(logs)} logs={len(logs)} hits={hits} dropped={rep.get('log_dropped')} "
+                                 f"err={(rep.get('error') or '')[:160]}" +
+                                 ("" if ok else f" out={out[:4]} base={base_out[:4]} logs={logs[:6]}" + dt_tail(r)))
+            except Exception as e:
+                record(name, False, repr(e))
+
+
+def dt_norm(m):
+    """A trace line with run-specific values (handles) removed."""
+    return re.sub(r"0x[0-9a-f]+", "0x?", m)
+
+
+def dt_workload(logs):
+    from collections import Counter
+    keep = []
+    for m in logs:
+        if ("uhhdt-" in m or "UHHDT-PAYLOAD" in m or m.endswith(", 1337)") or "version.dll" in m or
+                "/d /c exit 7" in m or m.startswith("RegOpenKeyExW(HKLM, \"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\"") or
+                (m.startswith("RegQueryValueExW(") and "ProductName" in m)):
+            keep.append(dt_norm(m))
+    return Counter(keep)
+
+
+def dt_gated(tg_exe, targs):
+    tgt = subprocess.Popen([str(tg_exe), *map(str, targs), "--gate"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, text=True)
+    tout = Lines(tgt.stdout)
+    waiting = tout.wait_for(lambda l: '"kind":"waiting"' in l, 30)
+    if not waiting:
+        tgt.kill()
+        raise RuntimeError("target never reached its gate")
+    return tgt, tout
+
+
+def check_detours_withdll(threads=2, iters=3):
+    """Detours withdll (launch with the DLL) vs attaching to a running process: the launch
+    trace and the attach trace of the same gated workload are identical, except for the one
+    registry read the target makes before its gate (it happens before the attach). Then
+    attach mid-run to a busy multi-threaded target and DETACH while it keeps running: it
+    must finish with every self-check passing."""
+    d, tg_exe = exe("detours_traceapi.exe"), exe("detours_target.exe")
+    if not d or not tg_exe:
+        return skip("detours-withdll", "detours_traceapi/detours_target missing")
+    wd = dt_dir()
+    targs = ["api", "--threads", threads, "--iters", iters, "--dir", wd]
+    for bk in (*DT_BACKENDS, "mix"):
+        for group in dt_groups(bk):
+            name = f"detours-withdll-{bk}" + (f"-g{DT_HW_GROUPS.index(group) + 1}" if group else "")
+            procs = []
+            try:
+                sel = ["--only", group] if group else []
+                # withdll: launch under instrumentation (gate released at once).
+                r, lo, _ = dt_run([d, "--backend", bk, *sel, "--", tg_exe, *targs, "--gate"], timeout=300, feed="\n")
+                launch = dt_workload(dt_logs(lo))
+                # attach: the target is already running, waiting at its gate.
+                tgt, tout = dt_gated(tg_exe, targs)
+                procs.append(tgt)
+                pid = tgt.pid
+                att = subprocess.Popen([str(d), "--backend", bk, *sel, "--attach", str(pid)],
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                procs.append(att)
+                aout, aerr = Lines(att.stdout), Lines(att.stderr)
+                nprobes = len(group.split(",")) if group else 9
+                if not aout.wait_for(lambda l: '"kind":"attached"' in l, 60):
+                    raise RuntimeError("did not attach: " + " | ".join(aerr.lines[-5:]))
+                deadline = time.time() + 60
+                while time.time() < deadline and sum(1 for l in list(aerr.lines) if l.startswith("probe: active ")) < nprobes:
+                    time.sleep(0.05)
+                active = sum(1 for l in list(aerr.lines) if l.startswith("probe: active "))
+                tgt.stdin.write("\n"); tgt.stdin.flush()
+                tgt.wait(timeout=300); att.wait(timeout=120)
+                ao, to = aout.objs(), tout.objs()
+                attach = dt_workload(dt_logs(ao))
+                diff_launch, diff_attach = launch - attach, attach - launch
+                pre_gate = {k: v for k, v in diff_launch.items()}
+                expect_pre = {}
+                if group is None or "RegOpenKeyExW" in group:
+                    expect_pre['RegOpenKeyExW(HKLM, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", 0x?)'] = 1
+                if group is None or "RegQueryValueExW" in group:
+                    expect_pre['RegQueryValueExW(0x?, "ProductName")'] = 1
+                tg, rep = dt_target(to), report(ao)
+                ok = (r.returncode == 0 and att.returncode == 0 and tgt.returncode == 0 and tg.get("errors") == 0 and
+                      active == nprobes and not diff_attach and pre_gate == expect_pre and sum(attach.values()) > 0 and
+                      rep.get("log_dropped") == 0 and rep.get("error") is None)
+                record(name, ok, f"workload lines launch={sum(launch.values())} attach={sum(attach.values())} "
+                                 f"only_in_launch={dict(diff_launch)} only_in_attach={dict(diff_attach)} active={active}/{nprobes} "
+                                 f"target_errors={tg.get('errors')} rc={r.returncode}/{att.returncode}/{tgt.returncode} "
+                                 f"dropped={rep.get('log_dropped')} err={(rep.get('error') or '')[:160]}")
+            except Exception as e:
+                record(name, False, repr(e))
+            finally:
+                for p_ in procs:
+                    if p_.poll() is None:
+                        p_.kill()
+    # Attach mid-run (no gate: the target is busy on 4 threads) and detach while it runs.
+    for bk in (*DT_BACKENDS, "mix"):
+        name = f"detours-withdll-detach-{bk}"
+        procs = []
+        try:
+            sel = ["--only", DT_HW_GROUPS[0]] if bk == "hw" else []
+            tgt = subprocess.Popen([str(tg_exe), "api", "--threads", "4", "--iters", "2", "--duration-ms", "8000",
+                                    "--dir", str(wd)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True)
+            procs.append(tgt)
+            tout, terr = Lines(tgt.stdout), Lines(tgt.stderr)
+            if not tout.wait_for(lambda l: '"kind":"open"' in l, 30):
+                raise RuntimeError("target never started its workload")
+            r, o, _ = dt_run([d, "--backend", bk, *sel, "--attach", tgt.pid, "--detach-after-ms", "2500"], timeout=120)
+            tgt.wait(timeout=180)
+            tg, rep, logs = dt_target(tout.objs()), report(o), dt_logs(o)
+            detached = any(x.get("kind") == "detached" for x in o)
+            ok = (r.returncode == 0 and detached and len(logs) > 0 and tgt.returncode == 0 and tg.get("errors") == 0 and
+                  tg.get("child_exit") == 7 and rep.get("log_dropped") == 0)
+            record(name, ok, f"logs_before_detach={len(logs)} detached={detached} target_exit={tgt.returncode} "
+                             f"target_errors={tg.get('errors')} child_exit={tg.get('child_exit')} creates={tg.get('creates')} "
+                             f"dropped={rep.get('log_dropped')}" +
+                             ("" if ok else f" target_stderr={terr.lines[-4:]}" + dt_tail(r)))
+        except Exception as e:
+            record(name, False, repr(e))
+        finally:
+            for p_ in procs:
+                if p_.poll() is None:
+                    p_.kill()
+
+
+def check_detours_retval(threads=4, iters=3):
+    """Return values the UHH way: CreateFileW's entry callback probes its return address
+    (probe_add_address from the callback); the return callback logs AX and GetLastError
+    (call_func on the hit thread). The logged (name, handle, error) of every workload
+    CreateFileW equals what the target itself saw, on every backend, from 4 threads."""
+    d, tg_exe = exe("detours_retval.exe"), exe("detours_target.exe")
+    if not d or not tg_exe:
+        return skip("detours-retval", "detours_retval/detours_target missing")
+    from collections import Counter
+    wd = dt_dir()
+    for bk, extra in (("breakpoint", []), ("hw", []), ("inline", []), ("inline", ["--fallback-hw"])):
+        name = f"detours-retval-{bk}{'-fallback' if extra else ''}"
+        try:
+            r, o, _ = dt_run([d, "--backend", bk, *extra, "--", tg_exe, "api", "--threads", threads, "--iters", iters,
+                        "--dir", wd], timeout=600)
+            truth = Counter((x["name"], int(x["handle"], 16), x["error"]) for x in o if x.get("kind") == "open")
+            got, strays = Counter(), []
+            for m in dt_logs(o):
+                mm = re.match(r'CreateFileW\("([^"]*)"\) -> handle=0x([0-9a-f]+) error=(-?\d+)', m)
+                if mm and mm.group(1).startswith("uhhdt-"):
+                    got[(mm.group(1), int(mm.group(2), 16), int(mm.group(3)))] += 1
+                elif not mm:
+                    strays.append(m)
+            tg, rep = dt_target(o), report(o)
+            ret_probes = [p for p in probes(o) if p.get("location", "").startswith("0x")]
+            errs = Counter(e for (_, _, e) in truth.elements())
+            ok = (r.returncode == 0 and tg.get("errors") == 0 and sum(truth.values()) == tg.get("creates") and
+                  got == truth and not strays and len(ret_probes) >= 1 and rep.get("log_dropped") == 0 and
+                  rep.get("error") is None)
+            record(name, ok, f"returns logged={sum(got.values())}/{sum(truth.values())} equal={got == truth} "
+                             f"errors_seen={dict(errs)} return_probes={[(p.get('backend'), p.get('hits')) for p in ret_probes]} "
+                             f"strays={strays[:3]} target_errors={tg.get('errors')} dropped={rep.get('log_dropped')} "
+                             f"err={(rep.get('error') or '')[:160]}" +
+                             ("" if ok else f" missing={list((truth - got).items())[:3]} extra={list((got - truth).items())[:3]}" + dt_tail(r)))
+        except Exception as e:
+            record(name, False, repr(e))
+    # A real program: cmd.exe types one file that exists and one that does not.
+    content = wd / "uhhdt-type.txt"
+    content.write_text("UHHDT-TYPE-CONTENT\n")
+    missing = wd / "uhhdt-nosuchfile.txt"
+    for bk in DT_BACKENDS:
+        name = f"detours-retval-cmd-{bk}"
+        try:
+            r, o, text = dt_run([d, "--backend", bk, "--", str(SYS32 / "cmd.exe"), "/d", "/c",
+                        f"type {content} & type {missing}"], timeout=300)
+            rets = [re.match(r'CreateFileW\("([^"]*)"\) -> handle=0x([0-9a-f]+) error=(-?\d+)', m) for m in dt_logs(o)]
+            rets = [(m.group(1), int(m.group(2), 16), int(m.group(3))) for m in rets if m]
+            good = [x for x in rets if x[0] == content.name]
+            bad = [x for x in rets if x[0] == missing.name]
+            rep = report(o)
+            ok = (any(h not in (0, 0xffffffff, (1 << 64) - 1) and e == 0 for _, h, e in good) and
+                  any(h in (0xffffffff, (1 << 64) - 1) and e == 2 for _, h, e in bad) and
+                  "UHHDT-TYPE-CONTENT" in text and rep.get("log_dropped") == 0)
+            record(name, ok, f"existing={good[:2]} missing={bad[:2]} returns={len(rets)} "
+                             f"return_probes={[(p.get('backend'), p.get('hits')) for p in probes(o) if p.get('location', '').startswith('0x')]} "
+                             f"err={(rep.get('error') or '')[:160]}" + ("" if ok else dt_tail(r)))
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+def check_detours_stdin():
+    """withdll semantics: a launched program keeps its own stdin. Detours' withdll starts
+    the child with the caller's handles; a filter like sort.exe must read the caller's input
+    and see EOF. (UHH's probe_launch gives the child a private pipe instead, writes one
+    gate keystroke into it and keeps it open -- see docs/ROADMAP.md, Detours-replica
+    findings.)"""
+    d = exe("detours_traceapi.exe")
+    if not d:
+        return skip("detours-launch-stdin", "detours_traceapi missing")
+    sort_exe, feed = str(SYS32 / "sort.exe"), "banana\napple\ncherry\n"
+    try:
+        br = subprocess.run([sort_exe], capture_output=True, text=True, timeout=60, input=feed)
+        base = [l for l in br.stdout.splitlines() if l.strip()]
+    except Exception as e:
+        return record("detours-launch-stdin", False, "baseline: " + repr(e))
+    for bk in DT_BACKENDS:
+        name = f"detours-launch-stdin-{bk}"
+        try:
+            r, o, text = dt_run([d, "--backend", bk, "--only", "ReadFile", "--", sort_exe], timeout=60, feed=feed)
+            out = text.splitlines()
+            ok = r.returncode == 0 and [l for l in out if l.strip()] == base and len(out) == len(br.stdout.splitlines())
+            record(name, ok, f"output={out[:5]} expected={br.stdout.splitlines()[:5]} rc={r.returncode}")
+        except subprocess.TimeoutExpired:
+            record(name, False, "hung: the program never saw EOF on its stdin (killed after 60 s)")
+        except Exception as e:
+            record(name, False, repr(e))
+
 
 def main():
     global BIN
@@ -1649,6 +2086,11 @@ def main():
     if want(check_attach_new): check_attach_new()
     if want(check_refusals): check_refusals()
     if want(check_hotpatch_prologue): check_hotpatch_prologue()
+    if want(check_detours_simple): check_detours_simple()
+    if want(check_detours_traceapi): check_detours_traceapi()
+    if want(check_detours_withdll): check_detours_withdll()
+    if want(check_detours_retval): check_detours_retval()
+    if want(check_detours_stdin): check_detours_stdin()
     print("-" * 72)
     failed = 0
     for name, status, detail in RESULTS:

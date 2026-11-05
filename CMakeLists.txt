@@ -109,7 +109,10 @@ add_library(probe_api_agent SHARED
     examples/conformance/conformance_callbacks.cpp
     bench/hitcost/hitcost_callbacks.cpp
     examples/memstress/memstress_callbacks.cpp
-    examples/sidefx/sidefx_callbacks.cpp)
+    examples/sidefx/sidefx_callbacks.cpp
+    examples/famous/detours_simple/simple_callbacks.cpp
+    examples/famous/detours_traceapi/traceapi_callbacks.cpp
+    examples/famous/detours_retval/retval_callbacks.cpp)
 target_include_directories(probe_api_agent PRIVATE include examples/gated_config examples/dynwatch examples/trace examples/memstress)
 target_link_libraries(probe_api_agent PRIVATE safetyhook)
 target_compile_definitions(probe_api_agent PRIVATE BREAKAGE_AGENT_ONLY FRIDA_PARITY_AGENT_ONLY HITCOST_SHARED)
@@ -270,7 +273,20 @@ target_include_directories(refusal_driver PRIVATE include)
 target_link_libraries(refusal_driver PRIVATE probe_api)
 add_dependencies(refusal_driver hitcost_target)
 
-foreach(t gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
+# --- famous: Microsoft Detours samples replicated on UHH (examples/famous/detours_*) -----
+# One target for all of them; each example's callbacks are also built into the agent DLL.
+add_executable(detours_target examples/famous/detours_target.c)
+target_link_libraries(detours_target PRIVATE advapi32)
+add_executable(detours_simple examples/famous/detours_simple/simple_driver.cpp examples/famous/detours_simple/simple_callbacks.cpp)
+add_executable(detours_traceapi examples/famous/detours_traceapi/traceapi_driver.cpp examples/famous/detours_traceapi/traceapi_callbacks.cpp)
+add_executable(detours_retval examples/famous/detours_retval/retval_driver.cpp examples/famous/detours_retval/retval_callbacks.cpp)
+foreach(d detours_simple detours_traceapi detours_retval)
+    target_include_directories(${d} PRIVATE include)
+    target_link_libraries(${d} PRIVATE probe_api)
+    add_dependencies(${d} detours_target probe_api_agent)
+endforeach()
+
+foreach(t detours_target detours_simple detours_traceapi detours_retval gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
     target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 endforeach()
