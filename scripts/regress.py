@@ -41,6 +41,8 @@ Checks:
     cmd/reg), withdll (launch trace == attach trace; attach mid-run + detach), retval (return
     values via a return-address probe + call_func GetLastError), launch-stdin. Every one
     compares against the uninstrumented run.
+  - newapp-file/flag/reg-<backends>: the new-app examples (filetrace, flagflip, regtrace),
+    every backend and mixes, each compared with the ground truth its fixture prints.
 Missing binaries (an example not built) are reported as SKIP, not FAIL.
 """
 import argparse
@@ -1925,6 +1927,217 @@ def check_gated_map(threads=4, reads=50):
             record(name, False, repr(e))
 
 
+# --- newapp-*: the three new-app examples (examples/filetrace, flagflip, regtrace), each
+# compared with the ground truth its fixture prints about itself. ------------------------
+def newapp_health(r, objs):
+    """Problems common to every newapp run: exit code, dropped logs, library warnings."""
+    rep, bad = report(objs), []
+    if r.returncode != 0:
+        bad.append(f"rc={r.returncode}")
+    if rep.get("log_dropped") != 0 or rep.get("callbacks_interrupted", 0) != 0:
+        bad.append(f"dropped={rep.get('log_dropped')} interrupted={rep.get('callbacks_interrupted')}")
+    warnings = [ln for ln in (r.stderr or "").splitlines() if "warning" in ln.lower()]
+    warnings += [m for m in newapp_msgs(objs) if m.startswith("uhh warning")]
+    if warnings:
+        bad.append(f"warnings={warnings[:2]}")
+    return bad
+
+
+def newapp_msgs(objs):
+    return [str(o.get("message", "")) for o in objs if o.get("kind") == "probe_log"]
+
+
+def newapp_label(backends):
+    return backends[0] if len(set(backends)) == 1 else "+".join(backends)
+
+
+def check_newapp_files(threads=4, files=4, chunks=6):
+    """filetrace (NtCreateFile call_original + return_from, NtWriteFile, NtClose) against
+    filetrace_target: every successful open is logged with exactly the handle the program got,
+    every failing open with exactly the NTSTATUS the program saw (and the program's own error
+    checks pass), every write is attributed to its path with the right count and bytes --
+    plain and overlapped -- and every file reads back intact. All-same and mixed backends."""
+    from collections import Counter
+    if not exe("filetrace.exe") or not exe("filetrace_target.exe"):
+        return skip("newapp-file", "filetrace.exe / filetrace_target.exe missing")
+    rx_create = re.compile(r"create path=(.*) access=0x([0-9a-f]+) status=0x([0-9a-f]+) handle=0x([0-9a-f]+)$")
+    rx_write = re.compile(r"write path=(.*) handle=0x([0-9a-f]+) len=(\d+) offset=(-?\d+)$")
+
+    def norm(path):
+        path = path[4:] if path.startswith("\\??\\") else path
+        return path.lower()
+
+    cells = [("breakpoint",) * 3, ("hw",) * 3, ("inline",) * 3, ("breakpoint", "inline", "hw"),
+             ("inline", "hw", "breakpoint"), ("hw", "breakpoint", "inline")]
+    for create, write, close in cells:
+        name = "newapp-file-" + newapp_label((create, write, close))
+        d = Path(tempfile.mkdtemp(prefix="uhhft-"))
+        try:
+            r, o = run([exe("filetrace.exe"), "--create-backend", create, "--write-backend", write,
+                        "--close-backend", close, "--filter", d.name, "--", exe("filetrace_target.exe"),
+                        "--dir", d, "--threads", threads, "--files", files, "--chunks", chunks], timeout=600)
+            done = next((x for x in o if x.get("kind") == "ft_done"), {})
+            truth_open = Counter((norm(x["path"]), x["handle"]) for x in o if x.get("kind") == "ft_open")
+            truth_fail = Counter((norm(x["path"]), int(x["status"], 16)) for x in o if x.get("kind") == "ft_fail")
+            truth_files = {norm(x["path"]): (x["writes"], x["bytes"]) for x in o if x.get("kind") == "ft_file"}
+            msgs = newapp_msgs(o)
+            creates = [m.groups() for m in map(rx_create.match, msgs) if m]
+            seen_open = Counter((norm(p), int(h, 16)) for p, _, st, h in creates if int(st, 16) < 0x80000000)
+            seen_fail = Counter((norm(p), int(st, 16)) for p, _, st, h in creates if int(st, 16) >= 0x80000000)
+            seen_files = {}
+            for p, _, ln, _ in (m.groups() for m in map(rx_write.match, msgs) if m):
+                n, b = seen_files.get(norm(p), (0, 0))
+                seen_files[norm(p)] = (n + 1, b + int(ln))
+            bad = newapp_health(r, o)
+            if done.get("bad") != 0 or done.get("fail_mismatch") != 0:
+                bad.append(f"target={done}")
+            if seen_open != truth_open:
+                bad.append(f"opens missing={list((truth_open - seen_open).items())[:2]} "
+                           f"extra={list((seen_open - truth_open).items())[:2]}")
+            if seen_fail != truth_fail:
+                bad.append(f"fails missing={list((truth_fail - seen_fail).items())[:2]} "
+                           f"extra={list((seen_fail - truth_fail).items())[:2]}")
+            bad += [f"handle on failure {p}" for p, _, st, h in creates if int(st, 16) >= 0x80000000 and int(h, 16)]
+            if seen_files != truth_files:
+                diff = [(p, truth_files.get(p), seen_files.get(p)) for p in set(truth_files) | set(seen_files)
+                        if truth_files.get(p) != seen_files.get(p)]
+                bad.append(f"writes (path, truth, seen)={diff[:2]}")
+            bad += [m for m in msgs if "unmapped" in m][:2]
+            ok = (not bad and len(truth_files) == threads * files and sum(truth_fail.values()) == threads * 4)
+            record(name, ok, f"opens={sum(seen_open.values())}/{sum(truth_open.values())} "
+                             f"fails={sum(seen_fail.values())}/{sum(truth_fail.values())} "
+                             f"files={len(seen_files)}/{len(truth_files)} "
+                             f"writes={sum(n for n, _ in seen_files.values())}" + ("" if ok else f" bad={bad[:4]}"))
+        except Exception as e:
+            record(name, False, repr(e))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def check_newapp_flag(threads=4, calls=200):
+    """flagflip on flagfeature.dll!Feature::IsEnabled (a virtual `bool IsEnabled() const`
+    found in the PDB, late-loaded; x86 __thiscall: `this` in ECX): "beta" is forced on, "alpha"
+    is left alone. force = return_from(1) without the original; modify = call_original, then
+    return_from(1). The target's own counters must show beta's gated path ran on EVERY call and
+    alpha's never; the logs must name the right object (`this` == the target's pointer)."""
+    if not exe("flagflip.exe") or not exe("flagflip_target.exe") or not exe("flagfeature.dll"):
+        return skip("newapp-flag", "flagflip.exe / flagflip_target.exe / flagfeature.dll missing")
+    rx = re.compile(r"IsEnabled this=0x([0-9a-f]+) name=(\S+) original=(\S+) returned=(\d+)$")
+    location = "flagfeature.dll!Feature::IsEnabled"
+    total = threads * calls
+    for bk in ("breakpoint", "hw", "inline"):
+        for mode in ("force", "modify"):
+            name = f"newapp-flag-{bk}-{mode}"
+            try:
+                r, o = run([exe("flagflip.exe"), "--backend", bk, "--mode", mode, "--feature", "beta", location,
+                            "--", exe("flagflip_target.exe"), "--threads", threads, "--calls", calls], timeout=300)
+                feat = {x["name"]: x for x in o if x.get("kind") == "ff_feature"}
+                alpha, beta = feat.get("alpha", {}), feat.get("beta", {})
+                logs = [m.groups() for m in map(rx.match, newapp_msgs(o)) if m]
+                hits = next((x.get("hits") for x in probes(o) if x.get("location") == location), None)
+                bad = newapp_health(r, o)
+                if (beta.get("calls"), beta.get("enabled"), beta.get("gated_ran")) != (total, total, total):
+                    bad.append(f"beta={beta}")
+                if (alpha.get("calls"), alpha.get("enabled"), alpha.get("gated_ran")) != (total, 0, 0):
+                    bad.append(f"alpha={alpha}")
+                if hits != 2 * total:
+                    bad.append(f"hits={hits}")
+                this = {n: int(str(f.get("this", "0x0")), 16) for n, f in feat.items()}
+                want = {("beta", "skipped" if mode == "force" else "0", "1"): total}
+                if mode == "modify":
+                    want[("alpha", "0", "0")] = total
+                got = {}
+                for ptr, who, orig, ret in logs:
+                    if int(ptr, 16) != this.get(who):
+                        bad.append(f"this=0x{ptr} for {who} (target says {hex(this.get(who) or 0)})")
+                    got[(who, orig, ret)] = got.get((who, orig, ret), 0) + 1
+                if got != want:
+                    bad.append(f"logs={got} want={want}")
+                ok = not bad
+                record(name, ok, f"beta enabled={beta.get('enabled')}/{total} gated_ran={beta.get('gated_ran')} "
+                                 f"alpha enabled={alpha.get('enabled')} hits={hits} logs={len(logs)}" +
+                                 ("" if ok else f" bad={bad[:4]}"))
+            except Exception as e:
+                record(name, False, repr(e))
+
+
+def check_newapp_reg(threads=4, iters=20):
+    """regtrace (NtOpenKey/NtOpenKeyEx/NtCreateKey via call_original + return_from,
+    NtQueryValueKey, NtSetValueKey, NtClose) against regtrace_target under HKCU\\Software\\
+    UHHTest: every key handle the program got is logged with its FULL name (the HKCU root
+    resolved too), every set/query is attributed to the right key and value name with the
+    program's own counts, a missing value / key fails for the program exactly as without the
+    tool, and the tree is gone afterwards. hw cannot take all six probes (4 debug registers,
+    and call_original on hw needs one free), so hw runs the open group or the value group."""
+    from collections import Counter
+    if not exe("regtrace.exe") or not exe("regtrace_target.exe"):
+        return skip("newapp-reg", "regtrace.exe / regtrace_target.exe missing")
+    rx_open = re.compile(r"(open|create) key=(.*) status=0x([0-9a-f]+) handle=0x([0-9a-f]+)$")
+    rx_val = re.compile(r"(query|set) key=(.*) handle=0x([0-9a-f]+) value=(\S*) (class|type)=(\d+)$")
+
+    def rel(key):   # "\REGISTRY\USER\S-1-..\Software\UHHTest\t0" -> "software\uhhtest\t0"
+        i = key.lower().find("software\\uhhtest")
+        return key[i:].lower() if i >= 0 else None
+
+    cells = [("breakpoint",) * 3, ("inline",) * 3, ("hw", "breakpoint", "breakpoint"), ("inline", "hw", "hw"),
+             ("breakpoint", "inline", "hw"), ("hw", "inline", "inline")]
+    for op_bk, val_bk, close_bk in cells:
+        name = "newapp-reg-" + newapp_label((op_bk, val_bk, close_bk))
+        try:
+            r, o = run([exe("regtrace.exe"), "--open-backend", op_bk, "--value-backend", val_bk,
+                        "--close-backend", close_bk, "--filter", "UHHTest", "--", exe("regtrace_target.exe"),
+                        "--threads", threads, "--iters", iters], timeout=600)
+            done = next((x for x in o if x.get("kind") == "rt_done"), {})
+            truth_keys = Counter((x["key"].lower(), x["handle"]) for x in o if x.get("kind") == "rt_key")
+            truth_vals = {(x["key"].lower(), x["value"]): (x["sets"], x["queries"]) for x in o if x.get("kind") == "rt_value"}
+            msgs = newapp_msgs(o)
+            opens = [m.groups() for m in map(rx_open.match, msgs) if m]
+            vals = [m.groups() for m in map(rx_val.match, msgs) if m]
+            bad = newapp_health(r, o)
+            if done.get("bad") != 0 or done.get("cleaned") != 1:
+                bad.append(f"target={done}")
+            # Every name must be complete: rooted at \REGISTRY\ (a relative open resolved
+            # through its root handle), never "?".
+            bad += [f"partial name {k}" for _, k, st, _ in opens if rel(k) and not k.upper().startswith("\\REGISTRY\\")][:2]
+            seen_keys = Counter((rel(k), int(h, 16)) for _, k, st, h in opens if rel(k) and int(st, 16) == 0)
+            if truth_keys - seen_keys:
+                bad.append(f"keys missing={list((truth_keys - seen_keys).items())[:2]}")
+            missing_opens = [k for _, k, st, _ in opens if rel(k) and rel(k).endswith("\\missing") and int(st, 16) == 0xC0000034]
+            if len(missing_opens) != threads:
+                bad.append(f"missing-key opens={len(missing_opens)}")
+            seen_vals = {}
+            for op, k, _, v, _, _ in vals:
+                if k == "?":
+                    # Keys opened before an inline open probe was live (loader-time queries,
+                    # e.g. IFEO) are unknown to the map; the fixture's own never may be.
+                    if v in ("count", "name", "blob", "missing"):
+                        bad.append(f"unmapped {op} value={v}")
+                    continue
+                key = (rel(k), v)
+                if key[0] is None:
+                    continue
+                sets, queries = seen_vals.get(key, (0, 0))
+                seen_vals[key] = (sets + (op == "set"), queries + (op == "query"))
+            if seen_vals != truth_vals:
+                diff = [(k, truth_vals.get(k), seen_vals.get(k)) for k in set(truth_vals) | set(seen_vals)
+                        if truth_vals.get(k) != seen_vals.get(k)]
+                bad.append(f"values (key, truth, seen)={diff[:3]}")
+            bad += [m for m in msgs if "unmapped" in m][:2]
+            ok = not bad and len(truth_vals) == threads * 4
+            record(name, ok, f"keys={sum(truth_keys.values()) - sum((truth_keys - seen_keys).values())}/"
+                             f"{sum(truth_keys.values())} sets={sum(s for s, _ in seen_vals.values())} "
+                             f"queries={sum(q for _, q in seen_vals.values())}" + ("" if ok else f" bad={bad[:4]}"))
+        except Exception as e:
+            record(name, False, repr(e))
+    # More hw probes than debug registers is refused up front, with the reason.
+    try:
+        r, _ = run([exe("regtrace.exe"), "--backend", "hw", "--", exe("regtrace_target.exe")], timeout=60)
+        record("newapp-reg-hw-overcommit", r.returncode == 2 and "debug registers" in (r.stderr or ""),
+               f"rc={r.returncode} stderr={(r.stderr or '').strip()[:120]!r}")
+    except Exception as e:
+        record("newapp-reg-hw-overcommit", False, repr(e))
+
+
 def check_agent_crt():
     """probe_api_agent.dll is injected into the target, so it must not import the dynamic
     MSVC runtime: it would bind to whatever msvcp140/vcruntime140 the target already loaded,
@@ -3793,6 +4006,9 @@ def main():
     if want(check_hunt): check_hunt()
     if want(check_blog_replicas): check_blog_replicas()
     if want(check_blog_pwsh_attach): check_blog_pwsh_attach()
+    if want(check_newapp_files): check_newapp_files()
+    if want(check_newapp_flag): check_newapp_flag()
+    if want(check_newapp_reg): check_newapp_reg()
     print("-" * 72)
     failed = 0
     for name, status, detail in RESULTS:

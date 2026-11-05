@@ -488,15 +488,18 @@ struct OrigFrame {                   // layout read by uhh_orig_thunk
     const void *xmm6;                // +0x58
 };
 static_assert(offsetof(OrigFrame, scope) == 0x50 && offsetof(OrigFrame, xmm6) == 0x58, "uhh_orig_thunk layout");
-extern "C" uint64_t uhh_orig_thunk(uint64_t fn, const uint64_t *args8, const OrigFrame *frame);
+// call_original's argument limit (probe_api.h): NtCreateFile alone takes 11.
+constexpr int kOrigMaxArgs = 16;
+extern "C" uint64_t uhh_orig_thunk(uint64_t fn, const uint64_t *args16, const OrigFrame *frame);
 extern "C" EXCEPTION_DISPOSITION uhh_orig_unwind(EXCEPTION_RECORD *rec, void *frame, CONTEXT *, void *) {
     if (rec && (rec->ExceptionFlags & 0x66) && frame) {           // EXCEPTION_UNWIND: leaving through us
-        auto *h = *reinterpret_cast<HitScope **>(static_cast<unsigned char *>(frame) + 0x68);
+        auto *h = *reinterpret_cast<HitScope **>(static_cast<unsigned char *>(frame) + 0xA8);
         if (h) hit_scope_abandon(h);
     }
     return ExceptionContinueSearch;
 }
 #else
+constexpr int kOrigMaxArgs = 16;              // call_original's argument limit (probe_api.h)
 struct SehRecord { SehRecord *next; void *handler; };
 // Push the args, load ECX/EDX (fastcall/thiscall), call, restore ESP: stdcall and cdecl.
 static void call_tramp_x86(uint32_t target, const uint32_t *args32, int nargs, uint32_t ecx_v, uint32_t edx_v,
@@ -548,7 +551,8 @@ static void warn_once(probe_context *c, const char *text);
 extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
     if (g_ctrl) return g_ctrl->call_original(c, nargs, out);
     auto *state = c ? static_cast<AgentState *>(c->controller) : nullptr;
-    if (!state || !state->shared || state->index >= PROBE_AGENT_MAX_PROBES || nargs < 0 || nargs > 8) return 0;
+    if (!state || !state->shared || state->index >= PROBE_AGENT_MAX_PROBES) return 0;
+    if (nargs < 0 || nargs > kOrigMaxArgs) { warn_once(c, "call_original refused: nargs must be 0..16"); return 0; }
     auto *scope = static_cast<HitScope *>(c->hit_scope);
     const uint64_t tramp = state->shared->requests[state->index].trampoline;
     if (!tramp || !scope) return 0;
@@ -557,8 +561,15 @@ extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
         warn_once(c, "call_original refused: not at a function entry ([SP] is no return address)");
         return 0;
     }
-    uint64_t a[8] = {0};
+    uint64_t a[kOrigMaxArgs] = {0};
+#if defined(_WIN64)
+    // The register arguments always go as the hit had them (as breakpoint/hw, which run the
+    // original in place): nargs only decides how much of the STACK is copied. A method
+    // called with nargs 0 still gets `this` (RCX) -- as x86 thiscall gets ECX below.
+    for (int i = 0; i < (nargs > 4 ? nargs : 4); ++i) a[i] = get_func_arg(c, (size_t)i);
+#else
     for (int i = 0; i < nargs; ++i) a[i] = get_func_arg(c, (size_t)i);
+#endif
     uint64_t r = 0;
 #if defined(_WIN64)
     OrigFrame f{};
@@ -568,7 +579,7 @@ extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
     f.scope = scope; f.xmm6 = scope->xmm6;
     r = uhh_orig_thunk(tramp, a, &f);
 #else
-    uint32_t a32[8], r32 = 0; for (int i = 0; i < 8; ++i) a32[i] = (uint32_t)a[i];
+    uint32_t a32[kOrigMaxArgs], r32 = 0; for (int i = 0; i < kOrigMaxArgs; ++i) a32[i] = (uint32_t)a[i];
     call_tramp_x86((uint32_t)tramp, a32, nargs, (uint32_t)c->regs.rcx, (uint32_t)c->regs.rdx, &r32,
                    (uint32_t)c->hit_sp, scope);
     r = r32;

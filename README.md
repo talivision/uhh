@@ -88,12 +88,43 @@ deadlock). The hardware breakpoint modifies no code at all and handles any
 instruction, including the control-flow sites displaced stepping routes to an
 in-place fallback. Inline is the fastest where the site has room for a trampoline.
 
+**When probes go live.** On launch, breakpoint and hw probes are armed from the target's first
+instruction. Inline probes go live at its entry point, once the injected agent is in (the main
+thread is held there until then). Loader-time activity, such as DLL initialisation and the
+loader's own registry queries, is therefore seen only by breakpoint/hw probes. A map that an
+inline probe builds does not know handles opened before that point.
+
 Backends are picked **per probe** and interoperate in one session — e.g. a
 breakpoint on a config-flag site (fires once) mixed with an inline hook on a hot
-read path (millions of hits). Probe locations are `module+0xRVA` or `module!Export[+0xOFF]`
-(resolved from the target's export table; PDB-only symbols are on the roadmap), and
+read path (millions of hits). Probe locations are `module+0xRVA` or `module!Name[+0xOFF]`
+(an export of the target image, else a symbol from the module's PDB -- beside the image or
+via `_NT_SYMBOL_PATH` -- e.g. `flagfeature.dll!Feature::IsEnabled`), and
 probes may be registered **before the target module is loaded** — they stay pending
 and activate on load.
+
+## Writing your own tool
+
+Copy an example ([`gated_config`](examples/gated_config), or a smaller one:
+[`filetrace`](examples/filetrace), [`flagflip`](examples/flagflip),
+[`regtrace`](examples/regtrace)). The layout is always the same:
+
+- `callbacks.cpp`: the callbacks, each `extern "C" __declspec(dllexport)`. Build it into
+  your driver **and** add it to `probe_api_agent`'s sources in `CMakeLists.txt`. Inline
+  callbacks run inside the target from the injected `probe_api_agent.dll`, found by
+  export name. A callback that is not in the agent DLL fails `probe_add_symbol` with
+  "inline callback is not a named export" or "... is not exported by the agent DLL".
+- State that probes share (a handle -> name map, say) must be `UHH_SHARED` (see
+  `probe_api.h`) when the probes may use different backends.
+  Breakpoint/hw callbacks run in the controller and inline ones run in the target, so a
+  plain global exists once in each process.
+- `main.cpp`: `probe_session_create`, then `probe_add_symbol[_cfg]` per probe (a
+  `--backend` option per probe is cheap), then `probe_launch`, `probe_run`,
+  `probe_wait_for_exit`, `probe_report` and `probe_close`.
+- Arguments: `get_func_arg(c, i)` is the i-th argument of a normal (cdecl/stdcall/x64)
+  function. A C++ member function on x86 is `__thiscall`, with `this` in ECX and not on
+  the stack; `get_reg(c, PROBE_REG_CX)` reads `this` on both arches.
+- `call_original` takes up to 16 arguments (`NtCreateFile` has 11). On hw it needs a free
+  debug register while it runs, so at most 3 hw probes leave room for it.
 
 ## Build
 

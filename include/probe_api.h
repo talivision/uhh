@@ -162,9 +162,10 @@ int call_func(probe_context *, const char *symbol, uint64_t *ret, int nargs, ...
    argument registers and stack (including set_reg/set_mem changes the callback made); *ret
    receives its return register (x64 RAX; x86 EAX, zero-extended). Returns 1 if it ran. This probe does not fire
    (and counts no hit) for that call. nargs = integer/pointer arguments the function takes
-   (0..8; more than it really takes is harmless, fewer is not): inline copies x64 args 5+ and
-   every x86 STACK argument from the hit's stack into a new call frame (x86 ECX/EDX are passed
-   as they are, for __fastcall / __thiscall). Inline: a real call to the hook's trampoline.
+   (0..16, e.g. 11 for NtCreateFile; more than it really takes is harmless, fewer is not): inline copies x64 args 5+ and
+   every x86 STACK argument from the hit's stack into a new call frame; register arguments
+   (x64 RCX/RDX/R8/R9, x86 ECX/EDX for __fastcall / __thiscall) are always passed as they are,
+   so e.g. a method with no other arguments is called with nargs 0 on both arches. Inline: a real call to the hook's trampoline.
    Breakpoint/hw: the original runs in place on the hit's own stack, from the probe address,
    and a debug register set on that thread only catches its return (needs one of the 4
    debug registers free for the duration of the call; refused -- 0, one warning --
