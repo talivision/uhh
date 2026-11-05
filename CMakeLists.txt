@@ -393,7 +393,7 @@ add_library(ccfix SHARED examples/callconv/ccfix.cpp ${CCFIX_ASM})
 target_link_options(ccfix PRIVATE ${CCFIX_EXPORTS} /INCREMENTAL:NO /OPT:NOICF)   # no folding of identical bodies (CcCdecl3/CcStd3 on x64)
 add_executable(cc_target examples/callconv/cc_target.cpp ${CCT_ASM})
 target_link_options(cc_target PRIVATE /EXPORT:CcImpThunk /INCREMENTAL:NO)
-add_dependencies(cc_target ccfix)
+target_link_libraries(cc_target PRIVATE ccfix)        # a static import: mapped before the first install round
 add_executable(cc_driver examples/callconv/cc_driver.cpp examples/callconv/cc_callbacks.cpp)
 target_include_directories(cc_driver PRIVATE include)
 target_link_libraries(cc_driver PRIVATE probe_api)

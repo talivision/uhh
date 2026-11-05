@@ -15,6 +15,7 @@
 extern "C" void *g_pfn_std3t = nullptr;      // the "IAT slots" of CcImpThunk / CcImpNext
 extern "C" void *g_pfn_jmp = nullptr;
 extern "C" void CcImpThunk(void);
+extern "C" __declspec(dllimport) volatile long cc_body;   // ccfix.dll: the bodies that ran
 
 #if !defined(_WIN64)
 struct cc_out { uint32_t eax, edx; int32_t popped; uint32_t nv_ok; double st0; uint32_t has_st0, pad; uint8_t xmm0[16]; };
@@ -31,9 +32,12 @@ int main(int argc, char **argv) {
     const char *m = argc > 1 ? argv[1] : "none";
     const int mode = !strcmp(m, "wrap") ? CCM_WRAP : !strcmp(m, "replace") ? CCM_REPLACE : !strcmp(m, "wrongpop") ? CCM_WRONGPOP : CCM_NONE;
     const uint32_t mask = argc > 2 ? (uint32_t)strtoul(argv[2], nullptr, 16) : 0xFFFFFFFFu;
-    HMODULE h = LoadLibraryA("ccfix.dll");
-    if (!h) { printf("{\"kind\":\"cct_sum\",\"fails\":1,\"error\":\"LoadLibrary ccfix.dll\"}\n"); return 1; }
-    volatile long *body = (volatile long *)GetProcAddress(h, "cc_body");
+    // ccfix.dll is a STATIC import (cc_body), so it is mapped before the session's first
+    // install round: a late LoadLibrary would test the LOAD_DLL install hold instead (see
+    // docs/ROADMAP.md, "Calling-convention findings", CC8).
+    HMODULE h = GetModuleHandleA("ccfix.dll");
+    if (!h) { printf("{\"kind\":\"cct_sum\",\"fails\":1,\"error\":\"ccfix.dll not loaded\"}\n"); return 1; }
+    volatile long *body = &cc_body;
     g_pfn_std3t = (void *)GetProcAddress(h, "CcStd3T");
     void *tail = (void *)GetProcAddress(h, "CcTail");
     g_pfn_jmp = (void *)GetProcAddress(h, "CcIltNext");
