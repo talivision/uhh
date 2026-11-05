@@ -1816,15 +1816,18 @@ def check_edgehunt():
             record(name, not bad, "; ".join(bad) or "6 records, invalid formats logged, truncation marked")
         except Exception as e:
             record(name, False, repr(e))
-        # %s of a TARGET pointer: inline prints the string; breakpoint/hw callbacks run in the
-        # controller, where it is not a valid pointer -> "[unformattable]" (never a crash)
+        # %s of a TARGET pointer (ROADMAP B10): inline prints the string; breakpoint/hw callbacks
+        # run in the controller, which formats whatever is at that address in ITS OWN memory:
+        # "[unformattable]" when unmapped there, the controller's bytes when mapped (x86 layouts
+        # often overlap). Either way exactly one record, never a crash, run unaffected.
         name = f"edgehunt-{bk}-fmtptr"
         try:
             r, o, msgs, tg = go(bk, ["fmtptr"])
             bad = common(r, o, msgs, tg)
             fm = [m for m in msgs if "fmtptr" in m]
-            ok_text = ["fmtptr hello-from-target"] if bk == "inline" else ["fmtptr hello-from-target", "[unformattable] fmtptr %s"]
-            if len(fm) != 1 or fm[0] not in ok_text: bad.append(f"got={fm}")
+            ok = (fm == ["fmtptr hello-from-target"] if bk == "inline" else
+                  len(fm) == 1 and (fm[0] == "[unformattable] fmtptr %s" or fm[0].startswith("fmtptr ")))
+            if not ok: bad.append(f"got={fm}")
             record(name, not bad, "; ".join(bad) or f"{fm[0]!r}")
         except Exception as e:
             record(name, False, repr(e))
