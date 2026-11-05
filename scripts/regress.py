@@ -6316,6 +6316,284 @@ def check_callfunc_registry():
         record("callfunc-many", False, repr(e))
 
 
+
+SDE_EXE = Path(r"C:\tools\sde\sde.exe")
+# -cet: shadow-stack checks on every call/ret of the process (Pin JIT); -cet_stderr: one
+# "Control flow error: IP: .. expected (shadow stack): .. got (actual return address): .."
+# block per violation on the target's stderr. SDE 9.48 is the last Windows kit with it (9.53+
+# print "CET is not supported on Windows"). Its labels are swapped: "expected" is the address
+# on the ordinary stack, "got" the shadow-stack entry (shown by cet_smash's known addresses).
+SDE_CET = ["-tgl", "-cet", "-cet_stderr", "-cet_call_stack", "-no-follow-child"]
+SDE_CF = re.compile(r"^Control flow error:\s+IP: (0x[0-9a-fA-F]+) expected \(shadow stack\): (0x[0-9a-fA-F]+) "
+                    r"got \(actual return address\): (0x[0-9a-fA-F]+)")
+
+
+def check_cet_sde(n=20, threads=2, reads=50):
+    r"""Intel CET shadow stacks EMULATED by Intel SDE (C:\tools\sde = the 9.48 kit; skipped when
+    absent). The VM's CPU has no CET, but SDE runs the target in its JIT with a shadow stack per
+    thread and reports every ret that does not match it. UHH attaches to the SDE-hosted target
+    (SDE starts it; probe_launch cannot) and every row compares the target's CET reports with an
+    uninstrumented run under SDE. cet-sde-probe: SDE's CPUID shows CET_SS and RDSSP is live
+    while Windows' ProcessUserShadowStackPolicy still says 0 -- so UHH's policy-keyed branches
+    (breakpoint CALL/RET in place, the breakpoint/hw call_func refusal) never run under SDE.
+    cet-sde-control-*: positive control -- cet_smash's deliberate return-address overwrite is
+    reported with exactly its two addresses, a clean run is not. Inline backend: cet_smash's
+    workload with call_original+return_from and a pure return_from (cet-sde-calls-inline), a
+    probe ON a call instruction (the hook relocates that call; cet-sde-relcall-inline: under a
+    shadow stack it must be copied verbatim, a push+jmp return is a violation), gated_config
+    on probe_app_cet (flag/open/read all inline), the callorig-hunt cases (call_original /
+    return_from incl. C++ throw, SEH, longjmp, 16 threads), set_reg(SP) (conformance SpSite).
+    Every inline row ends with the workload thread still under SDE (RDSSP live) and, for
+    cet_smash, its deliberate smash still reported (the checker was on the whole time).
+    breakpoint/hw are not measurable under SDE (SKIP rows say why). x86: SKIP (SDE's checker
+    reports hundreds of WoW64-transition mismatches on a clean 32-bit run, and Windows does not
+    enforce user shadow stacks for WoW64 anyway)."""
+    if not SDE_EXE.exists():
+        return skip("cet-sde", f"Intel SDE not installed ({SDE_EXE}; the CET emulation needs the 9.48 kit)")
+    sm, drv, tgt, att, cot, cop = (exe("cet_smash.exe"), exe("cet_sde_driver.exe"), exe("probe_app_cet.exe"),
+                                   exe("uhh_attach.exe"), exe("co_target.exe"), exe("conformance_target.exe"))
+    pr = exe("cet_probe.exe")
+    if not all((sm, drv, tgt, att, cot, cop, pr)):
+        return skip("cet-sde", "cet_smash/cet_sde_driver/probe_app_cet/uhh_attach/co_target/conformance_target/cet_probe missing")
+    if pe_is_x86(sm):
+        return skip("cet-sde", "x86: SDE's CET checker is not usable on WoW64 (530 reports on a clean cet_smash run, "
+                               "121 with ntdll excluded) and Windows does not enforce user shadow stacks for WoW64")
+
+    def violations(lines):
+        return [m.groups() for m in (SDE_CF.match(l) for l in lines) if m]
+
+    def sde(args, gate):
+        p = subprocess.Popen([str(SDE_EXE), *SDE_CET, "--", *[str(a) for a in args]],
+                             stdin=subprocess.PIPE if gate else subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True)
+        return p, Lines(p.stdout), Lines(p.stderr)
+
+    def plain(args, timeout=180):
+        """An uninstrumented run under SDE: (returncode, stdout objects, violations, stderr lines)."""
+        p, out, err = sde(args, False)
+        try:
+            p.wait(timeout=timeout)
+        finally:
+            if p.poll() is None:
+                p.kill()
+        o = out.objs(); err.t.join(timeout=30)
+        return p.returncode, o, violations(err.lines), err.lines
+
+    def child_pid(sde_pid, name):
+        """The pid of `name` that SDE started (sde.exe -> pin.exe -> the target), for targets whose
+        gate line carries no pid."""
+        ps = (f"$all = Get-CimInstance Win32_Process; $pins = $all | ?{{ $_.ParentProcessId -eq {sde_pid} -and "
+              f"$_.Name -eq 'pin.exe' }} | %{{ $_.ProcessId }}; $all | ?{{ $_.Name -eq '{name}' -and "
+              f"$pins -contains $_.ParentProcessId }} | %{{ $_.ProcessId }}")
+        o = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True, timeout=60).stdout.split()
+        return int(o[0]) if o else None
+
+    def attached(target_args, tool_args, active, timeout=240):
+        """Start target_args (gated on stdin) under SDE, attach the UHH tool (tool_args + pid),
+        wait until every location in `active` is live, release the gate. Returns (target rc,
+        target objs, violations, tool rc, tool objs, tool stderr lines)."""
+        p, out, err = sde(target_args, True)
+        procs = [p]
+        try:
+            w = out.wait_for(lambda l: '"kind":"waiting"' in l, 120)
+            if not w:
+                raise RuntimeError(f"target never reached its gate under SDE: {err.lines[-3:]}")
+            pid = json.loads(w).get("pid") or child_pid(p.pid, Path(str(target_args[0])).name)
+            if not pid:
+                raise RuntimeError("no pid for the SDE-hosted target")
+            a = subprocess.Popen([str(x) for x in tool_args(pid)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            procs.append(a)
+            aout, aerr = Lines(a.stdout), Lines(a.stderr)
+            if not aout.wait_for(lambda l: '"kind":"attached"' in l, 60):
+                raise RuntimeError(f"attach failed: {aerr.lines[-3:]}")
+            for loc in active:
+                if not aerr.wait_for(lambda l, loc=loc: l.startswith(f"probe: active {loc} "), 60):
+                    raise RuntimeError(f"{loc} never became active")
+            p.stdin.write("x"); p.stdin.flush()
+            p.wait(timeout=timeout); a.wait(timeout=60)
+            o = out.objs(); err.t.join(timeout=30)
+            return p.returncode, o, violations(err.lines), a.returncode, aout.objs(), aerr.lines
+        finally:
+            for x in procs:                    # only the processes this check started
+                if x.poll() is None:
+                    x.kill()
+
+    def logs_of(objs, prefix=""):
+        return dict(Counter(str(x.get("message")) for x in objs
+                            if x.get("kind") == "probe_log" and str(x.get("message")).startswith(prefix)))
+
+    def hits_of(objs):
+        return {str(x.get("location", "")).split("!", 1)[-1]: x.get("hits") for x in probes(objs)}
+
+    def row_of(objs, kind):
+        r = dict(next((x for x in objs if x.get("kind") == kind), {}))
+        r.pop("kind", None)
+        return r
+
+    # cet-sde-probe: what SDE emulates vs what Windows reports.
+    try:
+        rc, o, v, el = plain([pr], timeout=120)
+        info = row_of(o, "cet_probe")
+        pol = info.get("policy", {})
+        if any("not supported on Windows" in l for l in el):
+            record("cet-sde-probe", False, f"{SDE_EXE} refuses -cet on Windows (SDE 9.53+); install the 9.48 kit there")
+        else:
+            record("cet-sde-probe", rc == 0 and info.get("cpuid_cet_ss") == 1 and (info.get("ssp") or 0) != 0 and
+                   pol.get("EnableUserShadowStack") == 0,
+                   f"cpuid_cet_ss={info.get('cpuid_cet_ss')} ssp={info.get('ssp')} os_cet_u={info.get('os_cet_u')} "
+                   f"policy.EnableUserShadowStack={pol.get('EnableUserShadowStack')} (emulated in SDE's JIT; the OS "
+                   f"policy UHH keys its breakpoint CET branches on stays 0) rc={rc}")
+    except Exception as e:
+        record("cet-sde-probe", False, repr(e))
+
+    # cet-sde-control-*: the checker sees a real violation and nothing in a clean run.
+    try:
+        rc, o, v, _ = plain([sm, "clean"], timeout=120)
+        first = row_of(o, "cet_smash")
+        record("cet-sde-control-clean", rc == 0 and not v and (first.get("ssp") or 0) != 0,
+               f"violations={len(v)} ssp={first.get('ssp')} rc={rc}")
+        rc, o, v, _ = plain([sm, "smash"], timeout=120)
+        land = next((x for x in o if x.get("site_a")), {})
+        pair = {land.get("site_a"), land.get("site_b")}
+        hit = bool(v) and {int(v[0][1], 16), int(v[0][2], 16)} == {int(a, 16) for a in pair if a}
+        record("cet-sde-control-smash", rc == 3 and hit,
+               f"first={v[0] if v else None} smash=site_a {land.get('site_a')} / site_b {land.get('site_b')} "
+               f"violations={len(v)} rc={rc}")
+    except Exception as e:
+        record("cet-sde-control-smash", False, repr(e))
+
+    # cet_smash's workload, uninstrumented: the reference sum, RDSSP live in every iteration, and
+    # the violations of its closing smash (the only ones an instrumented run may show).
+    base_sum = base_v = None
+    call_off = -1
+    try:
+        r = subprocess.run([str(sm), "calls", "0"], capture_output=True, text=True, timeout=60)
+        call_off = next((json.loads(l)["call_off"] for l in r.stdout.splitlines() if '"cet_calls"' in l), -1)
+        rc, o, v, _ = plain([sm, "calls", n, "--smash"], timeout=120)
+        c = row_of(o, "cet_calls")
+        base_sum, base_v = c.get("sum"), v
+        record("cet-sde-calls-base", rc == 3 and c.get("ssp_live") == n and len(v) >= 1 and call_off > 0,
+               f"sum={c.get('sum')} ssp_live={c.get('ssp_live')}/{n} smash_violations={len(v)} call_off={call_off} rc={rc}")
+    except Exception as e:
+        record("cet-sde-calls-base", False, repr(e))
+
+    def smash_row(name, specs, want_sum, want_hits, want_logs):
+        try:
+            locs = [sp.split("=")[0] for sp in specs]
+            args = []
+            for sp in specs:
+                args += ["--probe", sp]
+            rc, o, v, arc, ao, ael = attached([sm, "calls", n, "--wait", "--smash"],
+                                              lambda pid: [drv, "--backend", "inline", *args, "--attach", pid], locs)
+            c, rep = row_of(o, "cet_calls"), report(ao)
+            hb, lg = hits_of(ao), logs_of(ao)
+            ok = (rc == 3 and c.get("sum") == want_sum and c.get("ssp_live") == n and base_v is not None and v == base_v and
+                  hb == want_hits and lg == want_logs and rep.get("error") is None and rep.get("log_dropped") == 0)
+            record(name, ok, f"sum={c.get('sum')}/{want_sum} ssp_live={c.get('ssp_live')}/{n} violations={len(v)} "
+                             f"(uninstrumented {len(base_v or [])}, same={v == base_v}) extra={[x for x in v if x not in (base_v or [])][:2]} "
+                             f"hits={hb} logs={lg} err={rep.get('error')} rc={rc}/{arc}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    leaf_sum = sum(3 * i + 1 for i in range(n))
+    smash_row("cet-sde-calls-inline", ["cet_smash.exe!cet_leaf=orig", "cet_smash.exe!cet_caller=replace"],
+              leaf_sum + 77 * n, {"cet_leaf": n, "cet_caller": n}, {"co fact": n, "co fact-done": n, "co prologue": n})
+    if call_off > 0:
+        site = f"cet_smash.exe!cet_caller+0x{call_off:x}"
+        smash_row("cet-sde-relcall-inline", [site + "=log"], base_sum, {site.split("!", 1)[1]: n}, {"ok watch-hit": n})
+    else:
+        record("cet-sde-relcall-inline", False, f"cet_caller has no call rel32 (call_off={call_off})")
+
+    # gated_config on probe_app_cet, every probe inline (uhh_attach: flag, open, close, read).
+    try:
+        W, R, helper, offset = int(threads), int(reads), 1, 64
+        _, bo, bv, _ = plain([tgt, "--no-wait", "--helpers", HELPERS, "--threads", W, "--reads", R,
+                              "--config", "reads_enabled=1"], timeout=180)
+        base = app(bo)
+        p, out, err = sde([tgt, "--helpers", HELPERS, "--threads", W, "--reads", R], True)
+        a = None
+        try:
+            w = out.wait_for(lambda l: '"kind":"waiting"' in l, 120)
+            if not w:
+                raise RuntimeError("probe_app_cet never reached its gate under SDE")
+            h = next(x for x in (json.loads(l) for l in out.lines if '"kind":"helper"' in l) if x["index"] == helper)
+            a = subprocess.Popen([str(att), str(json.loads(w)["pid"]), "--pid", str(h["pid"]), "--range",
+                                  f"{h['base'] + offset}:64", "--backend", "inline", "--flag-backend", "inline"],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            aout, aerr = Lines(a.stdout), Lines(a.stderr)
+            if not aout.wait_for(lambda l: '"kind":"attached"' in l, 60):
+                raise RuntimeError(f"uhh_attach did not attach: {aerr.lines[-3:]}")
+            for loc in (OPEN_LOCATION, READ_LOCATION):
+                if not aerr.wait_for(lambda l, loc=loc: l.startswith(f"probe: active {loc} "), 60):
+                    raise RuntimeError(f"{loc} never became active")
+            p.stdin.write("x"); p.stdin.flush()
+            p.wait(timeout=300); a.wait(timeout=60)
+            rc, o, arc, ao = p.returncode, out.objs(), a.returncode, aout.objs()
+            err.t.join(timeout=30)
+            v = violations(err.lines)
+        finally:
+            for x in (p, a):                   # only the processes this check started
+                if x is not None and x.poll() is None:
+                    x.kill()
+        rep, a_row = report(ao), app(o)
+        rd = next((x for x in probes(ao) if x.get("location") == READ_LOCATION), {})
+        logs, dropped = read_logs(ao)
+        want = predicted_reads(W, R, HELPERS, helper, offset)
+        ok = (arc == 0 and rc == 0 and rep.get("overrides") == 1 and rd.get("hits") == W * R and rd.get("backend") == "inline"
+              and a_row.get("successful_reads") == W * R and a_row.get("checksum") == base.get("checksum")
+              and logs == want and dropped == 0 and a_row.get("shadow_stack") is True and not v and not bv)
+        record("cet-sde-gated-inline", ok,
+               f"override={rep.get('overrides')} read_hits={rd.get('hits')}/{W * R} logged={logs}/{want} dropped={dropped} "
+               f"checksum_same={a_row.get('checksum') == base.get('checksum')} target_ssp={a_row.get('shadow_stack')} "
+               f"violations={len(v)} (uninstrumented {len(bv)}) rc={rc}/{arc} err={(rep.get('error') or '')[:100]}")
+    except Exception as e:
+        record("cet-sde-gated-inline", False, repr(e))
+
+    # The callorig-hunt cases (examples/hunt_callorig), inline, attached by co_driver. C++
+    # throw / SEH / longjmp make SDE report mismatches even uninstrumented (Windows' unwinder
+    # does not move a shadow stack the OS says is off): the instrumented run must show exactly
+    # the same reports.
+    for case in ("recurse", "cppthrow", "seh", "longjmp", "threads", "mid", "nargs", "conv", "retaddr", "prologue",
+                 "nested"):
+        name = f"cet-sde-co-{case}-inline"
+        try:
+            _, bo, bv, _ = plain([cot, case], timeout=180)
+            base = row_of(bo, "co")
+            want_row, want_hits, want_logs = co_expect(case, base, False)
+            want_row.pop("kind", None)
+            locs = [f"co_target.exe!{k}" for k in want_hits]
+            rc, o, v, arc, ao, ael = attached([cot, case, "--wait"],
+                                              lambda pid: [exe("co_driver.exe"), "--backend", "inline", "--case", case,
+                                                           "--attach", pid], locs)
+            row, rep, lg, hb = row_of(o, "co"), report(ao), logs_of(ao, "co "), hits_of(ao)
+            got_logs = {k: lg.get(k, 0) for k in want_logs}
+            extra = sorted(k for k in lg if k not in want_logs and not (case == "retaddr" and k == "co retsite"))
+            ok = (bool(base) and row == want_row and all(hb.get(k) == x for k, x in want_hits.items()) and
+                  got_logs == want_logs and not extra and rep.get("log_dropped") == 0 and rep.get("error") is None and
+                  rc == 0 and arc == 0 and sorted(v) == sorted(bv))
+            record(name, ok, f"row={row} want={want_row} hits={hb} logs={got_logs} extra={extra[:3]} violations={len(v)} "
+                             f"(uninstrumented {len(bv)}, same={sorted(v) == sorted(bv)}) err={rep.get('error')} rc={rc}/{arc}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    # set_reg(SP) inline (conformance_target!SpSite+3 moves SP down 32 bytes; SafetyHook's patched
+    # resume stub `pop rsp; jmp [trampoline]` resumes there).
+    try:
+        rc, o, v, arc, ao, ael = attached([cop], lambda pid: [drv, "--backend", "inline", "--sp-only", "--attach", pid],
+                                          ["conformance_target.exe!SpSite+0x3"])
+        t_row, rep = row_of(o, "target"), report(ao)
+        ok = rc == 0 and arc == 0 and t_row.get("sp_moved") == 10 and not v and rep.get("error") is None
+        record("cet-sde-sp-inline", ok, f"sp_moved={t_row.get('sp_moved')}/10 violations={len(v)} "
+                                        f"hits={hits_of(ao)} err={rep.get('error')} rc={rc}/{arc}")
+    except Exception as e:
+        record("cet-sde-sp-inline", False, repr(e))
+
+    skip("cet-sde-breakpoint", "not measurable under SDE: the first INT3 is reported as an unhandled 0x80000003 and "
+                               "lost, and the thread then runs NATIVELY (cet_smash: ssp_live 0/20, its smash no longer "
+                               "reported); a hit in the loader (gated_config's NtClose) hangs the target")
+    skip("cet-sde-hw", "not measurable under SDE: execute debug registers never match code run from SDE's code cache "
+                       "(0 hits on cet_smash/co_target/conformance; the program is unaffected)")
+
 def main():
     global BIN
     ap = argparse.ArgumentParser()
@@ -6448,6 +6726,7 @@ def main():
     if want(check_logs_controller_killed): check_logs_controller_killed()
     if want(check_logs_stdout_closed): check_logs_stdout_closed()
     if want(check_inplace_shapes): check_inplace_shapes()
+    if want(check_cet_sde): check_cet_sde()
     print("-" * 72)
     failed = 0
     for name, status, detail in RESULTS:
