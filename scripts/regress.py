@@ -1911,7 +1911,8 @@ def check_handle_map(threads=4, reads=500, decoys=5000):
                   (op.get("hits") or 0) >= decoys + HELPERS and unmapped(o) == 0 and logged_pids(o) == helper_pids(o))
             record(name, ok, f"open_hits={op.get('hits')}/{decoys + HELPERS} read_hits={rd.get('hits')}/{want} "
                              f"logs={logs} dropped={dropped} unmapped={unmapped(o)} "
-                             f"pids_ok={logged_pids(o) == helper_pids(o)} err={(report(o).get('error') or '')[:100]}")
+                             f"pids_ok={logged_pids(o) == helper_pids(o)} extra={sorted(logged_pids(o) - helper_pids(o))} "
+                             f"missing={sorted(helper_pids(o) - logged_pids(o))} err={(report(o).get('error') or '')[:100]}")
         except Exception as e:
             record(name, False, repr(e))
 

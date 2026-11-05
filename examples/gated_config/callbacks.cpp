@@ -124,6 +124,10 @@ OpenRecord open_of(probe_context *c, uint64_t handle) {
         const uint64_t pid = at(r.pid).load(std::memory_order_acquire);
         if (!pid) continue;                                            // empty, or already resolved
         if (read_pointer(c, at(r.out).load(std::memory_order_relaxed)) != handle) continue;
+        // A NEWER open of this handle may have been resolved by another thread while we
+        // scanned past it (its pending entry was already cleared): it wins. (An older
+        // open's out-pointer -- a stale stack slot -- can hold the same value by chance.)
+        if (const OpenRecord now = table_lookup(handle); now.pid && now.out > (uint64_t)k + 1) return now;
         char name[sizeof(r.name)];
         std::memcpy(name, r.name, sizeof(name)); name[sizeof(name) - 1] = 0;
         table_store(handle, pid, k + 1, name);                         // BEFORE leaving the ring
