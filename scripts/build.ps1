@@ -13,9 +13,9 @@
   --parallel. Pass -Generator vs to force the Visual Studio generator for a fresh dir.
 
 .EXAMPLE
-  powershell -File scripts\build.ps1                 # both arches, Release
-  powershell -File scripts\build.ps1 -Arch x64
-  powershell -File scripts\build.ps1 -Arch x86 -Target probe_api
+  powershell -ExecutionPolicy Bypass -File scripts\build.ps1                 # both arches, Release
+  powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Arch x64
+  powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Arch x86 -Target probe_api
 #>
 param(
     [ValidateSet('x64', 'x86', 'both')] [string]$Arch = 'both',

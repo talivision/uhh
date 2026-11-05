@@ -120,8 +120,8 @@ Visual Studio generator the build is parallel too (`/MP`, MultiToolTask and a ge
 `Directory.Build.rsp` with `-maxCpuCount`; `-DUHH_PARALLEL_MSBUILD=OFF` disables that).
 
 ```powershell
-powershell -File scripts\build.ps1               # both arches
-powershell -File scripts\build.ps1 -Arch x64 -Target probe_api
+powershell -ExecutionPolicy Bypass -File scripts\build.ps1               # both arches
+powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Arch x64 -Target probe_api
 ```
 
 ## Examples: `gated_config` (launch) and `uhh_attach` (attach)
