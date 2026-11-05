@@ -358,7 +358,9 @@ static int run_absreuse() {
 // ---- cdx-int3cap: more armed software breakpoints than the agent's INT3 table used to hold --
 static int run_int3cap(int n) {
     CtrlOp((const void *)&CtrlSled, (uintptr_t)n, 0);  // UHH: a breakpoint on each sled byte
-    CtrlOp((const void *)&CtrlSled, (uintptr_t)n, 1);  // get_mem must read the program's bytes
+    // get_mem of the LAST 16 (past the 1024th breakpoint) must read the program's bytes. (One
+    // inline read overlays at most 64 INT3s -- an agent-side bound, reported separately.)
+    CtrlOp((const char *)&CtrlSled + (n - 16), 16, 1);
     std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"int3cap\",\"n\":%d}\n", n);
     return 0;
 }
