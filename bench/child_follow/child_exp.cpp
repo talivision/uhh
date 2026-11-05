@@ -25,6 +25,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <timeapi.h>
+#include <intrin.h>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -59,6 +60,12 @@ static bool make_pipe(HANDLE &rd, HANDLE &wr) {
 }
 
 static std::map<DWORD, int> g_child_debugger;   // pid -> IsDebuggerPresent() at its main
+static std::map<DWORD, unsigned long> g_child_gflag;   // pid -> PEB NtGlobalFlag at its main
+static unsigned long debug_heap_children() {
+    unsigned long n = 0;
+    for (auto &g : g_child_gflag) n += (g.second & 0x70) != 0;
+    return n;
+}
 
 // pid -> main_qpc from the children's lines on a pipe (read after they exited).
 static std::map<DWORD, uint64_t> read_children(HANDLE rd) {
@@ -71,6 +78,8 @@ static std::map<DWORD, uint64_t> read_children(HANDLE rd) {
         if (q != std::string::npos) out[pid] = std::strtoull(all.c_str() + q + 11, nullptr, 10);
         size_t d = all.find("\"debugger\":", p);
         if (d != std::string::npos) g_child_debugger[pid] = std::atoi(all.c_str() + d + 11);
+        size_t g = all.find("\"ntglobalflag\":", p);
+        if (g != std::string::npos) g_child_gflag[pid] = std::strtoul(all.c_str() + g + 15, nullptr, 10);
     }
     return out;
 }
@@ -96,9 +105,17 @@ static void close_event_handles(const DEBUG_EVENT &ev) {
 
 static int child_main() {
     uint64_t t = qpc();
-    char line[160];
-    int n = std::snprintf(line, sizeof(line), "{\"kind\":\"child\",\"pid\":%lu,\"main_qpc\":%llu,\"debugger\":%d}\n",
-                          GetCurrentProcessId(), (unsigned long long)t, IsDebuggerPresent() ? 1 : 0);
+    // PEB->NtGlobalFlag: the loader sets the debug-heap flags (0x70: tail/free checking,
+    // parameter validation) when a debugger was attached during process initialisation and
+    // _NO_DEBUG_HEAP is not set -- the heap then behaves differently than without UHH.
+#if defined(_WIN64)
+    const unsigned long gflag = *(const unsigned long *)((const char *)__readgsqword(0x60) + 0xBC);
+#else
+    const unsigned long gflag = *(const unsigned long *)((const char *)__readfsdword(0x30) + 0x68);
+#endif
+    char line[200];
+    int n = std::snprintf(line, sizeof(line), "{\"kind\":\"child\",\"pid\":%lu,\"main_qpc\":%llu,\"debugger\":%d,\"ntglobalflag\":%lu}\n",
+                          GetCurrentProcessId(), (unsigned long long)t, IsDebuggerPresent() ? 1 : 0, gflag);
     DWORD w = 0; WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), line, (DWORD)n, &w, nullptr);
     return 0;
 }
@@ -211,9 +228,9 @@ static int suspended_main(int trials) {
                 "\"entry_int3_hit_on_main_thread\":%d,\"entry_hit_before_main\":%d,"
                 "\"DebugActiveProcess_us_median\":%.0f,\"DebugActiveProcess_us_max\":%.0f,"
                 "\"create_to_breakin_us_median\":%.0f,\"create_to_breakin_us_max\":%.0f,"
-                "\"resume_to_entry_us_median\":%.0f,\"event_sequence_trial0\":\"%s\"}\n",
+                "\"resume_to_entry_us_median\":%.0f,\"children_with_debug_heap\":%lu,\"event_sequence_trial0\":\"%s\"}\n",
                 trials, ok_trials, still_suspended, entry_on_main, entry_before_main,
-                med(attach_us), mx(attach_us), med(breakin_us), mx(breakin_us), med(resume_to_entry_us), firsts.c_str());
+                med(attach_us), mx(attach_us), med(breakin_us), mx(breakin_us), med(resume_to_entry_us), debug_heap_children(), firsts.c_str());
     return ok_trials == trials ? 0 : 1;
 }
 
@@ -254,9 +271,10 @@ static int debugproc_main(int n) {
         int seen_before_main = 0;
         for (auto &k : kids) if (created.count(k.first) && created[k.first] < k.second) ++seen_before_main;
         std::printf("{\"kind\":\"debugproc\",\"mode\":\"%s\",\"children\":%zu,\"processes_seen\":%zu,"
-                    "\"children_seen_before_main\":%d,\"debug_events\":%d,\"exits_seen\":%d,\"total_ms\":%.1f,\"per_child_ms\":%.2f}\n",
+                    "\"children_seen_before_main\":%d,\"debug_events\":%d,\"exits_seen\":%d,\"total_ms\":%.1f,\"per_child_ms\":%.2f,\"children_with_debug_heap\":%lu}\n",
                     m.name, kids.size(), created.size(), seen_before_main, events, exits, us(t0, t1) / 1000.0,
-                    us(t0, t1) / 1000.0 / (n ? n : 1));
+                    us(t0, t1) / 1000.0 / (n ? n : 1), debug_heap_children());
+        g_child_gflag.clear();
         CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
     }
     return 0;
@@ -299,9 +317,9 @@ static void report_race(const char *mode, int n, const std::vector<std::pair<DWO
     }
     std::sort(lead.begin(), lead.end());
     std::printf("{\"kind\":\"%s\",\"children\":%zu,\"attached_before_main\":%d,\"attached_after_main\":%d,"
-                "\"not_detected\":%d,\"attach_failed\":%d,\"lead_us_min\":%.0f,\"lead_us_median\":%.0f,\"lead_us_max\":%.0f,\"n\":%d}\n",
+                "\"not_detected\":%d,\"attach_failed\":%d,\"lead_us_min\":%.0f,\"lead_us_median\":%.0f,\"lead_us_max\":%.0f,\"n\":%d,\"children_with_debug_heap\":%lu}\n",
                 mode, kids.size(), before, after, missed, failed, lead.empty() ? 0 : lead.front(),
-                lead.empty() ? 0 : lead[lead.size() / 2], lead.empty() ? 0 : lead.back(), n);
+                lead.empty() ? 0 : lead[lead.size() / 2], lead.empty() ? 0 : lead.back(), n, debug_heap_children());
 }
 
 // ---- job: completion-port NEW_PROCESS notification -> attach ------------------------
@@ -415,9 +433,9 @@ static int inherit_main(int n, bool launch, bool drop) {
     DWORD code = 0; GetExitCodeProcess(pi.hProcess, &code);
     std::printf("{\"kind\":\"inherit\",\"root\":\"%s\",\"drop_children\":%d,\"debug_flags_before\":%lu,\"set_status\":\"0x%lx\","
                 "\"debug_flags_after\":%lu,\"children\":%zu,\"children_seen\":%zu,\"seen_before_main\":%d,"
-                "\"children_detached\":%d,\"children_that_saw_a_debugger\":%d,\"exits_seen\":%d,\"root_exit\":%lu}\n",
+                "\"children_detached\":%d,\"children_that_saw_a_debugger\":%d,\"children_with_debug_heap\":%lu,\"exits_seen\":%d,\"root_exit\":%lu}\n",
                 launch ? "DEBUG_ONLY_THIS_PROCESS launch" : "attach", drop ? 1 : 0, before, (unsigned long)st_set, after,
-                kids.size(), created.size() ? created.size() - 1 : 0, seen_before_main, dropped, saw_debugger, exits, code);
+                kids.size(), created.size() ? created.size() - 1 : 0, seen_before_main, dropped, saw_debugger, debug_heap_children(), exits, code);
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
     return 0;
 }
