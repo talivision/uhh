@@ -160,7 +160,8 @@ add_library(probe_api_agent SHARED
     examples/famous/detours_retval/retval_callbacks.cpp
     examples/hunt/hunt_callbacks.cpp
     examples/hunt_callorig/co_callbacks.cpp
-    examples/blogs/blog_callbacks.cpp)
+    examples/blogs/blog_callbacks.cpp
+    examples/logs_eval/logs_callbacks.cpp)
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     target_sources(probe_api_agent PRIVATE src/probe/agent_x64.asm)   # uhh_orig_thunk (call_original)
 endif()
@@ -417,3 +418,12 @@ foreach(t configparse cet_probe hook_edge parity_target watch_target dynwatch_ta
           hunt_target hunt_dll blog_target)
     set_property(TARGET ${t} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 endforeach()
+
+# --- adversarial log delivery (regress `logs-*`) --------------------------------------
+add_executable(logs_target examples/logs_eval/logs_target.cpp)
+target_include_directories(logs_target PRIVATE include)
+target_link_options(logs_target PRIVATE /INCREMENTAL:NO)
+add_executable(logs_driver examples/logs_eval/logs_driver.cpp examples/logs_eval/logs_callbacks.cpp)
+target_include_directories(logs_driver PRIVATE include)
+target_link_libraries(logs_driver PRIVATE probe_api)
+add_dependencies(logs_driver logs_target probe_api_agent)
