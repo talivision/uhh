@@ -59,7 +59,7 @@ identical source under every backend.
 - ✅ P1 target checksum asserted equal across every mix cell and vs a flag-only run
 - 🔧 P2 hw PROBE_ONCE and watch RW|ONCE proven distinctly (1 hit each under 4 threads); 5th hw probe refused cleanly (setup and runtime from a breakpoint/inline callback), both freed slots reused (exec + watch, exact). Test: `hw-once-slots-*` (examples/p2edge) -- x64 ✅, x86 pending
 - 🔧 P2 runtime adds on a DLL loaded later by a non-main thread (all backends, exact from the first call); probe_add_address(PROBE_INLINE) from a callback (every backend's callback; 2 threads, exact). Found+fixed: an inline callback folded by the linker (/OPT:ICF) with another exported callback was forwarded under the twin's name and refused -- both sides now match all export aliases. Test: `late-dll-worker-*` -- x64 ✅, x86 pending
-- 🔧 P2 threads started during the entry hold (TLS callback / DllMain(PROCESS_ATTACH) thread calling the probed function): fixed -- a thread created while inline installs are outstanding (after the initial break; not the agent's own) is held from its first instruction until the same confirmation. Test: `entry-hold-threads-*` -- x64 ✅, x86 pending
+- 🔧 P2 threads started during the entry hold (TLS callback / DllMain(PROCESS_ATTACH) thread calling the probed function): fixed -- a thread created while inline installs are outstanding (launch: after the initial break, incl. a static DLL's DllMain thread before the entry hold; attach: only during a runtime-add hold, never while the agent is injected; not the agent's own) is held from its first instruction until the same confirmation. Test: `entry-hold-threads-*` -- x64 ✅, x86 pending
 - 🔧 P2 refusal tests: PROBE_AT_RETURN, inline ONCE, 129th inline probe ✅; ALLOW_PREHOOKED inline chaining (attach onto probe_app --prehook's SafetyHook detour; foreign hook calls == UHH hits == logs == reads, checksum unchanged; `uhh_trace --allow-prehooked`). Test: `prehook-chain-inline` -- x64 ✅, x86 pending
 - ✅ P2 sidefx: full arithmetic EFLAGS (probe between cmp and jcc), LastStatus; below-SP documented as exempt
 - ✅ P2 x86 stacks mid-function / FPO frames identical across backends (examples/stacks; x86 inline: verified return-address scan; x64 inline: frame 0 unwound from the original bytes; remaining differences in docs/symbols.md)
@@ -79,7 +79,7 @@ identical source under every backend.
 - 🔧 (#11) every inline probe is accepted/retired before a failure is reported; (5 s hold timeout still a warning)
 - 🔧 (#12) uhh_attach --flag-backend, attach test flips the flag on every backend; ✅ detach/crash multi-thread log counts: `detach-*` (4 threads; probe_close prints `probe: detached: hits= logs_written= log_dropped=` AFTER the detach; logs == hits == written, 0 dropped -- found and fixed: inline counted hits that the unhooking agent passed straight through without a callback) and `crash-logs-*-4t` (4 threads logging when the target dies; logs == hits); (x87 status word: open)
 - ✅ probe_close waits for probe_run to return (warns every 15 s), never tears down underneath it
-- ⬜ frida_coexist hangs (found again 2026-11-05)
+- ✅ frida_coexist hangs (found again 2026-11-05): harness rewritten (leftovers merge) -- reader thread, file output, deadlines, watchdog, tree-kill, Frida count from the exit path, waits for UHH's `active` line; 8 cases incl. inline refused / --fallback-hw / --allow-prehooked. Relocated-INT3 adoption is the integration tree's own (is_relocated_copy). Detach never leaves a hold behind (`detaching`: no new holds during the drain, late release).
 
 ## Hunter B findings (2026-11-05) — edge-case code shapes x every backend
 Test: `examples/edgehunt` (target + asm shapes + ONE callback source), suite `edgehunt-*` (x64 + x86).
@@ -366,8 +366,14 @@ with the uninstrumented target and with exact hits / "co" logs / `log_dropped ==
   call is now released instead (the original runs on to its real caller; the callback ends).
 - ✅ (CO5) breakpoint/hw call_original is no longer refused under CET shadow stacks (nothing on the
   stack is rewritten any more).
+- ✅ (CO6, leftovers merge) all 4 debug registers taken by hw probes refused EVERY call_original --
+  gated_config with every probe on hw (flag, NtOpenProcess, NtClose, NtReadVirtualMemory) mapped no
+  handle (`mix flag=hw read=hw` unmapped=8000, `attach-hw`, `interrupt-detach-hw`, `cet-gated-hw`).
+  A hw execute probe now lends its own slot on the hit thread for the call (re-pointed at the
+  return address, restored after); only a recursive entry on that thread goes uncounted.
 - Limits (documented in probe_api.h): breakpoint/hw call_original needs one free debug register
-  for the call (all 4 taken by hw probes -> refused); probes hit inside the original count but
+  for the call (all 4 taken by hw probes -> refused, unless the hit is itself a hw execute probe,
+  which lends its own slot -- probe_api.h still says "refused"; doc-comment update left to the API owner); probes hit inside the original count but
   run no callback when they are of the same kind as the caller (inline in inline,
   breakpoint/hw in breakpoint/hw -- including this probe for a recursive function), and fire
   when of the other kind; inline needs nargs >= the real argument count (it builds a new frame;
@@ -424,5 +430,5 @@ with the uninstrumented target and with exact hits / "co" logs / `log_dropped ==
 - ⬜ x86 cumulative-session flakiness (possibly the same handle double-close; recheck)
 - ✅ PDB-only symbols (`module!InternalFunc`), Microsoft symbol server via dbghelp+symsrv and `_NT_SYMBOL_PATH`, export/function enumeration (`uhh_trace --list`) — engine by Codex, wired into the library; suite checks added
 - ⬜ Split `src/probe/session.cpp` (debug loop, backends, symbols, attach/call)
-- ⬜ [fan-out] Faster builds (user, 2026-11-05): incremental rebuilds should be seconds -- precompiled headers / unity build for session.cpp, avoid rebuilding every example when the library changes, Ninja instead of MSBuild, ccache-style caching
+- 🔧 [fan-out] Faster builds (user, 2026-11-05): parallel MSBuild (/MP, MultiToolTask, Directory.Build.rsp -maxCpuCount; `-DUHH_PARALLEL_MSBUILD=OFF` to disable) and `scripts\build.ps1` (Ninja Multi-Config). VM (4 cores), same tree: clean x64 221 s -> 83 s (VS) / 73 s (Ninja), x86 220 s -> 85 s / 66 s; touch session.cpp x64 49 s -> 24 s / 23 s. Still open: PCH / unity for session.cpp, not relinking every example when the library changes
 - ⬜ Final independent whole-codebase sanity review; README/API docs pass
