@@ -428,9 +428,12 @@ extern "C" int probe_add_symbol_cfg(probe_session *s, const char *symbol, probe_
 }
 
 static volatile LONG g_stopping;
-static struct alignas(64) { volatile LONG value; } g_inflight[PROBE_AGENT_STRIPES];
+// Callbacks running right now, striped in the SHARED block: what is still in flight when
+// the process dies (ExitProcess kills threads mid-callback) is reported by the controller.
+static thread_local int t_in_callback;
 static bool any_inflight() {
-    for (auto &x : g_inflight) if (x.value) return true;
+    if (!shared) return false;
+    for (auto &x : shared->inflight) if (x.value) return true;
     return false;
 }
 
@@ -494,15 +497,21 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     uint32_t stripe = (GetCurrentThreadId() >> 2) & (PROBE_AGENT_STRIPES - 1);
     InterlockedIncrement64(&shared->hit_stripes[index][stripe].value);
     if (g_stopping) return;                                // being unhooked: pass straight through
-    InterlockedIncrement(&g_inflight[stripe].value);
+    // A probe hit by code the callback itself runs (call_func of a probed function, or a
+    // probed API called directly) is counted but does not re-enter a callback -- exactly
+    // what breakpoint/hw do inside call_func. Re-entering recursed until the stack overflowed.
+    if (t_in_callback) return;
+    InterlockedIncrement(&shared->inflight[stripe].value);
     // The mid-hook stub preserves GPRs, flags and XMM0-15 only. The callback (and the CRT
     // it calls) may touch x87/MXCSR/YMM/ZMM state -- e.g. vzeroupper -- which the target
     // could be relying on at a mid-function site. Save and restore the full extended state
     // and give C code the ABI-required DF=0.
     // Extended state (MXCSR, AVX/AVX-512) and DF are handled in mid_entry, BEFORE any of
     // this C code runs -- see there.
+    t_in_callback = 1;
     bool callback_ok = run_callback(callbacks[index], &c);
-    InterlockedDecrement(&g_inflight[stripe].value);
+    t_in_callback = 0;
+    InterlockedDecrement(&shared->inflight[stripe].value);
     if (!callback_ok) return;
 #if defined(_WIN64)
 #define COPY(a,b) native.a = c.regs.a;
