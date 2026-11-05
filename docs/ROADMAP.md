@@ -159,6 +159,59 @@ breakpoint/hw/inline on x64+x86, compared with the uninstrumented run (`regress.
 - ✗ (F7) Observer effect: with inline probes, writing a hook makes the patched bytes PAGE_EXECUTE_READWRITE through the target's own NtProtectVirtualMemory (seen by an RWX watcher installed earlier: `rwx-protect size=0x8` in KernelBase); breakpoint/hw patch from the controller and are invisible. Documented (loader_rwx README)
 - ⬜ (F8) The live log tail shares the target's inherited stdout: a target writing partial lines (cmd `type`) interleaves with tail lines mid-line, corrupting both for a line-based reader. The session JSONL file is unaffected (the famous checks read logs from it). Options: document; or tail to stderr/another handle when the target inherits stdout
 
+## Detours-replica findings (examples/famous/detours_*, 2026-11-05)
+Replicas of Microsoft Detours' simple / traceapi / withdll / retval samples on real system
+binaries (cmd, reg, sort), multi-threaded targets, launch vs attach, attach mid-run + detach,
+9 probes at once and mixed backends. Everything else matched the uninstrumented runs exactly.
+- ⬜ (D1) **probe_launch replaces the program's stdin.** The child gets a private pipe, UHH writes
+  one "gate keystroke" (`\n`) into it and keeps the write end open until probe_close. A filter
+  program (`sort`, `findstr`, `more`, anything reading stdin to EOF) **hangs forever** under every
+  backend, and a program reading a line gets a `\n` it was never sent. Detours' withdll passes the
+  caller's handles through. The keystroke exists for probe_app's gate, so changing it touches the
+  gated_config flow (not a contained fix -- user's call: e.g. inherit stdin by default and make the
+  gate keystroke opt-in, or forward the controller's stdin after the keystroke and close at EOF).
+  Test: `detours-launch-stdin-*` (FAILS today: hang).
+- ⬜ (D2) **Live log tail splices records into the target's own stdout lines.** The child inherits
+  the controller's stdout; records are written whole, but a target that writes partial lines
+  (reg.exe writes `ProductName` and the padding separately; unbuffered UCRT stdout writes one
+  character per WriteFile) gets `{"kind":"probe_log",...}` inserted mid-line, so its output as read
+  from the controller's stdout is altered (and line-based consumers lose records). The log FILE is
+  intact. No way to separate the two streams through the API today (stdout to NUL hides the
+  target's output too). Workaround in the suite: `dt_split` cuts records back out of the line they
+  landed in. Options: a separate tail handle/stream, or giving the child its own stdout pipe that
+  the controller forwards line-wise.
+- ⬜ (D3) **call_func from a breakpoint/hw callback fails while another thread's call_func is in
+  flight.** The "no nesting" guard (`in_call_tid`) is session-wide: during thread A's call the
+  debug loop dispatches thread B's events, B's callback calls call_func -> returns 0. With
+  return-value probes on 4 threads (GetLastError via call_func at every CreateFileW return) this
+  happens in practice. Inline is unaffected. Clean failure (returns 0), but surprising: the doc
+  says "other threads keep running" without saying their callbacks cannot call_func meanwhile.
+  Test: `detours-retval-callfunc-{breakpoint,hw}` (intermittent: 0-2 of 36 refused per run, seen
+  on x64 and x86, both backends). Relates to (#6) (hardening not pursued). A fix would need either
+  a nested-call stack in `call_in_target` (an outer call's trap arriving inside the inner wait
+  must be recorded, its thread restored and suspended, and the outer told not to continue it) or
+  suspending the other threads during a call (changes the documented "other threads keep running").
+- ✅ (D4) **A hw probe armed from a callback never fired on threads that were hitting a probe at
+  the same moment.** hw entry probe on CreateFileW, return-address probe added (hw) from the
+  first entry callback; 4 threads start together: 18/36 and 27/36 returns seen, every miss on
+  the 1-2 threads whose own entry #DB was queued while the DR was written (their entries all
+  trapped). The SetThreadContext from `arm_hw` to a thread whose debug event is still queued
+  behind the one being handled does not stick. Fix: `handle_hw` re-asserts every slot the
+  session owns (address + DR7 bits; released slots cleared) in the context it writes back at the
+  thread's own event (`enforce_owned_drs`; logs "repaired hardware breakpoint state").
+  `detours-retval-hw` 36/36 since. (Still open in principle for a thread whose queued event is
+  not a hw hit, e.g. a software breakpoint in a mixed session: those paths write CONTEXT_FULL
+  and do not re-assert DRs.)
+- ⬜ (D5) (code reading, not reproduced) absolute-address inline probes (`probe_add_address(...,
+  PROBE_INLINE)`, e.g. a return site) are vetted with `base == 0`, which skips the function-bounds /
+  branch-target part of the inline site check (`analyse_site` and the block walk both need a base):
+  only the exit and call-inside-patch rules apply. A return site followed within 5 bytes by a jump
+  target (a loop head right after a call) would be hooked without a warning.
+- ✅ No issue: launch vs attach traces are identical (minus pre-attach work), detach mid-run on 4
+  busy threads leaves the target correct on every backend, 9 probes in one session (breakpoint/hw/
+  inline mixed), `kernel32` import-stub sites (`jmp [imp]` + padding) inline-hooked fine, APC-
+  interrupted alertable SleepEx unchanged, GetLastError via call_func exact on inline.
+
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`
 - ✅ Per-log overhead ceilings in the suite (`log-throughput-*`)
@@ -167,6 +220,7 @@ breakpoint/hw/inline on x64+x86, compared with the uninstrumented run (`regress.
 - ⬜ Per-method, per-backend benchmark table (hit, get_reg/set_reg, get_mem, send_log, send_log_stack, call_func, control ops)
 
 ## Real-world cases
+- ✅ Microsoft Detours samples replicated (`examples/famous/detours_*`: simple, traceapi, withdll/attach, retval) -- findings above
 - ✅ (1) Real binaries via `uhh_trace`: curl `CreateFileW` + `connect` (all backends); ✅ findstr via `ntdll!NtCreateFile`
 - ✅ Targets written by Codex in `examples/realworld/`, in CMake + suite:
   - ✅ (4) Re-entrancy: inline malloc hook whose callback logs/allocates
