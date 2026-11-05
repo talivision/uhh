@@ -1,6 +1,6 @@
 # UHH roadmap (living tracker)
 
-Status: ✅ done and verified on x64 + x86 · 🔧 in progress · ⬜ not started.
+Status: ✅ done and verified on x64 + x86 · 🔧 in progress · ⬜ not started · 📄 documented limitation.
 Rules: every fix gets a regression test; the full suite (`scripts/regress.py`) runs on
 x64 and x86 after each step; an adversarial review after each large change; push to
 github.com/talivision/uhh at each green milestone. **The public API is frozen** as
@@ -80,6 +80,51 @@ identical source under every backend.
 - 🔧 (#12) uhh_attach --flag-backend, attach test flips the flag on every backend; (detach/crash multi-thread log counts, x87 status word: open)
 - ✅ probe_close waits for probe_run to return (warns every 15 s), never tears down underneath it
 - ⬜ frida_coexist hangs (found again 2026-11-05)
+
+## Hunter B findings (2026-11-05) — edge-case code shapes x every backend
+Test: `examples/edgehunt` (target + asm shapes + ONE callback source), suite `edgehunt-*` (x64 + x86).
+Each finding below was reproduced on main (d197024) by the same suite before the fix.
+- ✅ (B1) breakpoint: a probe on `rep movsb/stosb` fired the callback once per ITERATION (500 hits for 5 calls; RCX
+  seen counting down 99, 98, ...): the in-place step re-armed the INT3 after every iteration's trap. REP string ops
+  now run out-of-line to completion ended by a trailing INT3 (no trap flag); an in-place fallback keeps stepping
+  until the instruction leaves the site
+- ✅ (B2) breakpoint: a probe on `syscall` (stepped in place) left the step's trap flag in R11 (the flags image the CPU
+  saves); R11 is corrected at step completion
+- ✅ (B3) breakpoint/hw `set_mem` into code succeeded (WriteProcessMemory silently makes PAGE_EXECUTE_READ writable)
+  and modified the target's .text, where inline refuses; a range running into a PAGE_NOACCESS page was half-written
+  (target-visible) and half-read. Callback memory ops now share the agent's policy: whole range committed,
+  readable / writable, no guard, checked before any byte moves
+- ✅ (B4) `get_mem` of code under a live probe: breakpoint returned 0xCC, inline the hook's jump bytes, hw the real
+  bytes. Every backend now returns the PROGRAM's bytes (INT3 / hook bytes overlaid with the originals)
+- ✅ (B5) a breakpoint/hw callback that faults (bad pointer) KILLED the controller (0xC0000005) and with it the target;
+  inline abandons it. The controller now runs callbacks under SEH like the agent: hit counted, register changes
+  discarded, one stderr warning, run continues
+- ✅ (B6) `send_log` with a format the UCRT rejects (`%n`) fast-failed the controller (0xC0000409) or, inline, the
+  TARGET; an encoding error dropped the record silently. One formatter for both sides (`include/probe_log_format.hpp`):
+  invalid format or a faulting argument -> `[unformattable] <format>`, truncation marked, never fatal, never dropped
+- ✅ (B7) hw + breakpoint on the SAME instruction, hw registered first: the INT3 was attributed to the hw probe (its
+  callback ran again, 7 hits for 5) and the in-place "re-arm" wrote the hw probe's zero original byte into the code
+  (wrong program result). INT3 lookups now only consider breakpoint probes
+- ✅ (B8) breakpoint + inline on one instruction is refused (an inline hook would relocate the live INT3); the reason was
+  a misleading "ret/jmp at +0x0" (the INT3 decoded as code) -- now names the breakpoint probe; site checks decode the
+  program's bytes under our INT3s
+- ✅ (B9) breakpoint/hw `send_log_stack` in deep recursion returned 2 frames (identical return addresses collapsed),
+  inline 32. Frames with the same address but a different stack pointer are kept
+- 📄 (B10) `%s` of a TARGET pointer in `send_log`: inline prints the string; breakpoint/hw callbacks run in the controller
+  where it is no valid pointer -> `[unformattable] fmt %s` (was: controller crash). Callbacks must `get_mem` target strings
+  into a local buffer first (the portable way); a pointer valid in both processes (system DLL data) prints on all
+- 📄 (B11) UHH's own allocations in the target (scratch blocks, agent) can take an address range the program has just
+  RELEASED (seen on x86: a just-freed page readable at the next probe). Programs that re-reserve a fixed address they
+  freed could collide; not addressed
+- 📄 (B12) Out of scope / not testable here: probes inside WOW64 thunks (x86 syscalls go through them; edgehunt's
+  syscall / int 2e shapes are x64 only); `int 2e` system calls fault on this Windows build even without UHH (target
+  records `int2e_ok:0`, behaviour identical); TSX (`xbegin`) and AVX-512 shapes (the VM's i5-6600 has neither); large-
+  address-aware x86 targets not covered
+- Verified clean (no change needed): RIP-relative load/store/compare(disp+imm)/AVX load, cpuid, rdtsc, pushf/popf, a bare
+  `ret`, `call [rip+x]`, jump tables (x64 refused inline: the 3-byte `jmp [reg*8]` precedes a case label; x86's 7-byte
+  form is hooked), x87, `lock cmpxchg`, 10 args at entry, a faulting load in a framed function caught by the caller's
+  `__except` (inline too: the trampoline fault is still handled), one-shot probes re-added from a callback on every call,
+  guard/read-only/decommitted/null/wrapping addresses, zero-size reads, hw + inline on one instruction
 
 ## Codex workaround audit (2026-11-05) — triaged
 - ✗ (C1) handle->pid through kernel32!OpenProcess: example-callback design, not a library issue (user, 2026-11-05); documented in the gated_config README
