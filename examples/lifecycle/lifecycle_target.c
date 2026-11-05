@@ -213,14 +213,28 @@ static DWORD WINAPI hold_loader_lock(void *arg) {
 }
 
 static LONG WINAPI report_unhandled(EXCEPTION_POINTERS *ep) {
-    char buf[256]; DWORD w = 0;
+    char buf[512]; DWORD w = 0;
 #if defined(_WIN64)
     unsigned long long ip = ep->ContextRecord->Rip;
 #else
     unsigned long long ip = ep->ContextRecord->Eip;
 #endif
-    int n = _snprintf_s(buf, sizeof(buf), _TRUNCATE, "{\"kind\":\"unhandled\",\"code\":\"0x%08lx\",\"ip\":\"0x%llx\",\"tid\":%lu}\n",
-                        (unsigned long)ep->ExceptionRecord->ExceptionCode, ip, GetCurrentThreadId());
+    /* The debug state at the fault (a #DB / INT3 nobody claimed): the live registers and the
+       exception context's copy (when it carries them). */
+    CONTEXT dr; memset(&dr, 0, sizeof(dr)); dr.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    GetThreadContext(GetCurrentThread(), &dr);
+    const CONTEXT *cx = ep->ContextRecord;
+    const int cx_dr = (cx->ContextFlags & CONTEXT_DEBUG_REGISTERS) == CONTEXT_DEBUG_REGISTERS;
+    int n = _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                        "{\"kind\":\"unhandled\",\"code\":\"0x%08lx\",\"ip\":\"0x%llx\",\"at\":\"0x%llx\",\"tid\":%lu,"
+                        "\"eflags\":\"0x%lx\",\"dr\":[\"0x%llx\",\"0x%llx\",\"0x%llx\",\"0x%llx\"],\"dr6\":\"0x%llx\",\"dr7\":\"0x%llx\","
+                        "\"cx_dr6\":\"0x%llx\",\"cx_dr7\":\"0x%llx\"}\n",
+                        (unsigned long)ep->ExceptionRecord->ExceptionCode, ip,
+                        (unsigned long long)(ULONG_PTR)ep->ExceptionRecord->ExceptionAddress, GetCurrentThreadId(),
+                        (unsigned long)cx->EFlags, (unsigned long long)dr.Dr0, (unsigned long long)dr.Dr1,
+                        (unsigned long long)dr.Dr2, (unsigned long long)dr.Dr3, (unsigned long long)dr.Dr6,
+                        (unsigned long long)dr.Dr7, cx_dr ? (unsigned long long)cx->Dr6 : 0ull,
+                        cx_dr ? (unsigned long long)cx->Dr7 : 0ull);
     if (n > 0) WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), buf, (DWORD)n, &w, NULL);
     return EXCEPTION_CONTINUE_SEARCH;
 }
