@@ -72,6 +72,11 @@ struct StepState {
     uint64_t site = 0;
     uint32_t insn_len = 0;
     uint64_t scratch = 0;   // the out-of-line copy's slot (displaced steps)
+    // A hit on ANOTHER tool's relocated copy of our INT3 (see find_relocated_bp): site is
+    // the copy's address (the step resumes at site + insn_len, inside that tool's
+    // trampoline) and orig0 the byte to lift there for an in-place step.
+    bool relocated = false;
+    unsigned char orig0 = 0;
 };
 
 // One log line, optionally with a raw stack snapshot (return addresses only). Frames
@@ -168,6 +173,7 @@ struct probe_session {
     std::atomic<bool> stop_requested{false};   // probe_close from another thread while probe_run runs
     std::atomic<bool> running{false};          // probe_run is executing (on some thread)
     bool detached = false;
+    bool detaching = false;    // detach() running: no new holds (nothing would release them)
     DWORD debug_tid = 0;                       // the thread that launched/attached: owns the debug object
     DWORD in_call_tid = 0;                     // thread currently running a call_func callee
     bool skip_continue = false;                // call_func already continued the current event
@@ -2006,6 +2012,75 @@ static bool still_armed(probe_session *s, uint64_t site) {
     return p && (p->flags & PROBE_BREAKPOINT);
 }
 
+// Is the INT3 of a step still there to re-arm (our site, or a relocated copy of it)?
+static bool step_armed(probe_session *s, const StepState &st) {
+    return st.relocated || still_armed(s, st.site);
+}
+
+// Put our saved byte back -- but only over OUR INT3. Another tool may have hooked the
+// site since we armed it (an inline hooker reads the live 0xCC, relocates it into its
+// trampoline and writes its jump over the site); writing our byte there would corrupt
+// that tool's jump. Then the site is left as it is: the copy of our INT3 lives on in
+// that tool's trampoline and keeps being serviced (find_relocated_bp) while we run.
+static bool unpatch_bp(probe_session *s, const Probe &p) {
+    unsigned char now = 0; size_t got = 0;
+    if (remote_read(s->pi.hProcess, p.address, &now, 1, &got) && got == 1 && now != 0xcc) {
+        if (trace_enabled())
+            std::fprintf(stderr, "  bp %s: site rewritten by another tool (0x%02x), not restored\n",
+                         p.location.c_str(), now);
+        return true;
+    }
+    return patch(s->pi.hProcess, p.address, p.original);
+}
+
+// An INT3 at an address that is none of our sites: is it a RELOCATED COPY of one of
+// them? An inline hooker installed after us (Frida's Interceptor, any detour library)
+// copies the live first instructions of the site -- including our 0xCC -- into its
+// trampoline, then overwrites the site with its jump. From then on the function's calls
+// run our INT3 at the copy. Recognised only when it is unambiguous:
+//   - the site no longer holds our 0xCC (someone rewrote it);
+//   - the bytes after the copied INT3 are verbatim the rest of the original instruction
+//     (the hooker copied them as-is), and the hooker's view of the stream -- decoding
+//     from the byte after 0xCC -- has an instruction boundary exactly at the original
+//     instruction's end, so copy + insn_len is the relocated equivalent of site + insn_len;
+//   - exactly one armed breakpoint probe matches.
+// Then the hit is that probe's: the callback runs (the site as its address), the
+// original instruction is stepped, and the thread resumes at copy + insn_len.
+static Probe *find_relocated_bp(probe_session *s, uint64_t at) {
+    unsigned char copy[32] = {0}; size_t got = 0;
+    if (!remote_read(s->pi.hProcess, at, copy, sizeof(copy), &got) || got < 1 || copy[0] != 0xcc) return nullptr;
+    Probe *found = nullptr;
+    for (auto &up : s->probes) {
+        Probe &p = *up;
+        if (!p.active || p.retired || !(p.flags & PROBE_BREAKPOINT) || (p.flags & PROBE_ONCE) ||
+            p.flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW) || !p.insn_len || p.orig_insn.size() < p.insn_len ||
+            p.insn_len >= got)
+            continue;
+        unsigned char live = 0; size_t n = 0;
+        if (!remote_read(s->pi.hProcess, p.address, &live, 1, &n) || n != 1 || live == 0xcc) continue;
+        if (std::memcmp(copy + 1, p.orig_insn.data() + 1, p.insn_len - 1) != 0) continue;
+        if (p.insn_len > 1) {
+            ZydisDecoder dec;
+#if defined(_WIN64)
+            ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+#else
+            ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_COMPAT_32, ZYDIS_STACK_WIDTH_32);
+#endif
+            size_t off = 1;
+            while (off < p.insn_len) {
+                ZydisDecodedInstruction insn;
+                ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+                if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, copy + off, got - off, &insn, ops))) break;
+                off += insn.length;
+            }
+            if (off != p.insn_len) continue;
+        }
+        if (found) return nullptr;      // ambiguous: not ours to claim
+        found = &p;
+    }
+    return found;
+}
+
 static Probe *probe_at(probe_session *s, uint64_t address) {
     for (auto &p : s->probes) if (p->active && p->address == address) return p.get();
     return nullptr;
@@ -2335,7 +2410,12 @@ static bool inline_hold_needed(const probe_session *s) {
 }
 
 static void hold_thread(probe_session *s, DWORD tid) {
-    HANDLE t = OpenThread(THREAD_SUSPEND_RESUME, FALSE, tid);
+    // While detaching, the drain below dispatches queued events (e.g. an attach's
+    // CREATE_THREADs) that would otherwise place an install hold -- and the hold's release
+    // (the agent confirming) may never come before we let go: the target would be left
+    // with suspended threads after detach. No hooks are being installed any more anyway.
+    if (s->detaching) return;
+    HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
     if (!t) return;
     DWORD prev = SuspendThread(t);
     if (prev == (DWORD)-1) { CloseHandle(t); return; }
@@ -2544,6 +2624,7 @@ static void ipc_thaw(probe_session *s);
 static void pump(probe_session *s, DWORD ms);
 static void detach(probe_session *s) {
     s->error.clear();
+    s->detaching = true;
     release_held(s, "detach");
     // Agent work in flight (load/init on a remote thread): let it finish first, or its hooks
     // would land AFTER the agent was told to stop -- live hooks in a detached process.
@@ -2578,7 +2659,7 @@ static void detach(probe_session *s) {
     for (auto &p : s->probes) {
         if (!p->active) continue;
         if (p->flags & PROBE_BREAKPOINT) {
-            patch(s->pi.hProcess, p->address, p->original);
+            unpatch_bp(s, *p);
             s->retired_bps.insert(p->address); p->active = false;
         } else if (p->flags & PROBE_HW) {
             release_hw(s, *p);
@@ -2677,6 +2758,7 @@ static void detach(probe_session *s) {
     }
     std::fprintf(stderr, "probe: detach: %zu thread(s) frozen;%s\n", frozen.size(),
                  report_tids.empty() ? " all clean" : report_tids.c_str());
+    release_held(s, "detach (late)");                    // belt and braces: never leave a hold behind
     stop_drainer(s);
     if (!s->exited) DebugActiveProcessStop(s->pi.dwProcessId);
     for (HANDLE t : frozen) { ResumeThread(t); CloseHandle(t); }
@@ -2984,6 +3066,14 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     auto step = stepping.find(event.dwThreadId);
     uint64_t address = (uint64_t)(uintptr_t)ex.ExceptionAddress;
     Probe *probe = code == EXCEPTION_BREAKPOINT ? probe_at(s, address) : nullptr;
+    bool relocated = false;
+    if (code == EXCEPTION_BREAKPOINT && !probe && !s->retired_bps.count(address) &&
+        event.u.Exception.dwFirstChance && (probe = find_relocated_bp(s, address)) != nullptr) {
+        relocated = true;
+        if (trace_enabled())
+            std::fprintf(stderr, "  relocated INT3 at 0x%llx = copy of %s (0x%llx)\n", (unsigned long long)address,
+                         probe->location.c_str(), (unsigned long long)probe->address);
+    }
     if (code == EXCEPTION_BREAKPOINT && !probe && s->retired_bps.count(address)) {
         // Another thread hit a one-shot INT3 that has since been removed: the original
         // byte is back, so rewind to it and continue as if the breakpoint never existed.
@@ -3049,9 +3139,10 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
             CONTEXT w{}; w.ContextFlags = CONTEXT_CONTROL;
             bool ok = t && GetThreadContext(t, &w);
-            bool armed = still_armed(s, step->second.site);
-            Probe *owner = armed ? probe_at(s, step->second.site) : nullptr;
-            if (ok && owner) ok = patch(s->pi.hProcess, step->second.site, owner->original);
+            bool armed = step_armed(s, step->second);
+            Probe *owner = armed ? (step->second.relocated ? step->second.probe : probe_at(s, step->second.site)) : nullptr;
+            if (ok && owner) ok = patch(s->pi.hProcess, step->second.site,
+                                        step->second.relocated ? step->second.orig0 : owner->original);
 #if defined(_WIN64)
             w.Rip = step->second.site;
 #else
@@ -3077,7 +3168,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         // later stray single-step can't teleport it to site+insn_len; re-arm the byte
         // if the step was in-place. Pass the exception through unchanged.
         if (step != stepping.end()) {
-            if (!step->second.displaced && still_armed(s, step->second.site)) patch(s->pi.hProcess, step->second.site, 0xcc);
+            if (!step->second.displaced && step_armed(s, step->second)) patch(s->pi.hProcess, step->second.site, 0xcc);
             stepping.erase(step);
         }
         return true;
@@ -3107,7 +3198,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             native.Eip = (DWORD)next;
 #endif
         } else if (ok) {
-            if (still_armed(s, step->second.site)) ok = patch(s->pi.hProcess, step->second.site, 0xcc);   // in-place: re-arm
+            if (step_armed(s, step->second)) ok = patch(s->pi.hProcess, step->second.site, 0xcc);   // in-place: re-arm
         }
         native.EFlags &= ~0x100u;
         if (ok) ok = !!SetThreadContext(thread, &native);
@@ -3125,7 +3216,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     bool at_entry = s->entry_addr && address == s->entry_addr && !s->entry_seen;
     if (at_entry) s->entry_seen = true;
     probe_context context = from_context(native, probe_index(s, probe),
-                                         address, &remote_ops, s->pi.hProcess);
+                                         probe->address, &remote_ops, s->pi.hProcess);
     context.config = probe->config.empty() ? nullptr : probe->config.data();
     context.tid = event.dwThreadId;
     CallbackState state{s, probe, event.dwProcessId, event.dwThreadId}; context.controller = &state;
@@ -3144,11 +3235,11 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
 #else
     native.Esp = (DWORD)context.regs.rsp;
 #endif
-    if (probe->flags & PROBE_ONCE) {
+    if ((probe->flags & PROBE_ONCE) && !relocated) {
         // One-shot: put the original byte back for good and resume AT the site -- the
         // real instruction runs in place, no single-step needed. Stale hits from other
         // threads are rewound via retired_bps above.
-        if (!patch(s->pi.hProcess, probe->address, probe->original)) {
+        if (!unpatch_bp(s, *probe)) {
             CloseHandle(thread); set_error(s, win_error("retire one-shot breakpoint")); return false;
         }
         probe->active = false; probe->retired = true; s->retired_bps.insert(probe->address);
@@ -3166,7 +3257,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     }
     // Branches, call/ret, loop, pushf/popf: executed here on the context -- the INT3 stays
     // armed (exact under threads) and no trap flag is ever set (nothing leaks).
-    if (!probe->displaced_ok && emulate_site(s, *probe, native)) {
+    if (!probe->displaced_ok && !relocated && emulate_site(s, *probe, native)) {
         native.ContextFlags = CONTEXT_FULL;               // keep any DRs the callback armed
         bool ok = !!SetThreadContext(thread, &native);
         CloseHandle(thread);
@@ -3207,13 +3298,13 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         // In-place fallback (control-flow sites, or scratch/reach failure): lift the
         // byte, step over it at the real address, re-arm on the single-step (this is
         // the only path with a brief unarmed window, so it is kept for the rare cases).
-        if (!patch(s->pi.hProcess, probe->address, probe->original)) {
+        if (!patch(s->pi.hProcess, address, relocated ? probe->orig_insn[0] : probe->original)) {
             CloseHandle(thread); set_error(s, win_error("restore probed instruction")); return false;
         }
 #if defined(_WIN64)
-        native.Rip = probe->address;
+        native.Rip = address;
 #else
-        native.Eip = (DWORD)probe->address;
+        native.Eip = (DWORD)address;
 #endif
     }
     native.EFlags |= 0x100u;
@@ -3229,7 +3320,8 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         std::fprintf(stderr, "  setup tid=%lu displaced=%d scratch=0x%llx rip=0x%llx\n",
                      (unsigned long)event.dwThreadId, displaced,
                      (unsigned long long)scratch_addr, (unsigned long long)(displaced ? scratch_addr : probe->address));
-    stepping[event.dwThreadId] = StepState{probe, displaced, probe->address, probe->insn_len, displaced ? scratch_addr : 0};
+    stepping[event.dwThreadId] = StepState{probe, displaced, address, probe->insn_len, displaced ? scratch_addr : 0,
+                                           relocated, relocated ? probe->orig_insn[0] : (unsigned char)0};
     if (at_entry && inline_hold_needed(s)) { hold_thread(s, event.dwThreadId); if (!kick_agent(s)) return false; }
     disposition = DBG_CONTINUE; return true;
 }
@@ -3708,7 +3800,7 @@ extern "C" void probe_close(probe_session *s) {
         detach(s);
     } else if (s->launched && !s->exited && s->pi.hProcess) {
         for (auto &p : s->probes)
-            if (p->active && (p->flags & PROBE_BREAKPOINT)) patch(s->pi.hProcess, p->address, p->original);
+            if (p->active && (p->flags & PROBE_BREAKPOINT)) unpatch_bp(s, *p);
         TerminateProcess(s->pi.hProcess, 3);
         if (WaitForSingleObject(s->pi.hProcess, 5000) == WAIT_OBJECT_0) s->exited = true;
         // On the debugger thread, consume the dead target's remaining events (through its

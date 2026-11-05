@@ -79,7 +79,7 @@ identical source under every backend.
 - 🔧 (#11) every inline probe is accepted/retired before a failure is reported; (5 s hold timeout still a warning)
 - 🔧 (#12) uhh_attach --flag-backend, attach test flips the flag on every backend; (detach/crash multi-thread log counts, x87 status word: open)
 - ✅ probe_close waits for probe_run to return (warns every 15 s), never tears down underneath it
-- ⬜ frida_coexist hangs (found again 2026-11-05)
+- ✅ frida_coexist hangs (found again 2026-11-05). Root cause: UHH breakpoint armed first, then Frida's Interceptor relocated the live 0xCC into its trampoline; that INT3 was not a UHH site -> passed through -> app died, and the harness blocked forever on probe_app's stdout (the helpers inherit the pipe, so EOF never came). Fix: the breakpoint backend recognises an unambiguous relocated copy of its INT3 (site rewritten, verbatim tail, aligned boundary, one match) and services it, resuming in the other tool's trampoline; restores never write over another tool's patch. Harness: reader thread, file output, deadlines, watchdog, tree-kill, exit-path Frida count; regress runs 8 cases (incl. inline refused / fallback-hw / allow-prehooked)
 
 ## Codex workaround audit (2026-11-05) — triaged
 - ✗ (C1) handle->pid through kernel32!OpenProcess: example-callback design, not a library issue (user, 2026-11-05); documented in the gated_config README
@@ -115,7 +115,7 @@ identical source under every backend.
   - ✅ (6) Anti-tamper: `.text` / function-byte checksums and DR visibility, measured per backend
   - ✅ (7) Anti-debug: IsDebuggerPresent, debug port/object/flags, PEB, timing — measured and documented
   - ✅ (3) Exceptions (C++, SEH, through a callback) unwinding across hooked frames
-- ✅ (9) Hot-patch `mov edi,edi` prologues (x86); 🔧 coexistence with Frida hooking the same function
+- ✅ (9) Hot-patch `mov edi,edi` prologues (x86); ✅ coexistence with Frida hooking the same function (`frida-coexist-*`, both orders, every backend)
 
 ## Production readiness (user decisions 2026-11-05)
 - ⬜ [fan-out] Intel CET shadow stacks: test /CETCOMPAT targets on CET hardware (SafetyHook's resume path, inline set_reg(SP), call_func all use ret-to-pushed-address)

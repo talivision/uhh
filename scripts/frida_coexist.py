@@ -90,6 +90,7 @@ def main():
 
     workdir = tempfile.mkdtemp(prefix="frida_coexist_")
     out_path, err_path = os.path.join(workdir, "uhh.out"), os.path.join(workdir, "uhh.err")
+    res["uhh_err_path"] = err_path
     app = tracer = session = None
     lines = queue.Queue()
     app_lines = []
@@ -209,6 +210,10 @@ def main():
             raise RuntimeError("uhh_trace did not exit after the target did")
     except Exception as e:      # noqa: BLE001
         res["error"] = str(e)
+        if app is not None:
+            res["app_alive_at_error"] = app.poll() is None
+        if tracer is not None:
+            res["uhh_alive_at_error"] = tracer.poll() is None
     finally:
         res.pop("_script", None)
         if res["error"]:
