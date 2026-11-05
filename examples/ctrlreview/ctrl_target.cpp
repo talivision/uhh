@@ -134,16 +134,23 @@ static DWORD WINAPI loop_thread(void *p) {
 static int run_inplace(int threads, int n) {
     std::vector<LoopArg> args(threads);
     std::vector<HANDLE> hs;
+    int started = 0;
     for (int t = 0; t < threads; ++t) {
         args[t] = LoopArg{(uint32_t)t + 1, (uint32_t)n, 0};
-        hs.push_back(CreateThread(nullptr, 0, loop_thread, &args[t], 0, nullptr));
+        HANDLE h = CreateThread(nullptr, 0, loop_thread, &args[t], 0, nullptr);
+        if (h) { hs.push_back(h); ++started; }
     }
-    WaitForMultipleObjects((DWORD)hs.size(), hs.data(), TRUE, INFINITE);
-    uint64_t bad = 0;
+    // Every thread must have started and finished: a failed CreateThread or wait is a
+    // fixture failure (calls would be missing for a reason that is not the probe's).
+    const DWORD w = hs.empty() ? WAIT_FAILED : WaitForMultipleObjects((DWORD)hs.size(), hs.data(), TRUE, 120000);
+    uint64_t bad = 0, done = 0;
     for (auto &a : args) bad += a.bad;
-    std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"inplace\",\"calls\":%d,\"bad\":%llu}\n", threads * n,
-                (unsigned long long)bad);
-    return 0;
+    for (HANDLE h : hs) { DWORD code = 1; if (GetExitCodeThread(h, &code) && code == 0) ++done; CloseHandle(h); }
+    const bool ok = started == threads && w == WAIT_OBJECT_0 && done == (uint64_t)threads;
+    std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"inplace\",\"calls\":%d,\"bad\":%llu,\"started\":%d,"
+                "\"finished\":%llu,\"wait_ok\":%d}\n", threads * n, (unsigned long long)bad, started,
+                (unsigned long long)done, w == WAIT_OBJECT_0);
+    return ok ? 0 : 4;
 }
 
 // ---- absunload / symunload ------------------------------------------------------------

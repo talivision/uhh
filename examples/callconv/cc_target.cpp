@@ -22,6 +22,23 @@ struct cc_out { uint32_t eax, edx; int32_t popped; uint32_t nv_ok; double st0; u
 extern "C" void cc_invoke(void *fn, const uint32_t *slots, int n, uint32_t ecx, uint32_t edx, const void *xmm, cc_out *out);
 #endif
 
+// What the caller must get from a replace-mode probe: literal constants, written out here
+// independently of the callback's formula (cc_callbacks.cpp, cc_replacement). Integer-class
+// results; CC_K_PTR results are checked through the struct (CC_REPLACED_STRUCT_BASE).
+static int64_t cc_replaced(int id) {
+    switch (id) {
+    case CC_CDECL0: return 0x5EED0000; case CC_CDECL3: return 0x5EED0001; case CC_STD3: return 0x5EED0002;
+    case CC_STD10: return 0x5EED0003; case CC_FAST4: return 0x5EED0004; case CC_THIS: return 0x5EED0005;
+    case CC_VEC: return 0x5EED0006; case CC_I64: return 0x7766554433221107ll; case CC_STDI64: return 0x7766554433221108ll;
+    case CC_S12: return 0x5EED0009; case CC_S8: return 0x5EED000A;
+    case CC_RET8: return ((int64_t)152 << 32) | 151;       // {a = 151, b = 152}
+    case CC_HOT: return 0x5EED0010; case CC_ILT: return 0x5EED0011; case CC_IMP: return 0x5EED0012;
+    case CC_JMPDST: return 0x5EED0013;
+    default: return -1;
+    }
+}
+static int cc_replaced_struct_base(int id) { return id == CC_RETBIG ? 131 : id == CC_RETBIGSTD ? 141 : -1; }
+
 static int g_fails;
 static void row(const char *name, bool ok, const char *detail) {
     if (!ok) ++g_fails;
@@ -122,12 +139,12 @@ int main(int argc, char **argv) {
             if (!have_d || gotd != want) { ok = false; snprintf(buf, sizeof(buf), "fp=%g have=%d want=%g ", gotd, have_d, want); strcat_s(detail, buf); }
         } else if (f.kind == CC_K_PTR) {
             const int x = id == CC_RETBIG ? 61 : 62;
-            const int base = replaced ? id * 10 + 1 : x;
+            const int base = replaced ? cc_replaced_struct_base(id) : x;
             if (big.a != base || big.b != base + 1 || big.c != base + 2 || big.d != base + 3) {
                 ok = false; snprintf(buf, sizeof(buf), "struct={%d,%d,%d,%d} want_base=%d ", big.a, big.b, big.c, big.d, base); strcat_s(detail, buf);
             }
         } else {
-            int64_t want = replaced ? (int64_t)cc_replacement(id) : cc_native_int(id);
+            int64_t want = replaced ? cc_replaced(id) : cc_native_int(id);
             if (f.kind == CC_K_INT) want = (int32_t)want;
             if (got != want) { ok = false; snprintf(buf, sizeof(buf), "ret=0x%llx want=0x%llx ", (unsigned long long)got, (unsigned long long)want); strcat_s(detail, buf); }
         }

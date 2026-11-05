@@ -15,7 +15,11 @@
 //   --mode exit          T threads flood LogSiteA; main calls ExitProcess(7) after --ms
 //   --mode selfterm      the same with TerminateProcess(self, 7)
 //   --mode gate          print {"kind":"waiting","pid":N}, wait for a line on stdin, then T
-//                        threads x M LogSiteA calls; prints the elapsed time (attach tests)
+//                        threads x M LogSiteA calls; prints the elapsed time (attach tests).
+//                        After the line it maps the agent's shared ring (the session must be
+//                        attached by then), prints {"kind":"mapped"}, waits for a SECOND line,
+//                        runs the calls and prints the ring's accounting before/after them:
+//                        hits, log_head, log_dropped, in-flight (the controller-death check)
 // Prints one {"kind":"app",...} line.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -27,6 +31,16 @@
 static volatile LONG64 g_sink;
 static volatile LONG g_stop, g_go;
 static int g_threads = 4, g_count = 3000, g_ms = 200;
+struct ring_acct { unsigned long long hits, head, tail, dropped, inflight; };
+static ring_acct acct(const probe_agent_shared *sh) {
+    ring_acct a{};
+    MemoryBarrier();
+    for (uint32_t p = 0; p < PROBE_AGENT_MAX_PROBES; ++p) a.hits += probe_agent_hits(sh, p);
+    a.inflight = probe_agent_inflight(sh);
+    a.head = (unsigned long long)sh->log_head; a.tail = (unsigned long long)sh->log_tail;
+    a.dropped = (unsigned long long)(ULONG)sh->log_dropped;
+    return a;
+}
 static unsigned g_cases = 16;
 
 extern "C" __declspec(dllexport) __declspec(noinline) LONG64 LogSiteA(unsigned tag, unsigned seq) {
@@ -171,10 +185,21 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(mode, "gate")) {
         printf("{\"kind\":\"waiting\",\"pid\":%lu}\n", GetCurrentProcessId()); fflush(stdout);
-        char b; DWORD got = 0; ReadFile(GetStdHandle(STD_INPUT_HANDLE), &b, 1, &got, nullptr);
+        HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+        char b = 0; DWORD got = 0;
+        while (ReadFile(in, &b, 1, &got, nullptr) && got == 1 && b != '\n') {}
+        probe_agent_shared *sh = map_ring();
+        printf("{\"kind\":\"mapped\",\"ok\":%d}\n", sh != nullptr); fflush(stdout);
+        b = 0;
+        while (ReadFile(in, &b, 1, &got, nullptr) && got == 1 && b != '\n') {}
+        const ring_acct a0 = sh ? acct(sh) : ring_acct{};
         int ms = run_phase2();
-        printf("{\"kind\":\"app\",\"mode\":\"gate\",\"calls\":%lld,\"want\":%d,\"ms\":%d}\n",
-               (long long)g_phase2_calls, g_threads * g_count, ms);
+        const ring_acct a1 = sh ? acct(sh) : ring_acct{};
+        printf("{\"kind\":\"app\",\"mode\":\"gate\",\"calls\":%lld,\"want\":%d,\"ms\":%d,\"mapped\":%d,"
+               "\"hits0\":%llu,\"hits1\":%llu,\"head0\":%llu,\"head1\":%llu,\"tail0\":%llu,\"tail1\":%llu,"
+               "\"dropped0\":%llu,\"dropped1\":%llu,\"inflight1\":%llu}\n",
+               (long long)g_phase2_calls, g_threads * g_count, ms, sh != nullptr, a0.hits, a1.hits, a0.head, a1.head,
+               a0.tail, a1.tail, a0.dropped, a1.dropped, a1.inflight);
         return 0;
     }
     if (!strcmp(mode, "wedge-kill")) return wedge(true);

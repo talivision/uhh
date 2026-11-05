@@ -229,11 +229,16 @@ def count_lines(path):
             n += b.count(b"\n")
 
 
+MIN_SAMPLES = 4         # a growth verdict needs at least this many valid samples (else: FAIL)
+MIN_CYCLES = 4          # the attach phase likewise needs this many measured cycles
+
+
 def growth(samples, who, key):
-    """Growth of samples[who][key] over the second half of the run (the first half is warm-up)."""
+    """Growth of samples[who][key] over the second half of the run (the first half is warm-up).
+    None when there are fewer than MIN_SAMPLES valid samples: no measurement is not 'no growth'."""
     vals = [s[who][key] for s in samples if s.get(who)]
-    if len(vals) < 4:
-        return 0.0, vals
+    if len(vals) < MIN_SAMPLES:
+        return None, vals
     half = vals[len(vals) // 2:]
     return round(max(half[-1] - half[0], 0), 2), vals
 
@@ -244,6 +249,7 @@ READ_RE = re.compile(rb"read handle=0x([0-9a-f]+) pid=(\d+) name=([^ ]+) addr=0x
 class Sampler:
     def __init__(self, out_csv, every, procs, log_path_fn, extra_fn=None, on_low_memory=None):
         self.samples, self.every, self.procs = [], every, procs
+        self.errors = []                # samples that raised (each one is a missing measurement)
         self.on_low_memory, self.low_memory = on_low_memory, None
         self.log_path_fn, self.extra_fn = log_path_fn, extra_fn
         self.stop = threading.Event()
@@ -290,7 +296,8 @@ class Sampler:
         while not self.stop.wait(self.every):
             try:
                 self.take()
-            except Exception as e:      # a sample must never kill the soak
+            except Exception as e:      # a sample must never kill the soak -- but it fails the phase
+                self.errors.append(repr(e))
                 say("sample failed:", repr(e))
 
     def finish(self):
@@ -394,7 +401,8 @@ def launch_phase(bin_dir, phase, minutes, threads, pace, out_dir, sample_s, max_
         gr[f"{who}_private_mb"], _ = growth(sampler.samples, who, "private_mb")
         gr[f"{who}_handles"], _ = growth(sampler.samples, who, "handles")
         gr[f"{who}_threads"], _ = growth(sampler.samples, who, "threads")
-    steady = (gr["ctl_private_mb"] < max_growth_mb and gr["tgt_private_mb"] < max_growth_mb and
+    measured = all(v is not None for v in gr.values()) and not sampler.errors
+    steady = (measured and gr["ctl_private_mb"] < max_growth_mb and gr["tgt_private_mb"] < max_growth_mb and
               gr["ctl_handles"] < max_handle_growth and gr["tgt_handles"] < max_handle_growth and
               gr["ctl_threads"] <= 2 and gr["tgt_threads"] <= 2)
     exact = (state["reads"] == hits == app.get("successful_reads") == total and rep.get("log_dropped") == 0 and
@@ -421,7 +429,7 @@ def launch_phase(bin_dir, phase, minutes, threads, pace, out_dir, sample_s, max_
         "overrides": rep.get("overrides"), "controller_peak_ws_mb": rep.get("controller_peak_ws_mb"),
         "error": rep.get("error"), "growth_2nd_half": gr, "system_growth_2nd_half": sysg,
         "aborted_low_memory": sampler.low_memory, "first_sample": first, "last_sample": last,
-        "samples": len(sampler.samples),
+        "samples": len(sampler.samples), "sample_errors": sampler.errors[:3], "measured": measured,
     }
     if state["log"] and ok:
         try:
@@ -434,16 +442,35 @@ def launch_phase(bin_dir, phase, minutes, threads, pace, out_dir, sample_s, max_
 
 
 # ---- attach phase (uhh_trace attach / detach cycles) ----------------------------------
+TRACE_READ_RE = re.compile(r"NtReadVirtualMemory\(0x([0-9a-f]+), 0x([0-9a-f]+), 0x([0-9a-f]+), 0x([0-9a-f]+)\)")
+
+
 def attach_cycle(bin_dir, pid, backend, attach_ms, timeout=600):
+    """One attach / detach of uhh_trace. Every read record is PARSED (not just counted):
+    (handle, address, size) per record, validated against probe_app's own helper/opened
+    records by validate_attach_reads once the target's output is complete."""
     args = [str(bin_dir / "uhh_trace.exe"), "--backend", backend, "--attach", str(pid), "--detach-after-ms",
             str(attach_ms), "-p", READ_LOCATION + ":xxxx"]
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
-    logs, objs, err = [0], [], []
+    logs, objs, err, reads, malformed = [0], [], [], {}, []
 
     def pump_out():
         for raw in proc.stdout:
             if raw.startswith(b'{"kind":"probe_log"'):
                 logs[0] += 1
+                try:
+                    msg = str(json.loads(raw.decode("utf-8")).get("message", ""))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    msg = None
+                m = TRACE_READ_RE.fullmatch(msg) if msg is not None else None
+                if not m:
+                    if len(malformed) < 5:
+                        malformed.append(raw[:160])
+                    else:
+                        malformed.append(None)
+                    continue
+                key = (int(m.group(1), 16), int(m.group(2), 16), int(m.group(4), 16))
+                reads[key] = reads.get(key, 0) + 1
             elif raw.startswith(b"{"):
                 objs.extend(json_objs([raw.decode(errors="replace")]))
 
@@ -468,10 +495,38 @@ def attach_cycle(bin_dir, pid, backend, attach_ms, timeout=600):
             except OSError:
                 pass
     detached = any(o.get("kind") == "detached" for o in objs)
-    ok = proc.returncode == 0 and detached and hits is not None and hits > 0 and logs[0] == hits == written and dropped == 0
+    ok = (proc.returncode == 0 and detached and hits is not None and hits > 0 and logs[0] == hits == written and
+          dropped == 0 and not malformed)
     return {"backend": backend, "ok": ok, "hits": hits, "logs": logs[0], "written": written, "dropped": dropped,
-            "exit": proc.returncode, "detached": detached,
+            "exit": proc.returncode, "detached": detached, "reads": reads, "malformed": len(malformed),
+            "malformed_examples": [m.decode(errors="replace") for m in malformed if m][:2],
             "stderr_tail": [] if ok else [l for l in err if "probe:" in l][-12:]}
+
+
+def validate_attach_reads(cycles, target_objs, mask):
+    """Every read an attach cycle logged must be one probe_app makes: through a handle it
+    opened (its "opened" records), inside THAT helper's buffer (its "helper" base), 16 bytes.
+    Marks failing cycles not ok; returns the number of wrong records."""
+    helpers = {o["pid"]: o for o in target_objs if o.get("kind") == "helper"}
+    opened = {o["handle"] & mask: o["pid"] for o in target_objs if o.get("kind") == "opened"}
+    total_wrong = 0
+    for c in cycles:
+        wrong = {}
+        for (h, addr, size), n in c.get("reads", {}).items():
+            pid = opened.get(h & mask)
+            hp = helpers.get(pid)
+            # probe_app reads 16 bytes at base + 64 * {0..3} (probe_app.cpp: kReadSize, kStride, kOffsets)
+            if not hp or (addr - hp["base"]) & mask not in (0, 64, 128, 192) or size != 16:
+                wrong[(hex(h), hex(addr), size)] = n
+        c["wrong_reads"] = sum(wrong.values())
+        if wrong:
+            c["ok"] = False
+            c["wrong_examples"] = list(wrong.items())[:3]
+        total_wrong += c["wrong_reads"]
+        c["reads"] = len(c.get("reads", {}))          # distinct (handle, addr, size): keep the result small
+    if not helpers or not opened:
+        total_wrong += 1
+    return total_wrong
 
 
 def attach_phase(bin_dir, minutes, threads, pace, out_dir, sample_s, attach_ms, gap_s, max_growth_mb, max_handle_growth):
@@ -538,18 +593,28 @@ def attach_phase(bin_dir, minutes, threads, pace, out_dir, sample_s, attach_ms, 
     time.sleep(1)
     sampler.finish()
     tp.close()
-    app = next((o for o in json_objs(tout) if o.get("kind") == "app"), {})
+    tobjs = json_objs(tout)
+    app = next((o for o in tobjs if o.get("kind") == "app"), {})
     unhandled = [l for l in terr if '"unhandled"' in l][:2]
     # Cycle-to-cycle growth of the target, per backend (an inline cycle loads the agent).
+    mask = (1 << 64) - 1
+    wrong_reads = validate_attach_reads(cycles, tobjs, mask)
+
     def grow(key):
-        vals = [c["target"][key] for c in cycles if c.get("target")]
+        """None when a cycle has no measurement or there are fewer than MIN_CYCLES: an
+        unmeasured run is not a steady one."""
+        vals = [c["target"][key] if c.get("target") else None for c in cycles]
+        if len(vals) < MIN_CYCLES or any(v is None for v in vals):
+            return None
         half = vals[len(vals) // 2:]
-        return round(max(half[-1] - half[0], 0), 2) if len(half) >= 2 else 0
+        return round(max(half[-1] - half[0], 0), 2)
     gr = {"tgt_private_mb": grow("private_mb"), "tgt_handles": grow("handles"), "tgt_threads": grow("threads")}
     agents = [c["agents"] for c in cycles if c.get("agents") is not None]
-    steady = (gr["tgt_private_mb"] < max_growth_mb and gr["tgt_handles"] < max_handle_growth and gr["tgt_threads"] <= 2
-              and (not agents or max(agents) <= 1))
-    all_cycles_ok = bool(cycles) and all(c["ok"] for c in cycles)
+    measured = (all(v is not None for v in gr.values()) and len(agents) == len(cycles) >= MIN_CYCLES and
+                not sampler.errors)
+    steady = (measured and gr["tgt_private_mb"] < max_growth_mb and gr["tgt_handles"] < max_handle_growth and
+              gr["tgt_threads"] <= 2 and max(agents) <= 1)
+    all_cycles_ok = bool(cycles) and all(c["ok"] for c in cycles) and wrong_reads == 0
     checksum_ok = (app.get("checksum") == base.get("checksum") and app.get("successful_reads") == total ==
                    base.get("successful_reads"))
     ok = all_cycles_ok and checksum_ok and target.returncode == 0 and not unhandled and steady and not sampler.low_memory
@@ -562,7 +627,8 @@ def attach_phase(bin_dir, minutes, threads, pace, out_dir, sample_s, attach_ms, 
             "failed_cycles": [c for c in cycles if not c["ok"]][:3], "successful_reads": app.get("successful_reads"),
             "total": total, "checksum": app.get("checksum"), "baseline_checksum": base.get("checksum"),
             "target_exit": target.returncode, "unhandled": unhandled, "growth_2nd_half": gr,
-            "aborted_low_memory": sampler.low_memory,
+            "aborted_low_memory": sampler.low_memory, "measured": measured, "wrong_reads": wrong_reads,
+            "sample_errors": sampler.errors[:3],
             "agent_modules_first_last": (agents[0], agents[-1]) if agents else None,
             "target_after_first_cycle": per_cycle[0] if per_cycle else None,
             "target_after_last_cycle": per_cycle[-1] if per_cycle else None}

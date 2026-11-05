@@ -19,31 +19,34 @@ enum cc_mode { CCM_NONE = 0, CCM_WRAP = 1, CCM_REPLACE = 2, CCM_WRONGPOP = 3 };
 struct cc_fn {
     const char *module, *name;
     int pop86;          // x86: bytes the callee pops (its `ret N`)
-    int nslots;         // integer slots the function's arguments take: x86 stack slots, x64 arguments
+    int co64;           // call_original's nargs on x64: integer-class argument positions (RCX.. then
+                        // stack; a hidden return pointer and a by-reference struct count one each)
+    int co86;           // call_original's nargs on x86: the 4-byte STACK slots (get_func_arg's view;
+                        // register arguments -- fastcall/vectorcall ECX/EDX, thiscall ECX -- excluded)
     int kind;
     int x86_only;
 };
 static const cc_fn CC_FNS[CC_N] = {
-    {"ccfix.dll", "CcCdecl0", 0, 0, CC_K_INT, 0},        // int __cdecl ()
-    {"ccfix.dll", "CcCdecl3", 0, 3, CC_K_INT, 0},        // int __cdecl (int, int, int)
-    {"ccfix.dll", "CcStd3", 12, 3, CC_K_INT, 0},         // int __stdcall (int, int, int)
-    {"ccfix.dll", "CcStd10", 40, 10, CC_K_INT, 0},       // int __stdcall (10 x int): > 8 arguments
-    {"ccfix.dll", "CcFast4", 8, 4, CC_K_INT, 0},         // int __fastcall (int, int, int, int)
-    {"ccfix.dll", "CcThisGet", 8, 3, CC_K_INT, 0},       // int CcObj::Get(int, int): __thiscall
-    {"ccfix.dll", "CcVec", 0, 4, CC_K_INT, 0},           // int __vectorcall (int, double, int, float)
-    {"ccfix.dll", "CcI64", 0, 5, CC_K_I64, 0},           // int64 __cdecl (int64, int, int64)
-    {"ccfix.dll", "CcStdI64", 12, 3, CC_K_I64, 0},       // int64 __stdcall (int64, int)
-    {"ccfix.dll", "CcS12", 16, 4, CC_K_INT, 0},          // int __stdcall (CcS12 by value, int)
-    {"ccfix.dll", "CcS8", 0, 2, CC_K_INT, 0},            // int __cdecl (CcS8 by value)
-    {"ccfix.dll", "CcDbl", 0, 4, CC_K_DBL, 0},           // double __cdecl (double, float, int)
-    {"ccfix.dll", "CcFlt", 8, 2, CC_K_FLT, 0},           // float __stdcall (float, float)
-    {"ccfix.dll", "CcRetBig", 0, 2, CC_K_PTR, 0},        // cc_s16 __cdecl (int): hidden return pointer
-    {"ccfix.dll", "CcRetBigStd", 8, 2, CC_K_PTR, 0},     // cc_s16 __stdcall (int): the callee pops it too
-    {"ccfix.dll", "CcRet8", 0, 1, CC_K_S8, 0},           // CcS8 __cdecl (int): x86 EDX:EAX, x64 RAX
-    {"ccfix.dll", "CcHot", 8, 2, CC_K_INT, 1},           // stdcall behind `mov edi,edi; push ebp; mov ebp,esp`
-    {"ccfix.dll", "CcIlt", 12, 3, CC_K_INT, 0},          // incremental-link thunk: jmp rel32 -> CcStd3T
-    {"cc_target.exe", "CcImpThunk", 12, 3, CC_K_INT, 0}, // import thunk: jmp [IAT slot] -> CcStd3T
-    {"ccfix.dll", "CcJmpDst", 12, 3, CC_K_INT, 0},       // reached by a tail-call jmp (CcTail), not a call
+    {"ccfix.dll", "CcCdecl0", 0, 0, 0, CC_K_INT, 0},        // int __cdecl ()
+    {"ccfix.dll", "CcCdecl3", 0, 3, 3, CC_K_INT, 0},        // int __cdecl (int, int, int)
+    {"ccfix.dll", "CcStd3", 12, 3, 3, CC_K_INT, 0},         // int __stdcall (int, int, int)
+    {"ccfix.dll", "CcStd10", 40, 10, 10, CC_K_INT, 0},       // int __stdcall (10 x int): > 8 arguments
+    {"ccfix.dll", "CcFast4", 8, 4, 2, CC_K_INT, 0},         // int __fastcall (int, int, int, int)
+    {"ccfix.dll", "CcThisGet", 8, 3, 2, CC_K_INT, 0},       // int CcObj::Get(int, int): __thiscall
+    {"ccfix.dll", "CcVec", 0, 4, 0, CC_K_INT, 0},           // int __vectorcall (int, double, int, float)
+    {"ccfix.dll", "CcI64", 0, 3, 5, CC_K_I64, 0},           // int64 __cdecl (int64, int, int64)
+    {"ccfix.dll", "CcStdI64", 12, 2, 3, CC_K_I64, 0},       // int64 __stdcall (int64, int)
+    {"ccfix.dll", "CcS12", 16, 2, 4, CC_K_INT, 0},          // int __stdcall (CcS12 by value, int)
+    {"ccfix.dll", "CcS8", 0, 1, 2, CC_K_INT, 0},            // int __cdecl (CcS8 by value)
+    {"ccfix.dll", "CcDbl", 0, 3, 4, CC_K_DBL, 0},           // double __cdecl (double, float, int)
+    {"ccfix.dll", "CcFlt", 8, 2, 2, CC_K_FLT, 0},           // float __stdcall (float, float)
+    {"ccfix.dll", "CcRetBig", 0, 2, 2, CC_K_PTR, 0},        // cc_s16 __cdecl (int): hidden return pointer
+    {"ccfix.dll", "CcRetBigStd", 8, 2, 2, CC_K_PTR, 0},     // cc_s16 __stdcall (int): the callee pops it too
+    {"ccfix.dll", "CcRet8", 0, 1, 1, CC_K_S8, 0},           // CcS8 __cdecl (int): x86 EDX:EAX, x64 RAX
+    {"ccfix.dll", "CcHot", 8, 2, 2, CC_K_INT, 1},           // stdcall behind `mov edi,edi; push ebp; mov ebp,esp`
+    {"ccfix.dll", "CcIlt", 12, 3, 3, CC_K_INT, 0},          // incremental-link thunk: jmp rel32 -> CcStd3T
+    {"cc_target.exe", "CcImpThunk", 12, 3, 3, CC_K_INT, 0}, // import thunk: jmp [IAT slot] -> CcStd3T
+    {"ccfix.dll", "CcJmpDst", 12, 3, 3, CC_K_INT, 0},       // reached by a tail-call jmp (CcTail), not a call
 };
 
 // Arguments cc_target passes.
@@ -76,12 +79,6 @@ static inline int64_t cc_native_int(int id) {
 #define CC_DBL_RESULT 6.375          /* 1.5 * 2.25f + 3 */
 #define CC_FLT_RESULT 2.125f         /* 0.5f * 4.0f + 0.125f */
 
-// What the replace-mode callback returns instead (integer-class results only: return_from
-// cannot set a floating-point return register).
-static inline uint64_t cc_replacement(int id) {
-    switch (CC_FNS[id].kind) {
-    case CC_K_I64: return 0x7766554433221100ull + (uint64_t)id;
-    case CC_K_S8: return ((uint64_t)(id * 10 + 2) << 32) | (uint64_t)(id * 10 + 1);
-    default: return 0x5EED0000u + (uint32_t)id;
-    }
-}
+// The replace-mode values are NOT shared: the callback computes its own (cc_callbacks.cpp,
+// cc_replacement) and the target checks against literal constants of its own (cc_target.cpp,
+// cc_replaced), so a wrong formula cannot make both sides agree.

@@ -54,6 +54,7 @@ Missing binaries (an example not built) are reported as SKIP, not FAIL.
 """
 import argparse
 import collections
+from collections import Counter
 import json
 import math
 import os
@@ -69,6 +70,7 @@ from pathlib import Path
 
 BIN = None
 RESULTS = []  # (name, status, detail)
+ONLY = []     # --only substrings (empty: the full suite)
 
 
 def run(args, timeout=180, feed=None):
@@ -898,6 +900,7 @@ def check_callorig():
 # observations); None = any value. Everything else must be identical on every backend.
 PORTABILITY_DOCUMENTED = {
     "win32.pid-is-target": {"breakpoint": "0", "hw": "0", "inline": "1"},
+    # inline callbacks run concurrently on the 5 hitting threads: any of 1..5 (checked below)
     "conc.max-inflight": {"breakpoint": "1", "hw": "1", "inline": None},
     "conc.thread-local-on-main": {"breakpoint": "210", "hw": "210", "inline": "10"},
     "call_func.callee-handles-fault": {"breakpoint": "0 r=7", "hw": "0 r=7", "inline": "1 r=0"},
@@ -915,6 +918,82 @@ PORTABILITY_REQUIRED = {
           "target.fault_r", "target.fault_mark"],
     "C": ["adds.throw", "throw.before", "target.throw_r", "target.throw_mark"],
 }
+
+
+def portability_expect(phase, x86):
+    """ABSOLUTE expected values (independent of every backend): what the target and the
+    callback source make each API call return. The cross-backend diff only proves the
+    backends agree; this proves they agree on the right answer."""
+    e = {}
+    if phase == "A":
+        e.update({"adds.entry": "1", "adds.regs": "1", "adds.other": "1",
+                  "args": "1 11 22 33 44 55", "arg.huge-index": "0", "arg.null-ctx": "0",
+                  "config": "1 aligned8=1", "config.null-ctx": "0", "reg.null-ctx": "0 set=0", "mem.null-ctx": "0 set=0",
+                  "mem.get.addr0": "0", "mem.get.rw": "1 content=1", "mem.get.ro": "1 content=1",
+                  "mem.get.reserved": "0", "mem.get.wrap": "0", "mem.get.huge": "0", "mem.get.huge2": "0",
+                  "mem.get.high": "0 untouched=1", "mem.get.null-buf": "0",
+                  "mem.get.code-mid-site": "9090909090909090",          # PmRegHit: 16 NOPs under this backend's probe
+                  "mem.get.code-other-backend": "9090909090909090",     # PmOther: 16 NOPs under the other backend's
+                  "mem.set.rw": "1", "mem.set.high": "0", "mem.set.null-buf": "0",
+                  "target.w_rw": "a5a5a5a5", "target.head_intact": "1",
+                  "call_func.plain": "1 pid=1", "call_func.upper": "1 pid=1", "call_func.path": "1 pid=1",
+                  "call_func.off-hex": "1 pid=1", "call_func.no-ext": "0 pid=0", "call_func.off-no-0x": "0 pid=0",
+                  "call_func.off-bad": "0 pid=0", "call_func.no-module": "0 pid=0", "call_func.no-export": "0 pid=0",
+                  "call_func.empty-export": "0 pid=0", "call_func.empty-module": "0 pid=0",
+                  "call_func.nargs9": "0", "call_func.nargs-neg": "0", "call_func.null-symbol": "0",
+                  "call_func.empty-symbol": "0", "call_func.address": "1 r=42", "call_func.module-rva": "1 r=42",
+                  "call_func.negative-arg": "1 r=-15", "call_func.bad-address": "0",
+                  "session": "1", "session.null-ctx": "0", "add.ok": "1", "add.no-export": "0", "add.no-type": "0",
+                  "add.null-callback": "0", "add.static-callback": "0", "add.config-308": "1", "add.long-symbol": "1",
+                  "add.null-session": "0", "add-address.zero": "0", "watch.on-breakpoint": "0",
+                  "log.null-format-follows": "1", "log.bad-format": "k",
+                  "reg.get.invalid": "0 0", "reg.set.invalid": "0 0", "call_original.mid": "0 r=1234",
+                  "target.cf": "1", "target.entry_r": "165", "target.other_r": "16"})
+        # "M log.long=" + 1499 x: a 1024-byte record (1023 chars) with the truncation marker.
+        mark = "...[truncated]"
+        text = ("M log.long=" + "x" * 1499)[:1023 - len(mark)] + mark
+        v = text[len("M log.long="):]
+        e["log.long"] = f"len={len(v)} end={v[-16:]}"
+        # PmRegSite's constants (conf_sp_x64.asm / conf_sp_x86.asm), probe_register order.
+        x64_regs = [0xA0A0A0A0A0A0A000, 0xB1B1B1B1B1B1B101, 0xC2C2C2C2C2C2C202, 0xD3D3D3D3D3D3D303,
+                    0x5454545454545404, 0x6565656565656505, 0x7676767676767606, None,
+                    0x8888888888888808, 0x9999999999999909, 0xAAAAAAAAAAAAAA0A, 0xBBBBBBBBBBBBBB0B,
+                    0xCCCCCCCCCCCCCC0C, 0xDDDDDDDDDDDDDD0D, 0xEEEEEEEEEEEEEE0E, 0xFFFFFFFFFFFFFF0F]
+        out = []
+        for r in range(16):
+            if r == 7:
+                out.append("0")
+                continue
+            if x86:
+                got = (x64_regs[r] & 0xFFFFFFFF) if r < 7 else 0
+                newv = 0x5E00 + r if r < 7 else None
+            else:
+                got, newv = x64_regs[r], 0x5E5E000000005E00 + r
+            e[f"reg.get.{r}"] = f"{got:x}"
+            e[f"reg.set.{r}"] = f"1 now={newv:x}" if newv is not None else "0 now=0"
+            out.append(f"{newv:x}" if newv is not None else "0")
+        e["target.out"] = ",".join(out)
+        if not x86:
+            e["reg.get.sp-aligned"] = "1"
+        e["reg.arg0"] = "0" if x86 else f"{x64_regs[2]:x}"
+        e["return_from.mid-ax"] = "5e00" if x86 else "5e5e000000005e00"
+    elif phase == "B":
+        # The faulting callback's register change is discarded, its set_mem writes stay: the
+        # argument (x64 RDX, x86 a stack slot written with set_mem) is 5 -> 10 on x64, 100 -> 200 on x86.
+        e.update({"adds.fault": "1", "adds.conc": "1", "adds.report": "1", "adds.bigcfg": "1",
+                  "fault.before": "1", "conc.total": "210", "report.config": "1", "config.big": "1",
+                  "target.fault_r": "200" if x86 else "10", "target.fault_mark": "fa017fa0"})
+    else:
+        e.update({"adds.throw": "1", "throw.before": "1",
+                  "target.throw_r": "200" if x86 else "10", "target.throw_mark": "7e40e7e4"})
+    return e
+
+
+# Pairs whose values must AGREE with each other (the API's answer == what the target saw).
+PORTABILITY_CONSISTENT = [
+    ("mem.set.ro", "target.ro_intact"),            # a write that succeeded must have changed the page
+    ("mem.set.partial", "target.partial_intact"),   # a refused partial write must leave every byte
+]
 
 
 def matrix_values(o, phase):
@@ -968,24 +1047,40 @@ def check_portability():
     d, t = exe("conformance_driver.exe"), exe("conformance_target.exe")
     if not d or not t:
         return skip("portability", "conformance_driver/target missing")
+    x86 = pe_is_x86(t)
     docs_seen = {}
     for phase in ("A", "B", "C"):
         name = f"portability-matrix-{phase}"
         try:
-            per = {}
+            per, rcs = {}, {}
             for bk in ("breakpoint", "hw", "inline"):
-                _, o = run([d, "--backend", bk, "--matrix", phase, "--", t, "--matrix"], timeout=120)
+                r, o = run([d, "--backend", bk, "--matrix", phase, "--", t, "--matrix"], timeout=120)
                 vals, doc = matrix_values(o, phase)
                 per[bk] = vals
+                rcs[bk] = (r.returncode, report(o).get("app_exit"))
                 docs_seen.setdefault(bk, {}).update(doc)
             keys = sorted(set().union(*[set(v) for v in per.values()]))
             diffs = [k for k in keys if len({per[bk].get(k) for bk in per}) > 1]
             missing = [k for k in PORTABILITY_REQUIRED[phase] for bk in per if k not in per[bk]]
             errors = [bk for bk in per if per[bk].get("report.error") != "None" or per[bk].get("report.log_dropped") != "0"]
+            # Every controller and target must have exited 0 (three identically broken runs
+            # would otherwise agree with each other).
+            rc_bad = {bk: v for bk, v in rcs.items() if v != (0, 0)}
+            exp = portability_expect(phase, x86)
+            wrong = [f"{k}[{bk}]={per[bk].get(k)!r} want {v!r}" for k, v in exp.items() for bk in per
+                     if per[bk].get(k) != v]
+            for a, b in PORTABILITY_CONSISTENT:
+                for bk in per:
+                    if a in per[bk] and per[bk].get(a) == per[bk].get(b):   # set ok=1 <-> intact=0
+                        wrong.append(f"{a}={per[bk].get(a)} but {b}={per[bk].get(b)} [{bk}]")
+            gone = [f"{k}[{bk}]" for k in ("fault.after", "throw.after") for bk in per if k in per[bk]]
             for k in diffs:
                 print(f"    {name} DIFF {k}: " + " | ".join(f"{bk}={per[bk].get(k)}" for bk in per), flush=True)
-            record(name, not diffs and not missing and not errors,
-                   f"keys={len(keys)} diffs={diffs[:6]} missing={sorted(set(missing))[:4]} report_errors={errors}")
+            for w in wrong:
+                print(f"    {name} WRONG {w}", flush=True)
+            record(name, not diffs and not missing and not errors and not rc_bad and not wrong and not gone,
+                   f"keys={len(keys)} absolute={len(exp)} diffs={diffs[:6]} wrong={wrong[:4]} "
+                   f"missing={sorted(set(missing))[:4]} report_errors={errors} rc(ctl,app)={rc_bad} after_fault={gone}")
         except Exception as e:
             record(name, False, repr(e))
     bad = []
@@ -994,6 +1089,15 @@ def check_portability():
             got = docs_seen.get(bk, {}).get(k)
             if got is None or (v is not None and got != v):
                 bad.append(f"{k}[{bk}]={got!r}")
+    # inline's max-inflight: concurrent callbacks on the 5 hitting threads, 1..5.
+    mi = docs_seen.get("inline", {}).get("conc.max-inflight")
+    if mi is None or not mi.isdigit() or not 1 <= int(mi) <= 5:
+        bad.append(f"conc.max-inflight[inline]={mi!r} (want 1..5)")
+    # The mid-function stack snapshot: frame 0 is in PmRegSite (the hit is at its PmRegHit label).
+    for bk in ("breakpoint", "hw", "inline"):
+        st = docs_seen.get(bk, {}).get("stack.mid")
+        if not st or not st.split(" < ")[0].lower().startswith("conformance_target!pmreg"):
+            bad.append(f"stack.mid[{bk}]={st!r}")
     for bk, doc in docs_seen.items():
         print(f"    portability-documented {bk}: " + " ".join(f"{k}={v!r}" for k, v in sorted(doc.items())), flush=True)
     record("portability-documented", not bad, f"unexpected={bad[:6]}")
@@ -2413,9 +2517,18 @@ def check_newapp_reg(threads=4, iters=20):
             # Every name must be complete: rooted at \REGISTRY\ (a relative open resolved
             # through its root handle), never "?".
             bad += [f"partial name {k}" for _, k, st, _ in opens if rel(k) and not k.upper().startswith("\\REGISTRY\\")][:2]
-            seen_keys = Counter((rel(k), int(h, 16)) for _, k, st, h in opens if rel(k) and int(st, 16) == 0)
+            # Exact multiset over the keys the program reports opening (its per-thread keys):
+            # every open logged once with the handle the program got -- no missing, no duplicate,
+            # no extra. (The root key's intermediate creates are not in the truth: filtered by name.)
+            truth_names = {k for k, _ in truth_keys}
+            seen_keys = Counter((rel(k), int(h, 16)) for _, k, st, h in opens
+                                if rel(k) in truth_names and int(st, 16) == 0)
             if truth_keys - seen_keys:
                 bad.append(f"keys missing={list((truth_keys - seen_keys).items())[:2]}")
+            if seen_keys - truth_keys:
+                bad.append(f"keys extra/duplicate={list((seen_keys - truth_keys).items())[:2]}")
+            if sum(truth_keys.values()) != 2 * threads:      # create + read-only reopen per thread
+                bad.append(f"truth keys={sum(truth_keys.values())} want {2 * threads}")
             missing_opens = [k for _, k, st, _ in opens if rel(k) and rel(k).endswith("\\missing") and int(st, 16) == 0xC0000034]
             if len(missing_opens) != threads:
                 bad.append(f"missing-key opens={len(missing_opens)}")
@@ -4521,13 +4634,25 @@ def check_latedll(reps=10):
                     tg = next((x for x in o if x.get("kind") == "latedll"), {})
                     drv = next((x for x in o if x.get("kind") == "latedll_driver"), {})
                     rep_ = report(o)
-                    calls, want = tg.get("calls") or [], tg.get("want") or []
+                    calls = tg.get("calls") or []
                     nsites = 2 if bk == "hw" else LD_NSITES
-                    exp = {k: want[k] for k in range(nsites)} if len(want) == LD_NSITES else {}
+                    # The oracle, computed HERE (not the target's own "want"): main/worker call
+                    # every site LD_CALLS times; dllmain = DllMain + main (2x every site), + the
+                    # DllMain thread (site 0 and HvSite once more), HvSite = DllMain + thread + main.
+                    if scen == "dllmain":
+                        exp = {k: 2 * LD_CALLS for k in range(nsites)}
+                        exp[0] = 3 * LD_CALLS
+                        exp[LD_HV_ID] = 3 * LD_CALLS
+                    else:
+                        exp = {k: LD_CALLS for k in range(nsites)}
                     got_calls = {k: calls[k] for k in range(nsites)} if len(calls) == LD_NSITES else {}
                     if scen == "dllmain":
-                        exp[LD_HV_ID] = tg.get("want_hv")
                         got_calls[LD_HV_ID] = tg.get("hv")
+                    # The unprobed sites' bodies ran the same counts too (hw probes only 0 and 1).
+                    for k in range(nsites, LD_NSITES):
+                        want_k = (2 * LD_CALLS) if scen == "dllmain" else LD_CALLS
+                        if len(calls) != LD_NSITES or calls[k] != want_k:
+                            got_calls[k] = calls[k] if len(calls) == LD_NSITES else None
                     hits = {}
                     for p in probes(o):
                         loc = str(p.get("location", ""))
@@ -4776,12 +4901,28 @@ def bigapps_js_expected():
     return r
 
 
+def bigapps_ps_expected_hash(files=48):
+    """workload.ps1's file set hashed HERE (hashlib): file i is 4096 + 97i bytes, byte k =
+    (31i + 7k) % 251 (BigAppsWork.Fill); SHA-256 over all of them in order, formatted like
+    .NET's BitConverter.ToString."""
+    import hashlib
+    h = hashlib.sha256()
+    for i in range(files):
+        h.update(bytes((i * 31 + k * 7) % 251 for k in range(4096 + i * 97)))
+    return "-".join(f"{b:02X}" for b in h.digest())
+
+
+def bigapps_async_n(hold_secs):
+    """page.html's async request count: one per 100 ms over the first half of the hold."""
+    return max(10, int(hold_secs * 10 / 2))
+
+
 def bigapps_server(slow_secs):
     """Local HTTP server for page.html. /slow is a parser-blocking script streamed over
     slow_secs (holds Edge's load event, so the browser stays busy until then; it ends by
     writing SLOW=done into the page); /data?i=N answers 'dataN'."""
     import http.server
-    page = (BIGAPPS_DIR / "page.html").read_bytes()
+    page = (BIGAPPS_DIR / "page.html").read_bytes().replace(b"__ASYNC_N__", str(bigapps_async_n(slow_secs)).encode())
     seen = threading.Event()
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -4834,8 +4975,20 @@ def bigapps_powershell(bk, mode, secs, ps):
     """powershell.exe running examples/bigapps/workload.ps1 (self-checking: bad=0, exit 0)."""
     work = Path(tempfile.mkdtemp(prefix="uhh-bigapps-ps-", dir=Path.cwd()))
     wl = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", BIGAPPS_DIR / "workload.ps1",
-          "-Seconds", secs, "-Work", work]
+          "-Seconds", secs, "-Work", work, "-ExpectedHash", bigapps_ps_expected_hash()]
     done_re = re.compile(r"BIGAPPS_DONE iters=(\d+) bad=(\d+) jobs=(\d+) exc=(\d+)")
+
+    def workload_bad(m):
+        """The workload's own result: bad 0, at least one background job, and exactly 6
+        caught exceptions per iteration (5 throws + 1 FormatException) -- in every mode."""
+        if not m:
+            return ["workload=None (no BIGAPPS_DONE)"]
+        it, bd, jobs, exc = (int(x) for x in m.groups())
+        out = []
+        if bd != 0 or it == 0: out.append(f"workload iters={it} bad={bd}")
+        if jobs == 0: out.append("workload jobs=0")
+        if exc != 6 * it: out.append(f"workload exc={exc} want {6 * it}")
+        return out
     target = None
     try:
         if mode == "launch":
@@ -4844,7 +4997,7 @@ def bigapps_powershell(bk, mode, secs, ps):
                                             [s.rsplit(":", 1)[0] for s in BIGAPPS_PS_PROBES], True)
             m = done_re.search(r.stdout)
             rep = report(objs)
-            if not m or m.group(2) != "0" or int(m.group(3)) == 0: bad.append(f"workload={m.group(0) if m else None}")
+            bad += workload_bad(m)
             if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
             return not bad, f"{detail} {m.group(0) if m else 'no DONE'} exit={rep.get('app_exit')}", bad, r.stderr
         target = subprocess.Popen([str(ps), *[str(x) for x in wl]], stdout=subprocess.PIPE,
@@ -4862,7 +5015,7 @@ def bigapps_powershell(bk, mode, secs, ps):
         ok, detail, bad = bigapps_judge(objs, r.stdout, r.stderr, bk, BIGAPPS_PS_PROBES,
                                         [s.rsplit(":", 1)[0] for s in BIGAPPS_PS_PROBES], mode == "exit")
         m = done_re.search(text)
-        if not m or m.group(2) != "0": bad.append(f"workload={m.group(0) if m else None}")
+        bad += workload_bad(m)
         if target.returncode != 0 or r.returncode != 0: bad.append(f"target_rc={target.returncode} tracer_rc={r.returncode}")
         if mode == "detach":
             if '"kind":"detached"' not in r.stdout: bad.append("not detached")
@@ -4881,7 +5034,9 @@ def bigapps_edge(bk, mode, secs):
     """Headless Edge (multi-process, JIT) dumping a local page while /slow keeps it loading.
     The browser process is the one launched/attached; its children run uninstrumented."""
     udd = Path(tempfile.mkdtemp(prefix="uhh-bigapps-edge-", dir=Path.cwd()))
-    srv, seen = bigapps_server(secs if mode != "launch" else max(5, secs // 2))
+    hold = secs if mode != "launch" else max(5, secs // 2)
+    srv, seen = bigapps_server(hold)
+    async_marker = f"ASYNC ok={bigapps_async_n(hold)} fail=0 sent={bigapps_async_n(hold)}<"
     url = f"http://127.0.0.1:{srv.server_address[1]}/"
     argv = [EDGE_EXE, "--headless", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
             "--disable-extensions", "--disable-component-update", "--disable-background-networking",
@@ -4899,6 +5054,8 @@ def bigapps_edge(bk, mode, secs):
             if marker not in r.stdout: bad.append("JS result missing/wrong in the dumped DOM")
             if "FETCHED=40" not in r.stdout: bad.append("fetches incomplete")
             if "SLOW=done" not in r.stdout: bad.append("slow script incomplete")
+            if async_marker not in r.stdout:
+                bad.append(f"async fetches: want {async_marker[:-1]!r}, got {re.findall(r'ASYNC ok=[^<]*', r.stdout)[:1]}")
             if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
             return not bad, f"{detail} exit={rep.get('app_exit')}", bad, r.stderr
         browser = subprocess.Popen([str(a) for a in argv], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -4917,7 +5074,8 @@ def bigapps_edge(bk, mode, secs):
         if marker not in dom: bad.append("JS result missing/wrong in the dumped DOM")
         if "FETCHED=40" not in dom: bad.append("fetches incomplete")
         if "SLOW=done" not in dom: bad.append("slow script incomplete")
-        if "ASYNC=0<" in dom: bad.append("no async fetch completed")
+        if async_marker not in dom:
+            bad.append(f"async fetches: want {async_marker[:-1]!r}, got {re.findall(r'ASYNC ok=[^<]*', dom)[:1]}")
         if browser.returncode != 0 or r.returncode != 0: bad.append(f"browser_rc={browser.returncode} tracer_rc={r.returncode}")
         if mode == "detach" and '"kind":"detached"' not in r.stdout: bad.append("not detached")
         return not bad, f"{detail} rc={browser.returncode}", bad, r.stderr
@@ -4953,7 +5111,8 @@ def check_bigapps(secs=40, select="all"):
                 if app_name == "edge" and arch == "x86":
                     skip(name, "msedge.exe is a 64-bit program (x64 build only)"); continue
                 if not (ps if app_name == "ps" else EDGE_EXE).exists():
-                    skip(name, f"{'powershell' if app_name == 'ps' else 'msedge'} not installed"); continue
+                    # --bigapps is opt-in: a requested app that is absent is a FAILURE, never a skip.
+                    record(name, False, f"{'powershell' if app_name == 'ps' else 'msedge'} missing (not installed)"); continue
                 t0 = time.time()
                 try:
                     ok, detail, bad, err = (bigapps_powershell(bk, mode, secs, ps) if app_name == "ps"
@@ -5196,7 +5355,13 @@ def check_realapps():
         if only and scen not in only:
             continue
         if not Path(argv[0]).exists():
-            skip(f"realapps-{scen}", f"{argv[0]} not on this system")
+            # Explicitly requested (--only realapps..., UHH_REALAPPS_ONLY): a FAILURE. In the
+            # full suite a program this Windows no longer ships (e.g. wmic) is a SKIP.
+            explicit = scen in only or any(o in n for o in ONLY for n in (f"realapps-{scen}", "check_realapps", "check-realapps"))
+            if explicit:
+                record(f"realapps-{scen}", False, f"{argv[0]} missing on this system (explicitly selected)")
+            else:
+                skip(f"realapps-{scen}", f"{argv[0]} not on this system")
             continue
         base = None
         bks = env_bks or ["breakpoint", "hw", "inline"]
@@ -5285,13 +5450,16 @@ def _realapps_one(name, drv, argv, kind, cols, bk, base, stem, x86, after=None):
               f"pids={len(pids)} unverified={sorted(unverified)[:4]} dropped={rep.get('log_dropped')} "
               f"intr={rep.get('callbacks_interrupted')}")
     if kind in ("csv", "lines"):
-        stable = {r for r in set(_realapps_rows(base[0][1], kind, cols)) & set(_realapps_rows(base[1][1], kind, cols))
-                  if _row_alive(r, cols, alive_pids, alive_names)}
-        mine = set(_realapps_rows(prog_out, kind, cols))
-        missing = sorted(stable - mine)
+        # Multisets, not sets: identical rows (e.g. several processes with the same image path)
+        # must all still be there -- losing one of two equal rows is lost output.
+        stable = Counter({r: n for r, n in (Counter(_realapps_rows(base[0][1], kind, cols)) &
+                                            Counter(_realapps_rows(base[1][1], kind, cols))).items()
+                          if _row_alive(r, cols, alive_pids, alive_names)})
+        mine = Counter(_realapps_rows(prog_out, kind, cols))
+        missing = sorted((stable - mine).elements())
         # A 32-bit Get-Process -FileVersionInfo lists only the few 32-bit processes: >= 1 row.
-        ok = ok and not missing and prc == plain_rc and len(stable) >= 1
-        detail += f" stable_rows={len(stable)} missing={len(missing)} exit={prc}/{base[0][0]}"
+        ok = ok and not missing and prc == plain_rc and sum(stable.values()) >= 1
+        detail += f" stable_rows={sum(stable.values())} missing={len(missing)} exit={prc}/{base[0][0]}"
         if missing:
             m0 = missing[0]
             key = ",".join(m0.split(",")[:2])
@@ -5445,6 +5613,9 @@ def check_ctrl_review():
             # restart of the same execution from a new hit; documented) -- reported, not failed
             if res.get("tf") != 0 and bk != "breakpoint": bad.append(f"tf_in_handler={res.get('tf')}")
             if res.get("stray") != 0: bad.append(f"stray_single_steps={res.get('stray')}")
+            # The program's own result: even loads read a freshly committed (zero) page, odd
+            # ones the guard page holding 7 -> N/2 * 7. A probe that changed the load fails it.
+            if res.get("sum") != (N // 2) * 7: bad.append(f"target_sum={res.get('sum')} want {(N // 2) * 7}")
             record(name, not bad, " ".join(bad) or
                    f"hits={hits} av={res.get('av')} guard={res.get('guard')} tf_in_handler={res.get('tf')}")
         except Exception as e:
@@ -5458,17 +5629,22 @@ def check_ctrl_review():
         r, o, res, logs, rows = go("inplace", "breakpoint", ["--threads", T, "--n", n], timeout=300)
         bad = common(r, o)
         logs = [x for x in famous_objs(r, o) if x.get("kind") == "probe_log"]
+        # Oracle computed here: thread t (1..T) calls CtrlLoop((t << 20) | i) for i < n, and
+        # the callback logs "tag=<hex>" -- every call exactly once.
+        want = Counter(f"tag={(t << 20) | i:x}" for t in range(1, T + 1) for i in range(n))
+        got = Counter(str(x.get("message", "")) for x in logs)
+        dups = sum((got - want).values())
+        missed = sum((want - got).values())
         hits = sum(x.get("hits", 0) for x in rows)
-        tags = collections.Counter(str(x.get("message", "")) for x in logs)
-        dups = sum(c - 1 for c in tags.values() if c > 1)
-        calls = T * n
-        if hits != calls: bad.append(f"hits={hits}")
-        if len(logs) != calls: bad.append(f"logs={len(logs)}")
-        if len(tags) != calls: bad.append(f"distinct={len(tags)}")
-        if dups: bad.append(f"duplicate_callbacks={dups}")
-        if res.get("bad") != 0: bad.append(f"target_bad={res.get('bad')}")
+        if dups: bad.append(f"duplicate_or_foreign_callbacks={dups}")
+        if missed: bad.append(f"missed_calls={missed} (ROADMAP round 3 #2)")
+        if hits != T * n: bad.append(f"hits={hits} want {T * n}")
+        if len(logs) != T * n: bad.append(f"logs={len(logs)} want {T * n}")
+        if (res.get("bad") != 0 or res.get("calls") != T * n or res.get("started") != T or res.get("finished") != T
+                or res.get("wait_ok") != 1):
+            bad.append(f"target={ {k: res.get(k) for k in ('calls', 'bad', 'started', 'finished', 'wait_ok')} }")
         record("ctrl-inplace", not bad, (" ".join(bad) + " " if bad else "") +
-               f"calls={calls} hits={hits} logs={len(logs)} distinct={len(tags)}")
+               f"calls={T * n} hits={hits} logs={len(logs)} distinct={len(set(got) & set(want))}")
     except Exception as e:
         record("ctrl-inplace", False, repr(e))
 
@@ -5487,6 +5663,12 @@ def check_ctrl_review():
             if len(absrows) != 2 * C or any(h != n for h in hits):
                 bad.append(f"abs_rows={len(absrows)} hits={hits}")
             if any(x.get("active") for x in absrows): bad.append("abs probe still active after unload")
+            # Each load starts CtrlDllCounter at 0 and work(1) returns the running count:
+            # sum = C * n(n+1)/2 exactly, with the probe and the watchpoint on it.
+            if res.get("sum") != C * n * (n + 1) // 2 or res.get("cycles") != C or len(res.get("bases") or []) != C:
+                bad.append(f"target sum={res.get('sum')} want {C * n * (n + 1) // 2} cycles={res.get('cycles')}")
+            ok_logs = [x for x in logs if str(x.get("message", "")).startswith("ok")]
+            if len(ok_logs) != C: bad.append(f"announce_logs={len(ok_logs)} want {C}")
             record(name, not bad, " ".join(bad) or f"{len(absrows)} absolute probes x {n} hits, all retired")
         except Exception as e:
             record(name, False, repr(e))
@@ -5501,6 +5683,11 @@ def check_ctrl_review():
             if len(logs) != C * n: bad.append(f"logs={len(logs)} want {C * n}")
             unres = [x for x in logs if not any("ctrl_dll" in str(f).lower() for f in (x.get("stack") or [])[:1])]
             if unres: bad.append(f"frames_not_in_ctrl_dll={len(unres)} e.g. {(unres[0].get('stack') or [])[:2]}")
+            # CtrlDllRecurse(12) returns CtrlDllLeaf(0) = 0 through every level: sum 0.
+            if res.get("sum") != 0 or res.get("cycles") != C or res.get("n") != n:
+                bad.append(f"target sum={res.get('sum')} want 0 cycles={res.get('cycles')} n={res.get('n')}")
+            leafs = sum(x.get("hits", 0) for x in rows)
+            if leafs != C * n: bad.append(f"hits={leafs} want {C * n}")
             record(name, not bad, " ".join(bad) or f"{len(logs)} stack logs, frame 0 in ctrl_dll for all")
         except Exception as e:
             record(name, False, repr(e))
@@ -5674,7 +5861,7 @@ def logs_expected_formats():
         "k11 \"quoted\" back\\slash /",
         "",
         cut("k13 " + "x" * 1100),
-        None,                                                # k14 %ls: checked for consistency only
+        "k14 w\u00e9",                                       # %ls of L"w\u00e9": the same two characters
         "k15 abc|5   |+2.50|0xff|%",
     ]
 
@@ -5791,32 +5978,52 @@ def check_logs_wedge(threads=4, count=3000):
 def check_logs_controller_killed(threads=4, count=20000):
     """The CONTROLLER dies while attached (inline hooks stay in the target, nobody drains the
     ring): the target must run to completion -- its log calls notice the controller is gone
-    and return (counted as dropped: the one case where dropping is allowed) instead of
-    waiting forever on a full ring."""
+    and return instead of waiting forever on a full ring -- and every call stays ACCOUNTED for
+    in the shared ring (read by the target itself, the only survivor): hits == records put in
+    the ring + log_dropped, nothing consumed after the death, nothing in flight, and the
+    records the full ring could not take are counted as dropped (the one case where dropping
+    is allowed). Order: attach -> target maps the ring -> controller killed -> calls."""
     t, tr = exe("logs_target.exe"), exe("uhh_trace.exe")
     if not t or not tr:
         return skip("logs-controller-killed", "logs_target/uhh_trace missing")
     name = "logs-controller-killed"
     tg = trc = None
+    cap = 4096                                                # PROBE_AGENT_LOG_CAP (probe_agent_shared.hpp)
     try:
         tg = subprocess.Popen([str(t), "--mode", "gate", "--threads", str(threads), "--count", str(count)],
-                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        pid = json.loads(tg.stdout.readline())["pid"]
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        tout = Lines(tg.stdout)
+        first = tout.wait_for(lambda l: '"waiting"' in l, 60)
+        if not first:
+            raise RuntimeError("target never printed waiting")
+        pid = json.loads(first)["pid"]
         trc = subprocess.Popen([str(tr), "--backend", "inline", "--attach", str(pid), "-p", "logs_target.exe!LogSiteA:dd"],
                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         terr = Lines(trc.stderr)
         if not terr.wait_for(lambda l: l.startswith("probe: active "), 60):
             raise RuntimeError("probe never became active: " + " | ".join(terr.lines[-5:])[:400])
-        tg.stdin.write(b"\n"); tg.stdin.flush()
-        time.sleep(0.3)
+        tg.stdin.write("\n"); tg.stdin.flush()
+        mapped = tout.wait_for(lambda l: '"mapped"' in l, 30)
         trc.kill(); trc.wait(timeout=30)
+        tg.stdin.write("\n"); tg.stdin.flush()
         try:
-            out = tg.communicate(timeout=90)[0].decode(errors="replace")
-            a = next((json.loads(l) for l in out.splitlines() if '"kind":"app"' in l), {})
-            ok = tg.returncode == 0 and a.get("calls") == threads * count
-            record(name, ok, f"target finished rc={tg.returncode} calls={a.get('calls')}/{threads * count} in {a.get('ms')}ms")
+            tg.wait(timeout=90)
         except subprocess.TimeoutExpired:
-            record(name, False, "target HUNG after the controller was killed (90 s): its log calls wait forever")
+            return record(name, False, "target HUNG after the controller was killed (90 s): its log calls wait forever")
+        a = next((o for o in tout.objs() if o.get("kind") == "app"), {})
+        calls = threads * count
+        d = lambda k: (a.get(k + "1") or 0) - (a.get(k + "0") or 0)
+        bad = []
+        if tg.returncode != 0 or a.get("calls") != calls: bad.append(f"rc={tg.returncode} calls={a.get('calls')}/{calls}")
+        if not mapped or a.get("mapped") != 1: bad.append(f"ring not mapped ({mapped})")
+        if d("hits") != calls: bad.append(f"hits={d('hits')} want {calls}")
+        if d("head") + d("dropped") != calls: bad.append(f"ring={d('head')} + dropped={d('dropped')} != calls {calls}")
+        if d("tail") != 0: bad.append(f"consumed after the controller died: {d('tail')}")
+        if a.get("inflight1") != 0: bad.append(f"in_flight={a.get('inflight1')}")
+        if (a.get("head1") or 0) - (a.get("tail1") or 0) > cap: bad.append("ring holds more than its capacity")
+        if d("dropped") < calls - cap: bad.append(f"dropped={d('dropped')} < {calls - cap}: the full ring's overflow is unaccounted")
+        record(name, not bad, " ".join(bad) or
+               f"target finished in {a.get('ms')}ms calls={calls} hits={d('hits')} ring={d('head')} dropped={d('dropped')}")
     except Exception as e:
         record(name, False, repr(e))
     finally:
@@ -5827,13 +6034,20 @@ def check_logs_controller_killed(threads=4, count=20000):
 
 def check_logs_stdout_closed(threads=4):
     """The reader of the controller's stdout goes away (`| head`): live output ends, but the
-    session's JSONL file -- the complete record -- must still receive EVERY log."""
+    session's JSONL file -- the complete record -- must still receive EVERY log, exactly:
+    every line strict UTF-8 JSON, each of the T threads' records "o 0", "o 2", ... in order
+    with no gap or duplicate, the controller exits 0, and the final accounting (written by
+    logs_driver --report to a file, a side channel that survives the closed stdout) says
+    hits == logs_written == T * count, nothing dropped or interrupted, no error."""
     if not exe("logs_driver.exe") or not exe("logs_target.exe"):
         return skip("logs-stdout-closed", "logs_driver/logs_target missing")
     for bk, count in (("inline", 5000), ("hw", 500)):
         name = f"logs-stdout-closed-{bk}"
+        rep_path = Path(tempfile.gettempdir()) / f"uhh-logs-report-{os.getpid()}-{bk}.jsonl"
         try:
-            p = subprocess.Popen([str(exe("logs_driver.exe")), "--a", bk, "--b", "none", "--", str(exe("logs_target.exe")),
+            rep_path.unlink(missing_ok=True)
+            p = subprocess.Popen([str(exe("logs_driver.exe")), "--a", bk, "--b", "none", "--report", str(rep_path),
+                                  "--", str(exe("logs_target.exe")),
                                   "--mode", "order", "--threads", str(threads), "--count", str(count)],
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             for _ in range(5):
@@ -5842,21 +6056,60 @@ def check_logs_stdout_closed(threads=4):
             err = p.stderr.read().decode(errors="replace")
             p.wait(timeout=300)
             m = re.search(r"probe: logs -> (.*)", err)
-            n = 0
-            if m:
+            bad, by, nlogs = [], {}, 0
+            if not m:
+                bad.append("no log file announced")
+            else:
                 path = Path(m.group(1).strip())
                 with open(path, "rb") as f:
-                    n = sum(1 for ln in f if b'"kind":"probe_log"' in ln)
+                    for ln in f:
+                        ln = ln.strip()
+                        if not ln:
+                            continue
+                        try:
+                            o = json.loads(ln.decode("utf-8"))
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            bad.append(f"bad line {ln[:60]!r}")
+                            continue
+                        if o.get("kind") != "probe_log":
+                            continue
+                        nlogs += 1
+                        mm = re.fullmatch(r"o (\d+)", str(o.get("message", "")))
+                        if not mm:
+                            bad.append(f"foreign log {str(o.get('message'))[:60]!r}")
+                            continue
+                        by.setdefault(o.get("tid"), []).append(int(mm.group(1)))
                 try:
                     path.unlink()
                 except OSError:
                     pass
-            want_n = threads * count                          # LogSiteA only: probe B is not set
-            ok = n == want_n
-            record(name, ok, f"file_logs={n}/{want_n} rc={p.returncode}" +
-                             ("" if ok else " stderr=" + " | ".join(err.strip().splitlines()[-3:])[:300]))
+            want_seq = [2 * i for i in range(count)]          # LogSiteA only: probe B is not set
+            wrong_threads = [tid for tid, seq in by.items() if seq != want_seq]
+            if len(by) != threads or wrong_threads:
+                bad.append(f"threads={len(by)}/{threads} wrong_sequence_threads={len(wrong_threads)}")
+            rep = {}
+            try:
+                rep = next((json.loads(l) for l in rep_path.read_text().splitlines()
+                            if '"kind":"probe_report"' in l), {})
+            except OSError as e:
+                bad.append(f"no report file ({e})")
+            want_n = threads * count
+            if (rep.get("hits") != want_n or rep.get("logs_written") != want_n or rep.get("log_dropped") != 0 or
+                    rep.get("callbacks_interrupted") != 0 or rep.get("error") is not None or rep.get("app_exit") != 0):
+                bad.append(f"report={ {k: rep.get(k) for k in ('hits', 'logs_written', 'log_dropped', 'callbacks_interrupted', 'app_exit', 'error')} }")
+            if p.returncode != 0: bad.append(f"rc={p.returncode}")
+            if nlogs != want_n: bad.append(f"file_logs={nlogs}/{want_n}")
+            record(name, not bad, f"file_logs={nlogs}/{want_n} threads={len(by)} rc={p.returncode}" +
+                   ("" if not bad else f" bad={bad[:4]} stderr=" + " | ".join(err.strip().splitlines()[-3:])[:300]))
         except Exception as e:
             record(name, False, repr(e))
+        finally:
+            try:
+                rep_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def check_agent_review():
     """Inline-agent static review (examples/agent_review), one reproduction per finding:
     agent-unwind: a C++ throw / SEH raise / AV from a callee whose CALL instruction is inline-
@@ -6003,6 +6256,7 @@ def main():
     args = ap.parse_args()
     BIN = args.bin.resolve()
     only = [x for x in args.only.split(",") if x]
+    ONLY[:] = only
     feed_keystrokes()
 
     import os as _os

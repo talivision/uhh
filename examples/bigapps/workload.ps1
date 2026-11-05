@@ -6,11 +6,14 @@
 #   - enumerates the directory, compiles a new script block (JIT), throws and catches .NET
 #     exceptions, runs a JIT-compiled C# loop checked against its closed form,
 #   - every ~8 s starts a background job (a child powershell.exe) and checks its result.
-# Every result is compared with the value computed before the loop: any corruption shows as
+# Every hash is compared with -ExpectedHash, the SHA-256 the suite computes itself (Python
+# hashlib over the same deterministic file contents: an oracle independent of this process
+# and of the instrumentation); the hash computed here before the loop must equal it too.
+# Without -ExpectedHash (manual runs) the pre-loop hash is the reference. Any corruption shows as
 # bad>0. Prints BIGAPPS_READY once, BIGAPPS_TICK about every second (liveness: the check
 # asserts ticks continue after a detach) and BIGAPPS_DONE at the end; exit code 0 iff bad==0.
 param([int]$Seconds = 45, [int]$Files = 48, [int]$Threads = 4, [string]$Work = $env:TEMP,
-      [int]$PauseMs = 100)
+      [int]$PauseMs = 100, [string]$ExpectedHash = '')
 $ErrorActionPreference = 'Stop'
 function say([string]$s) { [Console]::Out.WriteLine($s); [Console]::Out.Flush() }
 
@@ -47,11 +50,16 @@ New-Item -ItemType Directory -Force $dir | Out-Null
 $paths = [string[]]@(for ($i = 0; $i -lt $Files; $i++) {
     $p = Join-Path $dir ("f$i.bin"); [BigAppsWork]::Fill($p, $i); $p })
 $expected = [BigAppsWork]::HashAll($paths)
+$bad = 0
+if ($ExpectedHash) {       # (PowerShell names are case-insensitive: not $Expected)
+    if ($expected -ne $ExpectedHash) { $bad++; say "BIGAPPS_BAD manifest got=$expected want=$ExpectedHash" }
+    $expected = $ExpectedHash
+}
 
 $pool = [RunspaceFactory]::CreateRunspacePool(1, $Threads)
 $pool.Open()
 $task = { param($p) [BigAppsWork]::HashAll($p) }
-$iter = 0; $bad = 0; $jobs = 0; $exc = 0; $tick = 0
+$iter = 0; $jobs = 0; $exc = 0; $tick = 0
 $clock = [Diagnostics.Stopwatch]::StartNew()
 $nextJob = 2000
 say "BIGAPPS_READY pid=$PID threads=$Threads files=$Files"
