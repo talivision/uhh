@@ -955,13 +955,13 @@ Checks that now fail are left failing (library code is not changed here):
   the absolute oracle does: `portability-matrix-A` FAIL, x64 and x86, all three
   backends: `call_func.no-ext=1 pid=1`, want `0 pid=0`. Decide which is right and make the
   header and the code agree (then update `portability_expect`).
-- ⬜ (TH2) **A closed stdout makes the session fail**: `logs-stdout-closed-{inline,hw}` -- every
+- ✅ (TH2, resolved: a closed live stdout is a warning -- `"live_output_closed":true` in `probe_report` plus a stderr note; `error` and the exit code reflect real failures only; the file stays complete) **A closed stdout makes the session fail**: `logs-stdout-closed-{inline,hw}` -- every
   log IS in the JSONL file (20000/20000, 2000/2000, per-thread order exact; the report written
   to a side file says hits == logs_written, dropped 0), but `probe_report.error` = "tail probe
   logs to stdout (Win32=109/232)" (broken pipe / no process at the other end) and the
   controller exits 1 (`probe_wait_for_exit` fails). A reader going away (`| head`) is normal
   use; the complete file means the session did its job. x64 and x86, same errors.
-- ⬜ (TH3) **x86 `get_reg` returns a value no 32-bit register can hold**: after
+- ✅ (TH3, resolved: x86 `set_reg` stores `(uint32_t)v` on every backend -- controller and agent -- so `get_reg` returns what the program sees; `return_from` already split EDX:EAX) **x86 `get_reg` returns a value no 32-bit register can hold**: after
   `set_reg(c, r, 0x1_0000_5E0r)` (matrix_callbacks.cpp `pm_on_regs`, deliberately wider than
   the register) `get_reg(c, r)` = `0x100005e0r` for EAX..EBP on breakpoint, hw AND inline
   (`portability-matrix-A` x86: `reg.set.0..6`, `return_from.mid-ax` = `100005e00`), while the

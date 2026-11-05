@@ -73,8 +73,10 @@ return addresses at the hit; the writer resolves them to `module!function+0xoff`
 `file:line` with PDBs), so symbol work never runs in the hit path. `probe_report` catches
 the tail up, then emits only pre-hook/probe/summary records; its summary includes
 `logs_written`, `log_dropped`, `callbacks_interrupted` (inline callbacks cut off mid-run because
-the target process died -- their hits are counted, their logs never existed), and
-`controller_peak_ws_mb`. See
+the target process died -- their hits are counted, their logs never existed),
+`controller_peak_ws_mb`, and `live_output_closed` (stdout's reader went away, e.g. `| head`:
+the live tail stopped with a stderr warning, the session file still has every log; not an
+error). See
 [`examples/dynwatch`](examples/dynwatch).
 
 ## Backends

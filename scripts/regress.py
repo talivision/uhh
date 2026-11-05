@@ -6038,7 +6038,9 @@ def check_logs_stdout_closed(threads=4):
     every line strict UTF-8 JSON, each of the T threads' records "o 0", "o 2", ... in order
     with no gap or duplicate, the controller exits 0, and the final accounting (written by
     logs_driver --report to a file, a side channel that survives the closed stdout) says
-    hits == logs_written == T * count, nothing dropped or interrupted, no error."""
+    hits == logs_written == T * count, nothing dropped or interrupted, no error. A reader
+    going away is not a session error (TH2): the report says "live_output_closed":true and
+    stderr carries the warning, never a "probe: error:" line."""
     if not exe("logs_driver.exe") or not exe("logs_target.exe"):
         return skip("logs-stdout-closed", "logs_driver/logs_target missing")
     for bk, count in (("inline", 5000), ("hw", 500)):
@@ -6098,6 +6100,10 @@ def check_logs_stdout_closed(threads=4):
                     rep.get("callbacks_interrupted") != 0 or rep.get("error") is not None or rep.get("app_exit") != 0):
                 bad.append(f"report={ {k: rep.get(k) for k in ('hits', 'logs_written', 'log_dropped', 'callbacks_interrupted', 'app_exit', 'error')} }")
             if p.returncode != 0: bad.append(f"rc={p.returncode}")
+            if rep.get("live_output_closed") is not True:
+                bad.append(f"live_output_closed={rep.get('live_output_closed')!r} want True")
+            if "probe: warning: live output closed" not in err: bad.append("no live-output-closed warning on stderr")
+            if "probe: error:" in err: bad.append("a probe: error: line on stderr")
             if nlogs != want_n: bad.append(f"file_logs={nlogs}/{want_n}")
             record(name, not bad, f"file_logs={nlogs}/{want_n} threads={len(by)} rc={p.returncode}" +
                    ("" if not bad else f" bad={bad[:4]} stderr=" + " | ".join(err.strip().splitlines()[-3:])[:300]))

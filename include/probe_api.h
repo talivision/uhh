@@ -92,7 +92,9 @@ enum probe_flags {
 };
 
 /* Every ID is the full native register: RAX..R15 on x64, EAX..EBP/ESP on x86
-   (R8..R15 read 0 and cannot be set on x86). PROBE_REG_AX is the return value. */
+   (R8..R15 read 0 and cannot be set on x86). PROBE_REG_AX is the return value. On x86
+   set_reg keeps the low 32 bits of the value -- what the register holds -- and a later
+   get_reg returns exactly that. */
 enum probe_register {
     PROBE_REG_AX,
     PROBE_REG_BX,
@@ -162,7 +164,10 @@ int probe_attach_new(probe_session *, const char *image_name, uint32_t timeout_m
    logs and writes its report. A second press gets the default handling. */
 int probe_run(probe_session *);
 /* Waits until all probe_log records are in the session JSONL file and its live stdout
-   tail (unless stdout is NUL) has reached the same byte offset. */
+   tail (unless stdout is NUL) has reached the same byte offset. A stdout whose reader went
+   away (a closed pipe: `| head`) is not a failure: the live tail stops with a warning on
+   stderr, every record still reaches the file, and probe_report says
+   "live_output_closed":true; `error` and the return value reflect real failures only. */
 int probe_wait_for_exit(probe_session *);
 /* Catches the stdout tail up first, then writes only prehook/probe/probe_report records
    to out. File-backed logs are never replayed, including on repeated calls. */
