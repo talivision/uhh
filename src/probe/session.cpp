@@ -130,6 +130,7 @@ struct probe_session {
     void *remote_path = nullptr;
     uint64_t remote_agent = 0;
     DWORD remote_tid = 0;
+    std::string remote_fault;   // first fault raised on the agent's load/init thread (diagnostic)
     enum RemoteWork { REMOTE_NONE, REMOTE_LOAD_AGENT, REMOTE_INIT_AGENT } remote_work = REMOTE_NONE;
     std::wstring agent_path;
     // One out-of-line step buffer per thread (lazily allocated in the target), so
@@ -3097,6 +3098,27 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             disposition = DBG_CONTINUE; return true;
         }
     }
+    if (event.dwThreadId == s->remote_tid && s->remote_tid && event.u.Exception.dwFirstChance &&
+        code != EXCEPTION_BREAKPOINT && code != EXCEPTION_SINGLE_STEP && code != PROBE_IPC_CODE &&
+        s->remote_fault.empty()) {
+        // The agent's load/init thread faulted. If the target's own unhandled-exception
+        // filter swallows it, all we would see is the thread's exit code: keep where it was.
+        std::string where; uint64_t best = 0;
+        for (const auto &m : s->module_bases)
+            if (m.second <= address && m.second > best) { best = m.second; where = m.first; }
+        char buf[192];
+        if (best) std::snprintf(buf, sizeof(buf), "exception 0x%08lx at %s+0x%llx", (unsigned long)code,
+                                where.c_str(), (unsigned long long)(address - best));
+        else std::snprintf(buf, sizeof(buf), "exception 0x%08lx at 0x%llx", (unsigned long)code, (unsigned long long)address);
+        s->remote_fault = buf;
+        if (code == EXCEPTION_ACCESS_VIOLATION && ex.NumberParameters >= 2) {
+            std::snprintf(buf, sizeof(buf), " (%s 0x%llx)",
+                          ex.ExceptionInformation[0] == 8 ? "execute" : ex.ExceptionInformation[0] ? "write" : "read",
+                          (unsigned long long)ex.ExceptionInformation[1]);
+            s->remote_fault += buf;
+        }
+        std::fprintf(stderr, "probe: agent thread %s\n", s->remote_fault.c_str());
+    }
     if (trace_enabled() && code == EXCEPTION_ACCESS_VIOLATION && ex.NumberParameters >= 2) {
         unsigned char around[24] = {0}; size_t got = 0;
         remote_read(s->pi.hProcess, address - 8, around, sizeof(around), &got);
@@ -3303,6 +3325,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
 
 static bool start_remote(probe_session *s, LPTHREAD_START_ROUTINE entry,
                          void *argument, probe_session::RemoteWork work) {
+    s->remote_fault.clear();
     s->remote_thread = CreateRemoteThread(s->pi.hProcess, nullptr, 0, entry, argument, 0, &s->remote_tid);
     if (!s->remote_thread) { set_error(s, win_error("create agent thread")); return false; }
     if (trace_enabled()) std::fprintf(stderr, "  remote work=%d tid=%lu\n", (int)work, (unsigned long)s->remote_tid);
@@ -3420,11 +3443,19 @@ static bool complete_remote_thread(probe_session *s, DWORD result) {
         if (s->remote_path) {
             VirtualFreeEx(s->pi.hProcess, s->remote_path, 0, MEM_RELEASE); s->remote_path = nullptr;
         }
-        if (result == 0 || !s->remote_agent) { set_error(s, "LoadLibraryW failed for probe_api_agent.dll"); return false; }
+        if (result == 0 || !s->remote_agent) {
+            set_error(s, "LoadLibraryW failed for probe_api_agent.dll" + (s->remote_fault.empty() ? std::string() : ": " + s->remote_fault));
+            return false;
+        }
         return start_agent_init(s);
     }
     if (work == probe_session::REMOTE_INIT_AGENT) {
-        if (result != 0) { set_error(s, "probe_agent_init failed (code=" + std::to_string(result) + ")"); return false; }
+        if (result != 0) {
+            char code[16]; std::snprintf(code, sizeof(code), "0x%lx", (unsigned long)result);
+            set_error(s, std::string("probe_agent_init failed (code=") + code + ")" +
+                         (s->remote_fault.empty() ? std::string() : ": " + s->remote_fault));
+            return false;
+        }
         if (!accept_agent_install(s)) return false;
         // Requests registered while that round ran (runtime inline adds) go next.
         if (agent_has_pending(s)) return kick_agent(s);
