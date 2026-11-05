@@ -4984,6 +4984,16 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
     int slot = -1;
     for (int k = 0; k < 4 && slot < 0; ++k)
         if (!(s->dr_used & (1u << k)) && !((saved.Dr7 >> (k * 2)) & 3)) slot = k;
+    // All four in use, but the hit is a hardware EXECUTE probe: borrow its own slot on THIS
+    // thread only (re-pointed at the return address for the call, put back after). Other
+    // threads keep the probe; this thread is inside the original meanwhile, so only a
+    // recursive entry of the same function on it goes uncounted. (gated_config with every
+    // probe on hw: flag + NtOpenProcess + NtClose + NtReadVirtualMemory = 4 DRs.)
+    bool borrowed = false;
+    if (slot < 0 && (probe->flags & PROBE_HW) && !(probe->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) &&
+        probe->dr_slot >= 0 && probe->dr_slot < 4) {
+        slot = probe->dr_slot; borrowed = true;
+    }
     if (slot < 0) {
         CloseHandle(thread);
         co_warn(s->co_warned_dr, probe, "call_original refused: needs one free debug register (all 4 in use)");
@@ -5009,13 +5019,19 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
     s->co_entry_pending = !(probe->flags & PROBE_HW); s->co_left = false;
     auto clear_slot = [&](bool running) {
         if (running && SuspendThread(thread) == (DWORD)-1) return;
-        set_dr_on_thread(thread, slot, 0, false);
+        if (borrowed) {                                                // the probe's own DR, back at its site
+            uint32_t rw = 0, len = 0; hw_rw_len(probe->flags, rw, len);
+            set_dr_on_thread(thread, slot, probe->address, probe->active, rw, len);
+        } else {
+            set_dr_on_thread(thread, slot, 0, false);
+        }
         if (running) ResumeThread(thread);
     };
     if (!ContinueDebugEvent(st->pid, st->tid, DBG_CONTINUE)) {
         saved.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS;
         SetThreadContext(thread, &saved);
-        s->dr_used &= (uint8_t)~(1u << slot); s->in_call_tid = 0; s->co_addr = 0;
+        if (!borrowed) s->dr_used &= (uint8_t)~(1u << slot);
+        s->in_call_tid = 0; s->co_addr = 0;
         CloseHandle(thread); return 0;
     }
     bool done = false, thread_gone = false;
@@ -5078,7 +5094,13 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
     if (done) {
         CONTEXT cur{}; cur.ContextFlags = CONTEXT_DEBUG_REGISTERS;
         if (GetThreadContext(thread, &cur)) {          // keep any DR armed meanwhile, drop ours
-            cur.Dr7 = (decltype(cur.Dr7))(cur.Dr7 & ~(((DWORD64)3 << (slot * 2)) | ((DWORD64)0xF << (16 + slot * 4))));
+            const DWORD64 mask = ((DWORD64)3 << (slot * 2)) | ((DWORD64)0xF << (16 + slot * 4));
+            const auto keep = slot == 0 ? saved.Dr0 : slot == 1 ? saved.Dr1 : slot == 2 ? saved.Dr2 : saved.Dr3;
+            cur.Dr7 = (decltype(cur.Dr7))(cur.Dr7 & ~mask);
+            if (borrowed) {                            // the probe's own DR: as it was at the hit
+                cur.Dr7 = (decltype(cur.Dr7))(cur.Dr7 | (saved.Dr7 & mask));
+                (slot == 0 ? cur.Dr0 : slot == 1 ? cur.Dr1 : slot == 2 ? cur.Dr2 : cur.Dr3) = keep;
+            }
             saved.Dr0 = cur.Dr0; saved.Dr1 = cur.Dr1; saved.Dr2 = cur.Dr2; saved.Dr3 = cur.Dr3; saved.Dr7 = cur.Dr7;
         }
         saved.Dr6 = 0;
@@ -5087,7 +5109,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
     } else if (!s->exited && !thread_gone) {
         clear_slot(true);
     }
-    s->dr_used &= (uint8_t)~(1u << slot);
+    if (!borrowed) s->dr_used &= (uint8_t)~(1u << slot);
     resume_deferred_hits(s);                           // they hit their probes again now
     CloseHandle(thread);
     if (done) {
