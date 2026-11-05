@@ -1077,9 +1077,22 @@ static void restore_byte(uint64_t at, unsigned char original) {
         FlushInstructionCache(GetCurrentProcess(), (void *)p, 1);
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
+// Addresses our slots held when the cleanup cleared them: a #DB already raised for one of them
+// (its thread was stopped at that event when the controller died) is delivered AFTER the clear,
+// when neither DR7 nor the address says it was ours any more.
+static volatile LONG64 g_cleared[64];
+static volatile LONG g_cleared_n;
+static void remember_cleared(uint64_t a) {
+    if (!a) return;
+    LONG n = g_cleared_n;
+    for (LONG i = 0; i < n && i < 64; ++i) if ((uint64_t)g_cleared[i] == a) return;
+    LONG i = InterlockedIncrement(&g_cleared_n) - 1;
+    if (i < 64) g_cleared[i] = (LONG64)a;
+}
 static void clear_dr_slots(CONTEXT &c, DWORD mask) {
     for (int slot = 0; slot < 4; ++slot) {
         if (!(mask & (1u << slot))) continue;
+        remember_cleared(slot == 0 ? (uint64_t)c.Dr0 : slot == 1 ? (uint64_t)c.Dr1 : slot == 2 ? (uint64_t)c.Dr2 : (uint64_t)c.Dr3);
         c.Dr7 &= ~((decltype(c.Dr7))3 << (slot * 2)) & ~((decltype(c.Dr7))0xF << (16 + slot * 4));
         switch (slot) { case 0: c.Dr0 = 0; break; case 1: c.Dr1 = 0; break; case 2: c.Dr2 = 0; break; default: c.Dr3 = 0; }
     }
@@ -1120,6 +1133,8 @@ static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
         const uint64_t a[4] = {(uint64_t)dr.Dr0, (uint64_t)dr.Dr1, (uint64_t)dr.Dr2, (uint64_t)dr.Dr3};
         for (int slot = 0; slot < 4 && !ours; ++slot)
             ours = (mask & (1u << slot)) && ((dr.Dr7 >> (slot * 2)) & 3) && (a[slot] == ip || a[slot] == at);
+        LONG n = g_cleared_n; if (n > 64) n = 64;
+        for (LONG i = 0; i < n && !ours; ++i) ours = (uint64_t)g_cleared[i] == ip || (uint64_t)g_cleared[i] == at;
     }
     if (!ours) {
         const uint64_t ip = get_ip(cx);
@@ -1213,6 +1228,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
         AddVectoredExceptionHandler(1, guard_veh);
     }
     InterlockedExchange(&g_orphan_cleaned, 0);   // a new session: guard it afresh
+    InterlockedExchange(&g_cleared_n, 0);
     if (g_guard_wake) SetEvent(g_guard_wake);    // the service thread takes the new controller handle
     InterlockedExchange(&g_stopping, 0);   // a new session after a detach: callbacks run again
     for (auto &cb : callbacks) cb = nullptr;  // a new session may map slots to other callbacks
