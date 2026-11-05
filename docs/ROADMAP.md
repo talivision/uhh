@@ -474,14 +474,16 @@ by itself, nothing dropped), detach while callbacks run / block in call_original
   x64: every lifecycle-* check PASSED on the final code in some run, `--only interrupt` 3/3,
   `--only gated` 17/17, `--only attach` 11/11 (attach-new-inline failed once "probe never became
   active", then passed 3 runs in a row -- looks like a load flake, not re-investigated).
-- 🔧 OPEN (L11) x64 `lifecycle-controller-killed-breakpoint` intermittent (1 of 4 kill timings fails
+- 🔧 (L11, likely fixed) x64 `lifecycle-controller-killed-breakpoint` was intermittent (1 of 4 kill timings fails
   in ~1 of 3 runs): the target still dies after the controller is killed, 0x80000004 at
   lifecycle_target+0x194d (a return address -- call_original's in-place run / its return-catch
   DR) or once 0x80000003. Mitigations added in order (each reduced it): call_original's DR slot
   mirrored into the guard before the thread runs; addresses the cleanup cleared remembered for
   #DBs already in flight; a single-step on a thread with no DR of its own taken as ours once the
   debug port is gone; our INT3/DR traps acted on even before the kernel clears the debug port
-  (last commit -- run s64g was in flight at hand-over, UNVERIFIED). Next step if it persists: log
+  (last change: with it, x64 controller-killed-{breakpoint x4, hw, inline, mixed} + reattach/
+  interrupt-{breakpoint,inline} all PASSED; the x86 suite was not re-run on this last guard change,
+  and 4 clean runs do not prove the race gone -- keep watching). Next step if it recurs: log
   (OutputDebugString-free: a shared counter) which VEH branch rejects the trap, and check whether
   the dying debugger leaves TF set on a thread in the middle of the in-place call_original.
 - Test infra notes: `UHH_LC=substr[,substr]` narrows lifecycle checks; lifecycle_driver links the
