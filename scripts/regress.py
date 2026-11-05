@@ -5887,6 +5887,77 @@ def check_agent_review():
         record("agent-own-threads", False, repr(e))
 
 
+def check_callfunc_registry():
+    """Inline call_func's recursion guard (a probe its callee hits is counted, no callback).
+    callfunc-kill-reuse: a thread is killed (TerminateThread) while its callback is inside
+    call_func; short threads then run until one gets the dead thread's id. Every hit of every
+    later thread -- the reused id included -- runs its callback and logs; the killed hit is
+    accounted as interrupted: hits == logs + interrupted, nothing dropped. (The guard used to
+    be a thread-id table that a killed thread never left: the reused id's callbacks were
+    skipped silently, and its stale record was settled, losing the interrupted count.)
+    callfunc-many: 100 threads inside call_func at once, the callee hitting another probe:
+    no callback re-enters (that table had 64 entries), every call returns its value, exact
+    hits and logs."""
+    d, t = exe("ar_driver.exe"), exe("ar_target.exe")
+    if not d or not t:
+        return skip("callfunc-registry", "ar_driver/ar_target missing")
+
+    def go(case, specs, timeout=180):
+        args = [d]
+        for sp in specs:
+            args += ["--probe", sp]
+        return run(args + ["--", t, case], timeout=timeout)
+
+    def logs(o):
+        cnt = {}
+        for x in o:
+            m = str(x.get("message", ""))
+            if x.get("kind") == "probe_log" and m.startswith(("ar ", "uhh warning")):
+                cnt[m] = cnt.get(m, 0) + 1
+        return cnt
+
+    def hits_of(o, sym):
+        return next((p.get("hits") for p in probes(o) if sym in str(p.get("location", ""))), None)
+
+    def row(o):
+        return next((x for x in o if x.get("kind") == "ar"), {})
+
+    try:
+        r, o = go("cfkill", ["ar_target.exe!ar_cf_site=ar_on_cf"])
+        rw, rep, lg, bad = row(o), report(o), logs(o), []
+        hits, calls = hits_of(o, "ar_cf_site"), rw.get("calls", -1)
+        intr, logged = rep.get("callbacks_interrupted"), lg.get("ar cf", 0)
+        if rw.get("killed") != 1: bad.append(f"victim not killed inside call_func: {rw}")
+        if not rw.get("reused"): bad.append(f"no thread reused the dead id in {rw.get('threads')} threads")
+        if hits != calls + 1: bad.append(f"hits={hits} want={calls + 1}")
+        if logged != calls: bad.append(f"logged={logged} want={calls} (callbacks skipped)")
+        if set(lg) - {"ar cf"}: bad.append(f"logs={lg}")
+        if intr != 1: bad.append(f"interrupted={intr} want=1")
+        if hits is None or intr is None or hits != logged + intr: bad.append(f"hits != logs + interrupted")
+        if rep.get("log_dropped") != 0: bad.append(f"dropped={rep.get('log_dropped')}")
+        if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
+        record("callfunc-kill-reuse", not bad, "; ".join(bad) or
+               f"threads={rw.get('threads')} reused={rw.get('reused')} hits={hits} logs={logged} interrupted={intr}")
+    except Exception as e:
+        record("callfunc-kill-reuse", False, repr(e))
+
+    try:
+        n = 100
+        r, o = go("cfmany", ["ar_target.exe!ar_cf_site=ar_on_cf", "ar_target.exe!ar_cf_inner=ar_on_cf_inner"])
+        rw, rep, lg, bad = row(o), report(o), logs(o), []
+        hs, hi = hits_of(o, "ar_cf_site"), hits_of(o, "ar_cf_inner")
+        if rw.get("sum") != sum(range(1000, 1000 + n)): bad.append(f"row={rw}")
+        if rw.get("together") != n: bad.append(f"only {rw.get('together')}/{n} threads were inside call_func together")
+        if hs != n or hi != n: bad.append(f"hits site={hs} inner={hi} want={n}")
+        if lg != {"ar cf-many ok=1 good=1": n}: bad.append(f"logs={lg}")
+        if rep.get("log_dropped") != 0: bad.append(f"dropped={rep.get('log_dropped')}")
+        if rep.get("callbacks_interrupted", 0) != 0: bad.append(f"intr={rep.get('callbacks_interrupted')}")
+        if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
+        record("callfunc-many", not bad, "; ".join(bad) or f"row={rw} hits={hs}/{hi} logs={lg}")
+    except Exception as e:
+        record("callfunc-many", False, repr(e))
+
+
 def main():
     global BIN
     ap = argparse.ArgumentParser()
@@ -5967,6 +6038,7 @@ def main():
     if want(check_callorig_hunt): check_callorig_hunt()
     if want(check_callconv): check_callconv()
     if want(check_agent_review): check_agent_review()
+    if want(check_callfunc_registry): check_callfunc_registry()
     if want(check_transparency): check_transparency()
     if want(check_interrupt): check_interrupt()
     if want(check_agent_crt): check_agent_crt()

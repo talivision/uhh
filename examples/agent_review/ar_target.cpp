@@ -14,6 +14,9 @@
 //   ljframe0    x64 longjmp WITHOUT unwinding (jmp_buf.Frame = 0) out of a call_original
 //   prot        VirtualProtect calls while NtProtectVirtualMemory is probed (the agent's own
 //               hook writes call it too -- those must not run the program's callback)
+//   cfkill      a thread killed (TerminateThread) while its callback is inside call_func, then
+//               short threads until one gets the dead thread's id; each hits the probe
+//   cfmany      100 threads inside call_func at once, the callee hitting another probe
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <setjmp.h>
@@ -122,6 +125,30 @@ static intptr_t jump_call(intptr_t x, int *jumped) {
     return ar_jump(&env, x);
 }
 
+// ---- cfkill / cfmany: inline call_func's recursion guard (regress `callfunc-*`) ----------
+AR_EXPORT intptr_t ar_cf_site(intptr_t x) { return x + (intptr_t)g_zero; }    // probed: ar_on_cf
+static HANDLE g_cf_in;                                  // set once the victim is inside call_func
+AR_EXPORT intptr_t ar_cf_block() { SetEvent(g_cf_in); Sleep(INFINITE); return 0; }
+AR_EXPORT intptr_t ar_cf_inner(intptr_t x) { return x * 3 + (intptr_t)g_zero; } // probed: ar_on_cf_inner
+static std::atomic<long> g_cf_arrived{0}, g_cf_together{0};
+static long g_cf_need;
+// call_func's callee: wait until every thread is inside call_func, then hit ar_cf_inner.
+AR_EXPORT intptr_t ar_cf_gate(intptr_t x) {
+    g_cf_arrived++;
+    for (int i = 0; i < 10000 && g_cf_arrived.load() < g_cf_need; ++i) Sleep(1);
+    if (g_cf_arrived.load() >= g_cf_need) g_cf_together++;
+    return ar_cf_inner(x);
+}
+struct CfReuse { DWORD victim; std::atomic<long> calls{0}, reused{0}; };
+static DWORD WINAPI cf_short(void *p) {
+    auto *r = (CfReuse *)p;
+    for (int i = 0; i < 2; ++i) { ar_cf_site(0); r->calls++; }
+    if (GetCurrentThreadId() == r->victim) r->reused++;
+    return 0;
+}
+static DWORD WINAPI cf_victim(void *) { ar_cf_site(1); return 0; }
+static DWORD WINAPI cf_many(void *p) { return (DWORD)ar_cf_site((intptr_t)p); }
+
 static int wait_gate() {
     printf("{\"kind\":\"waiting\",\"pid\":%lu}\n", GetCurrentProcessId()); fflush(stdout);
     char b; DWORD n = 0;
@@ -182,6 +209,36 @@ int main(int argc, char **argv) {
         }
         DWORD old = 0; VirtualProtect(page, sizeof(page), PAGE_READWRITE, &old);
         printf("{\"kind\":\"ar\",\"case\":\"prot\",\"ok\":%d}\n", ok);
+    } else if (!strcmp(k, "cfkill")) {
+        g_cf_in = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        DWORD vtid = 0;
+        HANDLE v = CreateThread(nullptr, 0, cf_victim, nullptr, 0, &vtid);
+        HANDLE w[2] = {g_cf_in, v};
+        int killed = 0;
+        if (WaitForMultipleObjects(2, w, FALSE, 10000) == WAIT_OBJECT_0 && TerminateThread(v, 0x1234)) {
+            WaitForSingleObject(v, INFINITE);
+            killed = 1;
+        }
+        CloseHandle(v);
+        CfReuse r; r.victim = vtid;
+        int threads = 0;
+        for (int after = 0; threads < 3000 && after < 20; ++threads) {
+            HANDLE t = CreateThread(nullptr, 0, cf_short, &r, 0, nullptr);
+            if (!t) break;
+            WaitForSingleObject(t, INFINITE); CloseHandle(t);
+            if (r.reused.load()) ++after;
+        }
+        printf("{\"kind\":\"ar\",\"case\":\"cfkill\",\"killed\":%d,\"reused\":%ld,\"threads\":%d,\"calls\":%ld}\n",
+               killed, r.reused.load(), threads, r.calls.load());
+    } else if (!strcmp(k, "cfmany")) {
+        const int n = 100;
+        g_cf_need = n;
+        std::vector<HANDLE> ts;
+        for (int i = 0; i < n; ++i) ts.push_back(CreateThread(nullptr, 0, cf_many, (void *)(intptr_t)(1000 + i), 0, nullptr));
+        long long sum = 0;
+        for (HANDLE t : ts) { WaitForSingleObject(t, INFINITE); DWORD e = 0; GetExitCodeThread(t, &e); sum += e; CloseHandle(t); }
+        printf("{\"kind\":\"ar\",\"case\":\"cfmany\",\"sum\":%lld,\"arrived\":%ld,\"together\":%ld}\n",
+               sum, g_cf_arrived.load(), g_cf_together.load());
     } else {
         fprintf(stderr, "ar_target: unknown case '%s'\n", k);
         return 2;
