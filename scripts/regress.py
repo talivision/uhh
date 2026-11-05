@@ -4233,6 +4233,383 @@ def check_bigapps(secs=40, select="all"):
                            ("" if ok else f" BAD={bad} stderr_tail={tail}"))
                 except Exception as e:
                     record(name, False, repr(e))
+# ---- realapps: the gated_config callbacks on real Windows programs ------------------------
+
+REALAPPS_PS_TRUTH = r'''
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @"
+using System; using System.Runtime.InteropServices;
+public static class UhhR {
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr OpenProcess(int a, bool i, int pid);
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool ReadProcessMemory(IntPtr h, IntPtr a, byte[] b, IntPtr n, out IntPtr r);
+  [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
+  [DllImport("kernel32.dll")] public static extern IntPtr GetCurrentProcess();
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool DuplicateHandle(IntPtr sp, IntPtr sh, IntPtr tp, out IntPtr th, int acc, bool inh, int opt);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr GetModuleHandleW(string n);
+  public static string Read(IntPtr h, IntPtr a) { byte[] b = new byte[2]; IntPtr n; return ReadProcessMemory(h, a, b, (IntPtr)2, out n) ? System.Text.Encoding.ASCII.GetString(b) : "ERR" + Marshal.GetLastWin32Error(); }
+  public static string Hex(IntPtr h) { return h.ToInt64().ToString("x"); }
+}
+"@
+[Console]::Out.WriteLine('PSREADY'); [Console]::Out.Flush(); [void][Console]::In.ReadLine()
+$k32 = [UhhR]::GetModuleHandleW('kernel32.dll'); $cur = [UhhR]::GetCurrentProcess()
+"T k32 addr=$([UhhR]::Hex($k32))"
+$helpers = 1..3 | % { $psi = New-Object Diagnostics.ProcessStartInfo 'ping.exe', '-n 300 127.0.0.1'
+  $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.CreateNoWindow = $true; [Diagnostics.Process]::Start($psi) }
+# A just-started helper has no kernel32 yet (a read is a partial copy, ERROR 299): wait
+# until its loader is done, without touching the k32 address the test reads.
+foreach ($p in $helpers) { for ($t = 0; $t -lt 200; $t++) { try { if ([Diagnostics.Process]::GetProcessById($p.Id).Modules.Count -gt 3) { break } } catch {}; Start-Sleep -Milliseconds 50 } }
+$i = 0
+foreach ($p in $helpers) {
+  $i++
+  # NtOpenProcess -> mapped: the read must say this helper's pid and ping.exe.
+  $h = [UhhR]::OpenProcess(0x10, $false, $p.Id); "O open$i $([UhhR]::Read($h, $k32))"; "T read handle=$([UhhR]::Hex($h)) pid=$($p.Id)"
+  [void][UhhR]::CloseHandle($h)
+  # The closed value is reissued to a handle that never went through NtOpenProcess (a
+  # duplicate of CreateProcess's handle): it must read as unmapped, not as the closed open.
+  $d = [IntPtr]::Zero; [void][UhhR]::DuplicateHandle($cur, $p.Handle, $cur, [ref]$d, 0, $false, 2)
+  "O dup$i $([UhhR]::Read($d, $k32))"; "T read handle=$([UhhR]::Hex($d)) pid=0 reuse=$($d -eq $h)"
+  [void][UhhR]::CloseHandle($d)
+  "O cph$i $([UhhR]::Read($p.Handle, $k32))"; "T read handle=$([UhhR]::Hex($p.Handle)) pid=0"
+  "O self$i $([UhhR]::Read($cur, $k32))"; "T read handle=$([UhhR]::Hex($cur)) pid=0"
+  # Reuse between two opens: open helper 1, close, open this helper (same value back).
+  $a = [UhhR]::OpenProcess(0x10, $false, $helpers[0].Id); [void][UhhR]::CloseHandle($a)
+  $b = [UhhR]::OpenProcess(0x10, $false, $p.Id)
+  "O reopen$i $([UhhR]::Read($b, $k32))"; "T read handle=$([UhhR]::Hex($b)) pid=$($p.Id) reuse=$($a -eq $b)"
+  [void][UhhR]::CloseHandle($b)
+  # .NET's own path: Process.Modules (OpenProcess + EnumProcessModules).
+  $q = [Diagnostics.Process]::GetProcessById($p.Id)
+  "O mods$i $($q.MainModule.ModuleName) $($q.Modules.Count -gt 3)"
+}
+$helpers | % { $_.Kill(); $_.WaitForExit() }
+"O done"
+'''
+
+# name, argv after the program dir is chosen, row filter. Rows: the program's output lines
+# that the test compares (see realapps_rows). "stable" rows are those identical in two
+# uninstrumented runs (before and after); each must appear unchanged under instrumentation.
+def _realapps_scenarios(sysdir):
+    ps = sysdir / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    psargs = [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"]
+    return [
+        ("tasklist-m", [sysdir / "tasklist.exe", "/m", "/fo", "csv", "/nh"], "csv", (None, 1)),
+        ("tasklist-v", [sysdir / "tasklist.exe", "/v", "/fo", "csv", "/nh"], "csv", ((0, 1, 2, 3, 6), 1)),
+        ("wmic", [sysdir / "wbem" / "WMIC.exe", "process", "get", "Name,ProcessId,ExecutablePath", "/format:csv"], "lines", (None, -1)),
+        ("cmd-tasklist", [sysdir / "cmd.exe", "/c", "tasklist /fo csv /nh"], "csv", ((0, 1, 2, 3), 1)),
+        ("ps-modules", psargs + ["Get-Process | sort Id | % { try { '{0},{1},{2}' -f $_.Id,$_.ProcessName,"
+                                 "(($_.Modules | % ModuleName) -join ';') } catch {} }"], "lines", (None, 0)),
+        ("ps-fileversion", psargs + ["Get-Process -FileVersionInfo -EA SilentlyContinue | % { $_.FileName } | sort"],
+         "lines", (None, "path")),
+        ("ps-truth", psargs + [REALAPPS_PS_TRUTH], "truth", None),
+        ("ps-truth-attach", psargs + [REALAPPS_PS_TRUTH], "truth-attach", None),
+    ]
+
+
+def _snapshot_processes():
+    """{pid: image name} via Toolhelp (independent of UHH and of the program under test)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class PE32(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    snap = k32.CreateToolhelp32Snapshot(2, 0)
+    out, e = {}, PE32()
+    e.dwSize = ctypes.sizeof(PE32)
+    ok = k32.Process32FirstW(snap, ctypes.byref(e))
+    while ok:
+        out[e.th32ProcessID] = e.szExeFile
+        ok = k32.Process32NextW(snap, ctypes.byref(e))
+    k32.CloseHandle(snap)
+    return out
+
+
+class _ProcPoller:
+    """Every (pid, name) that existed while a run was going on, polled every 20 ms."""
+    def __init__(self):
+        self.seen, self.stop = {}, threading.Event()
+        self._add(_snapshot_processes())
+        self.t = threading.Thread(target=self._loop, daemon=True)
+        self.t.start()
+
+    def _add(self, snap):
+        cur = {(pid, name.lower()) for pid, name in snap.items()}
+        self.always = cur if not hasattr(self, "always") else self.always & cur
+        for pid, name in snap.items():
+            self.seen.setdefault(pid, set()).add(name.lower())
+
+    def _loop(self):
+        while not self.stop.wait(0.02):
+            self._add(_snapshot_processes())
+
+    def finish(self):
+        self.stop.set(); self.t.join(timeout=10); self._add(_snapshot_processes())
+        return self.seen
+
+
+_JSON_LINE = re.compile(rb'\{"kind":"[a-z_]+"[^\n]*\n')
+
+
+def _split_stdout(raw):
+    """The driver and the program share one stdout file (the target inherits it): every UHH
+    record is one complete JSON line written in one go, so cutting those out leaves the
+    program's output byte-for-byte."""
+    objs = []
+    for m in _JSON_LINE.finditer(raw):
+        try:
+            objs.append(json.loads(m.group(0)))
+        except json.JSONDecodeError:
+            pass
+    return _JSON_LINE.sub(b"", raw), objs
+
+
+def _decode_out(raw):
+    """wmic writes UTF-16LE (with a BOM); the rest the OEM/ANSI code page."""
+    if raw.startswith(b"\xff\xfe") or raw[1:200:2].count(0) > 50:
+        return raw.decode("utf-16-le", "replace").lstrip("\ufeff")
+    return raw.decode("mbcs", "replace")
+
+
+def _realapps_rows(text, kind, cols):
+    rows = []
+    for line in _decode_out(text).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if kind == "csv" and cols and cols[0]:
+            import csv as _csv
+            f = next(_csv.reader([line]), [])
+            line = ",".join(f[c] for c in cols[0] if c < len(f))
+        rows.append(line)
+    return rows
+
+
+def _row_alive(row, cols, alive_pids, alive_names):
+    """Only rows about processes that existed for the WHOLE instrumented run can be compared
+    (other agents' build/test processes come and go): key = the row's pid (csv field) or,
+    for a bare image path, its file name."""
+    if not cols or cols[1] is None:
+        return True
+    if cols[1] == "path":
+        return row.rsplit("\\", 1)[-1].lower() in alive_names
+    f = row.split(",")
+    try:
+        return int(f[cols[1]].strip('"')) in alive_pids
+    except (ValueError, IndexError):
+        return False
+
+
+def _run_plain(argv, outp, timeout=900, stdin=None):
+    t0 = time.perf_counter()
+    with open(outp, "wb") as fo, open(str(outp) + ".err", "wb") as fe:
+        p = subprocess.run([str(a) for a in argv], stdout=fo, stderr=fe, stdin=stdin or subprocess.DEVNULL, timeout=timeout)
+    return p.returncode, Path(outp).read_bytes(), time.perf_counter() - t0
+
+
+_RX_OPEN = re.compile(r"open pid=(\d+) name=(\S+)$")
+_RX_MAP = re.compile(r"map handle=0x([0-9a-f]+) -> pid=(\d+) name=(\S+)$")
+_RX_READ = re.compile(r"read handle=0x([0-9a-f]+) pid=(\d+) name=(\S+) addr=0x([0-9a-f]+) size=(\d+)$")
+
+
+def _realapps_verify_logs(objs, seen):
+    """Every read's (pid, name) must be a process that existed (per Toolhelp); pid 0 must
+    say name=?; a mapped read's handle must have been mapped to that pid by an open line."""
+    msgs = [str(o.get("message", "")) for o in objs if o.get("kind") == "probe_log"]
+    maps, reads, opens, other, bad, unverified = {}, [], [], [], [], set()
+    for m in msgs:
+        if (g := _RX_READ.match(m)):
+            reads.append((int(g[1], 16), int(g[2]), g[3], int(g[4], 16), int(g[5])))
+        elif (g := _RX_MAP.match(m)):
+            maps.setdefault(int(g[1], 16), set()).add(int(g[2]))
+        elif (g := _RX_OPEN.match(m)):
+            opens.append(int(g[1]))
+        else:
+            other.append(m)
+    pids = set()
+    for h, pid, name, _, _ in reads:
+        if pid == 0:
+            if name != "?":
+                bad.append(f"pid0 name={name}")
+            continue
+        pids.add(pid)
+        if pid not in maps.get(h, ()):
+            bad.append(f"read h={h:#x} pid={pid} never mapped to it")
+        if pid not in seen:
+            unverified.add((pid, name))
+        elif name.lower() not in seen[pid]:
+            bad.append(f"pid {pid} logged {name}, really {sorted(seen[pid])}")
+    return msgs, reads, opens, other, bad, unverified, pids
+
+
+def check_realapps():
+    """Flagship use case on REAL programs: realapps_driver applies gated_config's callbacks
+    (track_open_process / forget_closed_handle / log_read) to tasklist, wmic, cmd and
+    powershell (Get-Process .Modules / -FileVersionInfo, and a .NET P/Invoke script with
+    known handles), launched and attached, on every backend. Program output must equal the
+    uninstrumented run (rows stable across two plain runs must be unchanged); every logged
+    read's pid/name must be a real process (Toolhelp poll); reads through handles that did
+    not come from NtOpenProcess must be unmapped; nothing dropped (read logs == read hits).
+    UHH_REALAPPS_ONLY / UHH_REALAPPS_BACKENDS (comma lists) narrow it."""
+    drv = exe("realapps_driver.exe")
+    if not drv:
+        return skip("realapps", "realapps_driver.exe missing")
+    data = Path(drv).read_bytes()
+    x86 = struct.unpack_from("<H", data, struct.unpack_from("<I", data, 0x3C)[0] + 4)[0] == 0x14C
+    sysdir = Path(r"C:\Windows\SysWOW64") if x86 else SYS32
+    only = [x for x in os.environ.get("UHH_REALAPPS_ONLY", "").split(",") if x]
+    env_bks = [x for x in os.environ.get("UHH_REALAPPS_BACKENDS", "").split(",") if x]
+    work = Path(tempfile.mkdtemp(prefix="uhh_realapps_"))
+    for scen, argv, kind, cols in _realapps_scenarios(sysdir):
+        if only and scen not in only:
+            continue
+        if not Path(argv[0]).exists():
+            skip(f"realapps-{scen}", f"{argv[0]} not on this system")
+            continue
+        base = None
+        bks = env_bks or ["breakpoint", "hw", "inline"]
+        if x86 and scen == "tasklist-m" and not env_bks:
+            bks = ["breakpoint"]   # 32-bit tasklist /m takes ~2 min even uninstrumented (and opens nothing)
+        for bk in bks:
+            name = f"realapps-{scen}-{bk}"
+            print(f"  .. {name}", file=sys.stderr, flush=True)
+            try:
+                # Plain (uninstrumented) runs right before and right after this one: a
+                # process list changes all the time, so only rows identical in both count.
+                if kind in ("csv", "lines") or (kind == "truth" and base is None):
+                    base = [_run_plain(argv, work / f"{scen}-{bk}-plain0.txt")]
+                _realapps_one(name, drv, argv, kind, cols, bk, base, work / f"{scen}-{bk}", x86,
+                              after=(lambda: _run_plain(argv, work / f"{scen}-{bk}-plain1.txt"))
+                              if kind in ("csv", "lines") else None)
+            except Exception as e:
+                record(name, False, repr(e))
+    if os.environ.get("UHH_REALAPPS_KEEP"):
+        print(f"  realapps work dir kept: {work}", file=sys.stderr)
+    else:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _realapps_one(name, drv, argv, kind, cols, bk, base, stem, x86, after=None):
+    t0 = time.perf_counter()
+    poll = _ProcPoller()
+    target = None
+    try:
+        if kind == "truth-attach":
+            target = subprocess.Popen([str(a) for a in argv], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, text=True)
+            tl = Lines(target.stdout)
+            if not tl.wait_for(lambda l: "PSREADY" in l, 120):
+                raise RuntimeError("powershell never got ready")
+            with open(str(stem) + ".out", "wb") as fo, open(str(stem) + ".err", "wb") as fe:
+                d = subprocess.Popen([str(drv), "--backend", bk, "--attach", str(target.pid)], stdout=fo, stderr=fe)
+                deadline = time.time() + 120
+                while time.time() < deadline:
+                    err = Path(str(stem) + ".err").read_bytes().decode("utf-8", "replace")
+                    if sum(1 for l in err.splitlines() if l.startswith("probe: active ntdll.dll!")) >= 3 or d.poll() is not None:
+                        break
+                    time.sleep(0.05)
+                target.stdin.write("\n"); target.stdin.flush(); target.stdin.close()
+                d.wait(timeout=600)
+            target.wait(timeout=60)
+            tl.t.join(timeout=30)
+            prog_out = ("\n".join(tl.lines) + "\n").encode()
+            drc = d.returncode
+            raw = Path(str(stem) + ".out").read_bytes()
+            _, objs = _split_stdout(raw)
+            prc = target.returncode
+            # Baseline for attach: the launched-plain truth run.
+            base_out = None
+        else:
+            with open(str(stem) + ".out", "wb") as fo, open(str(stem) + ".err", "wb") as fe:
+                d = subprocess.run([str(drv), "--backend", bk, "--"] + [str(a) for a in argv], stdout=fo, stderr=fe,
+                                   stdin=subprocess.DEVNULL, timeout=900)
+            drc = d.returncode
+            raw = Path(str(stem) + ".out").read_bytes()
+            prog_out, objs = _split_stdout(raw)
+            prc = report(objs).get("app_exit")
+    finally:
+        seen = poll.finish()
+        alive_pids = {p for p, _ in poll.always}
+        alive_names = {n for _, n in poll.always}
+        if target and target.poll() is None:
+            target.kill()
+    secs = time.perf_counter() - t0
+    if after:
+        base = base + [after()]
+    rep = report(objs)
+    pr = {p.get("location"): p for p in probes(objs)}
+    read_hits = pr.get(READ_LOCATION, {}).get("hits")
+    msgs, reads, opens, other, bad, unverified, pids = _realapps_verify_logs(objs, seen)
+    unmapped = sum(1 for r in reads if r[1] == 0)
+    errs = Path(str(stem) + ".err").read_bytes().decode("utf-8", "replace").splitlines()
+    warn = [l for l in errs if "refus" in l.lower() or "warning" in l.lower() or "error" in l.lower()]
+    # The driver exits 1 when the program does (probe_wait_for_exit): compare with the plain run.
+    plain_rc = base[0][0] if base else 0
+    ok = ((drc == 0 or (drc == 1 and prc == plain_rc != 0)) and rep.get("error") is None and rep.get("log_dropped") == 0 and rep.get("callbacks_interrupted") == 0
+          and read_hits == len(reads) and len(other) == 0 and not bad
+          and all(p.get("active") for p in pr.values()) and len(pr) == 3)
+    plain_s = f"(plain {base[0][2]:.1f}s) " if base else ""
+    detail = (f"{secs:.1f}s {plain_s}rc={drc} app_exit={prc} opens={len(opens)} reads={len(reads)}/{read_hits} unmapped={unmapped} "
+              f"pids={len(pids)} unverified={sorted(unverified)[:4]} dropped={rep.get('log_dropped')} "
+              f"intr={rep.get('callbacks_interrupted')}")
+    if kind in ("csv", "lines"):
+        stable = {r for r in set(_realapps_rows(base[0][1], kind, cols)) & set(_realapps_rows(base[1][1], kind, cols))
+                  if _row_alive(r, cols, alive_pids, alive_names)}
+        mine = set(_realapps_rows(prog_out, kind, cols))
+        missing = sorted(stable - mine)
+        # A 32-bit Get-Process -FileVersionInfo lists only the few 32-bit processes: >= 1 row.
+        ok = ok and not missing and prc == plain_rc and len(stable) >= 1
+        detail += f" stable_rows={len(stable)} missing={len(missing)} exit={prc}/{base[0][0]}"
+        if missing:
+            m0 = missing[0]
+            key = ",".join(m0.split(",")[:2])
+            if cols and isinstance(cols[1], int):
+                try:   # did the instrumented program even get a handle to that process?
+                    kp = int(m0.split(",")[cols[1]].strip('"'))
+                    detail += f" [pid {kp}: opened={kp in opens} reads={sum(1 for r in reads if r[1] == kp)}]"
+                except (ValueError, IndexError):
+                    pass
+            twin = next((r for r in mine if r.startswith(key)), None)
+            if twin:   # show only where the row differs
+                ma, tb = m0.split(";"), twin.split(";")
+                detail += f" e.g. {key}: only_plain={sorted(set(ma) - set(tb))[:5]} only_instr={sorted(set(tb) - set(ma))[:5]}"
+            else:
+                detail += f" e.g.={m0[:200]!r} (row absent)"
+    else:
+        lines = prog_out.decode("mbcs", "replace").splitlines()
+        o_lines = [l.strip() for l in lines if l.startswith("O ")]
+        t_lines = [l.strip() for l in lines if l.startswith("T ")]
+        want_o = ["O open%d MZ", "O dup%d MZ", "O cph%d MZ", "O self%d MZ", "O reopen%d MZ", "O mods%d ping.exe True"]
+        want = [w % i for i in (1, 2, 3) for w in want_o] + ["O done"]
+        o_lines = [l.lower() for l in o_lines]; want = [w.lower() for w in want]
+        if base:
+            plain_o = [l.strip().lower() for l in base[0][1].decode("mbcs", "replace").splitlines() if l.startswith("O ")]
+            want_ok = plain_o == want
+        else:
+            want_ok = True
+        k32 = next((int(l.split("addr=")[1], 16) for l in t_lines if l.startswith("T k32")), None)
+        mask = 0xFFFFFFFF if x86 else (1 << 64) - 1
+        exp = [(int(re.search(r"handle=([0-9a-f]+)", l)[1], 16) & mask, int(re.search(r"pid=(\d+)", l)[1]))
+               for l in t_lines if l.startswith("T read")]
+        reuse = [l for l in t_lines if "reuse=True" in l]
+        got = [(h, pid) for h, pid, n, a, sz in reads if a == k32 and sz == 2]
+        names = {n.lower() for h, pid, n, a, sz in reads if a == k32 and sz == 2 and pid}
+        ok = ok and o_lines == want and want_ok and got == exp and names <= {"ping.exe"} and prc == 0
+        detail += (f" out_ok={o_lines == want} plain_ok={want_ok} k32_reads={len(got)}/{len(exp)} match={got == exp} "
+                   f"reused_values={len(reuse)} names={sorted(names)}")
+        if got != exp:
+            detail += f" got={[(hex(h), p) for h, p in got][:6]} exp={[(hex(h), p) for h, p in exp][:6]}"
+        if o_lines != want:
+            detail += f" out={[x for x in o_lines if x not in want][:4]} n={len(o_lines)} err={errs[-3:]}"
+    if bad:
+        detail += f" bad={bad[:3]}"
+    if other:
+        detail += f" other_logs={other[:2]}"
+    if warn:
+        detail += f" stderr={warn[:2]}"
+    record(name, ok, detail[:1500])
 
 
 def main():
@@ -4340,6 +4717,7 @@ def main():
     if want(check_stacks): check_stacks()
     if args.bigapps:
         if want(check_bigapps): check_bigapps(args.bigapps_secs, args.bigapps)
+    if want(check_realapps): check_realapps()
     print("-" * 72)
     failed = 0
     for name, status, detail in RESULTS:

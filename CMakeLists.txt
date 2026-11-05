@@ -216,6 +216,14 @@ target_include_directories(uhh_attach PRIVATE examples/gated_config include)
 target_link_libraries(uhh_attach PRIVATE probe_api)
 add_dependencies(uhh_attach probe_app configparse probe_api_agent)
 
+# --- Example: realapps -- the gated_config callbacks on arbitrary real programs ------
+add_executable(realapps_driver
+    examples/realapps/realapps_driver.cpp
+    examples/gated_config/callbacks.cpp)
+target_include_directories(realapps_driver PRIVATE examples/gated_config include)
+target_link_libraries(realapps_driver PRIVATE probe_api)
+add_dependencies(realapps_driver probe_api_agent)
+
 # --- Example: breakage --------------------------------------------------------
 # One session per hostile case keeps an expected failed install/crash isolated.
 add_executable(breakage_driver examples/breakage/breakage_driver.cpp)
