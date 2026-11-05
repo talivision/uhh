@@ -3391,7 +3391,10 @@ def check_blog_pwsh_attach():
     if not ps.exists():
         return skip("blog-pwsh", f"{ps} missing")
     iters = 400
-    script = ("$n=0; [Console]::Out.WriteLine('PSREADY'); [Console]::Out.Flush(); [void][Console]::In.ReadLine(); "
+    # Warm-up first: the first Start-Sleep autoloads Microsoft.PowerShell.Utility (1-2 s on
+    # the VM), which would otherwise fill the whole attach window with no script activity.
+    script = ("$n=0; Start-Sleep -Milliseconds 1; [IO.File]::WriteAllText(\"$env:TEMP\\uhhblog_ps_$($PID)_w.txt\", 'w'); "
+              "[IO.File]::Delete(\"$env:TEMP\\uhhblog_ps_$($PID)_w.txt\"); [Console]::Out.WriteLine('PSREADY'); [Console]::Out.Flush(); [void][Console]::In.ReadLine(); "
               f"for($i=0;$i -lt {iters};$i++){{ $p=\"$env:TEMP\\uhhblog_ps_$($PID)_$i.txt\"; "
               "[IO.File]::WriteAllText($p, ('x'*($i%50+1))); $n += ([IO.File]::ReadAllText($p)).Length; "
               "[IO.File]::Delete($p); Start-Sleep -Milliseconds 10 }; [Console]::Out.WriteLine(\"PSDONE $n\")")
@@ -3427,7 +3430,7 @@ def check_blog_pwsh_attach():
             rep = report(objs)
             ok = (done.strip() == f"PSDONE {want_n}" and target.returncode == 0 and detached and
                   rep.get("log_dropped") == 0 and rep.get("error") is None and pr.get("backend") == bk and
-                  0 < len(ours) < 2 * iters)                 # 2 opens per iteration: detached mid-run
+                  10 <= len(ours) < 2 * iters)               # 2 opens per iteration: seen, then detached mid-run
             record(name, ok, f"ps_out={done.strip()!r} want=PSDONE {want_n} ps_exit={target.returncode} hits={pr.get('hits')} "
                              f"our_opens_logged={len(ours)}/{2 * iters} detached={detached} dropped={rep.get('log_dropped')} "
                              f"err={(rep.get('error') or '')[:120]}" +
