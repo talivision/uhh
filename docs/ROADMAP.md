@@ -126,6 +126,70 @@ Each finding below was reproduced on main (d197024) by the same suite before the
   `__except` (inline too: the trampoline fault is still handled), one-shot probes re-added from a callback on every call,
   guard/read-only/decommitted/null/wrapping addresses, zero-size reads, hw + inline on one instruction
 
+## Hunter A findings (2026-11-05) — concurrency / lifecycle edge cases
+Driver `hunt_driver` + target `hunt_target` (`examples/hunt`): gated_config's own callbacks
+(NtOpenProcess handle->pid map, every NtReadVirtualMemory logged with its pid) under a stressor;
+suite `check_hunt` (`hunt-<scenario>-<backend>`; `UHH_HUNT=substr` narrows it). Clean on every
+backend: thread churn (1.6k short-lived threads), thread-pool work/timers/timer-queue, fibers,
+APCs, VEH + SEH filter + handler, DLL load/unload churn with a probe inside the DLL, TLS/DllMain
+reads, a slow (50 ms) callback under 32 threads.
+- ✅ (A1) inline: a callback whose call_func reaches the probed function (or that calls a probed
+  API directly) re-entered its own callback until the stack overflowed (target died 0xC0000005).
+  Now a per-thread guard: the nested hit is counted, no callback -- the breakpoint/hw call_func
+  rule. `hunt-threads-recurse-*` (hits == 2 x reads, every call_func ok)
+- ✅ (A2) breakpoint/hw: call_func returned 0 whenever ANOTHER thread hit a probe while a call was
+  running (its callback ran nested inside the call and was refused) -- ~10% of calls at 32
+  threads; the same callback source worked under inline. Now that other thread's hit is undone
+  (INT3: rewound to the site; execute #DB: not yet executed) and the thread held until the call
+  returns, then it hits again normally. Data-watch hits are not replayable and still run nested.
+  If the callee needs a lock a held thread owns, the call times out (5 s) as before.
+  `hunt-threads-tid-*` (call_func(GetCurrentThreadId) == the hit's tid), `hunt-threads-recurse-*`
+- ✅ (A3) inline: process exit (return from main / ExitProcess / TerminateProcess) kills threads
+  mid-callback: their hits were counted but their logs never existed and nothing said so
+  (logs < hits, log_dropped 0). The in-flight counter now lives in the shared block and the report
+  carries `callbacks_interrupted`; logs + log_dropped + callbacks_interrupted == hits exactly.
+  Breakpoint/hw always complete callbacks (0). `hunt-exit-{return,process,terminate}-*`
+- 🔧 (A4) breakpoint/hw + a target that round-trips its own threads' contexts (SuspendThread +
+  GetThreadContext + SetThreadContext, as GCs/profilers do): a context captured while the thread
+  sat in a UHH debug event and written back after UHH resumed it undoes UHH's fix-up.
+  Fixed: displaced step (resumed into the scratch slot -> ran garbage -> AV): every displaced copy
+  is now followed by a jump back to site+len and a stray TF step inside the scratch slots is
+  swallowed; hw (DR6 overwritten -> unhandled single step killed the target 0x80000004): a #DB at
+  one of our execute addresses with no DR6/BS/TF is recovered as ours.
+  Open (no contained fix): breakpoint -- a context captured at the INT3 trap (pc = site+1) written
+  back resumes the thread one byte into the original instruction (seen: 1-2 wrong reads in 3M);
+  hw -- the stale context has RF clear, so the same call is reported twice (+5 hits in 2M).
+  Inline unaffected. `hunt-ctx-{breakpoint,hw}` FAIL by design until fixed
+- ⬜ (A5) breakpoint/hw starvation: every debug event freezes the whole process, so with 8 threads
+  hitting a probe back to back, a thread that hits nothing runs only in the gaps. Seen: main's
+  Sleep(300)+exit taking 4 s typically and >180 s in ~1 of 6 runs (main measured still inside one
+  fprintf). Program results stay correct; wall-clock does not. Options: one event per hit instead
+  of two (emulate simple displaced instructions such as `mov r10, rcx` instead of single-stepping
+  them), or a fairness throttle that briefly holds a thread that hits continuously.
+  `hunt-starve-*` (exit within 60 s; flaky-fails on breakpoint/hw until fixed); exit checks use 2
+  readers on breakpoint/hw so they test exit correctness, not starvation
+- ⬜ (A6) inline misses calls made BEFORE the image entry point (TLS callbacks at process attach,
+  static-import DllMain): hooks are installed at the entry hold. Breakpoint/hw see them. In
+  gated_config terms an NtOpenProcess in a TLS callback is never mapped, so every later read logs
+  pid=0. Needs an earlier install point (e.g. load the agent from the loader breakpoint) -- design
+  change. `hunt-early-inline` FAIL by design
+- ⬜ (A7) hw: the target arming its OWN debug registers (SetThreadContext DR0/DR7 on its threads,
+  handled in its VEH) shares DR0-3 with UHH's hardware probes: the target's own breakpoint stopped
+  firing. Breakpoint/inline pass the target's #DB through untouched. Document per-backend, or pick
+  slots the thread does not use. `hunt-owndr-hw` FAIL by design
+- ⬜ (A8) hw: a hardware probe inside a DLL that 4 threads keep LoadLibrary/FreeLibrary-ing
+  (refcount reaches 0, so it really unloads and re-arms on every reload) misses hits: probe hits
+  60 / 62 / 120 / 125 of 240 calls, x86 and x64, whatever backend the read probe uses (inline
+  too, so only LOAD/UNLOAD/CREATE_THREAD events are involved); breakpoint and inline on the same
+  site are exact. Intermittent on x64 (passed twice, then failed 3 of 4), steady on x86.
+  Not yet proven. Leading suspect: UNLOAD_DLL of the old instance is processed AFTER the LOAD_DLL
+  of the new instance mapped at the SAME base (the unmapping thread reports after the VA is free;
+  another thread maps and reports first). The UNLOAD handler matches by base only, so it
+  release_hw()s the probe that the new instance just armed (and erases module_bases[name]); the
+  probe then stays pending until the next load. A per-base load count (skip teardown while a newer
+  instance at that base is live) fixes hw; breakpoint/inline would additionally need LOAD to
+  re-arm a probe still marked active at the same base. `hunt-dll-work-backend-hw` FAIL until fixed
+
 ## Codex workaround audit (2026-11-05) — triaged
 - ✗ (C1) handle->pid through kernel32!OpenProcess: example-callback design, not a library issue (user, 2026-11-05); documented in the gated_config README
 - ⬜ (C11) example handle map: no silent 1024 cap
@@ -211,6 +275,51 @@ binaries (cmd, reg, sort), multi-threaded targets, launch vs attach, attach mid-
   busy threads leaves the target correct on every backend, 9 probes in one session (breakpoint/hw/
   inline mixed), `kernel32` import-stub sites (`jmp [imp]` + padding) inline-hooked fine, APC-
   interrupted alertable SleepEx unchanged, GetLastError via call_func exact on inline.
+## Blog-replica findings (2026-11-05, `examples/blogs`, regress `blog-*`)
+Well-known instrumentation scenarios (crypto-API monitor, registry Run-key monitor,
+DNS/socket logger, process-creation tracker, COM CLSID logger, 1 kHz game loop, attach to
+PowerShell + detach) under every backend, against an uninstrumented baseline.
+- ✅ (B1) hw: a #DB queued on one thread while another thread's callback armed a new DR
+  (a return probe added from a callback) arrived with DR6 == 0 and was passed to the
+  target -> **target killed by STATUS_SINGLE_STEP**. A #DB with empty DR6 at the address
+  of a live execute probe enabled on that thread is now treated as that probe's hit.
+  Test: `blog-crypto-naive-hw` (6 rounds), `blog-crypto-hw`
+- ✅ (B2) hw: a DR armed while a thread was between CREATE_THREAD and the end of its
+  start-up (LdrInitializeThunk's NtContinue restores the creation-time DR image) was
+  **silently lost on that thread for its lifetime** (crypto: one worker never hit the
+  runtime return probe, 100/120). Library INT3 at ntdll!RtlUserThreadStart, armed only
+  once a hw probe is armed after start-up while such threads exist, re-applies the DRs.
+  Test: `blog-crypto-naive-hw` (asserts every return captured), `blog-crypto-hw`
+- ✅ (B3) breakpoint/hw `call_func`: another thread's probe hit during the call ran its
+  callback NESTED on the controller thread -> a callback holding a lock across
+  `call_func` **deadlocked** (registry monitor: NtSetValueKey -> call_func NtQueryKey hung
+  on breakpoint and hw), and a nested `call_func` was refused. Other threads' code-probe
+  hits are now parked (rewound + suspended) until the call returns, then re-hit.
+  Test: `blog-registry-breakpoint/hw`
+- ✅ (B4) a forwarded export whose target module maps after the forwarding module
+  (`ole32!CoCreateInstance` -> combase) **failed the launch**; it now stays pending on the
+  target module. Also the inline pre-vet of such a name checked the module header
+  (base+0). Test: `blog-com-*`
+- ⬜ (B5) attach + inline into a CLR process (PowerShell): every thread is held while the
+  agent is injected; intermittently (1 of ~8 runs) a held thread blocks the injection
+  (loader/heap/CLR lock) and the hold lasts until the 5 s timeout or detach -- target
+  frozen, inline probe not live in that window (seen: hits=0, "released 19 held
+  thread(s) (detach)" at 2.5 s). Fix idea: hold only for the install itself (after the
+  agent is loaded and its service thread is up), not across LoadLibrary / thread start.
+  Test: `blog-pwsh-attach-detach-inline` (fails when it happens; 2 of ~10 x64 runs).
+  Same family seen once on x86 `attach-inline` (1 of 4): the LOAD_DLL hold for
+  configparse hit "inline install not confirmed within 5 s", the flag probe missed the
+  parse, 0/8000 reads.
+- (note) `attach-new` failed once because ANOTHER agent's probe_app.exe started in the
+  same second on the shared VM and was attached instead (image-name matching is
+  inherently racy on a shared box; not a library bug).
+- ⬜ (B6) API reality the docs should mention: `bcrypt!BCryptGenRandom` re-enters itself
+  (2 hits per call), so entry counts != API calls and a naive return-capture needs a 5th
+  hw slot; probes report every caller of a system export (CoCreateInstance 25 hits for 24
+  target calls). The examples filter; the per-backend limitations doc should say so.
+- ⬜ (B7) docs: per-hit cost seen as frame time at 1 kHz (`blog-game-*`, x64 VM): inline
+  p50 1 us / p99 10 us, 0 missed frames; hw p50 ~220 us / p99 ~520 us, breakpoint p50
+  ~300 us / p99 ~660 us, a few frames over budget -- belongs in the backend table.
 
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`
