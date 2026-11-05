@@ -77,10 +77,14 @@ struct CallbackState {
     Probe *probe;
     DWORD pid = 0, tid = 0;   // the stopped event's thread (call_func runs code on it)
     bool released = false;    // call_original: the original left without returning; the thread runs on
-    // call_original (breakpoint/hw): the floating-point state the original returned with
-    // (XMM0 / x87 ST0 results), which return_from hands to the caller.
-    bool have_post_fp = false;
-    CONTEXT post_fp{};
+    // call_original returned: the thread's registers as the original left them (its return
+    // registers: x86 EDX:EAX, XMM0, x86 ST0; the other volatile ones) and the callback's
+    // registers at that moment. With return_from the caller gets them -- exactly what an
+    // un-hooked call leaves -- except AX (the return_from value) and any register the
+    // callback set_reg'd after the call (see apply_return_from).
+    bool have_post = false;
+    CONTEXT post{};
+    probe_regs post_seen{};
 };
 // The floating-point parts of a CONTEXT (x86: the x87 save area and the FXSAVE image with XMM).
 #if defined(_WIN64)
@@ -4066,7 +4070,9 @@ static const DWORD UHH_CALL_RELEASED = 0xE0554843u;
 // try/catch around a call through an extern "C" callback pointer may be elided.
 static bool seh_callback(probe_callback cb, probe_context *c, DWORD *code) {
     __try { cb(c); return true; }
-    __except (*code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) { return false; }
+    __except (*code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {}
+    if (*code == EXCEPTION_STACK_OVERFLOW) _resetstkoflw();      // the guard page, for the next overflow
+    return false;
 }
 static void run_callback(probe_session *s, Probe *probe, probe_context *c) {
     const probe_regs before = c->regs;
@@ -4127,15 +4133,22 @@ static bool apply_return_from(probe_session *s, Probe *probe, const probe_contex
     }
     uint64_t g = ret_gadget(s, c.ret_pop);
     auto *st = static_cast<CallbackState *>(c.controller);
-    if (g && c.called_original && st && st->have_post_fp) {
-        // The caller gets the original's floating-point result too (XMM0, x87 ST0): its whole
-        // FP state as it returned -- nonvolatile parts are the hit's anyway (ABI).
+    if (g && c.called_original && st && st->have_post) {
+        // The caller gets what the original left (see CallbackState::post): its whole FP state
+        // as it returned (XMM0 / x87 ST0 results; the nonvolatile parts are the hit's anyway,
+        // ABI) and the volatile GPRs the callback did not set_reg after the call. x86 EDX is
+        // already the original's unless return_from set a high half (probe_x86_return_regs).
+        const CONTEXT &a = st->post;
+#define UHH_KEEP(f, r) if (c.regs.r == st->post_seen.r) native.f = a.f;
 #if defined(_WIN64)
-        native.FltSave = st->post_fp.FltSave; native.MxCsr = st->post_fp.MxCsr;
+        UHH_KEEP(Rcx, rcx) UHH_KEEP(Rdx, rdx) UHH_KEEP(R8, r8) UHH_KEEP(R9, r9) UHH_KEEP(R10, r10) UHH_KEEP(R11, r11)
+        native.FltSave = a.FltSave; native.MxCsr = a.MxCsr;
 #else
-        native.FloatSave = st->post_fp.FloatSave;
-        std::memcpy(native.ExtendedRegisters, st->post_fp.ExtendedRegisters, sizeof(native.ExtendedRegisters));
+        UHH_KEEP(Ecx, rcx)
+        native.FloatSave = a.FloatSave;
+        std::memcpy(native.ExtendedRegisters, a.ExtendedRegisters, sizeof(native.ExtendedRegisters));
 #endif
+#undef UHH_KEEP
         native.ContextFlags |= UHH_CONTEXT_FP;
     }
     if (!g) {
@@ -5793,8 +5806,10 @@ static uint64_t resolve_symbol(probe_session *s, const char *symbol) {
     if (symbol[0] == '0' && (symbol[1] == 'x' || symbol[1] == 'X')) return std::strtoull(symbol + 2, nullptr, 16);
     Probe tmp; std::string saved = s->error;
     if (!parse_location(s, symbol, tmp)) { s->error = saved; return 0; }
+    // "kernel32!X" names kernel32.dll, as GetModuleHandle (and so inline call_func) reads it.
+    const bool bare = tmp.module.find('.') == std::string::npos;
     for (auto &kv : s->module_bases)
-        if (iequals(kv.first, tmp.module)) {
+        if (iequals(kv.first, tmp.module) || (bare && iequals(kv.first, tmp.module + ".dll"))) {
             uint64_t rva = tmp.rva;
             if (!tmp.export_name.empty()) {
                 uint64_t exp = 0;
@@ -5816,6 +5831,43 @@ static uint64_t resolve_symbol(probe_session *s, const char *symbol) {
     s->error = saved; return 0;
 }
 
+// The stopped thread's TEB in the target (0 if unknown): call_func restores the thread's
+// last error / last status there, as the inline agent does around every callback -- the
+// callee's Win32 calls must not leak into the program (GetLastError after the probed code).
+static uint64_t thread_teb(HANDLE thread, const CONTEXT &ctx) {
+#if defined(_WIN64)
+    (void)ctx;
+    struct { LONG status; PVOID teb; ULONG_PTR pid, tid, affinity; LONG prio, base; } tbi{};
+    using QueryFn = LONG(NTAPI *)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    static auto query = reinterpret_cast<QueryFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+    return query && query(thread, 0 /* ThreadBasicInformation */, &tbi, sizeof(tbi), nullptr) >= 0 ? (uint64_t)(uintptr_t)tbi.teb : 0;
+#else
+    LDT_ENTRY e{};                               // FS base = the 32-bit TEB (WOW64 too)
+    if (!GetThreadSelectorEntry(thread, ctx.SegFs, &e)) return 0;
+    return (uint64_t)((DWORD)e.BaseLow | ((DWORD)e.HighWord.Bytes.BaseMid << 16) | ((DWORD)e.HighWord.Bytes.BaseHi << 24));
+#endif
+}
+#if defined(_WIN64)
+static const uint64_t TEB_LAST_ERROR = 0x68, TEB_LAST_STATUS = 0x1250;
+#else
+static const uint64_t TEB_LAST_ERROR = 0x34, TEB_LAST_STATUS = 0xBF4;
+#endif
+struct TebErrors {
+    uint64_t teb = 0; DWORD error = 0, status = 0; bool ok = false;
+    void save(HANDLE process, HANDLE thread, const CONTEXT &ctx) {
+        size_t n1 = 0, n2 = 0;
+        teb = thread_teb(thread, ctx);
+        ok = teb && remote_read(process, teb + TEB_LAST_ERROR, &error, 4, &n1) && n1 == 4 &&
+             remote_read(process, teb + TEB_LAST_STATUS, &status, 4, &n2) && n2 == 4;
+    }
+    void restore(HANDLE process) const {
+        size_t n = 0;
+        if (!ok) return;
+        remote_write(process, teb + TEB_LAST_ERROR, &error, 4, &n);
+        remote_write(process, teb + TEB_LAST_STATUS, &status, 4, &n);
+    }
+};
+
 static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint64_t *ret, int nargs, const uint64_t *args,
                           const probe_context *seed = nullptr) {
     if (s->in_call_tid || nargs < 0 || nargs > 8) return 0;           // no nesting
@@ -5836,10 +5888,14 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
         if (!mem || !remote_write(s->pi.hProcess, (uint64_t)(uintptr_t)mem, &cc, 1, &w)) return 0;
         s->call_trap = (uint64_t)(uintptr_t)mem;
     }
-    HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, st->tid);
+    HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, FALSE, st->tid);
     if (!thread) return 0;
     CONTEXT saved{}; saved.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_FLOATING_POINT;
+#if !defined(_WIN64)
+    saved.ContextFlags |= CONTEXT_EXTENDED_REGISTERS;                  // x86: XMM0-7 live here, not in FloatSave
+#endif
     if (!GetThreadContext(thread, &saved)) { CloseHandle(thread); return 0; }
+    TebErrors teb_errors; teb_errors.save(s->pi.hProcess, thread, saved);
     CONTEXT w = saved; size_t wrote = 0; bool ok = true;
     if (seed) to_context(*seed, w);                                    // call_original: the callback's registers
 #if defined(_WIN64)
@@ -5886,8 +5942,14 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
                 trapped = true; break;                             // leave this event pending
             }
             if (!(er.ExceptionCode == EXCEPTION_BREAKPOINT || er.ExceptionCode == EXCEPTION_SINGLE_STEP)) {
+                if (trace_enabled())
+                    std::fprintf(stderr, "  call_func: callee raised 0x%08lx at 0x%llx; abandoned\n", (unsigned long)er.ExceptionCode,
+                                 (unsigned long long)(uintptr_t)er.ExceptionAddress);
                 trapped = true; break;                             // the callee faulted: abandon the call
             }
+            if (trace_enabled())
+                std::fprintf(stderr, "  call_func: own-thread event 0x%08lx at 0x%llx\n", (unsigned long)er.ExceptionCode,
+                             (unsigned long long)(uintptr_t)er.ExceptionAddress);
         }
         DWORD disposition = DBG_CONTINUE;
         dispatch_event(s, ev, disposition);                        // other threads keep working
@@ -5898,11 +5960,12 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
     resume_deferred_hits(s);                                       // they hit their probes again now
     if (trapped) {
         SetThreadContext(thread, &saved);                          // exactly as it was at the hit
+        teb_errors.restore(s->pi.hProcess);                        // and its last error / status
         // The pending trap/fault event on this thread now stands in for the original one.
     } else if (!s->exited) {
         // Timed out with the callee still running: stop it, put the context back, and tell
         // the loop the original event is already continued (there is nothing to continue).
-        SuspendThread(thread); SetThreadContext(thread, &saved); ResumeThread(thread);
+        SuspendThread(thread); SetThreadContext(thread, &saved); teb_errors.restore(s->pi.hProcess); ResumeThread(thread);
         s->skip_continue = true;
         std::fprintf(stderr, "probe: call_func timed out after 5 s; thread restored\n");
     } else {
@@ -6032,7 +6095,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
             if (ev.dwThreadId == st->tid && ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT &&
                 ev.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP &&
                 (uint64_t)(uintptr_t)ev.u.Exception.ExceptionRecord.ExceptionAddress == ret_addr) {
-                CONTEXT &r = st->post_fp; r.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | UHH_CONTEXT_FP;
+                CONTEXT &r = st->post; r.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | UHH_CONTEXT_FP;
                 if (GetThreadContext(thread, &r)) {
 #if defined(_WIN64)
                     const uint64_t sp = r.Rsp, rax = r.Rax;
@@ -6041,7 +6104,8 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
 #endif
                     if (sp > s->co_sp && sp <= s->co_sp + ptr + 1024) {   // x86 stdcall: ret N popped the args
                         result = rax; done = true;                         // this event now stands in for the hit
-                        st->have_post_fp = true;
+                        st->have_post = true;
+                        st->post_seen = c->regs;
 #if !defined(_WIN64)
                         c->orig_edx = r.Edx;                               // an EDX:EAX result's high half
                         c->orig_pop = (int32_t)(sp - (s->co_sp + ptr));    // the bytes its `ret N` popped

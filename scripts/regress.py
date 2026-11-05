@@ -1509,6 +1509,75 @@ def check_sidefx(iters=1000, threads=4):
             record(name, False, repr(e))
 
 
+TP_MODES = ("noop", "log", "mem", "sys", "callfn", "co")
+TP_PROBES = ("add", "i64", "dbl", "dblarg", "seterr", "std", "align", "fact", "mid", "spawn", "thread", "peek", "ovf")
+
+
+def check_transparency(iters=30):
+    """A hit is invisible to the program (examples/transparency): every probed function has an
+    unprobed twin, both called through one assembly harness, and a probed call must leave
+    exactly what the twin leaves -- return registers (x64 RAX/XMM0; x86 EDX:EAX/ST0), callee-
+    saved GPRs and XMM6-15, the SP after the call (x86 `ret N`), DF, x87 SW/TW, GetLastError,
+    the TEB's LastStatusValue and every other TEB byte -- and a mid-function site (between a
+    `cmp` and the flag snapshot, with a full x87 stack and a pending FCOM result) leaves every
+    GPR, EFLAGS, XMM and the x87 state as its twin does. Every backend, every callback kind:
+    no-op, send_log(+stack), get_mem/get_func_arg/get_reg, Win32+NT calls on the hit thread,
+    call_func (APIs that set the last error; a probed function: counted, no callback),
+    call_original + return_from (int, int64, double return; a double argument; __stdcall;
+    stack alignment; recursion). Plus a thread created by call_func DURING a hit, which runs
+    a probed function. hw: at most 3 probes per run (call_original needs a free DR)."""
+    d, t = exe("tp_driver.exe"), exe("tp_target.exe")
+    if not d or not t:
+        return skip("transparency", "tp_driver/tp_target missing")
+    groups = {"breakpoint": [TP_PROBES], "inline": [TP_PROBES],
+              "hw": [TP_PROBES[i:i + 3] for i in range(0, len(TP_PROBES), 3)]}
+    for bk in ("breakpoint", "hw", "inline"):
+        for mode in TP_MODES:
+            name = f"transparency-{bk}-{mode}"
+            bad = []
+            try:
+                for grp in groups[bk]:
+                    spawn = "spawn" in grp
+                    targs = [t, "--iters", iters] + [f"--{x}" for x in ("spawn", "peek", "ovf") if x in grp]
+                    r, o = run([d, "--backend", bk, "--mode", mode, "--probes", ",".join(grp), "--"] + targs, timeout=300)
+                    tg = next((x for x in o if x.get("kind") == "target"), {})
+                    rep = report(o)
+                    fails = sorted({str(x.get("message", "")) for x in o
+                                    if x.get("kind") == "probe_log" and str(x.get("message", "")).startswith("tp FAIL")})
+                    cold = [p.get("location") for p in probes(o) if not p.get("hits")]
+                    why = []
+                    if r.returncode != 0: why.append(f"rc={r.returncode}")
+                    if not tg: why.append("no target row")
+                    elif tg.get("bad") != 0: why.append(f"bad={tg.get('bad')} first={tg.get('first')!r}")
+                    for x in ("spawn", "peek", "ovf"):
+                        if x in grp and tg.get(x) != 1: why.append(f"{x}={tg.get(x)}")
+                    if fails: why.append(f"cb={fails[:2]}")
+                    if cold: why.append(f"no hits: {cold}")
+                    if rep.get("error") is not None or rep.get("app_exit") != 0 or rep.get("log_dropped") != 0:
+                        why.append(f"report err={rep.get('error')} exit={rep.get('app_exit')} dropped={rep.get('log_dropped')}")
+                    if why:
+                        bad.append(f"[{','.join(grp)}] " + " ".join(why) +
+                                   ("" if r.returncode == 0 else f" stderr={(r.stderr or '')[-200:]!r}"))
+                record(name, not bad, "; ".join(bad) if bad else f"{len(groups[bk])} run(s), iters={iters}, all calls identical to the twin")
+            except Exception as e:
+                record(name, False, repr(e))
+    # Inline, a CPU whose full XSAVE area (every XCR0 feature, e.g. AMX tiles: ~11 KB) exceeds
+    # the agent's save buffer: the live AVX state and MXCSR must still be kept (the agent sizes
+    # the save from the components it saves). UHH_BENCH_XSTATE=amx makes the agent see such a
+    # full-area size on any CPU.
+    name = "transparency-inline-xsave-bigarea"
+    try:
+        env = dict(os.environ, UHH_BENCH_XSTATE="amx")
+        r = subprocess.run([str(a) for a in [d, "--backend", "inline", "--mode", "log", "--probes", "mid", "--", t,
+                                             "--iters", iters]], capture_output=True, text=True, timeout=300, env=env)
+        o = [json.loads(l) for l in r.stdout.splitlines() if l.strip().startswith("{")]
+        tg = next((x for x in o if x.get("kind") == "target"), {})
+        record(name, r.returncode == 0 and tg.get("bad") == 0 and report(o).get("error") is None,
+               f"bad={tg.get('bad')} first={tg.get('first')!r} rc={r.returncode}")
+    except Exception as e:
+        record(name, False, repr(e))
+
+
 EDGE_ITERS = 5
 # (site, location) -- see examples/edgehunt/edge_driver.cpp
 EDGE_SHAPES = ["rep", "stos", "ripload", "ripcmp", "ripvec", "ripstore", "cpuid", "rdtsc", "syscall", "int2e",
@@ -5690,6 +5759,132 @@ def check_logs_stdout_closed(threads=4):
                              ("" if ok else " stderr=" + " | ".join(err.strip().splitlines()[-3:])[:300]))
         except Exception as e:
             record(name, False, repr(e))
+def check_agent_review():
+    """Inline-agent static review (examples/agent_review), one reproduction per finding:
+    agent-unwind: a C++ throw / SEH raise / AV from a callee whose CALL instruction is inline-
+    probed (the hook relocates that call), caught by the hooked function and by its caller,
+    and a load relocated by the hook faulting inside the hooked function's own __try -- the
+    program's handlers get every one (x64: no unwind data for the trampoline used to end in
+    std::terminate / an unhandled exception). agent-faultafter: a callback that ran the
+    original and then faults must not run the original again. agent-threadinit: an
+    allocating callback on RtlAllocateHeap while threads start (hits before the thread's TLS
+    exists) must not recurse. agent-ljframe0: x64 longjmp without unwinding out of
+    call_original must not leave the thread "in a callback" (later hits silently lost).
+    agent-own-threads: the agent's own hook writes (NtProtectVirtualMemory, run while every
+    other thread is frozen) must not run the program's callback. Every row equals the
+    uninstrumented run; hits and "ar" logs are exact; nothing dropped or interrupted."""
+    d, t = exe("ar_driver.exe"), exe("ar_target.exe")
+    if not d or not t:
+        return skip("agent-review", "ar_driver/ar_target missing")
+
+    def row(objs, kind="ar"):
+        r = dict(next((x for x in objs if x.get("kind") == kind), {}))
+        r.pop("kind", None)
+        return r
+
+    def ar_logs(objs):
+        cnt = {}
+        for x in objs:
+            m = str(x.get("message", ""))
+            if x.get("kind") == "probe_log" and m.startswith("ar "):
+                cnt[m] = cnt.get(m, 0) + 1
+        return cnt
+
+    def go(case, specs, timeout=180):
+        args = [d]
+        for sp in specs:
+            args += ["--probe", sp]
+        return run(args + ["--", t, case], timeout=timeout)
+
+    def common(r, o, base, extra_ok=()):
+        rep, bad = report(o), []
+        if not base:
+            bad.append("no baseline row")
+        if row(o) != base:
+            bad.append(f"row={row(o)} want={base}")
+        if rep.get("log_dropped") != 0: bad.append(f"dropped={rep.get('log_dropped')}")
+        if rep.get("callbacks_interrupted", 0) != 0: bad.append(f"intr={rep.get('callbacks_interrupted')}")
+        if rep.get("error") is not None: bad.append(f"err={rep.get('error')}")
+        if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
+        return bad
+
+    # agent-unwind
+    try:
+        _, wo = run([t, "where"], timeout=60)
+        w = row(wo, "where")
+        _, bo = run([t, "unwind"], timeout=60)
+        base = row(bo)
+        specs = []
+        for key in ("mid_cpp", "mid_seh", "self_cpp", "self_seh"):
+            specs.append(f"ar_target.exe!ar_{key}+0x{w.get(key, -1):x}=ar_on_site")
+        lo = w.get("load", -1)
+        specs.append(("ar_target.exe!ar_load_self" + (f"+0x{lo:x}" if lo >= 5 else "")) + "=ar_on_site")
+        if any(w.get(k, -1) < 0 for k in ("mid_cpp", "mid_seh", "self_cpp", "self_seh", "load")):
+            record("agent-unwind", False, f"site scan failed: {w}")
+        else:
+            r, o = go("unwind", specs)
+            bad = common(r, o, base)
+            hits = [p.get("hits") for p in probes(o)]
+            if hits != [10] * 5: bad.append(f"hits={hits}")
+            if ar_logs(o) != {"ar site": 50}: bad.append(f"logs={ar_logs(o)}")
+            record("agent-unwind", not bad, "; ".join(bad) or f"row={row(o)} sites={w}")
+    except Exception as e:
+        record("agent-unwind", False, repr(e))
+
+    # agent-faultafter
+    try:
+        _, bo = run([t, "faultafter"], timeout=60)
+        base = row(bo)
+        r, o = go("faultafter", ["ar_target.exe!ar_body=ar_on_fault_ret", "ar_target.exe!ar_body_std=ar_on_fault_noret"])
+        bad = common(r, o, base)
+        if ar_logs(o) != {"ar fault-ret": 5, "ar fault-noret": 5}: bad.append(f"logs={ar_logs(o)}")
+        record("agent-faultafter", not bad, "; ".join(bad) or f"row={row(o)}")
+    except Exception as e:
+        record("agent-faultafter", False, repr(e))
+
+    # agent-threadinit
+    try:
+        _, bo = run([t, "threadinit"], timeout=60)
+        base = row(bo)
+        r, o = go("threadinit", ["ntdll.dll!RtlAllocateHeap=ar_on_alloc"], timeout=300)
+        bad = common(r, o, base)
+        hits = sum(p.get("hits") or 0 for p in probes(o))
+        if hits < 40: bad.append(f"hits={hits}")
+        record("agent-threadinit", not bad, "; ".join(bad) or f"row={row(o)} hits={hits}")
+    except Exception as e:
+        record("agent-threadinit", False, repr(e))
+
+    # agent-ljframe0
+    try:
+        _, bo = run([t, "ljframe0"], timeout=60)
+        base = row(bo)
+        r, o = go("ljframe0", ["ar_target.exe!ar_jump=ar_on_jump", "ar_target.exe!ar_after=ar_on_after"])
+        bad = common(r, o, base)
+        want = {"ar jump": 10, "ar jump-done": 5, "ar after": 3}
+        if ar_logs(o) != want: bad.append(f"logs={ar_logs(o)} want={want}")
+        record("agent-ljframe0", not bad, "; ".join(bad) or f"row={row(o)}")
+    except Exception as e:
+        record("agent-ljframe0", False, repr(e))
+
+    # agent-own-threads
+    try:
+        _, bo = run([t, "prot"], timeout=60)
+        base = row(bo)
+        r, o = go("prot", ["ntdll.dll!NtProtectVirtualMemory=ar_on_prot"])
+        bad = common(r, o, base)
+        # The agent's own code (hook writes: VirtualProtect, run FROZEN) must never run the
+        # callback. The loader's own start/exit of the injected init thread (ntdll calling
+        # itself, outside the agent's code and outside any freeze) is reported, not failed.
+        lg = ar_logs(o)
+        agent = lg.get("ar prot agent=1 via=other", 0)
+        loader = lg.get("ar prot agent=1 via=ntdll", 0)
+        prog = lg.get("ar prot agent=0 via=other", 0) + lg.get("ar prot agent=0 via=ntdll", 0)
+        if agent: bad.append(f"{agent} callback(s) ran in the agent's own code (logs={lg})")
+        if prog < 5: bad.append(f"program calls seen={prog} (want >= 5)")
+        record("agent-own-threads", not bad,
+               "; ".join(bad) or f"row={row(o)} program={prog} agent={agent} agent-thread-loader={loader}")
+    except Exception as e:
+        record("agent-own-threads", False, repr(e))
 
 
 def main():
@@ -5771,6 +5966,8 @@ def main():
     if want(check_portability): check_portability()
     if want(check_callorig_hunt): check_callorig_hunt()
     if want(check_callconv): check_callconv()
+    if want(check_agent_review): check_agent_review()
+    if want(check_transparency): check_transparency()
     if want(check_interrupt): check_interrupt()
     if want(check_agent_crt): check_agent_crt()
     if want(check_oldcrt): check_oldcrt()
