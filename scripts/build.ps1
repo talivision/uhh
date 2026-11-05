@@ -42,7 +42,7 @@ function Find-Ninja {
 function Get-MsvcEnv([string]$vcArch) {
     $bat = Join-Path $vs 'VC\Auxiliary\Build\vcvarsall.bat'
     $vars = @{}
-    cmd /c "`"$bat`" $vcArch >nul 2>&1 && set" | ForEach-Object {
+    cmd /c "call `"$bat`" $vcArch >nul 2>&1 && set" | ForEach-Object {
         if ($_ -match '^([^=]+)=(.*)$') { $vars[$matches[1]] = $matches[2] }
     }
     if (-not $vars['VCToolsInstallDir']) { throw "vcvarsall $vcArch failed" }
