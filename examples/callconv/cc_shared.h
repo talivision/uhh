@@ -4,9 +4,9 @@
 #pragma once
 #include <stdint.h>
 
-struct CcS8 { int32_t a, b; };              // x86: by value = 2 stack slots, returned in EDX:EAX
-struct CcS12 { int32_t a, b, c; };          // x86: 3 stack slots; x64: passed by reference to a copy
-struct CcS16 { int32_t a, b, c, d; };       // returned through a hidden pointer on both arches
+struct cc_s8 { int32_t a, b; };              // x86: by value = 2 stack slots, returned in EDX:EAX
+struct cc_s12 { int32_t a, b, c; };          // x86: 3 stack slots; x64: passed by reference to a copy
+struct cc_s16 { int32_t a, b, c, d; };       // returned through a hidden pointer on both arches
 
 enum cc_id {
     CC_CDECL0, CC_CDECL3, CC_STD3, CC_STD10, CC_FAST4, CC_THIS, CC_VEC, CC_I64, CC_STDI64,
@@ -37,8 +37,8 @@ static const cc_fn CC_FNS[CC_N] = {
     {"ccfix.dll", "CcS8", 0, 2, CC_K_INT, 0},            // int __cdecl (CcS8 by value)
     {"ccfix.dll", "CcDbl", 0, 4, CC_K_DBL, 0},           // double __cdecl (double, float, int)
     {"ccfix.dll", "CcFlt", 8, 2, CC_K_FLT, 0},           // float __stdcall (float, float)
-    {"ccfix.dll", "CcRetBig", 0, 2, CC_K_PTR, 0},        // CcS16 __cdecl (int): hidden return pointer
-    {"ccfix.dll", "CcRetBigStd", 8, 2, CC_K_PTR, 0},     // CcS16 __stdcall (int): the callee pops it too
+    {"ccfix.dll", "CcRetBig", 0, 2, CC_K_PTR, 0},        // cc_s16 __cdecl (int): hidden return pointer
+    {"ccfix.dll", "CcRetBigStd", 8, 2, CC_K_PTR, 0},     // cc_s16 __stdcall (int): the callee pops it too
     {"ccfix.dll", "CcRet8", 0, 1, CC_K_S8, 0},           // CcS8 __cdecl (int): x86 EDX:EAX, x64 RAX
     {"ccfix.dll", "CcHot", 8, 2, CC_K_INT, 1},           // stdcall behind `mov edi,edi; push ebp; mov ebp,esp`
     {"ccfix.dll", "CcIlt", 12, 3, CC_K_INT, 0},          // incremental-link thunk: jmp rel32 -> CcStd3T
@@ -51,8 +51,8 @@ static const cc_fn CC_FNS[CC_N] = {
 #define CC_I64_A 0x1111111122222222ll
 #define CC_I64_C 0x0444444455555555ll
 #define CC_STDI64_A 0x0123456789ABCDEFll
-static const struct CcS12 CC_S12_ARG = {41, 42, 43};
-static const struct CcS8 CC_S8_ARG = {51, 52};
+static const struct cc_s12 CC_S12_ARG = {41, 42, 43};
+static const struct cc_s8 CC_S8_ARG = {51, 52};
 
 // Native results (what the uninstrumented function returns for those arguments).
 static inline int64_t cc_native_int(int id) {

@@ -25,13 +25,13 @@ int __vectorcall CcVec(int a, double d, int b, float f) {
 }
 long long __cdecl CcI64(long long a, int b, long long c) { CC_SELF("CcI64"); body(); return a + b + c; }
 long long __stdcall CcStdI64(long long a, int b) { CC_SELF("CcStdI64"); body(); return a + b; }
-int __stdcall CcS12(CcS12 s, int k) { CC_SELF("CcS12"); body(); return s.a + 2 * s.b + 3 * s.c + 4 * k; }
-int __cdecl CcS8(CcS8 s) { CC_SELF("CcS8"); body(); return s.a * 100 + s.b; }
+int __stdcall CcS12(cc_s12 s, int k) { CC_SELF("CcS12"); body(); return s.a + 2 * s.b + 3 * s.c + 4 * k; }
+int __cdecl CcS8(cc_s8 s) { CC_SELF("CcS8"); body(); return s.a * 100 + s.b; }
 double __cdecl CcDbl(double a, float b, int c) { CC_SELF("CcDbl"); body(); return a * b + c; }
 float __stdcall CcFlt(float a, float b) { CC_SELF("CcFlt"); body(); return a * b + 0.125f; }
-CcS16 __cdecl CcRetBig(int x) { CC_SELF("CcRetBig"); body(); return CcS16{x, x + 1, x + 2, x + 3}; }
-CcS16 __stdcall CcRetBigStd(int x) { CC_SELF("CcRetBigStd"); body(); return CcS16{x, x + 1, x + 2, x + 3}; }
-CcS8 __cdecl CcRet8(int x) { CC_SELF("CcRet8"); body(); return CcS8{x, x * 2}; }
+cc_s16 __cdecl CcRetBig(int x) { CC_SELF("CcRetBig"); body(); return cc_s16{x, x + 1, x + 2, x + 3}; }
+cc_s16 __stdcall CcRetBigStd(int x) { CC_SELF("CcRetBigStd"); body(); return cc_s16{x, x + 1, x + 2, x + 3}; }
+cc_s8 __cdecl CcRet8(int x) { CC_SELF("CcRet8"); body(); return cc_s8{x, x * 2}; }
 }
 
 // __thiscall (x86: `this` in ECX, the callee pops the stack arguments).

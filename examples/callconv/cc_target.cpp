@@ -48,7 +48,7 @@ int main(int argc, char **argv) {
         const bool floaty = f.kind == CC_K_DBL || f.kind == CC_K_FLT;
         const bool replaced = probed && mode == CC_REPLACE && !floaty;     // the body must not run
         const long before = *body;
-        CcS16 big{};                                                       // hidden return buffer
+        cc_s16 big{};                                                       // hidden return buffer
         int64_t got = 0; double gotd = 0; bool have_d = false;
         char detail[256] = "";
         bool ok = true;
@@ -88,7 +88,7 @@ int main(int argc, char **argv) {
         }
         if (f.kind == CC_K_PTR && o.eax != (uint32_t)(uintptr_t)&big) { ok = false; strcat_s(detail, "eax!=hidden "); }
 #else
-        static CcS16 *volatile sink;
+        static cc_s16 *volatile sink;
         switch (id) {
         case CC_CDECL0: got = ((int (*)())fn)(); break;
         case CC_CDECL3: got = ((int (*)(int, int, int))fn)(1, 2, 3); break;
@@ -100,13 +100,13 @@ int main(int argc, char **argv) {
         case CC_VEC: got = ((int(__vectorcall *)(int, double, int, float))fn)(31, 2.5, 32, 0.25f); break;
         case CC_I64: got = ((long long (*)(long long, int, long long))fn)(CC_I64_A, 3, CC_I64_C); break;
         case CC_STDI64: got = ((long long (*)(long long, int))fn)(CC_STDI64_A, 2); break;
-        case CC_S12: got = ((int (*)(CcS12, int))fn)(CC_S12_ARG, 44); break;
-        case CC_S8: got = ((int (*)(CcS8))fn)(CC_S8_ARG); break;
+        case CC_S12: got = ((int (*)(cc_s12, int))fn)(CC_S12_ARG, 44); break;
+        case CC_S8: got = ((int (*)(cc_s8))fn)(CC_S8_ARG); break;
         case CC_DBL: gotd = ((double (*)(double, float, int))fn)(1.5, 2.25f, 3); have_d = true; break;
         case CC_FLT: gotd = ((float (*)(float, float))fn)(0.5f, 4.0f); have_d = true; break;
-        case CC_RETBIG: big = ((CcS16 (*)(int))fn)(61); break;
-        case CC_RETBIGSTD: big = ((CcS16 (*)(int))fn)(62); break;
-        case CC_RET8: { CcS8 r = ((CcS8 (*)(int))fn)(63); got = ((int64_t)r.b << 32) | (uint32_t)r.a; break; }
+        case CC_RETBIG: big = ((cc_s16 (*)(int))fn)(61); break;
+        case CC_RETBIGSTD: big = ((cc_s16 (*)(int))fn)(62); break;
+        case CC_RET8: { cc_s8 r = ((cc_s8 (*)(int))fn)(63); got = ((int64_t)r.b << 32) | (uint32_t)r.a; break; }
         }
         sink = &big;
 #endif
