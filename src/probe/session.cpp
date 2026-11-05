@@ -2768,7 +2768,8 @@ static void guard_sync(probe_session *s) {
     g.step_count = (LONG)n;
     n = 0;
     for (const auto *list : {&s->held, &s->ipc_frozen, &s->call_deferred})
-        for (HANDLE t : *list) if (n < PROBE_AGENT_GUARD_TIDS) g.held_tids[n++] = GetThreadId(t);
+        for (HANDLE t : *list)
+            if (const DWORD tid = GetThreadId(t); tid && n < PROBE_AGENT_GUARD_TIDS) g.held_tids[n++] = tid;
     for (const auto &e : s->inplace_suspended)          // an in-place step window's suspensions
         if (n < PROBE_AGENT_GUARD_TIDS) g.held_tids[n++] = e.first;
     g.held_count = (LONG)n;
@@ -3400,7 +3401,8 @@ static void hold_thread(probe_session *s, DWORD tid) {
     // never come before we let go: the target would be left with suspended threads after
     // the detach. No hooks are being installed any more anyway.
     if (s->detaching) return;
-    HANDLE t = OpenThread(THREAD_SUSPEND_RESUME, FALSE, tid);
+    // (QUERY_LIMITED: the controller-death guard mirrors held threads by id, GetThreadId.)
+    HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
     if (!t) return;
     DWORD prev = SuspendThread(t);
     if (prev == (DWORD)-1) { CloseHandle(t); return; }
@@ -3985,7 +3987,8 @@ static void ipc_thaw(probe_session *s) {
 }
 
 static void ipc_freeze_thread(probe_session *s, DWORD tid) {
-    HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+    HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION,
+                          FALSE, tid);                     // (QUERY_LIMITED: GetThreadId, guard_sync)
     if (!t) return;
     if (SuspendThread(t) == (DWORD)-1) { CloseHandle(t); return; }
     s->ipc_frozen.push_back(t);
@@ -4201,7 +4204,8 @@ static void enforce_owned_drs(const probe_session *s, DWORD tid, CONTEXT &c) {
 // the call finishes it is resumed and hits the probe again, normally: counted once, its
 // callback runs with call_func available.
 static bool defer_hit_during_call(probe_session *s, DWORD tid, uint64_t address, bool rewind_ip) {
-    HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, tid);
+    HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
+                          FALSE, tid);                     // (QUERY_LIMITED: GetThreadId, guard_sync)
     if (!t) return false;
     CONTEXT w{}; w.ContextFlags = CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS;
     bool ok = !!GetThreadContext(t, &w);
@@ -5599,6 +5603,9 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
 static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposition) {
     const bool ok = dispatch_event_impl(s, event, disposition);
     inplace_sync(s, event);
+    // The guard's mirror, after EVERYTHING this event changed (an in-place window's holds are
+    // taken / handed over just above) and before the thread runs again.
+    if (!s->exited) guard_sync(s);
     return ok;
 }
 static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &disposition) {
@@ -5774,7 +5781,6 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
         s->exit_code = event.u.ExitProcess.dwExitCode; s->exited = true; break;
     default: break;
     }
-    if (!s->exited) guard_sync(s);
     return ok;
 }
 

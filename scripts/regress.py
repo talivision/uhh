@@ -6391,8 +6391,9 @@ class LcTarget:
 
 def lc_clean(c, attached_ok=False):
     """A check line that says the target is exactly as before any tool came."""
+    # (late / stuck: the quit report -- worker threads that did not end, threads left suspended)
     return (not c.get("dead") and not c.get("hung") and c.get("code_diff") == 0 and c.get("dr_dirty") == 0 and
-            c.get("errors") == 0 and (attached_ok or c.get("debugger") == 0))
+            c.get("errors") == 0 and not c.get("late") and not c.get("stuck") and (attached_ok or c.get("debugger") == 0))
 
 
 def lc_brief(c):
@@ -6400,7 +6401,8 @@ def lc_brief(c):
         return f"DEAD/HUNG {c}"
     return (f"code_diff={c.get('code_diff')} {c.get('code_bad') or ''} dr_dirty={c.get('dr_dirty')} {c.get('dr_bad') or ''} "
             f"dr_stale={c.get('dr_stale')} dbg={c.get('debugger')} errors={c.get('errors')} {c.get('first_error') or ''} flips={c.get('flips')} "
-            f"agent={c.get('agent_loaded')}").replace("  ", " ")
+            f"agent={c.get('agent_loaded')}" + (f" late={c.get('late')} stuck={c.get('stuck_info')}" if c.get("late") or c.get("stuck") else "")
+            ).replace("  ", " ")
 
 
 class LcDriver:
@@ -6659,10 +6661,11 @@ def lc_controller_killed(cfgname, cfg):
     and logging: the TARGET must survive -- keep running, never fault, never hang, make no
     error -- and, once the controller is gone, be left with no live hook / INT3 / debug register
     (it would die or misbehave at its next hit otherwise)."""
-    bad, n = [], 0
+    bad, n, took = [], 0, []
     for when in ("active", "active+0.5", "early-0.05", "early-0.3"):
         n += 1
         tg = d = None
+        t0, steps = time.time(), []
         try:
             # Inline only (no debug events per hit): flat out, so the agent's 4096-slot log ring
             # fills within the wait below -- an orphaned producer spinning on it is a hang.
@@ -6676,22 +6679,27 @@ def lc_controller_killed(cfgname, cfg):
             else:
                 time.sleep(float(when.split("-")[1]))
             d.kill(); d.finish(timeout=30)
+            steps = [f"fin={time.time() - t0:.0f}"]
             time.sleep(3.0)                                    # the target runs on, alone
             c = tg.check()
+            steps.append(f"chk={time.time() - t0:.0f}{'!' if c.get('hung') else ''}")
             time.sleep(1.0)
             c2 = tg.check()
             progressed = (c2.get("iterations") or 0) > (c.get("iterations") or 0)
             if not lc_clean(c2) or not progressed:
                 bad.append(f"kill@{when}: progressed={progressed} {lc_brief(c2)} unhandled={tg.unhandled()}")
             a = tg.quit()
-            if a.get("rc") != 0 and not any(x.startswith(f"kill@{when}") for x in bad):
+            steps.append(f"quit={time.time() - t0:.0f}")
+            if (a.get("rc") != 0 or a.get("late") or a.get("stuck")) and not any(x.startswith(f"kill@{when}") for x in bad):
                 bad.append(f"kill@{when}: exit={a.get('rc')} {lc_brief(a)} unhandled={tg.unhandled()}")
         except Exception as e:
             bad.append(f"kill@{when}: {e!r}")
         finally:
             if d: d.kill()
             if tg: tg.kill()
-    record(f"lifecycle-controller-killed-{cfgname}", not bad, f"cases={n}" + (f" bad={bad[:3]}" if bad else ""))
+            took.append(f"{when}={time.time() - t0:.0f}s" + (f"({','.join(steps)})" if steps else ""))
+    record(f"lifecycle-controller-killed-{cfgname}", not bad,
+           f"cases={n} took=[{' '.join(took)}]" + (f" bad={bad[:3]}" if bad else ""))
 
 
 def lc_agent_refused(cfgname, cfg):

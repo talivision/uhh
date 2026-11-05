@@ -1089,6 +1089,16 @@ by itself, nothing dropped), detach while callbacks run / block in call_original
   a target's own debugger-free INT3 at one of our sites while orphaned, and any single-step on a
   thread without debug registers of its own once the controller is gone, are taken as ours
   (a program single-stepping itself after its controller died would lose those steps).
+- ✅ (L12, found at the merge) The guard never resumed a thread the controller held suspended:
+  the held handles (install holds, hook-write freezes, call_original/call_func deferrals) were
+  opened without THREAD_QUERY_LIMITED_INFORMATION, so GetThreadId returned 0 and the mirrored
+  held list was all zeros. After a controller kill the target ran on with those threads parked
+  for good (x64 breakpoint: 1-3 workers suspended at their NtReadVirtualMemory/NtClose hit, rewound
+  by a call_original deferral, in 4 of 7 runs on eval-lifecycle itself; invisible to the check
+  except as a 60 s quit). Now opened with query rights, mirrored after the in-place window's own
+  bookkeeping (inplace_sync), and resumed once per hold. lifecycle_target's quit report now
+  carries `late` (workers not ended 15 s after quit) and `stuck` (threads left suspended:
+  tid:count:ip), and every lifecycle check fails on either. `lifecycle-controller-killed-*`
 - Merged into merge-frida (agent protocol v19 = v18 + the guard): the guard takes the armed INT3s
   from merge-frida's INT3 table (every armed breakpoint, sorted; was its own 512-entry copy, so a
   session with more breakpoints left the rest unguarded), resumes the threads an in-place step

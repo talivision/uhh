@@ -151,6 +151,39 @@ static int thread_dirty(HANDLE t, char *why, size_t cap) {
     return 0;
 }
 
+/* Quit: worker threads still running 15 s later (`late`; every loop polls g_stop within ms),
+   and every thread of the process left SUSPENDED (`stuck`: tid:suspend-count:ip) -- e.g. by a
+   controller that is gone. */
+static LONG g_stuck, g_late;
+static char g_stuck_info[256];
+static void find_stuck(void) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    THREADENTRY32 te; te.dwSize = sizeof(te);
+    DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    if (snap == INVALID_HANDLE_VALUE) return;
+    for (BOOL more = Thread32First(snap, &te); more; more = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+        HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, te.th32ThreadID);
+        if (!t) continue;
+        DWORD prev = SuspendThread(t);
+        CONTEXT c; memset(&c, 0, sizeof(c)); c.ContextFlags = CONTEXT_CONTROL;
+        GetThreadContext(t, &c);
+        if (prev != (DWORD)-1) ResumeThread(t);
+        CloseHandle(t);
+        if (prev == (DWORD)-1 || prev == 0) continue;
+#if defined(_WIN64)
+        unsigned long long ip = c.Rip;
+#else
+        unsigned long long ip = c.Eip;
+#endif
+        ++g_stuck;
+        size_t n = strlen(g_stuck_info);
+        _snprintf_s(g_stuck_info + n, sizeof(g_stuck_info) - n, _TRUNCATE, "%s%lu:%ld:0x%llx", n ? "," : "",
+                    te.th32ThreadID, (long)prev, ip);
+    }
+    CloseHandle(snap);
+}
+
 static void check(const char *kind) {
     char code_bad[256] = "", dr_bad[256] = "", why[96];
     int code_diff = 0, dr_dirty = 0, threads = 0;
@@ -190,10 +223,10 @@ static void check(const char *kind) {
     CloseHandle(snap);
     printf("{\"kind\":\"%s\",\"code_diff\":%d,\"code_bad\":\"%s\",\"dr_dirty\":%d,\"dr_bad\":\"%s\",\"dr_stale\":%ld,\"threads\":%d,"
            "\"debugger\":%d,\"agent_loaded\":%d,\"iterations\":%lld,\"errors\":%ld,\"first_error\":\"%s\","
-           "\"flips\":%ld,\"slow_calls\":%ld,\"churned\":%ld,\"dll_cycles\":%ld}\n",
+           "\"flips\":%ld,\"slow_calls\":%ld,\"churned\":%ld,\"dll_cycles\":%ld,\"late\":%ld,\"stuck\":%ld,\"stuck_info\":\"%s\"}\n",
            kind, code_diff, code_bad, dr_dirty, dr_bad, g_dr_stale, threads, IsDebuggerPresent() ? 1 : 0,
            GetModuleHandleA("probe_api_agent.dll") != NULL, (long long)g_iters, g_errors, g_first_error,
-           g_flips, g_slow_calls, g_churned, g_dll_cycles);
+           g_flips, g_slow_calls, g_churned, g_dll_cycles, g_late, g_stuck, g_stuck_info);
     fflush(stdout);
 }
 
@@ -293,7 +326,11 @@ int main(int argc, char **argv) {
         else if (!strncmp(line, "quit", 4)) break;
     }
     InterlockedExchange(&g_stop, 1);
-    WaitForMultipleObjects(n, pool, TRUE, 60000);
+    if (WaitForMultipleObjects(n, pool, TRUE, 15000) == WAIT_TIMEOUT) {
+        for (int i = 0; i < n; ++i) if (WaitForSingleObject(pool[i], 0) == WAIT_TIMEOUT) ++g_late;
+        find_stuck();
+        WaitForMultipleObjects(n, pool, TRUE, 45000);
+    }
     check("app");
     return g_errors ? 1 : 0;
 }

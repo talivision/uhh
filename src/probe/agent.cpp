@@ -1974,11 +1974,13 @@ static bool int3_original(uint64_t at, unsigned char &original) {
         if (shared->int3[i].address == at) { original = shared->int3[i].original; return true; }
     return false;
 }
-static bool tid_listed(const uint32_t *list, LONG count, DWORD tid) {
+static LONG tid_count(const uint32_t *list, LONG count, DWORD tid) {
     if (count > (LONG)PROBE_AGENT_GUARD_TIDS) count = PROBE_AGENT_GUARD_TIDS;
-    for (LONG i = 0; i < count; ++i) if (list[i] == tid) return true;
-    return false;
+    LONG n = 0;
+    for (LONG i = 0; i < count; ++i) n += list[i] == tid;
+    return n;
 }
+static bool tid_listed(const uint32_t *list, LONG count, DWORD tid) { return tid_count(list, count, tid) != 0; }
 // First in line for every exception, but acts only on OUR traps once no debugger is attached
 // (a live controller handles them before any handler in the target sees them).
 static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
@@ -2073,7 +2075,10 @@ static void guard_cleanup() {
                 }
                 ResumeThread(t);
             }
-            if (!pass && tid_listed(g.held_tids, g.held_count, te.th32ThreadID)) ResumeThread(t);   // the controller's hold
+            // The controller's holds: once per entry (a thread can be held twice, e.g. a deferred
+            // call_original hit that an in-place step window then suspended again).
+            if (!pass)
+                for (LONG k = tid_count(g.held_tids, g.held_count, te.th32ThreadID); k > 0; --k) ResumeThread(t);
             CloseHandle(t);
         }
         CloseHandle(snap);
