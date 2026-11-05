@@ -158,8 +158,9 @@ add_library(probe_api_agent SHARED
     examples/famous/detours_simple/simple_callbacks.cpp
     examples/famous/detours_traceapi/traceapi_callbacks.cpp
     examples/famous/detours_retval/retval_callbacks.cpp
-    examples/hunt/hunt_callbacks.cpp)
-target_include_directories(probe_api_agent PRIVATE include examples/gated_config examples/dynwatch examples/trace examples/memstress)
+    examples/hunt/hunt_callbacks.cpp
+    examples/blogs/blog_callbacks.cpp)
+target_include_directories(probe_api_agent PRIVATE include examples/gated_config examples/dynwatch examples/trace examples/memstress examples/blogs)
 target_link_libraries(probe_api_agent PRIVATE safetyhook)
 target_compile_definitions(probe_api_agent PRIVATE BREAKAGE_AGENT_ONLY FRIDA_PARITY_AGENT_ONLY HITCOST_SHARED)
 # Undecorated names for the __stdcall agent entries (x86 would otherwise export
@@ -353,6 +354,14 @@ target_include_directories(hunt_driver PRIVATE include examples/gated_config)
 target_link_libraries(hunt_driver PRIVATE probe_api)
 add_dependencies(hunt_driver hunt_target hunt_dll probe_api_agent)
 
+# --- blog replicas: API-monitor scenarios from well-known write-ups (examples/blogs) ----
+add_executable(blog_target examples/blogs/blog_target.c)
+target_compile_options(blog_target PRIVATE /W4)
+add_executable(blog_driver examples/blogs/blog_driver.cpp examples/blogs/blog_callbacks.cpp)
+target_include_directories(blog_driver PRIVATE include examples/blogs)
+target_link_libraries(blog_driver PRIVATE probe_api)
+add_dependencies(blog_driver blog_target probe_api_agent)
+
 add_executable(refusal_driver examples/conformance/refusal_driver.cpp)
 target_include_directories(refusal_driver PRIVATE include)
 target_link_libraries(refusal_driver PRIVATE probe_api)
@@ -372,6 +381,8 @@ foreach(d detours_simple detours_traceapi detours_retval)
 endforeach()
 
 foreach(t hunt_target hunt_dll hunt_driver detours_target detours_simple detours_traceapi detours_retval edge_target edge_driver famous_driver famous_heap_target famous_file_target famous_loader_target famous_tick_target probe_app_cet cet_probe gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
+
+foreach(t blog_target blog_driver gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
     target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 endforeach()

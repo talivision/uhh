@@ -3160,6 +3160,221 @@ def check_hunt():
                 record(name, False, repr(e))
 
 
+# ---------------------------------------------------------------------------------------
+# Blog replicas (examples/blogs): API-monitor scenarios from well-known write-ups, each run
+# uninstrumented (baseline) and under every backend. The target's deterministic results
+# must equal the baseline; every logged argument must match what the target did.
+BLOG_RUNS = {   # scenario -> (target args, fields that must equal the baseline)
+    "crypto": (["--threads", 6, "--files", 20],
+               ["threads", "files", "bcrypt_encrypt", "genrandom", "capi_encrypt", "roundtrip_ok", "written",
+                "pt_checksum", "dir_removed"]),
+    "registry": (["--threads", 4, "--values", 25], ["threads", "values", "created", "set", "readback_ok", "cleaned"]),
+    "net": (["--threads", 4, "--per", 4], ["clients", "exchanges_ok", "dns_calls", "dns_ok", "connect_calls",
+                                           "wsaconnect_calls"]),
+    "spawn": (["--threads", 4, "--children", 6], ["threads", "children", "started", "exit_ok"]),
+    "com": (["--threads", 3, "--objects", 8], ["threads", "objects", "created", "saved", "removed"]),
+    "game": (["--frames", 2000], ["frames", "checksum"]),
+}
+SHELL_LINK_CLSID = "{00021401-0000-0000-C000-000000000046}"
+
+
+def blog_target_json(objs):
+    return next((o for o in objs if o.get("kind") == "target"), {})
+
+
+def blog_hits(objs, suffix):
+    return next((p.get("hits") for p in probes(objs) if str(p.get("location", "")).endswith(suffix)), None)
+
+
+def blog_registry_gone(pid):
+    """True if the target removed its test key; otherwise remove it here and return False."""
+    try:
+        import winreg
+        winreg.CloseKey(winreg.OpenKey(winreg.HKEY_CURRENT_USER, rf"Software\UHHBlogTest_{pid}"))
+    except OSError:
+        return True
+    subprocess.run(["reg", "delete", rf"HKCU\Software\UHHBlogTest_{pid}", "/f"], capture_output=True)
+    return False
+
+
+def blog_scenario_ok(scn, bk, tgt, msgs, objs):
+    """Scenario-specific: the logged arguments are exactly what the target did. -> (ok, detail)"""
+    import re
+    if scn == "crypto":
+        enc = [m for m in msgs if m.startswith("BCryptEncrypt ") and 'pt="UHHFILE t=' in m]
+        capi = [m for m in msgs if m.startswith("CryptEncrypt ") and 'pt="UHHCAPI t=' in m]
+        rets = [m for m in msgs if m.startswith("BCryptGenRandom ret ")]
+        s = 0
+        for m in rets:
+            s = (s + int(m.rsplit("key_first8=", 1)[1].split()[0], 16)) % (1 << 64)
+        refused = [m for m in msgs if "REFUSED" in m]
+        want_sum = int(str(tgt.get("rng_first8_sum", "0")), 16)
+        ok = (len(enc) == tgt.get("bcrypt_encrypt") and len(capi) == tgt.get("capi_encrypt") and
+              len(rets) == tgt.get("genrandom") and s == want_sum and not refused and
+              blog_hits(objs, "!CryptEncrypt") == tgt.get("capi_encrypt"))
+        return ok, (f"enc_logs={len(enc)}/{tgt.get('bcrypt_encrypt')} capi_logs={len(capi)}/{tgt.get('capi_encrypt')} "
+                    f"rng_ret_logs={len(rets)}/{tgt.get('genrandom')} rng_sum_match={s == want_sum} "
+                    f"hits={[(p.get('location'), p.get('backend'), p.get('hits')) for p in probes(objs)]} refused={refused[:1]}")
+    if scn == "registry":
+        pid = tgt.get("pid")
+        sets = [m for m in msgs if m.startswith("NtSetValueKey ") and f"UHHBlogTest_{pid}/T" in m and '/Run"' in m]
+        good = 0
+        for m in sets:
+            mm = re.search(r'value="Updater_(\d+)_(\d+)" type=1 .*data="C:/Users/Public/uhh_(\d+)_(\d+)\.exe /silent"', m)
+            t = re.search(rf"UHHBlogTest_{pid}/T(\d+)/", m)
+            if mm and t and mm.group(1) == mm.group(3) == t.group(1) and mm.group(2) == mm.group(4):
+                good += 1
+        creates = [m for m in msgs if m.startswith("NtCreateKey ") and "/Run" in m and f"UHHBlogTest_{pid}" in m]
+        gone = blog_registry_gone(pid)
+        ok = len(sets) == tgt.get("set") and good == len(sets) and len(creates) >= (tgt.get("created") or 1) and gone
+        return ok, f"set_logs={len(sets)}/{tgt.get('set')} decoded_ok={good} create_logs={len(creates)} key_removed={gone}" + \
+            ("" if ok else f" sample={next((m for m in msgs if m.startswith('NtSetValueKey')), '')[:200]!r}")
+    if scn == "net":
+        port = tgt.get("port")
+        conns = [m for m in msgs if m.startswith("connect ") and m.endswith(f"addr=127.0.0.1:{port}")]
+        reqs = [m for m in msgs if m.startswith("send ") and 'data="UHHREQ id=' in m]
+        rsps = [m for m in msgs if m.startswith("send ") and 'data="UHHRSP id=' in m]
+        dns = [m for m in msgs if m.startswith('DnsQuery_W name="localhost"')]
+        hits = {k: blog_hits(objs, k) for k in ("!connect", "!WSAConnect", "!send", "!recv", "!DnsQuery_W")}
+        want_dns = None if bk == "hw" else tgt.get("dns_calls")
+        ok = (len(conns) == tgt.get("clients") and len(reqs) == tgt.get("clients") and len(rsps) == tgt.get("clients") and
+              hits["!send"] == tgt.get("send_calls") and hits["!recv"] == tgt.get("recv_calls") and
+              hits["!connect"] == tgt.get("connect_calls") and hits["!WSAConnect"] == tgt.get("wsaconnect_calls") and
+              (len(dns) if want_dns is not None else None) == want_dns and hits["!DnsQuery_W"] == want_dns)
+        return ok, (f"connect_logs={len(conns)}/{tgt.get('clients')} req={len(reqs)} rsp={len(rsps)} dns_logs={len(dns)} "
+                    f"hits={hits} target_send={tgt.get('send_calls')} target_recv={tgt.get('recv_calls')}")
+    if scn == "spawn":
+        n = tgt.get("children") or 0
+        pat = r'cmd=".*blog_target\.exe.? child (\d+)"'
+        ids_cp = sorted(int(x) for m in msgs if m.startswith("CreateProcessInternalW ") for x in re.findall(pat, m))
+        ids_nt = sorted(int(x) for m in msgs if m.startswith("NtCreateUserProcess ") for x in re.findall(pat, m))
+        ok = ids_cp == list(range(n)) and ids_nt == list(range(n))
+        return ok, f"CreateProcessInternalW={len(ids_cp)}/{n} NtCreateUserProcess={len(ids_nt)}/{n}" + \
+            ("" if ok else f" sample={next((m for m in msgs if m.startswith('NtCreateUserProcess')), '')[:200]!r}")
+    if scn == "com":
+        links = [m for m in msgs if m.startswith(f"CoCreateInstance clsid={SHELL_LINK_CLSID}")]
+        ok = len(links) == tgt.get("created")
+        return ok, f"shelllink_logs={len(links)}/{tgt.get('created')} all_cocreate_hits={blog_hits(objs, '!CoCreateInstance')}"
+    if scn == "game":
+        frames = [m for m in msgs if m.startswith("frame ")]
+        seq = [int(m.split()[1]) for m in frames]
+        ok = seq == list(range(tgt.get("frames") or 0)) and blog_hits(objs, "!blog_frame") == tgt.get("frames")
+        return ok, (f"frame_logs={len(frames)} in_order={seq == sorted(seq)} missed={tgt.get('missed')} "
+                    f"cost_us p50/p99/max={tgt.get('cost_us_p50')}/{tgt.get('cost_us_p99')}/{tgt.get('cost_us_max')} "
+                    f"late_us p99/max={tgt.get('late_us_p99')}/{tgt.get('late_us_max')}")
+    return False, "unknown scenario"
+
+
+def check_blog_replicas():
+    """Blog replicas: crypto-API monitor, registry Run-key monitor, DNS/socket logger,
+    process-creation tracker, COM CLSID logger, game-loop frame probe -- each against an
+    uninstrumented baseline of the same target, under breakpoint, hw and inline.
+    UHH_BLOG_SCENARIOS=crypto,net limits the scenarios (default: all)."""
+    d, t = exe("blog_driver.exe"), exe("blog_target.exe")
+    if not d or not t:
+        return skip("blog", "blog_driver/blog_target missing")
+    import os as _os
+    want_scn = [x for x in _os.environ.get("UHH_BLOG_SCENARIOS", "").split(",") if x] or list(BLOG_RUNS)
+    want_bk = [x for x in _os.environ.get("UHH_BLOG_BACKENDS", "").split(",") if x] or ["breakpoint", "hw", "inline"]
+    for scn in want_scn:
+        targs, fields = BLOG_RUNS[scn]
+        try:
+            _, bo = run([t, scn, *targs], timeout=300)
+            base = blog_target_json(bo)
+            if scn == "registry":
+                blog_registry_gone(base.get("pid"))
+            record(f"blog-{scn}-baseline", bool(base) and all(f in base for f in fields),
+                   " ".join(f"{k}={v}" for k, v in base.items() if k not in ("kind", "scenario")))
+        except Exception as e:
+            record(f"blog-{scn}-baseline", False, repr(e)); continue
+        for bk in want_bk:
+            name = f"blog-{scn}-{bk}"
+            try:
+                r, o = run([d, "--scenario", scn, "--backend", bk, "--", t, scn, *targs], timeout=600)
+                tgt, rep = blog_target_json(o), report(o)
+                msgs = [str(x.get("message", "")) for x in o if x.get("kind") == "probe_log"]
+                diff = {f: (base.get(f), tgt.get(f)) for f in fields if base.get(f) != tgt.get(f)}
+                prs = probes(o)
+                generic = (r.returncode == 0 and rep.get("error") is None and rep.get("log_dropped") == 0 and
+                           rep.get("app_exit") == 0 and bool(tgt) and not diff and
+                           rep.get("logs_written") == len(msgs) and
+                           # inline return probes may fall back to hw (PROBE_FALLBACK_HW)
+                           all(p.get("backend") == bk or (p.get("backend") == "hw" and bk == "inline") for p in prs) and
+                           all(p.get("active") or p.get("hits") for p in prs))
+                sok, sdet = blog_scenario_ok(scn, bk, tgt, msgs, o)
+                record(name, generic and sok,
+                       f"{sdet} vs_baseline={'same' if not diff else diff} rc={r.returncode} exit={rep.get('app_exit')} "
+                       f"logs={len(msgs)}/{rep.get('logs_written')} dropped={rep.get('log_dropped')} "
+                       f"err={(rep.get('error') or '')[:160]}" +
+                       ("" if generic else f" probes={[(p.get('location'), p.get('backend'), p.get('active'), p.get('hits')) for p in prs]}"
+                                           f" stderr={(r.stderr or '')[-300:]!r}"))
+            except Exception as e:
+                record(name, False, repr(e))
+
+
+def check_blog_pwsh_attach():
+    """JIT/managed process (the 'hook a .NET host' write-ups): attach to a running
+    powershell.exe, hook kernelbase!CreateFileW, which its script drives via [IO.File],
+    detach mid-run. PowerShell must finish with the same output and exit code."""
+    t = exe("uhh_trace.exe")
+    if not t:
+        return skip("blog-pwsh", "uhh_trace.exe missing")
+    import os as _os
+    import struct
+    data = Path(t).read_bytes()
+    x86 = struct.unpack_from("<H", data, struct.unpack_from("<I", data, 0x3C)[0] + 4)[0] == 0x14C
+    ps = Path(r"C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe") if x86 else \
+        SYS32 / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    if not ps.exists():
+        return skip("blog-pwsh", f"{ps} missing")
+    iters = 400
+    script = ("$n=0; [Console]::Out.WriteLine('PSREADY'); [Console]::Out.Flush(); [void][Console]::In.ReadLine(); "
+              f"for($i=0;$i -lt {iters};$i++){{ $p=\"$env:TEMP\\uhhblog_ps_$($PID)_$i.txt\"; "
+              "[IO.File]::WriteAllText($p, ('x'*($i%50+1))); $n += ([IO.File]::ReadAllText($p)).Length; "
+              "[IO.File]::Delete($p); Start-Sleep -Milliseconds 10 }; [Console]::Out.WriteLine(\"PSDONE $n\")")
+    want_n = sum(i % 50 + 1 for i in range(iters))
+    want_bk = [x for x in _os.environ.get("UHH_BLOG_BACKENDS", "").split(",") if x] or ["breakpoint", "hw", "inline"]
+    for bk in want_bk:
+        name = f"blog-pwsh-attach-detach-{bk}"
+        target = None
+        try:
+            target = subprocess.Popen([str(ps), "-NoProfile", "-NonInteractive", "-Command", script],
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            tl = Lines(target.stdout)
+            if not tl.wait_for(lambda l: "PSREADY" in l, 60):
+                raise RuntimeError("powershell never got ready")
+            tracer = subprocess.Popen([str(t), "--backend", bk, "--attach", str(target.pid), "--detach-after-ms", "2500",
+                                       "-p", "kernelbase.dll!CreateFileW:Wxxxx"],
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            tout, terr = Lines(tracer.stdout), Lines(tracer.stderr)
+            if not terr.wait_for(lambda l: l.startswith("probe: active kernelbase.dll!CreateFileW"), 60):
+                raise RuntimeError("probe never became active: " + " | ".join(terr.lines[-5:]))
+            target.stdin.write("\n"); target.stdin.flush()
+            tracer.wait(timeout=180)
+            tout.t.join(timeout=30); terr.t.join(timeout=30)
+            target.wait(timeout=180)
+            tl.t.join(timeout=30)
+            done = next((l for l in tl.lines if "PSDONE" in l), "")
+            objs = [json.loads(l) for l in tout.lines if l.startswith("{")]
+            pr = next(iter(probes(objs)), {})
+            msgs = [str(o.get("message", "")) for o in objs if o.get("kind") == "probe_log"]
+            ours = [m for m in msgs if "uhhblog_ps_" in m]
+            detached = any(o.get("kind") == "detached" for o in objs)
+            rep = report(objs)
+            ok = (done.strip() == f"PSDONE {want_n}" and target.returncode == 0 and detached and
+                  rep.get("log_dropped") == 0 and rep.get("error") is None and pr.get("backend") == bk and
+                  0 < len(ours) < 2 * iters)                 # 2 opens per iteration: detached mid-run
+            record(name, ok, f"ps_out={done.strip()!r} want=PSDONE {want_n} ps_exit={target.returncode} hits={pr.get('hits')} "
+                             f"our_opens_logged={len(ours)}/{2 * iters} detached={detached} dropped={rep.get('log_dropped')} "
+                             f"err={(rep.get('error') or '')[:120]}" +
+                             ("" if ok else f" tracer_stderr={' | '.join(terr.lines[-6:])[:600]}"))
+        except Exception as e:
+            record(name, False, repr(e))
+        finally:
+            if target and target.poll() is None:
+                target.kill()
+
+
 def main():
     global BIN
     ap = argparse.ArgumentParser()
@@ -3250,6 +3465,8 @@ def main():
     if want(check_detours_retval): check_detours_retval()
     if want(check_detours_stdin): check_detours_stdin()
     if want(check_hunt): check_hunt()
+    if want(check_blog_replicas): check_blog_replicas()
+    if want(check_blog_pwsh_attach): check_blog_pwsh_attach()
     print("-" * 72)
     failed = 0
     for name, status, detail in RESULTS:
