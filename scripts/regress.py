@@ -5537,6 +5537,104 @@ def check_ctrl_review():
     except Exception as e:
         record("ctrl-headclamp", False, repr(e))
 
+def check_cdx_review():
+    """Codex review of the controller (docs/ROADMAP.md "Codex controller review"), fixture
+    examples/ctrlreview, ONE callback source per check, every backend:
+      cdx-owndrx-<b>: UHH watches an address once (PROBE_ONCE) and releases it; a thread that
+        existed at the release then arms its OWN write watch there in every free slot: its
+        handler must see every write (the released address was swallowed as stale for good).
+      cdx-faultreg-<b>: the probed load faults; the program's handler repairs it by changing the
+        base REGISTER and retries at the site: one callback per execution (x86 took the
+        changed registers for a new hit).
+      cdx-absreuse-<b>: an absolute software breakpoint in a DLL that unloads; the address is
+        reused by new memory holding a real 0xCC: get_mem must read 0xCC (the agent's INT3
+        table kept the stale entry and showed the old original byte inline).
+      cdx-int3cap-<b>: 1200 armed software breakpoints; the last 16 read back with get_mem: the
+        program's bytes on every backend (inline saw 0xCC past the 1024th).
+      cdx-bigcfg-<b>: a dynamic add from a callback with a config over 64 MiB: accepted on every
+        backend (inline refused it)."""
+    d, t, dll = exe("ctrl_driver.exe"), exe("ctrl_target.exe"), exe("ctrl_dll.dll")
+    if not d or not t or not dll:
+        return skip("cdx-review", "ctrl_driver/ctrl_target/ctrl_dll missing")
+
+    def go(sc, bk, targs, timeout=180):
+        r, o = run([d, "--scenario", sc, "--backend", bk, "--", t, sc, *targs], timeout=timeout)
+        res = next((x for x in o if x.get("kind") == "ctrl_result"), {})
+        logs = [str(x.get("message", "")) for x in o if x.get("kind") == "probe_log"]
+        rows = [x for x in o if x.get("kind") == "probe"]
+        bad = []
+        if r.returncode != 0: bad.append(f"exit={r.returncode}")
+        rep = report(o)
+        if rep.get("error") is not None: bad.append(f"error={rep.get('error')}")
+        if rep.get("log_dropped", 0) != 0: bad.append(f"log_dropped={rep.get('log_dropped')}")
+        if rep.get("app_exit") != 0: bad.append(f"app_exit={rep.get('app_exit')}")
+        if not res: bad.append("no ctrl_result")
+        fails = [m for m in logs if "FAIL" in m]
+        if fails: bad.append(f"callback_fail={fails[:2]}")
+        return res, logs, rows, bad
+
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"cdx-owndrx-{bk}"
+        try:
+            N = 50
+            res, logs, rows, bad = go("owndrx", bk, ["--n", N])
+            w = res.get("w") or []
+            if len(w) != 4 or not any(v == N for v in w) or any(v not in (-1, N) for v in w):
+                bad.append(f"own_watch_per_slot={w} (want {N} on every free slot)")
+            if not any(m.startswith("ok wonce=1") for m in logs): bad.append(f"no one-shot watch: {logs[:2]}")
+            record(name, not bad, " ".join(bad) or f"own watch per slot={w}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"cdx-faultreg-{bk}"
+        try:
+            N = 200
+            res, logs, rows, bad = go("faultreg", bk, ["--n", N])
+            hits = sum(x.get("hits", 0) for x in rows)
+            if hits != N: bad.append(f"hits={hits}")
+            if len(logs) != N: bad.append(f"logs={len(logs)}")
+            if res.get("fix") != N: bad.append(f"veh_fixes={res.get('fix')} (want {N})")
+            if res.get("tf") != 0 and bk != "breakpoint": bad.append(f"tf_in_handler={res.get('tf')}")
+            if res.get("stray") != 0: bad.append(f"stray_single_steps={res.get('stray')}")
+            record(name, not bad, " ".join(bad) or f"hits={hits} logs={len(logs)} fixes={res.get('fix')}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"cdx-absreuse-{bk}"
+        try:
+            res, logs, rows, bad = go("absreuse", bk, [])
+            if res.get("reused") != 1: bad.append(f"reused={res.get('reused')} (address not free after unload)")
+            if "op arm ok=1/1" not in logs: bad.append(f"arm={[m for m in logs if 'arm' in m]}")
+            peek = [m for m in logs if m.startswith("op peek")]
+            if peek != ["op peek r=1 cc=16 n=16 first=cc"]: bad.append(f"peek={peek} (want 16 x 0xCC)")
+            record(name, not bad, " ".join(bad) or peek[0])
+        except Exception as e:
+            record(name, False, repr(e))
+
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"cdx-int3cap-{bk}"
+        try:
+            n = 1200
+            res, logs, rows, bad = go("int3cap", bk, ["--n", n], timeout=300)
+            if f"op arm ok={n}/{n}" not in logs: bad.append(f"arm={[m for m in logs if 'arm' in m]}")
+            peek = [m for m in logs if m.startswith("op peek")]
+            if peek != ["op peek r=1 cc=0 n=16 first=90"]: bad.append(f"peek={peek} (want no 0xCC in the last 16)")
+            record(name, not bad, " ".join(bad) or f"{n} breakpoints, {peek[0]}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"cdx-bigcfg-{bk}"
+        try:
+            res, logs, rows, bad = go("bigcfg", bk, [])
+            if "ok bigcfg add=1" not in logs: bad.append(f"add={[m for m in logs if 'bigcfg' in m]}")
+            if logs.count("tock") != 1: bad.append(f"tock_logs={logs.count('tock')} (want 1)")
+            record(name, not bad, " ".join(bad) or "64 MiB + 4 KiB config accepted, new probe fired once")
+        except Exception as e:
+            record(name, False, repr(e))
+
 # ---- logs-*: adversarial log delivery (examples/logs_eval) --------------------------------
 # Gospel: logs are never dropped and always delivered; hits == logs + log_dropped +
 # callbacks_interrupted, and log_dropped != 0 only when the controller itself is gone.
@@ -6079,6 +6177,7 @@ def main():
     if args.soak_minutes > 0:
         if want(check_soak): check_soak(args.soak_minutes)
     if want(check_ctrl_review): check_ctrl_review()
+    if want(check_cdx_review): check_cdx_review()
     if want(check_newapp_files): check_newapp_files()
     if want(check_newapp_flag): check_newapp_flag()
     if want(check_newapp_reg): check_newapp_reg()

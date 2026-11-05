@@ -1,4 +1,5 @@
-// ctrl_driver --scenario fault|inplace|absunload|symunload|owndr|headcorrupt|shape [--shape S] --backend b
+// ctrl_driver --scenario fault|faultreg|inplace|absunload|symunload|owndr|owndrx|absreuse|int3cap|
+//                        bigcfg|headcorrupt|shape [--shape S] --backend b
 //             -- <ctrl_target.exe> <scenario> [opts]
 // Instruments ctrl_target for one controller-review finding (see ctrl_target.cpp) with
 // one backend, runs it and prints the target's result, the probe rows and the logs.
@@ -15,6 +16,9 @@ void ctrl_on_loop(probe_context *);
 void ctrl_on_announce(probe_context *);
 void ctrl_on_leaf(probe_context *);
 void ctrl_on_tick(probe_context *);
+void ctrl_on_op(probe_context *);
+void ctrl_on_wonce(probe_context *);
+void ctrl_on_bigcfg(probe_context *);
 void ctrl_on_shape(probe_context *);
 }
 struct ctrl_cfg { uint32_t backend; uint32_t pad; };
@@ -42,7 +46,7 @@ int main(int argc, char **argv) {
     ctrl_cfg k{backend, 0};
     bool ok = s != nullptr;
     if (ok) {
-        if (sc == "fault")
+        if (sc == "fault" || sc == "faultreg")
             ok = probe_add_symbol(s, "ctrl_target.exe!CtrlLoadInsn", ctrl_on_load, backend);
         else if (sc == "inplace")
             ok = probe_add_symbol(s, "ctrl_target.exe!CtrlLoopInsn", ctrl_on_loop, backend);
@@ -52,6 +56,12 @@ int main(int argc, char **argv) {
             ok = probe_add_symbol(s, "ctrl_dll.dll!CtrlDllLeaf", ctrl_on_leaf, backend);
         else if (sc == "owndr" || sc == "headcorrupt")
             ok = probe_add_symbol(s, "ctrl_target.exe!CtrlTick", ctrl_on_tick, backend);
+        else if (sc == "absreuse" || sc == "int3cap")
+            ok = probe_add_symbol(s, "ctrl_target.exe!CtrlOp", ctrl_on_op, backend);
+        else if (sc == "owndrx")
+            ok = probe_add_symbol(s, "ctrl_target.exe!CtrlWatchOnce", ctrl_on_wonce, backend);
+        else if (sc == "bigcfg")
+            ok = probe_add_symbol(s, "ctrl_target.exe!CtrlBigCfg", ctrl_on_bigcfg, backend);
         else if (sc == "shape")
             ok = probe_add_symbol(s, ("ctrl_target.exe!Shape_" + shape + "_P_Insn").c_str(), ctrl_on_shape, backend);
         else { std::fprintf(stderr, "ctrl_driver: unknown scenario %s\n", sc.c_str()); ok = false; }

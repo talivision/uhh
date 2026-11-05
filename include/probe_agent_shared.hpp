@@ -10,7 +10,7 @@
 #include <cstdio>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 17;
+constexpr uint32_t PROBE_AGENT_VERSION = 18;
 constexpr uint32_t PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH = 1u << 9;   /* agent side only needs this one */   /* == PROBE_UNSAFE_FAST_PATCH (asserted in session.cpp) */
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 128;   /* inline probes per session; the 129th is refused */
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
@@ -47,8 +47,12 @@ struct probe_agent_request {
 /* Armed software breakpoints (INT3) of the session, published by the controller so an INLINE
    callback's get_mem shows the program's byte under them, as breakpoint/hw callbacks do (a
    callback reading code another backend probes saw 0xCC inline). Seqlock: the controller
-   makes int3_seq odd while it rewrites the table; a reader retries (bounded) or skips. */
-constexpr uint32_t PROBE_AGENT_INT3_CAP = 1024;
+   makes int3_seq odd while it rewrites the table; a reader retries (bounded) or skips.
+   The table holds EVERY armed breakpoint: in a session with the inline channel the controller
+   refuses to arm more than PROBE_AGENT_INT3_CAP (documented in probe_api.h). It was 1024 and
+   silently truncated: past it an inline get_mem read 0xCC where breakpoint/hw read the
+   program's byte (v18). 1 MiB of the section, touched only as far as it is used. */
+constexpr uint32_t PROBE_AGENT_INT3_CAP = 65536;
 struct probe_agent_int3 { uint64_t address; uint8_t original; uint8_t pad[7]; };
 
 /* Bounded MPMC ring (Vyukov): slot i starts with seq == i. A producer owns position
@@ -101,7 +105,7 @@ enum probe_ipc_op : uint32_t { PROBE_IPC_ADD_ADDRESS = 1, PROBE_IPC_WATCH = 2, P
    from an inline callback has no size limits a breakpoint/hw callback's call does not have
    (it had: config <= 256 bytes, symbol <= 255 chars, refused only inline). */
 constexpr uint64_t PROBE_IPC_TEXT_MAX = 64u << 10;      /* sanity bounds on what the target claims */
-constexpr uint64_t PROBE_IPC_CONFIG_MAX = 64u << 20;
+constexpr uint64_t PROBE_IPC_CONFIG_MAX = 0xFFFFFFFFu;   /* == every backend's config limit (probe_api.h) */
 struct probe_ipc_request {
     uint32_t op, flags, origin_site;
     int32_t result;
