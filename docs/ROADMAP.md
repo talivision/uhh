@@ -132,6 +132,13 @@ reads, a slow (50 ms) callback under 32 threads.
   handled in its VEH) shares DR0-3 with UHH's hardware probes: the target's own breakpoint stopped
   firing. Breakpoint/inline pass the target's #DB through untouched. Document per-backend, or pick
   slots the thread does not use. `hunt-owndr-hw` FAIL by design
+- ⬜ (A8) hw: a hardware probe inside a DLL that 4 threads keep LoadLibrary/FreeLibrary-ing
+  (refcount reaches 0, so it really unloads and re-arms on every reload) misses hits in WHOLE
+  THREADS: probe hits 60 / 120 / 125 of 240 calls (n=60 per thread), x86 and x64, whatever the
+  read probe's backend; breakpoint and inline on the same site are exact. Intermittent on x64
+  (passed twice, failed 3 of 4 later), steady on x86. Suspect: the re-arm on LOAD_DLL writes the
+  DR to a thread blocked in the loader (waiting on the loader lock in a syscall) and that write
+  does not survive -- not yet proven. `hunt-dll-work-backend-hw` FAIL until fixed
 
 ## Codex workaround audit (2026-11-05) — triaged
 - ✗ (C1) handle->pid through kernel32!OpenProcess: example-callback design, not a library issue (user, 2026-11-05); documented in the gated_config README
