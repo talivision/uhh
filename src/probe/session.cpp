@@ -1294,9 +1294,10 @@ static bool arm_breakpoint(probe_session *s, Probe &p, uint64_t base) {
     }
     p.base = base; p.address = address; p.active = true;
     s->retired_bps.erase(address);
-    std::fprintf(stderr, "probe: active %s -> base=0x%llx addr=0x%llx (was 0x%02x, len=%u, %s)\n",
-                 p.location.c_str(), (unsigned long long)base, (unsigned long long)address,
-                 p.original, len, disp_ok ? "displaced" : "in-place");
+    if (!p.internal || trace_enabled())       // library-owned probes are not the user's to see
+        std::fprintf(stderr, "%s %s -> base=0x%llx addr=0x%llx (was 0x%02x, len=%u, %s)\n",
+                     p.internal ? "  internal" : "probe: active", p.location.c_str(), (unsigned long long)base,
+                     (unsigned long long)address, p.original, len, disp_ok ? "displaced" : "in-place");
     return true;
 }
 
@@ -3285,14 +3286,22 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
 }
 
 // "exception 0xc0000005 at msvcp140.dll+0x1234 (read 0x0)" plus a hint for known causes.
-static std::string describe_fault(probe_session *s, const EXCEPTION_RECORD &ex, DWORD code, uint64_t address) {
+// "module+0xoff" for an address in a loaded module (nearest base below it), else "0xaddr".
+static std::string module_offset(probe_session *s, uint64_t address, std::string *module = nullptr) {
     std::string where; uint64_t best = 0;
     for (const auto &m : s->module_bases)
         if (m.second <= address && m.second > best) { best = m.second; where = m.first; }
+    if (module) *module = where;
+    char buf[160];
+    if (best) std::snprintf(buf, sizeof(buf), "%s+0x%llx", where.c_str(), (unsigned long long)(address - best));
+    else std::snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)address);
+    return buf;
+}
+
+static std::string describe_fault(probe_session *s, const EXCEPTION_RECORD &ex, DWORD code, uint64_t address) {
+    std::string where;
     char buf[256];
-    if (best) std::snprintf(buf, sizeof(buf), "exception 0x%08lx at %s+0x%llx", (unsigned long)code,
-                            where.c_str(), (unsigned long long)(address - best));
-    else std::snprintf(buf, sizeof(buf), "exception 0x%08lx at 0x%llx", (unsigned long)code, (unsigned long long)address);
+    std::snprintf(buf, sizeof(buf), "exception 0x%08lx at %s", (unsigned long)code, module_offset(s, address, &where).c_str());
     std::string out = buf;
     if (code == EXCEPTION_ACCESS_VIOLATION && ex.NumberParameters >= 2) {
         std::snprintf(buf, sizeof(buf), " (%s 0x%llx)",
@@ -3306,6 +3315,25 @@ static std::string describe_fault(probe_session *s, const EXCEPTION_RECORD &ex, 
         out += " -- the target's MSVC runtime is older than the one probe_api_agent.dll was built "
                "against; rebuild UHH with -DUHH_STATIC_CRT=ON (the default)";
     return out;
+}
+
+// The crashing thread's call stack, one frame per line as module+offset (raw return
+// addresses, no symbol lookup on this thread), so a crash is diagnosable from stderr alone.
+static void print_crash_stack(probe_session *s, DWORD tid) {
+    HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
+    CONTEXT w{}; w.ContextFlags = CONTEXT_FULL;
+    if (!thread || !GetThreadContext(thread, &w)) { if (thread) CloseHandle(thread); return; }
+#if defined(_WIN64)
+    const uint64_t pc = w.Rip, sp = w.Rsp, fp = w.Rbp;
+#else
+    const uint64_t pc = w.Eip, sp = w.Esp, fp = w.Ebp;
+#endif
+    std::vector<uint64_t> frames;
+    if (!s->sym_ready || !uhh_sym::walk_stack(s->pi.hProcess, thread, w, pc, sp, fp, frames, PROBE_STACK_MAX_FRAMES))
+        frames.assign(1, pc);
+    CloseHandle(thread);
+    for (size_t i = 0; i < frames.size(); ++i)
+        std::fprintf(stderr, "probe:   #%zu %s\n", i, module_offset(s, frames[i]).c_str());
 }
 
 static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
@@ -3411,6 +3439,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         // Unhandled: the target is about to die. Say where, whatever the cause.
         std::fprintf(stderr, "probe: target crashed: tid=%lu %s\n", (unsigned long)event.dwThreadId,
                      describe_fault(s, ex, code, address).c_str());
+        print_crash_stack(s, event.dwThreadId);
     }
     if (trace_enabled() && code == EXCEPTION_ACCESS_VIOLATION && ex.NumberParameters >= 2) {
         unsigned char around[24] = {0}; size_t got = 0;

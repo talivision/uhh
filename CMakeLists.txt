@@ -158,6 +158,7 @@ target_compile_definitions(probe_api_agent PRIVATE BREAKAGE_AGENT_ONLY FRIDA_PAR
 # Undecorated names for the __stdcall agent entries (x86 would otherwise export
 # _probe_agent_init@4; the controller resolves them by a fixed bare name).
 target_link_options(probe_api_agent PRIVATE "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/src/probe/agent.def")
+target_link_options(probe_api_agent PRIVATE "/ENTRY:uhh_agent_entry")   # keeps the CRT alive at process exit (agent.cpp)
 set_property(TARGET probe_api_agent APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/probe/agent.def")
 
 # --- Example: gated_config (launch) and uhh_attach (attach) -------------------------

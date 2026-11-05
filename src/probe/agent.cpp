@@ -920,3 +920,16 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, void *) {
     if (reason == DLL_PROCESS_ATTACH) { self_module = module; DisableThreadLibraryCalls(module); }
     return TRUE;
 }
+
+// The agent's entry point (linked /ENTRY:uhh_agent_entry). The agent carries its own static
+// CRT, which DLL_PROCESS_DETACH would tear down -- but at PROCESS EXIT the hooks are still
+// installed and keep firing while later DLLs shut down (CloseHandle, RegCloseKey, ...): a
+// callback would then run on a dead CRT and abort() the target (seen: cmd.exe 0xC0000409
+// at exit under inline traceapi probes). The process is going away, so at termination the
+// CRT is simply left alive and every late hit is still delivered. A real unload
+// (FreeLibrary: reserved == nullptr) uninitialises normally.
+extern "C" BOOL WINAPI _DllMainCRTStartup(HINSTANCE, DWORD, void *);
+extern "C" BOOL WINAPI uhh_agent_entry(HINSTANCE module, DWORD reason, void *reserved) {
+    if (reason == DLL_PROCESS_DETACH && reserved) return TRUE;
+    return _DllMainCRTStartup(module, reason, reserved);
+}
