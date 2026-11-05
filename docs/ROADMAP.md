@@ -306,7 +306,13 @@ PowerShell + detach) under every backend, against an uninstrumented baseline.
   frozen, inline probe not live in that window (seen: hits=0, "released 19 held
   thread(s) (detach)" at 2.5 s). Fix idea: hold only for the install itself (after the
   agent is loaded and its service thread is up), not across LoadLibrary / thread start.
-  Test: `blog-pwsh-attach-detach-inline` (fails when it happens)
+  Test: `blog-pwsh-attach-detach-inline` (fails when it happens; 2 of ~10 x64 runs).
+  Same family seen once on x86 `attach-inline` (1 of 4): the LOAD_DLL hold for
+  configparse hit "inline install not confirmed within 5 s", the flag probe missed the
+  parse, 0/8000 reads.
+- (note) `attach-new` failed once because ANOTHER agent's probe_app.exe started in the
+  same second on the shared VM and was attached instead (image-name matching is
+  inherently racy on a shared box; not a library bug).
 - ⬜ (B6) API reality the docs should mention: `bcrypt!BCryptGenRandom` re-enters itself
   (2 hits per call), so entry counts != API calls and a naive return-capture needs a 5th
   hw slot; probes report every caller of a system export (CoCreateInstance 25 hits for 24
