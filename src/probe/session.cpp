@@ -2944,8 +2944,30 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
     // would silently drop the other. Callbacks compose on one context in slot order.
     bool any = false, exec_hit = false;
     DWORD64 consumed = 0;
+    DWORD64 fired = native.Dr6 & 0xF;
+    if (!fired) {
+        // An execute breakpoint whose status was lost: a debug-register write from the
+        // controller (arming another hardware probe on every thread) reached this thread
+        // while its #DB was still waiting to be reported, and that write carries DR6 too,
+        // so the B-bit reads 0 here. Found by examples/famous retval_override (the target
+        // then died of an "unhandled" STATUS_SINGLE_STEP). An execute DR is unambiguous by
+        // address: a trap exactly at an active hardware execute probe whose slot is
+        // enabled on this thread is that probe's hit.
+#if defined(_WIN64)
+        const uint64_t pc = native.Rip;
+#else
+        const uint64_t pc = native.Eip;
+#endif
+        for (auto &p : s->probes)
+            if (p->active && (p->flags & PROBE_HW) && !(p->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) &&
+                p->address == pc && p->dr_slot >= 0 && p->dr_slot < 4 && ((native.Dr7 >> (p->dr_slot * 2)) & 1))
+                fired |= (DWORD64)1 << p->dr_slot;
+        if (fired && trace_enabled())
+            std::fprintf(stderr, "  hw-dr6-lost tid=%lu pc=0x%llx inferred=0x%llx\n", (unsigned long)event.dwThreadId,
+                         (unsigned long long)pc, (unsigned long long)fired);
+    }
     for (int slot = 0; slot < 4; ++slot) {
-        if (!(native.Dr6 & (1u << slot))) continue;
+        if (!(fired & (1u << slot))) continue;
         Probe *probe = nullptr;
         for (auto &p : s->probes) if (p->active && (p->flags & PROBE_HW) && p->dr_slot == slot) { probe = p.get(); break; }
         if (!probe) {
@@ -2990,7 +3012,15 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
         native.Esp = (DWORD)context.regs.rsp;
 #endif
     }
-    if (!any) { CloseHandle(thread); return true; }                  // none of our DRs fired
+    if (!any) {                                                      // none of our DRs fired
+        if (trace_enabled())
+            std::fprintf(stderr, "  hw-not-ours tid=%lu dr6=0x%llx dr7=0x%llx dr0=0x%llx dr1=0x%llx dr2=0x%llx dr3=0x%llx "
+                                 "used=0x%x ever=0x%x eflags=0x%lx\n", (unsigned long)event.dwThreadId,
+                         (unsigned long long)native.Dr6, (unsigned long long)native.Dr7, (unsigned long long)native.Dr0,
+                         (unsigned long long)native.Dr1, (unsigned long long)native.Dr2, (unsigned long long)native.Dr3,
+                         s->dr_used, s->dr_ever, (unsigned long)native.EFlags);
+        CloseHandle(thread); return true;
+    }
     // RF only for EXECUTE breakpoints (fault-type: the instruction has not run yet). Data
     // watchpoints are trap-type -- the access already happened -- and RF would wrongly
     // suppress an execute breakpoint on the very next instruction.
@@ -3049,9 +3079,10 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         }
     }
     if (trace_enabled())
-        std::fprintf(stderr, "EV code=0x%lx tid=%lu addr=0x%llx step=%d probe=%d\n",
+        std::fprintf(stderr, "EV code=0x%lx tid=%lu addr=0x%llx step=%d probe=%d first=%lu\n",
                      (unsigned long)code, (unsigned long)event.dwThreadId,
-                     (unsigned long long)address, step != stepping.end(), probe != nullptr);
+                     (unsigned long long)address, step != stepping.end(), probe != nullptr,
+                     (unsigned long)event.u.Exception.dwFirstChance);
     if (code == EXCEPTION_SINGLE_STEP && step == stepping.end() && (s->hw_active || s->dr_ever)) {
         bool handled = false;
         if (!handle_hw(s, event, handled)) return false;

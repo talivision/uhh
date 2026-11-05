@@ -1595,9 +1595,47 @@ def famous_x86():
     return struct.unpack_from("<H", data, struct.unpack_from("<I", data, 0x3C)[0] + 4)[0] == 0x14C
 
 
+def famous_json_lines(text):
+    out = []
+    for line in text.splitlines():
+        if line.startswith("{"):
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return out
+
+
+def famous_objs(r, objs):
+    """The probe_log records from the session's JSONL file (the "probe: logs -> path" line on
+    stderr) instead of the live stdout tail: the target inherits the same stdout, and a
+    program writing partial lines (cmd's `type`) interleaves with the tail mid-line. The
+    other records (app, probe, probe_report) come from stdout."""
+    m = re.search(r"probe: logs -> (.+)", r.stderr or "")
+    if not m:
+        return objs
+    path = Path(m.group(1).strip())
+    logs = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("{"):
+                    try:
+                        o = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if o.get("kind") == "probe_log":
+                        logs.append(o)
+        path.unlink()
+    except OSError:
+        return objs
+    return [o for o in objs if o.get("kind") != "probe_log"] + logs
+
+
 def famous(recipe, bk, argv, timeout=600, extra=()):
-    return run([exe("famous_driver.exe"), "--recipe", recipe, "--backend", bk, *extra, "--", *argv],
-               timeout=timeout)
+    r, objs = run([exe("famous_driver.exe"), "--recipe", recipe, "--backend", bk, *extra, "--", *argv],
+                  timeout=timeout)
+    return r, famous_objs(r, objs)
 
 
 def famous_msgs(objs, prefix=""):
@@ -1656,6 +1694,23 @@ def check_famous_heap(threads=4, iters=600):
                              f"app_same={a == base} {h}")
         except Exception as e:
             record(name, False, repr(e))
+    # Inline allocator probe whose callback calls call_func (Process.mainModule) while
+    # threads start, the agent's own included. Two agent bugs killed the target here in
+    # ~half of short runs: the callback ran before the thread had TLS (the agent's
+    # per-thread cache faulted), and the allocations inside call_func's own callee hit the
+    # probe again, recursing until STATUS_STACK_OVERFLOW.
+    name = "famous-heap-inline-reentry"
+    try:
+        bad = []
+        for i in range(12):
+            r, o = famous("heap", "inline", [t, "--threads", 2, "--iters", 50])
+            a, s = app(o), famous_kv((famous_msgs(o, "heap-summary") or [""])[-1])
+            if r.returncode != 0 or not a or s.get("leaks") != str(a.get("leaks")):
+                bad.append(f"run{i}: rc={r.returncode} app_exit={report(o).get('app_exit')} "
+                           f"err={(report(o).get('error') or '')[:80]}")
+        record(name, not bad, f"failed {len(bad)}/12 " + " | ".join(bad[:3]))
+    except Exception as e:
+        record(name, False, repr(e))
 
 
 def famous_file_totals(objs, dirname):
@@ -1697,8 +1752,11 @@ def check_famous_files(threads=3, chunks=20):
     root.mkdir(exist_ok=True)
 
     def fresh(tag):
+        # Created here, so the target's own CreateDirectory is skipped: with the hardware
+        # backend's single spare debug register only one NtCreateFile call site can be armed.
         p = root / f"files_{os.getpid()}_{tag}"
         shutil.rmtree(p, ignore_errors=True)
+        p.mkdir(parents=True)
         return p
 
     try:
@@ -1744,7 +1802,10 @@ def check_famous_files(threads=3, chunks=20):
                                     "--delay-ms", "2500"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             tout, _ = tgt.communicate(timeout=300)
             out, err = drv.communicate(timeout=300)
-            objs = [json.loads(line) for line in out.splitlines() if line.startswith("{")]
+
+            class _R:
+                stderr = err
+            objs = famous_objs(_R, famous_json_lines(out))
             a = app([json.loads(line) for line in tout.splitlines() if line.startswith("{")])
             tot, _ = famous_file_totals(objs, wdir.name)
             want = famous_file_expect(a)
@@ -1765,26 +1826,34 @@ def check_famous_files(threads=3, chunks=20):
     # (NtReadFile: the requested lengths must cover the file).
     sysdir = Path(r"C:\Windows\SysWOW64") if famous_x86() else SYS32
     data_dir = fresh("sysbin")
-    data_dir.mkdir(parents=True, exist_ok=True)
     data = data_dir / "haystack.txt"
     data.write_text("".join(f"line {i} {'UHHNEEDLE' if i % 7 == 0 else 'hay'}\n" for i in range(400)))
     size = data.stat().st_size
     want_lines = sum(1 for i in range(400) if i % 7 == 0)
-    for tool, argv, lines_want in (("findstr", [sysdir / "findstr.exe", "UHHNEEDLE", data], want_lines),
-                                   ("type", [sysdir / "cmd.exe", "/d", "/c", "type", data], 400)):
+    typed = data_dir / "typed.txt"
+    for tool, argv in (("findstr", [sysdir / "findstr.exe", "UHHNEEDLE", data]),
+                       ("type", [sysdir / "cmd.exe", "/d", "/c", "type", data, ">", typed])):
         for bk in FAMOUS_BACKENDS:
             name = f"famous-files-{tool}-{bk}"
             try:
+                if typed.exists():
+                    typed.unlink()
                 r, o = famous("files", bk, argv, extra=("--filter", "haystack.txt"))
-                found = sum(1 for line in r.stdout.splitlines() if line.startswith("line "))
+                # The program's own output, compared with the input: findstr's matches are
+                # counted in the shared stdout (lines may interleave with the log tail, the
+                # needle never appears in a log line); type's goes to a file.
+                if tool == "findstr":
+                    out_ok, out = r.stdout.count("UHHNEEDLE") == want_lines, f"matches={r.stdout.count('UHHNEEDLE')}/{want_lines}"
+                else:
+                    same = typed.exists() and typed.read_bytes() == data.read_bytes()
+                    out_ok, out = same, f"typed_same={same}"
                 tot, opens = famous_file_totals(o, data_dir.name)
-                e = tot.get("haystack.txt", [0, 0, 0, 0])
+                ev = tot.get("haystack.txt", [0, 0, 0, 0])
                 h_ok, h = famous_health(r.returncode, o, bk)
-                reads_ok = tool == "findstr" or (e[2] >= 1 and e[3] >= size)
-                ok = (h_ok and found == lines_want and bool(opens.get("haystack.txt")) and
+                reads_ok = tool == "findstr" or (ev[2] >= 1 and ev[3] >= size)
+                ok = (h_ok and out_ok and bool(opens.get("haystack.txt")) and
                       all(st == "00000000" for st in opens["haystack.txt"]) and reads_ok)
-                record(name, ok, f"{h} lines={found}/{lines_want} opens={opens.get('haystack.txt')} "
-                                 f"reads={e[2]} read_len={e[3]} size={size}")
+                record(name, ok, f"{h} {out} opens={opens.get('haystack.txt')} reads={ev[2]} read_len={ev[3]} size={size}")
             except Exception as e:
                 record(name, False, repr(e))
 

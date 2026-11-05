@@ -51,7 +51,7 @@ int main(int argc, char **argv) {
     }
     if (threads < 1 || threads > 32 || g_chunks < 1) return 2;
     if (delay) Sleep((DWORD)delay);
-    CreateDirectoryA(g_dir, NULL);
+    if (GetFileAttributesA(g_dir) == INVALID_FILE_ATTRIBUTES) CreateDirectoryA(g_dir, NULL);
     HANDLE h[32];
     for (int k = 0; k < threads; ++k) h[k] = CreateThread(NULL, 0, worker, (void *)(INT_PTR)k, 0, NULL);
     WaitForMultipleObjects((DWORD)threads, h, TRUE, INFINITE);
