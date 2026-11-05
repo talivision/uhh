@@ -107,6 +107,7 @@ add_library(probe_api_agent SHARED
     examples/dynwatch/dynwatch_callbacks.cpp
     examples/trace/trace_callback.cpp
     examples/conformance/conformance_callbacks.cpp
+    examples/stacks/stacks_callbacks.cpp
     bench/hitcost/hitcost_callbacks.cpp
     examples/memstress/memstress_callbacks.cpp
     examples/sidefx/sidefx_callbacks.cpp)
@@ -265,12 +266,30 @@ foreach(rw reentrancy_target thread_stress_target antitamper_target antidebug_ta
     target_link_options(${rw} PRIVATE /DEBUG)
 endforeach()
 
+# --- stacks: send_log_stack through mid-function, FPO and leaf frames, every backend ------
+# Optimised C callers (/Oy on x86: frame-pointer omission) over asm sites of exact shape;
+# PDBs so the controller's dbghelp walk has FPO data and frames symbolize.
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    set(STK_ASM examples/stacks/stk_sites_x86.asm)
+    set(STK_OY /Oy)
+else()
+    set(STK_ASM examples/stacks/stk_sites_x64.asm)
+    set(STK_OY "")
+endif()
+add_executable(stacks_target examples/stacks/stacks_target.c ${STK_ASM})
+target_compile_options(stacks_target PRIVATE /Zi $<$<COMPILE_LANGUAGE:C>:/O2> $<$<COMPILE_LANGUAGE:C>:${STK_OY}>)
+target_link_options(stacks_target PRIVATE /DEBUG /INCREMENTAL:NO "/MAP:$<TARGET_FILE_DIR:stacks_target>/stacks_target.map")
+add_executable(stacks_driver examples/stacks/stacks_driver.cpp examples/stacks/stacks_callbacks.cpp)
+target_include_directories(stacks_driver PRIVATE include)
+target_link_libraries(stacks_driver PRIVATE probe_api)
+add_dependencies(stacks_driver stacks_target probe_api_agent)
+
 add_executable(refusal_driver examples/conformance/refusal_driver.cpp)
 target_include_directories(refusal_driver PRIVATE include)
 target_link_libraries(refusal_driver PRIVATE probe_api)
 add_dependencies(refusal_driver hitcost_target)
 
-foreach(t gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
+foreach(t stacks_target stacks_driver gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
     target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 endforeach()

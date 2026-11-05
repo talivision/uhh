@@ -1579,6 +1579,73 @@ def check_realworld():
                 record(label, False, repr(e))
 
 
+STACK_SITES = {"mid": "StkMidSite", "fpo": "StkFpoSite", "leaf": "StkLeafSite"}
+
+
+def frame_name(f):
+    """'mod!func+0x12 (file:line) [0xADDR]' -> 'func' ('' when unsymbolized)."""
+    head = f.split(" ")[0]
+    if "!" not in head:
+        return ""
+    return head.split("!", 1)[1].rsplit("+", 1)[0]
+
+
+def strip_addr(f):
+    return f.rsplit(" [0x", 1)[0]
+
+
+def check_stacks():
+    """send_log_stack at a mid-function site, in a frame-pointer-omitted function that uses
+    EBP/RBP as data, and in a leaf -- each reached through optimised (x86: /Oy) C callers.
+    Every backend must show <site>, stk_outer_<x>, main, and the symbolized stacks (addresses
+    stripped) must be IDENTICAL across breakpoint, hw and inline -- frame 0 included."""
+    d, t = exe("stacks_driver.exe"), exe("stacks_target.exe")
+    if not d or not t:
+        return skip("stacks", "stacks_driver/stacks_target missing")
+    try:
+        r = rvas("stacks_target.map", *STACK_SITES.values())
+    except Exception as e:
+        return record("stacks", False, f"map: {e!r}")
+    specs = [f"{k}=stacks_target.exe+{r[v]:#x}" for k, v in STACK_SITES.items()]
+    per_bk = {}
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"stacks-{bk}"
+        try:
+            _, o = run([d, "--backend", bk, *specs, "--", t], timeout=120)
+            tgt = next((x for x in o if x.get("kind") == "target"), {})
+            got, bad = {}, []
+            for k, site in STACK_SITES.items():
+                sts = [[strip_addr(f) for f in x.get("stack") or []] for x in o
+                       if x.get("kind") == "probe_log" and x.get("message") == f"stack {k}"]
+                want = [site, f"stk_outer_{k}", "main"]
+                names = [[frame_name(f) for f in st] for st in sts]
+                if len(sts) != 3:
+                    bad.append(f"{k}: {len(sts)} logs")
+                elif any(n[:3] != want for n in names):
+                    bad.append(f"{k}: {names[0][:5]}")
+                elif any(st != sts[0] for st in sts):
+                    bad.append(f"{k}: hits differ")
+                got[k] = sts[0] if sts else []
+            per_bk[bk] = got
+            ok = not bad and tgt.get("correct") == 9 and report(o).get("error") is None
+            record(name, ok, f"correct={tgt.get('correct')}/9 err={report(o).get('error')} bad={bad} "
+                             f"fpo={[frame_name(f) for f in got.get('fpo', [])]}")
+        except Exception as e:
+            record(name, False, repr(e))
+    if len(per_bk) == 3:
+        diffs = []
+        for k in STACK_SITES:
+            ref = per_bk["breakpoint"].get(k)
+            for bk in ("hw", "inline"):
+                other = per_bk[bk].get(k)
+                if other != ref:
+                    i = next((j for j in range(max(len(ref or []), len(other or [])))
+                              if (ref or [None] * 99)[j:j + 1] != (other or [None] * 99)[j:j + 1]), -1)
+                    diffs.append(f"{k}/{bk}@{i}: {(ref or [])[i:i + 1]} vs {(other or [])[i:i + 1]}")
+        record("stacks-identical", not diffs and all(per_bk[b].get(k) for b in per_bk for k in STACK_SITES),
+               f"diffs={diffs[:4]} frames={ {k: len(per_bk['breakpoint'].get(k) or []) for k in STACK_SITES} }")
+
+
 def main():
     global BIN
     ap = argparse.ArgumentParser()
@@ -1649,6 +1716,7 @@ def main():
     if want(check_attach_new): check_attach_new()
     if want(check_refusals): check_refusals()
     if want(check_hotpatch_prologue): check_hotpatch_prologue()
+    if want(check_stacks): check_stacks()
     print("-" * 72)
     failed = 0
     for name, status, detail in RESULTS:
