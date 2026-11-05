@@ -391,10 +391,12 @@ reproduced on x64 before the fix (baseline numbers quoted) and has a `logs-*` ch
   fired, and dropped logs while the controller was alive when it did -- was the only way out.
   Baseline: `logs-wedge-kill` 4107/12000 calls in 25 s (deadline), `logs-wedge-suspend` 4103/12000
   in 42 s, `logs-wedge-exit` session hung > 180 s. Fix (`probe_agent_shared.hpp`, agent `agent_log`,
-  session `check_ring_stall`/`drain_final`): a slot records its owner tid right after the claim; the
-  drainer skips a claimed slot whose owner thread is GONE (its callback stays counted in flight ->
-  `callbacks_interrupted`: accounted, not dropped); while the ring is stuck behind a LIVE owner for
-  200 ms it sets `ring_stalled` and producers hand records over synchronously (`PROBE_IPC_LOG`, the
+  session `check_ring_stall`/`drain_final`): a producer claims a slot by owning it (CAS of the slot's
+  owner tid) BEFORE moving the head, so every claimed slot names its producer; the drainer skips a
+  claimed slot whose owner thread is GONE (its callback stays counted in flight ->
+  `callbacks_interrupted`: accounted, not dropped); behind a LIVE but stopped owner it delivers the
+  published records past that slot (in ring order; marked delivered, freed when the tail passes),
+  and after 200 ms it sets `ring_stalled` and producers hand records over synchronously (`PROBE_IPC_LOG`, the
   existing agent->debugger exception channel) instead of waiting or dropping. The producer-side
   2-s drop is gone: a producer drops only when the controller stopped consuming
   (`controller_gone`) or its process is dead (new: checked when the drainer heartbeat has not moved
@@ -404,9 +406,10 @@ reproduced on x64 before the fix (baseline numbers quoted) and has a `logs-*` ch
   and a breakpoint/hw-probed call saw its records reordered (inline records crossed the ring while
   the debugger queued its own directly). Baseline: 2923 (inline+breakpoint) / 1783 (inline+hw)
   inversions in 16000. Fix: a controller-side send_log first drains the ring (the hit thread is
-  stopped, so its earlier inline records are all published). Residual (documented, not fixed): a
-  record queued behind ANOTHER thread's unfinished slot, and records sent over `PROBE_IPC_LOG` while
-  the ring is stalled, can still overtake that thread's earlier ring records.
+  stopped, so its earlier inline records are all published). It also delivers past one unfinished slot
+  of another thread (frozen mid-record by the debug event). After the fix: 0 inversions.
+  Residual (documented): a record behind TWO unfinished slots of other threads at the same instant
+  can still be overtaken.
 - ✅ **Silent content loss in log text.** An embedded NUL (`%c` of 0) cut the message there; tab, CR
   and other control characters were deleted by the JSON writer; invalid UTF-8 bytes were written raw
   (the line was not valid UTF-8 JSON -- a strict reader rejects it); an `[unformattable]` copy of a
@@ -424,7 +427,11 @@ reproduced on x64 before the fix (baseline numbers quoted) and has a `logs-*` ch
   freeze caught mid-record finishes it instead of losing it), recovers published records behind a
   never-published slot, and the detach summary prints `in_flight=` (hits == logs_written +
   log_dropped + in_flight).
-- Checked, no defect: maximum-size text (1023 bytes kept whole, 1024 marked), `%n`/huge widths/
+- After the fix (x64): `logs-wedge-kill` 12000/12000 in 109 ms, `logs-wedge-suspend` 12000/12000 in
+  2.1 s with every record delivered live, `logs-wedge-exit` exits with hits == logs + 1 interrupted,
+  `logs-controller-killed` target completes 80000 calls.
+- Checked, no defect: ExitProcess / TerminateProcess(self) during a 4-thread flood on every backend
+  (hits == logs + log_dropped + callbacks_interrupted exactly, dropped 0); maximum-size text (1023 bytes kept whole, 1024 marked), `%n`/huge widths/
   null `%s`, valid UTF-8, stack snapshots on truncated messages, a slow stdout pipe (backpressure,
   nothing dropped), ring-full while the debugger holds the target (waiting time is not counted while
   the target is frozen).
