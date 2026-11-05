@@ -2819,8 +2819,10 @@ static void hold_thread(probe_session *s, DWORD tid) {
 
 // ---- Inline-install gates ------------------------------------------------------------
 // A module with inline sites that loads while the target runs: rather than park the
-// LOADING thread (it holds loader state the agent's install can need -- that deadlocked
-// until the hold timed out), put a hardware execute breakpoint on each pending site.
+// LOADING thread at its LOAD_DLL event (it is the loader's load owner; parking it is safe
+// only because the agent's service thread never needs the loader once it runs -- it reports
+// ready from its own code, after its loader thread-init), put a hardware execute breakpoint
+// on each pending site.
 // Whoever reaches a site before its hook is confirmed is held THERE (no loader locks),
 // and resumes straight into the hook once it is in. No call is missed, nothing waits on
 // the loader. Falls back to the old hold when the debug registers are all taken.
@@ -3389,7 +3391,7 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
             // Harmless if forged: acceptance re-checks every request status itself.
             if (!accept_agent_install(s)) { std::fprintf(stderr, "probe: %s\n", s->error.c_str()); }
             if (agent_has_pending(s)) kick_agent(s);
-            else if (!inline_unconfirmed(s)) release_held(s, "inline installs confirmed");
+            else if (!inline_hold_needed(s)) release_held(s, "inline installs confirmed");
             return true;
         }
     }
@@ -3956,6 +3958,36 @@ static void print_crash_stack(probe_session *s, DWORD tid) {
     CloseHandle(thread);
     for (size_t i = 0; i < frames.size(); ++i)
         std::fprintf(stderr, "probe:   #%zu %s\n", i, module_offset(s, frames[i]).c_str());
+}
+
+// PROBE_TRACE diagnostics: every target thread's symbolized stack (each thread briefly
+// suspended for its context), e.g. when an install hold does not confirm -- shows what the
+// agent's service thread is waiting on and what the held threads own.
+static void trace_thread_stacks(probe_session *s, const char *why) {
+    std::fprintf(stderr, "  thread stacks (%s) t=%llu:\n", why, (unsigned long long)GetTickCount64());
+    for (DWORD tid : s->threads) {
+        HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME, FALSE, tid);
+        if (!thread) continue;
+        const DWORD prev = SuspendThread(thread);
+        CONTEXT w{}; w.ContextFlags = CONTEXT_FULL;
+        if (GetThreadContext(thread, &w)) {
+#if defined(_WIN64)
+            const uint64_t pc = w.Rip, sp = w.Rsp, fp = w.Rbp;
+#else
+            const uint64_t pc = w.Eip, sp = w.Esp, fp = w.Ebp;
+#endif
+            std::vector<uint64_t> frames;
+            if (!s->sym_ready || !uhh_sym::walk_stack(s->pi.hProcess, thread, w, pc, sp, fp, frames, 24))
+                frames.assign(1, pc);
+            std::fprintf(stderr, "  tid=%lu suspend=%lu%s\n", (unsigned long)tid, (unsigned long)prev,
+                         agent_thread(s, tid) ? " (agent)" : "");
+            for (size_t i = 0; i < frames.size(); ++i)
+                std::fprintf(stderr, "    #%zu %s %s\n", i, module_offset(s, frames[i]).c_str(),
+                             s->sym_ready ? uhh_sym::symbolize(s->pi.hProcess, frames[i]).c_str() : "");
+        }
+        if (prev != (DWORD)-1) ResumeThread(thread);
+        CloseHandle(thread);
+    }
 }
 
 static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
@@ -4585,7 +4617,9 @@ static bool complete_remote_thread(probe_session *s, DWORD result) {
         if (!accept_agent_install(s)) return false;
         // Requests registered while that round ran (runtime inline adds) go next.
         if (agent_has_pending(s)) return kick_agent(s);
-        if (!inline_unconfirmed(s)) release_held(s, "inline installs confirmed");
+        // Release only once the service thread runs too (it reports itself with an
+        // INSTALL_DONE): a module with inline sites may load the moment the threads go.
+        if (!inline_hold_needed(s)) release_held(s, "inline installs confirmed");
         return true;
     }
     return true;
@@ -4839,6 +4873,8 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
             s->remote_agent = base;
         }
         if (!s->held.empty()) s->held_since = GetTickCount64();   // symbol work above may have been slow
+        if (trace_enabled()) std::fprintf(stderr, "  load_dll %s tid=%lu pending=%d t=%llu\n", name.c_str(),
+                                          (unsigned long)event.dwThreadId, (int)agent_has_pending(s), (unsigned long long)GetTickCount64());
         if (ok && agent_has_pending(s)) {
             if (s->shared->service_ready && s->svc_event) {
                 // Gate the new sites with debug registers and let the loading thread run on
@@ -4993,6 +5029,7 @@ extern "C" int probe_run(probe_session *s) {
             // Never wedge the target: an install that does not confirm in 5 s is reported
             // and the threads run on (the affected probes simply stay inactive).
             std::fprintf(stderr, "probe: warning: inline install not confirmed within 5 s\n");
+            if (trace_enabled()) trace_thread_stacks(s, "install timeout");
             release_held(s, "install timeout");
         }
         if (!WaitForDebugEvent(&event, 20)) {                         // short: also polls stop requests

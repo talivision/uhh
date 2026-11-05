@@ -300,16 +300,14 @@ PowerShell + detach) under every backend, against an uninstrumented baseline.
   (`ole32!CoCreateInstance` -> combase) **failed the launch**; it now stays pending on the
   target module. Also the inline pre-vet of such a name checked the module header
   (base+0). Test: `blog-com-*`
-- ⬜ (B5) attach + inline into a CLR process (PowerShell): every thread is held while the
-  agent is injected; intermittently (1 of ~8 runs) a held thread blocks the injection
-  (loader/heap/CLR lock) and the hold lasts until the 5 s timeout or detach -- target
-  frozen, inline probe not live in that window (seen: hits=0, "released 19 held
-  thread(s) (detach)" at 2.5 s). Fix idea: hold only for the install itself (after the
-  agent is loaded and its service thread is up), not across LoadLibrary / thread start.
-  Test: `blog-pwsh-attach-detach-inline` (fails when it happens; 2 of ~10 x64 runs).
-  Same family seen once on x86 `attach-inline` (1 of 4): the LOAD_DLL hold for
-  configparse hit "inline install not confirmed within 5 s", the flag probe missed the
-  parse, 0/8000 reads.
+- ✅ (B5) attach + inline into a CLR process (PowerShell) / x86 `attach-inline`: holds that
+  lasted until the 5 s install timeout (seen: hits=0, "released 19 held thread(s) (detach)";
+  x86 attach-inline once 0/8000 reads after "inline install not confirmed within 5 s" on the
+  configparse LOAD_DLL hold). The thread holds during injection were already gone (attach
+  holds nothing while the agent loads); the remaining cause was the CC8 root cause below --
+  the agent's service thread was reported ready before it had run, so a LOAD_DLL hold could
+  wait on a thread still in its loader init. Fixed with CC8. Tests: `attach-*`,
+  `blog-pwsh-attach-detach-*` (x64 + x86 green after the fix; `attach` 4/4 repeats on x86).
 - (note) `attach-new` failed once because ANOTHER agent's probe_app.exe started in the
   same second on the shared VM and was attached instead (image-name matching is
   inherently racy on a shared box; not a library bug).
@@ -493,15 +491,31 @@ x64 breakpoint/inline baseline was masked by identical-code folding of the fixtu
   pointer first); x86 = 4-byte stack slot, register args (fastcall/vectorcall ECX/EDX,
   thiscall ECX) via get_reg, 64-bit/double = 2 slots, struct = size/4, hidden pointer = slot 0.
   XMM arguments (x64 floats, vectorcall) have no accessor: the frozen API has none (inherent).
-- ⬜ (CC8) **Inline probes in a DLL the target LoadLibrary's at run time are missed about half
-  the time** (pre-existing; the B-family LOAD_DLL hold above): the hold for the new module
-  ends with "inline install not confirmed within 5 s" / "released 1 held thread(s) (install
-  timeout)", the target runs every call unhooked (hits=0, body ran), and the hooks report
-  "active" only afterwards. Reproducer (2 of 4 x64 runs; also x86 replace/wrongpop-inline):
-  the callconv fixture with ccfix.dll loaded by `LoadLibraryA` instead of a static import,
-  `cc_driver --backend inline --mode wrongpop -- cc_target.exe wrongpop`. The callconv
-  checks now import ccfix.dll statically so they test conventions, not this race; the race
-  needs its own fix (hold only for the install itself, see the B entry).
+- ✅ (CC8) **Inline probes in a DLL the target LoadLibrary's at run time were missed** (the
+  hold for the new module ended "inline install not confirmed within 5 s" / "released 1 held
+  thread(s) (install timeout)", every call ran unhooked, the hooks reported "active" only
+  afterwards). **Root cause** (PROBE_TRACE: `load_dll` timestamps + every thread's symbolized
+  stack at the timeout): `probe_agent_init` published `service_ready` right after
+  `CreateThread`, while the new service thread was still in `LdrInitializeThunk` (loader
+  thread-init: DLL_THREAD_ATTACH for every module, which waits while another thread is in a
+  load). The controller released the entry hold, the main thread at once LoadLibrary'd the DLL,
+  was held at its LOAD_DLL event as the loader's load owner (`NtMapViewOfSection` <-
+  `LdrLoadDll`), and the service thread (`LdrInitializeThunk` -> `ZwWaitForSingleObject`) waited
+  for that load: the SetEvent kick was never seen until the timeout released the hold, then the
+  install ran 220 ms later. Pre-fix: `latedll` main-thread and DllMain scenarios timed out 8/8
+  (x64 inline), the worker-thread one passed (its extra thread start gave the service thread
+  time). The install itself never needed the loader (callbacks are pre-resolved; SafetyHook
+  only allocates/VirtualProtects). **Fix**: the service thread sets `service_ready` itself from
+  `service_main` and raises INSTALL_DONE; `probe_agent_init` waits (bounded, 5 s) for it, so
+  nothing reports "active" before it can install; the controller releases holds only when
+  `inline_hold_needed` is false (i.e. the service thread runs). Holding the loading thread at
+  LOAD_DLL is then safe: no new thread, no loader call on the install path. Test:
+  `latedll-<main|worker|dllmain>-<inline|breakpoint|hw|mixed>` (examples/latedll: 8 inline
+  sites, more than the debug registers, so the DR gates fall back to the LOAD_DLL hold; the
+  dllmain case loads the probed DLL from a DllMain, calls every site under the loader lock and
+  starts a thread there), 10 runs each, exact hits == body counts == logs, x64 + x86.
+  Not covered: a probed site reached by the service thread's own DLL_THREAD_ATTACH callouts
+  before it runs (a target DLL calling its probed function from DLL_THREAD_ATTACH).
 - ✅ Thunks and prologues need nothing special: a probe on an import thunk (FF 25), an
   incremental-link thunk (E9, next thunk directly after) and a tail-call target sees the
   caller's return address at [SP], so get_func_arg, call_original and return_from (`ret 12`)

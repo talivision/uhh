@@ -1464,7 +1464,21 @@ static bool notify_installed() {
 }
 
 static HANDLE service_event;
+static volatile LONG service_running;   // service_main has started (past its loader init)
+static HANDLE service_up;               // set by service_main once it runs (init waits for it)
+// The service thread reports itself ready only from HERE, i.e. once it runs its own code:
+// a new thread first goes through the loader's thread initialisation (LdrInitializeThunk ->
+// DLL_THREAD_ATTACH for every module), which waits while another thread is in the middle of
+// a DLL load. Published as ready at CreateThread, it was not: the controller released the
+// entry hold, the main thread at once LoadLibrary'd a DLL with inline sites and was held at
+// its LOAD_DLL event (as the load owner) -- and the service thread, still in its loader init,
+// waited for that load to finish: deadlock until the 5 s install timeout, every call missed
+// (ROADMAP CC8/B5). The INSTALL_DONE raised here tells the controller it may release.
 static DWORD WINAPI service_main(void *) {
+    InterlockedExchange(&service_running, 1);
+    InterlockedExchange(&shared->service_ready, 1);
+    if (service_up) SetEvent(service_up);
+    notify_installed();
     for (;;) {
         if (WaitForSingleObject(service_event, INFINITE) != WAIT_OBJECT_0) return 1;
         install_pending();
@@ -1486,13 +1500,25 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
     for (auto &cb : callbacks) cb = nullptr;  // a new session may map slots to other callbacks
     resolve_callbacks();
     install_pending();
-    if (service_event) InterlockedExchange(&shared->service_ready, 1);   // thread from an earlier session
+    // A thread from an earlier session (or a repeated init) -- ready only if it already runs;
+    // one still in its loader init reports itself when it gets there.
+    if (service_event && service_running) InterlockedExchange(&shared->service_ready, 1);
     if (!service_event) {   // first init: start the persistent install thread
         wchar_t name[64]; probe_agent_service_name(GetCurrentProcessId(), name);
         service_event = OpenEventW(SYNCHRONIZE, FALSE, name);
         if (service_event) {
+            service_up = CreateEventW(nullptr, TRUE, FALSE, nullptr);
             HANDLE t = CreateThread(nullptr, 0, service_main, nullptr, 0, nullptr);
-            if (t) { CloseHandle(t); InterlockedExchange(&shared->service_ready, 1); }
+            // service_ready is set by the thread itself, once running. Init does not finish
+            // (so the controller reports nothing "active" and releases nothing) before then:
+            // a DLL with inline sites loaded right after -- e.g. at once after an attach --
+            // would otherwise find no service thread to install it. Nothing the controller
+            // holds can own the loader here (launch: the entry hold; attach: no hold), so the
+            // wait is short; bounded anyway (the thread then reports ready when it gets there).
+            if (t) {
+                CloseHandle(t);
+                if (service_up) WaitForSingleObject(service_up, 5000);
+            }
         }
     }
     return 0;
