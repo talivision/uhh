@@ -73,7 +73,14 @@ inline bool looks_like_return_site(const unsigned char pre[8]) {
         ((p[-6] >> 6) == 0 && (p[-6] & 7) == 4 && (p[-5] & 7) == 5))) return true;      // call [idx*s+d32]
     return false;
 }
-inline bool callback_export_name(probe_callback callback, std::string &name) {
+// Every export name of `callback`'s module that points at it, '\n'-separated, in export
+// table order. Several when the linker folded identical functions (/OPT:ICF: two empty
+// callbacks share one address) -- any of them is the same code, but another copy of the
+// callbacks (the agent DLL vs the controller executable) may export only some of them, so
+// the receiving side tries each. Reporting only the FIRST name made a dynamic add from an
+// inline callback fail (0) whenever that name was one the controller does not export.
+inline bool callback_export_names(probe_callback callback, std::string &names) {
+    names.clear();
     HMODULE module{};
     if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -88,16 +95,34 @@ inline bool callback_export_name(probe_callback callback, std::string &name) {
     if (!dir.VirtualAddress || !dir.Size) return false;
     auto exports = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY *>(base + dir.VirtualAddress);
     auto functions = reinterpret_cast<const DWORD *>(base + exports->AddressOfFunctions);
-    auto names = reinterpret_cast<const DWORD *>(base + exports->AddressOfNames);
+    auto names_rva = reinterpret_cast<const DWORD *>(base + exports->AddressOfNames);
     auto ordinals = reinterpret_cast<const WORD *>(base + exports->AddressOfNameOrdinals);
     uint64_t callback_rva = reinterpret_cast<const unsigned char *>(callback) - base;
     for (DWORD i = 0; i < exports->NumberOfNames; ++i) {
         WORD ordinal = ordinals[i];
         if (ordinal < exports->NumberOfFunctions && functions[ordinal] == callback_rva) {
-            name = reinterpret_cast<const char *>(base + names[i]); return true;
+            if (!names.empty()) names += '\n';
+            names += reinterpret_cast<const char *>(base + names_rva[i]);
         }
     }
-    return false;
+    return !names.empty();
+}
+inline bool callback_export_name(probe_callback callback, std::string &name) {
+    if (!callback_export_names(callback, name)) return false;
+    const size_t nl = name.find('\n');
+    if (nl != std::string::npos) name.resize(nl);
+    return true;
+}
+// The leading whole names of a '\n'-separated list that fit in cap-1 chars ("" if the first
+// does not fit).
+inline std::string export_names_fit(const std::string &names, size_t cap) {
+    size_t end = 0;
+    for (size_t next; end < names.size(); end = next) {
+        next = names.find('\n', end + 1);
+        if (next == std::string::npos) next = names.size();
+        if (next >= cap) break;
+    }
+    return names.substr(0, end);
 }
 
 inline std::string exe_directory() {

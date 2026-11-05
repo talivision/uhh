@@ -64,6 +64,7 @@ struct Probe {
     int dr_slot = -1;   // hardware-breakpoint DR register (0-3); -1 if not a HW probe
     bool active = false;
     bool warned_double_run = false;   // call_original without return_from (warn once)
+    bool warned_log = false;          // a "uhh warning: ..." log record was emitted (once per probe, as inline)
 };
 
 struct CallbackState {
@@ -1299,6 +1300,7 @@ static bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
     return true;
 }
 
+static void sync_int3_table(probe_session *s);
 static bool arm_breakpoint(probe_session *s, Probe &p, uint64_t base) {
     if (p.rva > UINT64_MAX - base) { set_error(s, "probe address overflow"); return false; }
     uint64_t address = base + p.rva; size_t got{};
@@ -1321,6 +1323,7 @@ static bool arm_breakpoint(probe_session *s, Probe &p, uint64_t base) {
             p.insn_len = len; p.displaced_ok = disp_ok; p.riprel_disp_off = riprel; p.rep_string = rep_str;
             p.base = base; p.address = address; p.active = true;
             s->retired_bps.erase(address);
+            sync_int3_table(s);
             return true;
         }
         set_error(s, "pre-hooked INT3 sites are unsupported by this breakpoint backend"); return false;
@@ -1338,6 +1341,7 @@ static bool arm_breakpoint(probe_session *s, Probe &p, uint64_t base) {
     }
     p.base = base; p.address = address; p.active = true;
     s->retired_bps.erase(address);
+    sync_int3_table(s);
     if (!p.internal || trace_enabled())       // library-owned probes are not the user's to see
         std::fprintf(stderr, "%s %s -> base=0x%llx addr=0x%llx (was 0x%02x, len=%u, %s)\n",
                      p.internal ? "  internal" : "probe: active", p.location.c_str(), (unsigned long long)base,
@@ -2357,6 +2361,27 @@ struct DynamicScope {
     }
 };
 
+// A probe added from INSIDE a callback (any backend) must have a named-export callback: an
+// inline callback's control calls reach the controller by export name, so only exports can
+// work there. Requiring it on every backend keeps one callback source portable (a static
+// function used to work from a breakpoint/hw callback and return 0 from an inline one).
+static bool callback_ok_from_callback(probe_session *s, probe_callback cb) {
+    std::string name;
+    if (!s->cb_tid || GetCurrentThreadId() != s->debug_tid || !cb || callback_export_name(cb, name)) return true;
+    set_error(s, "a probe added from a callback needs a callback exported by name (dllexport)");
+    return false;
+}
+
+// The export name(s) the agent resolves an inline probe's callback by (all names of a folded
+// function that fit the request, see callback_export_names).
+static bool inline_callback_names(probe_session *s, probe_callback cb, std::string &out) {
+    std::string names;
+    if (!callback_export_names(cb, names)) { set_error(s, "inline callback is not a named export"); return false; }
+    out = export_names_fit(names, PROBE_AGENT_EXPORT_CAP);
+    if (out.empty()) { set_error(s, "inline callback export name is too long"); return false; }
+    return true;
+}
+
 static uint32_t hw_in_use(const probe_session *s) {
     uint32_t n = 0;
     for (auto &pp : s->probes) if ((pp->flags & PROBE_HW) && !pp->retired) ++n;
@@ -2402,23 +2427,17 @@ extern "C" int probe_add_symbol_cfg(probe_session *s, const char *location, prob
     DynamicScope scope(s);
     if (s->exited) { set_error(s, "session already exited"); return 0; }
     if (!callback) { set_error(s, "probe callback is null"); return scope.done(0); }
+    if (!callback_ok_from_callback(s, callback)) return scope.done(0);
     if (!check_flags(s, flags, !s->launched)) return scope.done(0);
     uint32_t type = flags & (PROBE_BREAKPOINT | PROBE_INLINE | PROBE_HW);
     if (config_len && !config) { set_error(s, "non-empty probe config is null"); return scope.done(0); }
-    if (type == PROBE_INLINE && config_len > PROBE_AGENT_CONFIG_CAP) {
-        set_error(s, "inline probe config exceeds the agent limit"); return scope.done(0);
-    }
+    if ((uint64_t)config_len > UINT32_MAX) { set_error(s, "probe config is larger than 4 GB"); return scope.done(0); }
     try {
         auto p = std::make_unique<Probe>();
         if (!parse_location(s, location, *p)) return scope.done(0);
         p->callback = callback; p->flags = flags; p->runtime = s->launched;
         if (!bind_shared_callback(s, p->callback, flags)) return scope.done(0);
-        if (type == PROBE_INLINE && !callback_export_name(callback, p->callback_export)) {
-            set_error(s, "inline callback is not a named export"); return scope.done(0);
-        }
-        if (p->callback_export.size() >= PROBE_AGENT_EXPORT_CAP) {
-            set_error(s, "inline callback export name is too long"); return scope.done(0);
-        }
+        if (type == PROBE_INLINE && !inline_callback_names(s, callback, p->callback_export)) return scope.done(0);
         if (config_len) {
             auto first = static_cast<const unsigned char *>(config);
             p->config.assign(first, first + config_len);
@@ -2452,15 +2471,14 @@ static int add_absolute(probe_session *s, uint64_t address, probe_callback cb, u
     DynamicScope scope(s);
     if (!s->launched || s->exited) { set_error(s, "absolute-address probes need a running target"); return scope.done(0); }
     if (!cb) { set_error(s, "probe callback is null"); return scope.done(0); }
+    if (!callback_ok_from_callback(s, cb)) return scope.done(0);
     if (!check_flags(s, flags, false)) return scope.done(0);
     try {
         auto p = std::make_unique<Probe>();
         char loc[40]; std::snprintf(loc, sizeof(loc), "0x%llx", (unsigned long long)address);
         p->location = loc; p->flags = flags; p->callback = cb; p->rva = address; p->runtime = true;
         if (!bind_shared_callback(s, p->callback, flags)) return scope.done(0);
-        if ((flags & PROBE_INLINE) && !callback_export_name(cb, p->callback_export)) {
-            set_error(s, "inline callback is not a named export"); return scope.done(0);
-        }
+        if ((flags & PROBE_INLINE) && !inline_callback_names(s, cb, p->callback_export)) return scope.done(0);
         Probe *raw = p.get();
         s->probes.push_back(std::move(p));
         bool ok = (flags & PROBE_INLINE) ? register_runtime_inline(s, *raw) && resolve_inline(s, *raw, 0) && kick_agent(s)
@@ -2506,6 +2524,7 @@ static bool open_agent_section(probe_session *s, uint32_t count) {
     s->shared->magic = PROBE_AGENT_MAGIC; s->shared->version = PROBE_AGENT_VERSION;
     s->shared->request_count = count;
     for (uint32_t i = 0; i < PROBE_AGENT_LOG_CAP; ++i) s->shared->logs[i].seq = i;   // ring: all free
+    sync_int3_table(s);                                 // breakpoints armed before the channel existed
     // Benchmark-only knob (not API): compare inline extended-state handling strategies.
     if (const char *m = std::getenv("UHH_BENCH_XSTATE"))
         s->shared->xstate_mode = !std::strcmp(m, "none") ? 1 : !std::strcmp(m, "full") ? 2 : 0;
@@ -2515,11 +2534,24 @@ static bool open_agent_section(probe_session *s, uint32_t count) {
     return ensure_local_agent(s);
 }
 
+// A config larger than the request's inline buffer goes to a block allocated in the target
+// (freed at close), so an inline probe takes the same configs as a breakpoint/hw probe. If
+// that block cannot be made, config_remote stays 0 and the agent refuses the request.
 static void fill_request(probe_session *s, const Probe &p) {
     auto &request = s->shared->requests[p.agent_index]; request.flags = p.flags;
     request.config_len = (uint32_t)p.config.size();
     std::memcpy(request.callback, p.callback_export.c_str(), p.callback_export.size() + 1);
-    if (!p.config.empty()) std::memcpy(request.config, p.config.data(), p.config.size());
+    if (p.config.size() <= PROBE_AGENT_CONFIG_CAP) {
+        if (!p.config.empty()) std::memcpy(request.config, p.config.data(), p.config.size());
+        return;
+    }
+    void *mem = VirtualAllocEx(s->pi.hProcess, nullptr, p.config.size(), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    size_t wrote = 0;
+    if (!mem) return;
+    if (!remote_write(s->pi.hProcess, (uint64_t)(uintptr_t)mem, p.config.data(), p.config.size(), &wrote) ||
+        wrote != p.config.size()) { VirtualFreeEx(s->pi.hProcess, mem, 0, MEM_RELEASE); return; }
+    s->scratch_blocks.push_back((uint64_t)(uintptr_t)mem);
+    request.config_remote = (uint64_t)(uintptr_t)mem;
 }
 
 static bool create_agent_channel(probe_session *s) {
@@ -2882,7 +2914,7 @@ static void detach(probe_session *s) {
         if (!p->active) continue;
         if (p->flags & PROBE_BREAKPOINT) {
             restore_original(s->pi.hProcess, p->address, p->original);
-            s->retired_bps.insert(p->address); p->active = false;
+            s->retired_bps.insert(p->address); p->active = false; sync_int3_table(s);
         } else if (p->flags & PROBE_HW) {
             release_hw(s, *p);
         }
@@ -3158,7 +3190,20 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
     uint64_t at = (uint64_t)ex.ExceptionInformation[0];
     probe_ipc_request req{}; size_t got = 0;
     if (!remote_read(s->pi.hProcess, at, &req, sizeof(req), &got) || got != sizeof(req)) return false;
-    req.callback[sizeof(req.callback) - 1] = 0; req.symbol[sizeof(req.symbol) - 1] = 0;
+    // The name, symbol and config are read from the (stopped) calling thread's memory.
+    auto fetch = [&](uint64_t from, uint64_t len, uint64_t cap, void *to) {
+        size_t n = 0;
+        return len <= cap && (!len || (remote_read(s->pi.hProcess, from, to, (size_t)len, &n) && n == len));
+    };
+    std::string name, symbol; std::vector<unsigned char> config;
+    bool fetched = req.callback_len <= PROBE_IPC_TEXT_MAX && req.symbol_len <= PROBE_IPC_TEXT_MAX &&
+                   req.config_len <= PROBE_IPC_CONFIG_MAX;
+    if (fetched) {
+        name.resize((size_t)req.callback_len); symbol.resize((size_t)req.symbol_len); config.resize((size_t)req.config_len);
+        fetched = fetch(req.callback, req.callback_len, PROBE_IPC_TEXT_MAX, name.data()) &&
+                  fetch(req.symbol, req.symbol_len, PROBE_IPC_TEXT_MAX, symbol.data()) &&
+                  fetch(req.config, req.config_len, PROBE_IPC_CONFIG_MAX, config.data());
+    }
     // The callback is named; find the controller's copy of the same source. Prefer the
     // module that holds the originating inline probe's callback, then the executable.
     probe_callback cb = nullptr; bool origin = false;
@@ -3166,23 +3211,30 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
         if ((p->flags & PROBE_INLINE) && p->agent_index == req.origin_site && p->callback) {
             origin = true;
             HMODULE m{};
-            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                   reinterpret_cast<LPCSTR>(p->callback), &m))
-                cb = reinterpret_cast<probe_callback>(GetProcAddress(m, req.callback));
+            if (fetched && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                              reinterpret_cast<LPCSTR>(p->callback), &m))
+                for (size_t at0 = 0; !cb && at0 < name.size(); ) {          // '\n'-separated: any that resolves
+                    size_t nl = name.find('\n', at0);
+                    if (nl == std::string::npos) nl = name.size();
+                    cb = reinterpret_cast<probe_callback>(GetProcAddress(m, name.substr(at0, nl - at0).c_str()));
+                    at0 = nl + 1;
+                }
             break;
         }
     if (!origin) return false;
     int32_t result = 0;
     struct CbTid { probe_session *s; ~CbTid() { s->cb_tid = 0; } } cb_tid_scope{s};
     s->cb_tid = event.dwThreadId;
-    if (!cb) {
-        std::fprintf(stderr, "probe: dynamic add from inline callback: no controller-side export '%s'\n", req.callback);
+    if (!fetched) {
+        std::fprintf(stderr, "probe: dynamic add from inline callback: cannot read its arguments from the target\n");
+    } else if (!cb) {
+        std::fprintf(stderr, "probe: dynamic add from inline callback: no controller-side export '%s'\n", name.c_str());
     } else if (req.op == PROBE_IPC_ADD_ADDRESS) result = probe_add_address(s, req.address, cb, req.flags);
     else if (req.op == PROBE_IPC_WATCH)       result = probe_watch(s, req.address, cb, req.flags);
     else if (req.op == PROBE_IPC_ADD_SYMBOL)
-        result = probe_add_symbol_cfg(s, req.symbol, cb, req.flags, req.config_len ? req.config : nullptr,
-                                      req.config_len <= sizeof(req.config) ? req.config_len : 0);
-    std::fprintf(stderr, "probe: ipc op=%u from inline site %u cb=%s -> %d\n", req.op, req.origin_site, req.callback, result);
+        result = probe_add_symbol_cfg(s, req.symbol ? symbol.c_str() : nullptr, cb, req.flags,
+                                      config.empty() ? nullptr : config.data(), config.size());
+    std::fprintf(stderr, "probe: ipc op=%u from inline site %u cb=%s -> %d\n", req.op, req.origin_site, name.c_str(), result);
     size_t wrote = 0;
     remote_write(s->pi.hProcess, at + offsetof(probe_ipc_request, result), &result, sizeof(result), &wrote);
     return true;
@@ -3294,7 +3346,35 @@ static int callback_read(void *backend, uint64_t a, void *b, size_t n, size_t *d
         if (p->active && (p->flags & PROBE_BREAKPOINT) && !p->orig_insn.empty() && p->address >= a && p->address < a + n &&
             static_cast<unsigned char *>(b)[p->address - a] == 0xCC)
             static_cast<unsigned char *>(b)[p->address - a] = p->original;
+    // ...and installed inline hooks as the bytes they overwrote (published by the agent), as
+    // an inline callback reads them (it read the hook's jump here).
+    if (s->shared) {
+        const uint32_t count = s->shared->request_count < PROBE_AGENT_MAX_PROBES ? s->shared->request_count : PROBE_AGENT_MAX_PROBES;
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto &r = s->shared->requests[i];
+            const uint32_t len = r.original_len <= sizeof(r.original) ? r.original_len : 0;
+            if (r.status != PROBE_AGENT_INSTALLED || !len || !r.site || r.site >= a + n || r.site + len <= a) continue;
+            for (uint64_t x = r.site > a ? r.site : a; x < r.site + len && x < a + n; ++x)
+                static_cast<unsigned char *>(b)[x - a] = r.original[x - r.site];
+        }
+    }
     return 1;
+}
+// The agent's copy of the armed INT3s (probe_agent_shared::int3): rewritten whole after any
+// breakpoint probe is armed or disarmed.
+static void sync_int3_table(probe_session *s) {
+    if (!s->shared) return;
+    auto *sh = s->shared;
+    InterlockedIncrement(&sh->int3_seq);                // odd: being rewritten
+    MemoryBarrier();
+    LONG n = 0;
+    for (auto &p : s->probes)
+        if (p->active && (p->flags & PROBE_BREAKPOINT) && !p->orig_insn.empty() && p->address && n < (LONG)PROBE_AGENT_INT3_CAP) {
+            sh->int3[n].address = p->address; sh->int3[n].original = p->original; ++n;
+        }
+    sh->int3_count = n;
+    MemoryBarrier();
+    InterlockedIncrement(&sh->int3_seq);
 }
 static int callback_write(void *backend, uint64_t a, const void *b, size_t n, size_t *done) {
     auto *s = static_cast<probe_session *>(backend);
@@ -3312,11 +3392,13 @@ static const DWORD UHH_CALL_RELEASED = 0xE0554843u;
 // it inside the target: a callback that faults (a bad pointer, a target address used as a
 // controller pointer, ...) is abandoned -- the hit still counts, its register changes are
 // discarded, the target continues -- instead of killing the controller (and with it the
-// target). C++ exceptions are left to the caller's handlers.
+// target). A C++ exception thrown out of the callback is treated the same way, exactly as
+// the agent's SEH guard treats it inline (it used to end the whole session with "probe
+// callback threw" on breakpoint/hw only). Caught by SEH on purpose: under /EHsc a C++
+// try/catch around a call through an extern "C" callback pointer may be elided.
 static bool seh_callback(probe_callback cb, probe_context *c, DWORD *code) {
     __try { cb(c); return true; }
-    __except (GetExceptionCode() == 0xE06D7363u ? EXCEPTION_CONTINUE_SEARCH
-                                                : (*code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER)) { return false; }
+    __except (*code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 static void run_callback(probe_session *s, Probe *probe, probe_context *c) {
     const probe_regs before = c->regs;
@@ -3354,10 +3436,20 @@ static uint64_t ret_gadget(probe_session *s, uint32_t pop) {
     }
     return s->ret_gadgets + pop;
 }
+// The first call_original / return_from warning of a probe also goes to the LOG as one
+// "uhh warning: <text>" record -- the record the inline agent emits (it has no stderr), so
+// a log carries the same records on every backend.
+static void warn_record(probe_context *c, Probe *probe, const char *text) {
+    if (!c || !probe || probe->warned_log) return;
+    probe->warned_log = true;
+    send_log(c, "uhh warning: %s", text);
+}
 // After a callback: apply return_from (resume at the gadget, SP = the hit's) and return
 // true; or warn once when call_original ran but the hit will fall through into the body.
 static bool apply_return_from(probe_session *s, Probe *probe, const probe_context &c, CONTEXT &native) {
     if (!c.returned) {
+        if (c.called_original) warn_record(const_cast<probe_context *>(&c), probe,
+                                           "call_original without return_from -- the original runs again on fall-through");
         if (c.called_original && !probe->warned_double_run) {
             probe->warned_double_run = true;
             std::fprintf(stderr, "probe: warning: %s: call_original without return_from -- the original runs again "
@@ -3367,6 +3459,7 @@ static bool apply_return_from(probe_session *s, Probe *probe, const probe_contex
     }
     uint64_t g = ret_gadget(s, c.ret_pop);
     if (!g) {
+        warn_record(const_cast<probe_context *>(&c), probe, "return_from could not be applied (no return thunk); the original runs");
         if (!probe->warned_double_run) {
             probe->warned_double_run = true;
             std::fprintf(stderr, "probe: warning: %s: return_from could not be applied (no return gadget); falling through\n",
@@ -3930,7 +4023,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         // The body is skipped: resume at the `ret` gadget, the INT3 stays armed (a
         // one-shot is retired here instead).
         if ((probe->flags & PROBE_ONCE) && patch(s->pi.hProcess, probe->address, probe->original)) {
-            probe->active = false; probe->retired = true; s->retired_bps.insert(probe->address);
+            probe->active = false; probe->retired = true; s->retired_bps.insert(probe->address); sync_int3_table(s);
         }
         native.ContextFlags = CONTEXT_FULL;
         bool ok = !!SetThreadContext(thread, &native);
@@ -3946,7 +4039,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         if (!patch(s->pi.hProcess, probe->address, probe->original)) {
             CloseHandle(thread); set_error(s, win_error("retire one-shot breakpoint")); return false;
         }
-        probe->active = false; probe->retired = true; s->retired_bps.insert(probe->address);
+        probe->active = false; probe->retired = true; s->retired_bps.insert(probe->address); sync_int3_table(s);
 #if defined(_WIN64)
         native.Rip = probe->address;
 #else
@@ -4384,7 +4477,7 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
                 // breakpoint on the unloaded address -> later slot exhaustion / crash.
                 release_hw(s, *p);
                 p->base = p->address = 0;
-            } else { p->active = false; p->base = p->address = 0; }
+            } else { p->active = false; p->base = p->address = 0; sync_int3_table(s); }
         }
         break;
     }
@@ -4890,6 +4983,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
     const uint64_t ptr = sizeof(void *);
     uint64_t ret_addr = 0;
     if (!hit_is_function_entry(c, &ret_addr)) {
+        warn_record(c, probe, "call_original refused: not at a function entry ([SP] is no return address)");
         co_warn(s->co_warned_entry, probe, "call_original refused: not at a function entry ([SP] is no return address)");
         return 0;
     }
@@ -5031,6 +5125,7 @@ extern "C" void return_from(probe_context *c, uint64_t value, int nargs) {
     auto *st = static_cast<CallbackState *>(c->controller);
     if (!st || st->released) return;
     if (!hit_is_function_entry(c, nullptr)) {
+        warn_record(c, st->probe, "return_from refused: not at a function entry ([SP] is no return address)");
         if (st->session && st->probe)
             co_warn(st->session->co_warned_entry, st->probe,
                     "return_from refused: not at a function entry ([SP] is no return address)");

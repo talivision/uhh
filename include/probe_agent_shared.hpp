@@ -10,7 +10,7 @@
 #include <cstdio>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 14;
+constexpr uint32_t PROBE_AGENT_VERSION = 15;
 constexpr uint32_t PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH = 1u << 9;   /* agent side only needs this one */   /* == PROBE_UNSAFE_FAST_PATCH (asserted in session.cpp) */
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 128;   /* inline probes per session; the 129th is refused */
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
@@ -36,11 +36,20 @@ struct probe_agent_request {
     unsigned char config[PROBE_AGENT_CONFIG_CAP];
     volatile LONG status;
     uint32_t patch_len;            /* agent: bytes the hook overwrites at site (set before a freeze) */
-    volatile LONG64 hits;          /* unused (kept for layout); see hit_stripes */
+    uint64_t config_remote;        /* config_len > PROBE_AGENT_CONFIG_CAP: the config lives in a block
+                                      the controller allocated in the target (else in config[]) */
     uint64_t trampoline;           /* agent: relocated copies of the overwritten instructions */
     volatile LONG enabling;        /* agent: 1 while this hook is about to be written under a FREEZE */
-    LONG reserved2;
+    uint32_t original_len;         /* agent: the program's bytes the installed hook overwrote, so a */
+    uint8_t original[32];          /* breakpoint/hw callback's get_mem shows them (set before INSTALLED) */
 };
+
+/* Armed software breakpoints (INT3) of the session, published by the controller so an INLINE
+   callback's get_mem shows the program's byte under them, as breakpoint/hw callbacks do (a
+   callback reading code another backend probes saw 0xCC inline). Seqlock: the controller
+   makes int3_seq odd while it rewrites the table; a reader retries (bounded) or skips. */
+constexpr uint32_t PROBE_AGENT_INT3_CAP = 1024;
+struct probe_agent_int3 { uint64_t address; uint8_t original; uint8_t pad[7]; };
 
 /* Bounded MPMC ring (Vyukov): slot i starts with seq == i. A producer owns position
    pos when logs[pos % CAP].seq == pos, claims it by CAS on log_head, fills the slot,
@@ -72,14 +81,19 @@ enum probe_ipc_op : uint32_t { PROBE_IPC_ADD_ADDRESS = 1, PROBE_IPC_WATCH = 2, P
    the page stays executable, no thread can run the bytes mid-write, nothing faults. A thread
    the freeze caught inside a range about to be overwritten is moved by the controller to the
    same instruction in that hook's trampoline. */
+/* The callback's export name, the symbol and the config stay in the calling thread's memory
+   (it is stopped while the controller services the call) and are read from there, so a call
+   from an inline callback has no size limits a breakpoint/hw callback's call does not have
+   (it had: config <= 256 bytes, symbol <= 255 chars, refused only inline). */
+constexpr uint64_t PROBE_IPC_TEXT_MAX = 64u << 10;      /* sanity bounds on what the target claims */
+constexpr uint64_t PROBE_IPC_CONFIG_MAX = 64u << 20;
 struct probe_ipc_request {
     uint32_t op, flags, origin_site;
     int32_t result;
     uint64_t address;
-    char callback[PROBE_AGENT_EXPORT_CAP];
-    char symbol[256];
-    uint32_t config_len;                  /* probe_add_symbol_cfg: config travels with the call */
-    unsigned char config[PROBE_AGENT_CONFIG_CAP];
+    uint64_t callback, callback_len;      /* export name (not NUL-terminated) */
+    uint64_t symbol, symbol_len;          /* probe_add_symbol */
+    uint64_t config, config_len;          /* probe_add_symbol_cfg */
 };
 
 /* Hit counting and in-flight tracking are striped over cache-line-separated counters
@@ -108,6 +122,9 @@ struct probe_agent_shared {
     probe_agent_stripe hit_stripes[PROBE_AGENT_MAX_PROBES][PROBE_AGENT_STRIPES];
     probe_agent_request requests[PROBE_AGENT_MAX_PROBES];
     probe_agent_log logs[PROBE_AGENT_LOG_CAP];
+    volatile LONG int3_seq;
+    volatile LONG int3_count;
+    probe_agent_int3 int3[PROBE_AGENT_INT3_CAP];
 };
 
 constexpr LONG64 PROBE_AGENT_INFLIGHT_ONE = 1LL << 48;   /* one running callback in a hit_stripes cell */

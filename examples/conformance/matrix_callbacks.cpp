@@ -29,10 +29,13 @@ static void hex8(char *out, const unsigned char *b, int ok) {
     for (int i = 0; i < 8; ++i) sprintf(out + 2 * i, "%02x", b[i]);
 }
 
+// Two IDENTICAL callbacks on purpose: the linker folds them into one address (/OPT:ICF), so
+// each has several export names (an add from an inline callback named only the first one).
 PM_EXPORT void pm_noop(probe_context *c) { (void)c; }
 PM_EXPORT void pm_on_other(probe_context *c) { (void)c; }
-// Deliberately NOT exported: a probe added from a callback with this callback.
-static void pm_static_cb(probe_context *c) { (void)c; }
+// Deliberately NOT exported (and with a body of its own, so it is folded with nothing): a
+// probe added from a callback with this callback.
+static void pm_static_cb(probe_context *c) { send_log(c, "pm_static_cb %d", 0x57A71C); }
 
 static void entry_memory(probe_context *c, const pm_env &e) {
     unsigned char b[32];

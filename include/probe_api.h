@@ -14,6 +14,27 @@
    enforced by constinit), no pointers into either process (store values, handles,
    indices), lock-free atomics for synchronisation. Per session: separate sessions never
    share. Callbacks of a module without UHH_SHARED globals are unaffected. */
+
+/* Portability: what one callback source can rely on under every backend (checked by the
+   regress portability-* matrix; details in docs/ROADMAP.md, "Portability findings").
+   Every function below returns the same values on every backend, for the same arguments,
+   including the failure cases documented with it. What DIFFERS follows from WHERE the
+   callback runs -- breakpoint/hw: in the controller, one hit at a time on its debugger
+   thread; inline: inside the target, on the thread that hit the probe, concurrently:
+   - Win32 calls made directly by a callback act on the process the callback runs in:
+     GetCurrentProcessId/ThreadId, Sleep, file I/O, allocations... For the TARGET's pid / tid
+     use call_func(c, "kernel32.dll!GetCurrentProcessId" / "...!GetCurrentThreadId", &v, 0);
+     for target memory get_mem/set_mem (a target pointer cannot be dereferenced on
+     breakpoint/hw, nor printed with %s).
+   - Concurrency: inline callbacks of any number of target threads run at the same time;
+     breakpoint/hw callbacks never overlap. Plain static state must be atomic (or locked) to
+     be correct inline. thread_local is per TARGET thread inline but per controller thread
+     (one for all target threads) on breakpoint/hw: keep per-thread state keyed by the
+     target tid instead.
+   - A callback that faults or throws is abandoned on every backend (the hit counts, its
+     register changes are discarded, set_mem writes already made stay, the program runs on).
+     Inline the exception is raised in the target, so the program's vectored exception
+     handlers see it first (first chance); on breakpoint/hw the program never sees it. */
 #if defined(_MSC_VER)
 #pragma section("uhhshr", read, write, shared)
 #if defined(__cplusplus) && defined(__cpp_constinit)
@@ -50,7 +71,8 @@ enum probe_flags {
     PROBE_WATCH_WRITE     = 1u << 6,
     PROBE_WATCH_RW        = 1u << 7,
     /* Remove the probe after its first hit — e.g. a one-shot return hook, or an
-       alloc-site hook that arms a watchpoint once and retires. */
+       alloc-site hook that arms a watchpoint once and retires. PROBE_BREAKPOINT / PROBE_HW
+       only: refused (0) with PROBE_INLINE, from any caller. */
     PROBE_ONCE            = 1u << 8,
     /* PROBE_INLINE only. UNSAFE: write the hook's jump WITHOUT freezing the target. By
        default the controller suspends every other thread while an inline hook is
@@ -154,7 +176,15 @@ const void *get_config(probe_context *);
    debugger runs the call on the stopped thread and restores its context exactly (other
    threads keep running; probes hit inside the callee do not re-enter callbacks) -- tens
    of microseconds, so cache results. The callee runs with whatever locks the hit thread
-   holds: avoid functions that need them (e.g. the allocator from inside a malloc hook). */
+   holds: avoid functions that need them (e.g. the allocator from inside a malloc hook).
+   The symbol grammar is the same on every backend: the module is matched by its file name
+   WITH extension (a directory part is ignored; "kernel32!X" is refused), offsets are "+0x"
+   hex only; an unknown module/export, nargs outside 0..8 or an address that is no committed
+   executable memory returns 0 without calling anything. One difference: a callee that raises
+   an exception -- even one it handles itself -- is abandoned at that exception on
+   breakpoint/hw (returns 0, *ret untouched, the target never sees it), while inline it is
+   dispatched in the target as usual (handled inside: returns 1; unhandled: 0) and the
+   target's vectored handlers see it. */
 int call_func(probe_context *, const char *symbol, uint64_t *ret, int nargs, ...);
 /* Detours-style replacement from an ENTRY probe (a probe on a function's first
    instruction), same source on every backend.
@@ -195,7 +225,12 @@ void return_from(probe_context *, uint64_t value, int nargs);
 /* The session this callback belongs to, for control-plane calls from a callback. In a
    breakpoint/hardware callback it is the real session; in an inline callback (running
    inside the target) it is an agent-side proxy whose control calls are forwarded to the
-   controller synchronously. Same callback source works in every backend. */
+   controller synchronously. Same callback source works in every backend. From a callback,
+   only probe_add_symbol[_cfg] / probe_add_address / probe_watch may be used, and the new
+   probe's callback must be EXPORTED (dllexport) by the module of the calling callback: an
+   inline callback's request names it by export and the controller resolves that name there,
+   so a non-exported callback is refused (0) on every backend. Configs and symbols have no
+   extra size limit from a callback; an inline probe's config may be any size too. */
 probe_session *get_session(probe_context *);
 
 #define PROBE_LOG(c, ...) send_log((c), __VA_ARGS__)
