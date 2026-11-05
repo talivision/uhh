@@ -33,6 +33,10 @@ Checks:
     inside callbacks (entry probe as breakpoint / hw / inline; inline exercises the
     agent->controller IPC). Exact hit count across two threads (one created after the
     watch is armed), one-shot return probe retired, and a symbolized stack in the log.
+  - bigapps-<app>-<mode>-<backend> (opt-in, --bigapps): powershell.exe and headless Edge
+    under every backend, launched / attached to exit / detached mid-run, busy system
+    exports probed; program result + exit 0, no unhandled exception, hits > 0,
+    log_dropped == 0, logs == hits, still working after detach.
 Missing binaries (an example not built) are reported as SKIP, not FAIL.
 """
 import argparse
@@ -1579,6 +1583,257 @@ def check_realworld():
                 record(label, False, repr(e))
 
 
+BIGAPPS_DIR = Path(__file__).resolve().parent.parent / "examples" / "bigapps"
+EDGE_EXE = Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe")
+# Busy system exports. HeapAlloc is a forwarded export (-> ntdll!RtlAllocateHeap). ':-' =
+# count only (millions of hits); the others log every call. At most 4: the hw backend has 4 DRs.
+BIGAPPS_PS_PROBES = ["ntdll.dll!NtCreateFile:xxO", "KernelBase.dll!CreateFileW:Wxx",
+                     "ntdll.dll!NtAllocateVirtualMemory:-", "kernel32.dll!HeapAlloc:-"]
+BIGAPPS_EDGE_PROBES = ["ntdll.dll!NtCreateFile:xxO", "ntdll.dll!NtAllocateVirtualMemory:-",
+                       "kernel32.dll!HeapAlloc:-", "ws2_32.dll!connect:xSd"]
+
+
+def bin_machine():
+    """'x64' or 'x86': the bitness of the build under test (uhh_trace.exe's PE header)."""
+    import struct
+    b = (BIN / "uhh_trace.exe").read_bytes()[:4096]
+    off = struct.unpack_from("<I", b, 0x3c)[0]
+    return "x64" if struct.unpack_from("<H", b, off + 4)[0] == 0x8664 else "x86"
+
+
+def kill_matching(fragment):
+    """Kill ONLY processes whose command line contains fragment -- a unique directory this
+    run created (Edge passes its --user-data-dir to every child) -- never anything else."""
+    ps = (f"Get-CimInstance Win32_Process | ?{{ $_.CommandLine -like '*{fragment}*' -and $_.ProcessId -ne $PID }}"
+          " | %{ Stop-Process -Id $_.ProcessId -Force -EA SilentlyContinue }")
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, timeout=120)
+    except Exception:
+        pass
+
+
+def bigapps_judge(objs, out_text, err_text, bk, specs, required, exact):
+    """The assertions every bigapps run shares. exact: the session ran until the target exited,
+    so every logged probe's hits must equal the logs written (a detach reports a live snapshot)."""
+    rep = report(objs)
+    hits = {p.get("location"): p.get("hits") or 0 for p in probes(objs)}
+    backends = sorted({p.get("backend") for p in probes(objs)})
+    logged = [sp.rsplit(":", 1)[0] for sp in specs if not sp.endswith(":-")]
+    want_logs = sum(hits.get(l, 0) for l in logged)
+    written = rep.get("logs_written")
+    logs_out = out_text.count('"kind":"probe_log"')
+    unhandled = [l for l in err_text.splitlines() if "unhandled exception" in l][:2]
+    bad = []
+    if not rep: bad.append("no probe_report")
+    if rep.get("error") is not None: bad.append(f"error={str(rep.get('error'))[:200]}")
+    if rep.get("log_dropped") != 0: bad.append(f"log_dropped={rep.get('log_dropped')}")
+    if backends != [bk]: bad.append(f"backends={backends}")
+    missing = [r for r in required if not hits.get(r)]
+    if missing: bad.append(f"no hits on {missing}")
+    if not written: bad.append("no logs")
+    if exact and written != want_logs: bad.append(f"logs_written={written} != logged hits={want_logs}")
+    if logs_out < (written or 0): bad.append(f"stdout probe_log lines={logs_out} < logs_written={written}")
+    if unhandled: bad.append(f"unhandled={unhandled}")
+    short = {k.split("!")[-1]: v for k, v in hits.items()}
+    detail = f"hits={short} logs={written} dropped={rep.get('log_dropped')}"
+    return not bad, detail, bad
+
+
+def bigapps_js_expected():
+    """page.html's JS result, computed the same way (int32 arithmetic)."""
+    def i32(v):
+        return (v + 2 ** 31) % 2 ** 32 - 2 ** 31
+    r = 0
+    for k in range(20):
+        h = 0
+        for i in range(50000 + k):
+            h = i32(h * 31 + (i ^ (i >> 3)))
+        r = i32(r + h)
+    return r
+
+
+def bigapps_server(slow_secs):
+    """Local HTTP server for page.html. /slow streams for slow_secs (holds Edge's load event,
+    so the browser stays busy until then); /data?i=N answers 'dataN'."""
+    import http.server
+    page = (BIGAPPS_DIR / "page.html").read_bytes()
+    seen = threading.Event()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            try:
+                if self.path == "/slow":
+                    n = max(1, int(slow_secs * 10))
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/gif")
+                    self.send_header("Content-Length", str(n * 512))
+                    self.end_headers()
+                    for _ in range(n):
+                        self.wfile.write(b"\0" * 512); self.wfile.flush(); time.sleep(0.1)
+                    return
+                if self.path == "/":
+                    body, ctype = page, "text/html"; seen.set()
+                elif self.path.startswith("/data?i="):
+                    body, ctype = ("data" + self.path.split("=", 1)[1]).encode(), "text/plain"
+                else:
+                    self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers(); return
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+            except OSError:
+                pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, seen
+
+
+def bigapps_tracer(bk, specs, tail):
+    cmd = [str(exe("uhh_trace.exe")), "--backend", bk]
+    for sp in specs:
+        cmd += ["-p", sp]
+    return cmd + [str(x) for x in tail]
+
+
+def bigapps_powershell(bk, mode, secs, ps):
+    """powershell.exe running examples/bigapps/workload.ps1 (self-checking: bad=0, exit 0)."""
+    work = Path(tempfile.mkdtemp(prefix="uhh-bigapps-ps-", dir=Path.cwd()))
+    wl = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", BIGAPPS_DIR / "workload.ps1",
+          "-Seconds", secs, "-Work", work]
+    done_re = re.compile(r"BIGAPPS_DONE iters=(\d+) bad=(\d+) jobs=(\d+) exc=(\d+)")
+    target = None
+    try:
+        if mode == "launch":
+            r, objs = run(bigapps_tracer(bk, BIGAPPS_PS_PROBES, ["--", ps, *wl]), timeout=secs + 900)
+            ok, detail, bad = bigapps_judge(objs, r.stdout, r.stderr, bk, BIGAPPS_PS_PROBES,
+                                            [s.rsplit(":", 1)[0] for s in BIGAPPS_PS_PROBES], True)
+            m = done_re.search(r.stdout)
+            rep = report(objs)
+            if not m or m.group(2) != "0" or int(m.group(3)) == 0: bad.append(f"workload={m.group(0) if m else None}")
+            if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
+            return not bad, f"{detail} {m.group(0) if m else 'no DONE'} exit={rep.get('app_exit')}", bad, r.stderr
+        target = subprocess.Popen([str(ps), *[str(x) for x in wl]], stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True, errors="replace")
+        tl, te = Lines(target.stdout), Lines(target.stderr)
+        if not tl.wait_for(lambda l: l.startswith("BIGAPPS_READY"), 180):
+            return False, "workload never READY", ["no READY"], "\n".join(te.lines[-5:])
+        extra = ["--detach-after-ms", secs * 1000 // 2] if mode == "detach" else []
+        r, objs = run(bigapps_tracer(bk, BIGAPPS_PS_PROBES, ["--attach", target.pid, *extra]), timeout=secs + 900)
+        at_detach = len(tl.lines)
+        target.wait(timeout=secs + 600)
+        tl.t.join(timeout=30)
+        after = [l for l in tl.lines[at_detach:] if l.startswith("BIGAPPS_TICK")]
+        text = "\n".join(tl.lines)
+        ok, detail, bad = bigapps_judge(objs, r.stdout, r.stderr, bk, BIGAPPS_PS_PROBES,
+                                        [s.rsplit(":", 1)[0] for s in BIGAPPS_PS_PROBES], mode == "exit")
+        m = done_re.search(text)
+        if not m or m.group(2) != "0": bad.append(f"workload={m.group(0) if m else None}")
+        if target.returncode != 0 or r.returncode != 0: bad.append(f"target_rc={target.returncode} tracer_rc={r.returncode}")
+        if mode == "detach":
+            if '"kind":"detached"' not in r.stdout: bad.append("not detached")
+            if len(after) < 2: bad.append(f"ticks after detach={len(after)}")
+            detail += f" ticks_after_detach={len(after)}"
+        return not bad, f"{detail} {m.group(0) if m else 'no DONE'} rc={target.returncode}", bad, r.stderr
+    finally:
+        if target and target.poll() is None:
+            target.kill()
+        kill_matching(work.name)
+        import shutil
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def bigapps_edge(bk, mode, secs):
+    """Headless Edge (multi-process, JIT) dumping a local page while /slow keeps it loading.
+    The browser process is the one launched/attached; its children run uninstrumented."""
+    udd = Path(tempfile.mkdtemp(prefix="uhh-bigapps-edge-", dir=Path.cwd()))
+    srv, seen = bigapps_server(secs if mode != "launch" else max(5, secs // 2))
+    url = f"http://127.0.0.1:{srv.server_address[1]}/"
+    argv = [EDGE_EXE, "--headless", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+            "--disable-extensions", "--disable-component-update", "--disable-background-networking",
+            "--disable-sync", "--no-proxy-server", "--enable-features=NetworkServiceInProcess2",
+            f"--user-data-dir={udd}",
+            "--dump-dom", url]
+    marker = f"BIGAPPS_JS={bigapps_js_expected()} nodes=20000"
+    browser = None
+    try:
+        if mode == "launch":
+            r, objs = run(bigapps_tracer(bk, BIGAPPS_EDGE_PROBES, ["--", *argv]), timeout=secs + 900)
+            ok, detail, bad = bigapps_judge(objs, r.stdout, r.stderr, bk, BIGAPPS_EDGE_PROBES,
+                                            [s.rsplit(":", 1)[0] for s in BIGAPPS_EDGE_PROBES[:3]], True)
+            rep = report(objs)
+            if marker not in r.stdout: bad.append("JS result missing/wrong in the dumped DOM")
+            if "FETCHED=40" not in r.stdout: bad.append("fetches incomplete")
+            if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
+            return not bad, f"{detail} exit={rep.get('app_exit')}", bad, r.stderr
+        browser = subprocess.Popen([str(a) for a in argv], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, errors="replace")
+        bl, be = Lines(browser.stdout), Lines(browser.stderr)
+        if not seen.wait(120):
+            return False, "Edge never requested the page", ["no request"], "\n".join(be.lines[-5:])
+        time.sleep(1.0)                                      # renderer busy, fetches in flight
+        extra = ["--detach-after-ms", secs * 1000 // 2] if mode == "detach" else []
+        r, objs = run(bigapps_tracer(bk, BIGAPPS_EDGE_PROBES, ["--attach", browser.pid, *extra]), timeout=secs + 900)
+        browser.wait(timeout=secs + 600)
+        bl.t.join(timeout=30)
+        dom = "\n".join(bl.lines)
+        ok, detail, bad = bigapps_judge(objs, r.stdout, r.stderr, bk, BIGAPPS_EDGE_PROBES,
+                                        [s.rsplit(":", 1)[0] for s in BIGAPPS_EDGE_PROBES[:3]], mode == "exit")
+        if marker not in dom: bad.append("JS result missing/wrong in the dumped DOM")
+        if "FETCHED=40" not in dom: bad.append("fetches incomplete")
+        if browser.returncode != 0 or r.returncode != 0: bad.append(f"browser_rc={browser.returncode} tracer_rc={r.returncode}")
+        if mode == "detach" and '"kind":"detached"' not in r.stdout: bad.append("not detached")
+        return not bad, f"{detail} rc={browser.returncode}", bad, r.stderr
+    finally:
+        srv.shutdown()
+        if browser and browser.poll() is None:
+            browser.kill()
+        kill_matching(udd.name)
+        import shutil
+        shutil.rmtree(udd, ignore_errors=True)
+
+
+def check_bigapps(secs=40, select="all"):
+    """Stability on real, large, multi-threaded, JIT-heavy programs (opt-in: --bigapps).
+    powershell.exe (.NET JIT, runspace-pool threads, child jobs; the 32-bit host on x86) and
+    headless Edge (multi-process browser, x64 only), each under every backend, launched AND
+    attached (run to exit, and detach mid-run), with busy ntdll/KernelBase/kernel32/ws2_32
+    exports probed. Asserts: the program's own result is right and it exits 0, no unhandled
+    exception, every probe hit, log_dropped == 0, logs == hits (when run to exit), and after a
+    detach the program keeps working (ticks continue, result right, exit 0)."""
+    if not exe("uhh_trace.exe"):
+        return skip("bigapps", "uhh_trace.exe missing")
+    arch = bin_machine()
+    ps = Path(r"C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe") if arch == "x86" else \
+        SYS32 / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    sel = [x for x in select.split(",") if x and x != "all"]
+    for app_name in ("ps", "edge"):
+        for mode in ("launch", "exit", "detach"):
+            for bk in ("breakpoint", "hw", "inline"):
+                name = f"bigapps-{app_name}-{mode}-{bk}"
+                if sel and not any(x in name for x in sel):
+                    continue
+                if app_name == "edge" and arch == "x86":
+                    skip(name, "msedge.exe is a 64-bit program (x64 build only)"); continue
+                if not (ps if app_name == "ps" else EDGE_EXE).exists():
+                    skip(name, f"{'powershell' if app_name == 'ps' else 'msedge'} not installed"); continue
+                t0 = time.time()
+                try:
+                    ok, detail, bad, err = (bigapps_powershell(bk, mode, secs, ps) if app_name == "ps"
+                                            else bigapps_edge(bk, mode, secs))
+                    tail = " | ".join(l for l in (err or "").splitlines() if l.strip())[-600:]
+                    record(name, ok, f"{detail} secs={time.time() - t0:.0f}" +
+                           ("" if ok else f" BAD={bad} stderr_tail={tail}"))
+                except Exception as e:
+                    record(name, False, repr(e))
+
+
 def main():
     global BIN
     ap = argparse.ArgumentParser()
@@ -1587,6 +1842,10 @@ def main():
     ap.add_argument("--reads", default="1000")
     ap.add_argument("--volume-reads", default="0",
                     help="per-thread reads for the opt-in no-drop-at-scale tier (e.g. 250000 = 2M); 0 skips")
+    ap.add_argument("--bigapps", nargs="?", const="all", default="",
+                    help="opt-in slow tier: real large apps (powershell, headless Edge) under every backend, "
+                         "launch/attach/detach; optional comma list of name substrings (e.g. ps-launch,edge-detach)")
+    ap.add_argument("--bigapps-secs", type=int, default=40, help="workload length of each bigapps run")
     ap.add_argument("--only", default="", help="comma-separated substrings of check names to run (default: all)")
     args = ap.parse_args()
     BIN = args.bin.resolve()
@@ -1649,6 +1908,8 @@ def main():
     if want(check_attach_new): check_attach_new()
     if want(check_refusals): check_refusals()
     if want(check_hotpatch_prologue): check_hotpatch_prologue()
+    if args.bigapps:
+        if want(check_bigapps): check_bigapps(args.bigapps_secs, args.bigapps)
     print("-" * 72)
     failed = 0
     for name, status, detail in RESULTS:

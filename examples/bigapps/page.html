@@ -1,0 +1,28 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>uhh bigapps</title></head>
+<body>
+<!-- Served by scripts/regress.py (--bigapps) to headless Edge (--dump-dom). The JS result is
+     verified by the suite, as are 40 synchronous requests to the local server; /slow then holds
+     the load event open, so the browser process stays busy (IPC, allocations, file and
+     network I/O) for the whole run. -->
+<div id="js">pending</div>
+<div id="fetched">FETCHED=0</div>
+<script>
+function work(n) { let h = 0; for (let i = 0; i < n; i++) h = (h * 31 + (i ^ (i >> 3))) | 0; return h; }
+let r = 0;
+for (let k = 0; k < 20; k++) r = (r + work(50000 + k)) | 0;
+const frag = document.createDocumentFragment();
+for (let i = 0; i < 20000; i++) { const p = document.createElement('p'); p.textContent = 'row' + i; frag.appendChild(p); }
+document.getElementById('js').textContent = 'BIGAPPS_JS=' + r + ' nodes=' + frag.childNodes.length;
+// Synchronous requests: parsing (and so the load event / --dump-dom) waits for every one.
+const FETCHES = 40;
+let got = 0;
+for (let i = 0; i < FETCHES; i++) {
+  const x = new XMLHttpRequest();
+  x.open('GET', '/data?i=' + i, false);
+  try { x.send(); if (x.status === 200 && x.responseText === 'data' + i) got++; } catch (e) {}
+}
+document.getElementById('fetched').textContent = 'FETCHED=' + got;
+</script>
+<img src="/slow" alt="slow">
+</body></html>

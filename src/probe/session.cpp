@@ -3080,6 +3080,11 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             if (!step->second.displaced && still_armed(s, step->second.site)) patch(s->pi.hProcess, step->second.site, 0xcc);
             stepping.erase(step);
         }
+        // Second chance: no handler in the target took it -- the target is about to die.
+        // Say so (with where), so a crash under instrumentation is never silent.
+        if (!event.u.Exception.dwFirstChance)
+            std::fprintf(stderr, "probe: unhandled exception 0x%lx at 0x%llx tid=%lu (second chance)\n",
+                         (unsigned long)ex.ExceptionCode, (unsigned long long)address, (unsigned long)event.dwThreadId);
         return true;
     }
     HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
