@@ -321,6 +321,22 @@ PowerShell + detach) under every backend, against an uninstrumented baseline.
   p50 1 us / p99 10 us, 0 missed frames; hw p50 ~220 us / p99 ~520 us, breakpoint p50
   ~300 us / p99 ~660 us, a few frames over budget -- belongs in the backend table.
 
+## Code review of the 2026-11-05 merges (fresh-eyes reviewer)
+- ✅ Console close/logoff/shutdown during a session: the handler now holds until probe_run has let go
+  of the target (was: tool killed with INT3s/DRs/hooks still live -> target died at its next hit)
+- ✅ gated_config mapped a REUSED handle value (CreateProcess hProcess, DuplicateHandle, inherited)
+  to the pid opened under it before: ntdll!NtClose now clears the slot (forget_closed_handle)
+- ✅ In-place re-arm / displaced-fault restore wrote without checking the byte (could land on another
+  tool's hook written meanwhile): compare-before-write now
+- ✅ A relocated INT3 whose adoption failed was passed to the target as unhandled: now rewound
+- 🔧 (call_original hunter) breakpoint/hw count the call_original pass-through as a second hit;
+  inline call_original swallows the original's exceptions
+- 📄 Accounting edge: a callback killed by process exit AFTER publishing its log but BEFORE returning
+  is reported both as a delivered log and in callbacks_interrupted (logs + dropped + interrupted can
+  exceed hits by the number of such threads). No log is lost; closing it exactly needs a per-callback
+  serial carried in the log record and matched by the controller. (The reverse window -- a hit counted
+  with no log and not interrupted -- is closed: hit and in-flight are one atomic add.)
+
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`
 - ✅ Per-log overhead ceilings in the suite (`log-throughput-*`)
