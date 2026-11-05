@@ -132,6 +132,16 @@ int probe_add_address(probe_session *, uint64_t address, probe_callback, uint32_
 /* Hardware DATA watchpoint on an absolute address: flags = PROBE_WATCH_WRITE (default)
    or PROBE_WATCH_RW, optionally | PROBE_ONCE. Max 4 hardware probes in total. */
 int probe_watch(probe_session *, uint64_t address, probe_callback, uint32_t flags);
+/* Start argv[0] (with argv) under UHH. The target inherits the caller's stdin. Its stdout
+   and stderr are the caller's when those are a console (or NUL); when they are a pipe or a
+   file, the target writes into its own pipe (GetFileType: FILE_TYPE_PIPE) and UHH forwards
+   its bytes unchanged, a complete line at a time, so a live probe_log record is always a
+   whole line of its own and never lands inside one of the target's lines. An unfinished
+   line (a prompt, binary output) goes out after ~50 ms without new bytes; records logged
+   meanwhile follow at the target's next newline. stdout and stderr that are one stream
+   (2>&1) share one pipe, so their order is kept. Only when the target ends inside a line
+   and records or the report still follow does UHH end that line ("\n") first. After the
+   target exits, output its children still write is forwarded until probe_close. */
 int probe_launch(probe_session *, char *const argv[]);
 /* Attach to an already-running process instead of launching one. Probes resolve against
    the modules already loaded (and any loaded later). probe_run returns when the target
