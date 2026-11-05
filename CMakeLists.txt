@@ -30,6 +30,12 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
 endif()
 
 enable_language(ASM_MASM)
+# x86 links use /SAFESEH: every object must declare its exception handlers, and MASM only
+# marks an object as SAFESEH-compatible when assembled with /safeseh (LNK2026 otherwise,
+# on toolchains that enforce it). Our .asm files register no handlers.
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    string(APPEND CMAKE_ASM_MASM_FLAGS " /safeseh")
+endif()
 # MASM dialect (ml64 vs ml) follows the generator platform automatically; only the
 # fixture .asm variant is selected by pointer width (one file per arch, not IFDEF
 # inside a single .asm).
