@@ -33,6 +33,16 @@ target's checksum after all cycles, and that the target's private bytes, handles
 and loaded agent copies do not grow from cycle to cycle.
 
 regress.py --soak-minutes N runs every phase for N minutes through run_phase() below.
+
+Shared test VM (Proxmox VM 103, KVM, guest disk on a 5400 rpm HDD): keep the hw phase to
+<= 10 minutes per run (8.2 min / 5M hw hits verified clean), with no other VM jobs running and
+--sample-s <= 15. The VM hung silently twice 18-22 min into a 30-min hw soak; short sampled runs
+showed no growth of available memory, kernel pools, commit or handles with hw load (nor inline),
+so that is a VM artefact, not a UHH leak -- see docs/ROADMAP.md "hw load / VM freeze". Signs:
+Kernel-Power 41 with BugcheckCode=0, no Resource-Exhaustion (2004) event, samples flat up to the
+hang. The host's "kvm: Unhandled WRMSR(0x1d9)" lines are unrelated background noise, and the
+Proxmox memory graph (QEMU RSS) reads near-full whatever the guest's real use. Long hw soaks
+belong on bare metal.
 """
 import argparse
 import csv
@@ -571,7 +581,7 @@ def run_phase(bin_dir, phase, minutes, threads=8, pace=0, out_dir=None, sample_s
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--bin", type=Path, default=Path("build-x64/Release"))
-    ap.add_argument("--minutes", type=float, default=30, help="per phase (--soak-minutes)")
+    ap.add_argument("--minutes", type=float, default=30, help="per phase (--soak-minutes); on the shared test VM keep the hw phase <= 10 (see above)")
     ap.add_argument("--soak-minutes", type=float, dest="minutes")
     ap.add_argument("--phase", action="append", choices=list(PHASES) + ["attach"],
                     help="repeatable; default: mixed hw breakpoint attach")

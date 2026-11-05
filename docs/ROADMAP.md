@@ -734,6 +734,51 @@ reproduced on x64 before the fix (baseline numbers quoted) and has a `logs-*` ch
   atomically) -- over-accounting by at most one per killed thread, never a lost hit. A producer that
   read `controller_gone == 0` and claims a slot after the final drain at detach/close (a window of a
   few instructions) loses that record uncounted.
+## hw load / VM freeze (2026-11-06) — investigated: VM artefact, not a UHH leak
+
+The shared Win10 VM (Proxmox VM 103, KVM, cpu=host i5-6600) froze twice 18-22 min into the
+30-min all-hw soak phase (~12k hw hits/s). Investigated with short, sampled runs (10 s
+samples of Available MB, standby/modified/free lists, paged/nonpaged pool, commit, system
+cache, system handles/threads, per-process private/WS/handles for controller, target,
+python, System, Registry, MsMpEng; pool tags via SystemPoolTagInformation before/after;
+abort below 4000 MB available):
+
+- ✅ **No growth with hw load.** hw 2.3 min (1.44M hw hits, 10.4k/s): Available 14089 -> 14177 MB,
+  nonpaged 110 -> 109 MB, paged 292 -> 293 MB, commit 2370 -> 2172 MB. hw 8.2 min (5.04M hits,
+  10.3k/s, past the t=300 s and t=471 s points): Available 14065 -> 13980 MB (noise +-150),
+  nonpaged 122 -> 127, paged 341 -> 360 (largest pool-tag deltas FMfn/MmSt/Ntff/File: file-system
+  tags from other agents' builds, all < 5 MB), commit 2391 -> 2373. Controller ~2-3 MB private
+  and target ~1 MB flat, handle counts flat, MsMpEng 434 -> 498 MB (scanned the non-excluded
+  log file and other agents' builds). Same 2-min run on inline at the same rate (12k/s): equally
+  flat. Upper bound for any per-hit leak: < ~30 bytes/hit -- the freeze would have needed
+  ~1 KB/hit (6-10 MB/s). Every run PASSed soak.py's exactness checks.
+- ✅ **DR7 is clean.** Read live from the target's threads mid-run: 0x415 / 0x15 (L0-L2 +
+  reserved bit 10). UHH never sets LE/GE (bits 8/9), GD or BTF (set_dr_on_thread,
+  enforce_owned_drs, the agent's in-process path only touch Ln and RW/LEN).
+- ✅ **`kvm: Unhandled WRMSR(0x1d9) = 0x1` is unrelated to hw hits.** The guest writes
+  DEBUGCTL.LBR; KVM drops the bit and logs (rate-limited, so 132 lines/min = the cap). Zero such
+  lines during the whole 2.3-min hw run, and the same sporadic rate during the 8-min hw run as
+  while only builds/other agents ran (00:20, 00:25-00:31, 00:43-00:46 with no hw load).
+  Harmless (no #GP, no state); ignore it.
+- **What the freezes were:** silent guest hangs. Kernel-Power 41 with BugcheckCode=0 (no
+  bugcheck, no dump), no Resource-Exhaustion-Detector (2004) event, pagefile peak usage 0 --
+  the guest never ran out of commit. An identical silent freeze happened at 12:56 the same
+  day under concurrent builds with no hw soak at all. The "guest memory full" figure (6.3/8,
+  14.2/16 GB) is Proxmox's QEMU RSS (no balloon driver in the guest: device VEN_1AF4&DEV_1002 is
+  in Error state, so no balloon stats): it only shows guest pages ever touched (file cache of
+  the multi-GB soak logs) and never shrinks -- it reads 16.8 GB right now with 14 GB available
+  in the guest. The working-set trim seen at t=1085 s of the first run (8 GB guest) was with
+  several agents building/testing concurrently. The guest disk is a thin LV on a 5400 rpm HDD
+  (WD10EZRX, host /dev/sdb). Conclusion: a hypervisor/VM-load artefact on this box, not a UHH
+  defect; a real machine is not affected by anything UHH does under hw load.
+- **How to recognise it:** guest unreachable, Kernel-Power 41 BugcheckCode=0 after reset, no
+  2004 events, soak samples flat right up to the hang (Available, pools, commit), Proxmox memory
+  graph near the VM's maximum. WRMSR(0x1d9) lines are background noise, not a signal.
+- **Safe soak limit on this VM:** all-hw phase <= 10 min per run (8.2 min verified clean), only
+  with no other VM jobs running (take every vmslot), samples every <= 15 s, and the soak's abort
+  on low Available memory left on. Longer hw soaks belong on bare metal. (`scripts/soak.py --help`
+  says the same.)
+- No fix, so no `hwload-` regress check: there is nothing in UHH to regress.
 
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`
