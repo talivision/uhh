@@ -3,7 +3,8 @@
 ;   uint64_t uhh_orig_thunk(uint64_t fn, const uint64_t *args, OrigFrame *frame)
 ; Calls fn(args[0..3] in RCX/RDX/R8/R9, args[4..35] as its stack arguments 5..36) with XMM0-5
 ; loaded from frame->xmm0 (the hit's float/vector arguments; skipped when null), returns its
-; RAX and stores its XMM0 in frame->xmm0_out. Its UNWIND DATA does not describe this frame's
+; RAX and stores the volatile registers it left -- RCX RDX R8-R11, XMM0-5 (a float/double
+; result in XMM0) -- to frame->post (OrigPost, agent.cpp). Its UNWIND DATA does not describe this frame's
 ; real caller: it declares a machine frame (RIP/RSP = the hit's return address and the
 ; caller's SP after it) plus the hit's nonvolatile registers, all copied into this frame
 ; before the call. An exception or longjmp unwinding out of the original therefore steps
@@ -15,7 +16,7 @@
 ;   000..01F home space for fn    020..11F fn's stack args 5..36
 ;   120..147 machine frame (RIP, CS, EFLAGS, RSP, SS)   148 HitScope* (read by uhh_orig_unwind)
 ;   150..18F rbx rbp rsi rdi r12 r13 r14 r15 (the hit's)   190..22F xmm6..xmm15 (the hit's)
-;   230 the OrigFrame pointer (for the result after the call)
+;   230 the OrigFrame pointer (for the results after the call)
 ; The declared prologue is: [machine frame] ; sub rsp, 120h ; save regs. Unwinding applies the
 ; saves (relative to this rsp), then rsp += 120h, then pops the machine frame -- the real
 ; allocation (238h) is larger so the fake frame never overlaps our own return address.
@@ -133,8 +134,22 @@ no_args_xmm:
     mov r9, [r10+18h]
     call rax
     nop                                 ; the return address must not look like an epilogue
-    mov r10, [rsp+230h]
-    movups [r10+68h], xmm0              ; frame->xmm0_out: a float/double result
+    mov [rsp], r11                      ; home space is free again: R11 as the original left it
+    mov r11, [rsp+230h]
+    mov r11, [r11+68h]                  ; frame->post
+    mov [r11], rcx
+    mov [r11+8], rdx
+    mov [r11+10h], r8
+    mov [r11+18h], r9
+    mov [r11+20h], r10
+    mov r10, [rsp]
+    mov [r11+28h], r10
+    movups [r11+30h], xmm0
+    movups [r11+40h], xmm1
+    movups [r11+50h], xmm2
+    movups [r11+60h], xmm3
+    movups [r11+70h], xmm4
+    movups [r11+80h], xmm5
     add rsp, 238h
     ret
 uhh_orig_thunk ENDP

@@ -4,6 +4,7 @@
 #include "probe_log_format.hpp"
 #include "probe_agent_shared.hpp"
 #include <cerrno>
+#include <cwchar>
 #include <cctype>
 #include <cstdarg>
 #include <climits>
@@ -58,6 +59,9 @@ struct Probe {
     // REP/REPE/REPNE string instruction: the trap flag fires after EVERY iteration, so it
     // is run out-of-line WITHOUT single-stepping, ended by an INT3 placed after the copy.
     bool rep_string = false;
+    // x64 SYSCALL / INT 2E site: runs from a per-site trampoline (insn; mov rcx, site+len; jmp
+    // site+len) without any trap flag or completion event (see syscall_trampoline). 0 = none yet.
+    uint64_t tramp = 0;
     probe_callback callback = nullptr;
     uint32_t flags = 0;
     std::vector<unsigned char> config;
@@ -73,10 +77,14 @@ struct CallbackState {
     Probe *probe;
     DWORD pid = 0, tid = 0;   // the stopped event's thread (call_func runs code on it)
     bool released = false;    // call_original: the original left without returning; the thread runs on
-    // call_original (breakpoint/hw): the floating-point state the original returned with
-    // (XMM0 / x87 ST0 results), which return_from hands to the caller.
-    bool have_post_fp = false;
-    CONTEXT post_fp{};
+    // call_original returned: the thread's registers as the original left them (its return
+    // registers: x86 EDX:EAX, XMM0, x86 ST0; the other volatile ones) and the callback's
+    // registers at that moment. With return_from the caller gets them -- exactly what an
+    // un-hooked call leaves -- except AX (the return_from value) and any register the
+    // callback set_reg'd after the call (see apply_return_from).
+    bool have_post = false;
+    CONTEXT post{};
+    probe_regs post_seen{};
 };
 // The floating-point parts of a CONTEXT (x86: the x87 save area and the FXSAVE image with XMM).
 #if defined(_WIN64)
@@ -100,6 +108,9 @@ struct StepState {
     bool tail_int3 = false; // displaced copy ends at an INT3 (scratch + insn_len), no trap flag
     bool rep_string = false;// REP string op: an in-place step continues until it leaves the site
     bool syscall_insn = false; // SYSCALL stepped in place: the CPU copies OUR trap flag into R11
+    bool pushf_insn = false;   // PUSHF stepped in place: the pushed image carries OUR trap flag
+    bool prog_tf = false;      // ... unless the program had TF set itself
+    bool windowed = false;     // in place under the in-place window (other threads held, see inplace_begin)
 };
 
 // One log line, optionally with a raw stack snapshot (return addresses only). Frames
@@ -147,6 +158,22 @@ struct probe_session {
     uint64_t log_bytes_written = 0, log_bytes_tailed = 0;
     bool tail_stop = false, tail_failed = false, console_warning = false;
     std::string tail_error;
+    // probe_launch: when the controller's stdout/stderr is a pipe or file, the target gets
+    // its own pipe and a forwarder copies its bytes out line-wise (see forward_main), so
+    // live log records never land inside one of the target's lines.
+    struct StdForward {
+        HANDLE pipe = INVALID_HANDLE_VALUE;     // server (read) end, overlapped
+        HANDLE dst = INVALID_HANDLE_VALUE;      // the controller's real stdout / stderr
+        bool to_stdout = false;                 // shares stdout_mu and the log tail's line state
+        std::thread thread;
+        HANDLE wake = nullptr, drained = nullptr;
+        std::atomic<int> mode{0};               // FWD_RUN / FWD_DRAIN / FWD_STOP
+        std::mutex mu;                          // whole-line writes to a non-stdout dst
+    };
+    StdForward fwd_out, fwd_err;
+    bool fwd_out_active = false;               // the log tail goes through the line-state logic
+    bool fwd_finished = false;
+    std::atomic<bool> out_midline{false};      // stdout ends inside a target line (under stdout_mu)
     std::atomic<uint64_t> logs_written{0};
     bool sym_ready = false;    // dbghelp initialised on the target (stack walk + symbolize)
     std::unordered_map<std::string, uint64_t> module_bases;
@@ -231,6 +258,17 @@ struct probe_session {
     // recognised by the registers instead -- unchanged since the fault (snapshot below).
     struct Refault { uint64_t site = 0; CONTEXT regs{}; };
     std::unordered_map<DWORD, Refault> refault;
+    // In-place window (see inplace_begin): while a thread steps an instruction at its real
+    // address with our INT3 lifted, every other thread of the target is suspended by us, so
+    // none can run through the site uncounted. owner = the stepping thread (0: no window).
+    DWORD inplace_owner = 0;
+    ULONGLONG inplace_since = 0;
+    bool inplace_warned = false;
+    std::vector<std::pair<DWORD, HANDLE>> inplace_suspended;
+    std::unordered_map<DWORD, bool> agent_tid_cache;    // agent_thread() answers (remote reads)
+    // x64 SYSCALL / INT 2E trampolines (Probe::tramp). Never freed: after a detach a thread
+    // may still be blocked inside one (its syscall returns there).
+    uint64_t tramp_next = 0, tramp_end = 0;
 };
 
 static bool register_runtime_inline(probe_session *s, Probe &p);
@@ -248,6 +286,8 @@ static void deliver_past_stall(probe_session *s);
 static void enqueue_agent_record(probe_session *s, const probe_agent_log &rec);
 static void flush_log_writer(probe_session *s);
 static void stop_log_output(probe_session *s);
+static void forward_finish(probe_session *s);
+static void forward_stop(probe_session *s);
 static void release_hw(probe_session *s, Probe &p);
 static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposition);
 static void release_held(probe_session *s, const char *why);
@@ -335,6 +375,7 @@ static void writer_failed(probe_session *s, const std::string &message, uint64_t
 }
 
 static bool write_stdout_chunk(probe_session *s, const char *bytes, size_t size);
+static void tail_catch_up_locked(probe_session *s, const char *fresh, size_t fresh_size, uint64_t fresh_end);
 static bool write_log_batch(probe_session *s, const std::string &bytes, uint64_t records) {
     if (bytes.empty()) return true;
     DWORD wrote = 0;
@@ -346,9 +387,10 @@ static bool write_log_batch(probe_session *s, const std::string &bytes, uint64_t
         return false;
     }
     s->logs_written.fetch_add(records, std::memory_order_relaxed);
+    uint64_t end = 0;
     {
         std::lock_guard<std::mutex> lock(s->tail_mu);
-        s->log_bytes_written += bytes.size();
+        end = s->log_bytes_written += bytes.size();
     }
     // Live output: the SAME batch goes to stdout right away, from this thread (the
     // separate tailer let stdout fall seconds behind under load). A slow stdout (a
@@ -361,6 +403,12 @@ static bool write_log_batch(probe_session *s, const std::string &bytes, uint64_t
     {
         std::lock_guard<std::mutex> lock(s->tail_mu);
         tail = s->tail_enabled && !s->tail_failed;
+    }
+    if (tail && s->fwd_out_active) {
+        // The target's stdout is forwarded: the batch goes out only at a line boundary of it.
+        std::lock_guard<std::mutex> out_lock(s->stdout_mu);
+        tail_catch_up_locked(s, bytes.data(), bytes.size(), end);
+        tail = false;                                   // tail_catch_up_locked tracked the bytes
     }
     if (tail && !write_stdout_chunk(s, bytes.data(), bytes.size())) tail = false;   // tail_failed() said why
     if (tail) {
@@ -486,6 +534,233 @@ static bool write_stdout_chunk(probe_session *s, const char *bytes, size_t size)
     return true;
 }
 
+static bool write_all(HANDLE h, const char *bytes, size_t size) {
+    while (size) {
+        DWORD chunk = (DWORD)std::min<size_t>(size, 1u << 20), wrote = 0;
+        if (h == nullptr || h == INVALID_HANDLE_VALUE || !WriteFile(h, bytes, chunk, &wrote, nullptr) || !wrote) return false;
+        bytes += wrote; size -= wrote;
+    }
+    return true;
+}
+
+// ---- Forwarded target stdout/stderr (probe_launch) ------------------------------------------
+// The target writes into its own pipe; forward_main copies the bytes to the controller's real
+// stdout/stderr a complete line at a time, and the live log tail writes its records only while
+// stdout is at a line boundary. Records written while the target sits inside an unfinished line
+// (a prompt, a progress line, binary output) stay in the log FILE and are replayed from there
+// the moment the target ends that line -- so nothing is held in memory and nothing blocks the
+// writer (blocking it could deadlock: the target thread that would finish the line may be the
+// one waiting to log). Both run under stdout_mu.
+
+// stdout_mu held. Write log bytes up to fresh_end (the log file length) unless stdout is inside
+// a target line. [tailed, fresh_end - fresh_size) is replayed from the file; the rest -- the
+// writer's batch just appended -- comes from memory.
+static void tail_catch_up_locked(probe_session *s, const char *fresh, size_t fresh_size, uint64_t fresh_end) {
+    if (s->out_midline.load()) return;                  // deferred: replayed at the next newline
+    uint64_t tailed = 0;
+    {
+        std::lock_guard<std::mutex> lock(s->tail_mu);
+        if (s->tail_failed || !s->tail_enabled) return;
+        tailed = s->log_bytes_tailed;
+        if (!fresh_size) fresh_end = s->log_bytes_written;
+    }
+    if (tailed >= fresh_end) return;
+    if (std::fflush(stdout) != 0) { tail_failed(s, "flush controller stdout before probe logs"); return; }
+    const uint64_t file_end = fresh_end - fresh_size;
+    while (tailed < file_end) {
+        char buffer[64 * 1024];
+        OVERLAPPED at{}; at.Offset = (DWORD)tailed; at.OffsetHigh = (DWORD)(tailed >> 32);
+        DWORD want = (DWORD)std::min<uint64_t>(sizeof(buffer), file_end - tailed), got = 0;
+        if (!ReadFile(s->log_reader, buffer, want, &got, &at) || !got) {
+            tail_failed(s, win_error("replay probe log file to stdout")); return;
+        }
+        if (!write_all(s->stdout_handle, buffer, got)) { tail_failed(s, win_error("tail probe logs to stdout")); return; }
+        tailed += got;
+    }
+    if (tailed < fresh_end) {
+        size_t skip = (size_t)(fresh_size - (fresh_end - tailed));
+        if (!write_all(s->stdout_handle, fresh + skip, fresh_size - skip)) {
+            tail_failed(s, win_error("tail probe logs to stdout")); return;
+        }
+        tailed = fresh_end;
+    }
+    {
+        std::lock_guard<std::mutex> lock(s->tail_mu);
+        s->log_bytes_tailed = tailed;
+    }
+    s->tail_caught_up.notify_all();
+}
+
+enum { FWD_RUN = 0, FWD_DRAIN = 1, FWD_STOP = 2 };
+
+// Write target bytes to the real stream. false: the stream is gone (the reader closed it).
+static bool forward_emit(probe_session *s, probe_session::StdForward *f, const char *bytes, size_t size) {
+    if (!size) return true;
+    if (!f->to_stdout) {
+        std::lock_guard<std::mutex> lock(f->mu);
+        return write_all(f->dst, bytes, size);
+    }
+    bool ok;
+    {
+        std::lock_guard<std::mutex> out_lock(s->stdout_mu);
+        std::fflush(stdout);                            // the driver's own complete lines first
+        ok = write_all(f->dst, bytes, size);
+        s->out_midline = ok && bytes[size - 1] != '\n';
+        if (ok) tail_catch_up_locked(s, nullptr, 0, 0);  // records that waited for this newline
+    }
+    { std::lock_guard<std::mutex> lock(s->tail_mu); }   // no lost wakeup for flush_log_writer
+    s->tail_caught_up.notify_all();
+    return ok;
+}
+
+static void forward_main(probe_session *s, probe_session::StdForward *f) {
+    constexpr ULONGLONG PARTIAL_MS = 50;      // an unfinished line idle this long goes out as is
+    constexpr ULONGLONG DRAIN_IDLE_MS = 100;  // after the target exited: quiet this long = drained
+    constexpr ULONGLONG DRAIN_MAX_MS = 2000;  // ... or this long at most (a grandchild keeps writing)
+    constexpr size_t PARTIAL_MAX = 64 * 1024; // a line this long (binary output) goes out unfinished
+    OVERLAPPED ov{}; ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    std::vector<char> buffer(64 * 1024);
+    std::string pending;
+    bool reading = false, eof = false, dead = !ov.hEvent;
+    ULONGLONG last = GetTickCount64(), drain_start = 0;
+    bool drained = false;
+    auto emit = [&](bool all) {
+        if (pending.empty() || dead) return;
+        size_t n = pending.size();
+        if (!all) {
+            size_t nl = pending.rfind('\n');
+            if (nl == std::string::npos) { if (n < PARTIAL_MAX) return; }
+            else n = nl + 1;
+        }
+        if (!forward_emit(s, f, pending.data(), n)) dead = true;
+        pending.erase(0, n);
+    };
+    auto take = [&](DWORD got) { if (got) { pending.append(buffer.data(), got); last = GetTickCount64(); emit(false); } };
+    while (!eof && !dead) {
+        const int mode = f->mode.load();
+        if (mode == FWD_STOP) break;
+        if (mode == FWD_DRAIN && !drain_start) drain_start = GetTickCount64();
+        if (!reading) {
+            ResetEvent(ov.hEvent);
+            if (ReadFile(f->pipe, buffer.data(), (DWORD)buffer.size(), nullptr, &ov) || GetLastError() == ERROR_IO_PENDING)
+                reading = true;
+            else { eof = true; break; }                 // every writer is gone (ERROR_BROKEN_PIPE)
+        }
+        ULONGLONG now = GetTickCount64(), idle = now - last;
+        DWORD timeout = INFINITE;
+        if (!pending.empty()) timeout = (DWORD)(idle >= PARTIAL_MS ? 0 : PARTIAL_MS - idle);
+        if (drain_start && !drained) {
+            ULONGLONG a = idle >= DRAIN_IDLE_MS ? 0 : DRAIN_IDLE_MS - idle;
+            ULONGLONG b = now - drain_start >= DRAIN_MAX_MS ? 0 : DRAIN_MAX_MS - (now - drain_start);
+            timeout = (DWORD)std::min<ULONGLONG>(timeout, std::min(a, b));
+        }
+        HANDLE waits[2] = {ov.hEvent, f->wake};
+        DWORD w = WaitForMultipleObjects(2, waits, FALSE, timeout);
+        if (w == WAIT_OBJECT_0) {
+            DWORD got = 0;
+            reading = false;
+            if (GetOverlappedResult(f->pipe, &ov, &got, FALSE)) take(got);
+            else if (GetLastError() == ERROR_MORE_DATA) take(got);
+            else eof = true;
+        }
+        now = GetTickCount64();
+        if (!pending.empty() && now - last >= PARTIAL_MS) emit(true);    // a prompt shows promptly
+        if (drain_start && !drained &&
+            ((pending.empty() && now - last >= DRAIN_IDLE_MS) || now - drain_start >= DRAIN_MAX_MS)) {
+            emit(true); drained = true; SetEvent(f->drained);
+        }
+    }
+    if (reading) {
+        CancelIoEx(f->pipe, &ov);
+        DWORD got = 0;
+        if (GetOverlappedResult(f->pipe, &ov, &got, TRUE)) take(got);
+    }
+    emit(true);
+    // The real stream is gone: close our end so the target's own writes fail as they would
+    // have on the stream it was started with (and it never blocks on a full pipe).
+    if (dead) { CloseHandle(f->pipe); f->pipe = INVALID_HANDLE_VALUE; }
+    if (ov.hEvent) CloseHandle(ov.hEvent);
+    SetEvent(f->drained);
+}
+
+// A pipe for the target's stdout/stderr: an overlapped server end we read, and an inheritable
+// synchronous client end the target writes (GetFileType: FILE_TYPE_PIPE).
+static bool make_forward_pipe(HANDLE &server, HANDLE &client) {
+    static std::atomic<unsigned> counter{0};
+    wchar_t name[96];
+    std::swprintf(name, 96, L"\\\\.\\pipe\\uhh-stdio-%lu-%u-%llu", (unsigned long)GetCurrentProcessId(),
+                  counter.fetch_add(1), (unsigned long long)GetTickCount64());
+    server = CreateNamedPipeW(name, PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                              PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                              1, 0, 64 * 1024, 0, nullptr);
+    if (server == INVALID_HANDLE_VALUE) return false;
+    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+    client = CreateFileW(name, GENERIC_WRITE | FILE_READ_ATTRIBUTES, 0, &sa, OPEN_EXISTING, 0, nullptr);
+    if (client == INVALID_HANDLE_VALUE) { CloseHandle(server); server = INVALID_HANDLE_VALUE; return false; }
+    return true;
+}
+
+// Forward a stream only when it is a pipe or a file: there a line-based reader sees the
+// target's bytes and the records interleaved. A console (or NUL) stays inherited: an
+// interactive target keeps its console (GetConsoleMode, colours, line editing).
+static bool forwardable(HANDLE h) {
+    if (h == nullptr || h == INVALID_HANDLE_VALUE) return false;
+    DWORD type = GetFileType(h);
+    return type == FILE_TYPE_PIPE || type == FILE_TYPE_DISK;
+}
+
+static bool same_object(HANDLE a, HANDLE b) {
+    if (a == b) return true;
+    using compare_fn = BOOL(WINAPI *)(HANDLE, HANDLE);
+    static compare_fn compare = (compare_fn)(void *)GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "CompareObjectHandles");
+    return compare && compare(a, b);
+}
+
+// Start a forwarder thread for an already-created pipe.
+static bool forward_start(probe_session *s, probe_session::StdForward *f) {
+    if (f->pipe == INVALID_HANDLE_VALUE) return true;
+    f->wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    f->drained = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!f->wake || !f->drained) return false;
+    try { f->thread = std::thread(forward_main, s, f); } catch (...) { return false; }
+    return true;
+}
+
+// The target is gone: let the forwarders pass on what it wrote (until end of file, or a short
+// quiet spell when a grandchild still holds the pipe), then let the records that waited
+// behind an unfinished last line out -- on a line of their own.
+static void forward_finish(probe_session *s) {
+    if (s->fwd_finished) return;
+    s->fwd_finished = true;
+    for (auto *f : {&s->fwd_out, &s->fwd_err})
+        if (f->thread.joinable()) { f->mode = FWD_DRAIN; SetEvent(f->wake); }
+    for (auto *f : {&s->fwd_out, &s->fwd_err})
+        if (f->thread.joinable()) WaitForSingleObject(f->drained, 5000);
+    if (!s->fwd_out_active) return;
+    std::lock_guard<std::mutex> out_lock(s->stdout_mu);
+    bool behind;
+    {
+        std::lock_guard<std::mutex> lock(s->tail_mu);
+        behind = s->log_bytes_tailed < s->log_bytes_written && !s->tail_failed;
+    }
+    if (s->out_midline && behind) {
+        std::fflush(stdout);
+        if (write_all(s->stdout_handle, "\n", 1)) s->out_midline = false;
+        else tail_failed(s, win_error("tail probe logs to stdout"));
+    }
+    tail_catch_up_locked(s, nullptr, 0, 0);
+}
+
+static void forward_stop(probe_session *s) {
+    for (auto *f : {&s->fwd_out, &s->fwd_err}) {
+        if (f->thread.joinable()) { f->mode = FWD_STOP; SetEvent(f->wake); f->thread.join(); }
+        if (f->pipe != INVALID_HANDLE_VALUE) CloseHandle(f->pipe);
+        if (f->wake) CloseHandle(f->wake);
+        if (f->drained) CloseHandle(f->drained);
+        f->pipe = INVALID_HANDLE_VALUE; f->wake = f->drained = nullptr;
+    }
+}
+
 static void log_tailer_main(probe_session *s) {
     constexpr size_t CHUNK_BYTES = 64 * 1024;
     std::string pending;
@@ -598,7 +873,8 @@ static bool start_log_output(probe_session *s) {
     // the complete file and avoid spending a thread copying bytes into the null device.
     s->tail_enabled = stdout_valid &&
                       !(s->stdout_type == FILE_TYPE_CHAR && !s->stdout_is_console);
-    if (false) {   // (no separate tailer: the writer writes stdout itself)
+    if (s->fwd_out_active && !s->tail_enabled) s->fwd_out_active = false;
+    if (s->fwd_out_active) {   // records deferred behind an unfinished target line are replayed from the file
         s->log_reader = CreateFileW(s->log_path.c_str(), GENERIC_READ,
                                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                     nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -661,13 +937,15 @@ static void flush_log_writer(probe_session *s) {
         error = s->writer_error;
     }
     if (!error.empty()) set_error(s, error);
+    if (s->exited) forward_finish(s);          // the target's last bytes, then the waiting records
 
     std::string tail_error;
     if (s->tail_enabled) {
         std::unique_lock<std::mutex> lock(s->tail_mu);
         uint64_t target = s->log_bytes_written;
+        // While the (running) target is inside a line, records wait for its newline.
         s->tail_caught_up.wait(lock, [s, target] {
-            return s->log_bytes_tailed >= target || s->tail_failed;
+            return s->log_bytes_tailed >= target || s->tail_failed || s->out_midline.load();
         });
         tail_error = s->tail_error;
     }
@@ -732,6 +1010,8 @@ static void stop_log_output(probe_session *s) {
         s->tail_changed.notify_one();
         s->log_tailer.join();
     }
+    forward_finish(s);                          // the session ends: whatever the target left
+    forward_stop(s);
     if (!s->writer_error.empty()) set_error(s, s->writer_error);
     if (!s->tail_error.empty()) set_error(s, s->tail_error);
     if (s->log_reader != INVALID_HANDLE_VALUE) CloseHandle(s->log_reader);
@@ -1106,9 +1386,11 @@ static std::string quote_arg(const char *arg) {
 #if defined(_WIN64)
 #define EMU_IP(c) (c).Rip
 #define EMU_SP(c) (c).Rsp
+#define EMU_CX(c) (c).Rcx
 #else
 #define EMU_IP(c) (c).Eip
 #define EMU_SP(c) (c).Esp
+#define EMU_CX(c) (c).Ecx
 #endif
 static bool emu_reg(const CONTEXT &c, ZydisRegister r, uint64_t next_ip, uint64_t &v) {
     if (r == ZYDIS_REGISTER_NONE) { v = 0; return true; }
@@ -1184,6 +1466,7 @@ static bool target_has_shadow_stack(probe_session *s) {
     return s->shadow_stack == 1;
 }
 
+static bool remote_range_ok(HANDLE h, uint64_t a, size_t n, bool write);
 static bool emulate_site(probe_session *s, const Probe &p, CONTEXT &c) {
     if (p.orig_insn.empty()) return false;
     ZydisDecoder dec;
@@ -1199,13 +1482,19 @@ static bool emulate_site(probe_session *s, const Probe &p, CONTEXT &c) {
     if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, p.orig_insn.data(), p.orig_insn.size(), &in, ops))) return false;
     const uint64_t site = p.address, next = site + in.length;
     HANDLE h = s->pi.hProcess;
+    // Every memory access is checked against the CPU's view first (committed, not PAGE_GUARD,
+    // readable / writable): Read/WriteProcessMemory would consume a guard page (the stack's own
+    // guard -> no stack growth, the next overflow an access violation) or write through a
+    // read-only page. Anything that would fault is left to the CPU (in-place step).
     auto push = [&](uint64_t v, uint32_t size) {
         uint64_t sp = (uint64_t)EMU_SP(c) - size; size_t n = 0;
+        if (!remote_range_ok(h, sp, size, true)) return false;
         if (!remote_write(h, sp, &v, size, &n) || n != size) return false;
         EMU_SP(c) = (decltype(EMU_SP(c)))sp; return true;
     };
     auto pop = [&](uint64_t &v, uint32_t size) {
         v = 0; size_t n = 0;
+        if (!remote_range_ok(h, (uint64_t)EMU_SP(c), size, false)) return false;
         if (!remote_read(h, (uint64_t)EMU_SP(c), &v, size, &n) || n != size) return false;
         EMU_SP(c) = (decltype(EMU_SP(c)))((uint64_t)EMU_SP(c) + size); return true;
     };
@@ -1230,7 +1519,7 @@ static bool emulate_site(probe_session *s, const Probe &p, CONTEXT &c) {
             a = (uint32_t)a;
 #endif
             t = 0; size_t n = 0;
-            return remote_read(h, a, &t, ptr, &n) && n == ptr;
+            return remote_range_ok(h, a, ptr, false) && remote_read(h, a, &t, ptr, &n) && n == ptr;
         }
         return false;
     };
@@ -1257,22 +1546,35 @@ static bool emulate_site(probe_session *s, const Probe &p, CONTEXT &c) {
         case ZYDIS_MNEMONIC_JS: case ZYDIS_MNEMONIC_JNS: case ZYDIS_MNEMONIC_JP: case ZYDIS_MNEMONIC_JNP:
         case ZYDIS_MNEMONIC_JL: case ZYDIS_MNEMONIC_JNL: case ZYDIS_MNEMONIC_JLE: case ZYDIS_MNEMONIC_JNLE:
             ok = target(t); if (ok) EMU_IP(c) = (decltype(EMU_IP(c)))(emu_cond(in.mnemonic, c.EFlags) ? t : next); break;
-        case ZYDIS_MNEMONIC_JRCXZ: case ZYDIS_MNEMONIC_JECXZ: {
+        case ZYDIS_MNEMONIC_JRCXZ: case ZYDIS_MNEMONIC_JECXZ: case ZYDIS_MNEMONIC_JCXZ: {
+            // The counter width is the ADDRESS size: jrcxz (x64), jecxz (x86, or 67h on x64),
+            // jcxz (67h on x86).
             uint64_t cx = 0;
-            ok = target(t) && emu_reg(c, in.mnemonic == ZYDIS_MNEMONIC_JRCXZ ? ZYDIS_REGISTER_RCX : ZYDIS_REGISTER_ECX, next, cx);
+            ok = target(t);
+            if (ok && in.mnemonic == ZYDIS_MNEMONIC_JCXZ) cx = (uint64_t)(EMU_CX(c) & 0xFFFFu);
+            else if (ok) ok = emu_reg(c, in.mnemonic == ZYDIS_MNEMONIC_JRCXZ ? ZYDIS_REGISTER_RCX : ZYDIS_REGISTER_ECX, next, cx);
             if (ok) EMU_IP(c) = (decltype(EMU_IP(c)))(cx == 0 ? t : next);
             break;
         }
         case ZYDIS_MNEMONIC_LOOP: case ZYDIS_MNEMONIC_LOOPE: case ZYDIS_MNEMONIC_LOOPNE: {
-            if (in.address_width != ptr * 8 || !target(t)) break;   // counter = rcx (x64) / ecx (x86)
+            // The counter is rcx / ecx / cx by ADDRESS size (67h selects ecx on x64, cx on x86).
+            if (!target(t)) break;
+            bool nz;
 #if defined(_WIN64)
-            uint64_t &cx = c.Rcx;
+            if (in.address_width == 64) { --c.Rcx; nz = c.Rcx != 0; }
+            else if (in.address_width == 32) {          // a 32-bit counter write zero-extends, as
+                const uint32_t e = (uint32_t)c.Rcx - 1;  // the CPU does (inplace-loop_a32 compares)
+                c.Rcx = e; nz = e != 0;
+            } else break;
 #else
-            DWORD &cx = c.Ecx;
+            if (in.address_width == 32) { --c.Ecx; nz = c.Ecx != 0; }
+            else if (in.address_width == 16) {         // cx only; the upper half of ecx is kept
+                const WORD cx = (WORD)(c.Ecx - 1);
+                c.Ecx = (c.Ecx & 0xFFFF0000u) | cx; nz = cx != 0;
+            } else break;
 #endif
-            --cx;
             const bool zf = c.EFlags & 0x40;
-            const bool take = cx != 0 && (in.mnemonic == ZYDIS_MNEMONIC_LOOP ||
+            const bool take = nz && (in.mnemonic == ZYDIS_MNEMONIC_LOOP ||
                                           (in.mnemonic == ZYDIS_MNEMONIC_LOOPE && zf) ||
                                           (in.mnemonic == ZYDIS_MNEMONIC_LOOPNE && !zf));
             EMU_IP(c) = (decltype(EMU_IP(c)))(take ? t : next); ok = true;
@@ -2397,6 +2699,107 @@ static void end_inplace_step(probe_session *s, DWORD tid, uint64_t site) {
     if (still_armed(s, site)) rearm_breakpoint(s->pi.hProcess, site, probe_at(s, site)->original);
 }
 
+// ---- In-place window -------------------------------------------------------------------
+// The few sites that are neither displaced nor emulated (see emulate_site: segment-relative or
+// 16-bit branches, an access the CPU must fault on, CALL/RET under CET shadow stacks, a REP
+// string op without scratch, ...) are stepped IN PLACE: our INT3 is lifted for one trap-flag
+// step. While it is lifted, every OTHER thread of the target is suspended by us, so none can
+// run through the site uncounted; a hit another thread raised just before (its event was
+// already queued) is rewound onto the INT3 and replays after the window (handle_exception).
+// No deadlock: the window covers exactly one instruction of the stepping thread (one REP
+// iteration at a time for a string op), which reports its trap or its fault to us before any
+// other code of the target runs -- it cannot wait for a suspended thread. The instructions
+// that can block in the kernel (SYSCALL / INT 2E run from a trampoline instead; SYSENTER,
+// INT 2B, far transfers that may switch to 64-bit code) never get a window, and a window not
+// closed within 2 s (the target suspended the stepping thread itself) is released with a
+// warning. Our agent's threads are never suspended (an entry hold waits for them).
+static bool agent_thread(probe_session *s, DWORD tid);
+static bool inplace_exempt(probe_session *s, DWORD tid) {
+    if (s->remote_tid && tid == s->remote_tid) return true;
+    if (!s->remote_agent) return false;
+    if (auto it = s->agent_tid_cache.find(tid); it != s->agent_tid_cache.end()) return it->second;
+    const bool a = agent_thread(s, tid);
+    s->agent_tid_cache[tid] = a;
+    return a;
+}
+static void inplace_suspend(probe_session *s, DWORD tid) {
+    if (tid == s->inplace_owner || inplace_exempt(s, tid)) return;
+    for (auto &e : s->inplace_suspended) if (e.first == tid) return;
+    HANDLE t = OpenThread(THREAD_SUSPEND_RESUME, FALSE, tid);
+    if (!t) return;
+    if (SuspendThread(t) == (DWORD)-1) { CloseHandle(t); return; }
+    try { s->inplace_suspended.emplace_back(tid, t); } catch (...) { ResumeThread(t); CloseHandle(t); }
+}
+static void inplace_begin(probe_session *s, DWORD tid) {
+    if (s->inplace_owner) return;            // ours already, or tid is held in another thread's
+                                             // window and gets it handed over (inplace_sync)
+    s->inplace_owner = tid; s->inplace_since = GetTickCount64();
+    for (DWORD o : s->threads) if (o != tid) inplace_suspend(s, o);
+}
+static void inplace_release_all(probe_session *s) {
+    for (auto &e : s->inplace_suspended) { ResumeThread(e.second); CloseHandle(e.second); }
+    s->inplace_suspended.clear();
+    s->inplace_owner = 0;
+}
+static void inplace_watchdog(probe_session *s) {
+    if (!s->inplace_owner || GetTickCount64() - s->inplace_since < 2000) return;
+    if (!s->inplace_warned) {
+        s->inplace_warned = true;
+        std::fprintf(stderr, "probe: warning: in-place step on thread %lu not done within 2 s: other threads released "
+                             "(a call through that site meanwhile may be missed). Further cases are not reported.\n",
+                     (unsigned long)s->inplace_owner);
+    }
+    if (auto it = s->stepping.find(s->inplace_owner); it != s->stepping.end()) it->second.windowed = false;
+    inplace_release_all(s);
+}
+// After every debug event: the window lasts exactly as long as its owner's in-place step.
+static void inplace_sync(probe_session *s, const DEBUG_EVENT &ev) {
+    if (ev.dwDebugEventCode == EXIT_THREAD_DEBUG_EVENT) s->agent_tid_cache.erase(ev.dwThreadId);
+    if (!s->inplace_owner) return;
+    if (ev.dwDebugEventCode == CREATE_THREAD_DEBUG_EVENT) inplace_suspend(s, ev.dwThreadId);   // born in the window
+    auto pending = [&](DWORD tid) {
+        auto it = s->stepping.find(tid);
+        return it != s->stepping.end() && !it->second.displaced && it->second.windowed;
+    };
+    if (pending(s->inplace_owner)) { inplace_watchdog(s); return; }
+    // Hand the window to another thread whose own in-place step is pending (it is held in
+    // this window) without letting any other thread run in between.
+    DWORD next = 0;
+    for (auto &kv : s->stepping) if (kv.first != s->inplace_owner && pending(kv.first)) { next = kv.first; break; }
+    if (!next) { inplace_release_all(s); return; }
+    const DWORD prev = s->inplace_owner;
+    s->inplace_owner = next; s->inplace_since = GetTickCount64();
+    for (auto it = s->inplace_suspended.begin(); it != s->inplace_suspended.end(); ++it)
+        if (it->first == next) { ResumeThread(it->second); CloseHandle(it->second); s->inplace_suspended.erase(it); break; }
+    if (s->threads.count(prev)) inplace_suspend(s, prev);
+}
+
+// What an in-place step of the site needs: a pushed flags image to correct (PUSHF), and
+// whether the instruction may block in the kernel or leave 32-bit code (then no window).
+static void site_traits(const Probe &p, bool &pushf, bool &may_block) {
+    pushf = false; may_block = false;
+    ZydisDecoder dec;
+#if defined(_WIN64)
+    ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+#else
+    ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_COMPAT_32, ZYDIS_STACK_WIDTH_32);
+#endif
+    ZydisDecodedInstruction in; ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+    if (p.orig_insn.empty() || !ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, p.orig_insn.data(), p.orig_insn.size(), &in, ops))) {
+        may_block = true; return;                           // unknown: stay as before (no window)
+    }
+    switch (in.mnemonic) {
+        case ZYDIS_MNEMONIC_PUSHF: case ZYDIS_MNEMONIC_PUSHFD: case ZYDIS_MNEMONIC_PUSHFQ: pushf = true; break;
+        case ZYDIS_MNEMONIC_SYSCALL: case ZYDIS_MNEMONIC_SYSENTER: case ZYDIS_MNEMONIC_IRET:
+        case ZYDIS_MNEMONIC_IRETD: case ZYDIS_MNEMONIC_IRETQ: may_block = true; break;
+        case ZYDIS_MNEMONIC_INT:
+            may_block = ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && (ops[0].imm.value.u == 0x2E || ops[0].imm.value.u == 0x2B);
+            break;
+        default: break;
+    }
+    if (in.meta.branch_type == ZYDIS_BRANCH_TYPE_FAR) may_block = true;
+}
+
 // The active SOFTWARE-BREAKPOINT probe at an address (the owner of an INT3 there). Other
 // backends may probe the same address too (hw + breakpoint on one instruction): an INT3
 // must never be attributed to them -- that ran the hw callback a second time and then
@@ -2917,11 +3320,33 @@ extern "C" int probe_launch(probe_session *s, char *const argv[]) {
     try {
         std::string command;
         for (size_t i = 0; argv[i]; ++i) { if (i) command += ' '; command += quote_arg(argv[i]); }
-        // The target gets the controller's own stdin/stdout/stderr, exactly as if it had been
-        // started without UHH (a filter reading stdin to EOF must see the caller's stream).
+        // The target gets the controller's own stdin, exactly as if it had been started
+        // without UHH (a filter reading stdin to EOF must see the caller's stream). Its
+        // stdout/stderr are the controller's too when those are a console (or NUL); when they
+        // are a pipe or a file, the target writes into its own pipe and UHH forwards its bytes
+        // line-wise, so the live log records never land inside one of its lines. A stdout and
+        // stderr that are one stream (2>&1) share one pipe: their relative order is kept.
         STARTUPINFOA si{}; si.cb = sizeof(si); si.dwFlags = STARTF_USESTDHANDLES;
         si.hStdInput = GetStdHandle(STD_INPUT_HANDLE); si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
         si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+        HANDLE client_out = INVALID_HANDLE_VALUE, client_err = INVALID_HANDLE_VALUE;
+        const bool fwd_out = forwardable(si.hStdOutput), fwd_err = forwardable(si.hStdError);
+        const bool one_stream = fwd_out && fwd_err && same_object(si.hStdOutput, si.hStdError);
+        if (fwd_out) {
+            if (!make_forward_pipe(s->fwd_out.pipe, client_out)) { set_error(s, win_error("create target stdout pipe")); return 0; }
+            s->fwd_out.dst = si.hStdOutput; s->fwd_out.to_stdout = true; s->fwd_out_active = true;
+            si.hStdOutput = client_out;
+            if (one_stream) si.hStdError = client_out;
+        }
+        if (fwd_err && !one_stream) {
+            if (!make_forward_pipe(s->fwd_err.pipe, client_err)) {
+                if (client_out != INVALID_HANDLE_VALUE) CloseHandle(client_out);
+                forward_stop(s); s->fwd_out_active = false;
+                set_error(s, win_error("create target stderr pipe")); return 0;
+            }
+            s->fwd_err.dst = si.hStdError;
+            si.hStdError = client_err;
+        }
         // A process created under a debugger gets the NT debug heap (fill patterns,
         // different layout): the target must run exactly as it would without UHH.
         char prev_ndh[16] = {0};
@@ -2930,8 +3355,14 @@ extern "C" int probe_launch(probe_session *s, char *const argv[]) {
         BOOL ok = CreateProcessA(argv[0], command.data(), nullptr, nullptr, TRUE,
                                  DEBUG_ONLY_THIS_PROCESS, nullptr, nullptr, &si, &s->pi);
         SetEnvironmentVariableA("_NO_DEBUG_HEAP", had_ndh && had_ndh < sizeof(prev_ndh) ? prev_ndh : nullptr);
+        DWORD launch_error = GetLastError();
+        // Only the target (and what it hands them to) holds the write ends: end of file
+        // arrives when its tree closes them.
+        if (client_out != INVALID_HANDLE_VALUE) CloseHandle(client_out);
+        if (client_err != INVALID_HANDLE_VALUE) CloseHandle(client_err);
         if (!ok) {
-            set_error(s, win_error("debug launch")); return 0;
+            forward_stop(s); s->fwd_out_active = false;
+            SetLastError(launch_error); set_error(s, win_error("debug launch")); return 0;
         }
         if (!same_bitness(s, s->pi.hProcess)) {
             TerminateProcess(s->pi.hProcess, 3);
@@ -2941,6 +3372,9 @@ extern "C" int probe_launch(probe_session *s, char *const argv[]) {
         s->launched = true;
         s->debug_tid = GetCurrentThreadId();
         if (!start_log_output(s)) { TerminateProcess(s->pi.hProcess, 3); return 0; }
+        if (!forward_start(s, &s->fwd_out) || !forward_start(s, &s->fwd_err)) {
+            set_error(s, "target output forwarder creation failed"); TerminateProcess(s->pi.hProcess, 3); return 0;
+        }
         { std::string which; s->sym_ready = uhh_sym::init(s->pi.hProcess, which);
           std::fprintf(stderr, "probe: symbols via %s%s\n", which.c_str(), uhh_sym::has_symbol_server() ? " (symbol server capable)" : ""); }
         if (!create_agent_channel(s)) { TerminateProcess(s->pi.hProcess, 3); return 0; }
@@ -3156,6 +3590,7 @@ static void detach(probe_session *s) {
         if (t) CloseHandle(t);
     }
     s->stepping.clear();
+    inplace_release_all(s);                                 // every INT3 is gone: nothing to hold for
     // Final pass, after every queued event has been continued: continuing an event can
     // restore the debug registers captured when the exception was raised. Clear our DR
     // slots and the trap flag on every frozen thread one last time, right before letting go.
@@ -3235,6 +3670,35 @@ static uint64_t alloc_block_near(probe_session *s, uint64_t site) {
     void *m = VirtualAllocEx(s->pi.hProcess, nullptr, 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     return m ? (uint64_t)(uintptr_t)m : 0;
 }
+
+#if defined(_WIN64)
+// Per-site trampoline for an x64 SYSCALL / INT 2E site: `insn; mov rcx, site+len (SYSCALL
+// only: the CPU leaves the return address there); jmp [rip+0]; dq site+len`. Shared by every
+// thread and every nesting level (it holds no per-execution state), never freed (a thread may
+// be blocked inside its syscall across a detach). 0 = not such a site / no memory.
+static uint64_t syscall_trampoline(probe_session *s, Probe &p) {
+    if (p.tramp) return p.tramp;
+    if (p.insn_len != 2 || p.orig_insn.size() != 2) return 0;
+    const bool sc = p.orig_insn[0] == 0x0F && p.orig_insn[1] == 0x05, i2e = p.orig_insn[0] == 0xCD && p.orig_insn[1] == 0x2E;
+    if (!sc && !i2e) return 0;
+    if (s->tramp_next + 32 > s->tramp_end) {
+        void *m = VirtualAllocEx(s->pi.hProcess, nullptr, 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (!m) return 0;
+        s->tramp_next = (uint64_t)(uintptr_t)m; s->tramp_end = s->tramp_next + 0x10000;
+    }
+    const uint64_t back = p.address + 2;
+    std::vector<unsigned char> code(p.orig_insn.begin(), p.orig_insn.end());
+    if (sc) { code.push_back(0x48); code.push_back(0xB9); for (int b = 0; b < 8; ++b) code.push_back((unsigned char)(back >> (8 * b))); }
+    const unsigned char jmp[6] = {0xFF, 0x25, 0, 0, 0, 0};
+    code.insert(code.end(), jmp, jmp + 6);
+    for (int b = 0; b < 8; ++b) code.push_back((unsigned char)(back >> (8 * b)));
+    size_t wrote = 0;
+    if (!remote_write(s->pi.hProcess, s->tramp_next, code.data(), code.size(), &wrote) || wrote != code.size()) return 0;
+    FlushInstructionCache(s->pi.hProcess, (void *)(uintptr_t)s->tramp_next, code.size());
+    p.tramp = s->tramp_next; s->tramp_next += 32;
+    return p.tramp;
+}
+#endif
 
 static uint64_t thread_scratch(probe_session *s, DWORD tid, uint64_t site) {
     uint64_t region = site >> 30;
@@ -3606,7 +4070,9 @@ static const DWORD UHH_CALL_RELEASED = 0xE0554843u;
 // try/catch around a call through an extern "C" callback pointer may be elided.
 static bool seh_callback(probe_callback cb, probe_context *c, DWORD *code) {
     __try { cb(c); return true; }
-    __except (*code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) { return false; }
+    __except (*code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {}
+    if (*code == EXCEPTION_STACK_OVERFLOW) _resetstkoflw();      // the guard page, for the next overflow
+    return false;
 }
 static void run_callback(probe_session *s, Probe *probe, probe_context *c) {
     const probe_regs before = c->regs;
@@ -3667,15 +4133,22 @@ static bool apply_return_from(probe_session *s, Probe *probe, const probe_contex
     }
     uint64_t g = ret_gadget(s, c.ret_pop);
     auto *st = static_cast<CallbackState *>(c.controller);
-    if (g && c.called_original && st && st->have_post_fp) {
-        // The caller gets the original's floating-point result too (XMM0, x87 ST0): its whole
-        // FP state as it returned -- nonvolatile parts are the hit's anyway (ABI).
+    if (g && c.called_original && st && st->have_post) {
+        // The caller gets what the original left (see CallbackState::post): its whole FP state
+        // as it returned (XMM0 / x87 ST0 results; the nonvolatile parts are the hit's anyway,
+        // ABI) and the volatile GPRs the callback did not set_reg after the call. x86 EDX is
+        // already the original's unless return_from set a high half (probe_x86_return_regs).
+        const CONTEXT &a = st->post;
+#define UHH_KEEP(f, r) if (c.regs.r == st->post_seen.r) native.f = a.f;
 #if defined(_WIN64)
-        native.FltSave = st->post_fp.FltSave; native.MxCsr = st->post_fp.MxCsr;
+        UHH_KEEP(Rcx, rcx) UHH_KEEP(Rdx, rdx) UHH_KEEP(R8, r8) UHH_KEEP(R9, r9) UHH_KEEP(R10, r10) UHH_KEEP(R11, r11)
+        native.FltSave = a.FltSave; native.MxCsr = a.MxCsr;
 #else
-        native.FloatSave = st->post_fp.FloatSave;
-        std::memcpy(native.ExtendedRegisters, st->post_fp.ExtendedRegisters, sizeof(native.ExtendedRegisters));
+        UHH_KEEP(Ecx, rcx)
+        native.FloatSave = a.FloatSave;
+        std::memcpy(native.ExtendedRegisters, a.ExtendedRegisters, sizeof(native.ExtendedRegisters));
 #endif
+#undef UHH_KEEP
         native.ContextFlags |= UHH_CONTEXT_FP;
     }
     if (!g) {
@@ -4020,6 +4493,19 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             stepping.erase(st);
             disposition = DBG_CONTINUE; return true;
         }
+        // Another thread has an in-place window open (our INT3 lifted at its site): this hit
+        // was raised before the window and queued. Rewind it onto the INT3 -- the thread is
+        // held in the window and hits it again afterwards, counted then, exactly once.
+        if (s->inplace_owner && event.dwThreadId != s->inplace_owner && probe_at(s, at)) {
+            HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
+            CONTEXT w{}; w.ContextFlags = CONTEXT_CONTROL;
+            bool ok = t && GetThreadContext(t, &w);
+            EMU_IP(w) = (decltype(EMU_IP(w)))at;
+            ok = ok && SetThreadContext(t, &w);
+            if (t) CloseHandle(t);
+            if (!ok) { set_error(s, win_error("replay a hit after the in-place window")); return false; }
+            disposition = DBG_CONTINUE; return true;
+        }
     }
     // The loader's initial breakpoint -- but only if it is not one of OUR INT3s: a probe
     // can fire during loader initialisation (e.g. ntdll!NtCreateFile from the shim engine),
@@ -4190,7 +4676,12 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             ok = ok && SetThreadContext(t, &w);
             if (t) CloseHandle(t);
             if (!ok) { set_error(s, win_error("re-run faulting displaced instruction")); return false; }
-            if (owner) { step->second.displaced = false; step->second.tail_int3 = false; } else stepping.erase(step);
+            if (owner) {
+                step->second.displaced = false; step->second.tail_int3 = false;
+                step->second.windowed = true; inplace_begin(s, event.dwThreadId);   // lifted: hold the others
+            } else {
+                stepping.erase(step);
+            }
             disposition = DBG_CONTINUE; return true;
         }
     }
@@ -4244,6 +4735,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         ok = ok && patch(s->pi.hProcess, address, probe->original) && SetThreadContext(t, &w);
         if (t) CloseHandle(t);
         if (!ok) { set_error(s, win_error("re-lift in-place step")); return false; }
+        if (step->second.windowed) inplace_begin(s, event.dwThreadId);
         disposition = DBG_CONTINUE; return true;
     }
     HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
@@ -4292,6 +4784,17 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
 #endif
         } else if (ok) {
             end_inplace_step(s, event.dwThreadId, step->second.site);                                   // in-place: re-arm
+            if (step->second.pushf_insn && !step->second.prog_tf &&
+                (uint64_t)EMU_IP(native) == step->second.site + step->second.insn_len) {
+                // PUSHF ran with OUR trap flag: the program's flags image must not show it
+                // (RtlCaptureContext starts with pushfq).
+                uint64_t v = 0; size_t n = 0; const size_t w = sizeof(void *);
+                const uint64_t sp = (uint64_t)EMU_SP(native);
+                if (remote_read(s->pi.hProcess, sp, &v, w, &n) && n == w && (v & 0x100)) {
+                    v &= ~(uint64_t)0x100;
+                    remote_write(s->pi.hProcess, sp, &v, w, &n);
+                }
+            }
         }
         native.EFlags &= ~0x100u;
 #if defined(_WIN64)
@@ -4389,6 +4892,20 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         if (at_entry && inline_hold_needed(s)) { hold_thread(s, event.dwThreadId); if (!kick_agent(s)) return false; }
         disposition = DBG_CONTINUE; return true;
     }
+#if defined(_WIN64)
+    // SYSCALL / INT 2E: run from the site's trampoline -- the INT3 stays armed, no trap flag
+    // (R11 gets the program's flags), and a syscall that blocks or returns elsewhere (APC,
+    // NtContinue, a user-mode callback that hits probes on this thread) needs nothing from us.
+    if (uint64_t tr = syscall_trampoline(s, *probe)) {
+        native.Rip = tr;
+        native.ContextFlags = CONTEXT_FULL;
+        bool ok = !!SetThreadContext(thread, &native);
+        CloseHandle(thread);
+        if (!ok) { set_error(s, win_error("enter syscall trampoline")); return false; }
+        if (at_entry && inline_hold_needed(s)) { hold_thread(s, event.dwThreadId); if (!kick_agent(s)) return false; }
+        disposition = DBG_CONTINUE; return true;
+    }
+#endif
     // Branches, call/ret, loop, pushf/popf: executed here on the context -- the INT3 stays
     // armed (exact under threads) and no trap flag is ever set (nothing leaks).
     if (!probe->displaced_ok && emulate_site(s, *probe, native)) {
@@ -4447,9 +4964,9 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         native.Eip = (DWORD)scratch_addr;
 #endif
     } else {
-        // In-place fallback (control-flow sites, or scratch/reach failure): lift the
-        // byte, step over it at the real address, re-arm on the single-step (this is
-        // the only path with a brief unarmed window, so it is kept for the rare cases).
+        // In-place fallback (sites neither displaced nor emulated, or scratch/reach failure):
+        // lift the byte, step over it at the real address, re-arm on the single-step. Every
+        // other thread is held meanwhile (in-place window, inplace_begin below).
         if (!patch(s->pi.hProcess, probe->address, probe->original)) {
             CloseHandle(thread); set_error(s, win_error("restore probed instruction")); return false;
         }
@@ -4460,6 +4977,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
 #endif
     }
     const bool tail = displaced && probe->rep_string;
+    const bool prog_tf = native.EFlags & 0x100u;
     if (!tail) native.EFlags |= 0x100u;
     // Preserve debug registers: the callback may have armed a hardware probe/watchpoint on
     // THIS thread (probe_watch/probe_add_at); writing CONTEXT_ALL with the pre-callback DR
@@ -4474,8 +4992,16 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
                      (unsigned long)event.dwThreadId, displaced,
                      (unsigned long long)scratch_addr, (unsigned long long)(displaced ? scratch_addr : probe->address));
     const bool is_syscall = probe->orig_insn.size() == 2 && probe->orig_insn[0] == 0x0F && probe->orig_insn[1] == 0x05;
-    stepping[event.dwThreadId] = StepState{probe, displaced, probe->address, probe->insn_len, displaced ? scratch_addr : 0,
-                                           tail, probe->rep_string, is_syscall};
+    StepState st{probe, displaced, probe->address, probe->insn_len, displaced ? scratch_addr : 0,
+                 tail, probe->rep_string, is_syscall};
+    if (!displaced) {
+        bool pushf = false, may_block = false;
+        site_traits(*probe, pushf, may_block);
+        st.pushf_insn = pushf; st.prog_tf = prog_tf;
+        st.windowed = !may_block;
+        if (st.windowed) inplace_begin(s, event.dwThreadId);    // the byte is lifted: hold every other thread
+    }
+    stepping[event.dwThreadId] = st;
     if (at_entry && inline_hold_needed(s)) { hold_thread(s, event.dwThreadId); if (!kick_agent(s)) return false; }
     disposition = DBG_CONTINUE; return true;
 }
@@ -4803,7 +5329,13 @@ static void stop_drainer(probe_session *s) {
 }
 
 // One debug event -> library state changes. Shared by probe_run and the detach path.
+static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &disposition);
 static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposition) {
+    const bool ok = dispatch_event_impl(s, event, disposition);
+    inplace_sync(s, event);
+    return ok;
+}
+static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &disposition) {
     disposition = DBG_CONTINUE; bool ok = true;
     switch (event.dwDebugEventCode) {
     case CREATE_PROCESS_DEBUG_EVENT: {
@@ -5033,7 +5565,7 @@ extern "C" int probe_run(probe_session *s) {
             release_held(s, "install timeout");
         }
         if (!WaitForDebugEvent(&event, 20)) {                         // short: also polls stop requests
-            if (GetLastError() == ERROR_SEM_TIMEOUT) continue;            // idle: drain and wait again
+            if (GetLastError() == ERROR_SEM_TIMEOUT) { inplace_watchdog(s); continue; }   // idle: drain and wait again
             set_error(s, win_error("wait for debug event")); break;
         }
         if (continue_foreign_event(s, event)) continue;
@@ -5082,6 +5614,8 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
     // Report lines and log batches never interleave mid-line on a shared stdout.
     std::unique_lock<std::mutex> out_lock(s->stdout_mu, std::defer_lock);
     if (out == stdout) out_lock.lock();
+    // The forwarded target left its last line unfinished: report records start on their own line.
+    if (out == stdout && s->fwd_out_active && s->out_midline) { std::fputc('\n', out); s->out_midline = false; }
     for (const auto &j : s->prehooks) { std::fputs(j.c_str(), out); std::fputc('\n', out); }
     for (const auto &p : s->probes) {
         if (p->internal) continue;
@@ -5175,6 +5709,7 @@ extern "C" void probe_close(probe_session *s) {
                                           s->controller_dropped.load(std::memory_order_relaxed)),
                      (unsigned long long)(s->shared ? probe_agent_inflight(s->shared) : 0));
     }
+    inplace_release_all(s);
     if (s->pi.hProcess)
         for (uint64_t b : s->scratch_blocks) VirtualFreeEx(s->pi.hProcess, (void *)(uintptr_t)b, 0, MEM_RELEASE);
     if (s->sym_ready) uhh_sym::cleanup(s->pi.hProcess);
@@ -5271,8 +5806,10 @@ static uint64_t resolve_symbol(probe_session *s, const char *symbol) {
     if (symbol[0] == '0' && (symbol[1] == 'x' || symbol[1] == 'X')) return std::strtoull(symbol + 2, nullptr, 16);
     Probe tmp; std::string saved = s->error;
     if (!parse_location(s, symbol, tmp)) { s->error = saved; return 0; }
+    // "kernel32!X" names kernel32.dll, as GetModuleHandle (and so inline call_func) reads it.
+    const bool bare = tmp.module.find('.') == std::string::npos;
     for (auto &kv : s->module_bases)
-        if (iequals(kv.first, tmp.module)) {
+        if (iequals(kv.first, tmp.module) || (bare && iequals(kv.first, tmp.module + ".dll"))) {
             uint64_t rva = tmp.rva;
             if (!tmp.export_name.empty()) {
                 uint64_t exp = 0;
@@ -5294,6 +5831,43 @@ static uint64_t resolve_symbol(probe_session *s, const char *symbol) {
     s->error = saved; return 0;
 }
 
+// The stopped thread's TEB in the target (0 if unknown): call_func restores the thread's
+// last error / last status there, as the inline agent does around every callback -- the
+// callee's Win32 calls must not leak into the program (GetLastError after the probed code).
+static uint64_t thread_teb(HANDLE thread, const CONTEXT &ctx) {
+#if defined(_WIN64)
+    (void)ctx;
+    struct { LONG status; PVOID teb; ULONG_PTR pid, tid, affinity; LONG prio, base; } tbi{};
+    using QueryFn = LONG(NTAPI *)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    static auto query = reinterpret_cast<QueryFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+    return query && query(thread, 0 /* ThreadBasicInformation */, &tbi, sizeof(tbi), nullptr) >= 0 ? (uint64_t)(uintptr_t)tbi.teb : 0;
+#else
+    LDT_ENTRY e{};                               // FS base = the 32-bit TEB (WOW64 too)
+    if (!GetThreadSelectorEntry(thread, ctx.SegFs, &e)) return 0;
+    return (uint64_t)((DWORD)e.BaseLow | ((DWORD)e.HighWord.Bytes.BaseMid << 16) | ((DWORD)e.HighWord.Bytes.BaseHi << 24));
+#endif
+}
+#if defined(_WIN64)
+static const uint64_t TEB_LAST_ERROR = 0x68, TEB_LAST_STATUS = 0x1250;
+#else
+static const uint64_t TEB_LAST_ERROR = 0x34, TEB_LAST_STATUS = 0xBF4;
+#endif
+struct TebErrors {
+    uint64_t teb = 0; DWORD error = 0, status = 0; bool ok = false;
+    void save(HANDLE process, HANDLE thread, const CONTEXT &ctx) {
+        size_t n1 = 0, n2 = 0;
+        teb = thread_teb(thread, ctx);
+        ok = teb && remote_read(process, teb + TEB_LAST_ERROR, &error, 4, &n1) && n1 == 4 &&
+             remote_read(process, teb + TEB_LAST_STATUS, &status, 4, &n2) && n2 == 4;
+    }
+    void restore(HANDLE process) const {
+        size_t n = 0;
+        if (!ok) return;
+        remote_write(process, teb + TEB_LAST_ERROR, &error, 4, &n);
+        remote_write(process, teb + TEB_LAST_STATUS, &status, 4, &n);
+    }
+};
+
 static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint64_t *ret, int nargs, const uint64_t *args,
                           const probe_context *seed = nullptr) {
     if (s->in_call_tid || nargs < 0 || nargs > 8) return 0;           // no nesting
@@ -5314,10 +5888,14 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
         if (!mem || !remote_write(s->pi.hProcess, (uint64_t)(uintptr_t)mem, &cc, 1, &w)) return 0;
         s->call_trap = (uint64_t)(uintptr_t)mem;
     }
-    HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, st->tid);
+    HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, FALSE, st->tid);
     if (!thread) return 0;
     CONTEXT saved{}; saved.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_FLOATING_POINT;
+#if !defined(_WIN64)
+    saved.ContextFlags |= CONTEXT_EXTENDED_REGISTERS;                  // x86: XMM0-7 live here, not in FloatSave
+#endif
     if (!GetThreadContext(thread, &saved)) { CloseHandle(thread); return 0; }
+    TebErrors teb_errors; teb_errors.save(s->pi.hProcess, thread, saved);
     CONTEXT w = saved; size_t wrote = 0; bool ok = true;
     if (seed) to_context(*seed, w);                                    // call_original: the callback's registers
 #if defined(_WIN64)
@@ -5364,8 +5942,14 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
                 trapped = true; break;                             // leave this event pending
             }
             if (!(er.ExceptionCode == EXCEPTION_BREAKPOINT || er.ExceptionCode == EXCEPTION_SINGLE_STEP)) {
+                if (trace_enabled())
+                    std::fprintf(stderr, "  call_func: callee raised 0x%08lx at 0x%llx; abandoned\n", (unsigned long)er.ExceptionCode,
+                                 (unsigned long long)(uintptr_t)er.ExceptionAddress);
                 trapped = true; break;                             // the callee faulted: abandon the call
             }
+            if (trace_enabled())
+                std::fprintf(stderr, "  call_func: own-thread event 0x%08lx at 0x%llx\n", (unsigned long)er.ExceptionCode,
+                             (unsigned long long)(uintptr_t)er.ExceptionAddress);
         }
         DWORD disposition = DBG_CONTINUE;
         dispatch_event(s, ev, disposition);                        // other threads keep working
@@ -5376,11 +5960,12 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
     resume_deferred_hits(s);                                       // they hit their probes again now
     if (trapped) {
         SetThreadContext(thread, &saved);                          // exactly as it was at the hit
+        teb_errors.restore(s->pi.hProcess);                        // and its last error / status
         // The pending trap/fault event on this thread now stands in for the original one.
     } else if (!s->exited) {
         // Timed out with the callee still running: stop it, put the context back, and tell
         // the loop the original event is already continued (there is nothing to continue).
-        SuspendThread(thread); SetThreadContext(thread, &saved); ResumeThread(thread);
+        SuspendThread(thread); SetThreadContext(thread, &saved); teb_errors.restore(s->pi.hProcess); ResumeThread(thread);
         s->skip_continue = true;
         std::fprintf(stderr, "probe: call_func timed out after 5 s; thread restored\n");
     } else {
@@ -5510,7 +6095,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
             if (ev.dwThreadId == st->tid && ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT &&
                 ev.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP &&
                 (uint64_t)(uintptr_t)ev.u.Exception.ExceptionRecord.ExceptionAddress == ret_addr) {
-                CONTEXT &r = st->post_fp; r.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | UHH_CONTEXT_FP;
+                CONTEXT &r = st->post; r.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | UHH_CONTEXT_FP;
                 if (GetThreadContext(thread, &r)) {
 #if defined(_WIN64)
                     const uint64_t sp = r.Rsp, rax = r.Rax;
@@ -5519,7 +6104,8 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
 #endif
                     if (sp > s->co_sp && sp <= s->co_sp + ptr + 1024) {   // x86 stdcall: ret N popped the args
                         result = rax; done = true;                         // this event now stands in for the hit
-                        st->have_post_fp = true;
+                        st->have_post = true;
+                        st->post_seen = c->regs;
 #if !defined(_WIN64)
                         c->orig_edx = r.Edx;                               // an EDX:EAX result's high half
                         c->orig_pop = (int32_t)(sp - (s->co_sp + ptr));    // the bytes its `ret N` popped

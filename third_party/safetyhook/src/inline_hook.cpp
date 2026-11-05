@@ -15,6 +15,9 @@
 
 #include "safetyhook/inline_hook.hpp"
 
+// UHH: set when the process enforces CET shadow stacks (see uhh_relocate_call_as_jmp).
+extern "C" volatile long uhh_safetyhook_keep_calls = 0;
+
 namespace safetyhook {
 
 #pragma pack(push, 1)
@@ -191,6 +194,37 @@ std::expected<void, InlineHook::Error> InlineHook::setup(
     return {};
 }
 
+// UHH: a CALL that ends the overwritten range is relocated as `push <its return address in
+// the ORIGINAL code>; jmp <callee>` rather than copied verbatim. A verbatim copy makes the
+// callee return into the trampoline, which has no unwind data (x64) and is not the hooked
+// function: an exception from the callee then cannot unwind through it (std::terminate /
+// unhandled), a handler of the hooked function itself is never found, and stack walks lose
+// the frame. Returning to site+len (the code right after the overwritten range, intact) is
+// exactly what the original call did. Not under CET shadow stacks (the agent sets
+// uhh_safetyhook_keep_calls there): a return through a pushed address is a #CP. Forms: call
+// rel32, and call r/m (FF /2) unless it addresses through rsp/esp, which the push moves.
+static bool uhh_relocate_call_as_jmp(const ZydisDecodedInstruction& ix) {
+    if (uhh_safetyhook_keep_calls || ix.mnemonic != ZYDIS_MNEMONIC_CALL || ix.opcode_map != ZYDIS_OPCODE_MAP_DEFAULT) {
+        return false;
+    }
+    if (ix.opcode == 0xE8) {
+        return ix.raw.imm[0].size == 32;
+    }
+    if (ix.opcode != 0xFF || ix.raw.modrm.reg != 2) {
+        return false;
+    }
+    const unsigned b = ix.raw.rex.B ? 8 : 0;
+    if (ix.raw.modrm.mod == 3) {
+        return (ix.raw.modrm.rm | b) != 4; // call rsp
+    }
+    return ix.raw.modrm.rm != 4 || (ix.raw.sib.base | b) != 4; // [rsp+...]
+}
+#if SAFETYHOOK_ARCH_X86_64
+constexpr size_t uhh_push_ret_size = 13; // push imm32 (low half, sign-extended); mov dword [rsp+4], high half
+#else
+constexpr size_t uhh_push_ret_size = 5; // push imm32
+#endif
+
 std::expected<void, InlineHook::Error> InlineHook::e9_hook(const std::shared_ptr<Allocator>& allocator) {
     m_original_bytes.clear();
     m_trampoline_size = sizeof(TrampolineEpilogueE9);
@@ -205,6 +239,10 @@ std::expected<void, InlineHook::Error> InlineHook::e9_hook(const std::shared_ptr
 
         m_trampoline_size += ix.length;
         m_original_bytes.insert(m_original_bytes.end(), ip, ip + ix.length);
+
+        if (ip + ix.length >= m_target + sizeof(JmpE9) && uhh_relocate_call_as_jmp(ix)) {
+            m_trampoline_size += uhh_push_ret_size; // the last instruction: see uhh_relocate_call_as_jmp
+        }
 
         const auto is_relative = (ix.attributes & ZYDIS_ATTRIB_IS_RELATIVE) != 0;
 
@@ -245,7 +283,31 @@ std::expected<void, InlineHook::Error> InlineHook::e9_hook(const std::shared_ptr
 
         const auto is_relative = (ix.attributes & ZYDIS_ATTRIB_IS_RELATIVE) != 0;
 
-        if (is_relative && ix.raw.disp.size == 32) {
+        if (ip + ix.length == m_target + m_original_bytes.size() && uhh_relocate_call_as_jmp(ix)) {
+            const auto ret = reinterpret_cast<uintptr_t>(ip + ix.length);
+            *tramp_ip = 0x68; // push imm32
+            store(tramp_ip + 1, static_cast<uint32_t>(ret));
+#if SAFETYHOOK_ARCH_X86_64
+            const uint8_t mov_hi[] = {0xC7, 0x44, 0x24, 0x04}; // mov dword ptr [rsp+4], imm32
+            std::copy_n(mov_hi, sizeof(mov_hi), tramp_ip + 5);
+            store(tramp_ip + 9, static_cast<uint32_t>(static_cast<uint64_t>(ret) >> 32));
+#endif
+            tramp_ip += uhh_push_ret_size;
+            if (ix.opcode == 0xE8) {
+                const auto target_address = ip + ix.length + ix.raw.imm[0].value.s;
+                *tramp_ip = 0xE9;
+                store(tramp_ip + 1, static_cast<int32_t>(target_address - (tramp_ip + 5)));
+                tramp_ip += 5;
+            } else {
+                std::copy_n(ip, ix.length, tramp_ip);
+                tramp_ip[ix.raw.modrm.offset] = static_cast<uint8_t>((ip[ix.raw.modrm.offset] & ~0x38) | (4 << 3)); // FF /4
+                if (is_relative && ix.raw.disp.size == 32) {
+                    const auto target_address = ip + ix.length + ix.raw.disp.value;
+                    store(tramp_ip + ix.raw.disp.offset, static_cast<int32_t>(target_address - (tramp_ip + ix.length)));
+                }
+                tramp_ip += ix.length;
+            }
+        } else if (is_relative && ix.raw.disp.size == 32) {
             std::copy_n(ip, ix.length, tramp_ip);
             const auto target_address = ip + ix.length + ix.raw.disp.value;
             const auto new_disp = target_address - (tramp_ip + ix.length);

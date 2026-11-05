@@ -68,8 +68,34 @@ identical source under every backend.
 ## Evaluator round 3 (2026-11-05) — open
 - ✅ (#3) detach after a hooked DLL unloaded wrote original bytes to unmapped/reused memory -> agent skips UNLOADED hooks
 - ✅ (#4) call inside the stolen bytes -> refused / hw fallback
-- ⬜ (#1) in-place step of `pushf` leaks TF into the pushed flags (RtlCaptureContext) -> clear TF in the pushed value
-- ⬜ (#2) in-place fallback (branch/call/rep/pushf sites) not exact under threads: missed hits while lifted, double hit via queued INT3
+- ✅ (#1) in-place step of `pushf` leaked TF into the pushed flags (RtlCaptureContext). PUSHF is emulated (flags image
+  without TF); where the CPU must run it (the push lands in the stack's guard page -- emulating it would consume the
+  guard without growing the stack) the in-place step clears our TF in the pushed image at step completion.
+  Baseline `inplace-pushf_guard`: 7360/8000 pushed images carried TF (x86: 6441); now 0, stack grown as without UHH
+- ✅ (#2) in-place fallback not exact under threads. Baseline (8 threads, breakpoint): `ctrl-inplace` 709/24000 hits
+  on x64, 971/24000 on x86; `inplace-loop_a32` 1330/8000 (x86 677), `inplace-jecxz_a32` x86 1242/8000,
+  `inplace-segjmp` 1147/8000 (x86 1400), `inplace-pushf_guard` 7672/8000 (x86 7267), `inplace-syscall` 7968/8000.
+  Now every one exact (hits == logs == distinct tags == calls, results equal to a never-probed twin):
+  - more is emulated: address-size LOOP/LOOPE/LOOPNE (ecx on x64, cx on x86) and JECXZ/JCXZ; every emulated memory
+    access is first checked like the CPU would see it (committed, no PAGE_GUARD, readable/writable) -- before, an
+    emulated push into the stack guard page went through Read/WriteProcessMemory semantics (guard consumed, no growth)
+  - x64 SYSCALL / INT 2E run from a per-site trampoline (`insn; mov rcx, site+2; jmp site+2`, SYSCALL's RCX/R11 as
+    natively, no trap flag, no completion event): the INT3 stays armed for the whole syscall (a blocking syscall used
+    to keep the byte lifted until it returned), nesting (APCs, user-mode callbacks that hit probes) needs nothing;
+    trampolines are never freed (a thread can be blocked in one across a detach)
+  - whatever still steps in place (segment-relative / 16-bit branches, an access that must fault, the displaced-fault
+    re-run, CALL/RET under CET shadow stacks, a REP string op without scratch) runs in an **in-place window**: every
+    other target thread is suspended by the controller while the byte is lifted, and a hit queued just before the
+    window is rewound onto the INT3 and replays after it (counted once). No deadlock: the window covers one
+    instruction (one REP iteration) of the stepping thread, which reports its trap or fault before any other target
+    code runs; instructions that can block in the kernel or leave 32-bit code (SYSCALL/SYSENTER/INT 2E/2B without a
+    trampoline, far transfers, IRET) get no window; a window open for 2 s (the target suspended the stepping thread
+    itself) is released with a warning; our agent's threads are never held (an entry hold waits for them).
+    📄 Under CET the CALL/RET in-place path keeps working as before (the CPU executes them; only the other threads
+    are held meanwhile) -- still unexercised on the VM (`EnableUserShadowStack`=0)
+  - Tests: `inplace-*` (`--only inplace`: jmp rel8/rel32, jcc rel8/rel32 taken / not / data-dependent, call rel32,
+    call [mem], ret, loop taken/not, loopz, loopnz, jrcxz/jecxz, address-size loop and jecxz/jcxz, pushf, pushf into
+    the guard page, gs:/fs:-relative jmp, x64 syscall), `ctrl-inplace` exact
 - 🔧 (#5) inline stack walk bounded by the thread's TEB stack limits + code reads range-checked (never faults); writes always re-validated (read cache kept across hits) -- VM verify pending
 - ✗ (#6) breakpoint/hw call_func hardening: deliberately not pursued (see call_func note above)
 - 🔧 (#7) call_func follows forwarded exports on breakpoint/hw (via the controller's copy of the same system DLL); conformance `call_func-forwarded` -- VM verify pending
@@ -221,7 +247,7 @@ breakpoint/hw/inline on x64+x86, compared with the uninstrumented run (`regress.
 - ⬜ (F5) `call_func` from a breakpoint/hw callback returns 0 while another thread's callback is inside one (no nesting: the other thread's event is dispatched inside the first call). A Process.mainModule lookup via call_func silently skips that racing call; famous_common.h falls back to walking to the PE header. Library options: document in probe_api.h, or defer (replay) other threads' probe hits during a call
 - ✗ (F6) HW budget: a recipe needing one return probe per call site exceeds the 4 debug registers when unfiltered (NtCreateFile is called from several KernelBase sites, CreateDirectory among them) -> clean `too many hardware probes` refusal. By design; the recipe's Procmon-style `--filter` keeps it to one site. Documented in the recipe README
 - ✗ (F7) Observer effect: with inline probes, writing a hook makes the patched bytes PAGE_EXECUTE_READWRITE through the target's own NtProtectVirtualMemory (seen by an RWX watcher installed earlier: `rwx-protect size=0x8` in KernelBase); breakpoint/hw patch from the controller and are invisible. Documented (loader_rwx README)
-- ⬜ (F8) The live log tail shares the target's inherited stdout: a target writing partial lines (cmd `type`) interleaves with tail lines mid-line, corrupting both for a line-based reader. The session JSONL file is unaffected (the famous checks read logs from it). Options: document; or tail to stderr/another handle when the target inherits stdout
+- ✅ (F8, fixed with D2: a launched target writing to a pipe/file gets its own pipe, forwarded line-wise; regress `stdout-*`) The live log tail shares the target's inherited stdout: a target writing partial lines (cmd `type`) interleaves with tail lines mid-line, corrupting both for a line-based reader. The session JSONL file is unaffected (the famous checks read logs from it). Options: document; or tail to stderr/another handle when the target inherits stdout
 
 ## Detours-replica findings (examples/famous/detours_*, 2026-11-05)
 Replicas of Microsoft Detours' simple / traceapi / withdll / retval samples on real system
@@ -235,7 +261,15 @@ binaries (cmd, reg, sort), multi-threaded targets, launch vs attach, attach mid-
   gated_config flow (not a contained fix -- user's call: e.g. inherit stdin by default and make the
   gate keystroke opt-in, or forward the controller's stdin after the keystroke and close at EOF).
   Test: `detours-launch-stdin-*` (FAILS today: hang).
-- ⬜ (D2) **Live log tail splices records into the target's own stdout lines.** The child inherits
+- ✅ (D2, fixed: when the controller's stdout/stderr is a pipe or a file, probe_launch gives the
+  target its own pipe(s) and a forwarder thread copies the bytes out a complete line at a time;
+  log records are written only at a line boundary -- while the target sits inside an unfinished
+  line (partial flushed after ~50 ms idle) they stay in the log file and are replayed at its
+  next newline, so the writer never blocks on the target. 2>&1 shares one pipe (order kept). A
+  console stays inherited (interactive targets keep GetConsoleMode). Grandchildren holding the
+  pipe: drained with a bounded wait at target exit. Only exception: a target that ENDS inside
+  a line with records still to follow gets a "\n" before them. `dt_split` now splits whole
+  lines only; regress `stdout-*`) **Live log tail splices records into the target's own stdout lines.** The child inherits
   the controller's stdout; records are written whole, but a target that writes partial lines
   (reg.exe writes `ProductName` and the padding separately; unbuffered UCRT stdout writes one
   character per WriteFile) gets `{"kind":"probe_log",...}` inserted mid-line, so its output as read
@@ -382,6 +416,17 @@ with the uninstrumented target and with exact hits / "co" logs / `log_dropped ==
   INTERNALLY is invisible on every backend (call_original returns normally). Detach /
   Ctrl+Break while a call_original is in flight complete that call first (`callorig-hunt-
   {detach,ctrlbreak}-*`).
+
+## Agent review findings (2026-11-05, static review of the inline agent; regress `agent-*`, `examples/agent_review`)
+- [x] **(HIGH) Exceptions through a relocated `call` (x64).** A probe whose patch ends in a `call` copied that call verbatim into the trampoline, so the callee returned INTO the trampoline -- no unwind data there (and not the hooked function), so a C++ throw / SEH exception from the callee caught by the hooked function or its callers was never found (std::terminate / unhandled). Fix (SafetyHook patch step 5, `uhh_relocate_call_as_jmp`): such a call is relocated as `push <site+len>; jmp <callee>` (call rel32 and call r/m not addressing through rsp/esp), so the callee returns to the hooked function itself; correct unwind, the function's own handlers, `_ReturnAddress`, stack walks; x86 `call $+5; pop` PIC thunks now get the original address too. Under CET shadow stacks (a pushed return address is a #CP) the agent sets `uhh_safetyhook_keep_calls` and the call stays verbatim -- known limit there. Reproduced x64 (target died 0xE06D7363 at the first throw); x86 was already correct (frame-based SEH). `agent-unwind`.
+- [x] **Faulting instruction relocated into the trampoline** (e.g. a load inside the hooked function's own `__try`, x64 scope tables are looked up by RIP). The agent's first vectored handler RE-RAISES such a fault (NtRaiseException) at the original instruction it stands for (registers are identical: the copy did not execute) -- editing the CONTEXT in place is not enough, the dispatcher's machine frame keeps the trampoline RIP and the unwind ended in STATUS_BAD_STACK (seen); a vectored continue handler moves a resumed fault back into the trampoline. Reproduced x64. `agent-unwind` (`load`).
+- [x] **Callback faults after `call_original`** returned early, before the return_from handling: the original ran a SECOND time on fall-through (double free/close). Now the hooked function returns with return_from's value, else the original's own result (x86: the callee's `ret N` is measured by call_original). Reproduced x64 + x86 (body ran 20x for 10 calls). `agent-faultafter`.
+- [x] **Re-entrancy guard needed TLS.** A hit during LdrpInitializeThread (no TLS yet) had no guard: an allocating callback on RtlAllocateHeap recursed until the stack overflowed. The guard is now a TLS-free per-thread table (thread id -> running hit). Reproduced x64 (0xC00000FD) + x86 (0xC0000005). `agent-threadinit`.
+- [x] **x64 non-unwinding longjmp (jmp_buf.Frame == 0) out of call_original** left the thread marked "in a callback" (every later hit on it silently ran no callback, no log) and in-flight +1 (detach waited 2 s). The record is now recognised as stale on the thread's next hit (its frame is at/below the new hit's SP, off this stack, or overwritten -- canary) and settled. Residual: until that thread's next hit the in-flight count stays +1. Reproduced x64 (8 of 10 callbacks + all 3 later probes silently lost); x86 longjmp always unwinds. `agent-ljframe0`.
+- [x] **Agent's own threads ran program callbacks**, including the install rounds that run while every other thread is FROZEN (the hook writes call NtProtectVirtualMemory/FlushInstructionCache): a callback taking a lock a frozen thread held stalled the target for the controller's 5 s freeze limit. The service thread and the init/stop threads now pass straight through (not counted) while they run agent code. Reproduced x64 + x86 (callbacks on agent threads; with a stack-capturing callback the x64 run hung). Residual (not confirmed): one post-fix x64 run showed a single callback on an agent thread, not seen again; the likely source is the loader's own start/exit of the injected init thread (ntdll calling NtProtectVirtualMemory before/after the agent's code, outside any freeze), which the guard does not cover. The check now reports such loader hits separately and fails only on hits from agent code. `agent-own-threads`.
+- [x] **Stop race:** `g_stopping` was checked before the hit was counted in flight, so a thread between the check and the add ran its callback after detach (its IPC raised an unhandled 0xE0554848 the target's VEH could see). Now checked after the in-flight add (Dekker with probe_agent_stop). Fixed by reasoning (no deterministic reproduction).
+- [x] **probe_agent_init re-run cleared `callbacks[]`** while hooks could be live (null callback -> AV visible to the target). Each slot is now overwritten in one store; a null callback passes through. Fixed by reasoning.
+- [ ] **Remaining limits:** a thread that dies inside a callback and whose id is reused before the next hit is treated as a stale record (settled, not reported as interrupted); `call_func` left by a non-unwinding longjmp keeps its thread in the call_func table; the per-thread region cache (`t_region`; since the transparency merge valid for one hit only) still trusts `tls_ready()`, which at thread exit (LdrpFreeTls frees the block before clearing the pointer) may point at freed memory.
 
 ## Controller static review (2026-11-05) — known limits, not fixed by design
 - [ ] **call_func under contention (breakpoint/hw).** While a callback's `call_func` runs in the target, other threads that hit probes are parked; if one of them holds a lock the callee needs, the call times out after 5 s and the callee is abandoned mid-wait (SRW/CS wait blocks on a reused stack, locks it took never released). A first-chance exception inside the callee (C++ throw/catch, SEH probing) also abandons it. `call_original` is not affected (the thread runs on). Owner decision: no call_func hijack hardening -- use call_func only on lock-free, non-throwing callees; prefer `call_original`.
@@ -534,7 +579,9 @@ Before the fixes, x64 differed in 18 keys (A: 10, B: 2, C: every target row -- t
 - ✅ (P1) `call_func` symbol grammar differed: inline resolved `kernel32!X` (GetModuleHandle
   appends ".dll"), `X+0` and `X+0xZZ` (lenient `_strtoui64`) where breakpoint/hw refuse them, and
   refused `C:\any\dir\kernel32.dll!X` where breakpoint/hw match the file name. The agent now parses
-  with the controller's grammar (`module` with extension, matched by file name; `+0xHEX` only).
+  with the controller's grammar (`module` matched by file name; `+0xHEX` only). Since the
+  transparency merge (TR5) that grammar takes a bare module name as `<name>.dll` on every
+  backend (`kernel32!X` resolves everywhere, `portability-matrix-A` `call_func.no-ext`).
 - ✅ (P2) **A probe added from an inline callback returned 0 when its callback had been folded by
   the linker** (`/OPT:ICF`: two identical -- e.g. empty -- callbacks share one address): the agent
   sent the first export name of that address, which the controller's copy need not export.
@@ -622,9 +669,11 @@ Fixture `examples/ctrlreview` (ctrl_target + ctrl_dll + ONE callback source), re
   the byte lifted; B is set up to run the original at the site, A's step completion re-arms first, B
   executes the INT3 -> its callback ran again (20 duplicates in 24000 calls). Now a thread that is mid
   in-place step and hits the INT3 at its own site is put back and the byte lifted again, no callback.
-  ⬜ Missed hits while the byte is lifted remain (round 3 #2; `ctrl-inplace` reports the count).
-  Test: `ctrl-inplace` (8 threads x 3000 calls through an address-size LOOP, which is neither displaced
-  nor emulated)
+  ✅ Missed hits while the byte is lifted (round 3 #2): fixed -- address-size LOOP is emulated now and
+  every remaining in-place step holds the other threads (in-place window, see round 3 #2); a hit queued
+  before a window is replayed after it, so the duplicate path cannot arise there either.
+  Test: `ctrl-inplace` (8 threads x 3000 calls through an address-size LOOP): exact, x64 709 -> 24000/24000,
+  x86 971 -> 24000/24000 hits
 - ✅ (5) **probe_add_address / probe_watch inside a DLL that unloads were never retired** (UNLOAD_DLL only
   matched module probes by base). Seen: hw slots exhausted after 2-4 load cycles (`probe_watch` -> 0), and
   on reload at the same base every new probe's hits went to the stale first one (hits 0,0,0,0,500).
@@ -794,6 +843,74 @@ abort below 4000 MB available):
   says the same.)
 - No fix, so no `hwload-` regress check: there is nothing in UHH to regress.
 
+## Transparency findings (2026-11-06, `examples/transparency`, regress `transparency-*`)
+Adversarial check of "a hit is invisible to the program". Every probed function has an unprobed
+twin with the same body; both are called through one assembly harness that loads sentinels into
+every callee-saved register and captures what a caller can observe (return registers: x64
+RAX/XMM0, x86 EDX:EAX/ST0; callee-saved GPRs and XMM6-15; SP after the call, so x86 `ret N`; DF;
+x87 SW/TW), plus GetLastError, the TEB LastStatusValue and a byte diff of the WHOLE TEB. A
+mid-function site sits between a `cmp` and the flag snapshot with every GPR, XMM0-15, YMM upper
+halves, a full 8-deep x87 stack with a pending FCOM result, a non-default x87 CW and DF=1 live.
+Callback kinds: no-op, send_log(+stack), get_mem/get_func_arg/get_reg, Win32+NT calls on the hit
+thread, call_func (APIs that set the last error; a probed function), call_original+return_from
+(int / int64 / double return, a double argument, __stdcall, stack alignment, recursion); plus a
+thread created by call_func during a hit, get_mem on a page the target later guards /
+NOACCESSes / decommits (with a vectored handler counting exceptions), and a callback that
+overflows its stack. Every backend, x64 and x86.
+- ✅ (TR1) **call_original + return_from lost the original's return registers** on every
+  backend: return_from set only AX, and the resume restored the HIT's other registers -- a
+  double (x64 XMM0, x86 ST0) or x86 int64 (EDX) came back as garbage. Breakpoint/hw now capture
+  the original's integer + FP context at its return; inline x64 `uhh_orig_thunk` stores RCX RDX
+  R8-R11 XMM0-5 after the call, inline x86 ECX EDX XMM0-7 and the x87 state (FNSAVE, installed
+  after the hit's extended state is restored). With return_from the caller gets them -- except
+  AX and any register the callback set_reg'd after call_original. (Merged with the
+  calling-convention fixes CC1-CC3 and agent-faultafter: one record of the original's results,
+  `OrigPost` in the agent / `CallbackState::post` in the controller, serves return_from and a
+  callback that faults after call_original; x86 EDX goes through `probe_x86_return_regs`.)
+- ✅ (TR2) **inline x64 call_original ran the original with garbage XMM0-3**: float/double
+  arguments were not passed (breakpoint/hw run in place, so they were fine). The thunk now
+  loads the hit's XMM0-5 (the calling-convention fix, which also covers vectorcall).
+- ✅ (TR3) **inline call_original + return_from hid the original's GetLastError / last NT
+  status**: the agent restores both after every callback, to the values from BEFORE the hit.
+  When call_original ran they are now restored to what the original left.
+- ✅ (TR4) **breakpoint/hw call_func leaked the callee's last error / status** into the program
+  (inline hid them): call_func now saves and restores the stopped thread's TEB LastErrorValue
+  and LastStatusValue around the call. x86 also restores the XMM registers there
+  (CONTEXT_EXTENDED_REGISTERS): a callee's SSE use leaked into a mid-function site on breakpoint
+  x86 (hw happened to rewrite the full context afterwards).
+- ✅ (TR5) **breakpoint/hw call_func("kernel32!X")** (no `.dll`) did not resolve; inline did
+  (GetModuleHandle semantics). A bare module name now also matches `<name>.dll`.
+- ✅ (TR6, review a) **the inline XSAVE buffer was sized from CPUID(0xD,0).EBX** (every XCR0
+  feature): with AMX (~11 KB) it exceeded the 4 KiB buffer and the hit saved nothing, not even
+  MXCSR -- a callback's VZEROUPPER (CRT memcpy) wiped the target's live YMM upper halves. The
+  size now comes from the saved components only; without XSAVE, MXCSR is still kept. Test:
+  `transparency-inline-xsave-bigarea` (UHH_BENCH_XSTATE=amx simulates the AMX-sized area).
+- ✅ (TR7, review b) **x86 inline: the x87 state was not saved** (default mask = AVX only). x86
+  code returns floats in ST0, so any callback/CRT float call changes the x87 status/tag/stack a
+  mid-function site may have live. The gated mask now includes x87 on x86 when it is in use.
+  (x64: not included -- MSVC x64 code never touches x87 -- so x64 hits keep the cheap path.)
+- ✅ (TR8, review c) **inline get_mem trusted a per-thread region cache ACROSS hits**: a page the
+  target decommitted / NOACCESSed / guarded later faulted (a first-chance AV its vectored
+  handler saw) or silently consumed its PAGE_GUARD. The cache now lives for one hit (reset at
+  the hit and after call_original).
+- ✅ (TR9, review d) **a callback stack overflow was caught without `_resetstkoflw`**: the thread
+  (inline: the TARGET's thread) lost its guard page and the program's own next overflow killed
+  the process with an access violation. Restored on both the agent and the controller side.
+- 📄 Inherent to inline (documented, counted not failed by the check): (1) the callback runs on
+  the target thread's stack -- the hook path uses roughly 8-10 KiB (stub context, 4 KiB XSAVE
+  area, the callback's frames), so a thread close to its stack limit can overflow where it would
+  not have, and committing deeper stack moves TEB StackLimit (`stack_limit_moves`); (2) a
+  callback's own heap calls change heap state, including the TEB's per-thread LFH affinity hint
+  (`HeapData`, x64 TEB+0x17B0, x86 TEB+0xFA8; `heap_hint_changes`). Neither can be avoided while running C code
+  in the target; breakpoint/hw callbacks run in the controller and change neither.
+- 📄 Inline call_original is a real call from the agent: the original sees the agent's return
+  address (`_ReturnAddress()`, e.g. kernelbase!GetProcAddress's caller-based lookups) and a new
+  stack frame for its stack arguments, and is entered with the hit's argument registers (x64
+  RCX RDX R8 R9 XMM0-5; x86 EAX ECX EDX XMM0-5 + stack args) but NOT its other registers -- a function with a
+  custom register convention (hand-written asm, x86 LTCG internal functions taking ESI/EDI)
+  gets garbage there. Breakpoint/hw run the original in place with the full context and have
+  none of these limits. Returning through the program's caller would break the CET shadow stack.
+
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`
 - ✅ Per-log overhead ceilings in the suite (`log-throughput-*`)
@@ -818,7 +935,7 @@ abort below 4000 MB available):
   - **Audit (x64; Windows does not enforce user shadow stacks for WoW64/x86 processes):**
     - ✅ Inline, every hit: SafetyHook's mid-hook stub ended `lea rsp,[rsp+8]; pop rsp; ret`, returning to the trampoline through an address it had PUSHED -- a #CP on every inline hit (fatal in strict mode; in compatibility mode at best a kernel fix-up per hit, since stub and trampoline are non-image memory). Fixed: the stub now ends `pop rsp; jmp [trampoline]` (`cmake/patch_safetyhook.cmake` step 3, applied to `third_party/safetyhook`; x64 the same 7 bytes, x86 one byte longer with a relocated `jmp [abs32]`). No `ret` remains on the hook path (the stub's own `call [destination]` is a real call/ret pair).
     - ✅ Inline `set_reg(SP)` (#8): the same patch makes the context's rsp/esp the stack pointer the hooked code resumes with -- nothing is written below the new SP (the old `trampoline_rsp` slot clobbered the saved registers when SP moved down). Re-enabled in `src/probe/agent.cpp`; conformance `sp_moved` now 10/10 on every backend.
-    - ✅ Breakpoint emulation of CALL/RET (`emulate_site`): moves RSP/RIP but not SSP, so the target would #CP at its NEXT real `ret` inside its own CETCOMPAT code (fatal even in compatibility mode). Since 226f131 the emulation is skipped when `ProcessUserShadowStackPolicy.EnableUserShadowStack` is set and the CPU steps CALL/RET in place (JMP/Jcc/LOOP/PUSHF/POPF emulation is unaffected). Regress `cet-ret-breakpoint` (probe on NtOpenProcess's `ret` in probe_app_cet).
+    - ✅ Breakpoint emulation of CALL/RET (`emulate_site`): moves RSP/RIP but not SSP, so the target would #CP at its NEXT real `ret` inside its own CETCOMPAT code (fatal even in compatibility mode). Since 226f131 the emulation is skipped when `ProcessUserShadowStackPolicy.EnableUserShadowStack` is set and the CPU steps CALL/RET in place (JMP/Jcc/LOOP/PUSHF/POPF emulation is unaffected). Regress `cet-ret-breakpoint` (probe on NtOpenProcess's `ret` in probe_app_cet). That in-place CALL/RET step now runs in the in-place window (Evaluator round 3 #2: the other threads are held while the byte is lifted), so it is exact under threads too; the CPU still does the push/pop, so SSP stays consistent. The x64 SYSCALL trampoline has no call/ret (a `jmp [rip]` back), so it does not touch the shadow stack either.
     - ✅ `call_func` on breakpoint/hw (`call_in_target`): the callee is entered by SetThreadContext, so its `ret` to `call_trap` does not match the shadow stack -> #CP inside the callee (a CETCOMPAT system DLL: fatal). Now REFUSED (returns 0, one stderr warning) when the target has shadow stacks; inline `call_func` is a real call and unaffected. A working design for CET (return to the real shadow-stack top under a per-thread DR trap, then restore SSP through `CONTEXT_XSTATE`/`XSTATE_MASK_CET_U`) needs CET hardware to develop.
     - ⬜ SetThreadContext RIP changes (displaced stepping into scratch memory, moving frozen threads onto the trampoline, `call_func` restore, `set_reg`): no `ret` is involved and SSP is never touched (the controller never sets `CONTEXT_XSTATE`), so the CPU check does not apply. Open: Windows' optional `SetContextIpValidation` policy validates a new RIP against the shadow stack / EH-continuation table; whether it applies to a DEBUGGER's cross-process SetThreadContext is unverified. If it does, displaced stepping and the freeze move would be refused under that policy (in-place stepping would still work).
     - ⬜ `BlockNonCetBinaries` policy: the injected `probe_api_agent.dll` is not /CETCOMPAT and would be refused -> no inline backend in such a process. Linking the agent /CETCOMPAT is now plausible (its hook path has no ret-to-pushed-address) but untested.
