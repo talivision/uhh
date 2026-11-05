@@ -3684,6 +3684,42 @@ def check_blog_replicas():
                 record(name, False, repr(e))
 
 
+def check_soak(minutes):
+    """Opt-in (--soak-minutes N): scripts/soak.py's phases, N minutes each -- gated_config
+    against a paced probe_app (mixed breakpoint/inline, all-hw, all-breakpoint), then attach /
+    detach cycles of uhh_trace on one long-running probe_app. Each phase: every read logged
+    with the right pid/name (logs == hits == successful_reads, log_dropped 0, the log file
+    holds logs_written lines), the checksum of an uninstrumented run, and no growth of the
+    controller's or target's private bytes / handles / threads (or of agent copies loaded in
+    the attached target) beyond steady state."""
+    if not exe("gated_config.exe") or not exe("uhh_trace.exe") or not exe("probe_app.exe"):
+        return skip("soak", "gated_config/uhh_trace/probe_app missing")
+    sys.path.insert(0, str(Path(__file__).parent))
+    import soak
+    out = Path(tempfile.gettempdir()) / "uhh" / "soak-regress"
+    for phase in ("mixed", "hw", "breakpoint", "attach"):
+        name = f"soak-{phase}"
+        try:
+            r = soak.run_phase(BIN, phase, minutes, out_dir=out, sample_s=max(10.0, minutes * 60 / 6))
+            g = r.get("growth_2nd_half", {})
+            if phase == "attach":
+                detail = (f"cycles={r.get('cycles_ok')}/{r.get('cycles')} reads={r.get('successful_reads')}/{r.get('total')} "
+                          f"checksum_same={r.get('checksum') == r.get('baseline_checksum')} exit={r.get('target_exit')} "
+                          f"agents(first,last)={r.get('agent_modules_first_last')} growth={g}")
+                if not r["ok"]:
+                    detail += f" failed={json.dumps(r.get('failed_cycles'))[:600]} unhandled={r.get('unhandled')}"
+            else:
+                detail = (f"logged={r.get('logged_reads')} hits={r.get('read_hits')} reads={r.get('successful_reads')}/"
+                          f"{r.get('total')} dropped={r.get('log_dropped')} file_lines={r.get('log_file_lines')}/"
+                          f"{r.get('logs_written')} wrong={r.get('wrong_lines')} checksum_same="
+                          f"{r.get('checksum') == r.get('baseline_checksum')} rate={r.get('rate_per_s')}/s growth={g}")
+                if not r["ok"]:
+                    detail += f" error={r.get('error')} stderr={r.get('stderr_tail', [])[-4:]}"
+            record(name, r["ok"], detail)
+        except Exception as e:
+            record(name, False, repr(e))
+
+
 def check_blog_pwsh_attach():
     """JIT/managed process (the 'hook a .NET host' write-ups): attach to a running
     powershell.exe, hook kernelbase!CreateFileW, which its script drives via [IO.File],
@@ -4624,6 +4660,8 @@ def main():
                     help="opt-in slow tier: real large apps (powershell, headless Edge) under every backend, "
                          "launch/attach/detach; optional comma list of name substrings (e.g. ps-launch,edge-detach)")
     ap.add_argument("--bigapps-secs", type=int, default=40, help="workload length of each bigapps run")
+    ap.add_argument("--soak-minutes", type=float, default=0,
+                    help="opt-in soak tier (scripts/soak.py): every phase for this many minutes; 0 skips")
     ap.add_argument("--only", default="", help="comma-separated substrings of check names to run (default: all)")
     args = ap.parse_args()
     BIN = args.bin.resolve()
@@ -4718,6 +4756,8 @@ def main():
     if args.bigapps:
         if want(check_bigapps): check_bigapps(args.bigapps_secs, args.bigapps)
     if want(check_realapps): check_realapps()
+    if args.soak_minutes > 0:
+        if want(check_soak): check_soak(args.soak_minutes)
     print("-" * 72)
     failed = 0
     for name, status, detail in RESULTS:

@@ -259,6 +259,10 @@ target_include_directories(dynwatch_driver PRIVATE include examples/dynwatch)
 target_link_libraries(dynwatch_driver PRIVATE probe_api)
 add_dependencies(dynwatch_driver dynwatch_target probe_api_agent)
 
+# --- child_exp: raw Win32 measurements behind docs/child-processes.md (no UHH) ----------
+add_executable(child_exp bench/child_follow/child_exp.cpp)
+target_compile_definitions(child_exp PRIVATE _CRT_SECURE_NO_WARNINGS)
+
 # --- uhh_trace: trace any export of any program (the general CLI) ---------------------
 add_executable(uhh_trace examples/trace/uhh_trace.cpp examples/trace/trace_callback.cpp)
 target_include_directories(uhh_trace PRIVATE include examples/trace)
