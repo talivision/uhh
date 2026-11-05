@@ -33,6 +33,9 @@ Checks:
     inside callbacks (entry probe as breakpoint / hw / inline; inline exercises the
     agent->controller IPC). Exact hit count across two threads (one created after the
     watch is armed), one-shot return probe retired, and a symbolized stack in the log.
+  - famous-<recipe>-<backend>: the examples/famous recipes (heap tracker, file monitor
+    incl. attach mid-run and findstr, TLS plaintext via curl.exe, loader/RWX signals,
+    return-value override), each compared with the uninstrumented run of its target.
 Missing binaries (an example not built) are reported as SKIP, not FAIL.
 """
 import argparse
@@ -1579,6 +1582,330 @@ def check_realworld():
                 record(label, False, repr(e))
 
 
+# ---- examples/famous: classic Frida / API Monitor / Procmon recipes ------------------------
+# Every recipe runs under each backend and is compared against the UNINSTRUMENTED run of the
+# same target (its own ground-truth JSON line): the program must behave identically
+# (except deliberate overrides), and the callbacks' view must equal the ground truth.
+FAMOUS_BACKENDS = ("breakpoint", "hw", "inline")
+
+
+def famous_x86():
+    import struct
+    data = Path(exe("famous_driver.exe")).read_bytes()[:4096]
+    return struct.unpack_from("<H", data, struct.unpack_from("<I", data, 0x3C)[0] + 4)[0] == 0x14C
+
+
+def famous(recipe, bk, argv, timeout=600, extra=()):
+    return run([exe("famous_driver.exe"), "--recipe", recipe, "--backend", bk, *extra, "--", *argv],
+               timeout=timeout)
+
+
+def famous_msgs(objs, prefix=""):
+    return [str(o.get("message", "")) for o in objs
+            if o.get("kind") == "probe_log" and str(o.get("message", "")).startswith(prefix)]
+
+
+def famous_health(rc, objs, bk):
+    """Common to every recipe: clean exit, no error, nothing dropped, every probe (incl. the
+    return-site probes added at runtime) on exactly the backend asked for, no refusals."""
+    rep = report(objs)
+    got = sorted({x.get("backend") for x in probes(objs)})
+    refused = [m for m in famous_msgs(objs, "return-site") if "REFUSED" in m]
+    ok = (rc == 0 and rep.get("error") is None and rep.get("log_dropped") == 0 and got == [bk]
+          and not refused)
+    return ok, (f"rc={rc} backends={got} dropped={rep.get('log_dropped')} refused={len(refused)} "
+                f"err={(rep.get('error') or '')[:140]}")
+
+
+def famous_kv(message):
+    return dict(kv.split("=", 1) for kv in message.split() if "=" in kv)
+
+
+def check_famous_heap(threads=4, iters=600):
+    """Heap tracker: RtlAllocateHeap entry + per-call-site return probe + RtlFreeHeap +
+    RtlExitUserProcess, live table in UHH_SHARED. The tracker's allocs/frees/leaks/leaked
+    bytes must equal the target's own counts, one heap-leak line per leaked block, and the
+    target's output must equal the uninstrumented run."""
+    d, t = exe("famous_driver.exe"), exe("famous_heap_target.exe")
+    if not d or not t:
+        return skip("famous-heap", "famous_driver/famous_heap_target missing")
+    argv = [t, "--threads", threads, "--iters", iters]
+    try:
+        _, base_objs = run(argv, timeout=120)
+        base = app(base_objs)
+    except Exception as e:
+        return record("famous-heap-baseline", False, repr(e))
+    record("famous-heap-baseline", base.get("leaks", 0) > 1, json.dumps(base))
+    for bk in FAMOUS_BACKENDS:
+        name = f"famous-heap-{bk}"
+        try:
+            r, o = famous("heap", bk, argv)
+            a = app(o)
+            summ = famous_msgs(o, "heap-summary")
+            s = famous_kv(summ[-1]) if summ else {}
+            leaks = famous_msgs(o, "heap-leak ")
+            leak_bytes = sum(int(famous_kv(m).get("size", 0)) for m in leaks)
+            h_ok, h = famous_health(r.returncode, o, bk)
+            ok = (h_ok and a == base and len(summ) == 1 and
+                  int(s.get("allocs", -1)) == base.get("allocs") and int(s.get("frees", -1)) == base.get("frees") and
+                  int(s.get("leaks", -1)) == base.get("leaks") and
+                  int(s.get("leaked_bytes", -1)) == base.get("leaked_bytes") and
+                  s.get("unmatched") == "0" and s.get("overflow") == "0" and
+                  len(leaks) == base.get("leaks") and leak_bytes == base.get("leaked_bytes"))
+            record(name, ok, f"summary={summ[-1] if summ else None} leak_lines={len(leaks)} "
+                             f"app_same={a == base} {h}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+def famous_file_totals(objs, dirname):
+    """Per file name under `dirname`: [writes, written, reads, read] from the probe logs,
+    and the NTSTATUS of every logged open."""
+    tot, opens = {}, {}
+    pat = re.compile(r"^file-(open|read|write) path=(.*?) handle=0x[0-9a-f]+ (?:len=(\d+)|status=0x([0-9a-f]+))")
+    marker = "\\" + dirname.lower() + "\\"
+    for m in famous_msgs(objs, "file-"):
+        g = pat.match(m)
+        if not g or marker not in g.group(2).lower():
+            continue
+        fname = g.group(2).rsplit("\\", 1)[-1].lower()
+        if g.group(1) == "open":
+            opens.setdefault(fname, []).append(g.group(4))
+            continue
+        e = tot.setdefault(fname, [0, 0, 0, 0])
+        i = 0 if g.group(1) == "write" else 2
+        e[i] += 1
+        e[i + 1] += int(g.group(3))
+    return tot, opens
+
+
+def famous_file_expect(a):
+    return {f["name"].lower(): [f["writes"], f["written"], f["reads"], f["read"]] for f in a.get("files", [])}
+
+
+def check_famous_files(threads=3, chunks=20):
+    """File monitor (Procmon-lite): NtCreateFile (OBJECT_ATTRIBUTES -> path, return probe ->
+    handle) + NtReadFile/NtWriteFile. Per file: call counts and byte totals from the logs
+    equal the target's workload; launched, attached mid-run (attach-new), and on a real
+    system binary (findstr reading a known file)."""
+    import os
+    import shutil
+    d, t = exe("famous_driver.exe"), exe("famous_file_target.exe")
+    if not d or not t:
+        return skip("famous-files", "famous_driver/famous_file_target missing")
+    root = Path(os.environ.get("TEMP", ".")) / "uhh_famous"
+    root.mkdir(exist_ok=True)
+
+    def fresh(tag):
+        p = root / f"files_{os.getpid()}_{tag}"
+        shutil.rmtree(p, ignore_errors=True)
+        return p
+
+    try:
+        bdir = fresh("baseline")
+        _, bo = run([t, bdir, "--threads", threads, "--chunks", chunks], timeout=120)
+        base = app(bo)
+        record("famous-files-baseline", base.get("errors") == 0 and len(base.get("files", [])) == threads + 1,
+               json.dumps(base)[:200])
+    except Exception as e:
+        return record("famous-files-baseline", False, repr(e))
+    # Launched. Procmon-style "Path contains <dir>" filter on every backend; unfiltered
+    # (capture everything) on breakpoint/inline only -- unfiltered, every NtCreateFile call
+    # site in the process needs a return probe, more than the 4 debug registers hold.
+    runs = [(bk, True) for bk in FAMOUS_BACKENDS] + [("breakpoint", False), ("inline", False)]
+    for bk, filtered in runs:
+        name = f"famous-files-{bk}" + ("" if filtered else "-unfiltered")
+        try:
+            wdir = fresh(bk + ("" if filtered else "_all"))
+            r, o = famous("files", bk, [t, wdir, "--threads", threads, "--chunks", chunks],
+                          extra=("--filter", wdir.name) if filtered else ())
+            a = app(o)
+            tot, opens = famous_file_totals(o, wdir.name)
+            want = famous_file_expect(a)
+            bad_opens = [f for f in want if not opens.get(f) or any(st != "00000000" for st in opens[f])]
+            h_ok, h = famous_health(r.returncode, o, bk)
+            ok = h_ok and a.get("errors") == 0 and famous_file_expect(base) == want and tot == want and not bad_opens
+            record(name, ok, f"{h} files_ok={tot == want} opens_missing={bad_opens} logs={len(famous_msgs(o, 'file-'))}"
+                             + ("" if tot == want else f" got={tot} want={want}"))
+        except Exception as e:
+            record(name, False, repr(e))
+    # Attached mid-run: the driver waits for the NEXT famous_file_target.exe; the target
+    # sleeps before its workload, so the attach lands first and every operation is seen.
+    for bk in FAMOUS_BACKENDS:
+        name = f"famous-files-attach-{bk}"
+        drv = tgt = None
+        try:
+            wdir = fresh("attach_" + bk)
+            drv = subprocess.Popen([str(d), "--recipe", "files", "--backend", bk, "--filter", wdir.name,
+                                    "--attach-new", "famous_file_target.exe", "--timeout", "30000"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            time.sleep(1.0)
+            tgt = subprocess.Popen([str(t), str(wdir), "--threads", str(threads), "--chunks", str(chunks),
+                                    "--delay-ms", "2500"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            tout, _ = tgt.communicate(timeout=300)
+            out, err = drv.communicate(timeout=300)
+            objs = [json.loads(line) for line in out.splitlines() if line.startswith("{")]
+            a = app([json.loads(line) for line in tout.splitlines() if line.startswith("{")])
+            tot, _ = famous_file_totals(objs, wdir.name)
+            want = famous_file_expect(a)
+            h_ok, h = famous_health(drv.returncode, objs, bk)
+            attached = any(x.get("kind") == "attached" for x in objs)
+            ok = h_ok and attached and a.get("errors") == 0 and tgt.returncode == 0 and tot == want
+            record(name, ok, f"attached={attached} target_rc={tgt.returncode} {h} files_ok={tot == want}"
+                             + ("" if ok else f" got={tot} want={want} "
+                                              f"stderr={' | '.join(err.strip().splitlines()[-4:])}"))
+        except Exception as e:
+            record(name, False, repr(e))
+        finally:
+            for p_ in (tgt, drv):
+                if p_ and p_.poll() is None:
+                    p_.kill()
+    # Real system binaries on a known file: findstr (opens it; observed to read it without
+    # NtReadFile -- a file mapping -- so reads are not asserted) and cmd's built-in `type`
+    # (NtReadFile: the requested lengths must cover the file).
+    sysdir = Path(r"C:\Windows\SysWOW64") if famous_x86() else SYS32
+    data_dir = fresh("sysbin")
+    data_dir.mkdir(parents=True, exist_ok=True)
+    data = data_dir / "haystack.txt"
+    data.write_text("".join(f"line {i} {'UHHNEEDLE' if i % 7 == 0 else 'hay'}\n" for i in range(400)))
+    size = data.stat().st_size
+    want_lines = sum(1 for i in range(400) if i % 7 == 0)
+    for tool, argv, lines_want in (("findstr", [sysdir / "findstr.exe", "UHHNEEDLE", data], want_lines),
+                                   ("type", [sysdir / "cmd.exe", "/d", "/c", "type", data], 400)):
+        for bk in FAMOUS_BACKENDS:
+            name = f"famous-files-{tool}-{bk}"
+            try:
+                r, o = famous("files", bk, argv, extra=("--filter", "haystack.txt"))
+                found = sum(1 for line in r.stdout.splitlines() if line.startswith("line "))
+                tot, opens = famous_file_totals(o, data_dir.name)
+                e = tot.get("haystack.txt", [0, 0, 0, 0])
+                h_ok, h = famous_health(r.returncode, o, bk)
+                reads_ok = tool == "findstr" or (e[2] >= 1 and e[3] >= size)
+                ok = (h_ok and found == lines_want and bool(opens.get("haystack.txt")) and
+                      all(st == "00000000" for st in opens["haystack.txt"]) and reads_ok)
+                record(name, ok, f"{h} lines={found}/{lines_want} opens={opens.get('haystack.txt')} "
+                                 f"reads={e[2]} read_len={e[3]} size={size}")
+            except Exception as e:
+                record(name, False, repr(e))
+
+
+def check_famous_tls():
+    """TLS plaintext capture: sspicli!EncryptMessage (plaintext at entry) and DecryptMessage
+    (plaintext at the call site's return) inside the real curl.exe (SChannel) talking to a
+    local HTTPS server. The request line/header and the response marker must appear in
+    the logs, and curl must print the same body as uninstrumented."""
+    d = exe("famous_driver.exe")
+    if not d:
+        return skip("famous-tls", "famous_driver missing")
+    curl = (Path(r"C:\Windows\SysWOW64") if famous_x86() else SYS32) / "curl.exe"
+    if not curl.exists():
+        return record("famous-tls", False, f"{curl} not present (offline TLS client needed)")
+    server_py = Path(__file__).resolve().parent.parent / "examples" / "famous" / "tls_capture" / "tls_server.py"
+    srv = subprocess.Popen([sys.executable, "-u", str(server_py)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           text=True)
+    try:
+        port = json.loads(srv.stdout.readline())["port"]
+        marker_req, marker_resp = "request-marker-91c2", "UHH-TLS-RESPONSE-MARKER-7f3a"
+        argv = [curl, "-s", "-k", "--ssl-no-revoke", "-H", f"X-UHH: {marker_req}",
+                f"https://127.0.0.1:{port}/uhh-secret-path?token=s3cr3t"]
+        b = subprocess.run([str(x) for x in argv], capture_output=True, text=True, timeout=60)
+        body = [line for line in b.stdout.splitlines() if line.startswith(marker_resp)]
+        record("famous-tls-baseline", b.returncode == 0 and len(body) == 1,
+               f"rc={b.returncode} body={body} err={b.stderr.strip()[:120]}")
+        for bk in FAMOUS_BACKENDS:
+            name = f"famous-tls-{bk}"
+            try:
+                r, o = famous("tls", bk, argv, timeout=180)
+                got_body = [line for line in r.stdout.splitlines() if line.startswith(marker_resp)]
+                enc = famous_msgs(o, "tls-encrypt")
+                dec = famous_msgs(o, "tls-decrypt")
+                req_seen = any("GET /uhh-secret-path?token=s3cr3t HTTP/1.1" in m and marker_req in m for m in enc)
+                resp_seen = any(marker_resp in m and "path=/uhh-secret-path?token=s3cr3t" in m for m in dec)
+                h_ok, h = famous_health(r.returncode, o, bk)
+                ok = h_ok and got_body == body and req_seen and resp_seen
+                record(name, ok, f"{h} encrypt_logs={len(enc)} decrypt_logs={len(dec)} request_seen={req_seen} "
+                                 f"response_seen={resp_seen} body_same={got_body == body}")
+            except Exception as e:
+                record(name, False, repr(e))
+    except Exception as e:
+        record("famous-tls", False, repr(e))
+    finally:
+        srv.kill()
+        srv.wait()
+
+
+def check_famous_loader(threads=4):
+    """Loader / unpacker signals: LoadLibraryExW + LdrLoadDll names, and RWX transitions at
+    NtAllocateVirtualMemory / NtProtectVirtualMemory. Every worker's RWX allocation and
+    RW->RWX protect is logged exactly once (by its fingerprint size); the W^X-correct
+    RX protect is not; all three loads are seen by both probes; the target's output equals
+    the uninstrumented run (the generated code still runs)."""
+    d, t = exe("famous_driver.exe"), exe("famous_loader_target.exe")
+    if not d or not t:
+        return skip("famous-loader", "famous_driver/famous_loader_target missing")
+    argv = [t, "--threads", threads]
+    try:
+        _, bo = run(argv, timeout=120)
+        base = app(bo)
+        record("famous-loader-baseline", base.get("jit_ok") == 2 * threads and base.get("errors") == 0 and
+               base.get("loads_ok") == 2 and base.get("loads_failed") == 1, json.dumps(base))
+    except Exception as e:
+        return record("famous-loader-baseline", False, repr(e))
+    names = ("version.dll", "dbghelp.dll", "uhh_no_such_module.dll")
+    for bk in FAMOUS_BACKENDS:
+        name = f"famous-loader-{bk}"
+        try:
+            r, o = famous("loader", bk, argv)
+            a = app(o)
+            allocs = [famous_kv(m) for m in famous_msgs(o, "rwx-alloc ")]
+            prots = [famous_kv(m) for m in famous_msgs(o, "rwx-protect ")]
+            alloc_hits = [sum(1 for x in allocs if x.get("size") == f"0x{0x13000 + k * 0x1000:x}") for k in range(threads)]
+            prot_hits = [sum(1 for x in prots if x.get("size") == f"0x{0x25000 + k * 0x1000:x}") for k in range(threads)]
+            ll = " ".join(famous_msgs(o, "loadlibraryexw ")).lower()
+            ldr = " ".join(famous_msgs(o, "ldrloaddll ")).lower()
+            loads_ok = all(n in ll and n in ldr for n in names)
+            other = len(allocs) + len(prots) - sum(alloc_hits) - sum(prot_hits)
+            h_ok, h = famous_health(r.returncode, o, bk)
+            ok = h_ok and a == base and alloc_hits == [1] * threads and prot_hits == [1] * threads and loads_ok
+            record(name, ok, f"{h} rwx_alloc={alloc_hits} rwx_protect={prot_hits} other_rwx_events={other} "
+                             f"loads_seen={loads_ok} app_same={a == base}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+def check_famous_retval(threads=4, calls=25):
+    """Return-value override: GetTickCount's entry arms a probe at each main-module call
+    site's return address, which sets AX. Every call the program makes returns the forced
+    value (baseline: none), so its Sleep(150) timing check reads 'fast'; GetTickCount64
+    (the control) is untouched."""
+    d, t = exe("famous_driver.exe"), exe("famous_tick_target.exe")
+    if not d or not t:
+        return skip("famous-retval", "famous_driver/famous_tick_target missing")
+    argv = [t, "--threads", threads, "--calls", calls]
+    total = threads * calls + calls + 2
+    try:
+        _, bo = run(argv, timeout=120)
+        base = app(bo)
+        record("famous-retval-baseline", base.get("calls") == total and base.get("forced") == 0 and
+               base.get("timing_check") == "slow", json.dumps(base))
+    except Exception as e:
+        return record("famous-retval-baseline", False, repr(e))
+    for bk in FAMOUS_BACKENDS:
+        name = f"famous-retval-{bk}"
+        try:
+            r, o = famous("tick", bk, argv, extra=("--value", "0x1337BEEF"))
+            a = app(o)
+            armed = [m for m in famous_msgs(o, "return-site") if m.endswith("armed")]
+            h_ok, h = famous_health(r.returncode, o, bk)
+            ok = (h_ok and a.get("calls") == total and a.get("forced") == total and a.get("elapsed") == 0 and
+                  a.get("timing_check") == "fast" and a.get("tick64_forced") == 0 and len(armed) >= 2)
+            record(name, ok, f"{h} forced={a.get('forced')}/{total} main={a.get('forced_main')} "
+                             f"workers={a.get('forced_workers')} timing={a.get('timing_check')} "
+                             f"return_sites={len(armed)}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
 def main():
     global BIN
     ap = argparse.ArgumentParser()
@@ -1649,6 +1976,11 @@ def main():
     if want(check_attach_new): check_attach_new()
     if want(check_refusals): check_refusals()
     if want(check_hotpatch_prologue): check_hotpatch_prologue()
+    if want(check_famous_heap): check_famous_heap()
+    if want(check_famous_files): check_famous_files()
+    if want(check_famous_tls): check_famous_tls()
+    if want(check_famous_loader): check_famous_loader()
+    if want(check_famous_retval): check_famous_retval()
     print("-" * 72)
     failed = 0
     for name, status, detail in RESULTS:

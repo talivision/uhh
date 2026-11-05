@@ -99,6 +99,15 @@ add_library(probe_api STATIC src/probe/session.cpp src/probe/symbols.cpp)
 target_include_directories(probe_api PUBLIC include)
 target_link_libraries(probe_api PRIVATE Zydis)   # decode probe sites for displaced stepping
 
+# examples/famous: classic Frida / API Monitor / Procmon recipes. Each recipe's callbacks
+# are compiled into the agent (inline) and into famous_driver (breakpoint/hw).
+set(FAMOUS_CALLBACKS
+    examples/famous/heap_tracker/heap_callbacks.cpp
+    examples/famous/file_monitor/file_callbacks.cpp
+    examples/famous/tls_capture/tls_callbacks.cpp
+    examples/famous/loader_rwx/loader_callbacks.cpp
+    examples/famous/retval_override/retval_callbacks.cpp)
+
 add_library(probe_api_agent SHARED
     src/probe/agent.cpp
     examples/gated_config/callbacks.cpp
@@ -109,7 +118,8 @@ add_library(probe_api_agent SHARED
     examples/conformance/conformance_callbacks.cpp
     bench/hitcost/hitcost_callbacks.cpp
     examples/memstress/memstress_callbacks.cpp
-    examples/sidefx/sidefx_callbacks.cpp)
+    examples/sidefx/sidefx_callbacks.cpp
+    ${FAMOUS_CALLBACKS})
 target_include_directories(probe_api_agent PRIVATE include examples/gated_config examples/dynwatch examples/trace examples/memstress)
 target_link_libraries(probe_api_agent PRIVATE safetyhook)
 target_compile_definitions(probe_api_agent PRIVATE BREAKAGE_AGENT_ONLY FRIDA_PARITY_AGENT_ONLY HITCOST_SHARED)
@@ -265,12 +275,22 @@ foreach(rw reentrancy_target thread_stress_target antitamper_target antidebug_ta
     target_link_options(${rw} PRIVATE /DEBUG)
 endforeach()
 
+# --- examples/famous: classic instrumentation recipes, one callback source per recipe ------
+add_executable(famous_heap_target examples/famous/heap_tracker/heap_target.c)
+add_executable(famous_file_target examples/famous/file_monitor/file_target.c)
+add_executable(famous_loader_target examples/famous/loader_rwx/loader_target.c)
+add_executable(famous_tick_target examples/famous/retval_override/tick_target.c)
+add_executable(famous_driver examples/famous/famous_driver.cpp ${FAMOUS_CALLBACKS})
+target_include_directories(famous_driver PRIVATE include examples/famous)
+target_link_libraries(famous_driver PRIVATE probe_api)
+add_dependencies(famous_driver famous_heap_target famous_file_target famous_loader_target famous_tick_target probe_api_agent)
+
 add_executable(refusal_driver examples/conformance/refusal_driver.cpp)
 target_include_directories(refusal_driver PRIVATE include)
 target_link_libraries(refusal_driver PRIVATE probe_api)
 add_dependencies(refusal_driver hitcost_target)
 
-foreach(t gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
+foreach(t famous_driver famous_heap_target famous_file_target famous_loader_target famous_tick_target gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
     target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 endforeach()
