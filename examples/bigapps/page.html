@@ -2,11 +2,13 @@
 <html><head><meta charset="utf-8"><title>uhh bigapps</title></head>
 <body>
 <!-- Served by scripts/regress.py (--bigapps) to headless Edge (--dump-dom). The JS result is
-     verified by the suite, as are 40 synchronous requests to the local server; /slow then holds
-     the load event open, so the browser process stays busy (IPC, allocations, file and
+     verified by the suite, as are 40 synchronous requests to the local server; /slow (a parser-blocking
+     script streamed over the run) then holds the load event open, so the browser process stays busy (IPC, allocations, file and
      network I/O) for the whole run. -->
 <div id="js">pending</div>
 <div id="fetched">FETCHED=0</div>
+<div id="async">ASYNC=0</div>
+<div id="slow">SLOW=pending</div>
 <script>
 function work(n) { let h = 0; for (let i = 0; i < n; i++) h = (h * 31 + (i ^ (i >> 3))) | 0; return h; }
 let r = 0;
@@ -23,6 +25,17 @@ for (let i = 0; i < FETCHES; i++) {
   try { x.send(); if (x.status === 200 && x.responseText === 'data' + i) got++; } catch (e) {}
 }
 document.getElementById('fetched').textContent = 'FETCHED=' + got;
+// While /slow (below) blocks the parser, timers still run: keep the browser's network,
+// IPC and allocator busy for the whole hold (each request is a new loopback connection).
+let asyncGot = 0, asyncI = 0;
+setInterval(() => {
+  const i = asyncI++;
+  fetch('/data?i=' + i, {cache: 'no-store'}).then(x => x.text()).then(t => {
+    if (t === 'data' + i) document.getElementById('async').textContent = 'ASYNC=' + (++asyncGot);
+  }).catch(() => {});
+}, 100);
 </script>
-<img src="/slow" alt="slow">
+<!-- Parser-blocking script streamed slowly: the load event (and --dump-dom) waits for all of
+     it, and its last line proves it arrived complete. -->
+<script src="/slow"></script>
 </body></html>

@@ -1653,8 +1653,9 @@ def bigapps_js_expected():
 
 
 def bigapps_server(slow_secs):
-    """Local HTTP server for page.html. /slow streams for slow_secs (holds Edge's load event,
-    so the browser stays busy until then); /data?i=N answers 'dataN'."""
+    """Local HTTP server for page.html. /slow is a parser-blocking script streamed over
+    slow_secs (holds Edge's load event, so the browser stays busy until then; it ends by
+    writing SLOW=done into the page); /data?i=N answers 'dataN'."""
     import http.server
     page = (BIGAPPS_DIR / "page.html").read_bytes()
     seen = threading.Event()
@@ -1667,12 +1668,15 @@ def bigapps_server(slow_secs):
             try:
                 if self.path == "/slow":
                     n = max(1, int(slow_secs * 10))
+                    tail = b"\ndocument.getElementById('slow').textContent = 'SLOW=done';\n"
                     self.send_response(200)
-                    self.send_header("Content-Type", "image/gif")
-                    self.send_header("Content-Length", str(n * 512))
+                    self.send_header("Content-Type", "application/javascript")
+                    self.send_header("Content-Length", str(n * 512 + len(tail)))
+                    self.send_header("Cache-Control", "no-store")
                     self.end_headers()
                     for _ in range(n):
-                        self.wfile.write(b"\0" * 512); self.wfile.flush(); time.sleep(0.1)
+                        self.wfile.write(b" " * 511 + b"\n"); self.wfile.flush(); time.sleep(0.1)
+                    self.wfile.write(tail); self.wfile.flush()
                     return
                 if self.path == "/":
                     body, ctype = page, "text/html"; seen.set()
@@ -1770,6 +1774,7 @@ def bigapps_edge(bk, mode, secs):
             rep = report(objs)
             if marker not in r.stdout: bad.append("JS result missing/wrong in the dumped DOM")
             if "FETCHED=40" not in r.stdout: bad.append("fetches incomplete")
+            if "SLOW=done" not in r.stdout: bad.append("slow script incomplete")
             if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
             return not bad, f"{detail} exit={rep.get('app_exit')}", bad, r.stderr
         browser = subprocess.Popen([str(a) for a in argv], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -1787,6 +1792,8 @@ def bigapps_edge(bk, mode, secs):
                                         [s.rsplit(":", 1)[0] for s in BIGAPPS_EDGE_PROBES[:3]], mode == "exit")
         if marker not in dom: bad.append("JS result missing/wrong in the dumped DOM")
         if "FETCHED=40" not in dom: bad.append("fetches incomplete")
+        if "SLOW=done" not in dom: bad.append("slow script incomplete")
+        if "ASYNC=0<" in dom: bad.append("no async fetch completed")
         if browser.returncode != 0 or r.returncode != 0: bad.append(f"browser_rc={browser.returncode} tracer_rc={r.returncode}")
         if mode == "detach" and '"kind":"detached"' not in r.stdout: bad.append("not detached")
         return not bad, f"{detail} rc={browser.returncode}", bad, r.stderr
