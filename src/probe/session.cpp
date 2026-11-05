@@ -190,6 +190,7 @@ struct probe_session {
     std::atomic<bool> stop_requested{false};   // probe_close from another thread while probe_run runs
     std::atomic<bool> running{false};          // probe_run is executing (on some thread)
     bool detached = false;
+    bool detaching = false;    // detach() running: no new holds (nothing would release them)
     DWORD debug_tid = 0;                       // the thread that launched/attached: owns the debug object
     DWORD in_call_tid = 0;                     // thread currently running a call_func callee
     std::vector<HANDLE> call_deferred;         // other threads' hits during a call_func: rewound + suspended
@@ -2515,10 +2516,49 @@ static bool open_agent_section(probe_session *s, uint32_t count) {
     return ensure_local_agent(s);
 }
 
+// Every export name of module m at address addr. The linker folds identical functions
+// (/OPT:ICF), so two exported callbacks with the same body share one address and a
+// callback's name (taken from its address) is ambiguous: e.g. two empty callbacks. The
+// agent and the controller name callbacks by export, so each side matches the OTHER
+// side's exports against all aliases instead of trusting the first one.
+static std::vector<std::string> export_names_at(HMODULE m, const void *addr) {
+    std::vector<std::string> out;
+    if (!m || !addr) return out;
+    auto base = reinterpret_cast<const unsigned char *>(m);
+    auto dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return out;
+    auto nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(base + dos->e_lfanew);
+    auto dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dir.VirtualAddress || !dir.Size) return out;
+    auto exports = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY *>(base + dir.VirtualAddress);
+    auto functions = reinterpret_cast<const DWORD *>(base + exports->AddressOfFunctions);
+    auto names = reinterpret_cast<const DWORD *>(base + exports->AddressOfNames);
+    auto ordinals = reinterpret_cast<const WORD *>(base + exports->AddressOfNameOrdinals);
+    const uint64_t rva = (uint64_t)(reinterpret_cast<const unsigned char *>(addr) - base);
+    for (DWORD i = 0; i < exports->NumberOfNames; ++i)
+        if (ordinals[i] < exports->NumberOfFunctions && functions[ordinals[i]] == rva)
+            out.emplace_back(reinterpret_cast<const char *>(base + names[i]));
+    return out;
+}
+
+static HMODULE module_of(const void *addr) {
+    HMODULE m{};
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCSTR>(addr), &m);
+    return m;
+}
+
 static void fill_request(probe_session *s, const Probe &p) {
     auto &request = s->shared->requests[p.agent_index]; request.flags = p.flags;
     request.config_len = (uint32_t)p.config.size();
-    std::memcpy(request.callback, p.callback_export.c_str(), p.callback_export.size() + 1);
+    std::string name = p.callback_export;
+    // The agent resolves the name in ITS module (the same file as s->local_agent): if this
+    // alias is not exported there, send one that is (an identical-code-folded twin).
+    if (s->local_agent && p.callback && !GetProcAddress(s->local_agent, name.c_str()))
+        for (auto &alias : export_names_at(module_of(reinterpret_cast<const void *>(p.callback)),
+                                           reinterpret_cast<const void *>(p.callback)))
+            if (alias.size() < PROBE_AGENT_EXPORT_CAP && GetProcAddress(s->local_agent, alias.c_str())) { name = alias; break; }
+    std::memcpy(request.callback, name.c_str(), name.size() + 1);
     if (!p.config.empty()) std::memcpy(request.config, p.config.data(), p.config.size());
 }
 
@@ -2593,7 +2633,32 @@ static bool inline_hold_needed(const probe_session *s) {
     return has_inline(s) && !(s->shared && s->shared->service_ready && s->svc_event);
 }
 
+// A thread of OUR agent (its service thread, started from the agent image): never hold it
+// -- it may own the agent's install lock or be the one that must do the install.
+static bool agent_thread(probe_session *s, DWORD tid) {
+    if (!s->remote_agent) return false;
+    using QueryFn = LONG(NTAPI *)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    static auto query = reinterpret_cast<QueryFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+    HANDLE t = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
+    if (!t || !query) { if (t) CloseHandle(t); return false; }
+    PVOID start = nullptr;
+    LONG st = query(t, 9 /*ThreadQuerySetWin32StartAddress*/, &start, sizeof(start), nullptr);
+    CloseHandle(t);
+    if (st < 0) return false;
+    IMAGE_DOS_HEADER dos{}; IMAGE_NT_HEADERS nt{}; size_t got = 0;
+    if (!remote_read(s->pi.hProcess, s->remote_agent, &dos, sizeof(dos), &got) || got != sizeof(dos) ||
+        !remote_read(s->pi.hProcess, s->remote_agent + (uint32_t)dos.e_lfanew, &nt, sizeof(nt), &got) || got != sizeof(nt))
+        return false;
+    const uint64_t a = (uint64_t)(uintptr_t)start;
+    return a >= s->remote_agent && a < s->remote_agent + nt.OptionalHeader.SizeOfImage;
+}
+
 static void hold_thread(probe_session *s, DWORD tid) {
+    // While detaching, the drain dispatches queued events (CREATE_THREADs, gate hits) that
+    // would otherwise place an install hold -- and its release (the agent confirming) may
+    // never come before we let go: the target would be left with suspended threads after
+    // the detach. No hooks are being installed any more anyway.
+    if (s->detaching) return;
     HANDLE t = OpenThread(THREAD_SUSPEND_RESUME, FALSE, tid);
     if (!t) return;
     DWORD prev = SuspendThread(t);
@@ -2847,6 +2912,7 @@ static void ipc_thaw(probe_session *s);
 static void pump(probe_session *s, DWORD ms);
 static void detach(probe_session *s) {
     s->error.clear();
+    s->detaching = true;
     release_held(s, "detach");
     // Agent work in flight (load/init on a remote thread): let it finish first, or its hooks
     // would land AFTER the agent was told to stop -- live hooks in a detached process.
@@ -2980,6 +3046,7 @@ static void detach(probe_session *s) {
     }
     std::fprintf(stderr, "probe: detach: %zu thread(s) frozen;%s\n", frozen.size(),
                  report_tids.empty() ? " all clean" : report_tids.c_str());
+    release_held(s, "detach (late)");                    // belt and braces: never leave a hold behind
     stop_drainer(s);
     if (!s->exited) DebugActiveProcessStop(s->pi.dwProcessId);
     for (HANDLE t : frozen) { ResumeThread(t); CloseHandle(t); }
@@ -3169,6 +3236,12 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
             if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                    reinterpret_cast<LPCSTR>(p->callback), &m))
                 cb = reinterpret_cast<probe_callback>(GetProcAddress(m, req.callback));
+            // Identical-code folding in the agent DLL may have named the callback by a twin
+            // that the controller-side module does not export: try every alias of it.
+            if (!cb && m && s->local_agent)
+                if (auto here = GetProcAddress(s->local_agent, req.callback))
+                    for (auto &alias : export_names_at(s->local_agent, reinterpret_cast<const void *>(here)))
+                        if ((cb = reinterpret_cast<probe_callback>(GetProcAddress(m, alias.c_str())))) break;
             break;
         }
     if (!origin) return false;
@@ -4313,6 +4386,17 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
                     uint32_t rw = 0, len = 0; hw_rw_len(p->flags, rw, len);
                     set_dr_on_thread(event.u.CreateThread.hThread, p->dr_slot, p->address, true, rw, len);
                 }
+        // A launched target's thread born while inline installs are outstanding (e.g. started
+        // by a TLS callback or a static DLL's DllMain(PROCESS_ATTACH) during process init,
+        // before the main thread reaches the entry hold) could reach a site before its hook
+        // is in. Hold it from its first instruction (it owns no lock yet) until the same
+        // confirmation releases the others. Attached targets: only while a hold is already in
+        // progress (a callback's runtime add) and the agent is up -- attach holds nothing while
+        // the agent is injected. Never our own agent threads (they do the install).
+        if (s->initial_break && event.dwThreadId != s->remote_tid &&
+            (!s->attached || (!s->held.empty() && s->shared && s->shared->service_ready)) &&
+            inline_hold_needed(s) && !agent_thread(s, event.dwThreadId))
+            hold_thread(s, event.dwThreadId);
         // Do NOT close hThread: the debug subsystem owns it and closes it itself when the
         // thread's EXIT_THREAD event is continued. Closing it here made that later close hit
         // whatever handle had reused the value (e.g. a held thread's -> left suspended).
@@ -4900,6 +4984,16 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
     int slot = -1;
     for (int k = 0; k < 4 && slot < 0; ++k)
         if (!(s->dr_used & (1u << k)) && !((saved.Dr7 >> (k * 2)) & 3)) slot = k;
+    // All four in use, but the hit is a hardware EXECUTE probe: borrow its own slot on THIS
+    // thread only (re-pointed at the return address for the call, put back after). Other
+    // threads keep the probe; this thread is inside the original meanwhile, so only a
+    // recursive entry of the same function on it goes uncounted. (gated_config with every
+    // probe on hw: flag + NtOpenProcess + NtClose + NtReadVirtualMemory = 4 DRs.)
+    bool borrowed = false;
+    if (slot < 0 && (probe->flags & PROBE_HW) && !(probe->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) &&
+        probe->dr_slot >= 0 && probe->dr_slot < 4) {
+        slot = probe->dr_slot; borrowed = true;
+    }
     if (slot < 0) {
         CloseHandle(thread);
         co_warn(s->co_warned_dr, probe, "call_original refused: needs one free debug register (all 4 in use)");
@@ -4925,13 +5019,19 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
     s->co_entry_pending = !(probe->flags & PROBE_HW); s->co_left = false;
     auto clear_slot = [&](bool running) {
         if (running && SuspendThread(thread) == (DWORD)-1) return;
-        set_dr_on_thread(thread, slot, 0, false);
+        if (borrowed) {                                                // the probe's own DR, back at its site
+            uint32_t rw = 0, len = 0; hw_rw_len(probe->flags, rw, len);
+            set_dr_on_thread(thread, slot, probe->address, probe->active, rw, len);
+        } else {
+            set_dr_on_thread(thread, slot, 0, false);
+        }
         if (running) ResumeThread(thread);
     };
     if (!ContinueDebugEvent(st->pid, st->tid, DBG_CONTINUE)) {
         saved.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS;
         SetThreadContext(thread, &saved);
-        s->dr_used &= (uint8_t)~(1u << slot); s->in_call_tid = 0; s->co_addr = 0;
+        if (!borrowed) s->dr_used &= (uint8_t)~(1u << slot);
+        s->in_call_tid = 0; s->co_addr = 0;
         CloseHandle(thread); return 0;
     }
     bool done = false, thread_gone = false;
@@ -4994,7 +5094,13 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
     if (done) {
         CONTEXT cur{}; cur.ContextFlags = CONTEXT_DEBUG_REGISTERS;
         if (GetThreadContext(thread, &cur)) {          // keep any DR armed meanwhile, drop ours
-            cur.Dr7 = (decltype(cur.Dr7))(cur.Dr7 & ~(((DWORD64)3 << (slot * 2)) | ((DWORD64)0xF << (16 + slot * 4))));
+            const DWORD64 mask = ((DWORD64)3 << (slot * 2)) | ((DWORD64)0xF << (16 + slot * 4));
+            const auto keep = slot == 0 ? saved.Dr0 : slot == 1 ? saved.Dr1 : slot == 2 ? saved.Dr2 : saved.Dr3;
+            cur.Dr7 = (decltype(cur.Dr7))(cur.Dr7 & ~mask);
+            if (borrowed) {                            // the probe's own DR: as it was at the hit
+                cur.Dr7 = (decltype(cur.Dr7))(cur.Dr7 | (saved.Dr7 & mask));
+                (slot == 0 ? cur.Dr0 : slot == 1 ? cur.Dr1 : slot == 2 ? cur.Dr2 : cur.Dr3) = keep;
+            }
             saved.Dr0 = cur.Dr0; saved.Dr1 = cur.Dr1; saved.Dr2 = cur.Dr2; saved.Dr3 = cur.Dr3; saved.Dr7 = cur.Dr7;
         }
         saved.Dr6 = 0;
@@ -5003,7 +5109,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
     } else if (!s->exited && !thread_gone) {
         clear_slot(true);
     }
-    s->dr_used &= (uint8_t)~(1u << slot);
+    if (!borrowed) s->dr_used &= (uint8_t)~(1u << slot);
     resume_deferred_hits(s);                           // they hit their probes again now
     CloseHandle(thread);
     if (done) {

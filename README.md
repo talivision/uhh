@@ -111,6 +111,19 @@ cmake -S . -B build-x86 -G "Visual Studio 17 2022" -A Win32
 cmake --build build-x86 --config Release
 ```
 
+For fast (incremental) builds use `scripts\build.ps1` (PowerShell): it configures fresh
+build directories with the **Ninja Multi-Config** generator (the Ninja that ships with
+Visual Studio is used if none is on `PATH`) and the MSVC environment from
+`vcvarsall.bat`, then builds; output stays in `build-x64\Release` / `build-x86\Release`.
+A directory already configured with the Visual Studio generator keeps it. With the
+Visual Studio generator the build is parallel too (`/MP`, MultiToolTask and a generated
+`Directory.Build.rsp` with `-maxCpuCount`; `-DUHH_PARALLEL_MSBUILD=OFF` disables that).
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build.ps1               # both arches
+powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Arch x64 -Target probe_api
+```
+
 ## Examples: `gated_config` (launch) and `uhh_attach` (attach)
 
 The target (`examples/targets/probe_app`) ships a feature **disabled in its config**:

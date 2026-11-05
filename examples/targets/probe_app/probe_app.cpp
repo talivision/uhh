@@ -67,7 +67,9 @@ static SafetyHookInline prehook;
 static std::atomic<uint64_t> prehook_calls{0};
 static LONG NTAPI pre_read(HANDLE h, const void *a, void *b, SIZE_T n, SIZE_T *done) {
     prehook_calls.fetch_add(1, std::memory_order_relaxed);
-    return prehook.call<LONG>(h, a, b, n, done);
+    // ReadThunk is NTAPI (__stdcall on x86): through call<> (cdecl) the callee pops its 20
+    // bytes of arguments and the caller does too -- x86 --prehook hung/crashed with no tool at all.
+    return prehook.stdcall<LONG>(h, a, b, n, done);
 }
 
 // --- Helpers ------------------------------------------------------------------------

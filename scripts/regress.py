@@ -41,6 +41,10 @@ Checks:
     cmd/reg), withdll (launch trace == attach trace; attach mid-run + detach), retval (return
     values via a return-address probe + call_func GetLastError), launch-stdin. Every one
     compares against the uninstrumented run.
+  - bigapps-<app>-<mode>-<backend> (opt-in, --bigapps): powershell.exe and headless Edge
+    under every backend, launched / attached to exit / detached mid-run, busy system
+    exports probed; program result + exit 0, no unhandled exception, hits > 0,
+    log_dropped == 0, logs == hits, still working after detach.
 Missing binaries (an example not built) are reported as SKIP, not FAIL.
 """
 import argparse
@@ -1212,29 +1216,77 @@ def check_realworld_targets():
 FRIDA_PY = Path(r"C:\work\fv16\Scripts\python.exe")
 
 
+def run_killable(args, timeout):
+    """Run a command with its output in FILES (never a pipe some grandchild may inherit and
+    hold open) and a hard timeout; on timeout the whole process tree is killed. Returns
+    (returncode or None on timeout, stdout, stderr)."""
+    import tempfile
+    with tempfile.TemporaryFile() as fo, tempfile.TemporaryFile() as fe:
+        p = subprocess.Popen([str(x) for x in args], stdin=subprocess.DEVNULL, stdout=fo, stderr=fe)
+        try:
+            rc = p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], capture_output=True, timeout=30)
+            try:
+                p.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                pass
+            rc = None
+        fo.seek(0); fe.seek(0)
+        return rc, fo.read().decode(errors="replace"), fe.read().decode(errors="replace")
+
+
+FRIDA_COEXIST_CASES = [
+    # (order, UHH backend, uhh_trace flag, expected UHH backend or None = refused, expect a prehook report)
+    ("frida_first", "inline", "fallback-hw", "hw", True),
+    ("frida_first", "inline", "none", None, True),
+    ("frida_first", "inline", "allow-prehooked", "inline", True),
+    ("uhh_first", "inline", "fallback-hw", "inline", False),
+    ("frida_first", "hw", "none", "hw", False),
+    ("uhh_first", "hw", "none", "hw", False),
+    ("frida_first", "breakpoint", "none", "breakpoint", True),     # reported; the INT3 over the jmp still works
+    ("uhh_first", "breakpoint", "none", "breakpoint", False),
+]
+
+
 def check_frida_coexist():
-    """Frida and UHH on the same function, in both orders and on every UHH backend: the
-    target stays correct and BOTH tools see every call. (Needs an interpreter with frida;
+    """Frida and UHH on the same function (probe_app.exe!ReadThunk), in both orders and on
+    every UHH backend: the target stays correct and BOTH tools see every call. Inline over
+    a Frida hook follows UHH's documented pre-hook rules: refused by default (UHH reports
+    the foreign hook and exits; the target and Frida are unaffected), moved to a debug
+    register with PROBE_FALLBACK_HW (uhh_trace --fallback-hw), chained through Frida's
+    detour with PROBE_ALLOW_PREHOOKED. One case at a time, each with a hard deadline;
+    frida_coexist.py kills its children on any failure. (Needs an interpreter with frida;
     on the test VM a frida 16.5.9 venv.)"""
     if not FRIDA_PY.exists() or not exe("uhh_trace.exe") or not exe("probe_app.exe"):
         return skip("frida-coexist", "frida interpreter / uhh_trace / probe_app missing")
     script = Path(__file__).with_name("frida_coexist.py")
-    for order in ("frida_first", "uhh_first"):
-        for bk in ("inline", "hw", "breakpoint"):
-            name = f"frida-coexist-{order}-{bk}"
-            try:
-                r = subprocess.run([str(FRIDA_PY), str(script), "--app", str(exe("probe_app.exe")),
-                                    "--trace", str(exe("uhh_trace.exe")), "--order", order, "--backend", bk],
-                                   capture_output=True, text=True, timeout=300)
-                res = next((json.loads(l) for l in r.stdout.splitlines() if l.startswith('{"kind": "coexist"')), {})
-                total = res.get("total")
-                ok = (total and res.get("app_reads") == total and res.get("frida_hits") == total and
-                      res.get("uhh_hits") == total and res.get("app_exit") == 0)
-                record(name, ok, f"total={total} app={res.get('app_reads')} frida={res.get('frida_hits')} "
-                                 f"uhh={res.get('uhh_hits')}/{res.get('uhh_backend')} prehook={res.get('prehook_reports')} "
-                                 f"exit={res.get('app_exit')}" + ("" if ok else f" err={(r.stderr or '')[-300:]!r} tail={res.get('uhh_stderr_tail')}"))
-            except Exception as e:
-                record(name, False, repr(e))
+    for order, bk, flag, want_bk, want_pre in FRIDA_COEXIST_CASES:
+        name = f"frida-coexist-{order}-{bk}" + ("" if flag in ("none", "fallback-hw") and want_bk else f"-{flag}")
+        try:
+            rc, out, err = run_killable([FRIDA_PY, script, "--app", exe("probe_app.exe"),
+                                         "--trace", exe("uhh_trace.exe"), "--order", order,
+                                         "--backend", bk, "--uhh-flag", flag, "--timeout", "90"], timeout=150)
+            res = next((json.loads(l) for l in out.splitlines() if l.startswith('{"kind": "coexist"')), {})
+            total = res.get("total")
+            target_ok = (bool(total) and res.get("app_reads") == total and res.get("frida_hits") == total and
+                         res.get("app_exit") == 0 and res.get("error") is None)
+            if want_bk is None:      # refused: UHH says why, exits non-zero, nothing else changes
+                uhh_ok = (res.get("uhh_exit") not in (0, None) and "pre-hooked" in str(res.get("uhh_error")) and
+                          not res.get("uhh_hits"))
+            else:
+                uhh_ok = (res.get("uhh_hits") == total and res.get("uhh_backend") == want_bk and
+                          res.get("uhh_exit") == 0)
+            pre_ok = (res.get("prehook_reports", 0) > 0) == want_pre
+            ok = rc == 0 and target_ok and uhh_ok and pre_ok
+            record(name, ok, f"total={total} app={res.get('app_reads')} frida={res.get('frida_hits')} "
+                             f"uhh={res.get('uhh_hits')}/{res.get('uhh_backend')} prehook={res.get('prehook_reports')} "
+                             f"uhh_exit={res.get('uhh_exit')} exit={res.get('app_exit')}" +
+                             ("" if ok else f" rc={rc} error={res.get('error')!r} uhh_error={res.get('uhh_error')!r} "
+                                            f"tail={res.get('uhh_stderr_tail')} app_tail={res.get('app_tail')} "
+                                            f"stderr={err[-300:]!r}"))
+        except Exception as e:
+            record(name, False, repr(e))
 
 
 def check_sidefx(iters=1000, threads=4):
@@ -3699,6 +3751,490 @@ def check_blog_pwsh_attach():
                 target.kill()
 
 
+EDGE_CALLS = 2000          # examples/p2edge: calls per site / thread in --hold and --late
+
+
+def edge_run(mode, backend, targs=(), timeout=300):
+    d, t = exe("p2edge_driver.exe"), exe("p2edge_target.exe")
+    r, o = run([d, "--mode", mode, "--backend", backend, "--", t, f"--{mode}", *targs], timeout=timeout)
+    edge = next((x for x in o if x.get("kind") == "edge"), {})
+    drv = next((x for x in o if x.get("kind") == "p2edge_driver"), {})
+    return r, o, edge, drv
+
+
+def probe_hits(objs, suffix):
+    return [p.get("hits") for p in probes(objs) if p.get("location", "").endswith(suffix)]
+
+
+def tail(r, n=6):
+    return " | ".join(r.stderr.strip().splitlines()[-n:])
+
+
+def check_entry_hold_threads(trials=3):
+    """Threads started during the entry hold: p2edge_target's TLS callback and p2edge_early.dll's
+    DllMain(PROCESS_ATTACH) each start a thread that calls its site EDGE_CALLS times at once,
+    before main() runs (UHH holds the main thread at the entry point until the inline hooks
+    are in). Every call must be seen: hits == the target's own counts, on every backend.
+    Inline repeats (the miss was a race: such threads ran unheld while the hooks went in)."""
+    if not exe("p2edge_driver.exe") or not exe("p2edge_target.exe"):
+        return skip("entry-hold-threads", "p2edge_driver/p2edge_target missing")
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"entry-hold-threads-{bk}"
+        try:
+            details, ok = [], True
+            for _ in range(trials if bk == "inline" else 1):
+                r, o, edge, drv = edge_run("hold", bk)
+                tls, early = probe_hits(o, "!TlsSite"), probe_hits(o, "!EarlySite")
+                rep = report(o)
+                good = (edge.get("tls_calls") == EDGE_CALLS and edge.get("early_calls") == EDGE_CALLS and
+                        tls == [EDGE_CALLS] and early == [EDGE_CALLS] and drv.get("run_ok") == 1 and
+                        rep.get("error") is None and rep.get("app_exit") == 0)
+                ok = ok and good
+                details.append(f"tls={tls}/{edge.get('tls_calls')} early={early}/{edge.get('early_calls')}"
+                               + ("" if good else f" err={rep.get('error')} stderr={tail(r)}"))
+            record(name, ok, "; ".join(details))
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+def check_late_dll_worker():
+    """A DLL loaded LATER by a NON-main thread: p2edge_late.dll!LateSite, registered before
+    launch on <backend>, hits exactly from its first call (EDGE_CALLS). Its callback issues
+    probe_add_address(LateNext, PROBE_INLINE) at the first hit (forwarded over IPC from an
+    inline callback); LateNext is then called EDGE_CALLS times by the same thread and
+    EDGE_CALLS by a new thread: all 2*EDGE_CALLS seen. (edge_count is an empty callback that
+    the linker folds with other empty exported callbacks of the agent DLL: the forwarded name
+    is an alias, which the controller must still map to its own copy.)"""
+    if not exe("p2edge_driver.exe") or not exe("p2edge_target.exe"):
+        return skip("late-dll-worker", "p2edge_driver/p2edge_target missing")
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"late-dll-worker-{bk}"
+        try:
+            r, o, edge, drv = edge_run("late", bk)
+            late = probe_hits(o, "!LateSite")
+            added = [p for p in probes(o) if p.get("location", "").startswith("0x")]
+            msgs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
+            rep = report(o)
+            ok = (edge.get("worker_rc") == 0 and edge.get("late_calls") == EDGE_CALLS and
+                  edge.get("next_calls") == 2 * EDGE_CALLS and late == [EDGE_CALLS] and
+                  msgs == ["add_inline=1"] and len(added) == 1 and added[0].get("backend") == "inline" and
+                  added[0].get("hits") == 2 * EDGE_CALLS and drv.get("run_ok") == 1 and rep.get("error") is None)
+            record(name, ok, f"LateSite={late}/{edge.get('late_calls')} "
+                             f"added={[(a.get('backend'), a.get('hits')) for a in added]}/{edge.get('next_calls')} "
+                             f"logs={msgs[:3]} rc={edge.get('worker_rc')}"
+                             + ("" if ok else f" err={rep.get('error')} stderr={tail(r)}"))
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+def check_hw_once_slots(threads=4, calls=1000):
+    """Hardware PROBE_ONCE, distinctly: HwSite exec HW|ONCE and g_w1 watch RW|ONCE each fire
+    exactly once while 4 threads hammer them (an exec HW and a WRITE watch on the same sites
+    count every call). With those 4 slots in use a 5th hw probe is refused at setup and, from
+    a callback (marker probe on breakpoint / inline), at runtime. After both ONCE probes
+    retired, the marker reuses their two slots (an exec probe and a write watch, both exact)
+    and a further add is refused again."""
+    if not exe("p2edge_driver.exe") or not exe("p2edge_target.exe"):
+        return skip("hw-once-slots", "p2edge_driver/p2edge_target missing")
+    total = threads * calls
+    for marker in ("breakpoint", "inline"):
+        name = f"hw-once-slots-{marker}"
+        try:
+            r, o, edge, drv = edge_run("hw", marker, ("--threads", threads, "--calls", calls))
+            by = [(p.get("location", ""), p.get("hits")) for p in probes(o)]
+            site = [h for l, h in by if l.endswith("!HwSite")]
+            w1 = [h for l, h in by if l.endswith("!g_w1")]
+            added = [h for l, h in by if l.startswith("0x")]
+            msgs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
+            rep = report(o)
+            ok = (site == [1, total] and w1 == [1, total] and added == [total, total] and
+                  drv.get("setup_fifth") == 0 and msgs == ["markA fifth=0", "markB hw=1 watch=1 fifth=0"] and
+                  edge.get("w1") == total and edge.get("w2") == total and
+                  drv.get("run_ok") == 1 and rep.get("error") is None)
+            record(name, ok, f"HwSite[once,all]={site} g_w1[rw-once,write]={w1} reused={added}/{total} "
+                             f"setup_fifth={drv.get('setup_fifth')} logs={msgs}"
+                             + ("" if ok else f" err={rep.get('error')} stderr={tail(r)}"))
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+def check_prehook_chain(threads=4, reads=500):
+    """PROBE_ALLOW_PREHOOKED with inline asserted: attach to probe_app --prehook (its own
+    SafetyHook detour already sits on ReadThunk) and chain an INLINE probe on top. Both the
+    foreign hook and the UHH callback see every call and nothing changes for the target:
+    its prehook_calls == UHH hits == logs == reads, checksum == a run without UHH."""
+    t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
+    if not t or not a:
+        return skip("prehook-chain", "uhh_trace/probe_app missing")
+    target = None
+    total = threads * reads
+    common = ["--prehook", "--helpers", "1", "--threads", str(threads), "--reads", str(reads),
+              "--config", "reads_enabled=1"]
+    try:
+        _, bo = run([a, "--no-wait", *common], timeout=300)
+        base = app(bo)
+        target = subprocess.Popen([str(a), *common], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True)
+        tl = Lines(target.stdout)
+        if not tl.wait_for(lambda l: '"waiting"' in l, 60):
+            raise RuntimeError("target never reached its gate")
+        tracer = subprocess.Popen([str(t), "--backend", "inline", "--allow-prehooked", "--attach", str(target.pid),
+                                   "-p", "probe_app.exe!ReadThunk:xxxx"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        tout, terr = Lines(tracer.stdout), Lines(tracer.stderr)
+        if not terr.wait_for(lambda l: l.startswith("probe: active probe_app.exe!ReadThunk"), 60):
+            raise RuntimeError("probe never became active: " + " | ".join(terr.lines[-6:]))
+        target.stdin.write("\n"); target.stdin.flush()
+        target.wait(timeout=300)
+        tracer.wait(timeout=120)
+        res = app(tl.objs())
+        objs = tout.objs()
+        terr.t.join(timeout=30)
+        pre = [x for x in objs if x.get("kind") == "prehook"]
+        pr = next((x for x in probes(objs) if x.get("location", "").endswith("!ReadThunk")), {})
+        logs = sum(1 for x in objs if x.get("kind") == "probe_log")
+        rep = report(objs)
+        ok = (bool(pre) and pr.get("backend") == "inline" and pr.get("hits") == total and logs == total and
+              res.get("prehook_calls") == total and res.get("successful_reads") == total and
+              res.get("checksum") == base.get("checksum") and base.get("prehook_calls") == total and
+              target.returncode == 0 and rep.get("log_dropped") == 0)
+        record("prehook-chain-inline", ok,
+               f"prehook_reports={len(pre)} backend={pr.get('backend')} uhh_hits={pr.get('hits')} logs={logs} "
+               f"foreign_hook_calls={res.get('prehook_calls')} reads={res.get('successful_reads')}/{total} "
+               f"checksum_same={res.get('checksum') == base.get('checksum')} exit={target.returncode}"
+               + ("" if ok else " stderr=" + " | ".join(terr.lines[-8:])))
+    except Exception as e:
+        record("prehook-chain-inline", False, repr(e))
+    finally:
+        if target and target.poll() is None:
+            target.kill()
+
+
+STACK_SITES = {"mid": "StkMidSite", "fpo": "StkFpoSite", "leaf": "StkLeafSite"}
+
+
+def frame_name(f):
+    """'mod!func+0x12 (file:line) [0xADDR]' -> 'func' ('' when unsymbolized)."""
+    head = f.split(" ")[0]
+    if "!" not in head:
+        return ""
+    return head.split("!", 1)[1].rsplit("+", 1)[0]
+
+
+def strip_addr(f):
+    return f.rsplit(" [0x", 1)[0]
+
+
+def check_stacks():
+    """send_log_stack at a mid-function site, in a frame-pointer-omitted function that uses
+    EBP/RBP as data, and in a leaf -- each reached through optimised (x86: /Oy) C callers.
+    Every backend must show <site>, stk_outer_<x>, main, and the symbolized stacks (addresses
+    stripped) must be IDENTICAL across breakpoint, hw and inline -- frame 0 included."""
+    d, t = exe("stacks_driver.exe"), exe("stacks_target.exe")
+    if not d or not t:
+        return skip("stacks", "stacks_driver/stacks_target missing")
+    try:
+        r = rvas("stacks_target.map", *STACK_SITES.values())
+    except Exception as e:
+        return record("stacks", False, f"map: {e!r}")
+    specs = [f"{k}=stacks_target.exe+{r[v]:#x}" for k, v in STACK_SITES.items()]
+    per_bk = {}
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"stacks-{bk}"
+        try:
+            _, o = run([d, "--backend", bk, *specs, "--", t], timeout=120)
+            tgt = next((x for x in o if x.get("kind") == "target"), {})
+            got, bad = {}, []
+            for k, site in STACK_SITES.items():
+                sts = [[strip_addr(f) for f in x.get("stack") or []] for x in o
+                       if x.get("kind") == "probe_log" and x.get("message") == f"stack {k}"]
+                want = [site, f"stk_outer_{k}", "main"]
+                names = [[frame_name(f) for f in st] for st in sts]
+                if len(sts) != 3:
+                    bad.append(f"{k}: {len(sts)} logs")
+                elif any(n[:3] != want for n in names):
+                    bad.append(f"{k}: {names[0][:5]}")
+                elif any(st != sts[0] for st in sts):
+                    bad.append(f"{k}: hits differ")
+                got[k] = sts[0] if sts else []
+            per_bk[bk] = got
+            ok = not bad and tgt.get("correct") == 9 and report(o).get("error") is None
+            record(name, ok, f"correct={tgt.get('correct')}/9 err={report(o).get('error')} bad={bad} "
+                             f"fpo={[frame_name(f) for f in got.get('fpo', [])]}")
+        except Exception as e:
+            record(name, False, repr(e))
+    if len(per_bk) == 3:
+        diffs = []
+        for k in STACK_SITES:
+            ref = per_bk["breakpoint"].get(k)
+            for bk in ("hw", "inline"):
+                other = per_bk[bk].get(k)
+                if other != ref:
+                    i = next((j for j in range(max(len(ref or []), len(other or [])))
+                              if (ref or [None] * 99)[j:j + 1] != (other or [None] * 99)[j:j + 1]), -1)
+                    diffs.append(f"{k}/{bk}@{i}: {(ref or [])[i:i + 1]} vs {(other or [])[i:i + 1]}")
+        record("stacks-identical", not diffs and all(per_bk[b].get(k) for b in per_bk for k in STACK_SITES),
+               f"diffs={diffs[:4]} frames={ {k: len(per_bk['breakpoint'].get(k) or []) for k in STACK_SITES} }")
+
+
+BIGAPPS_DIR = Path(__file__).resolve().parent.parent / "examples" / "bigapps"
+EDGE_EXE = Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe")
+# Busy system exports. HeapAlloc is a forwarded export (-> ntdll!RtlAllocateHeap). ':-' =
+# count only (millions of hits); the others log every call. At most 4: the hw backend has 4 DRs.
+BIGAPPS_PS_PROBES = ["ntdll.dll!NtCreateFile:xxO", "KernelBase.dll!CreateFileW:Wxx",
+                     "ntdll.dll!NtAllocateVirtualMemory:-", "kernel32.dll!HeapAlloc:-"]
+BIGAPPS_EDGE_PROBES = ["ntdll.dll!NtCreateFile:xxO", "ntdll.dll!NtAllocateVirtualMemory:-",
+                       "kernel32.dll!HeapAlloc:-", "ws2_32.dll!connect:xSd"]
+
+
+def bin_machine():
+    """'x64' or 'x86': the bitness of the build under test (uhh_trace.exe's PE header)."""
+    import struct
+    b = (BIN / "uhh_trace.exe").read_bytes()[:4096]
+    off = struct.unpack_from("<I", b, 0x3c)[0]
+    return "x64" if struct.unpack_from("<H", b, off + 4)[0] == 0x8664 else "x86"
+
+
+def kill_matching(fragment):
+    """Kill ONLY processes whose command line contains fragment -- a unique directory this
+    run created (Edge passes its --user-data-dir to every child) -- never anything else."""
+    ps = (f"Get-CimInstance Win32_Process | ?{{ $_.CommandLine -like '*{fragment}*' -and $_.ProcessId -ne $PID }}"
+          " | %{ Stop-Process -Id $_.ProcessId -Force -EA SilentlyContinue }")
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True, timeout=120)
+    except Exception:
+        pass
+
+
+def bigapps_judge(objs, out_text, err_text, bk, specs, required, exact):
+    """The assertions every bigapps run shares. exact: the session ran until the target exited,
+    so every logged probe's hits must equal the logs written (a detach reports a live snapshot)."""
+    rep = report(objs)
+    hits = {p.get("location"): p.get("hits") or 0 for p in probes(objs)}
+    backends = sorted({p.get("backend") for p in probes(objs)})
+    logged = [sp.rsplit(":", 1)[0] for sp in specs if not sp.endswith(":-")]
+    want_logs = sum(hits.get(l, 0) for l in logged)
+    written = rep.get("logs_written")
+    logs_out = out_text.count('"kind":"probe_log"')
+    unhandled = [l for l in err_text.splitlines() if "target crashed" in l or "unhandled exception" in l][:2]
+    bad = []
+    if not rep: bad.append("no probe_report")
+    if rep.get("error") is not None: bad.append(f"error={str(rep.get('error'))[:200]}")
+    if rep.get("log_dropped") != 0: bad.append(f"log_dropped={rep.get('log_dropped')}")
+    if backends != [bk]: bad.append(f"backends={backends}")
+    missing = [r for r in required if not hits.get(r)]
+    if missing: bad.append(f"no hits on {missing}")
+    if not written: bad.append("no logs")
+    if exact and written != want_logs: bad.append(f"logs_written={written} != logged hits={want_logs}")
+    if logs_out < (written or 0): bad.append(f"stdout probe_log lines={logs_out} < logs_written={written}")
+    if unhandled: bad.append(f"unhandled={unhandled}")
+    short = {k.split("!")[-1]: v for k, v in hits.items()}
+    detail = f"hits={short} logs={written} dropped={rep.get('log_dropped')}"
+    return not bad, detail, bad
+
+
+def bigapps_js_expected():
+    """page.html's JS result, computed the same way (int32 arithmetic)."""
+    def i32(v):
+        return (v + 2 ** 31) % 2 ** 32 - 2 ** 31
+    r = 0
+    for k in range(20):
+        h = 0
+        for i in range(50000 + k):
+            h = i32(h * 31 + (i ^ (i >> 3)))
+        r = i32(r + h)
+    return r
+
+
+def bigapps_server(slow_secs):
+    """Local HTTP server for page.html. /slow is a parser-blocking script streamed over
+    slow_secs (holds Edge's load event, so the browser stays busy until then; it ends by
+    writing SLOW=done into the page); /data?i=N answers 'dataN'."""
+    import http.server
+    page = (BIGAPPS_DIR / "page.html").read_bytes()
+    seen = threading.Event()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            try:
+                if self.path == "/slow":
+                    n = max(1, int(slow_secs * 10))
+                    tail = b"\ndocument.getElementById('slow').textContent = 'SLOW=done';\n"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/javascript")
+                    self.send_header("Content-Length", str(n * 512 + len(tail)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    for _ in range(n):
+                        self.wfile.write(b" " * 511 + b"\n"); self.wfile.flush(); time.sleep(0.1)
+                    self.wfile.write(tail); self.wfile.flush()
+                    return
+                if self.path == "/":
+                    body, ctype = page, "text/html"; seen.set()
+                elif self.path.startswith("/data?i="):
+                    body, ctype = ("data" + self.path.split("=", 1)[1]).encode(), "text/plain"
+                else:
+                    self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers(); return
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+            except OSError:
+                pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, seen
+
+
+def bigapps_tracer(bk, specs, tail):
+    cmd = [str(exe("uhh_trace.exe")), "--backend", bk]
+    for sp in specs:
+        cmd += ["-p", sp]
+    return cmd + [str(x) for x in tail]
+
+
+def bigapps_powershell(bk, mode, secs, ps):
+    """powershell.exe running examples/bigapps/workload.ps1 (self-checking: bad=0, exit 0)."""
+    work = Path(tempfile.mkdtemp(prefix="uhh-bigapps-ps-", dir=Path.cwd()))
+    wl = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", BIGAPPS_DIR / "workload.ps1",
+          "-Seconds", secs, "-Work", work]
+    done_re = re.compile(r"BIGAPPS_DONE iters=(\d+) bad=(\d+) jobs=(\d+) exc=(\d+)")
+    target = None
+    try:
+        if mode == "launch":
+            r, objs = run(bigapps_tracer(bk, BIGAPPS_PS_PROBES, ["--", ps, *wl]), timeout=secs + 900)
+            ok, detail, bad = bigapps_judge(objs, r.stdout, r.stderr, bk, BIGAPPS_PS_PROBES,
+                                            [s.rsplit(":", 1)[0] for s in BIGAPPS_PS_PROBES], True)
+            m = done_re.search(r.stdout)
+            rep = report(objs)
+            if not m or m.group(2) != "0" or int(m.group(3)) == 0: bad.append(f"workload={m.group(0) if m else None}")
+            if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
+            return not bad, f"{detail} {m.group(0) if m else 'no DONE'} exit={rep.get('app_exit')}", bad, r.stderr
+        target = subprocess.Popen([str(ps), *[str(x) for x in wl]], stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True, errors="replace")
+        tl, te = Lines(target.stdout), Lines(target.stderr)
+        if not tl.wait_for(lambda l: l.startswith("BIGAPPS_READY"), 180):
+            return False, "workload never READY", ["no READY"], "\n".join(te.lines[-5:])
+        extra = ["--detach-after-ms", secs * 1000 // 2] if mode == "detach" else []
+        r, objs = run(bigapps_tracer(bk, BIGAPPS_PS_PROBES, ["--attach", target.pid, *extra]), timeout=secs + 900)
+        at_detach = len(tl.lines)
+        target.wait(timeout=secs + 600)
+        tl.t.join(timeout=30)
+        after = [l for l in tl.lines[at_detach:] if l.startswith("BIGAPPS_TICK")]
+        text = "\n".join(tl.lines)
+        ok, detail, bad = bigapps_judge(objs, r.stdout, r.stderr, bk, BIGAPPS_PS_PROBES,
+                                        [s.rsplit(":", 1)[0] for s in BIGAPPS_PS_PROBES], mode == "exit")
+        m = done_re.search(text)
+        if not m or m.group(2) != "0": bad.append(f"workload={m.group(0) if m else None}")
+        if target.returncode != 0 or r.returncode != 0: bad.append(f"target_rc={target.returncode} tracer_rc={r.returncode}")
+        if mode == "detach":
+            if '"kind":"detached"' not in r.stdout: bad.append("not detached")
+            if len(after) < 2: bad.append(f"ticks after detach={len(after)}")
+            detail += f" ticks_after_detach={len(after)}"
+        return not bad, f"{detail} {m.group(0) if m else 'no DONE'} rc={target.returncode}", bad, r.stderr
+    finally:
+        if target and target.poll() is None:
+            target.kill()
+        kill_matching(work.name)
+        import shutil
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def bigapps_edge(bk, mode, secs):
+    """Headless Edge (multi-process, JIT) dumping a local page while /slow keeps it loading.
+    The browser process is the one launched/attached; its children run uninstrumented."""
+    udd = Path(tempfile.mkdtemp(prefix="uhh-bigapps-edge-", dir=Path.cwd()))
+    srv, seen = bigapps_server(secs if mode != "launch" else max(5, secs // 2))
+    url = f"http://127.0.0.1:{srv.server_address[1]}/"
+    argv = [EDGE_EXE, "--headless", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+            "--disable-extensions", "--disable-component-update", "--disable-background-networking",
+            "--disable-sync", "--no-proxy-server", "--enable-features=NetworkServiceInProcess2",
+            f"--user-data-dir={udd}",
+            "--dump-dom", url]
+    marker = f"BIGAPPS_JS={bigapps_js_expected()} nodes=20000"
+    browser = None
+    try:
+        if mode == "launch":
+            r, objs = run(bigapps_tracer(bk, BIGAPPS_EDGE_PROBES, ["--", *argv]), timeout=secs + 900)
+            ok, detail, bad = bigapps_judge(objs, r.stdout, r.stderr, bk, BIGAPPS_EDGE_PROBES,
+                                            [s.rsplit(":", 1)[0] for s in BIGAPPS_EDGE_PROBES[:3]], True)
+            rep = report(objs)
+            if marker not in r.stdout: bad.append("JS result missing/wrong in the dumped DOM")
+            if "FETCHED=40" not in r.stdout: bad.append("fetches incomplete")
+            if "SLOW=done" not in r.stdout: bad.append("slow script incomplete")
+            if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
+            return not bad, f"{detail} exit={rep.get('app_exit')}", bad, r.stderr
+        browser = subprocess.Popen([str(a) for a in argv], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, errors="replace")
+        bl, be = Lines(browser.stdout), Lines(browser.stderr)
+        if not seen.wait(120):
+            return False, "Edge never requested the page", ["no request"], "\n".join(be.lines[-5:])
+        time.sleep(1.0)                                      # renderer busy, fetches in flight
+        extra = ["--detach-after-ms", secs * 1000 // 2] if mode == "detach" else []
+        r, objs = run(bigapps_tracer(bk, BIGAPPS_EDGE_PROBES, ["--attach", browser.pid, *extra]), timeout=secs + 900)
+        browser.wait(timeout=secs + 600)
+        bl.t.join(timeout=30)
+        dom = "\n".join(bl.lines)
+        ok, detail, bad = bigapps_judge(objs, r.stdout, r.stderr, bk, BIGAPPS_EDGE_PROBES,
+                                        [s.rsplit(":", 1)[0] for s in BIGAPPS_EDGE_PROBES[:3]], mode == "exit")
+        if marker not in dom: bad.append("JS result missing/wrong in the dumped DOM")
+        if "FETCHED=40" not in dom: bad.append("fetches incomplete")
+        if "SLOW=done" not in dom: bad.append("slow script incomplete")
+        if "ASYNC=0<" in dom: bad.append("no async fetch completed")
+        if browser.returncode != 0 or r.returncode != 0: bad.append(f"browser_rc={browser.returncode} tracer_rc={r.returncode}")
+        if mode == "detach" and '"kind":"detached"' not in r.stdout: bad.append("not detached")
+        return not bad, f"{detail} rc={browser.returncode}", bad, r.stderr
+    finally:
+        srv.shutdown()
+        if browser and browser.poll() is None:
+            browser.kill()
+        kill_matching(udd.name)
+        import shutil
+        shutil.rmtree(udd, ignore_errors=True)
+
+
+def check_bigapps(secs=40, select="all"):
+    """Stability on real, large, multi-threaded, JIT-heavy programs (opt-in: --bigapps).
+    powershell.exe (.NET JIT, runspace-pool threads, child jobs; the 32-bit host on x86) and
+    headless Edge (multi-process browser, x64 only), each under every backend, launched AND
+    attached (run to exit, and detach mid-run), with busy ntdll/KernelBase/kernel32/ws2_32
+    exports probed. Asserts: the program's own result is right and it exits 0, no unhandled
+    exception, every probe hit, log_dropped == 0, logs == hits (when run to exit), and after a
+    detach the program keeps working (ticks continue, result right, exit 0)."""
+    if not exe("uhh_trace.exe"):
+        return skip("bigapps", "uhh_trace.exe missing")
+    arch = bin_machine()
+    ps = Path(r"C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe") if arch == "x86" else \
+        SYS32 / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    sel = [x for x in select.split(",") if x and x != "all"]
+    for app_name in ("ps", "edge"):
+        for mode in ("launch", "exit", "detach"):
+            for bk in ("breakpoint", "hw", "inline"):
+                name = f"bigapps-{app_name}-{mode}-{bk}"
+                if sel and not any(x in name for x in sel):
+                    continue
+                if app_name == "edge" and arch == "x86":
+                    skip(name, "msedge.exe is a 64-bit program (x64 build only)"); continue
+                if not (ps if app_name == "ps" else EDGE_EXE).exists():
+                    skip(name, f"{'powershell' if app_name == 'ps' else 'msedge'} not installed"); continue
+                t0 = time.time()
+                try:
+                    ok, detail, bad, err = (bigapps_powershell(bk, mode, secs, ps) if app_name == "ps"
+                                            else bigapps_edge(bk, mode, secs))
+                    tail = " | ".join(l for l in (err or "").splitlines() if l.strip())[-600:]
+                    record(name, ok, f"{detail} secs={time.time() - t0:.0f}" +
+                           ("" if ok else f" BAD={bad} stderr_tail={tail}"))
+                except Exception as e:
+                    record(name, False, repr(e))
+
+
 def main():
     global BIN
     ap = argparse.ArgumentParser()
@@ -3707,6 +4243,10 @@ def main():
     ap.add_argument("--reads", default="1000")
     ap.add_argument("--volume-reads", default="0",
                     help="per-thread reads for the opt-in no-drop-at-scale tier (e.g. 250000 = 2M); 0 skips")
+    ap.add_argument("--bigapps", nargs="?", const="all", default="",
+                    help="opt-in slow tier: real large apps (powershell, headless Edge) under every backend, "
+                         "launch/attach/detach; optional comma list of name substrings (e.g. ps-launch,edge-detach)")
+    ap.add_argument("--bigapps-secs", type=int, default=40, help="workload length of each bigapps run")
     ap.add_argument("--only", default="", help="comma-separated substrings of check names to run (default: all)")
     args = ap.parse_args()
     BIN = args.bin.resolve()
@@ -3793,6 +4333,13 @@ def main():
     if want(check_hunt): check_hunt()
     if want(check_blog_replicas): check_blog_replicas()
     if want(check_blog_pwsh_attach): check_blog_pwsh_attach()
+    if want(check_entry_hold_threads): check_entry_hold_threads()
+    if want(check_late_dll_worker): check_late_dll_worker()
+    if want(check_hw_once_slots): check_hw_once_slots()
+    if want(check_prehook_chain): check_prehook_chain()
+    if want(check_stacks): check_stacks()
+    if args.bigapps:
+        if want(check_bigapps): check_bigapps(args.bigapps_secs, args.bigapps)
     print("-" * 72)
     failed = 0
     for name, status, detail in RESULTS:
