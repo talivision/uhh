@@ -1841,9 +1841,6 @@ static bool inline_site_unsafe(probe_session *s, const Probe &p, std::string &wh
             if (in.meta.category == ZYDIS_CATEGORY_RET || in.meta.category == ZYDIS_CATEGORY_UNCOND_BR) break;
             off += in.length;
         }
-        if (reason.empty())
-            std::fprintf(stderr, "probe: %s: function bounds unknown (no .pdata/PDB entry): inline site checked to the end "
-                         "of its block only\n", p.location.c_str());
     }
     if (reason.empty()) return false;
     // Suggest instruction boundaries in this function where the whole patch passes the same
