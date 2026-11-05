@@ -109,6 +109,9 @@ struct LogRecord {
     uint32_t tid = 0, probe = 0;
     bool has_stack = false;
     std::vector<uint64_t> frames;
+    // Not a log line: "the module at sym_unload unloaded" -- the writer unregisters it from
+    // dbghelp once every record queued before it is symbolized (see sym_unload).
+    uint64_t sym_unload = 0, sym_size = 0;
 };
 
 struct probe_session {
@@ -126,6 +129,7 @@ struct probe_session {
     std::deque<LogRecord> log_queue;
     std::mutex queue_mu;
     std::condition_variable queue_readable, queue_writable, queue_flushed;
+    std::vector<std::pair<uint64_t, uint64_t>> sym_pending;   // (base, size) unloads queued for the writer (queue_mu)
     std::thread log_writer;
     HANDLE log_file = INVALID_HANDLE_VALUE;
     HANDLE log_reader = INVALID_HANDLE_VALUE;
@@ -146,6 +150,7 @@ struct probe_session {
     bool sym_ready = false;    // dbghelp initialised on the target (stack walk + symbolize)
     std::unordered_map<std::string, uint64_t> module_bases;
     std::unordered_map<std::string, std::string> module_paths;   // name -> on-disk image (prehook diff)
+    std::unordered_map<uint64_t, uint32_t> module_sizes;          // mapped image base -> SizeOfImage
     std::vector<std::string> prehooks;                           // JSON lines for the report
     PROCESS_INFORMATION pi{};
     DWORD exit_code = 1;
@@ -217,6 +222,14 @@ struct probe_session {
     bool co_warned_entry = false, co_warned_dr = false, co_warned_left = false;
     bool initial_break = false;
     std::unordered_map<DWORD, StepState> stepping;   // threads mid single-step
+    // Threads whose in-place step at a probe site faulted: the fault went to the target with
+    // OUR trap flag in its context. If the target's handler continues execution there, the
+    // INT3 is hit again (with TF set) -- the same execution restarting, not a new hit; if it
+    // continues elsewhere, the trap flag raises one stray step. thread -> probe site + registers.
+    // A WOW64 (x86) handler's context comes back WITHOUT our trap flag: there the restart is
+    // recognised by the registers instead -- unchanged since the fault (snapshot below).
+    struct Refault { uint64_t site = 0; CONTEXT regs{}; };
+    std::unordered_map<DWORD, Refault> refault;
 };
 
 static bool register_runtime_inline(probe_session *s, Probe &p);
@@ -278,8 +291,12 @@ static void writer_failed(probe_session *s, const std::string &message, uint64_t
     if (!s->writer_failed) {
         s->writer_failed = true;
         s->writer_error = message;
-        unwritten += (uint64_t)s->log_queue.size();
+        for (const LogRecord &r : s->log_queue) {
+            if (r.sym_unload) uhh_sym::unregister_module(s->pi.hProcess, r.sym_unload);
+            else ++unwritten;
+        }
         s->log_queue.clear();
+        s->sym_pending.clear();
         s->controller_dropped.fetch_add(unwritten, std::memory_order_relaxed);
         std::fprintf(stderr, "probe: error: %s\n", message.c_str());
     }
@@ -344,6 +361,15 @@ static void log_writer_main(probe_session *s) {
                     record = std::move(s->log_queue.front());
                     s->log_queue.pop_front();
                     s->queue_writable.notify_one();
+                }
+                if (record.sym_unload) {
+                    // Every record queued before this unload is formatted (symbolized) by now.
+                    uhh_sym::unregister_module(s->pi.hProcess, record.sym_unload);
+                    std::lock_guard<std::mutex> lock(s->queue_mu);
+                    for (auto it = s->sym_pending.begin(); it != s->sym_pending.end(); ++it)
+                        if (it->first == record.sym_unload) { s->sym_pending.erase(it); break; }
+                    s->queue_flushed.notify_all();
+                    continue;
                 }
                 ++unwritten;
                 std::string line = format_log_line(s, record);
@@ -614,6 +640,48 @@ static void flush_log_writer(probe_session *s) {
     if (!tail_error.empty()) set_error(s, tail_error);
 }
 
+// A module unloaded. Stack frames are captured as raw addresses at the hit and symbolized
+// later on the writer thread, so records captured BEFORE the unload may still be queued (or,
+// inline, in the agent's ring): dbghelp keeps the module until the writer has passed them.
+// The unregister travels through the log queue, behind those records.
+static size_t drain_agent_logs(probe_session *s);
+static void sym_unload(probe_session *s, uint64_t base) {
+    if (!s->sym_ready) return;
+    auto sz = s->module_sizes.find(base);
+    const uint64_t size = sz != s->module_sizes.end() ? sz->second : 1;
+    if (s->log_writer.joinable()) {
+        drain_agent_logs(s);                               // inline records captured before the unload
+        std::unique_lock<std::mutex> lock(s->queue_mu);
+        s->queue_writable.wait(lock, [s] {
+            return s->log_queue.size() < probe_session::LOG_QUEUE_CAP || s->writer_failed;
+        });
+        if (!s->writer_failed) {
+            try {
+                LogRecord r; r.sym_unload = base; r.sym_size = size;
+                s->sym_pending.push_back({base, size});
+                s->log_queue.push_back(std::move(r));
+                lock.unlock();
+                s->queue_readable.notify_one();
+                return;
+            } catch (...) {
+                if (!s->sym_pending.empty() && s->sym_pending.back().first == base) s->sym_pending.pop_back();
+            }
+        }
+    }
+    uhh_sym::unregister_module(s->pi.hProcess, base);
+}
+// Before registering a module over [base, base+size): wait until the writer has unregistered
+// any unloaded module still held for older records in that range.
+static void wait_sym_unloads(probe_session *s, uint64_t base, uint64_t size) {
+    std::unique_lock<std::mutex> lock(s->queue_mu);
+    s->queue_flushed.wait(lock, [&] {
+        if (s->writer_failed) return true;
+        for (auto &p : s->sym_pending)
+            if (p.first < base + size && base < p.first + p.second) return false;
+        return true;
+    });
+}
+
 static void stop_log_output(probe_session *s) {
     if (s->log_writer.joinable()) {
         {
@@ -659,21 +727,32 @@ static std::string module_path_from_handle(HANDLE file) {
     return r;
 }
 
+// SizeOfImage of the image mapped at base in the target (0 if unreadable).
+static uint32_t remote_image_size(HANDLE process, uint64_t base) {
+    size_t got = 0;
+    IMAGE_DOS_HEADER dos{}; IMAGE_NT_HEADERS nt{};
+    if (remote_read(process, base, &dos, sizeof(dos), &got) && got == sizeof(dos) && dos.e_magic == IMAGE_DOS_SIGNATURE &&
+        remote_read(process, base + (uint32_t)dos.e_lfanew, &nt, sizeof(nt), &got) && got == sizeof(nt) &&
+        nt.Signature == IMAGE_NT_SIGNATURE)
+        return nt.OptionalHeader.SizeOfImage;
+    return 0;
+}
+
+static void wait_sym_unloads(probe_session *s, uint64_t base, uint64_t size);
 // Register a mapped image with dbghelp (deferred: no symbol I/O until the writer sees
 // a stack frame). Keeps working after the target exits: it reads files.
 static void sym_register(probe_session *s, HANDLE file, uint64_t base) {
+    const uint32_t size = remote_image_size(s->pi.hProcess, base);
+    if (size) s->module_sizes[base] = size;
     std::string path = module_path_from_handle(file);
     if (path.empty()) return;
     s->module_paths[basename_of(path)] = path;
     if (!s->sym_ready) return;
     // Pass the real SizeOfImage: with deferred loads dbghelp does not read the image yet,
     // so a size of 0 registers only the base address and no frame inside it resolves.
-    DWORD size = 0; size_t got = 0;
-    IMAGE_DOS_HEADER dos{}; IMAGE_NT_HEADERS nt{};
-    if (remote_read(s->pi.hProcess, base, &dos, sizeof(dos), &got) && got == sizeof(dos) && dos.e_magic == IMAGE_DOS_SIGNATURE &&
-        remote_read(s->pi.hProcess, base + (uint32_t)dos.e_lfanew, &nt, sizeof(nt), &got) && got == sizeof(nt) &&
-        nt.Signature == IMAGE_NT_SIGNATURE)
-        size = nt.OptionalHeader.SizeOfImage;
+    // A module that unloaded from this range may still be registered for log records
+    // captured before its unload (see sym_unload): those are written first.
+    wait_sym_unloads(s, base, size ? size : 1);
     // dbghelp gets the exact (wide) path, so non-ASCII directories work.
     std::wstring wpath;
     {
@@ -1267,6 +1346,35 @@ static void hw_rw_len(uint32_t flags, uint32_t &rw, uint32_t &len) {
     len = 3;   // LEN=11 -> 4-byte (dword) watchpoint; the address must be dword-aligned
 }
 
+// The TARGET's own debug registers. A program may set hardware breakpoints/watchpoints on
+// its own threads (SetThreadContext) and catch the #DB itself; those must keep working. A
+// slot is the target's on a thread when it is enabled there, is not one we use, and does not
+// hold an address we armed and released (a stale image of ours).
+static uint64_t dr_address(const CONTEXT &c, int slot) {
+    switch (slot) { case 0: return c.Dr0; case 1: return c.Dr1; case 2: return c.Dr2; default: return c.Dr3; }
+}
+static bool target_owns_slot(const probe_session *s, const CONTEXT &c, int slot) {
+    if (s->dr_used & (1u << slot)) return false;
+    if (!((c.Dr7 >> (slot * 2)) & 3)) return false;
+    return !s->retired_hw.count(dr_address(c, slot));
+}
+static uint8_t target_slots(const probe_session *s, const CONTEXT &c) {
+    uint8_t m = 0;
+    for (int k = 0; k < 4; ++k) if (target_owns_slot(s, c, k)) m |= (uint8_t)(1u << k);
+    return m;
+}
+// Slots the target owns on ANY of its threads (debug registers are per thread).
+static uint8_t target_slots_any(const probe_session *s) {
+    uint8_t m = 0;
+    for (DWORD tid : s->threads) {
+        HANDLE t = OpenThread(THREAD_GET_CONTEXT, FALSE, tid);
+        CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (t && GetThreadContext(t, &c)) m |= target_slots(s, c);
+        if (t) CloseHandle(t);
+    }
+    return m;
+}
+
 static void arm_thread_start_fixup(probe_session *s);
 static bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
     if (p.rva > UINT64_MAX - base) { set_error(s, "probe address overflow"); return false; }
@@ -1274,16 +1382,8 @@ static bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
     int slot = -1;
     // Rotate through free slots so a just-released slot is reused last: a #DB already in
     // flight for the old probe is then far less likely to be blamed on a new one.
-    // Slots the TARGET itself has enabled (its own debug registers) are not ours to take.
-    uint8_t foreign = 0;
-    if (!s->threads.empty()) {
-        HANDLE t = OpenThread(THREAD_GET_CONTEXT, FALSE, *s->threads.begin());
-        CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-        if (t && GetThreadContext(t, &c))
-            for (int i = 0; i < 4; ++i) if ((c.Dr7 >> (i * 2)) & 3) foreign |= (uint8_t)(1u << i);
-        if (t) CloseHandle(t);
-        foreign &= (uint8_t)~s->dr_used;
-    }
+    // Slots the TARGET itself has enabled on any of its threads are not ours to take.
+    const uint8_t foreign = target_slots_any(s);
     for (int k = 0; k < 4; ++k) {
         int i = (s->dr_next + k) & 3;
         if (!(s->dr_used & (1u << i)) && !(foreign & (1u << i))) { slot = i; break; }
@@ -2256,6 +2356,13 @@ static bool still_armed(probe_session *s, uint64_t site) {
     return p && (p->flags & PROBE_BREAKPOINT);
 }
 
+// An in-place step at site is over: re-arm the INT3 (see the re-lift in handle_exception
+// for a second thread that is still mid in-place step there).
+static void end_inplace_step(probe_session *s, DWORD tid, uint64_t site) {
+    (void)tid;
+    if (still_armed(s, site)) rearm_breakpoint(s->pi.hProcess, site, probe_at(s, site)->original);
+}
+
 // The active SOFTWARE-BREAKPOINT probe at an address (the owner of an INT3 there). Other
 // backends may probe the same address too (hw + breakpoint on one instruction): an INT3
 // must never be attributed to them -- that ran the hw callback a second time and then
@@ -2690,8 +2797,9 @@ static bool arm_gates_for_pending(probe_session *s) {
             if (!gated) sites.push_back(p->address);
         }
     std::vector<int> slots;
+    const uint8_t foreign = sites.empty() ? 0 : target_slots_any(s);
     for (int slot = 0; slot < 4 && slots.size() < sites.size(); ++slot)
-        if (!(s->dr_used & (1u << slot))) slots.push_back(slot);
+        if (!(s->dr_used & (1u << slot)) && !(foreign & (1u << slot))) slots.push_back(slot);
     if (slots.size() < sites.size()) return false;           // not enough DRs: caller holds instead
     for (size_t i = 0; i < sites.size(); ++i) {
         const int slot = slots[i];
@@ -3304,8 +3412,8 @@ static void enforce_owned_drs(const probe_session *s, CONTEXT &c) {
             default: c.Dr3 = (decltype(c.Dr3))owner->address; break;
             }
             dr7 = (dr7 & ~fieldmask) | ln | ((DWORD64)(((len & 3u) << 2) | (rw & 3u)) << (16 + slot * 4));
-        } else if (!(s->dr_used & (1u << slot))) {
-            dr7 &= ~(ln | fieldmask);
+        } else if (!(s->dr_used & (1u << slot)) && !target_owns_slot(s, c, slot)) {
+            dr7 &= ~(ln | fieldmask);                           // our stale slot (never the target's own)
         }
         c.Dr7 = (decltype(c.Dr7))dr7;
     }
@@ -3535,7 +3643,9 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
     if (!thread) { set_error(s, win_error("open hw event thread")); return false; }
     CONTEXT native{}; native.ContextFlags = CONTEXT_ALL;
     if (!GetThreadContext(thread, &native)) { CloseHandle(thread); set_error(s, win_error("get hw context")); return false; }
-    if (!(native.Dr6 & 0xF & s->dr_used) && !(native.Dr6 & 0x4000) && !(native.EFlags & 0x100u)) {
+    const uint8_t theirs = target_slots(s, native);       // the target's own slots on this thread
+    if (!(native.Dr6 & 0xF & s->dr_used) && !(native.Dr6 & 0xF & theirs) && !(native.Dr6 & 0x4000) &&
+        !(native.EFlags & 0x100u)) {
         // A #DB that is neither a trap-flag step (BS clear, TF clear) nor flagged in DR6 for
         // one of our slots, AT the address of one of our execute probes: ours, but DR6 was
         // overwritten by the target writing a thread context it captured earlier (Suspend +
@@ -3604,7 +3714,7 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
         if (!probe) {
             // A slot we owned but have since released (PROBE_ONCE / unload): a #DB that was
             // already in flight on another thread. Swallow it rather than crash the app.
-            if (s->dr_ever & (1u << slot)) { any = true; consumed |= (1u << slot); }
+            if ((s->dr_ever & (1u << slot)) && !(theirs & (1u << slot))) { any = true; consumed |= (1u << slot); }
             continue;
         }
         consumed |= (1u << slot);
@@ -3688,7 +3798,11 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
     }
     native.Dr6 &= ~consumed;     // clear only the status bits of slots we own
     if (!SetThreadContext(thread, &native)) { CloseHandle(thread); set_error(s, win_error("resume hw breakpoint")); return false; }
-    CloseHandle(thread); handled = true; return true;
+    CloseHandle(thread);
+    // The same #DB also reports one of the target's OWN debug registers: it is the target's
+    // exception too -- pass it on (our callbacks ran; their changes are applied above).
+    handled = !(native.Dr6 & 0xF & theirs);
+    return true;
 }
 
 // "exception 0xc0000005 at msvcp140.dll+0x1234 (read 0x0)" plus a hint for known causes.
@@ -3826,6 +3940,44 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     if (code == PROBE_IPC_CODE && handle_ipc(s, event)) { disposition = DBG_CONTINUE; return true; }
     auto step = stepping.find(event.dwThreadId);
     uint64_t address = (uint64_t)(uintptr_t)ex.ExceptionAddress;
+    bool restart = false;            // this INT3 is a faulted in-place step restarting (see refault)
+    if (auto rf = s->refault.find(event.dwThreadId); rf != s->refault.end() && step == stepping.end()) {
+        const probe_session::Refault was = rf->second;
+        const uint64_t site = was.site;
+        s->refault.erase(rf);                              // one event decides
+        if (code == EXCEPTION_BREAKPOINT || code == EXCEPTION_SINGLE_STEP) {
+            HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
+            CONTEXT w{}; w.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
+            const bool got = t && GetThreadContext(t, &w);
+            const bool tf = got && (w.EFlags & 0x100u);
+            // Without the flag (WOW64): the handler restored the faulting context unchanged --
+            // every integer register, SP and the arithmetic flags as at the fault.
+            const DWORD arith = 0x1 | 0x4 | 0x10 | 0x40 | 0x80 | 0x400 | 0x800;
+#if defined(_WIN64)
+            const bool same = got && w.Rax == was.regs.Rax && w.Rbx == was.regs.Rbx && w.Rcx == was.regs.Rcx &&
+                w.Rdx == was.regs.Rdx && w.Rsi == was.regs.Rsi && w.Rdi == was.regs.Rdi && w.Rbp == was.regs.Rbp &&
+                w.Rsp == was.regs.Rsp && w.R8 == was.regs.R8 && w.R9 == was.regs.R9 && w.R10 == was.regs.R10 &&
+                w.R11 == was.regs.R11 && w.R12 == was.regs.R12 && w.R13 == was.regs.R13 && w.R14 == was.regs.R14 &&
+                w.R15 == was.regs.R15 && (w.EFlags & arith) == (was.regs.EFlags & arith);
+#else
+            const bool same = got && w.Eax == was.regs.Eax && w.Ebx == was.regs.Ebx && w.Ecx == was.regs.Ecx &&
+                w.Edx == was.regs.Edx && w.Esi == was.regs.Esi && w.Edi == was.regs.Edi && w.Ebp == was.regs.Ebp &&
+                w.Esp == was.regs.Esp && (w.EFlags & arith) == (was.regs.EFlags & arith);
+#endif
+            if ((tf || same) && code == EXCEPTION_BREAKPOINT && address == site) {
+                restart = true;                            // same execution: no new hit
+            } else if (tf && code == EXCEPTION_SINGLE_STEP) {
+                // The handler continued elsewhere with our trap flag: one instruction ran,
+                // this is its trap. Drop the flag and let the thread run on.
+                w.EFlags &= ~0x100u;
+                const bool ok = !!SetThreadContext(t, &w);
+                CloseHandle(t);
+                if (!ok) { set_error(s, win_error("clear stray trap flag")); return false; }
+                disposition = DBG_CONTINUE; return true;
+            }
+            if (t) CloseHandle(t);
+        }
+    }
     Probe *probe = code == EXCEPTION_BREAKPOINT ? probe_at(s, address) : nullptr;
     if (code == EXCEPTION_BREAKPOINT && !probe && !s->retired_bps.count(address))
         probe = adopt_relocated_breakpoint(s, address);   // our INT3, copied by another hooking tool
@@ -3869,6 +4021,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             if (t && GetThreadContext(t, &w)) {
                 for (int slot = 0; slot < 4; ++slot) {
                     if (!(s->dr_ever & (1u << slot)) || (s->dr_used & (1u << slot))) continue;   // keep live probes
+                    if (target_owns_slot(s, w, slot)) continue;                                 // and the target's own
                     w.Dr7 &= ~((DWORD64)3 << (slot * 2)) & ~((DWORD64)0xF << (16 + slot * 4));
                 }
                 w.Dr6 = 0;
@@ -3928,6 +4081,15 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             bool armed = still_armed(s, step->second.site);
             Probe *owner = armed ? probe_at(s, step->second.site) : nullptr;
             if (ok && owner) restore_original(s->pi.hProcess, step->second.site, owner->original);
+            if (ok && owner && code == STATUS_GUARD_PAGE_VIOLATION && ex.NumberParameters >= 2) {
+                // The copy's access consumed the page's one-shot guard: put it back, so the
+                // re-run raises the guard violation the program expects at the real instruction.
+                MEMORY_BASIC_INFORMATION m{};
+                void *page = (void *)(uintptr_t)ex.ExceptionInformation[1];
+                DWORD old = 0;
+                if (VirtualQueryEx(s->pi.hProcess, page, &m, sizeof(m)) && m.State == MEM_COMMIT && !(m.Protect & PAGE_GUARD))
+                    VirtualProtectEx(s->pi.hProcess, page, 1, m.Protect | PAGE_GUARD, &old);
+            }
 #if defined(_WIN64)
             w.Rip = step->second.site;
 #else
@@ -3953,11 +4115,45 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         // later stray single-step can't teleport it to site+insn_len; re-arm the byte
         // if the step was in-place. Pass the exception through unchanged.
         if (step != stepping.end()) {
-            if (!step->second.displaced && still_armed(s, step->second.site))
-                rearm_breakpoint(s->pi.hProcess, step->second.site, probe_at(s, step->second.site)->original);
+            if (!step->second.displaced) {
+                end_inplace_step(s, event.dwThreadId, step->second.site);
+                // The instruction itself raised during its in-place step (e.g. the re-run of a
+                // faulting displaced copy): the program's handler gets it with our trap flag set
+                // in its context. Remember it, to tell a restart of this same execution (the
+                // handler continues at the site: the INT3 again, TF set) from a new hit, and to
+                // absorb the single stray step if the handler continues elsewhere.
+                if (event.u.Exception.dwFirstChance && address == step->second.site) {
+                    probe_session::Refault rf; rf.site = step->second.site;
+                    HANDLE t = OpenThread(THREAD_GET_CONTEXT, FALSE, event.dwThreadId);
+                    rf.regs.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
+                    if (t && GetThreadContext(t, &rf.regs)) s->refault[event.dwThreadId] = rf;
+                    if (t) CloseHandle(t);
+                }
+            }
             stepping.erase(step);
         }
         return true;
+    }
+    if (code == EXCEPTION_BREAKPOINT && step != stepping.end() && !step->second.displaced &&
+        step->second.site == address) {
+        // This thread is mid in-place step AT this site: its own hit was queued while another
+        // thread had the byte lifted, it was set up to run the original instruction, and that
+        // other thread's step completion re-armed the INT3 first. It executed our INT3 instead
+        // of the instruction: the same execution, not a new hit (it was a double callback).
+        // Put it back on the site, lift the byte again, and let its step run.
+        HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
+        CONTEXT w{}; w.ContextFlags = CONTEXT_CONTROL;
+        bool ok = t && GetThreadContext(t, &w);
+#if defined(_WIN64)
+        w.Rip = address;
+#else
+        w.Eip = (DWORD)address;
+#endif
+        w.EFlags |= 0x100u;
+        ok = ok && patch(s->pi.hProcess, address, probe->original) && SetThreadContext(t, &w);
+        if (t) CloseHandle(t);
+        if (!ok) { set_error(s, win_error("re-lift in-place step")); return false; }
+        disposition = DBG_CONTINUE; return true;
     }
     HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
     if (!thread) { set_error(s, win_error("open event thread")); return false; }
@@ -4004,8 +4200,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             native.Eip = (DWORD)next;
 #endif
         } else if (ok) {
-            if (still_armed(s, step->second.site))                                                     // in-place: re-arm
-                rearm_breakpoint(s->pi.hProcess, step->second.site, probe_at(s, step->second.site)->original);
+            end_inplace_step(s, event.dwThreadId, step->second.site);                                   // in-place: re-arm
         }
         native.EFlags &= ~0x100u;
 #if defined(_WIN64)
@@ -4053,14 +4248,14 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     context.tid = event.dwThreadId;
     CallbackState state{s, probe, event.dwProcessId, event.dwThreadId}; context.controller = &state;
     s->cb_tid = event.dwThreadId;
-    if (event.dwThreadId != s->in_call_tid)          // a probe hit INSIDE call_func's callee: step over it
+    if (event.dwThreadId != s->in_call_tid && !restart)   // a probe hit INSIDE call_func's callee: step over it
     try { run_callback(s, probe, &context); s->cb_tid = 0; }
     catch (const std::exception &e) {
         CloseHandle(thread); set_error(s, std::string("probe callback: ") + e.what()); return false;
     } catch (...) {
         CloseHandle(thread); set_error(s, "probe callback threw an unknown exception"); return false;
     }
-    if (!co_pass) count_hit(probe);
+    if (!co_pass && !restart) count_hit(probe);
     if (state.released) {        // call_original released the thread: it runs on, nothing to write back
         CloseHandle(thread); s->skip_continue = true; return true;
     }
@@ -4402,10 +4597,14 @@ static void drain_final(probe_session *s) {
     if (!s->exited) return;
     auto *sh = s->shared;
     std::lock_guard<std::mutex> consume(s->drain_mu);
+    // head and tail live in memory the TARGET can write: never trust them for the loop
+    // bound. At most one ring's worth of slots can hold unread records.
+    const LONG64 tail = sh->log_tail;
     LONG64 head = sh->log_head;
-    for (LONG64 pos = sh->log_tail; pos < head; ++pos) {
+    if ((uint64_t)head - (uint64_t)tail > PROBE_AGENT_LOG_CAP) head = (LONG64)((uint64_t)tail + PROBE_AGENT_LOG_CAP);
+    for (LONG64 pos = tail; pos != head; pos = (LONG64)((uint64_t)pos + 1)) {
         auto &rec = sh->logs[(uint64_t)pos % PROBE_AGENT_LOG_CAP];
-        if (rec.seq != pos + 1) continue;                 // its producer died mid-callback (see above)
+        if (rec.seq != (LONG64)((uint64_t)pos + 1)) continue;   // its producer died mid-callback (see above)
         try {
             LogRecord r;
             rec.text[PROBE_AGENT_LOG_TEXT_CAP - 1] = 0;
@@ -4476,11 +4675,11 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
         if (event.dwThreadId == s->remote_tid) ok = complete_remote_thread(s, event.u.ExitThread.dwExitCode);
         if (event.dwThreadId == s->ipc_freezer) ipc_thaw(s);       // agent thread died mid-write: never strand the rest
         s->threads.erase(event.dwThreadId);
+        s->refault.erase(event.dwThreadId);
         auto it = s->stepping.find(event.dwThreadId);
         if (ok && it != s->stepping.end()) {
             // Only the in-place path lifted the byte; a displaced step left it armed.
-            if (!it->second.displaced && still_armed(s, it->second.site))
-                rearm_breakpoint(s->pi.hProcess, it->second.site, probe_at(s, it->second.site)->original);
+            if (!it->second.displaced) end_inplace_step(s, event.dwThreadId, it->second.site);
             s->stepping.erase(it);
             if (!ok) set_error(s, win_error("re-arm probe after thread exit"));
         }
@@ -4518,9 +4717,29 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
     }
     case UNLOAD_DLL_DEBUG_EVENT: {
         uint64_t base = (uint64_t)(uintptr_t)event.u.UnloadDll.lpBaseOfDll;
-        if (s->sym_ready) uhh_sym::unregister_module(s->pi.hProcess, base);
+        sym_unload(s, base);
+        uint64_t size = 0;
+        if (auto sz = s->module_sizes.find(base); sz != s->module_sizes.end()) { size = sz->second; s->module_sizes.erase(sz); }
         for (auto it = s->module_bases.begin(); it != s->module_bases.end(); )
             if (it->second == base) it = s->module_bases.erase(it); else ++it;
+        for (auto &p : s->probes) {
+            // Absolute-address probes (probe_add_address / probe_watch: base 0) inside the
+            // module go with it, for good: there is no module to re-resolve them against, and
+            // a stale one would keep its debug register, shadow a new probe at a reused address
+            // (its saved instruction bytes run instead) and mask the new code's bytes.
+            if (!p->active || p->base || !size || p->address < base || p->address - base >= size) continue;
+            std::fprintf(stderr, "probe: %s retired: its module unloaded\n", p->location.c_str());
+            if (p->flags & PROBE_INLINE) {
+                if (s->shared && p->agent_index < PROBE_AGENT_MAX_PROBES)
+                    InterlockedExchange(&s->shared->requests[p->agent_index].status, PROBE_AGENT_UNLOADED);
+                p->active = false;
+            } else if (p->flags & PROBE_HW) {
+                release_hw(s, *p);
+            } else {
+                p->active = false;
+            }
+            p->retired = true;
+        }
         for (auto &p : s->probes) if (p->active && p->base == base) {
             if (p->flags & PROBE_INLINE) {
                 // The hooked code went away with its module. The probe goes back to pending,

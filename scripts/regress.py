@@ -4835,6 +4835,148 @@ def _realapps_one(name, drv, argv, kind, cols, bk, base, stem, x86, after=None):
     if warn:
         detail += f" stderr={warn[:2]}"
     record(name, ok, detail[:1500])
+def check_ctrl_review():
+    """Controller review findings (examples/ctrlreview, docs/ROADMAP.md "Controller review
+    findings"), each reproduced by its own fixture:
+      ctrl-fault-<b>: a probed load faults on a reserved page (VEH commits it) or a guard page
+        (VEH just retries) and the target CONTINUEs execution: one hit per execution (as
+        inline), the VEH sees every fault (the guard one too), never our trap flag, and no
+        stray single-step.
+      ctrl-inplace: 8 threads through an instruction the software breakpoint steps in place
+        (address-size LOOP): no call is reported twice (the re-armed INT3 must not re-fire for
+        a thread whose own hit was already queued).
+      ctrl-absunload-<b>: probe_add_address / probe_watch inside a DLL that unloads and
+        reloads 5 times: every absolute probe is retired at its unload (exactly N hits each,
+        none attributed to an old probe, no debug-register slot leak).
+      ctrl-symunload-<b>: stack logs captured inside a DLL that unloads right after a burst
+        still symbolize to that DLL (the writer runs behind the unload).
+      ctrl-owndr-<b>: the target's OWN hardware watchpoints (SetThreadContext on itself + VEH)
+        keep working while UHH arms a hardware probe at runtime and releases a one-shot one.
+      ctrl-headclamp: a target that corrupts the agent ring's log_head cannot hang the
+        controller at exit."""
+    d, t, dll = exe("ctrl_driver.exe"), exe("ctrl_target.exe"), exe("ctrl_dll.dll")
+    if not d or not t or not dll:
+        return skip("ctrl-review", "ctrl_driver/ctrl_target/ctrl_dll missing")
+
+    def go(sc, bk, targs, timeout=180):
+        r, o = run([d, "--scenario", sc, "--backend", bk, "--", t, sc, *targs], timeout=timeout)
+        res = next((x for x in o if x.get("kind") == "ctrl_result"), {})
+        logs = [x for x in o if x.get("kind") == "probe_log"]
+        rows = [x for x in o if x.get("kind") == "probe"]
+        return r, o, res, logs, rows
+
+    def common(r, o):
+        bad = []
+        if r.returncode != 0: bad.append(f"exit={r.returncode}")
+        rep = report(o)
+        if rep.get("error") is not None: bad.append(f"error={rep.get('error')}")
+        if rep.get("log_dropped", 0) != 0: bad.append(f"log_dropped={rep.get('log_dropped')}")
+        if rep.get("app_exit") != 0: bad.append(f"app_exit={rep.get('app_exit')}")
+        return bad
+
+    # Finding 2: faulting probed instruction, target handler continues execution.
+    N = 200
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"ctrl-fault-{bk}"
+        try:
+            r, o, res, logs, rows = go("fault", bk, ["--n", N])
+            bad = common(r, o)
+            hits = sum(x.get("hits", 0) for x in rows)
+            if hits != N: bad.append(f"hits={hits}")
+            if len(logs) != N: bad.append(f"logs={len(logs)}")
+            if res.get("av") != N // 2 or res.get("guard") != N // 2:
+                bad.append(f"veh av={res.get('av')} guard={res.get('guard')} (want {N // 2} each)")
+            # breakpoint: the handler's context carries our trap flag (the marker that tells a
+            # restart of the same execution from a new hit; documented) -- reported, not failed
+            if res.get("tf") != 0 and bk != "breakpoint": bad.append(f"tf_in_handler={res.get('tf')}")
+            if res.get("stray") != 0: bad.append(f"stray_single_steps={res.get('stray')}")
+            record(name, not bad, " ".join(bad) or
+                   f"hits={hits} av={res.get('av')} guard={res.get('guard')} tf_in_handler={res.get('tf')}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    # Finding 3: in-place stepping with many threads -> no double callback for one call.
+    try:
+        T, n = 8, 3000
+        r, o, res, logs, rows = go("inplace", "breakpoint", ["--threads", T, "--n", n], timeout=300)
+        bad = common(r, o)
+        seen, dups = set(), 0
+        for x in logs:
+            m = str(x.get("message", ""))
+            if m in seen: dups += 1
+            seen.add(m)
+        if dups: bad.append(f"duplicate_callbacks={dups}")
+        if res.get("bad") != 0: bad.append(f"target_bad={res.get('bad')}")
+        missed = T * n - len(seen)
+        record("ctrl-inplace", not bad, (" ".join(bad) + " " if bad else "") +
+               f"calls={T * n} distinct={len(seen)} (missed while lifted: {missed}, ROADMAP round 3 #2)")
+    except Exception as e:
+        record("ctrl-inplace", False, repr(e))
+
+    # Finding 5: absolute probes / watches inside a DLL that unloads.
+    C, n = 5, 100
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"ctrl-absunload-{bk}"
+        try:
+            r, o, res, logs, rows = go("absunload", bk, ["--cycles", C, "--n", n])
+            bad = common(r, o)
+            fails = [str(x.get("message")) for x in logs if not str(x.get("message", "")).startswith("ok")]
+            if fails: bad.append(f"callback_fail={fails[:2]}")
+            # C absolute execute probes (this backend) + C watchpoints (hw), N hits each
+            absrows = [x for x in rows if str(x.get("location", "")).startswith("0x")]
+            hits = sorted(x.get("hits", 0) for x in absrows)
+            if len(absrows) != 2 * C or any(h != n for h in hits):
+                bad.append(f"abs_rows={len(absrows)} hits={hits}")
+            if any(x.get("active") for x in absrows): bad.append("abs probe still active after unload")
+            record(name, not bad, " ".join(bad) or f"{len(absrows)} absolute probes x {n} hits, all retired")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    # Finding 6: frames captured before an unload must symbolize to the unloaded DLL.
+    C, n = 4, 1500
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"ctrl-symunload-{bk}"
+        try:
+            r, o, res, logs, rows = go("symunload", bk, ["--cycles", C, "--n", n], timeout=300)
+            bad = common(r, o)
+            if len(logs) != C * n: bad.append(f"logs={len(logs)} want {C * n}")
+            unres = [x for x in logs if not any("ctrl_dll" in str(f).lower() for f in (x.get("stack") or [])[:1])]
+            if unres: bad.append(f"frames_not_in_ctrl_dll={len(unres)} e.g. {(unres[0].get('stack') or [])[:2]}")
+            record(name, not bad, " ".join(bad) or f"{len(logs)} stack logs, frame 0 in ctrl_dll for all")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    # Finding 7: the target's own debug registers keep working.
+    N = 50
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"ctrl-owndr-{bk}"
+        try:
+            r, o, res, logs, rows = go("owndr", bk, ["--n", N])
+            bad = common(r, o)
+            if res.get("w1_slot", -1) < 0: bad.append(f"w1_slot={res.get('w1_slot')}")
+            if res.get("w1") != N: bad.append(f"own_watch_w1={res.get('w1')} (slot {res.get('w1_slot')})")
+            w2 = res.get("w2") or []
+            if not any(v == N for v in w2) or any(v not in (-1, N) for v in w2): bad.append(f"own_watch_w2={w2}")
+            fails = [str(x.get("message")) for x in logs if "FAIL" in str(x.get("message", ""))]
+            if fails: bad.append(f"callback_fail={fails[:2]}")
+            tock = [x for x in rows if str(x.get("location", "")).startswith("0x")]
+            if len(tock) != 1 or tock[0].get("hits") != 1: bad.append(f"tock_rows={tock}")
+            record(name, not bad, " ".join(bad) or f"w1(slot {res.get('w1_slot')})={res.get('w1')} w2={w2}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    # Finding 8: corrupt log_head from the target must not hang drain_final.
+    try:
+        t0 = time.time()
+        r, o, res, logs, rows = go("headcorrupt", "inline", [], timeout=60)
+        bad = []
+        if res.get("mapped") != 1: bad.append(f"mapped={res.get('mapped')}")
+        if not report(o): bad.append("no report")
+        record("ctrl-headclamp", not bad, " ".join(bad) or f"controller finished in {time.time() - t0:.1f}s")
+    except subprocess.TimeoutExpired:
+        record("ctrl-headclamp", False, "controller hung (timeout 60s) after the target corrupted log_head")
+    except Exception as e:
+        record("ctrl-headclamp", False, repr(e))
 
 
 def main():
@@ -4875,7 +5017,7 @@ def main():
 
     def want(fn):
         sweep_logs()
-        return not only or any(o in fn.__name__ for o in only)
+        return not only or any(o in fn.__name__ or o.replace('-', '_') in fn.__name__ for o in only)
     print(f"UHH regression suite — bin={BIN}")
     if want(check_sites): check_sites()
     if want(check_gated_off): check_gated_off()
@@ -4949,6 +5091,7 @@ def main():
     if want(check_realapps): check_realapps()
     if args.soak_minutes > 0:
         if want(check_soak): check_soak(args.soak_minutes)
+    if want(check_ctrl_review): check_ctrl_review()
     print("-" * 72)
     failed = 0
     for name, status, detail in RESULTS:
