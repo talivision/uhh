@@ -27,7 +27,7 @@ int main(int argc, char **argv) {
     probe_session *s = probe_session_create();
     if (!s) return 1;
     int ok = probe_add_symbol(s, "ntdll.dll!NtOpenProcess", track_open_process, backend) &&
-             probe_add_symbol(s, "ntdll.dll!NtClose", forget_closed_handle, backend) &&
+             probe_add_symbol(s, "ntdll.dll!NtClose", forget_closed_handle, close_backend_for(backend)) &&
              probe_add_symbol_cfg(s, "ntdll.dll!NtReadVirtualMemory", hunt_read_cb, backend, &cfg, sizeof(cfg)) &&
              (!work_backend || probe_add_symbol(s, "hunt_dll.dll!HuntWork", hunt_work_cb, work_backend)) &&
              probe_launch(s, argv + i + 1) && probe_run(s) && probe_wait_for_exit(s);

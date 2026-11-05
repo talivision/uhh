@@ -37,6 +37,13 @@ inline int add_read_range(struct read_log_config *cfg, const char *text) {
     return 1;
 }
 
+/* Drivers: the backend for the NtClose probe. Same as the open probe, except hw: there it
+   would take the 4th debug register, and call_original on hw needs one free for the duration
+   of each call (track_open_process). A close is rare -- a software breakpoint costs nothing. */
+inline uint32_t close_backend_for(uint32_t open_backend) {
+    return open_backend == PROBE_HW ? PROBE_BREAKPOINT : open_backend;
+}
+
 /* Drivers: "breakpoint" | "hw" | "inline" -> PROBE_* flag, 0 if unknown. */
 inline uint32_t backend_flag(const char *name) {
     return !strcmp(name, "breakpoint") ? PROBE_BREAKPOINT : !strcmp(name, "hw") ? PROBE_HW

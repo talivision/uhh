@@ -43,7 +43,7 @@ int main(int argc, char **argv) {
     if (!s) return 1;
     int ok = probe_add_symbol(s, locations[0], enable_reads_mem, flag_backend) &&
              probe_add_symbol(s, "ntdll.dll!NtOpenProcess", track_open_process, open_backend) &&
-             probe_add_symbol(s, "ntdll.dll!NtClose", forget_closed_handle, open_backend) &&
+             probe_add_symbol(s, "ntdll.dll!NtClose", forget_closed_handle, close_backend_for(open_backend)) &&
              probe_add_symbol_cfg(s, locations[1], log_read, read_backend, &cfg, sizeof(cfg)) &&
              probe_launch(s, target) && probe_run(s) && probe_wait_for_exit(s);
     probe_report(s, stdout);   // the flip is logged ("flag flipped in memory at ...")
