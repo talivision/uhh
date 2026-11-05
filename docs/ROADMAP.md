@@ -718,7 +718,7 @@ Fixture `examples/ctrlreview` (scenarios owndrx / faultreg / absreuse / int3cap 
   over a real 0xCC. Now synced. Test: `cdx-absreuse-*`
 - 🔧 (4) **Only the first 1024 software breakpoints entered the shared INT3 table**: past them inline
   get_mem read UHH's 0xCC where breakpoint/hw read the program's byte. The table now holds 65536 entries
-  (PROBE_AGENT_VERSION 17, 1 MiB of the section, touched only as far as used) and, in a session with the
+  (PROBE_AGENT_VERSION 18, 1 MiB of the section, touched only as far as used) and, in a session with the
   inline channel, the 65537th armed breakpoint is refused (documented in probe_api.h) instead of silently
   missing from it. Test: `cdx-int3cap-*` (1200 breakpoints)
 - 🔧 (5) **A dynamic add from an inline callback refused configs over 64 MiB** (PROBE_IPC_CONFIG_MAX) while
