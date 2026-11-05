@@ -257,6 +257,7 @@ int main(int argc, char **argv)
     HANDLE main_thread = NULL;
     BOOL debug_registers_seen = FALSE;
     BOOL fn_disk_ok = TRUE;
+    const char *detected_by = "none", *detected_at = "none";
 
     for (i = 1U; i < (DWORD)argc; ++i) {
         if (strcmp(argv[i], "--no-wait") == 0) {
@@ -295,29 +296,43 @@ int main(int argc, char **argv)
     result.text_ok = TRUE;
     result.function_ok = TRUE;
     result.text_changed_at = "none";
-    check_integrity(&baseline, &result, "before");
 
-    for (i = 0U; i < calls; ++i) {
-        (void)guarded_fn((int)i);
-        if (i + 1U == (calls + 1U) / 2U) {
-            check_integrity(&baseline, &result, "middle");
+    /* The tamper response: once instrumentation is detected, the target takes a DIFFERENT
+       path -- guarded_fn is still called, but with -1 (a "protected feature disabled"
+       marker) instead of the loop index, so the change is visible to the probe's own log
+       as well as in the summary line. Checked right after release and again halfway. */
+    for (i = 0U; i <= calls; ++i) {
+        if (i == 0U || i == calls / 2U) {
+            const char *stage = i == 0U ? "before" : "middle";
+            BOOL code_changed, dr = FALSE;
+            check_integrity(&baseline, &result, stage);
             fn_disk_ok = function_matches_disk();
-            if (!inspect_debug_registers(main_thread, &debug_registers_seen)) {
+            if (!inspect_debug_registers(main_thread, &dr)) {
                 (void)fprintf(stderr, "unable to inspect main-thread debug registers\n");
                 (void)CloseHandle(main_thread);
                 return 6;
             }
+            debug_registers_seen = debug_registers_seen || dr;
+            code_changed = !fn_disk_ok || !result.text_ok || !result.function_ok;
+            if (strcmp(detected_at, "none") == 0 && (code_changed || dr)) {
+                detected_by = code_changed ? (dr ? "code+debug_registers" : "code") : "debug_registers";
+                detected_at = stage;
+            }
         }
+        if (i == calls) break;
+        (void)guarded_fn(strcmp(detected_at, "none") == 0 ? (int)i : -1);
     }
     check_integrity(&baseline, &result, "after");
     (void)CloseHandle(main_thread);
 
     (void)printf("{\"kind\":\"target\",\"name\":\"antitamper\","
                  "\"calls\":%lu,\"text_ok\":%s,\"fn_bytes_ok\":%s,"
-                 "\"text_changed_at\":\"%s\",\"debug_registers_seen\":%s,\"fn_disk_ok\":%s}\n",
+                 "\"text_changed_at\":\"%s\",\"debug_registers_seen\":%s,\"fn_disk_ok\":%s,"
+                 "\"path\":\"%s\",\"detected_by\":\"%s\",\"detected_at\":\"%s\"}\n",
                  (unsigned long)calls, json_bool(result.text_ok),
                  json_bool(result.function_ok), result.text_changed_at,
-                 json_bool(debug_registers_seen), json_bool(fn_disk_ok));
+                 json_bool(debug_registers_seen), json_bool(fn_disk_ok),
+                 strcmp(detected_at, "none") == 0 ? "clean" : "tampered", detected_by, detected_at);
     (void)fflush(stdout);
     return 0;
 }

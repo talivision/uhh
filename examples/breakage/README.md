@@ -1,24 +1,44 @@
 # Inline-hook breakage fixtures
 
-`hook_edge` is intentionally hostile code, not a correctness test. Its public MASM
+`hook_edge` is intentionally hostile code. Its public MASM
 labels are map-file landmarks; the driver still addresses every probe as
 `hook_edge.exe+0xRVA`. `breakage_driver` gives every row a fresh target/session so
 an expected inline-install failure or target fault cannot hide later rows.
 
 The driver calls `probe_report` into a temporary stream and emits one summary JSON
 line per case. `install_ok` means every registration in that row became active;
-`hits` is their sum. A target exit mismatch is folded into `verdict` because that is
-how relocation corruption is distinguished from a harmless install.
+`hits` is their sum; `app_exit` and `error` come from the report.
+
+Every row has ONE required outcome (`required`), and the driver exits non-zero if any
+row's `verdict` differs:
+
+- `pass`: every probe installed, each hit exactly once, and the target's own result
+  check passed (exit 0 -- the same as an uninstrumented run).
+- `refused`: UHH refused the probe with a reason (the report's `error`), nothing was
+  hit, and the target was not corrupted (it never ran its case).
+- `broken`: anything else (wrong return value, fault, missed or extra hit). Never allowed.
+
+| Row | Required |
+|---|---|
+| every breakpoint / hw control (10 rows) | `pass` |
+| `ShortSite` inline | `refused` (5-byte patch would run past the `ret`) |
+| `PrehookSite` inline + `PROBE_ALLOW_PREHOOKED` | `pass` (chains: 1017) |
+| `PrehookSite` inline (default) | `pass`: the `E9` is in the image FILE too, so live == disk and it is not a pre-hook; relocated and chained (1017) |
+| `PrehookSite` inline + `PROBE_FALLBACK_HW` | `pass` (moved to hw) |
+| `UnrelocSite` inline | `refused` (`jrcxz`/`jecxz` is rel8-only: the hook engine cannot relocate it; it used to crash the target) |
+| `StackSite` twice, inline | `refused` (second hook overlaps the first) |
+| `StackSite` + `StackInsideSite`, inline | `refused` (inner site inside the outer hook) |
+
+The descriptions below explain why each site is hostile.
 
 ## Cases
 
 1. **Short site (`ShortSite`).** The label is `xor eax,eax; ret`: only two bytes of
    ordinary code exist before a control-flow boundary. A five-byte inline jump
    cannot be installed without stealing `ret` and bytes belonging to the next
-   function. Expected inline result: installer rejection, an inactive probe, or no
-   hit (`expected_breakage`). A clean inline hit is deliberately reported as
-   `unexpected_inline_success`. An individual INT3 or DR execute breakpoint needs
-   no five-byte region and must report one hit with exit code zero.
+   function. Inline: `refused` by the site check (the patch would run past the
+   `ret`). An individual INT3 or DR execute breakpoint needs no five-byte region and
+   must report one hit with exit code zero.
 
 2. **Already hooked / over the top (`PrehookSite`).** The mapped entry begins with
    a real `E9 rel32` to `ForeignReplacement`, so even a probe armed at the early
@@ -31,45 +51,38 @@ how relocation corruption is distinguished from a harmless install.
    prologue. If its inline relocator accepts a foreign detour, execution is:
    UHH detour -> UHH callback -> UHH trampoline's relocated foreign `E9` -> foreign
    replacement -> foreign trampoline -> `PrehookSite+5`. Exact expected result is
-   one UHH hit, one foreign hit, and return value 1017
-   (`foreign_then_uhh_chain_ok`). Rejection, recursion, a missed callback, or a bad
-   return is `prehook_chain_broken`. Breakpoint/HW controls stop on the foreign
+   one UHH hit, one foreign hit, and return value 1017 (`pass`). The `E9` is also in
+   the image file, so live == disk: UHH does not see a pre-hook here and chains with
+   or without `PROBE_ALLOW_PREHOOKED`. Breakpoint/HW controls stop on the foreign
    `E9` and must preserve the same result.
 
 3. **Un-relocatable prologue (`UnrelocSite`).** The first instruction is
    `JRCXZ rel8` on x64 or `JECXZ rel8` on x86. Those instructions have no wider
    relative encoding. Copying their two bytes to a remote trampoline preserves the
    displacement but changes its base, so the taken edge no longer reaches
-   `UnrelocZero`; the target then returns the wrong value or faults. Exact naive
-   inline failure is zero hits/install rejection, a nonzero target exit, or a
-   fault. A relocator that expands or otherwise retargets this branch may correctly
-   produce one hit and return 77; that is labelled `relocated_safely`, not hidden.
-   Breakpoint uses UHH's in-place control-flow step and HW uses RF, so each control
+   `UnrelocZero`; the target then faults (observed: the hook engine copies it
+   as is). Inline: `refused` by the site check (`[reloc]`). Breakpoint uses UHH's in-place control-flow step and HW uses RF, so each control
    must hit once and return 77.
 
 4. **Stacked UHH (`StackSite`).** The driver submits two `PROBE_INLINE` requests at
    the identical address, in order, with distinct exported callbacks. There is no
-   public stacking contract. Expected failure is rejection of the second install
-   or fewer than two total hits (`expected_stack_breakage`). If both callbacks run
-   exactly once and the target still returns 8, the row says
-   `unexpected_clean_stack`; this is useful evidence that the current underlying
-   hook engine happened to compose the detours.
+   public stacking contract: the second would relocate the first one's jump, and
+   removing either restores bytes under the other. Inline: the second is `refused`
+   (overlapping patch).
 
 5. **Probe inside stolen bytes (`StackSite` + `StackInsideSite`).** The inner label
    is two bytes after the outer label and therefore lies inside the outer detour's
    minimum five-byte stolen region. The outer hook is installed first. Installing
    at the inner RVA subsequently decodes patched jump payload rather than the
    original NOP stream, or the outer trampoline bypasses the original inner
-   address. Expected result is a rejected/inactive inner probe, fewer than two
-   hits, or a broken target (`expected_overlap_breakage`). A fully correct two-hit
-   run is explicitly `unexpected_clean_overlap`. The controls probe each label
+   address. Inline: the inner probe is `refused` (overlapping patch). The controls
+   probe each label
    separately—never stack INT3/DR state—and each must hit once.
 
 The ten control rows cover all five labels once with `PROBE_BREAKPOINT` and once
-with `PROBE_HW`. They should all have `install_ok:true`, `hits:1`, and verdict
-`pass`. Inline rows are observations of intentionally unsupported edge cases; the
-driver exits zero after emitting them even when their verdict contains “breakage.”
-Usage/setup errors still exit nonzero.
+with `PROBE_HW`; each must `pass`. UHH refuses an inline probe whose patch would
+overlap another inline probe's patch (same address included) -- or moves it to a debug
+register with `PROBE_FALLBACK_HW`. Usage/setup errors exit 2.
 
 ## Build and run
 

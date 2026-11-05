@@ -23,14 +23,21 @@ extern "C" BREAKAGE_EXPORT void breakage_hit_b(probe_context *c) { PROBE_LOG(c, 
 enum SiteId { SHORT_SITE, PREHOOK_SITE, UNRELOC_SITE, STACK_SITE, STACK_INSIDE_SITE, SITE_COUNT };
 
 struct Registration { SiteId site; probe_callback callback; };
-enum Expected { MUST_PASS, MUST_BREAK, MAY_RELOCATE, PREHOOK_CHAIN, STACK_SAME, STACK_OVERLAP };
+// Every row has ONE required outcome. PASS: every probe installed, each hit exactly once,
+// and the target returned exactly what it returns uninstrumented (exit 0). REFUSED: UHH
+// refused the probe with a reason (error text), nothing was hit, and the target was not
+// corrupted (it never ran its case, or ran it unaffected). Anything else is BROKEN.
+enum Required { PASS, REFUSED };
 struct Case {
     const char *name, *site, *target_case, *backend, *expected;
     uint32_t flags;
-    Expected outcome;
+    Required required;
     std::vector<Registration> registrations;
 };
-struct RunResult { bool install_ok = false, target_ok = false; uint64_t hits = 0; int prehook_reports = 0; };
+struct RunResult {
+    bool install_ok = false, target_ok = false; uint64_t hits = 0; int prehook_reports = 0;
+    unsigned long app_exit = 0; std::string error;
+};
 
 static bool parse_rva(const char *text, const char *name, uint64_t &value) {
     if (!text || !*text) {
@@ -70,6 +77,14 @@ static RunResult run_case(const char *target, const Case &c, const uint64_t rvas
         char line[16384];
         while (std::fgets(line, sizeof(line), report)) {
             if (std::strstr(line, "\"kind\":\"prehook\"")) { ++result.prehook_reports; continue; }
+            if (std::strstr(line, "\"kind\":\"probe_report\"")) {
+                if (const char *e = std::strstr(line, "\"app_exit\":")) result.app_exit = std::strtoul(e + 11, nullptr, 10);
+                if (const char *e = std::strstr(line, "\"error\":\"")) {
+                    result.error = e + 9;
+                    result.error.resize(result.error.rfind('"'));
+                }
+                continue;
+            }
             if (!std::strstr(line, "\"kind\":\"probe\"")) continue;
             ++probes;
             if (std::strstr(line, "\"active\":true")) ++active;
@@ -94,27 +109,26 @@ static void json_string(const char *text) {
 }
 
 static const char *verdict(const Case &c, const RunResult &r) {
-    size_t wanted = c.registrations.size();
-    bool clean = r.install_ok && r.target_ok && r.hits == wanted;
-    switch (c.outcome) {
-    case MUST_PASS: return clean ? "pass" : "unexpected_failure";
-    case MUST_BREAK: return clean ? "unexpected_inline_success" : "expected_breakage";
-    case MAY_RELOCATE: return clean ? "relocated_safely" : "expected_relocation_breakage";
-    case PREHOOK_CHAIN: return clean ? "foreign_then_uhh_chain_ok" : "prehook_chain_broken";
-    case STACK_SAME: return clean ? "unexpected_clean_stack" : "expected_stack_breakage";
-    case STACK_OVERLAP:
-        return r.install_ok && r.target_ok && r.hits == 2 ? "unexpected_clean_overlap" : "expected_overlap_breakage";
-    }
-    return "unknown";
+    if (r.install_ok && r.target_ok && r.hits == c.registrations.size()) return "pass";
+    // Refused: a reason, no hit, and no sign of corruption -- hook_edge's own wrong-result
+    // exits are 4..7 and a fault is an NTSTATUS (>= 0x80000000); a refused launch never
+    // releases the target's gate, so it is ended before it runs its case.
+    const bool corrupted = (r.app_exit >= 4 && r.app_exit <= 7) || r.app_exit >= 0x80000000ul;
+    if (!r.install_ok && r.hits == 0 && !r.error.empty() && !corrupted) return "refused";
+    return "broken";
 }
 
-static void print_result(const Case &c, const RunResult &r) {
+static bool print_result(const Case &c, const RunResult &r) {
     std::fputs("{\"site\":", stdout); json_string(c.site);
     std::fputs(",\"backend\":", stdout); json_string(c.backend);
     std::fprintf(stdout, ",\"install_ok\":%s,\"hits\":%llu,\"prehook_reports\":%d,\"expected\":",
                  r.install_ok ? "true" : "false", (unsigned long long)r.hits, r.prehook_reports);
-    json_string(c.expected); std::fputs(",\"verdict\":", stdout); json_string(verdict(c, r));
+    json_string(c.expected);
+    std::fprintf(stdout, ",\"app_exit\":%lu,\"error\":", r.app_exit); json_string(r.error.c_str());
+    std::fputs(",\"required\":", stdout); json_string(c.required == PASS ? "pass" : "refused");
+    std::fputs(",\"verdict\":", stdout); json_string(verdict(c, r));
     std::fputs("}\n", stdout); std::fflush(stdout);
+    return !std::strcmp(verdict(c, r), c.required == PASS ? "pass" : "refused");
 }
 
 int main(int argc, char **argv) {
@@ -134,43 +148,45 @@ int main(int argc, char **argv) {
     const char *control = "one install, one hit, correct target exit";
     std::vector<Case> cases = {
         {"short_inline", "ShortSite", "short", "inline",
-         "inline install rejection/no hit at the two-byte region", PROBE_INLINE, MUST_BREAK,
+         "refused: the 5-byte patch would run past the ret", PROBE_INLINE, REFUSED,
          {{SHORT_SITE, breakage_hit_a}}},
         {"prehook_inline", "PrehookSite", "prehook", "inline",
          "one hit, then relocated foreign E9 -> replacement -> foreign trampoline (opted in)",
-         PROBE_INLINE | PROBE_ALLOW_PREHOOKED, PREHOOK_CHAIN,
+         PROBE_INLINE | PROBE_ALLOW_PREHOOKED, PASS,
          {{PREHOOK_SITE, breakage_hit_a}}},
         {"prehook_inline_default", "PrehookSite", "prehook", "inline-default",
-         "refused with a pre-hook report (live vs disk bytes, disassembly, suggestions)", PROBE_INLINE, MUST_BREAK,
+         "the E9 is in the image file too (live == disk: not a pre-hook): relocated and chained, one hit, 1017",
+         PROBE_INLINE, PASS,
          {{PREHOOK_SITE, breakage_hit_a}}},
         {"prehook_inline_fallback", "PrehookSite", "prehook", "inline-fallback",
-         "pre-hook detected -> moved to a debug register; one hit, clean exit", PROBE_INLINE | PROBE_FALLBACK_HW, MUST_PASS,
+         "pre-hook detected -> moved to a debug register; one hit, clean exit", PROBE_INLINE | PROBE_FALLBACK_HW, PASS,
          {{PREHOOK_SITE, breakage_hit_a}}},
         {"unreloc_inline", "UnrelocSite", "unreloc", "inline",
-         "naive rel8 copy misbranches; aware relocation may preserve one hit and exit", PROBE_INLINE, MAY_RELOCATE,
+         "refused: jrcxz/jecxz (rel8-only) cannot be relocated", PROBE_INLINE, REFUSED,
          {{UNRELOC_SITE, breakage_hit_a}}},
         {"stack_same_inline", "StackSite+StackSite", "stack", "inline",
-         "unsupported double install: reject or fewer than two hits", PROBE_INLINE, STACK_SAME,
+         "second inline hook at the same address refused (overlapping patch)", PROBE_INLINE, REFUSED,
          {{STACK_SITE, breakage_hit_a}, {STACK_SITE, breakage_hit_b}}},
         {"stack_overlap_inline", "StackSite+StackInsideSite", "stack", "inline",
-         "inner install/hit fails because its address lies in outer stolen bytes", PROBE_INLINE, STACK_OVERLAP,
+         "inner probe refused: its address lies in the outer hook's patch", PROBE_INLINE, REFUSED,
          {{STACK_SITE, breakage_hit_a}, {STACK_INSIDE_SITE, breakage_hit_b}}}
     };
     for (int backend = 0; backend < 2; ++backend) {
         uint32_t flag = backend ? PROBE_HW : PROBE_BREAKPOINT;
         const char *label = backend ? "hw" : "breakpoint";
-        cases.push_back({"control_short", "ShortSite", "short", label, control, flag, MUST_PASS,
+        cases.push_back({"control_short", "ShortSite", "short", label, control, flag, PASS,
                          {{SHORT_SITE, breakage_hit_a}}});
-        cases.push_back({"control_prehook", "PrehookSite", "prehook", label, control, flag, MUST_PASS,
+        cases.push_back({"control_prehook", "PrehookSite", "prehook", label, control, flag, PASS,
                          {{PREHOOK_SITE, breakage_hit_a}}});
-        cases.push_back({"control_unreloc", "UnrelocSite", "unreloc", label, control, flag, MUST_PASS,
+        cases.push_back({"control_unreloc", "UnrelocSite", "unreloc", label, control, flag, PASS,
                          {{UNRELOC_SITE, breakage_hit_a}}});
-        cases.push_back({"control_stack_outer", "StackSite", "stack", label, control, flag, MUST_PASS,
+        cases.push_back({"control_stack_outer", "StackSite", "stack", label, control, flag, PASS,
                          {{STACK_SITE, breakage_hit_a}}});
-        cases.push_back({"control_stack_inner", "StackInsideSite", "stack", label, control, flag, MUST_PASS,
+        cases.push_back({"control_stack_inner", "StackInsideSite", "stack", label, control, flag, PASS,
                          {{STACK_INSIDE_SITE, breakage_hit_a}}});
     }
-    for (const auto &c : cases) print_result(c, run_case(target, c, rvas));
-    return 0; /* Rows carry the expected failures; setup/usage errors return nonzero. */
+    int wrong = 0;
+    for (const auto &c : cases) wrong += !print_result(c, run_case(target, c, rvas));
+    return wrong ? 1 : 0;   /* any row off its required outcome fails the driver */
 }
 #endif

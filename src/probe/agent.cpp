@@ -647,14 +647,14 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     // the callback under SEH so an access violation (or any exception) inside user code
     // cannot take down the target. On a fault we skip register write-back, leaving the
     // target's registers untouched (the callback behaves as a no-op mutation).
+    // A hit is a callback run: while being unhooked the hook passes straight through and
+    // that pass is NOT counted (else a detach would report hits that have no callback/log).
+    if (g_stopping) return;
     uint32_t stripe = (GetCurrentThreadId() >> 2) & (PROBE_AGENT_STRIPES - 1);
     volatile LONG64 &cell = shared->hit_stripes[index][stripe].value;
     // ONE atomic add counts the hit and marks a callback in flight (see hit_stripes): a thread
     // killed between two separate counters left a hit that was neither logged nor interrupted.
     InterlockedExchangeAdd64(&cell, 1 + PROBE_AGENT_INFLIGHT_ONE);
-    if (g_stopping) {                                      // being unhooked: pass straight through
-        InterlockedExchangeAdd64(&cell, -PROBE_AGENT_INFLIGHT_ONE); return;
-    }
     // A probe hit by code the callback itself runs (call_func of a probed function, or a
     // probed API called directly) is counted but does not re-enter a callback -- exactly
     // what breakpoint/hw do inside call_func. Re-entering recursed until the stack overflowed.

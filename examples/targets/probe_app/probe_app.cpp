@@ -232,6 +232,7 @@ int main(int argc, char **argv) try {
     if (argc == 3 && !std::strcmp(argv[1], "--helper")) return helper_main(argv[2]);
     size_t helper_count = 4, threads = std::thread::hardware_concurrency();
     uint64_t reads = 1000;
+    uint64_t decoy_opens = 0;
     bool existing_hook = false, wait = true;
     std::string config = "reads_enabled=0\n";   // shipped config: the feature is OFF
     for (int i = 1; i < argc; ++i) {
@@ -243,9 +244,10 @@ int main(int argc, char **argv) try {
         else if (a == "--prehook") existing_hook = true;
         else if (a == "--config") { config = next(); for (auto &c : config) if (c == ';') c = '\n'; }
         else if (a == "--no-wait") wait = false;
+        else if (a == "--decoy-opens") decoy_opens = _strtoui64(next(), nullptr, 10);
         else if (a == "--open-via") g_open_kernel32 = std::string(next()) == "kernel32";
         else throw std::runtime_error("usage: probe_app [--helpers N] [--threads W] [--reads R] [--prehook] "
-                                      "[--config k=v;...] [--no-wait]");
+                                      "[--config k=v;...] [--no-wait] [--decoy-opens N]");
     }
     require(helper_count >= 1 && helper_count <= 64 && threads >= 1 && threads <= 256 &&
             reads >= 1 && reads <= 1000000000ULL, "helper/thread/read counts");
@@ -286,6 +288,15 @@ int main(int argc, char **argv) try {
     std::vector<ThreadResult> results;
     double elapsed_ns = 0;
     if (parsed.reads_enabled) {
+        // --decoy-opens: open (and close) ourselves N times first through the same stub, so
+        // an open-tracking map sees many opens -- and reused handle values -- before the
+        // helpers are opened. None of these handles is ever read.
+        for (uint64_t k = 0; k < decoy_opens; ++k) {
+            ObjectAttributes oa{sizeof(oa)}; HANDLE self{};
+            ClientId cid{(HANDLE)(uintptr_t)GetCurrentProcessId(), nullptr};
+            require(OpenThunk(&self, PROCESS_QUERY_LIMITED_INFORMATION, &oa, &cid) >= 0 && self, "NtOpenProcess self");
+            CloseHandle(self);
+        }
         open_helpers(helpers);
         for (auto &h : helpers)      // ground truth for the handle -> pid map tools build
             std::printf("{\"kind\":\"opened\",\"pid\":%lu,\"handle\":%llu}\n", h.hello.pid,
