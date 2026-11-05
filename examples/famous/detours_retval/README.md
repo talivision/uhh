@@ -49,6 +49,11 @@ uses the entry probe's backend; `--fallback-hw` lets an inline return probe move
 debug register where the site check refuses an inline hook (a return site is in the middle
 of the caller's code).
 
+Caveat found with this example (docs/ROADMAP.md, "Detours-replica findings" D3): under
+breakpoint/hw, a `call_func` made while ANOTHER thread's `call_func` is still running is
+refused (returns 0) — the callback then logs `error=-1 (call_func failed)`. Inline callbacks
+call directly and are not affected.
+
 ## The checks (`scripts/regress.py --only detours_retval`)
 
 - `detours-retval-<backend>` (and `inline-fallback`): `detours_target api` on 4 threads.
@@ -57,7 +62,8 @@ of the caller's code).
   after the call). The multiset of logged `(name, handle, error)` must **equal** the
   target's — including `ERROR_ALREADY_EXISTS` (183) on re-creates and
   `INVALID_HANDLE_VALUE` / `ERROR_FILE_NOT_FOUND` (2) for the missing file — with no
-  unmatched return and nothing dropped.
+  unmatched return and nothing dropped. Run with `--log-entry` so a miss can be traced to a
+  thread. `detours-retval-callfunc-{breakpoint,hw}` asserts no `call_func` was refused.
 - `detours-retval-cmd-<backend>`: the real `cmd.exe /c type <file> & type <missing>`:
   a valid handle with error 0 for the file, `INVALID_HANDLE_VALUE` with error 2 for the
   missing one, and cmd's output unchanged.

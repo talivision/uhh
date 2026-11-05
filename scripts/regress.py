@@ -33,6 +33,11 @@ Checks:
     inside callbacks (entry probe as breakpoint / hw / inline; inline exercises the
     agent->controller IPC). Exact hit count across two threads (one created after the
     watch is armed), one-shot return probe retired, and a symbolized stack in the log.
+  - detours-*: Microsoft Detours samples replicated (examples/famous): simple (SleepEx
+    counter), traceapi (decoded file/registry/process/module APIs on detours_target and on
+    cmd/reg), withdll (launch trace == attach trace; attach mid-run + detach), retval (return
+    values via a return-address probe + call_func GetLastError), launch-stdin. Every one
+    compares against the uninstrumented run.
 Missing binaries (an example not built) are reported as SKIP, not FAIL.
 """
 import argparse

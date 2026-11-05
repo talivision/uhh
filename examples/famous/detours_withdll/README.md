@@ -27,6 +27,14 @@ There is no DLL to inject by hand and no binary to patch: the session does both 
 It is the same driver and callback as `../detours_traceapi` (`traceapi_driver.cpp`,
 `traceapi_callbacks.cpp`): one callback source, every backend, launch or attach.
 
+One difference from `withdll` found here (docs/ROADMAP.md, D1): `probe_launch` does not
+pass the caller's stdin to the program — it gets a private pipe holding one `\n` (the gate
+keystroke for `probe_app`) that stays open, so a program that reads stdin to EOF (`sort`,
+`findstr`, `more`) waits forever. `detours-launch-stdin-*` checks this. Attach is not
+affected (the program keeps its own handles). Also (D2) the launched program shares the
+controller's stdout with the live log tail: a program that writes partial lines gets
+records spliced into them.
+
 ## The checks (`scripts/regress.py --only detours_withdll`)
 
 - `detours-withdll-<backend>` (hw in groups of ≤4, plus `mix`): `detours_target api --gate`
