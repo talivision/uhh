@@ -33,15 +33,35 @@ static AgentState states[PROBE_AGENT_MAX_PROBES];
 struct RegionCache { uintptr_t lo = 0, hi = 0; bool writable = false; };
 static thread_local RegionCache t_region;
 
+// The per-thread cache is implicit TLS -- which does not exist yet on a thread that is
+// still in its loader initialisation: LdrpInitializeThread allocates the thread's TLS
+// block with RtlAllocateHeap, so an inline probe on the allocator (a heap tracker) runs
+// its callback there with TEB->ThreadLocalStoragePointer (or this module's slot in it)
+// still NULL, and touching t_region faults -- recursively, through the exception
+// dispatcher's own allocations, until the stack overflows and the target dies. Found by
+// examples/famous heap_tracker (inline). No TLS yet = no cache: validate every time.
+extern "C" unsigned long _tls_index;
+static RegionCache *region_cache() {
+#if defined(_WIN64)
+    void **array = *reinterpret_cast<void ***>(reinterpret_cast<unsigned char *>(NtCurrentTeb()) + 0x58);
+#else
+    void **array = *reinterpret_cast<void ***>(reinterpret_cast<unsigned char *>(NtCurrentTeb()) + 0x2C);
+#endif
+    if (!array || !array[_tls_index]) return nullptr;
+    return &t_region;
+}
+
 static bool range_ok(uintptr_t a, size_t n, bool write) {
     if (!n) return true;
     if (a + n < a) return false;
+    RegionCache scratch, *cache = region_cache();
+    if (!cache) cache = &scratch;
     uintptr_t end = a + n;
     while (a < end) {
         // Reads trust the per-thread cache across hits; WRITES re-check every time: the
         // target may have made the region read-only since (a write fault would be visible).
-        if (!write && a >= t_region.lo && a < t_region.hi) {
-            a = t_region.hi; continue;
+        if (!write && a >= cache->lo && a < cache->hi) {
+            a = cache->hi; continue;
         }
         MEMORY_BASIC_INFORMATION mbi{};
         if (!VirtualQuery((void *)a, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
@@ -51,24 +71,25 @@ static bool range_ok(uintptr_t a, size_t n, bool write) {
                  prot == PAGE_EXECUTE_WRITECOPY;
         bool r = w || prot == PAGE_READONLY || prot == PAGE_EXECUTE_READ;
         if (!r || (write && !w)) return false;
-        t_region.lo = (uintptr_t)mbi.BaseAddress;
-        t_region.hi = t_region.lo + mbi.RegionSize;
-        t_region.writable = w;
-        a = t_region.hi;
+        cache->lo = (uintptr_t)mbi.BaseAddress;
+        cache->hi = cache->lo + mbi.RegionSize;
+        cache->writable = w;
+        a = cache->hi;
     }
     return true;
 }
+static void forget_region() { if (RegionCache *cache = region_cache()) *cache = {}; }
 static int local_read(void *, uint64_t address, void *buffer, size_t size, size_t *done) {
     *done = 0;
     if (!range_ok((uintptr_t)address, size, false)) return 0;
     __try { std::memcpy(buffer, (const void *)(uintptr_t)address, size); *done = size; return 1; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { t_region = {}; return 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { forget_region(); return 0; }
 }
 static int local_write(void *, uint64_t address, const void *buffer, size_t size, size_t *done) {
     *done = 0;
     if (!range_ok((uintptr_t)address, size, true)) return 0;
     __try { std::memcpy((void *)(uintptr_t)address, buffer, size); *done = size; return 1; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { t_region = {}; return 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { forget_region(); return 0; }
 }
 static const probe_ops local_ops{local_read, local_write};
 
@@ -347,6 +368,30 @@ static bool call_raw(uint64_t fn, const uint64_t *a, uint64_t *ret, int nargs) {
 }
 #endif
 
+// Threads currently inside call_func (resolution included). Probes they hit there do not
+// run callbacks -- the documented call_func contract, which the breakpoint/hw path already
+// kept. Without it an inline allocator probe whose callback calls call_func recursed
+// forever: GetModuleHandle/GetProcAddress (and many callees) allocate, which hits the
+// probe, whose callback calls call_func again... -> STATUS_STACK_OVERFLOW (found by
+// examples/famous heap_tracker). A fixed table, not TLS: it must work on a thread that
+// is still in its loader initialisation.
+static volatile LONG g_in_call_count;
+static volatile LONG g_in_call_tids[64];
+static bool in_call_func(DWORD tid) {
+    if (!g_in_call_count) return false;
+    for (auto &slot : g_in_call_tids) if ((DWORD)slot == tid) return true;
+    return false;
+}
+struct CallFuncScope {
+    volatile LONG *slot = nullptr;
+    CallFuncScope() {
+        const LONG tid = (LONG)GetCurrentThreadId();
+        for (auto &s : g_in_call_tids)
+            if (InterlockedCompareExchange(&s, tid, 0) == 0) { slot = &s; InterlockedIncrement(&g_in_call_count); break; }
+    }
+    ~CallFuncScope() { if (slot) { InterlockedExchange(slot, 0); InterlockedDecrement(&g_in_call_count); } }
+};
+
 extern "C" int call_func(probe_context *c, const char *symbol, uint64_t *ret, int nargs, ...) {
     if (nargs < 0 || nargs > 8) return 0;
     uint64_t a[8] = {0};
@@ -354,6 +399,7 @@ extern "C" int call_func(probe_context *c, const char *symbol, uint64_t *ret, in
     for (int i = 0; i < nargs; ++i) a[i] = va_arg(ap, uint64_t);
     va_end(ap);
     if (g_ctrl) return g_ctrl->call_func_args(c, symbol, ret, nargs, a);
+    CallFuncScope scope;
     uint64_t fn = agent_resolve(symbol);
     if (!fn) return 0;
 #if defined(_WIN64)
@@ -492,6 +538,7 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     uint32_t stripe = (GetCurrentThreadId() >> 2) & (PROBE_AGENT_STRIPES - 1);
     InterlockedIncrement64(&shared->hit_stripes[index][stripe].value);
     if (g_stopping) return;                                // being unhooked: pass straight through
+    if (in_call_func(GetCurrentThreadId())) return;        // hit inside this thread's call_func: no re-entry
     InterlockedIncrement(&g_inflight[stripe].value);
     // The mid-hook stub preserves GPRs, flags and XMM0-15 only. The callback (and the CRT
     // it calls) may touch x87/MXCSR/YMM/ZMM state -- e.g. vzeroupper -- which the target

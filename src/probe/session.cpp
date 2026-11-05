@@ -152,6 +152,7 @@ struct probe_session {
     uint64_t entry_reapply = 0;                // image entry: re-apply DRs on first arrival
     uint64_t entry_addr = 0;                   // image entry point (hold-for-install point)
     bool entry_seen = false;
+    bool thread_start_fixup = false;           // library INT3 at ntdll!RtlUserThreadStart armed
     HANDLE svc_event = nullptr;                // agent service: "install pending requests"
     std::vector<HANDLE> held;                  // threads held until inline installs confirm
     ULONGLONG held_since = 0;                       // slots we have ever owned (stale-#DB filter)
@@ -1195,6 +1196,7 @@ static void hw_rw_len(uint32_t flags, uint32_t &rw, uint32_t &len) {
     len = 3;   // LEN=11 -> 4-byte (dword) watchpoint; the address must be dword-aligned
 }
 
+static void arm_thread_start_fixup(probe_session *s);
 static bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
     if (p.rva > UINT64_MAX - base) { set_error(s, "probe address overflow"); return false; }
     uint64_t address = base + p.rva;
@@ -1235,6 +1237,7 @@ static bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
     std::fprintf(stderr, "probe: active %s -> base=0x%llx addr=0x%llx (hw DR%d, %s)\n",
                  p.location.c_str(), (unsigned long long)base, (unsigned long long)address, slot,
                  rw == 3 ? "watch rw" : rw == 1 ? "watch write" : "execute");
+    arm_thread_start_fixup(s);
     return true;
 }
 
@@ -2046,6 +2049,48 @@ static void arm_entry_fixup(probe_session *s, uint64_t entry) {
         auto p = std::make_unique<Probe>();
         p->location = "<entry>"; p->flags = PROBE_BREAKPOINT | PROBE_ONCE; p->callback = reapply_hw;
         p->rva = entry; p->internal = true;
+        Probe *raw = p.get(); s->probes.push_back(std::move(p));
+        std::string saved = s->error;
+        if (!arm_breakpoint(s, *raw, 0)) { raw->retired = true; s->error = saved; }
+    } catch (...) {}
+}
+
+// The same NtContinue wipe hits EVERY thread, not just the initial one: a thread still in
+// its loader initialisation (LdrInitializeThunk: DLL_THREAD_ATTACH, TLS) when a hardware
+// probe is armed at runtime -- from a callback, or at a later DLL load -- resumes at
+// ntdll!RtlUserThreadStart with the DR image captured when it was created, and never sees
+// that probe (found by examples/famous retval_override: whole worker threads missed a
+// return-site probe added while they were starting). A library-owned breakpoint at
+// RtlUserThreadStart re-applies the active hardware probes to each thread arriving there,
+// i.e. right after its context was restored. Armed the first time a hardware probe is
+// armed while the process is already running.
+static uint64_t resolve_symbol(probe_session *s, const char *symbol);
+static void reapply_hw_thread(probe_session *s, DWORD tid) {
+    if (!s->hw_active) return;
+    HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+    if (!t) return;
+    for (auto &p : s->probes) {
+        if (!p->active || !(p->flags & PROBE_HW)) continue;
+        uint32_t rw = 0, len = 0; hw_rw_len(p->flags, rw, len);
+        set_dr_on_thread(t, p->dr_slot, p->address, true, rw, len);
+    }
+    CloseHandle(t);
+}
+
+static void thread_start_fixup(probe_context *c) {
+    if (probe_session *s = get_session(c)) reapply_hw_thread(s, c->tid);
+}
+
+static void arm_thread_start_fixup(probe_session *s) {
+    if (s->thread_start_fixup || !(s->entry_seen || s->attached)) return;
+    uint64_t at = resolve_symbol(s, "ntdll.dll!RtlUserThreadStart");
+    if (!at) return;
+    s->thread_start_fixup = true;
+    if (Probe *owner = probe_at(s, at)) { (void)owner; return; }   // a user probe owns the site: rare, left as is
+    try {
+        auto p = std::make_unique<Probe>();
+        p->location = "<thread-start>"; p->flags = PROBE_BREAKPOINT; p->callback = thread_start_fixup;
+        p->rva = at; p->internal = true;
         Probe *raw = p.get(); s->probes.push_back(std::move(p));
         std::string saved = s->error;
         if (!arm_breakpoint(s, *raw, 0)) { raw->retired = true; s->error = saved; }
@@ -2961,8 +3006,30 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
     // would silently drop the other. Callbacks compose on one context in slot order.
     bool any = false, exec_hit = false;
     DWORD64 consumed = 0;
+    DWORD64 fired = native.Dr6 & 0xF;
+    if (!fired) {
+        // An execute breakpoint whose status was lost: a debug-register write from the
+        // controller (arming another hardware probe on every thread) reached this thread
+        // while its #DB was still waiting to be reported, and that write carries DR6 too,
+        // so the B-bit reads 0 here. Found by examples/famous retval_override (the target
+        // then died of an "unhandled" STATUS_SINGLE_STEP). An execute DR is unambiguous by
+        // address: a trap exactly at an active hardware execute probe whose slot is
+        // enabled on this thread is that probe's hit.
+#if defined(_WIN64)
+        const uint64_t pc = native.Rip;
+#else
+        const uint64_t pc = native.Eip;
+#endif
+        for (auto &p : s->probes)
+            if (p->active && (p->flags & PROBE_HW) && !(p->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) &&
+                p->address == pc && p->dr_slot >= 0 && p->dr_slot < 4 && ((native.Dr7 >> (p->dr_slot * 2)) & 1))
+                fired |= (DWORD64)1 << p->dr_slot;
+        if (fired && trace_enabled())
+            std::fprintf(stderr, "  hw-dr6-lost tid=%lu pc=0x%llx inferred=0x%llx\n", (unsigned long)event.dwThreadId,
+                         (unsigned long long)pc, (unsigned long long)fired);
+    }
     for (int slot = 0; slot < 4; ++slot) {
-        if (!(native.Dr6 & (1u << slot))) continue;
+        if (!(fired & (1u << slot))) continue;
         Probe *probe = nullptr;
         for (auto &p : s->probes) if (p->active && (p->flags & PROBE_HW) && p->dr_slot == slot) { probe = p.get(); break; }
         if (!probe) {
@@ -3007,7 +3074,15 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
         native.Esp = (DWORD)context.regs.rsp;
 #endif
     }
-    if (!any) { CloseHandle(thread); return true; }                  // none of our DRs fired
+    if (!any) {                                                      // none of our DRs fired
+        if (trace_enabled())
+            std::fprintf(stderr, "  hw-not-ours tid=%lu dr6=0x%llx dr7=0x%llx dr0=0x%llx dr1=0x%llx dr2=0x%llx dr3=0x%llx "
+                                 "used=0x%x ever=0x%x eflags=0x%lx\n", (unsigned long)event.dwThreadId,
+                         (unsigned long long)native.Dr6, (unsigned long long)native.Dr7, (unsigned long long)native.Dr0,
+                         (unsigned long long)native.Dr1, (unsigned long long)native.Dr2, (unsigned long long)native.Dr3,
+                         s->dr_used, s->dr_ever, (unsigned long)native.EFlags);
+        CloseHandle(thread); return true;
+    }
     // RF only for EXECUTE breakpoints (fault-type: the instruction has not run yet). Data
     // watchpoints are trap-type -- the access already happened -- and RF would wrongly
     // suppress an execute breakpoint on the very next instruction.
@@ -3090,9 +3165,10 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         }
     }
     if (trace_enabled())
-        std::fprintf(stderr, "EV code=0x%lx tid=%lu addr=0x%llx step=%d probe=%d\n",
+        std::fprintf(stderr, "EV code=0x%lx tid=%lu addr=0x%llx step=%d probe=%d first=%lu\n",
                      (unsigned long)code, (unsigned long)event.dwThreadId,
-                     (unsigned long long)address, step != stepping.end(), probe != nullptr);
+                     (unsigned long long)address, step != stepping.end(), probe != nullptr,
+                     (unsigned long)event.u.Exception.dwFirstChance);
     if (code == EXCEPTION_SINGLE_STEP && step == stepping.end() && !s->gates.empty() && handle_gate(s, event)) {
         disposition = DBG_CONTINUE; return true;
     }
