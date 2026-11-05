@@ -3058,6 +3058,8 @@ def hunt_run(backend, scenario, n, extra=(), timeout=600, readers=None):
             st["tid_ok" if ok else "tid_bad"] += 1
         elif m.startswith("recurse ok=1 status=0x0"):
             st["recurse_ok"] += 1
+        elif m.startswith("open pid=") or m.startswith("map handle="):
+            pass                      # gated_config's open log / handle -> pid -> name map lines
         else:
             st["other"] += 1
     if readers:
