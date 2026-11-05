@@ -54,10 +54,21 @@ void on_malloc(probe_context *c) {                      /* malloc entry         
 probe_add_symbol(s, "ucrtbase.dll!malloc", on_malloc, PROBE_BREAKPOINT);
 ```
 
-`send_log_stack` captures only raw return addresses at the hit; they are symbolized
-(`module!function+0xoff`, plus `file:line` with PDBs) when the log is reported, so the
-stack costs almost nothing inside the breakpoint and prints as part of the same log
-record. See [`examples/dynwatch`](examples/dynwatch).
+`send_log` and `send_log_stack` append `probe_log` JSON lines to a per-session file under
+`%TEMP%\uhh\logs`; its path is printed once as `probe: logs -> ...`. Both the debugger
+callbacks and inline agent feed one bounded controller queue, so filesystem backpressure
+waits instead of dropping logs or growing memory. A background tailer copies new complete
+lines to controller stdout with raw-handle writes (up to 64 KiB each), flushing the
+driver's CRT stdout first. This keeps the target decoupled from a slow console while logs
+remain live; redirecting stdout to `NUL` disables tailing and leaves the complete file.
+If a console tail falls behind for more than about a second, UHH prints a one-time
+redirect-to-file-or-pipe performance warning on stderr.
+The writer flushes on idle or within about 10 ms. `send_log_stack` captures only raw
+return addresses at the hit; the writer resolves them to `module!function+0xoff` (plus
+`file:line` with PDBs), so symbol work never runs in the hit path. `probe_report` catches
+the tail up, then emits only pre-hook/probe/summary records; its summary includes
+`logs_written`, `log_dropped`, and `controller_peak_ws_mb`. See
+[`examples/dynwatch`](examples/dynwatch).
 
 ## Backends
 
@@ -84,8 +95,9 @@ and activate on load.
 
 ## Build
 
-Requires Windows, Visual Studio 2022 (MSVC) and CMake. SafetyHook and Zydis are
-fetched automatically.
+Requires Windows, Visual Studio 2022 (MSVC) and CMake -- nothing else, and **no network**:
+SafetyHook and Zydis are vendored in `third_party/` (see `third_party/README.md`) and used by
+default. Pass `-DUHH_VENDORED_DEPS=OFF` to fetch the same tags from GitHub instead.
 
 ```sh
 # x64
@@ -128,6 +140,5 @@ Software breakpoints are multithread-safe via displaced stepping and proven exac
 exact under multithreading too. The backend mix matrix passes for breakpoint-flag
 combinations.
 
-Roadmap (see [`docs/plan-v2.md`](docs/plan-v2.md)): per-thread `PROBE_LOG` queues,
-`module!symbol` resolution, attach-by-name (`watch_new`), inline-over-existing-hook
-chaining, a general `read_logger` CLI, and Frida benchmarks.
+Roadmap (see [`docs/ROADMAP.md`](docs/ROADMAP.md)): further hot-path measurement,
+inline-over-existing-hook chaining, and the remaining adversarial correctness cases.

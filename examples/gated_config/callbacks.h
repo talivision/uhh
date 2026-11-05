@@ -30,6 +30,8 @@ inline uint32_t backend_flag(const char *name) {
 extern "C" {
 /* configparse.dll!ParseConfig+0x16: the parsed flag is in EAX; 0 -> 1. */
 PROBE_EXAMPLE_EXPORT void enable_reads(probe_context *);
+/* configparse.dll!ParseConfig+0x18: the flag is already stored at [BX]; rewrite it 0 -> 1. */
+PROBE_EXAMPLE_EXPORT void enable_reads_mem(probe_context *);
 /* ntdll!NtOpenProcess entry: remember (pid, out-handle pointer). */
 PROBE_EXAMPLE_EXPORT void track_open_process(probe_context *);
 /* ntdll!NtReadVirtualMemory entry: log handle/pid/addr/size. */
