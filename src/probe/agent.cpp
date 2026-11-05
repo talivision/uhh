@@ -97,16 +97,49 @@ static void overlay_original(uintptr_t a, void *buffer, size_t n) {
             static_cast<uint8_t *>(buffer)[x - a] = g_shadow[i].bytes[x - lo];
     }
 }
+// A target address this process cannot hold (x86: at or above 4 GB, or a range ending past
+// it) is refused -- as the controller refuses it -- instead of being truncated to 32 bits,
+// which read or WROTE a different, valid address (rw + 4 GB landed on rw).
+static bool addressable(uint64_t a, size_t n) {
+#if defined(_WIN64)
+    (void)a; (void)n; return true;
+#else
+    return a <= 0xFFFFFFFFull && (uint64_t)n <= 0x100000000ull - a;
+#endif
+}
+// The program's byte under each armed breakpoint-backend INT3 (shared->int3, see there).
+static void overlay_int3(uint64_t a, void *buffer, size_t n) {
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        const LONG seq = shared->int3_seq;
+        if (seq & 1) { YieldProcessor(); continue; }
+        MemoryBarrier();
+        LONG count = shared->int3_count;
+        if (count > (LONG)PROBE_AGENT_INT3_CAP) count = PROBE_AGENT_INT3_CAP;
+        struct { uint64_t at; uint8_t b; } fix[64]; int nfix = 0;
+        for (LONG i = 0; i < count && nfix < 64; ++i) {
+            const uint64_t x = shared->int3[i].address;
+            if (x >= a && x - a < n) fix[nfix++] = {x, shared->int3[i].original};
+        }
+        MemoryBarrier();
+        if (shared->int3_seq != seq) continue;
+        for (int k = 0; k < nfix; ++k)
+            if (static_cast<uint8_t *>(buffer)[fix[k].at - a] == 0xCC) static_cast<uint8_t *>(buffer)[fix[k].at - a] = fix[k].b;
+        return;
+    }
+}
 static int local_read(void *, uint64_t address, void *buffer, size_t size, size_t *done) {
     *done = 0;
+    if (size && !addressable(address, size)) return 0;
     if (!range_ok((uintptr_t)address, size, false)) return 0;
     __try { std::memcpy(buffer, (const void *)(uintptr_t)address, size); *done = size; }
     __except (EXCEPTION_EXECUTE_HANDLER) { forget_region(); return 0; }
     if (g_shadow_count) overlay_original((uintptr_t)address, buffer, size);
+    if (shared && shared->int3_count) overlay_int3(address, buffer, size);
     return 1;
 }
 static int local_write(void *, uint64_t address, const void *buffer, size_t size, size_t *done) {
     *done = 0;
+    if (size && !addressable(address, size)) return 0;
     if (!range_ok((uintptr_t)address, size, true)) return 0;
     __try { std::memcpy((void *)(uintptr_t)address, buffer, size); *done = size; return 1; }
     __except (EXCEPTION_EXECUTE_HANDLER) { forget_region(); return 0; }
@@ -603,23 +636,54 @@ extern "C" const void *get_config(probe_context *c) {
 }
 
 // call_func inside the target: resolve and call directly on this (the hit) thread.
+// The controller's grammar exactly (session.cpp parse_location / resolve_symbol), so a
+// call_func symbol resolves -- or is refused -- the same on every backend: "0xADDRESS",
+// "module+0xRVA", "module!Export[+0xOFF]"; offsets need "0x" and hex digits only; the module
+// is matched by its file name (a directory part is ignored) and must include the extension.
+// (GetModuleHandleA alone appended ".dll" to "kernel32" and searched a full path as given;
+// _strtoui64 accepted "+0", "+0xZZ" and "+10"; the controller refuses all of those.)
+static bool agent_parse_hex(const char *p, const char *end, uint64_t *out) {
+    if (end - p < 3 || p[0] != '0' || (p[1] != 'x' && p[1] != 'X')) return false;
+    uint64_t v = 0;
+    for (p += 2; p < end; ++p) {
+        const char ch = *p;
+        const int d = ch >= '0' && ch <= '9' ? ch - '0' : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10
+                    : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1;
+        if (d < 0 || v >> 60) return false;
+        v = v << 4 | (uint64_t)d;
+    }
+    *out = v; return true;
+}
+static HMODULE agent_module(const char *begin, const char *end) {
+    for (const char *p = begin; p < end; ++p) if (*p == '\\' || *p == '/') begin = p + 1;
+    char mod[MAX_PATH];
+    if (begin == end || (size_t)(end - begin) + 2 > sizeof(mod)) return nullptr;
+    memcpy(mod, begin, end - begin); mod[end - begin] = 0;
+    if (!memchr(begin, '.', end - begin)) { mod[end - begin] = '.'; mod[end - begin + 1] = 0; }   // no ".dll" appended
+    return GetModuleHandleA(mod);
+}
 static uint64_t agent_resolve(const char *symbol) {
     if (!symbol || !*symbol) return 0;
     if (symbol[0] == '0' && (symbol[1] == 'x' || symbol[1] == 'X')) return _strtoui64(symbol + 2, nullptr, 16);
-    char mod[MAX_PATH]; const char *bang = strchr(symbol, '!'), *plus = strrchr(symbol, '+');
-    const char *split = bang ? bang : plus;
-    if (!split || (size_t)(split - symbol) >= sizeof(mod)) return 0;
-    memcpy(mod, symbol, split - symbol); mod[split - symbol] = 0;
-    HMODULE m = GetModuleHandleA(mod);
+    const char *bang = strchr(symbol, '!'), *stop = symbol + strlen(symbol);
+    if (!bang) {
+        const char *plus = strrchr(symbol, '+');
+        uint64_t rva = 0;
+        if (!plus || plus == symbol || !agent_parse_hex(plus + 1, stop, &rva)) return 0;
+        HMODULE m = agent_module(symbol, plus);
+        return m ? (uint64_t)(uintptr_t)m + rva : 0;
+    }
+    if (bang == symbol) return 0;
+    const char *plus = strchr(bang + 1, '+'), *name_end = plus ? plus : stop;
+    uint64_t off = 0;
+    char name[256];
+    if (name_end == bang + 1 || (size_t)(name_end - bang - 1) >= sizeof(name)) return 0;
+    if (plus && !agent_parse_hex(plus + 1, stop, &off)) return 0;
+    HMODULE m = agent_module(symbol, bang);
     if (!m) return 0;
-    if (!bang) return (uint64_t)(uintptr_t)m + _strtoui64(split + 1, nullptr, 16);
-    char name[256]; const char *end = plus && plus > bang ? plus : bang + strlen(bang);
-    if ((size_t)(end - bang - 1) >= sizeof(name)) return 0;
-    memcpy(name, bang + 1, end - bang - 1); name[end - bang - 1] = 0;
+    memcpy(name, bang + 1, name_end - bang - 1); name[name_end - bang - 1] = 0;
     FARPROC f = GetProcAddress(m, name);
-    if (!f) return 0;
-    uint64_t off = (plus && plus > bang) ? _strtoui64(plus + 1, nullptr, 16) : 0;
-    return (uint64_t)(uintptr_t)f + off;
+    return f ? (uint64_t)(uintptr_t)f + off : 0;
 }
 
 #if defined(_WIN64)
@@ -658,6 +722,18 @@ static bool call_raw(uint64_t fn, const uint64_t *a, uint64_t *ret, int nargs) {
 }
 #endif
 
+// call_func of an address that is no committed executable memory (e.g. "0x1") returns 0
+// without calling it: the call would fault, and inline that first-chance fault is seen by the
+// target's vectored handlers -- breakpoint/hw (the debugger sees it first) return 0 silently.
+static bool executable(uint64_t a) {
+    if (!addressable(a, 1)) return false;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery((const void *)(uintptr_t)a, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+        (mbi.Protect & PAGE_GUARD)) return false;
+    const DWORD p = mbi.Protect & 0xFF;
+    return p == PAGE_EXECUTE || p == PAGE_EXECUTE_READ || p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
+}
+
 // Threads currently inside call_func (resolution included). Probes they hit there do not
 // run callbacks -- the documented call_func contract, which the breakpoint/hw path already
 // kept. Without it an inline allocator probe whose callback calls call_func recursed
@@ -691,7 +767,7 @@ extern "C" int call_func(probe_context *c, const char *symbol, uint64_t *ret, in
     if (g_ctrl) return g_ctrl->call_func_args(c, symbol, ret, nargs, a);
     CallFuncScope scope;
     uint64_t fn = agent_resolve(symbol);
-    if (!fn) return 0;
+    if (!fn || !executable(fn)) return 0;
 #if defined(_WIN64)
     return call_raw(fn, a, ret) ? 1 : 0;
 #else
@@ -959,21 +1035,14 @@ static bool raise_ipc(probe_ipc_request *req) {
 static int forward(probe_session *s, uint32_t op, uint64_t address, const char *symbol,
                    probe_callback cb, uint32_t flags, const void *config = nullptr, size_t config_len = 0) {
     if (!s || s < proxies || s >= proxies + PROBE_AGENT_MAX_PROBES || !cb) return 0;
+    if (config_len && !config) return 0;
     probe_ipc_request req{};
     req.op = op; req.flags = flags; req.origin_site = s->site; req.address = address;
     std::string name;
-    if (!callback_export_name(cb, name) || name.size() >= sizeof(req.callback)) return 0;
-    std::memcpy(req.callback, name.c_str(), name.size() + 1);
-    if (symbol) {
-        size_t n = strnlen(symbol, sizeof(req.symbol));
-        if (n >= sizeof(req.symbol)) return 0;
-        std::memcpy(req.symbol, symbol, n + 1);
-    }
-    if (config_len) {
-        if (!config || config_len > sizeof(req.config)) return 0;
-        std::memcpy(req.config, config, config_len);
-        req.config_len = (uint32_t)config_len;
-    }
+    if (!callback_export_names(cb, name)) return 0;           // all names of a folded function
+    req.callback = (uintptr_t)name.data(); req.callback_len = name.size();
+    if (symbol) { req.symbol = (uintptr_t)symbol; req.symbol_len = strlen(symbol); }
+    if (config_len) { req.config = (uintptr_t)config; req.config_len = config_len; }
     return raise_ipc(&req) ? req.result : 0;
 }
 
@@ -1066,7 +1135,9 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     c.regs.rbp = native.ebp; c.regs.rsp = native.esp; c.regs.flags = native.eflags;
 #endif
     c.regs.pc = sites[index]; c.hit_sp = c.regs.rsp;
-    c.config = shared->requests[index].config_len ? shared->requests[index].config : nullptr;
+    const auto &request = shared->requests[index];
+    c.config = !request.config_len ? nullptr
+             : request.config_len > PROBE_AGENT_CONFIG_CAP ? (void *)(uintptr_t)request.config_remote : (void *)request.config;
     c.ops = &local_ops; c.tid = GetCurrentThreadId(); c.site = index; c.controller = &states[index];
     // Count the hit before the call so a faulting callback is still accounted, and run
     // the callback under SEH so an access violation (or any exception) inside user code
@@ -1245,15 +1316,26 @@ static void install_pending() {
 }
 // Resolve every requested callback by name NOW, while no DLL load is in progress, so later
 // install rounds (e.g. for a module that is being loaded right now) never call the loader.
+// request.callback holds one or more '\n'-separated export names of the same (folded)
+// function: the first this DLL exports.
+static probe_callback resolve_callback_names(const char *list) {
+    char name[PROBE_AGENT_EXPORT_CAP];
+    for (const char *p = list; *p && p < list + PROBE_AGENT_EXPORT_CAP; ) {
+        size_t n = 0;
+        while (p[n] && p[n] != '\n' && p + n < list + PROBE_AGENT_EXPORT_CAP - 1) ++n;
+        std::memcpy(name, p, n); name[n] = 0;
+        if (auto f = reinterpret_cast<probe_callback>(GetProcAddress(self_module, name))) return f;
+        p += n; if (*p == '\n') ++p; else break;
+    }
+    return nullptr;
+}
 static void resolve_callbacks() {
     uint32_t count = shared->request_count;
     if (count > PROBE_AGENT_MAX_PROBES) count = PROBE_AGENT_MAX_PROBES;
     for (uint32_t i = 0; i < count; ++i) {
         const auto &request = shared->requests[i];
-        if (callbacks[i] || !request.callback[0] || request.config_len > PROBE_AGENT_CONFIG_CAP) continue;
-        char name[PROBE_AGENT_EXPORT_CAP];
-        std::memcpy(name, request.callback, sizeof(name)); name[sizeof(name) - 1] = 0;
-        callbacks[i] = reinterpret_cast<probe_callback>(GetProcAddress(self_module, name));
+        if (callbacks[i] || !request.callback[0] || (request.config_len > PROBE_AGENT_CONFIG_CAP && !request.config_remote)) continue;
+        callbacks[i] = resolve_callback_names(request.callback);
     }
 }
 
@@ -1264,14 +1346,14 @@ static void install_pending_locked() {
     for (uint32_t i = 0; i < count; ++i) {
         auto &request = shared->requests[i];
         if (!request.site || request.status != PROBE_AGENT_PENDING) continue;
-        if (request.config_len > PROBE_AGENT_CONFIG_CAP || !request.callback[0]) {
+        if ((request.config_len > PROBE_AGENT_CONFIG_CAP && !request.config_remote) || !request.callback[0]) {
             InterlockedExchange(&request.status, PROBE_AGENT_BAD_REQUEST); continue;
         }
         // Normally already resolved by resolve_callbacks() at init: GetProcAddress can block on
         // loader state held by a thread that is parked at a LOAD_DLL event (the install that
         // event is waiting for would then never run).
         if (!callbacks[i])
-            callbacks[i] = reinterpret_cast<probe_callback>(GetProcAddress(self_module, request.callback));
+            callbacks[i] = resolve_callback_names(request.callback);
         if (!callbacks[i]) {
             InterlockedExchange(&request.status, PROBE_AGENT_CALLBACK_MISSING); continue;
         }
@@ -1299,6 +1381,10 @@ static void install_pending_locked() {
             if (!which[i]) continue;
             const bool ok = hooks[i].enable().has_value();
             const auto &orig = hooks[i].original_bytes();
+            if (ok && orig.size() <= sizeof(shared->requests[i].original)) {
+                std::memcpy(shared->requests[i].original, orig.data(), orig.size());
+                shared->requests[i].original_len = (uint32_t)orig.size();
+            }
             if (ok && !g_shadow[i].lo && orig.size() <= sizeof(g_shadow[i].bytes)) {
                 std::memcpy(g_shadow[i].bytes, orig.data(), orig.size());
                 g_shadow[i].len = (uint32_t)orig.size();

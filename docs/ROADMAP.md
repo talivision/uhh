@@ -506,6 +506,88 @@ x64 breakpoint/inline baseline was masked by identical-code folding of the fixtu
   incremental-link thunk (E9, next thunk directly after) and a tail-call target sees the
   caller's return address at [SP], so get_func_arg, call_original and return_from (`ret 12`)
   work as on the real function, on every backend; the x86 hot-patch prologue likewise.
+## Portability findings (2026-11-05, `examples/conformance/matrix_callbacks.cpp`, regress `portability-*`)
+Gospel check: ONE callback source records what every API call returns -- registers (all 16 ids,
+invalid ids, CF across the hit), memory of every kind (RW, read-only, guard, execute-only,
+reserved, a range running into PAGE_NOACCESS, wrap-around, huge sizes, addresses no pointer can
+hold, null buffers, size 0, code under this / another backend's probe), arguments, config (incl.
+> 256 bytes), `call_func` symbol forms and failures, the control plane from a callback, logging
+edge cases, a faulting and a throwing callback, 5 threads hitting one probe -- under breakpoint,
+hw and inline (`conformance_driver --matrix A|B|C`, phases keep hw within 4 DRs). The suite diffs
+the "M" lines of the three runs line by line (plus every other log record and the target's own
+observations); "D" lines are documented divergences checked against their per-backend value.
+Before the fixes, x64 differed in 18 keys (A: 10, B: 2, C: every target row -- the session died).
+- ✅ (P1) `call_func` symbol grammar differed: inline resolved `kernel32!X` (GetModuleHandle
+  appends ".dll"), `X+0` and `X+0xZZ` (lenient `_strtoui64`) where breakpoint/hw refuse them, and
+  refused `C:\any\dir\kernel32.dll!X` where breakpoint/hw match the file name. The agent now parses
+  with the controller's grammar (`module` with extension, matched by file name; `+0xHEX` only).
+- ✅ (P2) **A probe added from an inline callback returned 0 when its callback had been folded by
+  the linker** (`/OPT:ICF`: two identical -- e.g. empty -- callbacks share one address): the agent
+  sent the first export name of that address, which the controller's copy need not export.
+  breakpoint/hw: 1. All names of the address now travel (IPC and the inline install request);
+  the receiver takes the first it exports.
+- ✅ (P3) From an inline callback, `probe_add_symbol_cfg` refused a config > 256 bytes and a symbol
+  > 255 chars (fixed IPC buffers); breakpoint/hw accepted them. The controller now reads the name,
+  symbol and config from the stopped calling thread's memory.
+- ✅ (P4) An inline probe refused a config > 256 bytes at add time (breakpoint/hw: any size). A
+  larger config now goes to a block the controller allocates in the target.
+- ✅ (P5) **A callback that throws a C++ exception ended the whole breakpoint/hw session** ("probe
+  callback threw an unknown exception"; the target's remaining run was lost); inline abandons
+  the callback. The controller now abandons it the same way (SEH: hit counted, register changes
+  discarded, set_mem writes kept, one stderr warning).
+- ✅ (P6) Adding a probe from a callback with a NON-exported (static) callback: breakpoint/hw 1,
+  inline 0 (the controller resolves inline requests by export name). Now refused (0, error
+  message) on every backend when called from inside a callback; top-level adds are unchanged.
+- ✅ (P7) The `call_original` / `return_from` refusal warning ("not at a function entry") was a log
+  record inline but stderr only on breakpoint/hw: the logs differed by one record. breakpoint/hw
+  now also emit the same "uhh warning: ..." record, once per probe like the agent.
+- ✅ (P8) `get_mem` of code under a probe of ANOTHER backend (mixed sessions): inline read the
+  breakpoint's 0xCC, breakpoint/hw read the inline hook's `jmp` (`e9 ...`). The controller now
+  publishes its armed INT3s to the agent (shared table, seqlock) and overlays the bytes each
+  installed inline hook overwrote (published by the agent): every backend reads `90 90 ...`.
+- ✅ (P9) `call_func(c, "0x1", ...)` inline called the address and caught the fault, but the
+  target's vectored handler saw the first-chance AV (breakpoint/hw: silent 0). Inline now refuses
+  an address that is not committed executable memory before calling.
+- ✅ (P10) **x86 inline `get_mem`/`set_mem` truncated a 64-bit address to 32 bits**: `set_mem(rw +
+  4 GB)` returned 1 and WROTE `rw` (the target's first bytes changed; breakpoint/hw: 0, untouched),
+  `get_mem` of it read `rw`, and `get_func_arg(c, SIZE_MAX)` returned the stack word at `[esp]`
+  (address wrapped past 4 GB; breakpoint/hw: 0). Refused now, as on the controller.
+- Evidence: before the fixes x64 differed in 18 keys and x86 in 21 (P1-P10 above; plus
+  `portability-matrix-C` lost every target row on breakpoint/hw because the session died on the
+  throw); after them `portability-matrix-{A,B,C}` and `portability-documented` pass on x64 and x86.
+- ⬜ Open (seen on the x86 run of this branch, not caused by a portability change): `edgehunt-
+  {breakpoint,hw}-fmtptr` expects `[unformattable] fmtptr %s` for a TARGET pointer printed with
+  `%s` in a controller callback, but on x86 the same address can be mapped in the controller too
+  and then prints the controller's bytes (`fmtptr W..}j`) -- the B10 behaviour itself; the
+  check's expectation is address-layout dependent.
+- 📄 (D1) Win32 calls made directly by a callback act on the process the callback runs in
+  (`GetCurrentProcessId() == target pid`: breakpoint/hw 0, inline 1). Portable: `call_func`
+  `kernel32.dll!GetCurrentProcessId` / `GetCurrentThreadId`; target memory only via get/set_mem.
+- 📄 (D2) Concurrency: breakpoint/hw callbacks never overlap (max in flight 1 over 210 hits on 5
+  threads); inline ones do (5 measured). `thread_local` in a callback is per target thread inline
+  (main thread: 10) but one controller thread for all target threads on breakpoint/hw (210).
+- 📄 (D3) A faulting / throwing callback is abandoned identically, but inline the exception is
+  raised IN the target: its vectored handlers see the first chance (`c0000005`, `e06d7363`);
+  breakpoint/hw: never.
+- 📄 (D4) `call_func` of a callee that raises and handles its own exception (`lstrlenA((char*)1)`):
+  breakpoint/hw abandon the call at the first-chance exception (0, `*ret` untouched, the target
+  never sees it); inline the callee's handler runs (1, `*ret` = 0) and the target's vectored
+  handlers see it. Passing the exception to the target from the debugger is not safe: the
+  callee's frame chain ends in a frame the debugger built (x64 unwind / x86 SEH chain would reach
+  the HIT's handlers and could unwind the thread out of the call).
+- 📄 (D5) `PROBE_ONCE` is breakpoint/hw only (refused inline, from any caller); now in the header.
+- 📄 (D6) A probe added from an inline callback names its callback by export, resolved in the
+  module of the calling callback only (breakpoint/hw take the pointer as is): keep a callback and
+  the callbacks it adds in one module.
+- Agree on every backend (verified, no change): get_reg of all 16 ids at a mid-function site,
+  set_reg of each (x86: values wider than 32 bits read back whole in the callback, the target gets
+  the low half; R8..R15 are 0 / refused), invalid ids, CF preserved, every memory case above incl.
+  untouched buffers on failure and the program-visible effects (guard page still armed, read-only
+  and partial ranges unmodified), get_func_arg (huge index 0), get_config (null for none, 8-byte
+  aligned), every null-context call, send_log (null format: no record; 1500 chars truncated alike;
+  `%k` -> `[unformattable]`), send_log_stack at a function entry (frames 0-1), call_original /
+  return_from refused mid-function, the probe and target rows of the faulting / throwing callbacks.
+
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`
 - ✅ Per-log overhead ceilings in the suite (`log-throughput-*`)

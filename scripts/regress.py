@@ -887,6 +887,112 @@ def check_callorig():
             record(name, False, repr(e))
 
 
+# ---- Portability matrix (examples/conformance/matrix_callbacks.cpp) -------------------------
+# Expected per-backend values of the DOCUMENTED divergences ("D key=value" lines and target
+# observations); None = any value. Everything else must be identical on every backend.
+PORTABILITY_DOCUMENTED = {
+    "win32.pid-is-target": {"breakpoint": "0", "hw": "0", "inline": "1"},
+    "conc.max-inflight": {"breakpoint": "1", "hw": "1", "inline": None},
+    "conc.thread-local-on-main": {"breakpoint": "210", "hw": "210", "inline": "10"},
+    "call_func.callee-handles-fault": {"breakpoint": "0 r=7", "hw": "0 r=7", "inline": "1 r=0"},
+    # exceptions the PROGRAM's vectored handler saw, as stage:code (4 = the faulting callback,
+    # 6 = the throwing callback, stage 1 = lstrlenA's own fault inside call_func)
+    "target.veh-A": {"breakpoint": "", "hw": "", "inline": "1:c0000005"},
+    "target.veh-B": {"breakpoint": "", "hw": "", "inline": "4:c0000005"},
+    "target.veh-C": {"breakpoint": "", "hw": "", "inline": "6:e06d7363"},
+}
+PORTABILITY_REQUIRED = {
+    "A": ["adds.entry", "adds.regs", "adds.other", "args", "mem.get.rw", "mem.set.high", "call_func.plain",
+          "add.ok", "add.static-callback", "add.config-308", "add.long-symbol", "log.long", "reg.get.0",
+          "reg.set.1", "target.cf", "target.out", "stack.entry"],
+    "B": ["adds.fault", "adds.conc", "adds.report", "adds.bigcfg", "fault.before", "conc.total", "config.big",
+          "target.fault_r", "target.fault_mark"],
+    "C": ["adds.throw", "throw.before", "target.throw_r", "target.throw_mark"],
+}
+
+
+def matrix_values(o, phase):
+    """One backend's run -> ({key: value} that must match, {key: value} documented)."""
+    vals, doc = {}, {}
+
+    def put(d, k, v):
+        d[k] = v if k not in d else d[k] + "|" + v
+    for x in o:
+        kind = x.get("kind")
+        if kind == "probe_log":
+            m = str(x.get("message", ""))
+            tag = ""
+            if m.startswith("[unformattable] "):
+                tag, m = "[unformattable]", m[len("[unformattable] "):]
+            if m.startswith("S "):
+                frames = x.get("stack") or []
+                put(vals if m == "S entry" else doc, "stack." + m[2:], " < ".join(str(f) for f in frames[:2]))
+            elif not (m[:2] in ("M ", "D ") and "=" in m):
+                put(vals, "logs.other", m)               # any other record (e.g. a library warning)
+            else:
+                k, v = m[2:].split("=", 1)
+                if k == "log.long":
+                    v = f"len={len(v)} end={v[-16:]}"
+                put(vals if m[0] == "M" else doc, k, tag + v)
+        elif kind == "matrix_adds":
+            for k, v in x.items():
+                if k not in ("kind", "phase"):
+                    vals["adds." + k] = str(v)
+        elif kind == "matrix":
+            for k, v in x.items():
+                if k in ("kind", "veh_n"):
+                    continue
+                if k == "veh":
+                    doc["target.veh-" + phase] = ",".join(v)
+                else:
+                    vals["target." + k] = ",".join(v) if isinstance(v, list) else str(v)
+        elif kind == "probe_report":
+            vals["report.error"] = str(x.get("error"))
+            vals["report.log_dropped"] = str(x.get("log_dropped"))
+    return vals, doc
+
+
+def check_portability():
+    """The SAME callback source must observe and do the same under breakpoint, hw and inline:
+    every API a callback can call (registers incl. CF and invalid ids, memory of every kind and
+    bad ranges, args, config incl. > 256 bytes, call_func symbol forms and failures, the control
+    plane from a callback, logging edge cases, a faulting / throwing callback, concurrency). Each
+    phase runs the matrix under all three backends and diffs the M lines; documented
+    divergences must have exactly their documented value per backend."""
+    d, t = exe("conformance_driver.exe"), exe("conformance_target.exe")
+    if not d or not t:
+        return skip("portability", "conformance_driver/target missing")
+    docs_seen = {}
+    for phase in ("A", "B", "C"):
+        name = f"portability-matrix-{phase}"
+        try:
+            per = {}
+            for bk in ("breakpoint", "hw", "inline"):
+                _, o = run([d, "--backend", bk, "--matrix", phase, "--", t, "--matrix"], timeout=120)
+                vals, doc = matrix_values(o, phase)
+                per[bk] = vals
+                docs_seen.setdefault(bk, {}).update(doc)
+            keys = sorted(set().union(*[set(v) for v in per.values()]))
+            diffs = [k for k in keys if len({per[bk].get(k) for bk in per}) > 1]
+            missing = [k for k in PORTABILITY_REQUIRED[phase] for bk in per if k not in per[bk]]
+            errors = [bk for bk in per if per[bk].get("report.error") != "None" or per[bk].get("report.log_dropped") != "0"]
+            for k in diffs:
+                print(f"    {name} DIFF {k}: " + " | ".join(f"{bk}={per[bk].get(k)}" for bk in per), flush=True)
+            record(name, not diffs and not missing and not errors,
+                   f"keys={len(keys)} diffs={diffs[:6]} missing={sorted(set(missing))[:4]} report_errors={errors}")
+        except Exception as e:
+            record(name, False, repr(e))
+    bad = []
+    for k, want in PORTABILITY_DOCUMENTED.items():
+        for bk, v in want.items():
+            got = docs_seen.get(bk, {}).get(k)
+            if got is None or (v is not None and got != v):
+                bad.append(f"{k}[{bk}]={got!r}")
+    for bk, doc in docs_seen.items():
+        print(f"    portability-documented {bk}: " + " ".join(f"{k}={v!r}" for k, v in sorted(doc.items())), flush=True)
+    record("portability-documented", not bad, f"unexpected={bad[:6]}")
+
+
 CO_CASES = ("recurse", "cppthrow", "seh", "longjmp", "threads", "mid", "nargs", "conv", "retaddr",
             "prologue", "nested", "vslow")
 
@@ -4804,6 +4910,7 @@ def main():
     if want(check_gated_map): check_gated_map()
     if want(check_gated_filter): check_gated_filter()
     if want(check_callorig): check_callorig()
+    if want(check_portability): check_portability()
     if want(check_callorig_hunt): check_callorig_hunt()
     if want(check_callconv): check_callconv()
     if want(check_interrupt): check_interrupt()

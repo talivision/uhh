@@ -167,6 +167,7 @@ add_library(probe_api_agent SHARED
     examples/conformance/conformance_callbacks.cpp
     examples/p2edge/p2edge_callbacks.cpp
     examples/stacks/stacks_callbacks.cpp
+    examples/conformance/matrix_callbacks.cpp
     bench/hitcost/hitcost_callbacks.cpp
     examples/memstress/memstress_callbacks.cpp
     examples/sidefx/sidefx_callbacks.cpp
@@ -277,10 +278,11 @@ else()
     set(CONF_SP_ASM examples/conformance/conf_sp_x64.asm)
 endif()
 add_executable(conformance_target examples/conformance/conformance_target.c ${CONF_SP_ASM})
-target_link_options(conformance_target PRIVATE "/EXPORT:SpSite")
+target_link_options(conformance_target PRIVATE "/EXPORT:SpSite" "/EXPORT:PmRegHit" "/EXPORT:PmOther")
 target_compile_options(conformance_target PRIVATE /Zi)
 target_link_options(conformance_target PRIVATE /DEBUG)
-add_executable(conformance_driver examples/conformance/conformance_driver.cpp examples/conformance/conformance_callbacks.cpp)
+add_executable(conformance_driver examples/conformance/conformance_driver.cpp examples/conformance/conformance_callbacks.cpp
+               examples/conformance/matrix_callbacks.cpp)
 target_include_directories(conformance_driver PRIVATE include)
 target_link_libraries(conformance_driver PRIVATE probe_api)
 add_dependencies(conformance_driver conformance_target probe_api_agent)
