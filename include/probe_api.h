@@ -110,8 +110,10 @@ int probe_launch(probe_session *, char *const argv[]);
 /* Attach to an already-running process instead of launching one. Probes resolve against
    the modules already loaded (and any loaded later). probe_run returns when the target
    exits; probe_close on a still-running target DETACHES (restores breakpoints, clears
-   debug registers, removes inline hooks) instead of terminating it. With inline probes,
-   every thread is held at the attach until the hooks are confirmed (bounded: 5 s). */
+   debug registers, removes inline hooks) instead of terminating it. The target keeps
+   running while the probes arm: each one counts from its "probe: active" line on (an
+   inline hook once the injected agent confirms it; every hook write briefly suspends
+   all threads so none is ever mid-patch). */
 int probe_attach(probe_session *, uint32_t pid);
 /* Wait (up to timeout_ms, 0 = forever) for a NEW process whose image name matches
    (e.g. "probe_app.exe"; processes already running are ignored) and attach to it as

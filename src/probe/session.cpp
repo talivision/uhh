@@ -176,7 +176,6 @@ struct probe_session {
     bool launched = false, exited = false, inline_ready = false;
     bool interrupted = false, ctrl_counted = false;   // Ctrl+C ended this session / counted in g_ctrl_sessions
     std::atomic<bool> ran{false};              // probe_run has started (read by probe_close on any thread)
-    bool attach_held = false;                  // attach: threads held once until inline hooks confirmed
     bool call_cet_warned = false;              // call_func refused under CET (warn once)
     int shadow_stack = -1;                     // target has hardware shadow stacks (CET): -1 unknown, 0/1
     uint64_t ret_gadgets = 0;                  // return_from: `ret` / `ret N` gadgets in the target
@@ -1995,8 +1994,8 @@ static bool arm_probe(probe_session *s, Probe &item, uint64_t base) {
         if (moved) item.flags = view.flags;                // pre-hooked -> hw (PROBE_FALLBACK_HW)
     }
     // (No "late inline -> hardware" rule: launch holds the main thread at the entry point
-    // until the agent is ready, attach holds every thread until the hooks are confirmed,
-    // and a module loaded later is held at its LOAD_DLL event. Inline stays inline.)
+    // until the agent is ready, and a module loaded later is gated until its hooks are in.
+    // Inline stays inline.)
     if (!item.export_name.empty()) {
         uint64_t exp = 0;
         const bool exported = resolve_export(s, base, item.export_name, exp);
@@ -2509,32 +2508,6 @@ static bool inline_unconfirmed(const probe_session *s) {
 // while inline probes exist but the agent's service thread is not up yet: a module
 // with an inline site may load at any moment after entry, and the thread loading it
 // holds the loader lock -- only an already-running service thread can install then.
-// A thread of OUR agent left from an earlier, detached session (its service thread): never
-// hold it -- it may own the agent's install lock or be the one that must do the install.
-static bool agent_thread(probe_session *s, DWORD tid) {
-    if (!s->remote_agent) return false;
-    using QueryFn = LONG(NTAPI *)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-    static auto query = reinterpret_cast<QueryFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
-    HANDLE t = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
-    if (!t || !query) { if (t) CloseHandle(t); return false; }
-    PVOID start = nullptr;
-    LONG st = query(t, 9 /*ThreadQuerySetWin32StartAddress*/, &start, sizeof(start), nullptr);
-    CloseHandle(t);
-    if (st < 0) return false;
-    IMAGE_DOS_HEADER dos{}; IMAGE_NT_HEADERS nt{}; size_t got = 0;
-    if (!remote_read(s->pi.hProcess, s->remote_agent, &dos, sizeof(dos), &got) || got != sizeof(dos) ||
-        !remote_read(s->pi.hProcess, s->remote_agent + (uint32_t)dos.e_lfanew, &nt, sizeof(nt), &got) || got != sizeof(nt))
-        return false;
-    const uint64_t a = (uint64_t)(uintptr_t)start;
-    return a >= s->remote_agent && a < s->remote_agent + nt.OptionalHeader.SizeOfImage;
-}
-
-// Inline probes other than PROBE_UNSAFE_FAST_PATCH ones (those ask for no suspension at all).
-static bool has_safe_inline(const probe_session *s) {
-    for (const auto &p : s->probes) if ((p->flags & PROBE_INLINE) && !(p->flags & PROBE_UNSAFE_FAST_PATCH)) return true;
-    return false;
-}
-
 static bool inline_hold_needed(const probe_session *s) {
     if (inline_unconfirmed(s)) return true;
     return has_inline(s) && !(s->shared && s->shared->service_ready && s->svc_event);
@@ -4290,15 +4263,12 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
         s->cb_tid = 0;
         for (DWORD tid : s->pending_hold) hold_thread(s, tid);
         s->pending_hold.clear();
-        if (ok && s->initial_break && s->attached && !s->attach_held && has_safe_inline(s)) {
-            // Attach: the target was already running. Hold every thread (not the break-in
-            // thread, which only returns) until the agent confirms the inline hooks, so no
-            // call slips past a site that is about to be hooked. Released by the install
-            // confirmation, or by the install timeout if a held thread blocks the loader.
-            s->attach_held = true;
-            for (DWORD tid : s->threads)
-                if (tid != event.dwThreadId && !agent_thread(s, tid)) hold_thread(s, tid);
-        }
+        // (Attach does NOT hold the target's threads while the agent is injected: the target
+        //  was already running, so a call before the hook lands is no different from one
+        //  before the attach -- a probe reports "active" only once its hook is confirmed --
+        //  while a held thread that owns the loader lock blocked the agent's LoadLibrary and
+        //  froze the target until the install timeout (seen attaching to PowerShell). The
+        //  hook write itself is safe without it: FREEZE suspends every thread for the patch.)
         if (ok && s->initial_break && has_inline(s) && !s->remote_agent &&
             s->remote_work == probe_session::REMOTE_NONE)
             ok = start_agent_load(s);
