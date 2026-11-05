@@ -2175,7 +2175,9 @@ def dt_target(objs):
 
 
 def dt_dir():
-    d = Path(tempfile.gettempdir()) / "uhhdt"
+    """detours_target's working files: one directory per regress run, so suites running in
+    parallel (x64 and x86 at once) never read or overwrite each other's files."""
+    d = Path(tempfile.gettempdir()) / f"uhhdt-{os.getpid()}"
     d.mkdir(exist_ok=True)
     return d
 
