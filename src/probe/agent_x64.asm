@@ -13,6 +13,9 @@
 ;   00..1F home space for fn      20..3F fn's stack args 5..8
 ;   40..67 machine frame (RIP, CS, EFLAGS, RSP, SS)   68 HitScope* (read by uhh_orig_unwind)
 ;   70..AF rbx rbp rsi rdi r12 r13 r14 r15 (the hit's)   B0..14F xmm6..xmm15 (the hit's)
+;   150 the OrigFrame pointer (not described by the unwind data)
+; The original is entered with the hit's XMM0-3 (float arguments) and, after it returns, the
+; volatile registers it left (RCX RDX R8-R10, XMM0-5) are stored to frame->post.
 ; The declared prologue is: [machine frame] ; sub rsp, 40h ; save regs. Unwinding applies the
 ; saves (relative to this rsp), then rsp += 40h, then pops the machine frame -- the real
 ; allocation (158h) is larger so the fake frame never overlaps our own return address.
@@ -104,6 +107,15 @@ no_xmm:
     movaps [rsp+130h], xmm14
     movaps [rsp+140h], xmm15
 have_xmm:
+    mov [rsp+150h], r8                  ; the OrigFrame, for after the call
+    mov r11, [r8+60h]                   ; the hit's XMM0..3 (float/double arguments; may be null)
+    test r11, r11
+    jz no_xarg
+    movups xmm0, [r11]
+    movups xmm1, [r11+10h]
+    movups xmm2, [r11+20h]
+    movups xmm3, [r11+30h]
+no_xarg:
     mov r10, rdx                        ; args 5..8 on the stack
     mov rax, [r10+20h]
     mov [rsp+20h], rax
@@ -120,6 +132,22 @@ have_xmm:
     mov r9, [r10+18h]
     call rax
     nop                                 ; the return address must not look like an epilogue
+    mov r11, [rsp+150h]
+    mov r11, [r11+68h]                  ; OrigPost: what the original left (may be null)
+    test r11, r11
+    jz no_post
+    mov [r11], rcx
+    mov [r11+8], rdx
+    mov [r11+10h], r8
+    mov [r11+18h], r9
+    mov [r11+20h], r10
+    movups [r11+30h], xmm0
+    movups [r11+40h], xmm1
+    movups [r11+50h], xmm2
+    movups [r11+60h], xmm3
+    movups [r11+70h], xmm4
+    movups [r11+80h], xmm5
+no_post:
     add rsp, 158h
     ret
 uhh_orig_thunk ENDP

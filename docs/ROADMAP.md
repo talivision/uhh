@@ -379,6 +379,71 @@ with the uninstrumented target and with exact hits / "co" logs / `log_dropped ==
   Ctrl+Break while a call_original is in flight complete that call first (`callorig-hunt-
   {detach,ctrlbreak}-*`).
 
+## Transparency findings (2026-11-06, `examples/transparency`, regress `transparency-*`)
+Adversarial check of "a hit is invisible to the program". Every probed function has an unprobed
+twin with the same body; both are called through one assembly harness that loads sentinels into
+every callee-saved register and captures what a caller can observe (return registers: x64
+RAX/XMM0, x86 EDX:EAX/ST0; callee-saved GPRs and XMM6-15; SP after the call, so x86 `ret N`; DF;
+x87 SW/TW), plus GetLastError, the TEB LastStatusValue and a byte diff of the WHOLE TEB. A
+mid-function site sits between a `cmp` and the flag snapshot with every GPR, XMM0-15, YMM upper
+halves, a full 8-deep x87 stack with a pending FCOM result, a non-default x87 CW and DF=1 live.
+Callback kinds: no-op, send_log(+stack), get_mem/get_func_arg/get_reg, Win32+NT calls on the hit
+thread, call_func (APIs that set the last error; a probed function), call_original+return_from
+(int / int64 / double return, a double argument, __stdcall, stack alignment, recursion); plus a
+thread created by call_func during a hit, get_mem on a page the target later guards /
+NOACCESSes / decommits (with a vectored handler counting exceptions), and a callback that
+overflows its stack. Every backend, x64 and x86.
+- ✅ (TR1) **call_original + return_from lost the original's return registers** on every
+  backend: return_from set only AX, and the resume restored the HIT's other registers -- a
+  double (x64 XMM0, x86 ST0) or x86 int64 (EDX) came back as garbage. Breakpoint/hw now capture
+  the original's integer + FP context at its return; inline x64 `uhh_orig_thunk` stores RCX RDX
+  R8-R10 XMM0-5 after the call, inline x86 ECX EDX XMM0-7 and the x87 state (FNSAVE, installed
+  after the hit's extended state is restored). With return_from the caller gets them -- except
+  AX and any register the callback set_reg'd after call_original.
+- ✅ (TR2) **inline x64 call_original ran the original with garbage XMM0-3**: float/double
+  arguments were not passed (breakpoint/hw run in place, so they were fine). The thunk now
+  loads the hit's XMM0-3.
+- ✅ (TR3) **inline call_original + return_from hid the original's GetLastError / last NT
+  status**: the agent restores both after every callback, to the values from BEFORE the hit.
+  When call_original ran they are now restored to what the original left.
+- ✅ (TR4) **breakpoint/hw call_func leaked the callee's last error / status** into the program
+  (inline hid them): call_func now saves and restores the stopped thread's TEB LastErrorValue
+  and LastStatusValue around the call. x86 also restores the XMM registers there
+  (CONTEXT_EXTENDED_REGISTERS): a callee's SSE use leaked into a mid-function site on breakpoint
+  x86 (hw happened to rewrite the full context afterwards).
+- ✅ (TR5) **breakpoint/hw call_func("kernel32!X")** (no `.dll`) did not resolve; inline did
+  (GetModuleHandle semantics). A bare module name now also matches `<name>.dll`.
+- ✅ (TR6, review a) **the inline XSAVE buffer was sized from CPUID(0xD,0).EBX** (every XCR0
+  feature): with AMX (~11 KB) it exceeded the 4 KiB buffer and the hit saved nothing, not even
+  MXCSR -- a callback's VZEROUPPER (CRT memcpy) wiped the target's live YMM upper halves. The
+  size now comes from the saved components only; without XSAVE, MXCSR is still kept. Test:
+  `transparency-inline-xsave-bigarea` (UHH_BENCH_XSTATE=amx simulates the AMX-sized area).
+- ✅ (TR7, review b) **x86 inline: the x87 state was not saved** (default mask = AVX only). x86
+  code returns floats in ST0, so any callback/CRT float call changes the x87 status/tag/stack a
+  mid-function site may have live. The gated mask now includes x87 on x86 when it is in use.
+  (x64: not included -- MSVC x64 code never touches x87 -- so x64 hits keep the cheap path.)
+- ✅ (TR8, review c) **inline get_mem trusted a per-thread region cache ACROSS hits**: a page the
+  target decommitted / NOACCESSed / guarded later faulted (a first-chance AV its vectored
+  handler saw) or silently consumed its PAGE_GUARD. The cache now lives for one hit (reset at
+  the hit and after call_original).
+- ✅ (TR9, review d) **a callback stack overflow was caught without `_resetstkoflw`**: the thread
+  (inline: the TARGET's thread) lost its guard page and the program's own next overflow killed
+  the process with an access violation. Restored on both the agent and the controller side.
+- 📄 Inherent to inline (documented, counted not failed by the check): (1) the callback runs on
+  the target thread's stack -- the hook path uses roughly 8-10 KiB (stub context, 4 KiB XSAVE
+  area, the callback's frames), so a thread close to its stack limit can overflow where it would
+  not have, and committing deeper stack moves TEB StackLimit (`stack_limit_moves`); (2) a
+  callback's own heap calls change heap state, including the TEB's per-thread LFH affinity hint
+  (`HeapData`, x64 TEB+0x17B0, x86 TEB+0xFA8; `heap_hint_changes`). Neither can be avoided while running C code
+  in the target; breakpoint/hw callbacks run in the controller and change neither.
+- 📄 Inline call_original is a real call from the agent: the original sees the agent's return
+  address (`_ReturnAddress()`, e.g. kernelbase!GetProcAddress's caller-based lookups) and a new
+  stack frame for its stack arguments, and is entered with the hit's argument registers (x64
+  RCX RDX R8 R9 XMM0-3; x86 ECX EDX + stack args) but NOT its other registers -- a function with a
+  custom register convention (hand-written asm, x86 LTCG internal functions taking EAX/ESI/EDI)
+  gets garbage there. Breakpoint/hw run the original in place with the full context and have
+  none of these limits. Returning through the program's caller would break the CET shadow stack.
+
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`
 - ✅ Per-log overhead ceilings in the suite (`log-throughput-*`)

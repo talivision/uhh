@@ -27,9 +27,11 @@ static AgentState states[PROBE_AGENT_MAX_PROBES];
    page protections: executable writes belong to the hook installer, not hits. */
 /* A bad pointer must fail cleanly WITHOUT raising an exception the target could observe
    (its vectored handlers see first-chance faults before our __except). So the range is
-   validated first. The last validated region is cached per thread, so the common case
-   -- repeated access to the same buffer/stack/image -- costs a bounds check, not a
-   syscall. The __try stays only for a region freed concurrently (a race the target
+   validated first. The last validated region is cached per thread FOR THE CURRENT HIT
+   (call_mid and call_original reset it), so repeated access to the same buffer/stack/image
+   within a callback costs a bounds check, not a syscall -- while a page the target decommits,
+   guards or protects between hits is validated afresh (a stale entry faulted, and a read of a
+   PAGE_GUARD page consumed the target's guard). The __try stays only for a region freed concurrently (a race the target
    would also have). */
 struct RegionCache { uintptr_t lo = 0, hi = 0; bool writable = false; };
 static thread_local RegionCache t_region;
@@ -459,6 +461,12 @@ static void make_ret_thunks() {
     g_ret_thunks = p;
 }
 
+#if defined(_WIN64)
+static inline volatile DWORD *teb_last_status() { return (volatile DWORD *)((unsigned char *)NtCurrentTeb() + 0x1250); }
+#else
+static inline volatile DWORD *teb_last_status() { return (volatile DWORD *)((unsigned char *)NtCurrentTeb() + 0xBF4); }
+#endif
+
 /* An exception (or longjmp) inside the original must reach the PROGRAM's handlers, exactly
    as without the probe, and must not run the original a second time. So call_original
    swallows nothing: the unwind goes from the original straight to the hooked function's
@@ -477,6 +485,19 @@ struct HitScope {
     bool tls;                       // t_in_callback was set for this hit
     volatile LONG abandoned;
     const void *xmm6;               // x64: the hit's XMM6..XMM15 (safetyhook Context, contiguous)
+    // call_original ran: the thread's last error / last status as the ORIGINAL left them. The
+    // callback's own Win32 calls are undone back to these, not to the values before the hit
+    // (an un-hooked call leaves what the function set).
+    bool co_ran;
+    DWORD co_error, co_status;
+    // ...and the volatile registers it left (x64 RCX RDX R8-R10, XMM0-5; x86 ECX EDX, XMM0-7):
+    // with return_from the caller gets them, as from an un-hooked call -- its return registers
+    // (x86 EDX:EAX, XMM0) above all -- except AX and what the callback set_reg'd after the call
+    // (co_seen: the context's GPRs when the original returned).
+    struct { uint64_t gpr[6]; uint8_t xmm[8][16]; } co_post;
+    uint64_t co_seen[6];
+    void *xmm0;                     // the hit's XMM0.. (safetyhook Context)
+    uint8_t co_fpu[108];            // x86: FNSAVE image right after the original returned
 };
 static void hit_scope_abandon(HitScope *h);
 
@@ -486,8 +507,11 @@ struct OrigFrame {                   // layout read by uhh_orig_thunk
     uint64_t nv[8];                  // rbx rbp rsi rdi r12 r13 r14 r15 at the hit
     HitScope *scope;                 // +0x50
     const void *xmm6;                // +0x58
+    const void *xmm0;                // +0x60 the hit's XMM0..3 (float arguments)
+    void *post;                      // +0x68 receives RCX RDX R8 R9 R10 _ XMM0..5 after the call
 };
-static_assert(offsetof(OrigFrame, scope) == 0x50 && offsetof(OrigFrame, xmm6) == 0x58, "uhh_orig_thunk layout");
+static_assert(offsetof(OrigFrame, scope) == 0x50 && offsetof(OrigFrame, xmm6) == 0x58 &&
+              offsetof(OrigFrame, post) == 0x68, "uhh_orig_thunk layout");
 extern "C" uint64_t uhh_orig_thunk(uint64_t fn, const uint64_t *args8, const OrigFrame *frame);
 extern "C" EXCEPTION_DISPOSITION uhh_orig_unwind(EXCEPTION_RECORD *rec, void *frame, CONTEXT *, void *) {
     if (rec && (rec->ExceptionFlags & 0x66) && frame) {           // EXCEPTION_UNWIND: leaving through us
@@ -501,7 +525,9 @@ struct SehRecord { SehRecord *next; void *handler; };
 // Push the args, load ECX/EDX (fastcall/thiscall), call, restore ESP: stdcall and cdecl.
 static void call_tramp_x86(uint32_t target, const uint32_t *args32, int nargs, uint32_t ecx_v, uint32_t edx_v,
                            uint32_t *ret, uint32_t hit_sp, HitScope *scope) {
-    uint32_t lo = 0;
+    uint32_t lo = 0, post_ecx = 0, post_edx = 0;
+    uint8_t *post_xmm = scope->co_post.xmm[0], *post_fpu = scope->co_fpu;
+    uint16_t cw0 = 0;
     volatile int normal = 0;
     __try {
         // This function's own record heads the chain here; link it straight to the first
@@ -521,12 +547,28 @@ static void call_tramp_x86(uint32_t target, const uint32_t *args32, int nargs, u
             push dword ptr [esi + ecx*4]
             jmp push_loop
         do_call:
+            fnstcw cw0
             mov ecx, ecx_v
             mov edx, edx_v
             call dword ptr [target]
             mov esp, ebx
             mov lo, eax
+            mov eax, post_fpu
+            fnsave [eax]
+            fldcw cw0
+            mov post_ecx, ecx
+            mov post_edx, edx
+            mov eax, post_xmm
+            movdqu [eax], xmm0
+            movdqu [eax + 10h], xmm1
+            movdqu [eax + 20h], xmm2
+            movdqu [eax + 30h], xmm3
+            movdqu [eax + 40h], xmm4
+            movdqu [eax + 50h], xmm5
+            movdqu [eax + 60h], xmm6
+            movdqu [eax + 70h], xmm7
         }
+        scope->co_post.gpr[0] = post_ecx; scope->co_post.gpr[1] = post_edx;
         self->next = saved;
         normal = 1;
     } __finally {
@@ -565,7 +607,7 @@ extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
     f.rip = ret_addr; f.rsp = c->hit_sp + 8;
     f.nv[0] = c->regs.rbx; f.nv[1] = c->regs.rbp; f.nv[2] = c->regs.rsi; f.nv[3] = c->regs.rdi;
     f.nv[4] = c->regs.r12; f.nv[5] = c->regs.r13; f.nv[6] = c->regs.r14; f.nv[7] = c->regs.r15;
-    f.scope = scope; f.xmm6 = scope->xmm6;
+    f.scope = scope; f.xmm6 = scope->xmm6; f.xmm0 = scope->xmm0; f.post = &scope->co_post;
     r = uhh_orig_thunk(tramp, a, &f);
 #else
     uint32_t a32[8], r32 = 0; for (int i = 0; i < 8; ++i) a32[i] = (uint32_t)a[i];
@@ -573,6 +615,14 @@ extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
                    (uint32_t)c->hit_sp, scope);
     r = r32;
 #endif
+    scope->co_error = GetLastError(); scope->co_status = *teb_last_status(); scope->co_ran = true;
+    forget_region();                                   // the original may have changed protections
+#if defined(_WIN64)
+    const uint64_t seen[6] = {c->regs.rcx, c->regs.rdx, c->regs.r8, c->regs.r9, c->regs.r10, c->regs.r11};
+#else
+    const uint64_t seen[6] = {c->regs.rcx, c->regs.rdx, 0, 0, 0, 0};
+#endif
+    std::memcpy(scope->co_seen, seen, sizeof(seen));
     c->called_original = 1;
     if (out) *out = r;
     return 1;
@@ -671,16 +721,35 @@ static bool any_inflight() {
 }
 
 // XSAVE support, probed once: mask = XCR0 restricted to x87|SSE|AVX|AVX-512 components.
-static struct XState { bool ok = false, compact = false, xinuse = false; uint64_t mask = 0, avx_mask = 0; uint32_t size = 0; } g_xs = [] {
+// size = the save area THOSE components need (standard or compacted layout), not CPUID(0xD,0)
+// .EBX, which covers every XCR0 feature -- with AMX tiles (~11 KB) that exceeded the buffer,
+// and the hit then saved nothing at all (a callback's VZEROUPPER wiped the live YMM state).
+// x86: the gated mask also keeps the x87 state when it is live -- 32-bit C code returns
+// floating-point values in ST0, so any callback (or CRT) float call pushes/pops the x87 stack
+// and changes its status word, which a mid-function site may have live.
+static struct XState { bool ok = false, compact = false, xinuse = false; uint64_t mask = 0, avx_mask = 0; uint32_t size = 0, full = 0; } g_xs = [] {
     XState x;
     int r[4];
     __cpuid(r, 1);
     if (!(r[2] & (1 << 27))) return x;                     // OSXSAVE
     x.mask = _xgetbv(0) & 0xE7ull;
     x.avx_mask = x.mask & 0xE4ull;                         // AVX upper + AVX-512 (opmask, ZMM) only
-    __cpuidex(r, 0xD, 0); x.size = (uint32_t)r[1];
+#if !defined(_WIN64)
+    x.avx_mask |= x.mask & 1ull;                           // x87 (see above)
+#endif
+    __cpuidex(r, 0xD, 0); x.full = (uint32_t)r[1];
+    char knob[8] = {};                                     // regress: a CPU with AMX tiles in XCR0
+    if (GetEnvironmentVariableA("UHH_BENCH_XSTATE", knob, sizeof(knob)) && !strcmp(knob, "amx")) x.full += 8192;
     __cpuidex(r, 0xD, 1); x.compact = (r[0] & 2) != 0; x.xinuse = (r[0] & 4) != 0;   // XGETBV(1)
-    x.ok = x.size && x.size <= 4096;
+    uint32_t size = 576;                                   // legacy region + XSAVE header
+    for (int i = 2; i < 8; ++i) {
+        if (!(x.mask & (1ull << i))) continue;
+        __cpuidex(r, 0xD, i);                              // EAX size, EBX offset, ECX bit 1: 64-aligned
+        if (x.compact) size = ((r[2] & 2) ? (size + 63) & ~63u : size) + (uint32_t)r[0];
+        else if ((uint32_t)(r[1] + r[0]) > size) size = (uint32_t)(r[1] + r[0]);
+    }
+    x.size = size;
+    x.ok = x.size <= 4096;
     return x;
 }();
 
@@ -688,26 +757,33 @@ static struct XState { bool ok = false, compact = false, xinuse = false; uint64_
 
 // The callback runs on the target's own thread: any Win32 call it (or the library) makes
 // can change the thread's last-error / last-status, which the target may read right
-// after the probed instruction. Save and restore both (plain TEB fields: ~free).
-#if defined(_WIN64)
-static inline volatile DWORD *teb_last_status() { return (volatile DWORD *)((unsigned char *)NtCurrentTeb() + 0x1250); }
-#else
-static inline volatile DWORD *teb_last_status() { return (volatile DWORD *)((unsigned char *)NtCurrentTeb() + 0xBF4); }
-#endif
+// after the probed instruction. Save and restore both (plain TEB fields: ~free) -- to what
+// the original left if call_original ran (see HitScope).
 static bool run_callback(probe_callback cb, probe_context *c) {
     DWORD last_error = GetLastError(), last_status = *teb_last_status();
     __writeeflags(__readeflags() & ~(uintptr_t)0x400);
     bool ok = true;
+    DWORD code = 0;
     __try { cb(c); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+    __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+    // A callback that overflowed the stack used up the thread's guard page (the target's
+    // stack): restore it, or the program's own next overflow is no longer catchable.
+    if (code == EXCEPTION_STACK_OVERFLOW) _resetstkoflw();
+    if (const auto *h = static_cast<const HitScope *>(c->hit_scope); h && h->co_ran) {
+        last_error = h->co_error; last_status = h->co_status;
+    }
     *teb_last_status() = last_status;
     SetLastError(last_error);
     return ok;
 }
 // Kept out of line so the 4 KiB save area (and its stack probe) costs nothing on the
 // common path.
-static void call_mid(safetyhook::Context &native, uint32_t index) {
+// Returns true when x87_out (108 bytes, x86) holds the x87 state to install after the hit's
+// extended state is restored (call_original + return_from: the original's, see HitScope).
+static bool call_mid(safetyhook::Context &native, uint32_t index, uint8_t *x87_out) {
     probe_context c{};
+    bool x87 = false;
+    (void)x87_out;
     /* SafetyHook's Context is Context64 on x64 and Context32 on x86; fill the same
        gospel probe_regs from whichever register image this build captured. */
 #if defined(_WIN64)
@@ -729,7 +805,7 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     // target's registers untouched (the callback behaves as a no-op mutation).
     // A hit is a callback run: while being unhooked the hook passes straight through and
     // that pass is NOT counted (else a detach would report hits that have no callback/log).
-    if (g_stopping) return;
+    if (g_stopping) return false;
     uint32_t stripe = (GetCurrentThreadId() >> 2) & (PROBE_AGENT_STRIPES - 1);
     volatile LONG64 &cell = shared->hit_stripes[index][stripe].value;
     // ONE atomic add counts the hit and marks a callback in flight (see hit_stripes): a thread
@@ -741,7 +817,7 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     // (No TLS yet -- a thread in loader init, see region_cache -- means no callback is running
     // on it; in_call_func covers this thread's call_func whatever its TLS state.)
     if (in_call_func(GetCurrentThreadId()) || (tls_ready() && t_in_callback)) {
-        InterlockedExchangeAdd64(&cell, -PROBE_AGENT_INFLIGHT_ONE); return;
+        InterlockedExchangeAdd64(&cell, -PROBE_AGENT_INFLIGHT_ONE); return false;
     }
     // The mid-hook stub preserves GPRs, flags and XMM0-15 only. The callback (and the CRT
     // it calls) may touch x87/MXCSR/YMM/ZMM state -- e.g. vzeroupper -- which the target
@@ -751,7 +827,8 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     // this C code runs -- see there.
     const bool tls = tls_ready();
     if (tls) t_in_callback = 1;
-    HitScope scope{&cell, tls, 0, nullptr};
+    forget_region();     // validated regions are trusted within ONE hit only (see RegionCache)
+    HitScope scope{&cell, tls, 0, nullptr, false, 0, 0, {}, {}, &native.xmm0};
 #if defined(_WIN64)
     scope.xmm6 = &native.xmm6;
 #endif
@@ -759,7 +836,7 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     bool callback_ok = run_callback(callbacks[index], &c);
     if (tls) t_in_callback = 0;
     InterlockedExchangeAdd64(&cell, -PROBE_AGENT_INFLIGHT_ONE);
-    if (!callback_ok) return;
+    if (!callback_ok) return false;
 #if defined(_WIN64)
 #define COPY(a,b) native.a = c.regs.a;
     PROBE_GPRS(COPY)
@@ -788,10 +865,28 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
 #else
         native.esp = (uint32_t)c.hit_sp; native.eip = (uintptr_t)(g_ret_thunks + c.ret_pop);
 #endif
+        if (c.called_original && scope.co_ran) {      // what the original left (see HitScope)
+            const uint64_t *seen = scope.co_seen, *post = scope.co_post.gpr;
+#if defined(_WIN64)
+            uintptr_t *regs[6] = {&native.rcx, &native.rdx, &native.r8, &native.r9, &native.r10, nullptr};
+            const uint64_t now[6] = {c.regs.rcx, c.regs.rdx, c.regs.r8, c.regs.r9, c.regs.r10, 0};
+            std::memcpy(&native.xmm0, scope.co_post.xmm, 6 * 16);
+#else
+            uintptr_t *regs[6] = {&native.ecx, &native.edx, nullptr, nullptr, nullptr, nullptr};
+            const uint64_t now[6] = {c.regs.rcx, c.regs.rdx, 0, 0, 0, 0};
+            std::memcpy(&native.xmm0, scope.co_post.xmm, 8 * 16);
+#endif
+            for (int k = 0; k < 6; ++k)
+                if (regs[k] && now[k] == seen[k]) *regs[k] = (uintptr_t)post[k];
+        }
+#if !defined(_WIN64)
+        if (c.called_original && scope.co_ran && x87_out) { std::memcpy(x87_out, scope.co_fpu, sizeof(scope.co_fpu)); x87 = true; }
+#endif
     } else if (c.returned || c.called_original) {
         warn_once(&c, c.returned ? "return_from could not be applied (no return thunk); the original runs"
                                  : "call_original without return_from -- the original runs again on fall-through");
     }
+    return x87;
 }
 
 // Entry point of every inline hit. It runs FIRST, before any C code that might call the
@@ -801,6 +896,16 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
 // does not (MXCSR always; AVX/AVX-512 when live, or unconditionally when the CPU cannot
 // report liveness), using intrinsics only -- then run the hit. The stub restores RFLAGS
 // (so the target's DF) on the way out.
+// x86: load an FNSAVE image (the original's x87 state, see call_mid). x64 never passes one.
+static inline void install_x87(const uint8_t *image) {
+#if defined(_WIN64)
+    (void)image;
+#else
+    __asm { mov eax, image
+            frstor [eax] }
+#endif
+}
+
 static __declspec(noinline) void mid_entry_saved(safetyhook::Context &native, uint32_t index, uint64_t mask) {
     alignas(64) unsigned char area[4096];
     __stosb(area + 512, 0, 64);                            // XSAVE header must start clean (no CRT call)
@@ -810,27 +915,39 @@ static __declspec(noinline) void mid_entry_saved(safetyhook::Context &native, ui
     if (g_xs.compact) _xsavec(area, mask); else _xsave(area, mask);
 #endif
     unsigned int mxcsr = _mm_getcsr();
-    call_mid(native, index);
+    alignas(16) uint8_t x87[108];
+    const bool put_x87 = call_mid(native, index, x87);
     _mm_setcsr(mxcsr);
 #if defined(_WIN64)
     _xrstor64(area, mask);
+    (void)put_x87;
 #else
     _xrstor(area, mask);
+    if (put_x87) install_x87(x87);
 #endif
 }
 
 static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
     __writeeflags(__readeflags() & ~(uintptr_t)0x400);    // DF=0 before ANY C code
     LONG xmode = shared->xstate_mode;                      // 0 gated (default), 1 none, 2 full (bench knob)
-    if (xmode == 1 || !g_xs.ok) { call_mid(native, index); return; }
+    alignas(16) uint8_t x87[108];
+    if (xmode == 1) { if (call_mid(native, index, x87)) install_x87(x87); return; }
+    if (!g_xs.ok) {                                        // no XSAVE: MXCSR at least
+        unsigned int mxcsr = _mm_getcsr();
+        const bool put_x87 = call_mid(native, index, x87);
+        _mm_setcsr(mxcsr);
+        if (put_x87) install_x87(x87);
+        return;
+    }
     uint64_t mask = 0;
     if (xmode == 2) mask = g_xs.mask;
     else if (g_xs.xinuse) mask = _xgetbv(1) & g_xs.avx_mask;  // only components actually live
     else mask = g_xs.avx_mask;                             // liveness unknown: keep AVX state
     if (mask) { mid_entry_saved(native, index, mask); return; }
     unsigned int mxcsr = _mm_getcsr();                     // the common case: just MXCSR
-    call_mid(native, index);
+    const bool put_x87 = call_mid(native, index, x87);
     _mm_setcsr(mxcsr);
+    if (put_x87) install_x87(x87);
 }
 
 // One entry thunk per request slot (the slot index is baked in), generated at compile time.
