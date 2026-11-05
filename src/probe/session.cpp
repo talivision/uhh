@@ -3026,6 +3026,30 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
     CloseHandle(thread); handled = true; return true;
 }
 
+// "exception 0xc0000005 at msvcp140.dll+0x1234 (read 0x0)" plus a hint for known causes.
+static std::string describe_fault(probe_session *s, const EXCEPTION_RECORD &ex, DWORD code, uint64_t address) {
+    std::string where; uint64_t best = 0;
+    for (const auto &m : s->module_bases)
+        if (m.second <= address && m.second > best) { best = m.second; where = m.first; }
+    char buf[256];
+    if (best) std::snprintf(buf, sizeof(buf), "exception 0x%08lx at %s+0x%llx", (unsigned long)code,
+                            where.c_str(), (unsigned long long)(address - best));
+    else std::snprintf(buf, sizeof(buf), "exception 0x%08lx at 0x%llx", (unsigned long)code, (unsigned long long)address);
+    std::string out = buf;
+    if (code == EXCEPTION_ACCESS_VIOLATION && ex.NumberParameters >= 2) {
+        std::snprintf(buf, sizeof(buf), " (%s 0x%llx)",
+                      ex.ExceptionInformation[0] == 8 ? "execute" : ex.ExceptionInformation[0] ? "write" : "read",
+                      (unsigned long long)ex.ExceptionInformation[1]);
+        out += buf;
+    }
+    std::string lower = where;
+    for (auto &ch : lower) ch = (char)std::tolower((unsigned char)ch);
+    if (lower.rfind("msvcp140", 0) == 0 || lower.rfind("vcruntime140", 0) == 0)
+        out += " -- the target's MSVC runtime is older than the one probe_api_agent.dll was built "
+               "against; rebuild UHH with -DUHH_STATIC_CRT=ON (the default)";
+    return out;
+}
+
 static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
                              std::unordered_map<DWORD, StepState> &stepping,
                              bool &initial_break, DWORD &disposition) {
@@ -3100,21 +3124,12 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         s->remote_fault.empty()) {
         // The agent's load/init thread faulted. If the target's own unhandled-exception
         // filter swallows it, all we would see is the thread's exit code: keep where it was.
-        std::string where; uint64_t best = 0;
-        for (const auto &m : s->module_bases)
-            if (m.second <= address && m.second > best) { best = m.second; where = m.first; }
-        char buf[192];
-        if (best) std::snprintf(buf, sizeof(buf), "exception 0x%08lx at %s+0x%llx", (unsigned long)code,
-                                where.c_str(), (unsigned long long)(address - best));
-        else std::snprintf(buf, sizeof(buf), "exception 0x%08lx at 0x%llx", (unsigned long)code, (unsigned long long)address);
-        s->remote_fault = buf;
-        if (code == EXCEPTION_ACCESS_VIOLATION && ex.NumberParameters >= 2) {
-            std::snprintf(buf, sizeof(buf), " (%s 0x%llx)",
-                          ex.ExceptionInformation[0] == 8 ? "execute" : ex.ExceptionInformation[0] ? "write" : "read",
-                          (unsigned long long)ex.ExceptionInformation[1]);
-            s->remote_fault += buf;
-        }
+        s->remote_fault = describe_fault(s, ex, code, address);
         std::fprintf(stderr, "probe: agent thread %s\n", s->remote_fault.c_str());
+    } else if (!event.u.Exception.dwFirstChance && code != PROBE_IPC_CODE) {
+        // Unhandled: the target is about to die. Say where, whatever the cause.
+        std::fprintf(stderr, "probe: target crashed: tid=%lu %s\n", (unsigned long)event.dwThreadId,
+                     describe_fault(s, ex, code, address).c_str());
     }
     if (trace_enabled() && code == EXCEPTION_ACCESS_VIOLATION && ex.NumberParameters >= 2) {
         unsigned char around[24] = {0}; size_t got = 0;

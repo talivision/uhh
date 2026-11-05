@@ -38,7 +38,10 @@ Missing binaries (an example not built) are reported as SKIP, not FAIL.
 import argparse
 import json
 import math
+import os
 import re
+import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1266,6 +1269,73 @@ def pe_cetcompat(path):
     return False
 
 
+def find_old_msvcp():
+    """A pre-14.40 msvcp140.dll of this build's bitness (before VS 17.10's constexpr std::mutex).
+    UHH_OLD_MSVCP names one; otherwise VS's bundled LLVM ships 14.29. None if not found."""
+    env = os.environ.get("UHH_OLD_MSVCP")
+    if env and Path(env).exists():
+        return Path(env)
+    d = (BIN / "uhh_trace.exe").read_bytes()[:4096]
+    pe = struct.unpack_from("<I", d, 0x3c)[0]
+    is64 = struct.unpack_from("<H", d, pe + 4)[0] == 0x8664
+    roots = [Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio",
+             Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Microsoft Visual Studio"]
+    for root in roots:
+        for cand in sorted(root.glob("*/*/VC/Tools/Llvm/x64/bin/msvcp140.dll" if is64 else
+                                     "*/*/VC/Tools/Llvm/bin/msvcp140.dll")):
+            return cand
+    return None
+
+
+def check_oldcrt(calls=2000):
+    """The target ships an OLDER msvcp140.dll next to its exe (app-local), as real software
+    does. The injected agent binds to the target's already-loaded msvcp140 by name, so an
+    agent built /MD against a newer runtime crashed in _Mtx_* (null read) during the inline
+    install (field report: probe_agent_init failed 0xc0000005 / 0xffffffff). With the static
+    CRT the agent is immune: every call is hit, the target finishes, no error."""
+    tracer, target = exe("uhh_trace.exe"), exe("oldcrt_target.exe")
+    if not tracer or not target:
+        return skip("oldcrt", "uhh_trace/oldcrt_target missing")
+    old = find_old_msvcp()
+    if not old:
+        return skip("oldcrt", "no pre-14.40 msvcp140.dll on this machine (set UHH_OLD_MSVCP)")
+    tmp = Path(tempfile.mkdtemp(prefix="uhh-oldcrt-"))
+    try:
+        shutil.copy2(target, tmp / "oldcrt_target.exe")
+        shutil.copy2(old, tmp / "msvcp140.dll")
+        for backend in ("inline", "breakpoint"):
+            name = f"oldcrt-{backend}"
+            try:
+                r, objs = run([tracer, "--backend", backend, "-p", "oldcrt_target.exe!Tick:-", "--",
+                               tmp / "oldcrt_target.exe", str(calls)], timeout=120)
+                info = next((o for o in objs if o.get("kind") == "oldcrt_target"), {})
+                done = next((o for o in objs if o.get("kind") == "oldcrt_done"), {})
+                rep = report(objs)
+                app_local = (tmp / "msvcp140.dll").resolve().as_posix().lower() == \
+                    Path(str(info.get("msvcp140", ""))).resolve().as_posix().lower()
+                ok = (r.returncode == 0 and app_local and done.get("calls") == calls and
+                      rep.get("hits") == calls and not rep.get("error"))
+                crash = next((l for l in r.stderr.splitlines() if "crashed" in l or "agent thread" in l), "")
+                record(name, ok, f"msvcp140={old.parent.name}/{old.name} app_local={app_local} "
+                                 f"hits={rep.get('hits')}/{calls} rc={r.returncode} error={rep.get('error')} {crash}")
+            except Exception as e:
+                record(name, False, repr(e))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def check_agent_crt():
+    """probe_api_agent.dll is injected into the target, so it must not import the dynamic
+    MSVC runtime: it would bind to whatever msvcp140/vcruntime140 the target already loaded,
+    and an older app-local msvcp140 crashes SafetyHook's std::mutex (_Mtx_* null read)."""
+    path = BIN / "probe_api_agent.dll"
+    if not path.exists():
+        return skip("agent-crt", "probe_api_agent.dll missing")
+    d = path.read_bytes().lower()
+    bad = [n for n in (b"msvcp140", b"vcruntime140", b"api-ms-win-crt-") if n in d]
+    record("agent-crt", not bad, "imports " + ",".join(n.decode() for n in bad) if bad else "static CRT")
+
+
 def check_cet(threads=8, reads=500):
     """Intel CET shadow stacks. cet_probe (linked /CETCOMPAT) reports what this machine
     gives such a process: CPUID CET_SS, the OS CET_U state, the process's
@@ -1742,6 +1812,8 @@ def main():
     if want(check_patch_race): check_patch_race()
     if want(check_emulated_sites): check_emulated_sites()
     if want(check_ret_probe): check_ret_probe()
+    if want(check_agent_crt): check_agent_crt()
+    if want(check_oldcrt): check_oldcrt()
     if want(check_cet): check_cet()
     if want(check_shared_mix): check_shared_mix()
     if want(check_gated_mem): check_gated_mem()

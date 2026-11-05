@@ -3,6 +3,16 @@ project(uhh LANGUAGES C CXX)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# Static CRT everywhere. probe_api_agent.dll is injected into the TARGET: with /MD it would
+# bind to whatever msvcp140/vcruntime140 the target already loaded -- an older app-local
+# msvcp140 crashes SafetyHook's std::mutex (constexpr mutex since VS 17.10: _Mtx_* null read).
+# The agent must carry its own runtime; everything else follows so libraries link together.
+option(UHH_STATIC_CRT "Link everything (the injected agent above all) against the static CRT" ON)
+if(UHH_STATIC_CRT)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+else()
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")   # for the oldcrt repro only
+endif()
 
 if(NOT WIN32)
     message(FATAL_ERROR "UHH is a Windows user-mode instrumentation library")
@@ -78,6 +88,13 @@ add_library(configparse SHARED examples/targets/configparse/configparse.c ${PARS
 target_link_options(configparse PRIVATE
     "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/configparse/configparse.def"
     "/MAP:$<TARGET_FILE_DIR:configparse>/configparse.map")
+
+# oldcrt_target: a /MD app as an OLDER toolset would have built it (no constexpr std::mutex),
+# so it runs on an app-local pre-14.40 msvcp140.dll -- regress `oldcrt` (the injected agent
+# must not be broken by the target's runtime).
+add_executable(oldcrt_target examples/targets/oldcrt/oldcrt_target.cpp)
+set_property(TARGET oldcrt_target PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+target_compile_definitions(oldcrt_target PRIVATE _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
 
 # probe_app EXPORTS its read site, so tools address it as probe_app.exe!ReadThunk.
 add_executable(probe_app examples/targets/probe_app/probe_app.cpp ${READ_SITE_ASM})
