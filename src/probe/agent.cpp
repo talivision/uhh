@@ -172,8 +172,9 @@ static bool looks_like_return(uint32_t addr) {
 //            256 KiB, and no int3 padding (CC CC: MSVC's inter-function fill) between
 //   UNKNOWN  an indirect call (call reg / [reg+disp]): the target cannot be known
 //   OTHER    a direct call to some other function (a stale value, or a tail-jumped callee)
-// Per frame: the lowest EXACT slot wins, then [ebp+4] while EBP still frames something
-// above the stack pointer, then the lowest UNKNOWN, then the lowest OTHER. EBP is kept or
+// Per frame: the lowest EXACT slot wins, then (frame 0 only) a call-encoding [esp], then
+// [ebp+4] while EBP still frames something above the stack pointer, then the lowest
+// UNKNOWN, then the lowest OTHER. EBP is kept or
 // recovered (an EBP-framed or EBP-saving callee leaves the caller's EBP just below its
 // return slot) as a bound and tie-break only.
 // No-fault rule: every stack read is inside the hit thread's TEB stack bounds, and every
@@ -218,18 +219,33 @@ static bool return_checked(X86Mem &m, uint32_t ret) {
     return ret >= 0x10000 && m.ok(ret - 7, 8, true) && looks_like_return(ret);
 }
 
-static uint32_t x86_follow_thunks(X86Mem &m, uint32_t t) {
-    for (int hop = 0; hop < 3 && m.ok(t, 6, true); ++hop) {
+// Does the function starting at t hold pc? (t <= pc, close, no int3 padding between.)
+static bool x86_contains(X86Mem &m, uint32_t t, uint32_t pc) {
+    if (t > pc || pc - t > X86_FN_MAX) return false;
+    if (pc == t) return true;
+    if (!m.ok(t, pc - t, true)) return false;
+    const unsigned char *q = (const unsigned char *)(uintptr_t)t;
+    for (uint32_t i = 0; i + 1 < pc - t; ++i)
+        if (q[i] == 0xCC && q[i + 1] == 0xCC) return false;                      // a function boundary
+    return true;
+}
+
+// The call target, then each thunk hop (E9 ILT jmp, FF 25 jmp [IAT]); EXACT if any of them
+// starts the function holding pc. Every hop is checked -- the first one too, because the
+// target may itself be an inline-hooked entry whose first bytes are now OUR jmp.
+static bool x86_target_holds(X86Mem &m, uint32_t t, uint32_t pc) {
+    for (int hop = 0; hop < 4; ++hop) {
+        if (x86_contains(m, t, pc)) return true;
+        if (hop == 3 || !m.ok(t, 6, true)) return false;
         const unsigned char *p = (const unsigned char *)(uintptr_t)t;
-        if (p[0] == 0xE9) { t = t + 5 + *(const int32_t *)(p + 1); continue; }   // jmp rel32 (ILT)
-        if (p[0] == 0xFF && p[1] == 0x25) {                                      // jmp [IAT]
+        if (p[0] == 0xE9) t = t + 5 + *(const int32_t *)(p + 1);
+        else if (p[0] == 0xFF && p[1] == 0x25) {
             const uint32_t slot = *(const uint32_t *)(p + 2);
-            if (!m.ok(slot, 4, false)) break;
-            t = *(const uint32_t *)(uintptr_t)slot; continue;
-        }
-        break;
+            if (!m.ok(slot, 4, false)) return false;
+            t = *(const uint32_t *)(uintptr_t)slot;
+        } else return false;
     }
-    return t;
+    return false;
 }
 
 static X86Ret x86_classify(X86Mem &m, uint32_t ret, uint32_t pc) {
@@ -242,15 +258,7 @@ static X86Ret x86_classify(X86Mem &m, uint32_t ret, uint32_t pc) {
         if (!m.ok(slot, 4, false)) return X86Ret::UNKNOWN;
         target = *(const uint32_t *)(uintptr_t)slot;
     } else return looks_like_return(ret) ? X86Ret::UNKNOWN : X86Ret::NO;
-    target = x86_follow_thunks(m, target);
-    if (target > pc || pc - target > X86_FN_MAX) return X86Ret::OTHER;
-    if (pc != target) {
-        if (!m.ok(target, pc - target, true)) return X86Ret::OTHER;
-        const unsigned char *q = (const unsigned char *)(uintptr_t)target;
-        for (uint32_t i = 0; i + 1 < pc - target; ++i)
-            if (q[i] == 0xCC && q[i + 1] == 0xCC) return X86Ret::OTHER;           // a function boundary
-    }
-    return X86Ret::EXACT;
+    return x86_target_holds(m, target, pc) ? X86Ret::EXACT : X86Ret::OTHER;
 }
 
 static uint32_t walk_x86(const probe_context *c, uint64_t *frames, uint32_t n, uint32_t cap) {
@@ -277,7 +285,10 @@ static uint32_t walk_x86(const probe_context *c, uint64_t *frames, uint32_t n, u
             if (k == X86Ret::UNKNOWN && !unknown) unknown = a;
             if (k == X86Ret::OTHER && !other) other = a;
         }
-        const uint32_t slot = exact ? exact : anchored ? bp + 4 : unknown ? unknown : other;
+        // Frame 0 only: a call-encoding [esp] is the return address (the site is a function's
+        // first instruction, e.g. reached by call reg) -- the controller applies the same rule.
+        const bool top = n == 1 && return_checked(m, rd(sp));
+        const uint32_t slot = exact ? exact : top ? sp : anchored ? bp + 4 : unknown ? unknown : other;
         if (!slot) break;
         const uint32_t ret = rd(slot);
         if (!ret) break;
@@ -291,6 +302,137 @@ static uint32_t walk_x86(const probe_context *c, uint64_t *frames, uint32_t n, u
         pc = ret; sp = slot + 4;
     }
     return n;
+}
+#endif
+
+#if defined(_WIN64)
+// ---- x64 frame 0 at an INLINE site ------------------------------------------------------
+// RtlVirtualUnwind decides "is pc in an epilogue?" by decoding the code AT pc. At a hooked
+// site that code is our jmp to the hook stub -- a jmp leaving the function, i.e. a tail-call
+// epilogue to the unwinder -- so it would take [rsp] as the return address and report
+// garbage for any site past a prolog that moved rsp. Frame 0 is therefore unwound here,
+// from the hook's ORIGINAL bytes: the epilogue check on them, else the function's unwind
+// codes (UNWIND_INFO), exactly as the OS unwinder interprets them. Later frames are return
+// addresses (not hooked code) and use RtlVirtualUnwind. Every read is range-checked.
+struct X64Stack { uint64_t lo, hi; bool ok(uint64_t a, uint64_t n) const { return a >= lo && a <= hi - n && hi >= n; } };
+
+static bool rd64(const X64Stack &st, uint64_t a, uint64_t &v) {
+    if (!st.ok(a, 8)) return false;
+    v = *(const uint64_t *)(uintptr_t)a; return true;
+}
+
+// The function's code as it was before the hook: original bytes over the patch, live after.
+static size_t original_code(uint64_t pc, uint64_t site, const std::vector<uint8_t> &orig,
+                            unsigned char *out, size_t cap) {
+    size_t n = 0;
+    for (uint64_t a = pc; n < cap; ++a, ++n) {
+        if (a >= site && a < site + orig.size()) { out[n] = orig[(size_t)(a - site)]; continue; }
+        if (!range_ok((uintptr_t)a, 1, false)) break;
+        out[n] = *(const unsigned char *)(uintptr_t)a;
+    }
+    return n;
+}
+
+// The canonical x64 epilogue: [add rsp,imm | lea rsp,[fp+d]] pop* (ret | jmp out). True
+// (and w unwound to the caller) when the code at w.Rip is one.
+static bool x64_epilogue(CONTEXT &w, const unsigned char *b, size_t n, uint64_t fn_lo, uint64_t fn_hi,
+                         const X64Stack &st) {
+    size_t k = 0; uint64_t *regs = &w.Rax;
+    uint64_t rsp = w.Rsp;
+    auto have = [&](size_t m) { return k + m <= n; };
+    if (have(4) && b[k] == 0x48 && b[k + 1] == 0x83 && b[k + 2] == 0xC4) { rsp += (int8_t)b[k + 3]; k += 4; }
+    else if (have(7) && b[k] == 0x48 && b[k + 1] == 0x81 && b[k + 2] == 0xC4) { rsp += *(const int32_t *)(b + k + 3); k += 7; }
+    else if (have(4) && (b[k] & 0xFE) == 0x48 && b[k + 1] == 0x8D && ((b[k + 2] >> 3) & 7) == 4 &&
+             (b[k + 2] >> 6) != 0 && (b[k + 2] >> 6) != 3 && (b[k + 2] & 7) != 4) {
+        const unsigned mod = b[k + 2] >> 6, reg = (b[k + 2] & 7) | ((b[k] & 1) << 3);
+        const size_t len = mod == 1 ? 4 : 7;
+        if (!have(len)) return false;
+        rsp = regs[reg] + (mod == 1 ? (int64_t)(int8_t)b[k + 3] : (int64_t)*(const int32_t *)(b + k + 3));
+        k += len;
+    }
+    uint64_t popped[16]; int preg[16]; int np = 0;
+    for (;;) {
+        if (have(1) && (b[k] & 0xF8) == 0x58) { if (np == 16) return false; preg[np++] = b[k] & 7; k += 1; continue; }
+        if (have(2) && b[k] == 0x41 && (b[k + 1] & 0xF8) == 0x58) { if (np == 16) return false; preg[np++] = 8 + (b[k + 1] & 7); k += 2; continue; }
+        break;
+    }
+    bool term = false;
+    if (have(1) && b[k] == 0xC3) term = true;
+    else if (have(2) && b[k] == 0xF3 && b[k + 1] == 0xC3) term = true;
+    else if (have(3) && b[k] == 0xC2) term = true;
+    else if (have(5) && b[k] == 0xE9) {
+        const uint64_t t = w.Rip + k + 5 + *(const int32_t *)(b + k + 1);
+        term = t < fn_lo || t >= fn_hi;                                      // tail call out
+    } else if ((have(6) && b[k] == 0xFF && b[k + 1] == 0x25) || (have(7) && b[k] == 0x48 && b[k + 1] == 0xFF && b[k + 2] == 0x25))
+        term = true;
+    if (!term) return false;
+    for (int i = 0; i < np; ++i) { if (!rd64(st, rsp, popped[i])) return false; rsp += 8; }
+    uint64_t ret = 0;
+    if (!rd64(st, rsp, ret)) return false;
+    for (int i = 0; i < np; ++i) regs[preg[i]] = popped[i];
+    w.Rip = ret; w.Rsp = rsp + 8;
+    return true;
+}
+
+// Apply a function's unwind codes (and its chain) to w; off = pc - function start.
+static bool x64_unwind_codes(CONTEXT &w, uint64_t image, const RUNTIME_FUNCTION *fn, uint64_t off,
+                             const X64Stack &st) {
+    uint64_t *regs = &w.Rax;
+    for (int depth = 0; depth < 8; ++depth) {
+        const uint64_t ui = image + fn->UnwindData;
+        if (!range_ok((uintptr_t)ui, 4, false)) return false;
+        const unsigned char *h = (const unsigned char *)(uintptr_t)ui;
+        const unsigned flags = h[0] >> 3, prolog = h[1], count = h[2], fp = h[3] & 15, fpoff = h[3] >> 4;
+        if (!range_ok((uintptr_t)ui + 4, count * 2 + 12, false)) return false;
+        const uint16_t *codes = (const uint16_t *)(uintptr_t)(ui + 4);
+        const bool in_prolog = depth == 0 && off < prolog;
+        for (unsigned i = 0; i < count;) {
+            const unsigned at = codes[i] & 0xFF, op = (codes[i] >> 8) & 15, info = codes[i] >> 12;
+            unsigned slots = op == 1 ? (info ? 3 : 2) : (op == 4 || op == 8 || op == 6) ? 2 : (op == 5 || op == 9) ? 3 : 1;
+            if (i + slots > count) return false;
+            if (in_prolog && at > off) { i += slots; continue; }            // not executed yet
+            uint64_t v = 0;
+            switch (op) {
+            case 0: if (!rd64(st, w.Rsp, v)) return false; regs[info] = v; w.Rsp += 8; break;   // PUSH_NONVOL
+            case 1: w.Rsp += info ? *(const uint32_t *)&codes[i + 1] : codes[i + 1] * 8ull; break; // ALLOC_LARGE
+            case 2: w.Rsp += info * 8ull + 8; break;                                                // ALLOC_SMALL
+            case 3: w.Rsp = regs[fp] - 16ull * fpoff; break;                                        // SET_FPREG
+            case 4: if (!rd64(st, w.Rsp + codes[i + 1] * 8ull, v)) return false; regs[info] = v; break;
+            case 5: if (!rd64(st, w.Rsp + *(const uint32_t *)&codes[i + 1], v)) return false; regs[info] = v; break;
+            case 6: case 8: case 9: break;                                    // EPILOG (v2), SAVE_XMM128[_FAR]
+            case 10: {                                                        // PUSH_MACHFRAME
+                const uint64_t base = w.Rsp + (info ? 8 : 0);
+                uint64_t rip = 0, rsp = 0;
+                if (!rd64(st, base, rip) || !rd64(st, base + 24, rsp)) return false;
+                w.Rip = rip; w.Rsp = rsp; return true;
+            }
+            default: return false;
+            }
+            i += slots;
+        }
+        if (!(flags & UNW_FLAG_CHAININFO)) break;
+        fn = (const RUNTIME_FUNCTION *)(uintptr_t)(ui + 4 + ((count + 1) & ~1u) * 2);
+        if (!range_ok((uintptr_t)fn, sizeof(*fn), false)) return false;
+    }
+    uint64_t ret = 0;
+    if (!rd64(st, w.Rsp, ret)) return false;
+    w.Rip = ret; w.Rsp += 8;
+    return true;
+}
+
+static bool x64_unwind_hooked(CONTEXT &w, uint64_t site, const std::vector<uint8_t> &orig, const X64Stack &st) {
+    DWORD64 image = 0;
+    PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(w.Rip, &image, nullptr);
+    unsigned char b[32];
+    const size_t n = original_code(w.Rip, site, orig, b, sizeof(b));
+    if (!fn) {                                                                // leaf: [rsp]
+        uint64_t ret = 0;
+        if (!rd64(st, w.Rsp, ret)) return false;
+        w.Rip = ret; w.Rsp += 8; return true;
+    }
+    const uint64_t lo = image + fn->BeginAddress, hi = image + fn->EndAddress;
+    if (x64_epilogue(w, b, n, lo, hi, st)) return true;
+    return x64_unwind_codes(w, image, fn, w.Rip - lo, st);
 }
 #endif
 
@@ -309,8 +451,18 @@ static uint32_t capture_stack(probe_context *c, uint64_t *frames, uint32_t cap) 
     w.R12 = c->regs.r12; w.R13 = c->regs.r13; w.R14 = c->regs.r14; w.R15 = c->regs.r15;
     const NT_TIB *tib = reinterpret_cast<const NT_TIB *>(NtCurrentTeb());
     const DWORD64 stack_lo = (DWORD64)tib->StackLimit, stack_hi = (DWORD64)tib->StackBase;
+    const X64Stack st{stack_lo, stack_hi};
+    const auto *state = static_cast<const AgentState *>(c->controller);
+    const std::vector<uint8_t> *orig = state && state->index < PROBE_AGENT_MAX_PROBES && hooks[state->index]
+                                       ? &hooks[state->index].original_bytes() : nullptr;
     __try {
-        while (n < cap) {
+        // Frame 0 sits ON the hook's patched bytes: unwind it from the original code.
+        bool walk = true;
+        if (orig && n < cap && c->regs.pc == sites[state->index]) {
+            walk = w.Rsp >= stack_lo && w.Rsp < stack_hi && x64_unwind_hooked(w, c->regs.pc, *orig, st) && w.Rip;
+            if (walk) frames[n++] = w.Rip;
+        }
+        while (walk && n < cap) {
             if (w.Rsp < stack_lo || w.Rsp >= stack_hi) break;   // unwound off this thread's stack
             DWORD64 image = 0;
             PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(w.Rip, &image, nullptr);

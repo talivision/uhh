@@ -62,7 +62,7 @@ identical source under every backend.
 - ⬜ P2 threads started during the entry hold (TLS/DllMain thread calling the probed function)
 - 🔧 P2 refusal tests: PROBE_AT_RETURN, inline ONCE, 129th inline probe ✅; ALLOW_PREHOOKED inline assertion ⬜
 - ✅ P2 sidefx: full arithmetic EFLAGS (probe between cmp and jcc), LastStatus; below-SP documented as exempt
-- ⬜ P2 x86 stacks mid-function / FPO frames identical across backends
+- ✅ P2 x86 stacks mid-function / FPO frames identical across backends (examples/stacks; x86 inline: verified return-address scan; x64 inline: frame 0 unwound from the original bytes; remaining differences in docs/symbols.md)
 - ⬜ P2 mixed backends for state-sharing probes: documented limitation (state lives where callbacks run)
 
 ## Evaluator round 3 (2026-11-05) — open

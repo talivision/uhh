@@ -105,6 +105,65 @@ myapp+0x1052 [0x7ff612341052]
 `SymGetModuleBase64`. Its first returned frame is always the supplied program counter;
 later frames are callers recovered by DbgHelp.
 
+## Stacks per backend (`send_log_stack`)
+
+Every backend captures raw return addresses at the hit and symbolizes them at report
+time, so the same callback logs the same stack. The walkers differ:
+
+| Backend | x64 | x86 |
+|---|---|---|
+| breakpoint / hw | `StackWalk64` (controller, `.pdata`) | `StackWalk64` with the PDB's FPO / frame data, plus an `[esp]` return-address check at a function's first instruction |
+| inline | `RtlVirtualUnwind` in the target; frame 0 is unwound by the agent from the hook's **original** bytes | verified return-address scan in the target (`walk_x86` in `src/probe/agent.cpp`) |
+
+- **x64 inline, frame 0.** At a hooked site the code at `pc` is the hook's `jmp`.
+  `RtlVirtualUnwind` reads that as a tail-call epilogue and takes `[rsp]` as the return
+  address. The agent therefore unwinds the first frame itself: it runs the epilogue check
+  on the original bytes and then interprets the function's `UNWIND_INFO` codes, chained
+  entries included. Later frames are return addresses and go through `RtlVirtualUnwind`.
+- **x86 inline.** The agent cannot read PDBs at a hit, so it scans the stack upward
+  for return addresses. It ranks each candidate by the call instruction just before it:
+  - **exact:** a direct `call` (`E8`, or `FF 15` through the IAT, with `E9` and `FF 25`
+    thunks followed) whose target starts the function holding `pc`. "Starts the function"
+    means the target is at most 256 KiB below `pc`, with no `CC CC` padding between them.
+  - **unknown:** an indirect call.
+  - **other:** a direct call to a different function.
+
+  Within each frame it takes the lowest exact slot first. In frame 0 only, it next
+  takes `[esp]` if the bytes before it encode a call; this is the rule the controller
+  applies after dbghelp, and it covers a site at a function's first instruction reached
+  by `call reg`. Failing that, it takes `[ebp+4]` if EBP still points to a frame above
+  the stack pointer, then the lowest unknown slot, then the lowest other. This handles frames without a frame pointer
+  (`/Oy`), functions that hold data in EBP, mid-function sites and leaves without any
+  unwind data.
+
+  The agent never raises an exception the target can see. Stack reads stay inside the
+  thread's TEB stack bounds. Code and import-table reads stay inside regions that
+  `VirtualQuery` reported committed and readable; that cache is built per capture and
+  never reused across hits. Each frame scans at most 16 KiB, and each capture makes at
+  most 128 queries.
+- **Frame 0** is the probe site on every backend (`pc` of the hit), never the agent's
+  own frames.
+
+`regress.py`'s `stacks` check runs `examples/stacks` under all three backends. It probes
+a site mid-function in a function with a frame pointer, a site in a function without a
+frame pointer that stores data in EBP/RBP, and a leaf. Each chain is reached through
+optimised C callers built with `/Oy` on x86. The check requires `<site>, stk_outer_<x>,
+main` and identical symbolized stacks (addresses stripped) across backends on x64 and
+x86, all the way to `ntdll`.
+
+Remaining differences (x86 inline only; dbghelp uses the PDB and is unaffected):
+
+- A function without a frame pointer that was reached by an **indirect call or a tail
+  jump**, while EBP still points to an ancestor's frame, cannot be verified. The scan
+  then trusts `[ebp+4]` and omits that function's immediate caller.
+- Uninitialised locals holding stale return addresses can win over an unverifiable
+  true slot. They never win over a slot that verifies as exact.
+- A frame larger than 16 KiB without a frame pointer ends the walk.
+- x64 inline: only frame 0 is unwound from the original bytes. A return address that
+  lands inside ANOTHER inline hook's patched bytes would go through `RtlVirtualUnwind`
+  over live code. The site check refuses hooks over a call's return point, so this needs
+  a probe placed by `PROBE_ALLOW_UNSAFE_SITE`.
+
 `enumerate` uses `SymEnumSymbolsW`. Its mask is a DbgHelp wildcard such as `*`,
 `*Create*`, or `worker_*`. Each result contains its name, absolute address, size, and
 whether DbgHelp set `SYMFLAG_EXPORT`. PDB-only symbols have `export` set to `false`.
