@@ -23,10 +23,10 @@ without rebuilding the target, editing its config, or patching its files:
    status with `return_from`. The pid cannot be recovered from the handle later (helpers
    are opened with only `PROCESS_VM_READ`), so it is captured at the open -- for any
    caller, including `kernel32!OpenProcess` whose output slot dies as it returns.
- `log_read` on
-   `ntdll.dll!NtReadVirtualMemory` logs every read as
+   `log_read` on `ntdll.dll!NtReadVirtualMemory` logs every read as
    `read handle=0x.. pid=.. name=.. addr=0x.. size=..`. Regress `gated-map` checks every
-   map and read line against the handle the target's open really returned. Both are the ntdll syscall stubs, so every
+   map and read line against the handle the target's open really returned. Both are the
+   ntdll syscall stubs, so every
    caller is seen whichever wrapper it used (ReadProcessMemory, a direct ntdll call, a
    wrapper you do not know about) -- under every backend, inline included.
 
