@@ -1630,7 +1630,9 @@ def check_late_dll_worker():
     launch on <backend>, hits exactly from its first call (EDGE_CALLS). Its callback issues
     probe_add_address(LateNext, PROBE_INLINE) at the first hit (forwarded over IPC from an
     inline callback); LateNext is then called EDGE_CALLS times by the same thread and
-    EDGE_CALLS by a new thread: all 2*EDGE_CALLS seen."""
+    EDGE_CALLS by a new thread: all 2*EDGE_CALLS seen. (edge_count is an empty callback that
+    the linker folds with other empty exported callbacks of the agent DLL: the forwarded name
+    is an alias, which the controller must still map to its own copy.)"""
     if not exe("edge_driver.exe") or not exe("edge_target.exe"):
         return skip("late-dll-worker", "edge_driver/edge_target missing")
     for bk in ("breakpoint", "hw", "inline"):
