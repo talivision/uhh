@@ -581,13 +581,13 @@ extern "C" int probe_add_symbol_cfg(probe_session *s, const char *symbol, probe_
 }
 
 static volatile LONG g_stopping;
-// Callbacks running right now, striped in the SHARED block: what is still in flight when
-// the process dies (ExitProcess kills threads mid-callback) is reported by the controller.
+// Callbacks running right now are counted with their hits in the SHARED block (hit_stripes'
+// high bits): what is still in flight when the process dies (ExitProcess kills threads
+// mid-callback) is reported by the controller as callbacks_interrupted.
 static thread_local int t_in_callback;
 static bool any_inflight() {
     if (!shared) return false;
-    for (auto &x : shared->inflight) if (x.value) return true;
-    return false;
+    return probe_agent_inflight(shared) != 0;
 }
 
 // XSAVE support, probed once: mask = XCR0 restricted to x87|SSE|AVX|AVX-512 components.
@@ -648,15 +648,21 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     // cannot take down the target. On a fault we skip register write-back, leaving the
     // target's registers untouched (the callback behaves as a no-op mutation).
     uint32_t stripe = (GetCurrentThreadId() >> 2) & (PROBE_AGENT_STRIPES - 1);
-    InterlockedIncrement64(&shared->hit_stripes[index][stripe].value);
-    if (g_stopping) return;                                // being unhooked: pass straight through
+    volatile LONG64 &cell = shared->hit_stripes[index][stripe].value;
+    // ONE atomic add counts the hit and marks a callback in flight (see hit_stripes): a thread
+    // killed between two separate counters left a hit that was neither logged nor interrupted.
+    InterlockedExchangeAdd64(&cell, 1 + PROBE_AGENT_INFLIGHT_ONE);
+    if (g_stopping) {                                      // being unhooked: pass straight through
+        InterlockedExchangeAdd64(&cell, -PROBE_AGENT_INFLIGHT_ONE); return;
+    }
     // A probe hit by code the callback itself runs (call_func of a probed function, or a
     // probed API called directly) is counted but does not re-enter a callback -- exactly
     // what breakpoint/hw do inside call_func. Re-entering recursed until the stack overflowed.
     // (No TLS yet -- a thread in loader init, see region_cache -- means no callback is running
     // on it; in_call_func covers this thread's call_func whatever its TLS state.)
-    if (in_call_func(GetCurrentThreadId()) || (tls_ready() && t_in_callback)) return;
-    InterlockedIncrement64(&shared->inflight[stripe].value);
+    if (in_call_func(GetCurrentThreadId()) || (tls_ready() && t_in_callback)) {
+        InterlockedExchangeAdd64(&cell, -PROBE_AGENT_INFLIGHT_ONE); return;
+    }
     // The mid-hook stub preserves GPRs, flags and XMM0-15 only. The callback (and the CRT
     // it calls) may touch x87/MXCSR/YMM/ZMM state -- e.g. vzeroupper -- which the target
     // could be relying on at a mid-function site. Save and restore the full extended state
@@ -667,7 +673,7 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     if (tls) t_in_callback = 1;
     bool callback_ok = run_callback(callbacks[index], &c);
     if (tls) t_in_callback = 0;
-    InterlockedDecrement64(&shared->inflight[stripe].value);
+    InterlockedExchangeAdd64(&cell, -PROBE_AGENT_INFLIGHT_ONE);
     if (!callback_ok) return;
 #if defined(_WIN64)
 #define COPY(a,b) native.a = c.regs.a;

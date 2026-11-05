@@ -4425,7 +4425,7 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
     // holds the thread). Their hits are counted; any log they would have sent never existed.
     uint64_t interrupted = 0;
     if (s->exited && s->shared)
-        for (const auto &x : s->shared->inflight) interrupted += (uint64_t)(x.value > 0 ? x.value : 0);
+        interrupted = probe_agent_inflight(s->shared);
     std::fprintf(out, "{\"kind\":\"probe_report\",\"probes\":%llu,\"active\":%llu,"
                  "\"hits\":%llu,\"overrides\":%llu,\"log_dropped\":%llu,\"callbacks_interrupted\":%llu,"
                  "\"logs_written\":%llu,\"controller_peak_ws_mb\":%llu,\"app_exit\":%lu,\"error\":",

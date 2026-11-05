@@ -10,7 +10,7 @@
 #include <cstdio>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 13;
+constexpr uint32_t PROBE_AGENT_VERSION = 14;
 constexpr uint32_t PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH = 1u << 9;   /* agent side only needs this one */   /* == PROBE_UNSAFE_FAST_PATCH (asserted in session.cpp) */
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 128;   /* inline probes per session; the 129th is refused */
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
@@ -101,17 +101,28 @@ struct probe_agent_shared {
     volatile LONG64 drain_beat;    /* bumped by the controller's drainer every loop: liveness */
     volatile LONG xstate_mode;     /* benchmark knob: 0 = default (gated), 1 = none, 2 = full */
     volatile LONG controller_gone; /* set when the controller stops consuming (detach/close): log calls return at once */
+    /* Per probe, striped by thread: the low 48 bits count hits, the high 16 bits count
+       callbacks running now. One atomic add does both, so a thread killed at ANY instant
+       (process exit) leaves hits == logs + dropped + interrupted exactly. Non-zero in-flight
+       after the target exited = callbacks cut off by the process dying. */
     probe_agent_stripe hit_stripes[PROBE_AGENT_MAX_PROBES][PROBE_AGENT_STRIPES];
     probe_agent_request requests[PROBE_AGENT_MAX_PROBES];
     probe_agent_log logs[PROBE_AGENT_LOG_CAP];
-    /* inline callbacks running now (striped by thread). Non-zero after the target exited
-       = callbacks cut off by the process dying (their logs were never produced). */
-    probe_agent_stripe inflight[PROBE_AGENT_STRIPES];
 };
+
+constexpr LONG64 PROBE_AGENT_INFLIGHT_ONE = 1LL << 48;   /* one running callback in a hit_stripes cell */
 
 inline uint64_t probe_agent_hits(const probe_agent_shared *sh, uint32_t index) {
     uint64_t n = 0;
-    for (uint32_t i = 0; i < PROBE_AGENT_STRIPES; ++i) n += (uint64_t)sh->hit_stripes[index][i].value;
+    for (uint32_t i = 0; i < PROBE_AGENT_STRIPES; ++i)
+        n += (uint64_t)sh->hit_stripes[index][i].value & ((1ULL << 48) - 1);
+    return n;
+}
+
+inline uint64_t probe_agent_inflight(const probe_agent_shared *sh) {
+    uint64_t n = 0;
+    for (uint32_t p = 0; p < PROBE_AGENT_MAX_PROBES; ++p)
+        for (uint32_t i = 0; i < PROBE_AGENT_STRIPES; ++i) n += (uint64_t)sh->hit_stripes[p][i].value >> 48;
     return n;
 }
 
