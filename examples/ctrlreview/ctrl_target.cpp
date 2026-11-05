@@ -15,6 +15,13 @@
 //                                       SetThreadContext on itself, caught by its VEH) while
 //                                       UHH arms / releases hardware probes
 //   ctrl_target headcorrupt             write a huge log_head into the agent's shared section
+//   ctrl_target faultreg [--n N]        the probed load faults; the VEH repairs it by pointing the
+//                                       base register at valid memory and retries (cdx-faultreg)
+//   ctrl_target owndrx [--n N]          the target's own watch on an address UHH watched once and
+//                                       released, from a thread that existed then (cdx-owndrx)
+//   ctrl_target absreuse                absolute INT3 in an unloaded DLL; its address reused (cdx-absreuse)
+//   ctrl_target int3cap [--n N]         N armed INT3s read back with get_mem (cdx-int3cap)
+//   ctrl_target bigcfg                  a dynamic add with a > 64 MiB config (cdx-bigcfg)
 //
 // Each prints one {"kind":"ctrl_result",...} line.
 #define WIN32_LEAN_AND_MEAN
@@ -28,6 +35,19 @@
 
 extern "C" int CtrlLoad(const int *p);
 extern "C" uint32_t CtrlLoop(uint32_t tag);
+extern "C" void CtrlSled(void);
+
+// Codex-review sites (cdx-*): the probes' callbacks do the work (ctrl_callbacks.cpp).
+extern "C" __declspec(dllexport) __declspec(noinline) void CtrlOp(const void *addr, uintptr_t n, uintptr_t mode) {
+    static volatile uintptr_t sink[3];
+    sink[0] = (uintptr_t)addr; sink[1] = n; sink[2] = mode;
+}
+extern "C" __declspec(dllexport) __declspec(noinline) void CtrlWatchOnce(volatile LONG *var) {
+    static volatile void *sink; sink = (void *)var;
+}
+extern "C" __declspec(dllexport) __declspec(noinline) void CtrlBigCfg(void) {
+    static volatile int sink; sink = 1;
+}
 
 extern "C" __declspec(dllexport) __declspec(noinline) void CtrlAnnounce(void *work, void *counter) {
     static volatile void *sink[2];
@@ -240,6 +260,110 @@ static int run_owndr(int n) {
     return 0;
 }
 
+// ---- cdx-faultreg: the VEH repairs the fault by changing a REGISTER and retries ----------
+static int g_good = 42;
+static volatile LONG g_fix = 0;
+static LONG CALLBACK faultreg_veh(EXCEPTION_POINTERS *e) {
+    const DWORD code = e->ExceptionRecord->ExceptionCode;
+    if (code == EXCEPTION_SINGLE_STEP) {
+        InterlockedIncrement(&g_stray);
+        e->ContextRecord->EFlags &= ~0x100u;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (code != EXCEPTION_ACCESS_VIOLATION || e->ExceptionRecord->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    char *a = (char *)e->ExceptionRecord->ExceptionInformation[1];
+    if (!g_page || a < g_page || a >= g_page + 4096) return EXCEPTION_CONTINUE_SEARCH;
+    if (e->ContextRecord->EFlags & 0x100u) InterlockedIncrement(&g_tf);
+#if defined(_WIN64)
+    e->ContextRecord->Rcx = (DWORD64)(uintptr_t)&g_good;     // the faulting load's base register
+#else
+    e->ContextRecord->Ecx = (DWORD)(uintptr_t)&g_good;
+#endif
+    InterlockedIncrement(&g_fix);
+    return EXCEPTION_CONTINUE_EXECUTION;                     // retry the load at the probe site
+}
+static int run_faultreg(int n) {
+    PVOID h = AddVectoredExceptionHandler(1, faultreg_veh);
+    char *p = (char *)VirtualAlloc(nullptr, 4096, MEM_RESERVE, PAGE_NOACCESS);
+    if (!p) { std::printf("{\"kind\":\"ctrl_result\",\"error\":\"alloc\"}\n"); return 1; }
+    long long sum = 0;
+    g_page = p;
+    for (int i = 0; i < n; ++i) sum += CtrlLoad((const int *)p);
+    g_page = nullptr;
+    VirtualFree(p, 0, MEM_RELEASE);
+    RemoveVectoredExceptionHandler(h);
+    std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"faultreg\",\"n\":%d,\"fix\":%ld,\"tf\":%ld,"
+                "\"stray\":%ld,\"sum\":%lld}\n", n, g_fix, g_tf, g_stray, sum);
+    return 0;
+}
+
+// ---- cdx-owndrx: the target's own watch on an address UHH watched once and released -----
+static volatile LONG g_var3 = 0;
+static LONG g_wx[4] = {-1, -1, -1, -1};
+static DWORD WINAPI owndrx_thread(void *) {           // exists BEFORE UHH's release
+    t_mine = true;
+    WaitForSingleObject(g_go, INFINITE);
+    const int fm = free_slot_mask();
+    for (int k = 3; k >= 0; --k) {
+        if (!(fm & (1 << k))) continue;
+        if (!set_own_watch(k, &g_var3, true)) { g_wx[k] = -2; continue; }
+        const LONG before = t_traps;
+        for (int i = 0; i < g_n; ++i) g_var3 = g_var3 + 1;
+        set_own_watch(k, &g_var3, false);
+        g_wx[k] = t_traps - before;
+    }
+    return 0;
+}
+static int run_owndrx(int n) {
+    g_n = n;
+    PVOID h = AddVectoredExceptionHandler(1, owndr_veh);
+    g_go = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE w = CreateThread(nullptr, 0, owndrx_thread, nullptr, 0, nullptr);
+    CtrlWatchOnce(&g_var3);                            // UHH: one-shot watch on g_var3
+    g_var3 = 1;                                        // fires (this thread), released
+    SetEvent(g_go);
+    WaitForSingleObject(w, INFINITE);
+    RemoveVectoredExceptionHandler(h);
+    std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"owndrx\",\"n\":%d,\"w\":[%ld,%ld,%ld,%ld]}\n",
+                n, g_wx[0], g_wx[1], g_wx[2], g_wx[3]);
+    return 0;
+}
+
+// ---- cdx-absreuse: an absolute INT3 in a DLL that unloads; its address is then reused -----
+static int run_absreuse() {
+    HMODULE m = LoadLibraryA("ctrl_dll.dll");
+    if (!m) { std::printf("{\"kind\":\"ctrl_result\",\"error\":\"load\"}\n"); return 1; }
+    work_fn work = (work_fn)GetProcAddress(m, "CtrlDllWork");
+    const uintptr_t at = (uintptr_t)work;
+    CtrlOp((const void *)at, 1, 0);                    // UHH: software breakpoint at CtrlDllWork
+    long long sum = work(1);
+    FreeLibrary(m);                                    // the breakpoint is retired with the DLL
+    // Reuse the range: new memory at the same address holds a REAL 0xCC there.
+    void *r = VirtualAlloc((void *)(at & ~(uintptr_t)0xFFFF), 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    const bool reused = r == (void *)(at & ~(uintptr_t)0xFFFF);
+    if (reused) std::memset((void *)(at & ~(uintptr_t)0xFFF), 0xCC, 4096);
+    if (reused) CtrlOp((const void *)at, 16, 1);       // get_mem must read the 16 0xCC bytes
+    std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"absreuse\",\"reused\":%d,\"sum\":%lld}\n",
+                reused ? 1 : 0, sum);
+    return 0;
+}
+
+// ---- cdx-int3cap: more armed software breakpoints than the agent's INT3 table used to hold --
+static int run_int3cap(int n) {
+    CtrlOp((const void *)&CtrlSled, (uintptr_t)n, 0);  // UHH: a breakpoint on each sled byte
+    CtrlOp((const void *)&CtrlSled, (uintptr_t)n, 1);  // get_mem must read the program's bytes
+    std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"int3cap\",\"n\":%d}\n", n);
+    return 0;
+}
+
+// ---- cdx-bigcfg: a dynamic add with a config over 64 MiB ------------------------------------
+static int run_bigcfg() {
+    CtrlBigCfg();                                      // the callback adds CtrlTock with the big config
+    const int r = CtrlTock(5);
+    std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"bigcfg\",\"r\":%d}\n", r);
+    return 0;
+}
+
 // ---- headcorrupt ---------------------------------------------------------------------
 static int run_headcorrupt() {
     CtrlTick(nullptr);                                   // one probe hit (the agent is up)
@@ -268,6 +392,11 @@ int main(int argc, char **argv) {
     else if (sc == "symunload") rc = run_symunload(arg_int(argc, argv, "--cycles", 4), arg_int(argc, argv, "--n", 1500));
     else if (sc == "owndr") rc = run_owndr(arg_int(argc, argv, "--n", 50));
     else if (sc == "headcorrupt") rc = run_headcorrupt();
+    else if (sc == "faultreg") rc = run_faultreg(arg_int(argc, argv, "--n", 200));
+    else if (sc == "owndrx") rc = run_owndrx(arg_int(argc, argv, "--n", 50));
+    else if (sc == "absreuse") rc = run_absreuse();
+    else if (sc == "int3cap") rc = run_int3cap(arg_int(argc, argv, "--n", 1200));
+    else if (sc == "bigcfg") rc = run_bigcfg();
     std::fflush(stdout);
     return rc;
 }

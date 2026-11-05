@@ -645,6 +645,36 @@ Fixture `examples/ctrlreview` (ctrl_target + ctrl_dll + ONE callback source), re
   `dr_ever` slot (detach path owned elsewhere). Test: `ctrl-owndr-*`
 - ✅ (8) **drain_final trusted log_head from shared memory**: a target writing a huge value hung the
   controller at exit. The loop is clamped to one ring (tail + PROBE_AGENT_LOG_CAP). Test: `ctrl-headclamp`
+## Codex controller review (library diff, 2026-11-06)
+Fixture `examples/ctrlreview` (scenarios owndrx / faultreg / absreuse / int3cap / bigcfg), regress `cdx-*`
+(`--only cdx-`), every check on breakpoint, hw and inline.
+- 🔧 (1) **A target-owned hardware breakpoint at an address UHH once probed with hw and released was
+  swallowed**: `retired_hw` kept the address "ours" forever, so the target's slot there was not its own,
+  its #DB was taken for a stale UHH event (and its DR cleared). Now a released address is ours on a thread
+  only until that thread's next debug event, and only if the thread has not run since the release
+  (registers unchanged: its event was queued before the release, when our DR clear can be lost -- see
+  enforce_owned_drs); then its image is cleared and the #DB swallowed as before. A thread that has run
+  since got our clear, so whatever it arms there afterwards is the target's. 📄 A context captured before
+  the release and restored after it by a handler already running then (NtContinue) brings our released
+  DR back as the program's own (passed on). Test: `cdx-owndrx-*` (a thread alive at the release arms its
+  own write watch on the address UHH watched once, in every free slot)
+- 🔧 (2) **WOW64 in-place fault restart compared registers**: an x86 handler that repairs the fault by
+  changing a register and retries at the probe site was a new hit (two callbacks for one execution; x64
+  recognises the restart by our trap flag). Now on x86 the restart is the faulted thread's next event being
+  the INT3 at the site, whatever its registers (the fault was dispatched to the program in between).
+  📄 x86: a handler that continues elsewhere and whose thread's very next event is a NEW call reaching the
+  same site is taken for the restart (no callback for that call). Test: `cdx-faultreg-*`
+- 🔧 (3) **Absolute software breakpoint retired on unload left the agent's INT3 table stale** (the
+  module-relative branch synced it): an inline get_mem at the reused address showed the old original byte
+  over a real 0xCC. Now synced. Test: `cdx-absreuse-*`
+- 🔧 (4) **Only the first 1024 software breakpoints entered the shared INT3 table**: past them inline
+  get_mem read UHH's 0xCC where breakpoint/hw read the program's byte. The table now holds 65536 entries
+  (PROBE_AGENT_VERSION 17, 1 MiB of the section, touched only as far as used) and, in a session with the
+  inline channel, the 65537th armed breakpoint is refused (documented in probe_api.h) instead of silently
+  missing from it. Test: `cdx-int3cap-*` (1200 breakpoints)
+- 🔧 (5) **A dynamic add from an inline callback refused configs over 64 MiB** (PROBE_IPC_CONFIG_MAX) while
+  breakpoint/hw accepted any size: the limit is now the API's 4 GB (UINT32_MAX bytes) on every backend,
+  documented in probe_api.h. Test: `cdx-bigcfg-*` (64 MiB + 4 KiB)
 ## New-app evaluator findings (2026-11-06, `examples/{filetrace,flagflip,regtrace}`, regress `newapp-*`)
 A new user wrote three tools in gated_config's style from README.md, probe_api.h and the
 examples alone. Each tool has a per-probe `--backend` option and a fixture that prints its

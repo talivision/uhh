@@ -119,7 +119,11 @@ enum probe_register {
    callback via get_session(c). From a callback, breakpoint/hw probes arm before the
    target resumes; an inline probe holds the calling thread until its hook is in. */
 probe_session *probe_session_create(void);
-/* "module+0xRVA" or "module!Export[+0xOFF]" -- resolved when the module loads. */
+/* "module+0xRVA" or "module!Export[+0xOFF]" -- resolved when the module loads.
+   Limits, the same on every backend and from a callback: a config is at most 4 GB
+   (UINT32_MAX bytes); in a session that also has inline probes at most 65536 software-
+   breakpoint probes are armed at once (the next one is refused: inline get_mem must see the
+   program's byte under each of them). */
 int probe_add_symbol(probe_session *, const char *symbol, probe_callback, uint32_t flags);
 int probe_add_symbol_cfg(probe_session *, const char *symbol, probe_callback, uint32_t flags,
                          const void *config, size_t config_len);
@@ -270,7 +274,8 @@ void return_from(probe_context *, uint64_t value, int nargs);
    probe's callback must be EXPORTED (dllexport) by the module of the calling callback: an
    inline callback's request names it by export and the controller resolves that name there,
    so a non-exported callback is refused (0) on every backend. Configs and symbols have no
-   extra size limit from a callback; an inline probe's config may be any size too. */
+   extra size limit from a callback (a config's limit is 4 GB everywhere, see probe_add_symbol);
+   an inline probe's config may be that size too. */
 probe_session *get_session(probe_context *);
 
 #define PROBE_LOG(c, ...) send_log((c), __VA_ARGS__)

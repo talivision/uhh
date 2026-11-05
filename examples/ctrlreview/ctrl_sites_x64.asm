@@ -1,6 +1,6 @@
 ; Controller-review fixture sites (x64). See ctrl_target.cpp.
 OPTION CASEMAP:NONE
-PUBLIC CtrlLoad, CtrlLoadInsn, CtrlLoop, CtrlLoopInsn
+PUBLIC CtrlLoad, CtrlLoadInsn, CtrlLoop, CtrlLoopInsn, CtrlSled
 
 .code
 ; int CtrlLoad(const int *p): the probed instruction is the load itself (it faults on a
@@ -32,4 +32,10 @@ CtrlLoopInsn::
     nop
     ret
 CtrlLoop ENDP
+; CtrlSled: 1200 one-byte instructions, never executed -- the cdx-int3cap check arms a
+; software breakpoint on each (more than the agent's INT3 table used to hold).
+CtrlSled PROC
+    DB 1200 DUP (90h)
+    ret
+CtrlSled ENDP
 END

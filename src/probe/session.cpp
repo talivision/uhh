@@ -190,7 +190,18 @@ struct probe_session {
     std::vector<HANDLE> held;                  // threads held until inline installs confirm
     ULONGLONG held_since = 0;                       // slots we have ever owned (stale-#DB filter)
     std::unordered_set<uint64_t> retired_bps;  // removed INT3 sites (stale-hit filter)
-    std::unordered_set<uint64_t> retired_hw;   // addresses of released hardware probes (stale #DB filter)
+    // Released hardware probes (stale-#DB filter), per thread. A release clears the DR on every
+    // thread, but the write can be lost on a thread whose debug event is already QUEUED (see
+    // enforce_owned_drs): until that thread reports an event, a DR image of a released address
+    // on it may be our stale one. Each entry holds the thread's registers at the release; at its
+    // next event, unchanged registers mean it has not run since (that event was queued before
+    // the release) -> its image of those addresses is ours, cleared then and its #DB swallowed
+    // (hw_stale); changed registers mean it ran, so our clear reached it -> whatever it has armed
+    // since is the target's own. A released address is never the target's otherwise-forever.
+    struct HwUnsettled { CONTEXT regs{}; bool have_regs = false; std::unordered_set<uint64_t> addrs; };
+    std::unordered_map<DWORD, HwUnsettled> hw_unsettled;
+    DWORD hw_stale_tid = 0;                    // the thread of the event being handled, if it was unsettled
+    std::unordered_set<uint64_t> hw_stale;     // ...and the released addresses still ours on it
     std::vector<HANDLE> ipc_frozen;            // threads suspended for an agent hook write (FREEZE..THAW)
     DWORD ipc_freezer = 0;                     // the agent thread doing that write (0 = no freeze)
     int hw_active = 0;
@@ -226,10 +237,10 @@ struct probe_session {
     // Threads whose in-place step at a probe site faulted: the fault went to the target with
     // OUR trap flag in its context. If the target's handler continues execution there, the
     // INT3 is hit again (with TF set) -- the same execution restarting, not a new hit; if it
-    // continues elsewhere, the trap flag raises one stray step. thread -> probe site + registers.
+    // continues elsewhere, the trap flag raises one stray step. thread -> probe site.
     // A WOW64 (x86) handler's context comes back WITHOUT our trap flag: there the restart is
-    // recognised by the registers instead -- unchanged since the fault (snapshot below).
-    struct Refault { uint64_t site = 0; CONTEXT regs{}; };
+    // the thread's next event being the INT3 at the site (whatever registers it repaired).
+    struct Refault { uint64_t site = 0; };
     std::unordered_map<DWORD, Refault> refault;
 };
 
@@ -1387,14 +1398,21 @@ static void hw_rw_len(uint32_t flags, uint32_t &rw, uint32_t &len) {
 static uint64_t dr_address(const CONTEXT &c, int slot) {
     switch (slot) { case 0: return c.Dr0; case 1: return c.Dr1; case 2: return c.Dr2; default: return c.Dr3; }
 }
-static bool target_owns_slot(const probe_session *s, const CONTEXT &c, int slot) {
+// A released address is still ours on `tid` only while that thread is unsettled (see
+// probe_session::hw_unsettled); once it has run since the release, it is the target's.
+static bool hw_released_on(const probe_session *s, DWORD tid, uint64_t address) {
+    if (tid == s->hw_stale_tid && s->hw_stale.count(address)) return true;
+    const auto it = s->hw_unsettled.find(tid);
+    return it != s->hw_unsettled.end() && it->second.addrs.count(address);
+}
+static bool target_owns_slot(const probe_session *s, DWORD tid, const CONTEXT &c, int slot) {
     if (s->dr_used & (1u << slot)) return false;
     if (!((c.Dr7 >> (slot * 2)) & 3)) return false;
-    return !s->retired_hw.count(dr_address(c, slot));
+    return !hw_released_on(s, tid, dr_address(c, slot));
 }
-static uint8_t target_slots(const probe_session *s, const CONTEXT &c) {
+static uint8_t target_slots(const probe_session *s, DWORD tid, const CONTEXT &c) {
     uint8_t m = 0;
-    for (int k = 0; k < 4; ++k) if (target_owns_slot(s, c, k)) m |= (uint8_t)(1u << k);
+    for (int k = 0; k < 4; ++k) if (target_owns_slot(s, tid, c, k)) m |= (uint8_t)(1u << k);
     return m;
 }
 // Slots the target owns on ANY of its threads (debug registers are per thread).
@@ -1403,10 +1421,71 @@ static uint8_t target_slots_any(const probe_session *s) {
     for (DWORD tid : s->threads) {
         HANDLE t = OpenThread(THREAD_GET_CONTEXT, FALSE, tid);
         CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-        if (t && GetThreadContext(t, &c)) m |= target_slots(s, c);
+        if (t && GetThreadContext(t, &c)) m |= target_slots(s, tid, c);
         if (t) CloseHandle(t);
     }
     return m;
+}
+// The integer registers, IP, SP and flags: equal -> the thread has not run in between.
+static bool same_thread_regs(const CONTEXT &a, const CONTEXT &b) {
+#if defined(_WIN64)
+    return a.Rip == b.Rip && a.Rsp == b.Rsp && a.EFlags == b.EFlags && a.Rax == b.Rax && a.Rbx == b.Rbx &&
+           a.Rcx == b.Rcx && a.Rdx == b.Rdx && a.Rsi == b.Rsi && a.Rdi == b.Rdi && a.Rbp == b.Rbp && a.R8 == b.R8 &&
+           a.R9 == b.R9 && a.R10 == b.R10 && a.R11 == b.R11 && a.R12 == b.R12 && a.R13 == b.R13 && a.R14 == b.R14 &&
+           a.R15 == b.R15;
+#else
+    return a.Eip == b.Eip && a.Esp == b.Esp && a.EFlags == b.EFlags && a.Eax == b.Eax && a.Ebx == b.Ebx &&
+           a.Ecx == b.Ecx && a.Edx == b.Edx && a.Esi == b.Esi && a.Edi == b.Edi && a.Ebp == b.Ebp;
+#endif
+}
+// A hardware probe at `address` was just released (its DR cleared on every thread): until
+// each thread reports an event, an image of it there may be our stale one. A thread that has
+// run since an earlier release settled that one (our clear reached it): only the new counts.
+static void retire_hw_address(probe_session *s, uint64_t address) {
+    for (DWORD tid : s->threads) {
+        auto &u = s->hw_unsettled[tid];
+        CONTEXT now{}; now.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        HANDLE t = OpenThread(THREAD_GET_CONTEXT, FALSE, tid);
+        const bool got = t && GetThreadContext(t, &now);
+        if (t) CloseHandle(t);
+        if (got && u.have_regs && !same_thread_regs(u.regs, now)) u.addrs.clear();
+        if (got && (!u.have_regs || u.addrs.empty())) { u.regs = now; u.have_regs = true; }
+        u.addrs.insert(address);
+    }
+}
+// Re-armed by us: no image of it is stale any more.
+static void unretire_hw_address(probe_session *s, uint64_t address) {
+    s->hw_stale.erase(address);
+    for (auto it = s->hw_unsettled.begin(); it != s->hw_unsettled.end(); ) {
+        it->second.addrs.erase(address);
+        it = it->second.addrs.empty() ? s->hw_unsettled.erase(it) : std::next(it);
+    }
+}
+// At each debug event of `tid`, before it is handled: settle it (see hw_unsettled).
+static void settle_hw_thread(probe_session *s, DWORD tid) {
+    s->hw_stale_tid = 0; s->hw_stale.clear();
+    const auto it = s->hw_unsettled.find(tid);
+    if (it == s->hw_unsettled.end()) return;
+    probe_session::HwUnsettled u = std::move(it->second);
+    s->hw_unsettled.erase(it);
+    HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+    if (!t) return;
+    CONTEXT now{}; now.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS;
+    // Without a register snapshot nothing tells "has run" apart: keep the address ours.
+    if (GetThreadContext(t, &now) && (!u.have_regs || same_thread_regs(u.regs, now))) {
+        // Not run since the release: this event was queued before it, and our clear may not
+        // have landed. Its image of a released address is ours -- clear it now (a write at the
+        // thread's own event sticks) and treat this event's #DB from it as stale.
+        bool changed = false;
+        for (int slot = 0; slot < 4; ++slot) {
+            if ((s->dr_used & (1u << slot)) || !((now.Dr7 >> (slot * 2)) & 3) || !u.addrs.count(dr_address(now, slot))) continue;
+            now.Dr7 &= ~((decltype(now.Dr7))3 << (slot * 2)) & ~((decltype(now.Dr7))0xF << (16 + slot * 4));
+            changed = true;
+        }
+        if (changed) { now.ContextFlags = CONTEXT_DEBUG_REGISTERS; SetThreadContext(t, &now); }
+        s->hw_stale_tid = tid; s->hw_stale = std::move(u.addrs);
+    }
+    CloseHandle(t);
 }
 
 static void arm_thread_start_fixup(probe_session *s);
@@ -1437,7 +1516,7 @@ static bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
         set_error(s, win_error("set hardware breakpoint on target threads")); return false;
     }
     s->dr_used |= (uint8_t)(1u << slot); s->dr_ever |= (uint8_t)(1u << slot); ++s->hw_active;
-    s->retired_hw.erase(address);
+    unretire_hw_address(s, address);
     p.dr_slot = slot; p.base = base; p.address = address; p.active = true;
     std::fprintf(stderr, "probe: active %s -> base=0x%llx addr=0x%llx (hw DR%d, %s)\n",
                  p.location.c_str(), (unsigned long long)base, (unsigned long long)address, slot,
@@ -1447,6 +1526,15 @@ static bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
 }
 
 static void sync_int3_table(probe_session *s);
+// Armed software breakpoints: the entries of the agent's INT3 table (probe_agent_shared::int3).
+static bool int3_entry(const Probe &p) {
+    return p.active && (p.flags & PROBE_BREAKPOINT) && !p.orig_insn.empty() && p.address;
+}
+static size_t int3_armed(const probe_session *s) {
+    size_t n = 0;
+    for (const auto &p : s->probes) n += int3_entry(*p);
+    return n;
+}
 static bool arm_breakpoint(probe_session *s, Probe &p, uint64_t base) {
     if (p.rva > UINT64_MAX - base) { set_error(s, "probe address overflow"); return false; }
     uint64_t address = base + p.rva; size_t got{};
@@ -1477,6 +1565,11 @@ static bool arm_breakpoint(probe_session *s, Probe &p, uint64_t base) {
     uint32_t len = 0; bool disp_ok = false, rep_str = false; int riprel = -1;
     if (!decode_site(buf, sizeof(buf), len, disp_ok, riprel, &rep_str) || len == 0 || len > sizeof(buf)) {
         set_error(s, "could not decode probe site instruction"); return false;
+    }
+    if (s->shared && int3_armed(s) >= PROBE_AGENT_INT3_CAP) {   // the agent's copy must hold every one
+        set_error(s, "too many software breakpoints armed alongside inline probes (max " +
+                     std::to_string(PROBE_AGENT_INT3_CAP) + ")");
+        return false;
     }
     p.original = buf[0];
     p.orig_insn.assign(buf, buf + len);
@@ -2660,6 +2753,11 @@ extern "C" int probe_watch(probe_session *s, uint64_t address, probe_callback cb
 }
 
 static bool open_agent_section(probe_session *s, uint32_t count) {
+    if (int3_armed(s) > PROBE_AGENT_INT3_CAP) {          // the agent's INT3 copy could not hold them all
+        set_error(s, "too many software breakpoints armed alongside inline probes (max " +
+                     std::to_string(PROBE_AGENT_INT3_CAP) + ")");
+        return false;
+    }
     wchar_t name[64]; probe_agent_mapping_name(s->pi.dwProcessId, name);
     s->mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
                                     (DWORD)sizeof(probe_agent_shared), name);
@@ -2859,7 +2957,7 @@ static void clear_gates(probe_session *s) {
             if (t) { set_dr_on_thread(t, g.second, 0, false); CloseHandle(t); }
         }
         s->dr_used &= (uint8_t)~(1u << g.second);
-        s->retired_hw.insert(g.first);                       // a #DB already in flight is stale
+        retire_hw_address(s, g.first);                       // a #DB already in flight is stale
     }
     s->gates.clear();
 }
@@ -3256,11 +3354,11 @@ static uint64_t thread_scratch(probe_session *s, DWORD tid, uint64_t site) {
 // Fully release a hardware probe: clear its DR on every thread and free the slot.
 static void release_hw(probe_session *s, Probe &p) {
     if (p.dr_slot < 0) return;
-    if (p.address) s->retired_hw.insert(p.address);
     for (DWORD tid : s->threads) {
         HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
         if (t) { set_dr_on_thread(t, p.dr_slot, 0, false); CloseHandle(t); }
     }
+    if (p.address) retire_hw_address(s, p.address);
     s->dr_used &= (uint8_t)~(1u << p.dr_slot);
     if (s->hw_active > 0) --s->hw_active;
     p.active = false; p.dr_slot = -1;
@@ -3404,11 +3502,15 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
         return len <= cap && (!len || (remote_read(s->pi.hProcess, from, to, (size_t)len, &n) && n == len));
     };
     std::string name, symbol; std::vector<unsigned char> config;
-    bool fetched = req.callback_len <= PROBE_IPC_TEXT_MAX && req.symbol_len <= PROBE_IPC_TEXT_MAX &&
-                   req.config_len <= PROBE_IPC_CONFIG_MAX;
+    // The config limit is the API's, the same on every backend (probe_api.h: 4 GB); it used to
+    // be 64 MiB here only, so a dynamic add accepted by breakpoint/hw was refused inline.
+    const bool cfg_too_big = req.config_len > PROBE_IPC_CONFIG_MAX;
+    bool fetched = req.callback_len <= PROBE_IPC_TEXT_MAX && req.symbol_len <= PROBE_IPC_TEXT_MAX && !cfg_too_big;
     if (fetched) {
-        name.resize((size_t)req.callback_len); symbol.resize((size_t)req.symbol_len); config.resize((size_t)req.config_len);
-        fetched = fetch(req.callback, req.callback_len, PROBE_IPC_TEXT_MAX, name.data()) &&
+        try {
+            name.resize((size_t)req.callback_len); symbol.resize((size_t)req.symbol_len); config.resize((size_t)req.config_len);
+        } catch (const std::bad_alloc &) { fetched = false; }
+        fetched = fetched && fetch(req.callback, req.callback_len, PROBE_IPC_TEXT_MAX, name.data()) &&
                   fetch(req.symbol, req.symbol_len, PROBE_IPC_TEXT_MAX, symbol.data()) &&
                   fetch(req.config, req.config_len, PROBE_IPC_CONFIG_MAX, config.data());
     }
@@ -3433,7 +3535,9 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
     int32_t result = 0;
     struct CbTid { probe_session *s; ~CbTid() { s->cb_tid = 0; } } cb_tid_scope{s};
     s->cb_tid = event.dwThreadId;
-    if (!fetched) {
+    if (cfg_too_big) {
+        std::fprintf(stderr, "probe: error: probe config is larger than 4 GB\n");   // as probe_add_symbol_cfg says it
+    } else if (!fetched) {
         std::fprintf(stderr, "probe: dynamic add from inline callback: cannot read its arguments from the target\n");
     } else if (!cb) {
         std::fprintf(stderr, "probe: dynamic add from inline callback: no controller-side export '%s'\n", name.c_str());
@@ -3456,7 +3560,7 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
 // once) can be lost -- seen as a hw probe added from a callback (e.g. a return-address
 // probe) that never fires on that thread. Re-asserting our slots at the thread's own
 // event repairs it before it runs on.
-static void enforce_owned_drs(const probe_session *s, CONTEXT &c) {
+static void enforce_owned_drs(const probe_session *s, DWORD tid, CONTEXT &c) {
     for (int slot = 0; slot < 4; ++slot) {
         if (!(s->dr_ever & (1u << slot))) continue;
         const Probe *owner = nullptr;
@@ -3473,7 +3577,7 @@ static void enforce_owned_drs(const probe_session *s, CONTEXT &c) {
             default: c.Dr3 = (decltype(c.Dr3))owner->address; break;
             }
             dr7 = (dr7 & ~fieldmask) | ln | ((DWORD64)(((len & 3u) << 2) | (rw & 3u)) << (16 + slot * 4));
-        } else if (!(s->dr_used & (1u << slot)) && !target_owns_slot(s, c, slot)) {
+        } else if (!(s->dr_used & (1u << slot)) && !target_owns_slot(s, tid, c, slot)) {
             dr7 &= ~(ln | fieldmask);                           // our stale slot (never the target's own)
         }
         c.Dr7 = (decltype(c.Dr7))dr7;
@@ -3577,7 +3681,7 @@ static void sync_int3_table(probe_session *s) {
     MemoryBarrier();
     LONG n = 0;
     for (auto &p : s->probes)
-        if (p->active && (p->flags & PROBE_BREAKPOINT) && !p->orig_insn.empty() && p->address && n < (LONG)PROBE_AGENT_INT3_CAP) {
+        if (int3_entry(*p) && n < (LONG)PROBE_AGENT_INT3_CAP) {
             sh->int3[n].address = p->address; sh->int3[n].original = p->original; ++n;
         }
     sh->int3_count = n;
@@ -3704,7 +3808,7 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
     if (!thread) { set_error(s, win_error("open hw event thread")); return false; }
     CONTEXT native{}; native.ContextFlags = CONTEXT_ALL;
     if (!GetThreadContext(thread, &native)) { CloseHandle(thread); set_error(s, win_error("get hw context")); return false; }
-    const uint8_t theirs = target_slots(s, native);       // the target's own slots on this thread
+    const uint8_t theirs = target_slots(s, event.dwThreadId, native);       // the target's own slots on this thread
     if (!(native.Dr6 & 0xF & s->dr_used) && !(native.Dr6 & 0xF & theirs) && !(native.Dr6 & 0x4000) &&
         !(native.EFlags & 0x100u)) {
         // A #DB that is neither a trap-flag step (BS clear, TF clear) nor flagged in DR6 for
@@ -3852,7 +3956,7 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
     }
     {                              // repair a DR write lost while this thread's event was queued
         const auto d7 = native.Dr7, d0 = native.Dr0, d1 = native.Dr1, d2 = native.Dr2, d3 = native.Dr3;
-        enforce_owned_drs(s, native);
+        enforce_owned_drs(s, event.dwThreadId, native);
         if (d7 != native.Dr7 || d0 != native.Dr0 || d1 != native.Dr1 || d2 != native.Dr2 || d3 != native.Dr3)
             std::fprintf(stderr, "probe: repaired hardware breakpoint state on thread %lu (dr7 0x%llx -> 0x%llx)\n",
                          (unsigned long)event.dwThreadId, (unsigned long long)d7, (unsigned long long)native.Dr7);
@@ -4033,27 +4137,21 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     uint64_t address = (uint64_t)(uintptr_t)ex.ExceptionAddress;
     bool restart = false;            // this INT3 is a faulted in-place step restarting (see refault)
     if (auto rf = s->refault.find(event.dwThreadId); rf != s->refault.end() && step == stepping.end()) {
-        const probe_session::Refault was = rf->second;
-        const uint64_t site = was.site;
+        const uint64_t site = rf->second.site;
         s->refault.erase(rf);                              // one event decides
         if (code == EXCEPTION_BREAKPOINT || code == EXCEPTION_SINGLE_STEP) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
             CONTEXT w{}; w.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
             const bool got = t && GetThreadContext(t, &w);
             const bool tf = got && (w.EFlags & 0x100u);
-            // Without the flag (WOW64): the handler restored the faulting context unchanged --
-            // every integer register, SP and the arithmetic flags as at the fault.
-            const DWORD arith = 0x1 | 0x4 | 0x10 | 0x40 | 0x80 | 0x400 | 0x800;
 #if defined(_WIN64)
-            const bool same = got && w.Rax == was.regs.Rax && w.Rbx == was.regs.Rbx && w.Rcx == was.regs.Rcx &&
-                w.Rdx == was.regs.Rdx && w.Rsi == was.regs.Rsi && w.Rdi == was.regs.Rdi && w.Rbp == was.regs.Rbp &&
-                w.Rsp == was.regs.Rsp && w.R8 == was.regs.R8 && w.R9 == was.regs.R9 && w.R10 == was.regs.R10 &&
-                w.R11 == was.regs.R11 && w.R12 == was.regs.R12 && w.R13 == was.regs.R13 && w.R14 == was.regs.R14 &&
-                w.R15 == was.regs.R15 && (w.EFlags & arith) == (was.regs.EFlags & arith);
+            const bool same = false;       // x64: our trap flag in the restored context marks the restart
 #else
-            const bool same = got && w.Eax == was.regs.Eax && w.Ebx == was.regs.Ebx && w.Ecx == was.regs.Ecx &&
-                w.Edx == was.regs.Edx && w.Esi == was.regs.Esi && w.Edi == was.regs.Edi && w.Ebp == was.regs.Ebp &&
-                w.Esp == was.regs.Esp && (w.EFlags & arith) == (was.regs.EFlags & arith);
+            // WOW64 (x86): the handler's context comes back WITHOUT our trap flag. The fault was
+            // dispatched to the program, and this is the thread's next event: an INT3 at the
+            // site is its handler retrying the same execution, whatever registers it changed to
+            // repair the fault (comparing them took a repaired retry for a new hit: 2 callbacks).
+            const bool same = true;
 #endif
             if ((tf || same) && code == EXCEPTION_BREAKPOINT && address == site) {
                 restart = true;                            // same execution: no new hit
@@ -4106,13 +4204,13 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         // A trap at the address of a hardware probe we have RELEASED, raised before the
         // release reached this thread (its debug status no longer names the slot): ours,
         // stale. Clear our slots on the thread, step over with RF, and swallow it.
-        if (s->retired_hw.count(address) && !probe_any_at(s, address)) {
+        if (hw_released_on(s, event.dwThreadId, address) && !probe_any_at(s, address)) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
             CONTEXT w{}; w.ContextFlags = CONTEXT_DEBUG_REGISTERS | CONTEXT_CONTROL;
             if (t && GetThreadContext(t, &w)) {
                 for (int slot = 0; slot < 4; ++slot) {
                     if (!(s->dr_ever & (1u << slot)) || (s->dr_used & (1u << slot))) continue;   // keep live probes
-                    if (target_owns_slot(s, w, slot)) continue;                                 // and the target's own
+                    if (target_owns_slot(s, event.dwThreadId, w, slot)) continue;                                 // and the target's own
                     w.Dr7 &= ~((DWORD64)3 << (slot * 2)) & ~((DWORD64)0xF << (16 + slot * 4));
                 }
                 w.Dr6 = 0;
@@ -4215,10 +4313,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
                 // absorb the single stray step if the handler continues elsewhere.
                 if (event.u.Exception.dwFirstChance && address == step->second.site) {
                     probe_session::Refault rf; rf.site = step->second.site;
-                    HANDLE t = OpenThread(THREAD_GET_CONTEXT, FALSE, event.dwThreadId);
-                    rf.regs.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
-                    if (t && GetThreadContext(t, &rf.regs)) s->refault[event.dwThreadId] = rf;
-                    if (t) CloseHandle(t);
+                    s->refault[event.dwThreadId] = rf;
                 }
             }
             stepping.erase(step);
@@ -4805,6 +4900,7 @@ static void stop_drainer(probe_session *s) {
 // One debug event -> library state changes. Shared by probe_run and the detach path.
 static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposition) {
     disposition = DBG_CONTINUE; bool ok = true;
+    settle_hw_thread(s, event.dwThreadId);           // released hardware probes: still ours on it?
     switch (event.dwDebugEventCode) {
     case CREATE_PROCESS_DEBUG_EVENT: {
         s->threads.insert(event.dwThreadId);                 // initial thread (for HW DRs)
@@ -4848,6 +4944,7 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
         if (event.dwThreadId == s->ipc_freezer) ipc_thaw(s);       // agent thread died mid-write: never strand the rest
         s->threads.erase(event.dwThreadId);
         s->refault.erase(event.dwThreadId);
+        s->hw_unsettled.erase(event.dwThreadId);
         auto it = s->stepping.find(event.dwThreadId);
         if (ok && it != s->stepping.end()) {
             // Only the in-place path lifted the byte; a displaced step left it armed.
@@ -4911,6 +5008,7 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
                 release_hw(s, *p);
             } else {
                 p->active = false;
+                sync_int3_table(s);      // the agent's copy too: a stale entry masks reused memory
             }
             p->retired = true;
         }

@@ -2,7 +2,7 @@
 .686
 .model flat, C
 OPTION CASEMAP:NONE
-PUBLIC CtrlLoad, CtrlLoadInsn, CtrlLoop, CtrlLoopInsn
+PUBLIC CtrlLoad, CtrlLoadInsn, CtrlLoop, CtrlLoopInsn, CtrlSled
 
 .code
 CtrlLoad PROC
@@ -31,4 +31,10 @@ CtrlLoopInsn::
     nop
     ret
 CtrlLoop ENDP
+; CtrlSled: 1200 one-byte instructions, never executed -- the cdx-int3cap check arms a
+; software breakpoint on each (more than the agent's INT3 table used to hold).
+CtrlSled PROC
+    DB 1200 DUP (90h)
+    ret
+CtrlSled ENDP
 END

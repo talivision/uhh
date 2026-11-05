@@ -2,6 +2,8 @@
 // built into the agent DLL). The config carries the backend for runtime adds.
 #include "probe_api.h"
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define CTRL_EXPORT extern "C" __declspec(dllexport)
 
@@ -38,4 +40,39 @@ CTRL_EXPORT void ctrl_on_tick(probe_context *c) {
     if (!tock) { send_log(c, "tick"); return; }
     const int r = probe_add_address(get_session(c), tock, ctrl_on_tock, PROBE_HW | PROBE_ONCE);
     send_log(c, "%s tick add=%d", r == 1 ? "ok" : "FAIL", r);
+}
+
+// ---- Codex review fixtures (regress `cdx-*`) ----------------------------------------------
+// CtrlOp(addr, n, mode): mode 0 arms a software breakpoint on each of the n bytes at addr
+// (by address, from the callback); mode 1 reads them with get_mem and counts 0xCC bytes --
+// the program's bytes must show, never our INT3s, on every backend.
+CTRL_EXPORT void ctrl_on_op(probe_context *c) {
+    const uint64_t addr = get_func_arg(c, 0), n = get_func_arg(c, 1), mode = get_func_arg(c, 2);
+    if (mode == 0) {
+        int ok = 0;
+        for (uint64_t i = 0; i < n; ++i) ok += probe_add_address(get_session(c), addr + i, ctrl_on_work, PROBE_BREAKPOINT) == 1;
+        send_log(c, "op arm ok=%d/%d", ok, (int)n);
+        return;
+    }
+    static unsigned char buf[4096];
+    const size_t len = n < sizeof(buf) ? (size_t)n : sizeof(buf);
+    const int r = get_mem(c, addr, buf, len);
+    int cc = 0;
+    for (size_t i = 0; i < len; ++i) cc += buf[i] == 0xCC;
+    send_log(c, "op peek r=%d cc=%d n=%d first=%02x", r, cc, (int)len, buf[0]);
+}
+// CtrlWatchOnce(var): a one-shot data watch on var (released when it fires).
+CTRL_EXPORT void ctrl_on_wonce(probe_context *c) {
+    const int r = probe_watch(get_session(c), get_func_arg(c, 0), ctrl_on_watch, PROBE_WATCH_WRITE | PROBE_ONCE);
+    send_log(c, "%s wonce=%d", r == 1 ? "ok" : "FAIL", r);
+}
+// CtrlBigCfg(): a dynamic add with a config over 64 MiB (the old inline-only IPC bound).
+CTRL_EXPORT void ctrl_on_bigcfg(probe_context *c) {
+    const size_t n = ((size_t)64 << 20) + 4096;
+    unsigned char *cfg = (unsigned char *)malloc(n);
+    if (!cfg) { send_log(c, "FAIL bigcfg malloc"); return; }
+    memset(cfg, 0x5A, n);
+    const int r = probe_add_symbol_cfg(get_session(c), "ctrl_target.exe!CtrlTock", ctrl_on_tock, PROBE_BREAKPOINT, cfg, n);
+    free(cfg);
+    send_log(c, "%s bigcfg add=%d", r == 1 ? "ok" : "FAIL", r);
 }
