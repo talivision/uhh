@@ -1,6 +1,6 @@
 // probe_app: the target the gated_config and attach examples instrument.
 //
-//   probe_app [--helpers N] [--threads W] [--reads R] [--prehook] [--config k=v;...] [--no-wait]
+//   probe_app [--helpers N] [--threads W] [--reads R] [--pace P] [--prehook] [--config k=v;...] [--no-wait]
 //
 // 1. Spawn N helper processes (probe_app --helper). Each holds the same known 256-byte
 //    buffer (byte j == j) at the same address and prints nothing; probe_app prints one
@@ -16,6 +16,10 @@
 //    sees every handle being created -- then W threads x R reads of the helpers' buffers via
 //    NtReadVirtualMemory, through the hookable ReadThunk (exported, probe_app.exe!ReadThunk).
 //    Every read is verified; totals are reported as one {"kind":"app",...} JSON line.
+//
+// --pace P caps each read thread at about P reads per second (it sleeps when ahead of
+// schedule), so a long soak (scripts/soak.py) runs at a steady, sustainable rate for as long
+// as R / P seconds. Pacing changes only the timing: the reads, and the checksum, are the same.
 //
 // Read pattern (deterministic, so a filter on one pid + one address range selects an
 // exactly predictable count): global read i = t*R + k (thread t, its k-th read) reads
@@ -91,24 +95,35 @@ struct Helper {
         finish = CreateEventA(&sa, TRUE, FALSE, nullptr); require(finish != nullptr, "event");
         STARTUPINFOA si{}; si.cb = sizeof(si); si.dwFlags = STARTF_USESTDHANDLES;
         si.hStdOutput = wr; si.hStdError = GetStdHandle(STD_ERROR_HANDLE); si.hStdInput = nullptr;
+        // The helper also watches this process: it exits with it (no fixed timeout, so a
+        // soak may read it for hours) and never outlives a killed probe_app.
+        HANDLE parent{};
+        require(!!DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(), &parent,
+                                  SYNCHRONIZE, TRUE, 0), "parent handle");
         std::string exe = exe_path();
-        std::string command = "\"" + exe + "\" --helper " + std::to_string((uintptr_t)finish);
+        std::string command = "\"" + exe + "\" --helper " + std::to_string((uintptr_t)finish) + " " +
+                              std::to_string((uintptr_t)parent);
         // Only the pipe and event are inherited; no DEBUG_* flags, so a debugger on
         // probe_app does not follow the helpers.
         BOOL ok = CreateProcessA(exe.c_str(), command.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi);
-        CloseHandle(wr); if (!ok) { CloseHandle(rd); require(false, "helper launch"); }
+        CloseHandle(wr); CloseHandle(parent); if (!ok) { CloseHandle(rd); require(false, "helper launch"); }
         DWORD got = 0; BOOL read = ReadFile(rd, &hello, sizeof(hello), &got, nullptr); CloseHandle(rd);
         require(read && got == sizeof(hello) && hello.pid == pi.dwProcessId, "helper handshake");
         SetHandleInformation(finish, HANDLE_FLAG_INHERIT, 0);
     }
 };
 
-static int helper_main(const char *finish_handle) {
+static int helper_main(const char *finish_handle, const char *parent_handle) {
     static unsigned char data[kBufferSize];
     for (unsigned i = 0; i < kBufferSize; ++i) data[i] = (unsigned char)i;
     Hello h{(uint64_t)(uintptr_t)data, GetCurrentProcessId(), 0}; DWORD n{};
     require(!!WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), &h, sizeof(h), &n, nullptr) && n == sizeof(h), "helper write");
-    return WaitForSingleObject((HANDLE)(uintptr_t)_strtoui64(finish_handle, nullptr, 10), 600000) == WAIT_OBJECT_0 ? 0 : 2;
+    // Until probe_app says so (finish), or probe_app is gone. An old-style launch without the
+    // parent handle keeps the former 10-minute safety timeout.
+    HANDLE wait[2] = {(HANDLE)(uintptr_t)_strtoui64(finish_handle, nullptr, 10),
+                      parent_handle ? (HANDLE)(uintptr_t)_strtoui64(parent_handle, nullptr, 10) : nullptr};
+    DWORD r = WaitForMultipleObjects(parent_handle ? 2 : 1, wait, FALSE, parent_handle ? INFINITE : 600000);
+    return r == WAIT_OBJECT_0 ? 0 : 2;
 }
 
 // Find our helpers among ALL processes on the system, then open each one by PID.
@@ -170,9 +185,19 @@ static bool wait_for_key() {
 // --- Reads ------------------------------------------------------------------------
 struct ThreadResult { uint64_t success = 0, checksum = 0; std::string error; };
 
+static uint64_t g_pace = 0;   // --pace: reads per second per thread (0 = as fast as possible)
+
+static uint64_t qpc_now() { LARGE_INTEGER t{}; QueryPerformanceCounter(&t); return (uint64_t)t.QuadPart; }
+
 static void read_worker(std::vector<Helper> &helpers, uint64_t t, uint64_t reads, ThreadResult &r) {
     const uint64_t n = helpers.size();
+    LARGE_INTEGER freq{}; QueryPerformanceFrequency(&freq);
+    const uint64_t start = qpc_now();
     for (uint64_t k = 0; k < reads; ++k) {
+        if (g_pace && (k & 15) == 0) {          // ahead of schedule: sleep until read k is due
+            const double due = (double)k / (double)g_pace;
+            while ((double)(qpc_now() - start) / (double)freq.QuadPart < due) Sleep(1);
+        }
         uint64_t i = t * reads + k;
         Helper &h = helpers[(size_t)(i % n)];
         unsigned offset = kStride * (unsigned)((i / n) % kOffsets);
@@ -229,7 +254,7 @@ static LONG WINAPI report_unhandled(EXCEPTION_POINTERS *ep) {
 
 int main(int argc, char **argv) try {
     SetUnhandledExceptionFilter(report_unhandled);
-    if (argc == 3 && !std::strcmp(argv[1], "--helper")) return helper_main(argv[2]);
+    if ((argc == 3 || argc == 4) && !std::strcmp(argv[1], "--helper")) return helper_main(argv[2], argc == 4 ? argv[3] : nullptr);
     size_t helper_count = 4, threads = std::thread::hardware_concurrency();
     uint64_t reads = 1000;
     uint64_t decoy_opens = 0;
@@ -241,12 +266,13 @@ int main(int argc, char **argv) try {
         if (a == "--helpers") helper_count = (size_t)_strtoui64(next(), nullptr, 10);
         else if (a == "--threads") threads = (size_t)_strtoui64(next(), nullptr, 10);
         else if (a == "--reads") reads = _strtoui64(next(), nullptr, 10);
+        else if (a == "--pace") g_pace = _strtoui64(next(), nullptr, 10);
         else if (a == "--prehook") existing_hook = true;
         else if (a == "--config") { config = next(); for (auto &c : config) if (c == ';') c = '\n'; }
         else if (a == "--no-wait") wait = false;
         else if (a == "--decoy-opens") decoy_opens = _strtoui64(next(), nullptr, 10);
         else if (a == "--open-via") g_open_kernel32 = std::string(next()) == "kernel32";
-        else throw std::runtime_error("usage: probe_app [--helpers N] [--threads W] [--reads R] [--prehook] "
+        else throw std::runtime_error("usage: probe_app [--helpers N] [--threads W] [--reads R] [--pace P] [--prehook] "
                                       "[--config k=v;...] [--no-wait] [--decoy-opens N]");
     }
     require(helper_count >= 1 && helper_count <= 64 && threads >= 1 && threads <= 256 &&
