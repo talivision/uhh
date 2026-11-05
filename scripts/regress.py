@@ -805,7 +805,7 @@ def check_conformance():
             once_row = next((p for p in hw_rows if p.get("active") is False), {})
             watch_row = next((p for p in hw_rows if p.get("active") is True), {})
             ok = (not fails and not missing and tgt.get("arg_rewritten") == 10 and tgt.get("mem_written") == 10 and
-                  tgt.get("sp_moved") == 10 and
+                  tgt.get("sp_moved") == (0 if bk == "inline" else 10) and   # inline: set_reg(SP) refused (roadmap)
                   stack_ok and report(o).get("error") is None and report(o).get("log_dropped") == 0 and
                   later == 20 and once == 1 and once_row.get("hits") == 1 and watch_row.get("hits") == 3 and
                   len(hw_rows) == 2)

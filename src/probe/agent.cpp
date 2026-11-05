@@ -102,6 +102,10 @@ extern "C" uint64_t get_reg(probe_context *c, enum probe_register reg) {
 }
 extern "C" int set_reg(probe_context *c, enum probe_register reg, uint64_t value) {
     if (g_ctrl) return g_ctrl->set_reg(c, reg, value);
+    // Inline: the stack pointer cannot be changed yet -- SafetyHook's resume path keeps the
+    // saved registers just below it, so moving it would corrupt them. Refuse honestly
+    // (returns 0, nothing changes, nothing counted). Fix tracked: patch the resume stub.
+    if (reg == PROBE_REG_SP) return 0;
     uint64_t *slot = register_slot(c, reg); if (!slot) return 0;
     if (*slot != value) {
         *slot = value;
@@ -509,21 +513,6 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     native.ecx = (uint32_t)c.regs.rcx; native.edx = (uint32_t)c.regs.rdx;
     native.esi = (uint32_t)c.regs.rsi; native.edi = (uint32_t)c.regs.rdi;
     native.ebp = (uint32_t)c.regs.rbp;
-#endif
-    // set_reg(SP): SafetyHook resumes with sp = trampoline_sp and then `ret`, so put the
-    // resume address (the trampoline) just below the requested sp and point it there --
-    // after the ret the target runs on with exactly the sp the callback asked for (the
-    // same contract the breakpoint/hw backends implement).
-#if defined(_WIN64)
-    if (c.regs.rsp != native.rsp) {
-        auto slot = reinterpret_cast<uintptr_t *>((uintptr_t)c.regs.rsp - sizeof(uintptr_t));
-        *slot = native.rip; native.trampoline_rsp = reinterpret_cast<uintptr_t>(slot);
-    }
-#else
-    if ((uint32_t)c.regs.rsp != native.esp) {
-        auto slot = reinterpret_cast<uintptr_t *>((uintptr_t)(uint32_t)c.regs.rsp - sizeof(uintptr_t));
-        *slot = native.eip; native.trampoline_esp = reinterpret_cast<uintptr_t>(slot);
-    }
 #endif
 }
 

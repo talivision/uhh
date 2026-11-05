@@ -73,7 +73,7 @@ identical source under every backend.
 - 🔧 (#5) inline stack walk bounded by the thread's TEB stack limits + code reads range-checked (never faults); writes always re-validated (read cache kept across hits) -- VM verify pending
 - ✗ (#6) breakpoint/hw call_func hardening: deliberately not pursued (see call_func note above)
 - 🔧 (#7) call_func follows forwarded exports on breakpoint/hw (via the controller's copy of the same system DLL); conformance `call_func-forwarded` -- VM verify pending
-- 🔧 (#8) inline set_reg(SP) honoured via SafetyHook trampoline_rsp; conformance `sp_moved` (SpSite asm) on every backend -- VM verify pending
+- ⬜ (#8) inline set_reg(SP): currently REFUSED (returns 0) -- the trampoline_rsp approach overwrote saved registers when SP moves down. Real fix: patch SafetyHook's resume stub to `pop rsp; jmp [trampoline]` (also needed for CET) and make the context rsp writable; conformance `sp_moved` expects 0 for inline until then
 - 🔧 (#9) detach waits for in-flight agent work; agent install/stop serialized (SRW lock), no install after stop -- VM verify pending
 - 🔧 (#10) re-attach reuses the agent channel; agent re-arms on init -- VM verify pending (ntdll-churn-inline)
 - 🔧 (#11) every inline probe is accepted/retired before a failure is reported; (5 s hold timeout still a warning)
