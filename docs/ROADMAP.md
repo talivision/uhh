@@ -275,6 +275,45 @@ binaries (cmd, reg, sort), multi-threaded targets, launch vs attach, attach mid-
   busy threads leaves the target correct on every backend, 9 probes in one session (breakpoint/hw/
   inline mixed), `kernel32` import-stub sites (`jmp [imp]` + padding) inline-hooked fine, APC-
   interrupted alertable SleepEx unchanged, GetLastError via call_func exact on inline.
+## Blog-replica findings (2026-11-05, `examples/blogs`, regress `blog-*`)
+Well-known instrumentation scenarios (crypto-API monitor, registry Run-key monitor,
+DNS/socket logger, process-creation tracker, COM CLSID logger, 1 kHz game loop, attach to
+PowerShell + detach) under every backend, against an uninstrumented baseline.
+- ✅ (B1) hw: a #DB queued on one thread while another thread's callback armed a new DR
+  (a return probe added from a callback) arrived with DR6 == 0 and was passed to the
+  target -> **target killed by STATUS_SINGLE_STEP**. A #DB with empty DR6 at the address
+  of a live execute probe enabled on that thread is now treated as that probe's hit.
+  Test: `blog-crypto-naive-hw` (6 rounds), `blog-crypto-hw`
+- ✅ (B2) hw: a DR armed while a thread was between CREATE_THREAD and the end of its
+  start-up (LdrInitializeThunk's NtContinue restores the creation-time DR image) was
+  **silently lost on that thread for its lifetime** (crypto: one worker never hit the
+  runtime return probe, 100/120). Library INT3 at ntdll!RtlUserThreadStart, armed only
+  once a hw probe is armed after start-up while such threads exist, re-applies the DRs.
+  Test: `blog-crypto-naive-hw` (asserts every return captured), `blog-crypto-hw`
+- ✅ (B3) breakpoint/hw `call_func`: another thread's probe hit during the call ran its
+  callback NESTED on the controller thread -> a callback holding a lock across
+  `call_func` **deadlocked** (registry monitor: NtSetValueKey -> call_func NtQueryKey hung
+  on breakpoint and hw), and a nested `call_func` was refused. Other threads' code-probe
+  hits are now parked (rewound + suspended) until the call returns, then re-hit.
+  Test: `blog-registry-breakpoint/hw`
+- ✅ (B4) a forwarded export whose target module maps after the forwarding module
+  (`ole32!CoCreateInstance` -> combase) **failed the launch**; it now stays pending on the
+  target module. Also the inline pre-vet of such a name checked the module header
+  (base+0). Test: `blog-com-*`
+- ⬜ (B5) attach + inline into a CLR process (PowerShell): every thread is held while the
+  agent is injected; intermittently (1 of ~8 runs) a held thread blocks the injection
+  (loader/heap/CLR lock) and the hold lasts until the 5 s timeout or detach -- target
+  frozen, inline probe not live in that window (seen: hits=0, "released 19 held
+  thread(s) (detach)" at 2.5 s). Fix idea: hold only for the install itself (after the
+  agent is loaded and its service thread is up), not across LoadLibrary / thread start.
+  Test: `blog-pwsh-attach-detach-inline` (fails when it happens)
+- ⬜ (B6) API reality the docs should mention: `bcrypt!BCryptGenRandom` re-enters itself
+  (2 hits per call), so entry counts != API calls and a naive return-capture needs a 5th
+  hw slot; probes report every caller of a system export (CoCreateInstance 25 hits for 24
+  target calls). The examples filter; the per-backend limitations doc should say so.
+- ⬜ (B7) docs: per-hit cost seen as frame time at 1 kHz (`blog-game-*`, x64 VM): inline
+  p50 1 us / p99 10 us, 0 missed frames; hw p50 ~220 us / p99 ~520 us, breakpoint p50
+  ~300 us / p99 ~660 us, a few frames over budget -- belongs in the backend table.
 
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`

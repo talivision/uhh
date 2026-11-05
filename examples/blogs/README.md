@@ -45,6 +45,11 @@ any leftover), sockets on 127.0.0.1 only, DNS with `DNS_QUERY_NO_WIRE_QUERY`.
   return address at SP and `probe_add_address` it once (under a lock, so a second thread
   cannot return before it is armed), and remember the output pointer keyed by the entry
   SP; at the return site, SP - (pointer + stdcall args) finds it again.
+* **APIs re-enter themselves.** `BCryptGenRandom` calls itself (same buffer): two entry
+  hits per call. The monitor captures only the outermost call (a pending entry slightly
+  above the current SP on the same stack is the outer one). `--naive` keeps the first-cut
+  behaviour; on hw it asks for a 5th debug register from inside a callback, which must be
+  refused cleanly (`blog-crypto-naive-hw`).
 * **Decoding handles runs code in the target.** The registry monitor turns key handles
   into paths with `call_func("ntdll.dll!NtQueryKey", ...)`, and allocates one 64 KiB
   scratch region in the target (`kernelbase!VirtualAlloc`) for the out-buffer -- a
@@ -53,3 +58,11 @@ any leftover), sockets on 127.0.0.1 only, DNS with `DNS_QUERY_NO_WIRE_QUERY`.
 * **Per-hit cost shows up as frame jitter** (`game`): inline costs well under a
   microsecond per frame; hw and breakpoint cost tens to hundreds of microseconds per hit
   (a debug event round trip), visible as `cost_us` percentiles in the target's line.
+
+## Issues these replicas found
+
+See "Blog-replica findings" in [`docs/ROADMAP.md`](../../docs/ROADMAP.md): a hw #DB with a
+lost DR6 killing the target, hw DRs lost on threads still starting up, `call_func`
+deadlocking when another thread hit a probe during the call (breakpoint/hw), a forwarded
+export into a later-loaded module failing the launch, and an intermittent attach-hold
+stall when injecting into PowerShell (open).
