@@ -127,7 +127,6 @@ struct probe_session {
     std::unordered_map<std::string, std::string> module_paths;   // name -> on-disk image (prehook diff)
     std::vector<std::string> prehooks;                           // JSON lines for the report
     PROCESS_INFORMATION pi{};
-    HANDLE stdin_write = nullptr;
     DWORD exit_code = 1;
     uint64_t overrides = 0;
     std::string error;
@@ -168,7 +167,7 @@ struct probe_session {
     std::vector<HANDLE> ipc_frozen;            // threads suspended for an agent hook write (FREEZE..THAW)
     DWORD ipc_freezer = 0;                     // the agent thread doing that write (0 = no freeze)
     int hw_active = 0;
-    bool launched = false, ran = false, exited = false, gate_sent = false;
+    bool launched = false, ran = false, exited = false, inline_ready = false;
     bool attach_held = false;                  // attach: threads held once until inline hooks confirmed
     bool call_cet_warned = false;              // call_func refused under CET (warn once)
     int shadow_stack = -1;                     // target has hardware shadow stacks (CET): -1 unknown, 0/1
@@ -2516,16 +2515,6 @@ static bool kick_agent(probe_session *s) {
     return start_agent_init(s);
 }
 
-static bool release_gate(probe_session *s) {
-    if (s->gate_sent) return true;
-    if (s->attached || !s->stdin_write) { s->gate_sent = true; return true; }   // nothing to release
-    DWORD wrote{}; char key = '\n';
-    if (!WriteFile(s->stdin_write, &key, 1, &wrote, nullptr) || wrote != 1) {
-        set_error(s, win_error("deliver gate keystroke")); return false;
-    }
-    s->gate_sent = true; return true;
-}
-
 static bool same_bitness(probe_session *s, HANDLE process);
 extern "C" int probe_launch(probe_session *s, char *const argv[]) {
     if (!s || !argv || !argv[0]) { if (s) set_error(s, "launch argv is empty"); return 0; }
@@ -2534,14 +2523,10 @@ extern "C" int probe_launch(probe_session *s, char *const argv[]) {
     try {
         std::string command;
         for (size_t i = 0; argv[i]; ++i) { if (i) command += ' '; command += quote_arg(argv[i]); }
-        SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE}; HANDLE stdin_read{};
-        if (!CreatePipe(&stdin_read, &s->stdin_write, &sa, 0)) { set_error(s, win_error("stdin pipe")); return 0; }
-        if (!SetHandleInformation(s->stdin_write, HANDLE_FLAG_INHERIT, 0)) {
-            CloseHandle(stdin_read); CloseHandle(s->stdin_write); s->stdin_write = nullptr;
-            set_error(s, win_error("stdin pipe inheritance")); return 0;
-        }
+        // The target gets the controller's own stdin/stdout/stderr, exactly as if it had been
+        // started without UHH (a filter reading stdin to EOF must see the caller's stream).
         STARTUPINFOA si{}; si.cb = sizeof(si); si.dwFlags = STARTF_USESTDHANDLES;
-        si.hStdInput = stdin_read; si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+        si.hStdInput = GetStdHandle(STD_INPUT_HANDLE); si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
         si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
         // A process created under a debugger gets the NT debug heap (fill patterns,
         // different layout): the target must run exactly as it would without UHH.
@@ -2551,15 +2536,12 @@ extern "C" int probe_launch(probe_session *s, char *const argv[]) {
         BOOL ok = CreateProcessA(argv[0], command.data(), nullptr, nullptr, TRUE,
                                  DEBUG_ONLY_THIS_PROCESS, nullptr, nullptr, &si, &s->pi);
         SetEnvironmentVariableA("_NO_DEBUG_HEAP", had_ndh && had_ndh < sizeof(prev_ndh) ? prev_ndh : nullptr);
-        CloseHandle(stdin_read);
         if (!ok) {
-            CloseHandle(s->stdin_write); s->stdin_write = nullptr;
             set_error(s, win_error("debug launch")); return 0;
         }
         if (!same_bitness(s, s->pi.hProcess)) {
             TerminateProcess(s->pi.hProcess, 3);
             CloseHandle(s->pi.hThread); CloseHandle(s->pi.hProcess); s->pi = {};
-            CloseHandle(s->stdin_write); s->stdin_write = nullptr;
             return 0;
         }
         s->launched = true;
@@ -2567,9 +2549,8 @@ extern "C" int probe_launch(probe_session *s, char *const argv[]) {
         if (!start_log_output(s)) { TerminateProcess(s->pi.hProcess, 3); return 0; }
         { std::string which; s->sym_ready = uhh_sym::init(s->pi.hProcess, which);
           std::fprintf(stderr, "probe: symbols via %s%s\n", which.c_str(), uhh_sym::has_symbol_server() ? " (symbol server capable)" : ""); }
-        if (!create_agent_channel(s) || (!has_inline(s) && !release_gate(s))) {
-            TerminateProcess(s->pi.hProcess, 3); return 0;
-        }
+        if (!create_agent_channel(s)) { TerminateProcess(s->pi.hProcess, 3); return 0; }
+        if (!has_inline(s)) s->inline_ready = true;
         return 1;
     } catch (const std::exception &e) { set_error(s, e.what()); return 0; }
 }
@@ -2599,7 +2580,7 @@ extern "C" int probe_attach(probe_session *s, uint32_t pid) {
     DebugSetProcessKillOnExit(FALSE);              // our exit must never take the target down
     s->debug_tid = GetCurrentThreadId();
     s->pi.dwProcessId = pid;
-    s->attached = true; s->launched = true; s->gate_sent = true;
+    s->attached = true; s->launched = true; s->inline_ready = true;
     if (!start_log_output(s)) { DebugActiveProcessStop(pid); return 0; }
     { std::string which; s->sym_ready = uhh_sym::init(s->pi.hProcess, which); }
     if (!create_agent_channel(s)) { DebugActiveProcessStop(pid); return 0; }
@@ -3715,7 +3696,8 @@ static bool accept_agent_install(probe_session *s) {
                      p->location.c_str(), (unsigned long long)p->address);
     }
     if (!first_failure.empty()) { set_error(s, first_failure); return false; }
-    return release_gate(s);
+    s->inline_ready = true;
+    return true;
 }
 
 static bool complete_remote_thread(probe_session *s, DWORD result) {
@@ -4011,7 +3993,7 @@ extern "C" int probe_run(probe_session *s) {
     stop_drainer(s);
     flush_log_writer(s);
     if (!s->exited && s->pi.hProcess && !s->attached) TerminateProcess(s->pi.hProcess, 3);
-    if (s->exited && has_inline(s) && !s->gate_sent) set_error(s, "target exited before inline probes were ready");
+    if (s->exited && has_inline(s) && !s->inline_ready) set_error(s, "target exited before inline probes were ready");
     int result = (s->exited || s->detached) && s->error.empty();
     s->running = false;                                   // last touch of s on this thread
     return result;
@@ -4125,7 +4107,6 @@ extern "C" void probe_close(probe_session *s) {
         DeleteFileW(s->agent_copy.c_str());
         RemoveDirectoryW(s->agent_copy.substr(0, s->agent_copy.find_last_of(L'\\')).c_str());
     }
-    if (s->stdin_write) CloseHandle(s->stdin_write);
     if (s->pi.hThread) CloseHandle(s->pi.hThread);
     if (s->pi.hProcess) CloseHandle(s->pi.hProcess);
     delete s;

@@ -2873,6 +2873,17 @@ def check_famous_retval(threads=4, calls=25):
         except Exception as e:
             record(name, False, repr(e))
 
+def feed_keystrokes():
+    """Targets that wait for a keystroke (probe_app's gate and the other --no-wait-less
+    fixtures) read it from the stdin they inherit -- through the tool, exactly as if a user
+    pressed a key; UHH passes the caller's stdin through untouched. Give every child of this
+    run a stdin of newlines (one shared file offset, so each reader takes its own), unless a
+    check feeds one explicitly."""
+    keys = tempfile.TemporaryFile()
+    keys.write(b"\n" * (1 << 20)); keys.flush(); keys.seek(0)
+    os.dup2(keys.fileno(), 0)        # also the process's STD_INPUT_HANDLE, inherited by children
+
+
 def main():
     global BIN
     ap = argparse.ArgumentParser()
@@ -2885,6 +2896,7 @@ def main():
     args = ap.parse_args()
     BIN = args.bin.resolve()
     only = [x for x in args.only.split(",") if x]
+    feed_keystrokes()
 
     import os as _os
 

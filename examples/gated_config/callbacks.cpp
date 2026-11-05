@@ -41,7 +41,7 @@ struct OpenRecord {
     std::atomic<uint64_t> handle{0};    // 0 = not resolved yet
     char name[64];                      // image name of pid, written before pid is published
 };
-constexpr uint32_t kMaxOpens = 1024;
+constexpr uint32_t kMaxOpens = 0x10000;   // opens remembered (~5.5 MiB shared, zero-initialised)
 // UHH_SHARED: the map is ONE piece of memory for every backend -- the open probe and the
 // read probe may run in different processes (breakpoint/hw in the controller, inline in
 // the target) and still see each other's records. Plain values only (pids, target

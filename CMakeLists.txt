@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # bind to whatever msvcp140/vcruntime140 the target already loaded -- an older app-local
 # msvcp140 crashes SafetyHook's std::mutex (constexpr mutex since VS 17.10: _Mtx_* null read).
 # The agent must carry its own runtime; everything else follows so libraries link together.
-option(UHH_STATIC_CRT "Link everything (the injected agent above all) against the static CRT" ON)
+option(UHH_STATIC_CRT "Link UHH's own binaries (the injected agent above all) against the static CRT" ON)
 if(UHH_STATIC_CRT)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 else()
@@ -93,7 +93,7 @@ target_link_options(configparse PRIVATE
 # so it runs on an app-local pre-14.40 msvcp140.dll -- regress `oldcrt` (the injected agent
 # must not be broken by the target's runtime).
 add_executable(oldcrt_target examples/targets/oldcrt/oldcrt_target.cpp)
-set_property(TARGET oldcrt_target PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+set_property(TARGET oldcrt_target PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 target_compile_definitions(oldcrt_target PRIVATE _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
 
 # probe_app EXPORTS its read site, so tools address it as probe_app.exe!ReadThunk.
@@ -358,4 +358,15 @@ endforeach()
 foreach(t detours_target detours_simple detours_traceapi detours_retval edge_target edge_driver famous_driver famous_heap_target famous_file_target famous_loader_target famous_tick_target probe_app_cet cet_probe gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
     target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
+endforeach()
+
+# Example TARGETS stand in for ordinary applications, so they keep the usual dynamic CRT
+# (/MD: ucrtbase!malloc etc. are real imports that probes can hit). Only UHH's own
+# binaries -- above all the agent injected into those targets -- carry the static CRT.
+# probe_app/probe_app_cet link SafetyHook (their --existing-hook mode) and follow UHH.
+foreach(t configparse cet_probe hook_edge parity_target watch_target dynwatch_target conformance_target
+          hitcost_target logstream_target memstress_target patchrace_target sidefx_target
+          reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target
+          famous_heap_target famous_file_target famous_loader_target famous_tick_target edge_target detours_target)
+    set_property(TARGET ${t} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 endforeach()
