@@ -22,6 +22,7 @@ static int usage() {
 }
 
 int main(int argc, char **argv) {
+    read_log_config cfg{};
     uint32_t flag_backend = PROBE_BREAKPOINT, read_backend = PROBE_INLINE, open_backend = 0, log = 1;
     const char *locations[2] = {}; int nloc = 0, i = 1;
     for (; i < argc && std::strcmp(argv[i], "--"); ++i) {
@@ -36,7 +37,7 @@ int main(int argc, char **argv) {
     if (!open_backend) open_backend = read_backend;
     char **target = argv + i + 1;   // argv is NULL-terminated
 
-    read_log_config cfg{READ_LOG_COOKIE, log, 0, 0, 0, 0};
+    cfg.cookie = READ_LOG_COOKIE; cfg.log = log;
 
     probe_session *s = probe_session_create();
     if (!s) return 1;

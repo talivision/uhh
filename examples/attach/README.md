@@ -84,7 +84,9 @@ Two consoles in the build directory (`build-x64\Release` or `build-x86\Release`;
    report, and exits when the target does:
 
    ```
-   {"kind":"probe_log","probe":2,"tid":...,"message":"read handle=0xa4 pid=7516 addr=0x7ff7fb509690 size=16"}
+   {"kind":"probe_log","probe":1,"tid":...,"message":"open pid=7516 name=probe_app.exe"}
+   {"kind":"probe_log","probe":2,"tid":...,"message":"map handle=0xa4 -> pid=7516 name=probe_app.exe"}
+   {"kind":"probe_log","probe":2,"tid":...,"message":"read handle=0xa4 pid=7516 name=probe_app.exe addr=0x7ff7fb509690 size=16"}
    ...
    {"kind":"probe","location":"configparse.dll!ParseConfig+0x16","backend":"breakpoint","active":true,"hits":1}
    {"kind":"probe","location":"ntdll.dll!NtOpenProcess","backend":"inline","active":true,"hits":4}

@@ -1,4 +1,5 @@
 #include "win_common.hpp"
+#include "probe_log_format.hpp"
 #include "probe_agent_shared.hpp"
 #include <safetyhook.hpp>
 #include <array>
@@ -33,15 +34,35 @@ static AgentState states[PROBE_AGENT_MAX_PROBES];
 struct RegionCache { uintptr_t lo = 0, hi = 0; bool writable = false; };
 static thread_local RegionCache t_region;
 
+// The per-thread cache is implicit TLS -- which does not exist yet on a thread that is
+// still in its loader initialisation: LdrpInitializeThread allocates the thread's TLS
+// block with RtlAllocateHeap, so an inline probe on the allocator (a heap tracker) runs
+// its callback there with TEB->ThreadLocalStoragePointer (or this module's slot in it)
+// still NULL, and touching t_region faults -- recursively, through the exception
+// dispatcher's own allocations, until the stack overflows and the target dies. Found by
+// examples/famous heap_tracker (inline). No TLS yet = no cache: validate every time.
+extern "C" unsigned long _tls_index;
+static bool tls_ready() {             // this module's implicit TLS exists on this thread
+#if defined(_WIN64)
+    void **array = *reinterpret_cast<void ***>(reinterpret_cast<unsigned char *>(NtCurrentTeb()) + 0x58);
+#else
+    void **array = *reinterpret_cast<void ***>(reinterpret_cast<unsigned char *>(NtCurrentTeb()) + 0x2C);
+#endif
+    return array && array[_tls_index];
+}
+static RegionCache *region_cache() { return tls_ready() ? &t_region : nullptr; }
+
 static bool range_ok(uintptr_t a, size_t n, bool write) {
     if (!n) return true;
     if (a + n < a) return false;
+    RegionCache scratch, *cache = region_cache();
+    if (!cache) cache = &scratch;
     uintptr_t end = a + n;
     while (a < end) {
         // Reads trust the per-thread cache across hits; WRITES re-check every time: the
         // target may have made the region read-only since (a write fault would be visible).
-        if (!write && a >= t_region.lo && a < t_region.hi) {
-            a = t_region.hi; continue;
+        if (!write && a >= cache->lo && a < cache->hi) {
+            a = cache->hi; continue;
         }
         MEMORY_BASIC_INFORMATION mbi{};
         if (!VirtualQuery((void *)a, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
@@ -51,24 +72,44 @@ static bool range_ok(uintptr_t a, size_t n, bool write) {
                  prot == PAGE_EXECUTE_WRITECOPY;
         bool r = w || prot == PAGE_READONLY || prot == PAGE_EXECUTE_READ;
         if (!r || (write && !w)) return false;
-        t_region.lo = (uintptr_t)mbi.BaseAddress;
-        t_region.hi = t_region.lo + mbi.RegionSize;
-        t_region.writable = w;
-        a = t_region.hi;
+        cache->lo = (uintptr_t)mbi.BaseAddress;
+        cache->hi = cache->lo + mbi.RegionSize;
+        cache->writable = w;
+        a = cache->hi;
     }
     return true;
+}
+static void forget_region() { if (RegionCache *cache = region_cache()) *cache = {}; }
+// The bytes each installed hook overwrote, so a callback reading code sees the PROGRAM's
+// bytes (as the breakpoint backend shows the original byte under its INT3 and hw changes
+// nothing), not the hook's jump. Published after the jump is written, withdrawn before it
+// is removed; a reader checks the request is still INSTALLED (not unloaded/reused).
+struct PatchShadow { volatile uintptr_t lo; uint32_t len; uint8_t bytes[32]; };
+static PatchShadow g_shadow[PROBE_AGENT_MAX_PROBES];
+static volatile LONG g_shadow_count;
+static void overlay_original(uintptr_t a, void *buffer, size_t n) {
+    for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i) {
+        const uintptr_t lo = g_shadow[i].lo;
+        if (!lo || !shared || shared->requests[i].status != PROBE_AGENT_INSTALLED) continue;
+        const uintptr_t hi = lo + g_shadow[i].len;
+        if (hi <= a || lo >= a + n) continue;
+        for (uintptr_t x = lo > a ? lo : a; x < hi && x < a + n; ++x)
+            static_cast<uint8_t *>(buffer)[x - a] = g_shadow[i].bytes[x - lo];
+    }
 }
 static int local_read(void *, uint64_t address, void *buffer, size_t size, size_t *done) {
     *done = 0;
     if (!range_ok((uintptr_t)address, size, false)) return 0;
-    __try { std::memcpy(buffer, (const void *)(uintptr_t)address, size); *done = size; return 1; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { t_region = {}; return 0; }
+    __try { std::memcpy(buffer, (const void *)(uintptr_t)address, size); *done = size; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { forget_region(); return 0; }
+    if (g_shadow_count) overlay_original((uintptr_t)address, buffer, size);
+    return 1;
 }
 static int local_write(void *, uint64_t address, const void *buffer, size_t size, size_t *done) {
     *done = 0;
     if (!range_ok((uintptr_t)address, size, true)) return 0;
     __try { std::memcpy((void *)(uintptr_t)address, buffer, size); *done = size; return 1; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { t_region = {}; return 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { forget_region(); return 0; }
 }
 static const probe_ops local_ops{local_read, local_write};
 
@@ -102,10 +143,8 @@ extern "C" uint64_t get_reg(probe_context *c, enum probe_register reg) {
 }
 extern "C" int set_reg(probe_context *c, enum probe_register reg, uint64_t value) {
     if (g_ctrl) return g_ctrl->set_reg(c, reg, value);
-    // Inline: the stack pointer cannot be changed yet -- SafetyHook's resume path keeps the
-    // saved registers just below it, so moving it would corrupt them. Refuse honestly
-    // (returns 0, nothing changes, nothing counted). Fix tracked: patch the resume stub.
-    if (reg == PROBE_REG_SP) return 0;
+    // Inline set_reg(SP) is honoured: the (patched) SafetyHook stub resumes with
+    // `pop rsp; jmp [trampoline]`, loading the context's rsp -- see call_mid.
     uint64_t *slot = register_slot(c, reg); if (!slot) return 0;
     if (*slot != value) {
         *slot = value;
@@ -228,15 +267,9 @@ static void agent_log(probe_context *c, bool stack, const char *format, va_list 
     auto *state = c ? static_cast<AgentState *>(c->controller) : nullptr;
     if (!state || !state->shared || !format) return;
     char text[PROBE_AGENT_LOG_TEXT_CAP];
-    int n = -1;
-    text[0] = 0;
-    __try { n = _vsnprintf_s(text, sizeof(text), _TRUNCATE, format, ap); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { n = -1; }
-    text[sizeof(text) - 1] = 0;
-    if (n < 0 && text[0]) {                                  // truncated: say so, never silently
-        static const char mark[] = "...[truncated]";
-        std::memcpy(text + sizeof(text) - sizeof(mark), mark, sizeof(mark));
-    }
+    // The controller's formatter: an invalid format (%k, %n) used to fast-fail the TARGET
+    // through the CRT's invalid-parameter handler; now logged as "[unformattable] <format>".
+    if (!uhh_format_log(text, sizeof(text), format, ap)) return;
     uint64_t frames[PROBE_STACK_MAX_FRAMES]; uint32_t nframes = 0;
     if (stack) nframes = capture_stack(c, frames, PROBE_STACK_MAX_FRAMES);
     auto *sh = state->shared;
@@ -276,6 +309,16 @@ static void agent_log(probe_context *c, bool stack, const char *format, va_list 
     if (nframes) std::memcpy(rec->frames, frames, nframes * sizeof(uint64_t));
     MemoryBarrier();
     InterlockedExchange64(&rec->seq, pos + 1);                    // publish
+}
+
+// One warning per probe, delivered as a log record (the callback runs inside the target).
+static volatile LONG g_warned[PROBE_AGENT_MAX_PROBES];
+static void warn_log(probe_context *c, const char *format, ...) {
+    va_list ap; va_start(ap, format); agent_log(c, false, format, ap); va_end(ap);
+}
+static void warn_once(probe_context *c, const char *text) {
+    if (!c || c->site >= PROBE_AGENT_MAX_PROBES || InterlockedExchange(&g_warned[c->site], 1)) return;
+    warn_log(c, "uhh warning: %s", text);
 }
 
 extern "C" void send_log(probe_context *c, const char *format, ...) {
@@ -349,6 +392,30 @@ static bool call_raw(uint64_t fn, const uint64_t *a, uint64_t *ret, int nargs) {
 }
 #endif
 
+// Threads currently inside call_func (resolution included). Probes they hit there do not
+// run callbacks -- the documented call_func contract, which the breakpoint/hw path already
+// kept. Without it an inline allocator probe whose callback calls call_func recursed
+// forever: GetModuleHandle/GetProcAddress (and many callees) allocate, which hits the
+// probe, whose callback calls call_func again... -> STATUS_STACK_OVERFLOW (found by
+// examples/famous heap_tracker). A fixed table, not TLS: it must work on a thread that
+// is still in its loader initialisation.
+static volatile LONG g_in_call_count;
+static volatile LONG g_in_call_tids[64];
+static bool in_call_func(DWORD tid) {
+    if (!g_in_call_count) return false;
+    for (auto &slot : g_in_call_tids) if ((DWORD)slot == tid) return true;
+    return false;
+}
+struct CallFuncScope {
+    volatile LONG *slot = nullptr;
+    CallFuncScope() {
+        const LONG tid = (LONG)GetCurrentThreadId();
+        for (auto &s : g_in_call_tids)
+            if (InterlockedCompareExchange(&s, tid, 0) == 0) { slot = &s; InterlockedIncrement(&g_in_call_count); break; }
+    }
+    ~CallFuncScope() { if (slot) { InterlockedExchange(slot, 0); InterlockedDecrement(&g_in_call_count); } }
+};
+
 extern "C" int call_func(probe_context *c, const char *symbol, uint64_t *ret, int nargs, ...) {
     if (nargs < 0 || nargs > 8) return 0;
     uint64_t a[8] = {0};
@@ -356,6 +423,7 @@ extern "C" int call_func(probe_context *c, const char *symbol, uint64_t *ret, in
     for (int i = 0; i < nargs; ++i) a[i] = va_arg(ap, uint64_t);
     va_end(ap);
     if (g_ctrl) return g_ctrl->call_func_args(c, symbol, ret, nargs, a);
+    CallFuncScope scope;
     uint64_t fn = agent_resolve(symbol);
     if (!fn) return 0;
 #if defined(_WIN64)
@@ -365,6 +433,91 @@ extern "C" int call_func(probe_context *c, const char *symbol, uint64_t *ret, in
 #endif
 }
 
+/* ---- call_original / return_from (inline). ----
+   call_original: a real call to the hook's trampoline (the overwritten instructions, then a
+   jump back past the hook), so this probe does not fire for it, with the context's argument
+   registers and the hit's stack arguments. return_from: the patched mid-hook stub resumes at
+   Context::rip with rsp at Context::rsp (cmake/patch_safetyhook.cmake, uhh_resume_slot); a
+   return thunk there does `pop rsp; ret` (x86 `pop esp; ret N`) with Context::rsp = the hit's
+   SP, so the hooked function returns to its caller through a REAL ret (CET shadow stacks
+   stay in sync). The thunks live in one executable page allocated at init: slot k (4 bytes,
+   at offset 4k) is `pop esp; ret 4k` (k = 0: `pop esp; ret`), i.e. the thunk for N popped
+   bytes is at base + N. */
+static uint8_t *g_ret_thunks;
+static void make_ret_thunks() {
+    if (g_ret_thunks) return;
+    auto *p = static_cast<uint8_t *>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!p) return;
+    for (uint32_t k = 0; k < 1024; k += 4) {
+        p[k] = 0x5C;                                       // pop rsp / pop esp
+        if (!k) { p[k + 1] = 0xC3; p[k + 2] = p[k + 3] = 0xCC; }
+        else { p[k + 1] = 0xC2; p[k + 2] = (uint8_t)k; p[k + 3] = (uint8_t)(k >> 8); }
+    }
+    DWORD old = 0;
+    if (!VirtualProtect(p, 4096, PAGE_EXECUTE_READ, &old)) { VirtualFree(p, 0, MEM_RELEASE); return; }
+    FlushInstructionCache(GetCurrentProcess(), p, 4096);
+    g_ret_thunks = p;
+}
+
+#if !defined(_WIN64)
+// Push the args, load ECX/EDX (fastcall/thiscall), call, restore ESP: stdcall and cdecl.
+static bool call_tramp_x86(uint32_t target, const uint32_t *args32, int nargs, uint32_t ecx_v, uint32_t edx_v, uint32_t *ret) {
+    uint32_t lo = 0;
+    __try {
+        __asm {
+            mov ebx, esp
+            mov ecx, nargs
+            mov esi, args32
+        push_loop:
+            test ecx, ecx
+            jz do_call
+            dec ecx
+            push dword ptr [esi + ecx*4]
+            jmp push_loop
+        do_call:
+            mov ecx, ecx_v
+            mov edx, edx_v
+            call dword ptr [target]
+            mov esp, ebx
+            mov lo, eax
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    *ret = lo;
+    return true;
+}
+#endif
+
+static void warn_once(probe_context *c, const char *text);
+extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
+    if (g_ctrl) return g_ctrl->call_original(c, nargs, out);
+    auto *state = c ? static_cast<AgentState *>(c->controller) : nullptr;
+    if (!state || !state->shared || state->index >= PROBE_AGENT_MAX_PROBES || nargs < 0 || nargs > 8) return 0;
+    const uint64_t tramp = state->shared->requests[state->index].trampoline;
+    if (!tramp) return 0;
+    uint64_t a[8] = {0};
+    for (int i = 0; i < nargs; ++i) a[i] = get_func_arg(c, (size_t)i);
+    uint64_t r = 0;
+#if defined(_WIN64)
+    if (!call_raw(tramp, a, &r)) return 0;
+#else
+    uint32_t a32[8], r32 = 0; for (int i = 0; i < 8; ++i) a32[i] = (uint32_t)a[i];
+    if (!call_tramp_x86((uint32_t)tramp, a32, nargs, (uint32_t)c->regs.rcx, (uint32_t)c->regs.rdx, &r32)) return 0;
+    r = r32;
+#endif
+    c->called_original = 1;
+    if (out) *out = r;
+    return 1;
+}
+extern "C" void return_from(probe_context *c, uint64_t value, int nargs) {
+    if (g_ctrl) { g_ctrl->return_from(c, value, nargs); return; }
+    if (!c || nargs < 0 || nargs > 255) return;
+#if defined(_WIN64)
+    (void)nargs; c->regs.rax = value; c->ret_pop = 0;
+#else
+    c->regs.rax = (uint32_t)value; c->ret_pop = (uint32_t)nargs * 4;
+#endif
+    c->returned = 1;
+}
 
 /* ---- Control plane from an inline callback: forwarded to the controller. ----
    get_session(c) returns a per-site proxy (so the controller knows which probe's
@@ -428,9 +581,12 @@ extern "C" int probe_add_symbol_cfg(probe_session *s, const char *symbol, probe_
 }
 
 static volatile LONG g_stopping;
-static struct alignas(64) { volatile LONG value; } g_inflight[PROBE_AGENT_STRIPES];
+// Callbacks running right now, striped in the SHARED block: what is still in flight when
+// the process dies (ExitProcess kills threads mid-callback) is reported by the controller.
+static thread_local int t_in_callback;
 static bool any_inflight() {
-    for (auto &x : g_inflight) if (x.value) return true;
+    if (!shared) return false;
+    for (auto &x : shared->inflight) if (x.value) return true;
     return false;
 }
 
@@ -484,7 +640,7 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     c.regs.rdx = native.edx; c.regs.rsi = native.esi; c.regs.rdi = native.edi;
     c.regs.rbp = native.ebp; c.regs.rsp = native.esp; c.regs.flags = native.eflags;
 #endif
-    c.regs.pc = sites[index];
+    c.regs.pc = sites[index]; c.hit_sp = c.regs.rsp;
     c.config = shared->requests[index].config_len ? shared->requests[index].config : nullptr;
     c.ops = &local_ops; c.tid = GetCurrentThreadId(); c.site = index; c.controller = &states[index];
     // Count the hit before the call so a faulting callback is still accounted, and run
@@ -496,15 +652,24 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     if (g_stopping) return;
     uint32_t stripe = (GetCurrentThreadId() >> 2) & (PROBE_AGENT_STRIPES - 1);
     InterlockedIncrement64(&shared->hit_stripes[index][stripe].value);
-    InterlockedIncrement(&g_inflight[stripe].value);
+    // A probe hit by code the callback itself runs (call_func of a probed function, or a
+    // probed API called directly) is counted but does not re-enter a callback -- exactly
+    // what breakpoint/hw do inside call_func. Re-entering recursed until the stack overflowed.
+    // (No TLS yet -- a thread in loader init, see region_cache -- means no callback is running
+    // on it; in_call_func covers this thread's call_func whatever its TLS state.)
+    if (in_call_func(GetCurrentThreadId()) || (tls_ready() && t_in_callback)) return;
+    InterlockedIncrement64(&shared->inflight[stripe].value);
     // The mid-hook stub preserves GPRs, flags and XMM0-15 only. The callback (and the CRT
     // it calls) may touch x87/MXCSR/YMM/ZMM state -- e.g. vzeroupper -- which the target
     // could be relying on at a mid-function site. Save and restore the full extended state
     // and give C code the ABI-required DF=0.
     // Extended state (MXCSR, AVX/AVX-512) and DF are handled in mid_entry, BEFORE any of
     // this C code runs -- see there.
+    const bool tls = tls_ready();
+    if (tls) t_in_callback = 1;
     bool callback_ok = run_callback(callbacks[index], &c);
-    InterlockedDecrement(&g_inflight[stripe].value);
+    if (tls) t_in_callback = 0;
+    InterlockedDecrement64(&shared->inflight[stripe].value);
     if (!callback_ok) return;
 #if defined(_WIN64)
 #define COPY(a,b) native.a = c.regs.a;
@@ -516,6 +681,28 @@ static void call_mid(safetyhook::Context &native, uint32_t index) {
     native.esi = (uint32_t)c.regs.rsi; native.edi = (uint32_t)c.regs.rdi;
     native.ebp = (uint32_t)c.regs.rbp;
 #endif
+    // set_reg(SP): the patched resume stub (cmake/patch_safetyhook.cmake, uhh_resume_jmp)
+    // ends `pop rsp; jmp [trampoline]`, so the context's rsp IS the stack pointer the
+    // hooked code resumes with -- nothing is written to the stack (moving SP down cannot
+    // clobber the saved registers) and there is no `ret` to a pushed address (CET shadow
+    // stacks never see the hook).
+#if defined(_WIN64)
+    native.rsp = c.regs.rsp;
+#else
+    native.esp = (uint32_t)c.regs.rsp;
+#endif
+    if (c.returned && g_ret_thunks) {
+        // return_from: the stub ends `jmp [Context::rip]` with rsp at Context::rsp; the thunk
+        // pops the hit's SP and returns (x86: ret N) to the caller.
+#if defined(_WIN64)
+        native.rsp = c.hit_sp; native.rip = (uintptr_t)(g_ret_thunks + c.ret_pop);
+#else
+        native.esp = (uint32_t)c.hit_sp; native.eip = (uintptr_t)(g_ret_thunks + c.ret_pop);
+#endif
+    } else if (c.returned || c.called_original) {
+        warn_once(&c, c.returned ? "return_from could not be applied (no return thunk); the original runs"
+                                 : "call_original without return_from -- the original runs again on fall-through");
+    }
 }
 
 // Entry point of every inline hit. It runs FIRST, before any C code that might call the
@@ -633,6 +820,7 @@ static void install_pending_locked() {
         if (InterlockedCompareExchange(&request.status, PROBE_AGENT_INSTALLING, PROBE_AGENT_PENDING) != PROBE_AGENT_PENDING)
             continue;
         sites[i] = request.site; states[i] = {shared, i}; proxies[i].site = i;
+        if (g_shadow[i].lo) { g_shadow[i].lo = 0; InterlockedDecrement(&g_shadow_count); }
         if (hooks[i]) {
             // A re-install after the module was unloaded: the old hook's code and target are
             // gone, so it must NOT be destroyed (its destructor would write to unmapped
@@ -652,6 +840,14 @@ static void install_pending_locked() {
         for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i) {
             if (!which[i]) continue;
             const bool ok = hooks[i].enable().has_value();
+            const auto &orig = hooks[i].original_bytes();
+            if (ok && !g_shadow[i].lo && orig.size() <= sizeof(g_shadow[i].bytes)) {
+                std::memcpy(g_shadow[i].bytes, orig.data(), orig.size());
+                g_shadow[i].len = (uint32_t)orig.size();
+                MemoryBarrier();
+                g_shadow[i].lo = hooks[i].target_address();
+                InterlockedIncrement(&g_shadow_count);
+            }
             InterlockedExchange(&shared->requests[i].status, ok ? PROBE_AGENT_INSTALLED : PROBE_AGENT_HOOK_FAILED);
         }
     };
@@ -695,6 +891,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
         if (!shared || shared->magic != PROBE_AGENT_MAGIC || shared->version != PROBE_AGENT_VERSION) return 2;
     }
     if (shared->request_count > PROBE_AGENT_MAX_PROBES) return 3;
+    make_ret_thunks();
     InterlockedExchange(&g_stopping, 0);   // a new session after a detach: callbacks run again
     for (auto &cb : callbacks) cb = nullptr;  // a new session may map slots to other callbacks
     resolve_callbacks();
@@ -717,6 +914,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_stop(void *) {
     AcquireSRWLockExclusive(&g_install_lock);            // after any install round in progress
     InterlockedExchange(&g_stopping, 1);
     for (int i = 0; i < 2000 && any_inflight(); ++i) Sleep(1);
+    for (auto &sh : g_shadow) if (sh.lo) { sh.lo = 0; InterlockedDecrement(&g_shadow_count); }
     frozen(slot_set{}, [] {
         for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i)
             // Restore the original bytes -- unless the controller saw the module unload
@@ -734,4 +932,17 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_stop(void *) {
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, void *) {
     if (reason == DLL_PROCESS_ATTACH) { self_module = module; DisableThreadLibraryCalls(module); }
     return TRUE;
+}
+
+// The agent's entry point (linked /ENTRY:uhh_agent_entry). The agent carries its own static
+// CRT, which DLL_PROCESS_DETACH would tear down -- but at PROCESS EXIT the hooks are still
+// installed and keep firing while later DLLs shut down (CloseHandle, RegCloseKey, ...): a
+// callback would then run on a dead CRT and abort() the target (seen: cmd.exe 0xC0000409
+// at exit under inline traceapi probes). The process is going away, so at termination the
+// CRT is simply left alive and every late hit is still delivered. A real unload
+// (FreeLibrary: reserved == nullptr) uninitialises normally.
+extern "C" BOOL WINAPI _DllMainCRTStartup(HINSTANCE, DWORD, void *);
+extern "C" BOOL WINAPI uhh_agent_entry(HINSTANCE module, DWORD reason, void *reserved) {
+    if (reason == DLL_PROCESS_DETACH && reserved) return TRUE;
+    return _DllMainCRTStartup(module, reason, reserved);
 }

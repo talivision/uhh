@@ -1,7 +1,7 @@
 bits 64
 
 ; save context
-push qword [rel trampoline]
+push qword [rel resume] ; uhh_resume_slot: Context::rip = resume_default
 push rsp ; push trampoline rsp
 push rsp ; push original rsp (this gets fixed later)
 push rbp
@@ -91,11 +91,14 @@ pop rcx
 pop rbx
 pop rax
 pop rbp
-lea rsp, [rsp+8] ; skip original rsp
-pop rsp
-ret
+jmp qword [rsp+16] ; uhh_resume_slot: Context::rip (per hit)
+resume_default:
+pop rsp ; uhh_resume_jmp: the context's rsp (writable)
+jmp qword [rel trampoline] ; no ret: CET shadow stacks
 
 destination:
 dq 0
 trampoline:
+dq 0
+resume:
 dq 0

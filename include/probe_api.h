@@ -118,6 +118,10 @@ int probe_attach(probe_session *, uint32_t pid);
    early as possible. Polls about every millisecond, so the target may run for a few
    milliseconds before the attach lands: instrument what it does after start-up. */
 int probe_attach_new(probe_session *, const char *image_name, uint32_t timeout_ms);
+/* Ctrl+C / Ctrl+Break while probe_run (through probe_wait_for_exit) runs ends the SESSION,
+   not the tool: an attached target is detached (probes removed, it keeps running), a
+   launched one is ended, and probe_run returns normally -- so the caller still flushes the
+   logs and writes its report. A second press gets the default handling. */
 int probe_run(probe_session *);
 /* Waits until all probe_log records are in the session JSONL file and its live stdout
    tail (unless stdout is NUL) has reached the same byte offset. */
@@ -150,6 +154,27 @@ const void *get_config(probe_context *);
    of microseconds, so cache results. The callee runs with whatever locks the hit thread
    holds: avoid functions that need them (e.g. the allocator from inside a malloc hook). */
 int call_func(probe_context *, const char *symbol, uint64_t *ret, int nargs, ...);
+/* Detours-style replacement from an ENTRY probe (a probe on a function's first
+   instruction), same source on every backend.
+   call_original runs the probed function NOW, on the hit thread, with the CURRENT
+   argument registers and stack (including set_reg/set_mem changes the callback made); *ret
+   receives its return register (x64 RAX; x86 EAX, zero-extended). Returns 1 if it ran. This probe does not fire
+   for that call. nargs = integer/pointer arguments the function takes (0..8): x64 args 5+
+   and every x86 argument are copied from the hit's stack into the new call frame. Inline:
+   a real call to the hook's trampoline (other probes inside the callee fire normally).
+   Breakpoint/hw: as call_func (other probes inside the callee do not re-enter callbacks;
+   refused -- returns 0 with one warning -- when the target has CET shadow stacks). On 0
+   the original has NOT run: don't return_from, just let the hit fall through.
+   return_from makes the probed function return to its caller as soon as the callback
+   ends, with value in AX: the original body is not run (again). Resumes at a real `ret`
+   (x86: `ret nargs*4`) with SP at the hit's return address, so the CPU pops the normal
+   and shadow stacks together (CET-safe on every backend). nargs: x86 __stdcall argument
+   count (the callee pops nargs*4 bytes); pass 0 for an x86 __cdecl function (the caller
+   pops); ignored on x64. Register changes the callback made (set_reg) are kept; SP is
+   always the hit's. Calling call_original without return_from lets the original run a
+   second time on fall-through (warned once per probe). */
+int call_original(probe_context *, int nargs, uint64_t *ret);
+void return_from(probe_context *, uint64_t value, int nargs);
 /* The session this callback belongs to, for control-plane calls from a callback. In a
    breakpoint/hardware callback it is the real session; in an inline callback (running
    inside the target) it is an agent-side proxy whose control calls are forwarded to the

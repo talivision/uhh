@@ -3,6 +3,16 @@ project(uhh LANGUAGES C CXX)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# Static CRT everywhere. probe_api_agent.dll is injected into the TARGET: with /MD it would
+# bind to whatever msvcp140/vcruntime140 the target already loaded -- an older app-local
+# msvcp140 crashes SafetyHook's std::mutex (constexpr mutex since VS 17.10: _Mtx_* null read).
+# The agent must carry its own runtime; everything else follows so libraries link together.
+option(UHH_STATIC_CRT "Link UHH's own binaries (the injected agent above all) against the static CRT" ON)
+if(UHH_STATIC_CRT)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+else()
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")   # for the oldcrt repro only
+endif()
 
 if(NOT WIN32)
     message(FATAL_ERROR "UHH is a Windows user-mode instrumentation library")
@@ -20,6 +30,12 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
 endif()
 
 enable_language(ASM_MASM)
+# x86 links use /SAFESEH: every object must declare its exception handlers, and MASM only
+# marks an object as SAFESEH-compatible when assembled with /safeseh (LNK2026 otherwise,
+# on toolchains that enforce it). Our .asm files register no handlers.
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    string(APPEND CMAKE_ASM_MASM_FLAGS " /safeseh")
+endif()
 # MASM dialect (ml64 vs ml) follows the generator platform automatically; only the
 # fixture .asm variant is selected by pointer width (one file per arch, not IFDEF
 # inside a single .asm).
@@ -79,11 +95,29 @@ target_link_options(configparse PRIVATE
     "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/examples/targets/configparse/configparse.def"
     "/MAP:$<TARGET_FILE_DIR:configparse>/configparse.map")
 
+# oldcrt_target: a /MD app as an OLDER toolset would have built it (no constexpr std::mutex),
+# so it runs on an app-local pre-14.40 msvcp140.dll -- regress `oldcrt` (the injected agent
+# must not be broken by the target's runtime).
+add_executable(oldcrt_target examples/targets/oldcrt/oldcrt_target.cpp)
+set_property(TARGET oldcrt_target PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+target_compile_definitions(oldcrt_target PRIVATE _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
+
 # probe_app EXPORTS its read site, so tools address it as probe_app.exe!ReadThunk.
 add_executable(probe_app examples/targets/probe_app/probe_app.cpp ${READ_SITE_ASM})
 target_include_directories(probe_app PRIVATE examples/targets/configparse)
 target_link_libraries(probe_app PRIVATE safetyhook)
 target_link_options(probe_app PRIVATE ${READ_THUNK_EXPORT} "/MAP:$<TARGET_FILE_DIR:probe_app>/probe_app.map")
+
+# Intel CET (hardware shadow stacks): the same target linked /CETCOMPAT, so Windows gives it
+# a user shadow stack on CET hardware (Tiger Lake+ / Zen 3+, x64; WoW64 is not enforced),
+# and cet_probe, which reports whether this machine actually enforces one (regress `cet-*`).
+add_executable(probe_app_cet examples/targets/probe_app/probe_app.cpp ${READ_SITE_ASM})
+target_include_directories(probe_app_cet PRIVATE examples/targets/configparse)
+target_link_libraries(probe_app_cet PRIVATE safetyhook)
+target_link_options(probe_app_cet PRIVATE ${READ_THUNK_EXPORT} /CETCOMPAT)
+add_dependencies(probe_app_cet configparse)
+add_executable(cet_probe examples/cet/cet_probe.c)
+target_link_options(cet_probe PRIVATE /CETCOMPAT)
 
 # Hostile entry sequences and a real pre-existing E9 detour for the breakage demo.
 add_executable(hook_edge examples/breakage/hook_edge.c ${BREAKAGE_ASM})
@@ -99,6 +133,15 @@ add_library(probe_api STATIC src/probe/session.cpp src/probe/symbols.cpp)
 target_include_directories(probe_api PUBLIC include)
 target_link_libraries(probe_api PRIVATE Zydis)   # decode probe sites for displaced stepping
 
+# examples/famous: classic Frida / API Monitor / Procmon recipes. Each recipe's callbacks
+# are compiled into the agent (inline) and into famous_driver (breakpoint/hw).
+set(FAMOUS_CALLBACKS
+    examples/famous/heap_tracker/heap_callbacks.cpp
+    examples/famous/file_monitor/file_callbacks.cpp
+    examples/famous/tls_capture/tls_callbacks.cpp
+    examples/famous/loader_rwx/loader_callbacks.cpp
+    examples/famous/retval_override/retval_callbacks.cpp)
+
 add_library(probe_api_agent SHARED
     src/probe/agent.cpp
     examples/gated_config/callbacks.cpp
@@ -109,13 +152,21 @@ add_library(probe_api_agent SHARED
     examples/conformance/conformance_callbacks.cpp
     bench/hitcost/hitcost_callbacks.cpp
     examples/memstress/memstress_callbacks.cpp
-    examples/sidefx/sidefx_callbacks.cpp)
-target_include_directories(probe_api_agent PRIVATE include examples/gated_config examples/dynwatch examples/trace examples/memstress)
+    examples/sidefx/sidefx_callbacks.cpp
+    ${FAMOUS_CALLBACKS}
+    examples/edgehunt/edge_callbacks.cpp
+    examples/famous/detours_simple/simple_callbacks.cpp
+    examples/famous/detours_traceapi/traceapi_callbacks.cpp
+    examples/famous/detours_retval/retval_callbacks.cpp
+    examples/hunt/hunt_callbacks.cpp
+    examples/blogs/blog_callbacks.cpp)
+target_include_directories(probe_api_agent PRIVATE include examples/gated_config examples/dynwatch examples/trace examples/memstress examples/blogs)
 target_link_libraries(probe_api_agent PRIVATE safetyhook)
 target_compile_definitions(probe_api_agent PRIVATE BREAKAGE_AGENT_ONLY FRIDA_PARITY_AGENT_ONLY HITCOST_SHARED)
 # Undecorated names for the __stdcall agent entries (x86 would otherwise export
 # _probe_agent_init@4; the controller resolves them by a fixed bare name).
 target_link_options(probe_api_agent PRIVATE "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/src/probe/agent.def")
+target_link_options(probe_api_agent PRIVATE "/ENTRY:uhh_agent_entry")   # keeps the CRT alive at process exit (agent.cpp)
 set_property(TARGET probe_api_agent APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/probe/agent.def")
 
 # --- Example: gated_config (launch) and uhh_attach (attach) -------------------------
@@ -265,12 +316,83 @@ foreach(rw reentrancy_target thread_stress_target antitamper_target antidebug_ta
     target_link_options(${rw} PRIVATE /DEBUG)
 endforeach()
 
+# --- examples/famous: classic instrumentation recipes, one callback source per recipe ------
+add_executable(famous_heap_target examples/famous/heap_tracker/heap_target.c)
+add_executable(famous_file_target examples/famous/file_monitor/file_target.c)
+add_executable(famous_loader_target examples/famous/loader_rwx/loader_target.c)
+add_executable(famous_tick_target examples/famous/retval_override/tick_target.c)
+add_executable(famous_driver examples/famous/famous_driver.cpp ${FAMOUS_CALLBACKS})
+target_include_directories(famous_driver PRIVATE include examples/famous)
+target_link_libraries(famous_driver PRIVATE probe_api)
+add_dependencies(famous_driver famous_heap_target famous_file_target famous_loader_target famous_tick_target probe_api_agent)
+
+# --- edgehunt: unusual code shapes / argument and memory edge cases, every backend ------
+set(EDGE_SITES EdgeRepSite EdgeStosSite EdgeCpuidSite EdgeRdtscSite EdgePushfSite EdgePopfSite
+    EdgeRetOnlySite EdgeThunkSite EdgeJumpSite EdgeFaultMidSite EdgeX87Site EdgeLockSite EdgeDualSite
+    EdgeReaddA EdgeReaddB)
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    set(EDGE_ASM examples/edgehunt/edge_sites_x86.asm)
+else()
+    set(EDGE_ASM examples/edgehunt/edge_sites_x64.asm)
+    list(APPEND EDGE_SITES EdgeRipLoadSite EdgeRipCmpSite EdgeRipVecSite EdgeRipStoreSite EdgeSyscallSite EdgeInt2eSite)
+endif()
+list(TRANSFORM EDGE_SITES PREPEND "/EXPORT:" OUTPUT_VARIABLE EDGE_EXPORTS)
+add_executable(edge_target examples/edgehunt/edge_target.c ${EDGE_ASM})
+target_link_options(edge_target PRIVATE ${EDGE_EXPORTS} /INCREMENTAL:NO)
+target_compile_options(edge_target PRIVATE $<$<COMPILE_LANGUAGE:C>:/Zi>)
+target_link_options(edge_target PRIVATE /DEBUG)
+add_executable(edge_driver examples/edgehunt/edge_driver.cpp examples/edgehunt/edge_callbacks.cpp)
+target_include_directories(edge_driver PRIVATE include)
+target_link_libraries(edge_driver PRIVATE probe_api)
+add_dependencies(edge_driver edge_target probe_api_agent)
+
+# --- edge-case hunter: concurrency / lifecycle stress under gated_config instrumentation --
+add_executable(hunt_target examples/hunt/hunt_target.c)
+add_library(hunt_dll SHARED examples/hunt/hunt_dll.c)
+add_executable(hunt_driver examples/hunt/hunt_driver.cpp examples/hunt/hunt_callbacks.cpp examples/gated_config/callbacks.cpp)
+target_include_directories(hunt_driver PRIVATE include examples/gated_config)
+target_link_libraries(hunt_driver PRIVATE probe_api)
+add_dependencies(hunt_driver hunt_target hunt_dll probe_api_agent)
+
+# --- blog replicas: API-monitor scenarios from well-known write-ups (examples/blogs) ----
+add_executable(blog_target examples/blogs/blog_target.c)
+target_compile_options(blog_target PRIVATE /W4)
+add_executable(blog_driver examples/blogs/blog_driver.cpp examples/blogs/blog_callbacks.cpp)
+target_include_directories(blog_driver PRIVATE include examples/blogs)
+target_link_libraries(blog_driver PRIVATE probe_api)
+add_dependencies(blog_driver blog_target probe_api_agent)
+
 add_executable(refusal_driver examples/conformance/refusal_driver.cpp)
 target_include_directories(refusal_driver PRIVATE include)
 target_link_libraries(refusal_driver PRIVATE probe_api)
 add_dependencies(refusal_driver hitcost_target)
 
-foreach(t gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
+# --- famous: Microsoft Detours samples replicated on UHH (examples/famous/detours_*) -----
+# One target for all of them; each example's callbacks are also built into the agent DLL.
+add_executable(detours_target examples/famous/detours_target.c)
+target_link_libraries(detours_target PRIVATE advapi32)
+add_executable(detours_simple examples/famous/detours_simple/simple_driver.cpp examples/famous/detours_simple/simple_callbacks.cpp)
+add_executable(detours_traceapi examples/famous/detours_traceapi/traceapi_driver.cpp examples/famous/detours_traceapi/traceapi_callbacks.cpp)
+add_executable(detours_retval examples/famous/detours_retval/retval_driver.cpp examples/famous/detours_retval/retval_callbacks.cpp)
+foreach(d detours_simple detours_traceapi detours_retval)
+    target_include_directories(${d} PRIVATE include)
+    target_link_libraries(${d} PRIVATE probe_api)
+    add_dependencies(${d} detours_target probe_api_agent)
+endforeach()
+
+foreach(t blog_target blog_driver gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver hunt_target hunt_dll hunt_driver detours_target detours_simple detours_traceapi detours_retval edge_target edge_driver famous_driver famous_heap_target famous_file_target famous_loader_target famous_tick_target probe_app_cet cet_probe)
     target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
+endforeach()
+
+# Example TARGETS stand in for ordinary applications, so they keep the usual dynamic CRT
+# (/MD: ucrtbase!malloc etc. are real imports that probes can hit). Only UHH's own
+# binaries -- above all the agent injected into those targets -- carry the static CRT.
+# probe_app/probe_app_cet link SafetyHook (their --existing-hook mode) and follow UHH.
+foreach(t configparse cet_probe hook_edge parity_target watch_target dynwatch_target conformance_target
+          hitcost_target logstream_target memstress_target patchrace_target sidefx_target
+          reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target
+          famous_heap_target famous_file_target famous_loader_target famous_tick_target edge_target detours_target
+          hunt_target hunt_dll blog_target)
+    set_property(TARGET ${t} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 endforeach()

@@ -1,7 +1,7 @@
 bits 32
 
 ; save context
-push dword [trampoline]
+push dword [resume] ; uhh_resume_slot: Context::rip = resume_default
 push esp ; push trampoline esp
 push esp ; push original esp (this gets fixed later)
 push ebp
@@ -50,11 +50,14 @@ pop ecx
 pop ebx
 pop eax
 pop ebp
-lea esp, [esp+4] ; skip original esp
-pop esp
-ret
+jmp dword [esp+8] ; uhh_resume_slot: Context::rip (per hit)
+resume_default:
+pop esp ; uhh_resume_jmp: the context's esp (writable)
+jmp dword [trampoline] ; no ret: CET shadow stacks
 
 destination:
 dd 0
 trampoline:
+dd 0
+resume:
 dd 0

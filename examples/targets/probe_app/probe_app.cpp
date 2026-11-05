@@ -23,6 +23,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <immintrin.h>
 #include <tlhelp32.h>
 #include <atomic>
 #include <cstdio>
@@ -116,6 +117,9 @@ static int helper_main(const char *finish_handle) {
 // NtOpenProcess remembers that pointer at entry and can dereference it any time later
 // to learn which handle the open produced. Through kernel32!OpenProcess the pointer
 // would be a stack local of kernelbase, reused as soon as OpenProcess returns.
+// --open-via kernel32: open through kernel32!OpenProcess instead, whose out-handle slot is a
+// short-lived stack local of kernelbase (the case a lazy out-pointer map cannot resolve).
+static bool g_open_kernel32 = false;
 static void open_helpers(std::vector<Helper> &helpers) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     require(snap != INVALID_HANDLE_VALUE, "process snapshot");
@@ -133,6 +137,11 @@ static void open_helpers(std::vector<Helper> &helpers) {
         // ntdll!NtOpenProcess(PHANDLE out, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID):
         // what kernel32!OpenProcess(PROCESS_VM_READ, FALSE, pid) does, but with the
         // out-handle pointing at h.read_handle, which lives as long as the helper.
+        if (g_open_kernel32) {
+            h.read_handle = OpenProcess(PROCESS_VM_READ, FALSE, h.hello.pid);
+            require(h.read_handle != nullptr, "OpenProcess helper");
+            continue;
+        }
         ObjectAttributes oa{sizeof(oa)};
         ClientId cid{(HANDLE)(uintptr_t)h.hello.pid, nullptr};
         require(OpenThunk(&h.read_handle, PROCESS_VM_READ, &oa, &cid) >= 0 && h.read_handle, "NtOpenProcess helper");
@@ -236,6 +245,7 @@ int main(int argc, char **argv) try {
         else if (a == "--config") { config = next(); for (auto &c : config) if (c == ';') c = '\n'; }
         else if (a == "--no-wait") wait = false;
         else if (a == "--decoy-opens") decoy_opens = _strtoui64(next(), nullptr, 10);
+        else if (a == "--open-via") g_open_kernel32 = std::string(next()) == "kernel32";
         else throw std::runtime_error("usage: probe_app [--helpers N] [--threads W] [--reads R] [--prehook] "
                                       "[--config k=v;...] [--no-wait] [--decoy-opens N]");
     }
@@ -288,20 +298,32 @@ int main(int argc, char **argv) try {
             CloseHandle(self);
         }
         open_helpers(helpers);
+        for (auto &h : helpers)      // ground truth for the handle -> pid map tools build
+            std::printf("{\"kind\":\"opened\",\"pid\":%lu,\"handle\":%llu}\n", h.hello.pid,
+                        (unsigned long long)(uintptr_t)h.read_handle);
+        std::fflush(stdout);
         elapsed_ns = run_reads(helpers, threads, reads, results);
     }
     uint64_t success = 0, checksum = 0;
     for (auto &r : results) { require(r.error.empty(), r.error); success += r.success; checksum += r.checksum; }
     uint64_t hook_calls = prehook_calls.load();
     prehook.reset();
+    // CET: RDSSP reads the shadow-stack pointer, and is a NOP (leaves 0) when this thread
+    // has no shadow stack -- the /CETCOMPAT build (probe_app_cet) reports whether the CPU
+    // and OS actually enforced one for this run.
+#if defined(_WIN64)
+    const uint64_t ssp = _rdsspq();
+#else
+    const uint64_t ssp = _rdsspd();
+#endif
     std::printf("{\"kind\":\"app\",\"reads_enabled\":%u,\"helpers\":%llu,\"opened\":%llu,\"threads\":%llu,"
                 "\"reads_per_thread\":%llu,\"successful_reads\":%llu,\"checksum\":%llu,\"elapsed_ns\":%.0f,"
-                "\"prehook\":%s,\"prehook_calls\":%llu,\"configparse_base\":%llu}\n",
+                "\"prehook\":%s,\"prehook_calls\":%llu,\"configparse_base\":%llu,\"shadow_stack\":%s}\n",
                 parsed.reads_enabled, (unsigned long long)helper_count,
                 (unsigned long long)(parsed.reads_enabled ? helper_count : 0), (unsigned long long)threads,
                 (unsigned long long)reads, (unsigned long long)success, (unsigned long long)checksum, elapsed_ns,
                 existing_hook ? "true" : "false", (unsigned long long)hook_calls,
-                (unsigned long long)(uintptr_t)dll);
+                (unsigned long long)(uintptr_t)dll, ssp ? "true" : "false");
     std::fflush(stdout);
     return 0;
 } catch (const std::exception &e) { std::fprintf(stderr, "probe_app: %s\n", e.what()); return 1; }

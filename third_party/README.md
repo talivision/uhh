@@ -5,7 +5,7 @@ building needs no network. Licences are in each directory (both MIT).
 
 | Directory   | Upstream                                  | Version | Changes |
 |-------------|-------------------------------------------|---------|---------|
-| safetyhook/ | https://github.com/cursey/safetyhook      | v0.7.0  | `cmake/patch_safetyhook.cmake` already applied (frozen-patch switch, `uhh_trampoline()`); `test/`, `docs/`, `example/` removed |
+| safetyhook/ | https://github.com/cursey/safetyhook      | v0.7.0  | `cmake/patch_safetyhook.cmake` already applied (frozen-patch switch, `uhh_trampoline()`, mid-hook resume `pop rsp; jmp [trampoline]` with a writable context rsp); `test/`, `docs/`, `example/` removed |
 | zydis/      | https://github.com/zyantific/zydis        | v4.1.0  | includes the `dependencies/zycore` submodule; `tests/`, `msvc/`, `assets/`, `man/` removed |
 
 To refresh: replace the directory with a clean checkout of the new tag (Zydis with

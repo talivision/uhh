@@ -21,7 +21,60 @@ __declspec(dllexport) __declspec(noinline) intptr_t conf_site(intptr_t a0, intpt
 __declspec(dllexport) __declspec(noinline) intptr_t conf_mul(intptr_t a, intptr_t b) { return a * b; }
 // Probed only at runtime (added from inside the callback).
 __declspec(dllexport) __declspec(noinline) void conf_later(int i) { g_later_calls += i ? 1 : 1; }
-intptr_t SpSite(void);   /* asm: returns how far SP moved across the probe at SpSite+3 */
+intptr_t SpSite(void);
+
+/* call_original / return_from (conformance_driver --callorig). g_co_body counts how often a
+   body really ran: once with call_original + return_from, never with a pure return_from. */
+static volatile long g_co_body;
+__declspec(dllexport) __declspec(noinline) intptr_t co_args6(intptr_t a0, intptr_t a1, intptr_t a2,
+                                                             intptr_t a3, intptr_t a4, intptr_t a5) {
+    g_co_body++;
+    return a0 * 100000 + a1 * 10000 + a2 * 1000 + a3 * 100 + a4 * 10 + a5;
+}
+__declspec(dllexport) __declspec(noinline) intptr_t __stdcall co_std2(intptr_t a, intptr_t b) {
+    g_co_body++;
+    return a * 31 + b;
+}
+__declspec(dllexport) __declspec(noinline) intptr_t __cdecl co_cdecl2(intptr_t a, intptr_t b) {
+    g_co_body++;
+    return a * b + 1;
+}
+#if !defined(_WIN64)
+#pragma comment(linker, "/EXPORT:co_std2=_co_std2@8")
+#endif
+static int callorig_main(void) {
+    int args6 = 0, std2 = 0, std2_sp = 0, cdecl2 = 0, body_ok = 0;
+    for (int k = 0; k < 10; ++k) {
+        /* callback: a0 1 -> 7 and a5 6 -> 9 (a stack arg on both arches), call_original, then
+           return_from(r + 1). Expect 7,2,3,4,5,9 -> 723459 + 1, body ran exactly once. */
+        g_co_body = 0;
+        intptr_t r = co_args6(1, 2, 3, 4, 5, 6);
+        if (r == 723460) ++args6;
+        int once = g_co_body == 1;
+        /* pure replacement: return_from(99, 2) -- body never runs; x86 stdcall pops 8 bytes. */
+        g_co_body = 0;
+#if !defined(_WIN64)
+        uintptr_t sp_before, sp_after;
+        __asm mov sp_before, esp
+        r = co_std2(3, 4);
+        __asm mov sp_after, esp
+        if (sp_before == sp_after) ++std2_sp;
+#else
+        r = co_std2(3, 4); ++std2_sp;
+#endif
+        if (r == 99) ++std2;
+        int none = g_co_body == 0;
+        /* cdecl: call_original (5*6+1 = 31) then return_from(r * 2, 0) -> 62, body once. */
+        g_co_body = 0;
+        r = co_cdecl2(5, 6);
+        if (r == 62) ++cdecl2;
+        if (once && none && g_co_body == 1) ++body_ok;
+    }
+    printf("{\"kind\":\"callorig\",\"args6\":%d,\"std2\":%d,\"std2_sp\":%d,\"cdecl2\":%d,\"body_ok\":%d}\n",
+           args6, std2, std2_sp, cdecl2, body_ok);
+    fflush(stdout);
+    return 0;
+}   /* asm: returns how far SP moved across the probe at SpSite+3 */
 
 static int wait_gate(void) {
     char b; DWORD n = 0; HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
@@ -29,6 +82,7 @@ static int wait_gate(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "--callorig")) return callorig_main();
     int no_wait = argc > 1 && !strcmp(argv[1], "--no-wait");
     printf("{\"kind\":\"waiting\"}\n"); fflush(stdout);
     if (!no_wait && !wait_gate()) return 3;

@@ -36,7 +36,7 @@ inline probe_context from_context(CONTEXT &w, uint32_t site, uint64_t pc, const 
     c.regs.rax = w.Eax; c.regs.rbx = w.Ebx; c.regs.rcx = w.Ecx; c.regs.rdx = w.Edx;
     c.regs.rsi = w.Esi; c.regs.rdi = w.Edi; c.regs.rbp = w.Ebp; c.regs.rsp = w.Esp;
 #endif
-    c.regs.flags = w.EFlags; c.regs.pc = pc;
+    c.regs.flags = w.EFlags; c.regs.pc = pc; c.hit_sp = c.regs.rsp;
     c.site = site; c.ops = ops; c.backend = backend; return c;
 }
 inline void to_context(const probe_context &c, CONTEXT &w) {

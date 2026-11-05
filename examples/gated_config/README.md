@@ -16,9 +16,12 @@ without rebuilding the target, editing its config, or patching its files:
    to store "enabled" as if its config had said so. The probe is registered before
    the DLL exists in the process; it stays pending and arms when the DLL loads.
 2. **Observe the path you enabled.** `track_open_process` on `ntdll.dll!NtOpenProcess`
-   learns which pid each new process handle belongs to, and `log_read` on
+   logs every open as `open pid=.. name=..` (image name from the kernel by pid, without
+   opening it) and builds a handle -> pid -> name map; the first read through a handle
+   logs `map handle=0x.. -> pid=.. name=..`. `log_read` on
    `ntdll.dll!NtReadVirtualMemory` logs every read as
-   `read handle=0x.. pid=.. addr=0x.. size=..`. Both are the ntdll syscall stubs, so every
+   `read handle=0x.. pid=.. name=.. addr=0x.. size=..`. Regress `gated-map` checks every
+   map and read line against the handle the target's open really returned. Both are the ntdll syscall stubs, so every
    caller is seen whichever wrapper it used (ReadProcessMemory, a direct ntdll call, a
    wrapper you do not know about) -- under every backend, inline included.
 
