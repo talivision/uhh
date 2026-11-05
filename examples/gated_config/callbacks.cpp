@@ -11,6 +11,20 @@ extern "C" void enable_reads(probe_context *c) {
     if (get_reg(c, PROBE_REG_AX) == 0) set_reg(c, PROBE_REG_AX, 1);
 }
 
+// 1b. The same flip done in MEMORY (examples/gated_config_mem). One instruction later, at
+//     configparse.dll!ParseConfig+0x18, the parsed value has been stored to *out, and BX
+//     (rbx/ebx) still points at out on both arches: read the stored flag and, if it is 0,
+//     write 1 over it. No register changes -- the target simply reads enabled config.
+extern "C" void enable_reads_mem(probe_context *c) {
+    const uint64_t out = get_reg(c, PROBE_REG_BX);
+    uint32_t reads_enabled = 1;
+    if (out && get_mem(c, out, &reads_enabled, sizeof(reads_enabled)) && reads_enabled == 0) {
+        reads_enabled = 1;
+        set_mem(c, out, &reads_enabled, sizeof(reads_enabled));
+        send_log(c, "flag flipped in memory at 0x%llx", (unsigned long long)out);
+    }
+}
+
 // 2. Handle -> pid map, built from ntdll!NtOpenProcess (PHANDLE out, ACCESS_MASK,
 //    POBJECT_ATTRIBUTES, PCLIENT_ID): the syscall stub every OpenProcess path ends in.
 //    It uses the same backend as the read probe: the map must live where the read

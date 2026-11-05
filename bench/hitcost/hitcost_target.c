@@ -15,13 +15,20 @@ __declspec(dllexport) __declspec(noinline) intptr_t hit_site(intptr_t i);
 static long long g_calls = 10000000; static int g_avx = 0;
 static long long g_crash_after = 0;            /* >0: die with an unhandled access violation after N calls */
 static volatile LONG g_go;
+static int g_qpc_arg = 0;                      /* --qpc-arg: pass a QPC timestamp (microseconds, low 31 bits) instead of i */
+static LARGE_INTEGER g_freq;
+static intptr_t qpc_us(void) {                 /* same clock as Python's time.perf_counter_ns, in us, 31 bits (fits x86) */
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    long long us = (t.QuadPart / g_freq.QuadPart) * 1000000LL + (t.QuadPart % g_freq.QuadPart) * 1000000LL / g_freq.QuadPart;
+    return (intptr_t)(us & 0x7fffffffLL);
+}
 
 static DWORD WINAPI loop(void *arg) {
     (void)arg;
     __m256 live = _mm256_set1_ps(1.0f), flip = _mm256_castsi256_ps(_mm256_set1_epi32(0x00800000));
     while (!g_go) YieldProcessor();
     for (long long i = 0; i < g_calls; ++i) {
-        hit_site((intptr_t)i);
+        hit_site(g_qpc_arg ? qpc_us() : (intptr_t)i);
         if (g_crash_after && i + 1 == g_crash_after) *(volatile int *)(uintptr_t)8 = 1;   /* crash */
         if (g_avx) live = _mm256_xor_ps(live, flip);
     }
@@ -41,8 +48,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--avx")) g_avx = 1;
         else if (!strcmp(argv[i], "--crash-after") && i + 1 < argc) g_crash_after = atoll(argv[++i]);
         else if (!strcmp(argv[i], "--no-wait")) no_wait = 1;
+        else if (!strcmp(argv[i], "--qpc-arg")) g_qpc_arg = 1;
     }
     if (threads < 1 || threads > 64) threads = 1;
+    QueryPerformanceFrequency(&g_freq);
     printf("{\"kind\":\"waiting\"}\n"); fflush(stdout);
     if (!no_wait) { char b; DWORD got = 0; ReadFile(GetStdHandle(STD_INPUT_HANDLE), &b, 1, &got, NULL); }
     HANDLE h[64];

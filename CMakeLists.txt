@@ -29,15 +29,38 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
     set(READ_THUNK_EXPORT "/EXPORT:ReadThunk=_ReadThunk@20" "/EXPORT:OpenThunk=_OpenThunk@16")
     set(BREAKAGE_ASM  examples/breakage/hook_edge_x86.asm)
     set(PARITY_ASM    examples/frida_parity/parity_sites_x86.asm)
+    set(LOGSTREAM_EXPORT "/EXPORT:LogSite")    # the x86 linker adds the cdecl underscore itself
 else()
     set(READ_SITE_ASM examples/targets/probe_app/read_site_x64.asm)
     set(PARSE_ASM     examples/targets/configparse/parse_x64.asm)
     set(READ_THUNK_EXPORT "/EXPORT:ReadThunk" "/EXPORT:OpenThunk")
     set(BREAKAGE_ASM  examples/breakage/hook_edge_x64.asm)
     set(PARITY_ASM    examples/frida_parity/parity_sites_x64.asm)
+    set(LOGSTREAM_EXPORT "/EXPORT:LogSite")
 endif()
 
 include(FetchContent)
+# Offline by default: SafetyHook (pre-patched) and Zydis/Zycore are vendored in third_party/
+# and FetchContent is pointed at them -- no git, no network. UHH_VENDORED_DEPS=OFF fetches
+# the same tags from GitHub instead (and applies the SafetyHook patch at fetch time).
+option(UHH_VENDORED_DEPS "Build SafetyHook and Zydis from third_party/ (no network)" ON)
+if(UHH_VENDORED_DEPS)
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/safetyhook/CMakeLists.txt" OR
+       NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/zydis/dependencies/zycore/CMakeLists.txt")
+        message(FATAL_ERROR "UHH_VENDORED_DEPS=ON but third_party/ is incomplete (see third_party/README.md)")
+    endif()
+    set(FETCHCONTENT_SOURCE_DIR_SAFETYHOOK "${CMAKE_CURRENT_SOURCE_DIR}/third_party/safetyhook" CACHE PATH "" FORCE)
+    set(FETCHCONTENT_SOURCE_DIR_ZYDIS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/zydis" CACHE PATH "" FORCE)
+else()
+    unset(FETCHCONTENT_SOURCE_DIR_SAFETYHOOK CACHE)
+    unset(FETCHCONTENT_SOURCE_DIR_ZYDIS CACHE)
+endif()
+set(ZYDIS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(ZYDIS_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(ZYDIS_BUILD_MAN OFF CACHE BOOL "" FORCE)
+set(ZYDIS_BUILD_DOXYGEN OFF CACHE BOOL "" FORCE)
+set(ZYCORE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(SAFETYHOOK_BUILD_TEST OFF CACHE BOOL "" FORCE)
 set(SAFETYHOOK_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(SAFETYHOOK_BUILD_DOCS OFF CACHE BOOL "" FORCE)
@@ -105,6 +128,14 @@ add_executable(gated_config
 target_include_directories(gated_config PRIVATE examples/gated_config include)
 target_link_libraries(gated_config PRIVATE probe_api)
 add_dependencies(gated_config probe_app configparse probe_api_agent)
+
+# Same, but the flag is flipped in the target's MEMORY (set_mem) instead of a register.
+add_executable(gated_config_mem
+    examples/gated_config_mem/main.cpp
+    examples/gated_config/callbacks.cpp)
+target_include_directories(gated_config_mem PRIVATE examples/gated_config include)
+target_link_libraries(gated_config_mem PRIVATE probe_api)
+add_dependencies(gated_config_mem probe_app configparse probe_api_agent)
 
 add_executable(uhh_attach
     examples/attach/uhh_attach.cpp
@@ -184,6 +215,12 @@ target_compile_definitions(hitcost_driver_shared PRIVATE HITCOST_SHARED)
 target_link_libraries(hitcost_driver_shared PRIVATE probe_api)
 add_dependencies(hitcost_driver_shared hitcost_target probe_api_agent)
 
+# --- streaming logs: visible latency and per-thread ordering --------------------------
+add_executable(logstream_target examples/targets/logstream/logstream_target.c)
+target_compile_options(logstream_target PRIVATE /W4)
+target_link_options(logstream_target PRIVATE ${LOGSTREAM_EXPORT})
+add_dependencies(uhh_trace logstream_target)
+
 # --- memory read/write at scale (every backend) ------------------------------------------
 add_executable(memstress_target examples/memstress/memstress_target.c)
 add_executable(memstress_driver examples/memstress/memstress_driver.cpp examples/memstress/memstress_callbacks.cpp)
@@ -233,7 +270,7 @@ target_include_directories(refusal_driver PRIVATE include)
 target_link_libraries(refusal_driver PRIVATE probe_api)
 add_dependencies(refusal_driver hitcost_target)
 
-foreach(t patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
+foreach(t gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver)
     target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 endforeach()
