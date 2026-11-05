@@ -227,7 +227,7 @@ breakpoint/hw/inline on x64+x86, compared with the uninstrumented run (`regress.
 Replicas of Microsoft Detours' simple / traceapi / withdll / retval samples on real system
 binaries (cmd, reg, sort), multi-threaded targets, launch vs attach, attach mid-run + detach,
 9 probes at once and mixed backends. Everything else matched the uninstrumented runs exactly.
-- ⬜ (D1) **probe_launch replaces the program's stdin.** The child gets a private pipe, UHH writes
+- ✅ (D1, fixed: the target now inherits the caller's stdin; regress feeds keystrokes at the harness) **probe_launch replaced the program's stdin.** The child gets a private pipe, UHH writes
   one "gate keystroke" (`\n`) into it and keeps the write end open until probe_close. A filter
   program (`sort`, `findstr`, `more`, anything reading stdin to EOF) **hangs forever** under every
   backend, and a program reading a line gets a `\n` it was never sent. Detours' withdll passes the
