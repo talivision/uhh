@@ -872,6 +872,7 @@ struct HitScope {
 };
 static void hit_scope_abandon(HitScope *h);
 
+constexpr int kOrigMaxArgs = 16;              // call_original's argument limit (probe_api.h)
 #if defined(_WIN64)
 struct OrigFrame {                   // layout read by uhh_orig_thunk
     uint64_t rip, rsp;               // the hit's return address, and the caller's SP after it
@@ -894,7 +895,6 @@ extern "C" EXCEPTION_DISPOSITION uhh_orig_unwind(EXCEPTION_RECORD *rec, void *fr
     return ExceptionContinueSearch;
 }
 #else
-constexpr int kOrigMaxArgs = 16;              // call_original's argument limit (probe_api.h)
 struct SehRecord { SehRecord *next; void *handler; };
 // FNSAVE/FRSTOR image of the x87 state (108 bytes in 32-bit protected mode).
 static void x87_restore(const unsigned char *img) { __asm { mov eax, img

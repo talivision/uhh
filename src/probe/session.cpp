@@ -4784,7 +4784,7 @@ static void drain_final(probe_session *s) {
     if ((uint64_t)head - (uint64_t)tail > PROBE_AGENT_LOG_CAP) head = (LONG64)((uint64_t)tail + PROBE_AGENT_LOG_CAP);
     for (LONG64 pos = tail; pos != head; pos = (LONG64)((uint64_t)pos + 1)) {
         auto &rec = sh->logs[(uint64_t)pos % PROBE_AGENT_LOG_CAP];
-        if (rec.seq != pos + 1) continue;                 // its producer died / is stopped mid-callback (see above)
+        if (rec.seq != (LONG64)((uint64_t)pos + 1)) continue;                 // its producer died / is stopped mid-callback (see above)
         MemoryBarrier();
         enqueue_agent_record(s, rec);
     }
@@ -5600,6 +5600,7 @@ extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
     auto *st = c ? static_cast<CallbackState *>(c->controller) : nullptr;
     if (!st || !st->session || !st->tid || !st->probe || st->released) return 0;
     if (nargs < 0 || nargs > 16) {                                     // same contract as inline
+        warn_record(c, st->probe, "call_original refused: nargs must be 0..16");
         co_warn(st->session->co_warned_nargs, st->probe, "call_original refused: nargs must be 0..16"); return 0;
     }
     if (st->probe->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) return 0;
@@ -5623,6 +5624,8 @@ extern "C" void return_from(probe_context *c, uint64_t value, int nargs) {
     uint32_t pop = (uint32_t)nargs * 4;
     if (probe_x86_return_regs(c, value, &pop) && st->probe && !st->probe->warned_pop) {
         st->probe->warned_pop = true;
+        send_log(c, "uhh warning: return_from nargs=%d but the original popped %d bytes (ret %d); the original's "
+                    "count is used", nargs, (int)c->orig_pop, (int)c->orig_pop);   // as inline logs it
         std::fprintf(stderr, "probe: warning: %s: return_from nargs=%d but the original popped %d bytes (ret %d); "
                      "the original's count is used. Further cases are not reported.\n",
                      st->probe->location.c_str(), nargs, (int)c->orig_pop, (int)c->orig_pop);
