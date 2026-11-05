@@ -47,6 +47,9 @@ Checks:
     log_dropped == 0, logs == hits, still working after detach.
   - newapp-file/flag/reg-<backends>: the new-app examples (filetrace, flagflip, regtrace),
     every backend and mixes, each compared with the ground truth its fixture prints.
+  - logs-*: adversarial log delivery (examples/logs_eval): exact text for hostile formats on
+    every backend, per-thread order across mixed backends, a producer killed/suspended
+    mid-record, the controller killed while attached, the stdout reader going away.
 Missing binaries (an example not built) are reported as SKIP, not FAIL.
 """
 import argparse
@@ -5191,6 +5194,229 @@ def check_ctrl_review():
     except Exception as e:
         record("ctrl-headclamp", False, repr(e))
 
+# ---- logs-*: adversarial log delivery (examples/logs_eval) --------------------------------
+# Gospel: logs are never dropped and always delivered; hits == logs + log_dropped +
+# callbacks_interrupted, and log_dropped != 0 only when the controller itself is gone.
+
+def logs_run(a, b, targs, timeout=300):
+    """logs_driver on logs_target. stdout is parsed as STRICT UTF-8 JSON: a line that is not
+    valid JSON / UTF-8 is itself a failure (returned in bad)."""
+    r = subprocess.run([str(exe("logs_driver.exe")), "--a", a, "--b", b, "--", str(exe("logs_target.exe"))] +
+                       [str(x) for x in targs], capture_output=True, timeout=timeout)
+    objs, bad = [], []
+    for ln in r.stdout.split(b"\n"):
+        ln = ln.strip()
+        if not ln.startswith(b"{"):
+            continue
+        try:
+            objs.append(json.loads(ln.decode("utf-8")))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            bad.append(ln[:120])
+    return r, objs, bad
+
+
+def logs_expected_formats():
+    mark = "...[truncated]"
+    cut = lambda text: text[:1023 - len(mark)] + mark       # 1024-byte record: 1023 chars + NUL
+    return [
+        "x" * 1023,                                          # exactly the cap: whole
+        cut("x" * 1024),                                     # one over: marked, never silent
+        "[unformattable] k2 %n",
+        "k3 k",                                              # the CRT prints an unknown conversion's letter
+        cut("k4 " + " " * 4999 + "7"),
+        "k5 a\x00b",                                         # embedded NUL kept (escaped)
+        "k6 t\tr\rx\x01e\x1bf\x7f",                          # control characters kept (escaped)
+        "k7 é→\U0001F600",                         # valid UTF-8 passes through
+        "k8 ÿþ ok Ã",                         # invalid UTF-8 bytes -> \u00XX
+        "k9 (null)",
+        cut("[unformattable] " + "y" * 1100 + " %n"),        # long AND invalid: still marked
+        "k11 \"quoted\" back\\slash /",
+        "",
+        cut("k13 " + "x" * 1100),
+        None,                                                # k14 %ls: checked for consistency only
+        "k15 abc|5   |+2.50|0xff|%",
+    ]
+
+
+def check_logs_format():
+    """Every send_log text arrives exactly, identically on every backend: maximum size kept
+    whole, one byte over truncated WITH a visible marker (also for an unformattable long
+    format), %n / unknown conversions logged as [unformattable], embedded NULs, control
+    characters and invalid UTF-8 escaped (nothing silently removed), valid UTF-8 untouched,
+    every line strict UTF-8 JSON, a stack snapshot on a truncated send_log_stack."""
+    if not exe("logs_driver.exe") or not exe("logs_target.exe"):
+        return skip("logs-format", "logs_driver/logs_target missing")
+    want = logs_expected_formats()
+    seen = {}
+    for bk in ("inline", "hw", "breakpoint"):
+        name = f"logs-format-{bk}"
+        try:
+            r, o, bad = logs_run(bk, "none", ["--mode", "format", "--cases", len(want)])
+            logs = [x for x in o if x.get("kind") == "probe_log"]
+            msgs = [x.get("message") for x in logs]
+            seen[bk] = msgs
+            wrong = [f"k{i}: got {msgs[i]!r:.80} want {w!r:.80}" for i, w in enumerate(want)
+                     if w is not None and i < len(msgs) and msgs[i] != w]
+            stack13 = len(logs) > 13 and bool(logs[13].get("stack"))
+            rep = report(o)
+            ok = (r.returncode == 0 and not bad and len(msgs) == len(want) and not wrong and stack13 and
+                  rep.get("log_dropped") == 0)
+            record(name, ok, f"logs={len(msgs)}/{len(want)} bad_json_lines={len(bad)} wrong={len(wrong)} "
+                             f"stack_on_truncated={stack13} dropped={rep.get('log_dropped')}" +
+                             ("" if ok else f" first_wrong={wrong[:2]} bad={bad[:1]}"))
+        except Exception as e:
+            record(name, False, repr(e))
+    try:
+        same = len(seen) == 3 and seen["inline"] == seen["hw"] == seen["breakpoint"]
+        record("logs-format-same-everywhere", same,
+               "identical text on inline/hw/breakpoint" if same else
+               f"differ: {[(i, a, b) for i, (a, b) in enumerate(zip(seen.get('inline', []), seen.get('breakpoint', []))) if a != b][:2]}")
+    except Exception as e:
+        record("logs-format-same-everywhere", False, repr(e))
+
+
+def check_logs_order(threads=4, count=2000):
+    """Per-thread order across MIXED backends: each thread alternates an inline-probed call
+    and a breakpoint/hw-probed call (seq 0,1,2,...; the second logs with a stack). Inline
+    logs cross the shared ring, breakpoint/hw logs are queued by the debugger -- every
+    thread's records must still arrive in its own order, all of them, nothing dropped."""
+    if not exe("logs_driver.exe") or not exe("logs_target.exe"):
+        return skip("logs-order", "logs_driver/logs_target missing")
+    for a, b in (("inline", "breakpoint"), ("inline", "hw")):
+        name = f"logs-order-{a}+{b}"
+        try:
+            r, o, bad = logs_run(a, b, ["--mode", "order", "--threads", threads, "--count", count], timeout=600)
+            by, nostack = {}, 0
+            for x in o:
+                if x.get("kind") != "probe_log":
+                    continue
+                m = re.fullmatch(r"o (\d+)", str(x.get("message", "")))
+                if m:
+                    v = int(m.group(1))
+                    by.setdefault(x.get("tid"), []).append(v)
+                    nostack += bool(v % 2) and not x.get("stack")
+            inversions = sum(sum(1 for p, q in zip(s, s[1:]) if q <= p) for s in by.values())
+            total = sum(map(len, by.values()))
+            rep = report(o)
+            ok = (r.returncode == 0 and not bad and len(by) == threads and total == 2 * threads * count and
+                  inversions == 0 and nostack == 0 and rep.get("log_dropped") == 0)
+            record(name, ok, f"threads={len(by)}/{threads} logs={total}/{2 * threads * count} "
+                             f"out_of_order={inversions} stack_missing={nostack} dropped={rep.get('log_dropped')}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+def check_logs_wedge(threads=4, count=3000):
+    """A producer stopped BETWEEN claiming a ring slot and publishing it (the target finds that
+    instant through the shared ring and freezes the thread there):
+      kill:    TerminateThread there. Its slot can never be published.
+      suspend: the program's own SuspendThread, held while the other threads log.
+      exit:    ExitProcess kills it there, and the exiting thread then logs more records than
+               the ring holds from a TLS callback at DLL_PROCESS_DETACH (the hang case: every
+               later log used to wait behind the dead slot forever).
+    The others' logs must keep flowing live (no stalls, all delivered while the target runs),
+    nothing may be dropped, and the killed callback is accounted as interrupted:
+    hits == logs + callbacks_interrupted exactly."""
+    if not exe("logs_driver.exe") or not exe("logs_target.exe"):
+        return skip("logs-wedge", "logs_driver/logs_target missing")
+    for mode in ("kill", "suspend", "exit"):
+        name = f"logs-wedge-{mode}"
+        try:
+            n = 6000 if mode == "exit" else count
+            r, o, bad = logs_run("inline", "none", ["--mode", f"wedge-{mode}", "--threads", threads, "--count", n],
+                                 timeout=180)
+            a, rep = app(o), report(o)
+            hits = next(iter(probes(o)), {}).get("hits")
+            logs = sum(1 for x in o if x.get("kind") == "probe_log" and str(x.get("message", "")).startswith("o "))
+            interrupted = rep.get("callbacks_interrupted")
+            if mode == "exit":
+                live_ok = rep.get("app_exit") == 7
+                detail = f"exit={rep.get('app_exit')}"
+            else:
+                live_ok = (r.returncode == 0 and a.get("phase2_calls") == threads * count and
+                           (a.get("phase2_ms") or 1e9) < 10000 and a.get("undelivered_after_phase2") == 0)
+                detail = (f"phase2={a.get('phase2_calls')}/{threads * count} in {a.get('phase2_ms')}ms "
+                          f"undelivered_live={a.get('undelivered_after_phase2')}")
+            ok = (live_ok and a.get("wedged") == 1 and rep.get("log_dropped") == 0 and
+                  interrupted == (0 if mode == "suspend" else 1) and hits is not None and hits == logs + interrupted)
+            record(name, ok, f"wedged={a.get('wedged')} {detail} hits={hits} logs={logs} interrupted={interrupted} "
+                             f"dropped={rep.get('log_dropped')} rc={r.returncode}")
+        except subprocess.TimeoutExpired:
+            record(name, False, "session HUNG (180 s): logging stalled behind the unpublished slot")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+def check_logs_controller_killed(threads=4, count=20000):
+    """The CONTROLLER dies while attached (inline hooks stay in the target, nobody drains the
+    ring): the target must run to completion -- its log calls notice the controller is gone
+    and return (counted as dropped: the one case where dropping is allowed) instead of
+    waiting forever on a full ring."""
+    t, tr = exe("logs_target.exe"), exe("uhh_trace.exe")
+    if not t or not tr:
+        return skip("logs-controller-killed", "logs_target/uhh_trace missing")
+    name = "logs-controller-killed"
+    tg = trc = None
+    try:
+        tg = subprocess.Popen([str(t), "--mode", "gate", "--threads", str(threads), "--count", str(count)],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        pid = json.loads(tg.stdout.readline())["pid"]
+        trc = subprocess.Popen([str(tr), "--backend", "inline", "--attach", str(pid), "-p", "logs_target.exe!LogSiteA:dd"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        terr = Lines(trc.stderr)
+        if not terr.wait_for(lambda l: l.startswith("probe: active "), 60):
+            raise RuntimeError("probe never became active: " + " | ".join(terr.lines[-5:])[:400])
+        tg.stdin.write(b"\n"); tg.stdin.flush()
+        time.sleep(0.3)
+        trc.kill(); trc.wait(timeout=30)
+        try:
+            out = tg.communicate(timeout=90)[0].decode(errors="replace")
+            a = next((json.loads(l) for l in out.splitlines() if '"kind":"app"' in l), {})
+            ok = tg.returncode == 0 and a.get("calls") == threads * count
+            record(name, ok, f"target finished rc={tg.returncode} calls={a.get('calls')}/{threads * count} in {a.get('ms')}ms")
+        except subprocess.TimeoutExpired:
+            record(name, False, "target HUNG after the controller was killed (90 s): its log calls wait forever")
+    except Exception as e:
+        record(name, False, repr(e))
+    finally:
+        for p_ in (tg, trc):
+            if p_ and p_.poll() is None:
+                p_.kill()
+
+
+def check_logs_stdout_closed(threads=4):
+    """The reader of the controller's stdout goes away (`| head`): live output ends, but the
+    session's JSONL file -- the complete record -- must still receive EVERY log."""
+    if not exe("logs_driver.exe") or not exe("logs_target.exe"):
+        return skip("logs-stdout-closed", "logs_driver/logs_target missing")
+    for bk, count in (("inline", 5000), ("hw", 500)):
+        name = f"logs-stdout-closed-{bk}"
+        try:
+            p = subprocess.Popen([str(exe("logs_driver.exe")), "--a", bk, "--b", "none", "--", str(exe("logs_target.exe")),
+                                  "--mode", "order", "--threads", str(threads), "--count", str(count)],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            for _ in range(5):
+                p.stdout.readline()
+            p.stdout.close()                                  # the reader is gone
+            err = p.stderr.read().decode(errors="replace")
+            p.wait(timeout=300)
+            m = re.search(r"probe: logs -> (.*)", err)
+            n = 0
+            if m:
+                path = Path(m.group(1).strip())
+                with open(path, "rb") as f:
+                    n = sum(1 for ln in f if b'"kind":"probe_log"' in ln)
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            want_n = threads * count                          # LogSiteA only: probe B is not set
+            ok = n == want_n
+            record(name, ok, f"file_logs={n}/{want_n} rc={p.returncode}" +
+                             ("" if ok else " stderr=" + " | ".join(err.strip().splitlines()[-3:])[:300]))
+        except Exception as e:
+            record(name, False, repr(e))
+
 
 def main():
     global BIN
@@ -5230,7 +5456,10 @@ def main():
 
     def want(fn):
         sweep_logs()
-        return not only or any(o in fn.__name__ or o.replace('-', '_') in fn.__name__ for o in only)
+        # Also matches the hyphenated name (check_logs_order -> check-logs-order), so
+        # --only logs- selects the logs-* family by its record-name prefix.
+        names = (fn.__name__, fn.__name__.replace("_", "-"))
+        return not only or any(o in n for o in only for n in names)
     print(f"UHH regression suite — bin={BIN}")
     if want(check_sites): check_sites()
     if want(check_gated_off): check_gated_off()
@@ -5308,6 +5537,11 @@ def main():
     if want(check_newapp_files): check_newapp_files()
     if want(check_newapp_flag): check_newapp_flag()
     if want(check_newapp_reg): check_newapp_reg()
+    if want(check_logs_format): check_logs_format()
+    if want(check_logs_order): check_logs_order()
+    if want(check_logs_wedge): check_logs_wedge()
+    if want(check_logs_controller_killed): check_logs_controller_killed()
+    if want(check_logs_stdout_closed): check_logs_stdout_closed()
     print("-" * 72)
     failed = 0
     for name, status, detail in RESULTS:

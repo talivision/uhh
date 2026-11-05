@@ -559,52 +559,94 @@ static uint32_t capture_stack(probe_context *c, uint64_t *frames, uint32_t cap) 
     return n;
 }
 
+static bool raise_ipc(probe_ipc_request *req);
+
+// The ring is stalled behind a live producer (see probe_agent_shared.hpp): hand the record
+// to the controller synchronously. False = not delivered (no debugger is servicing it).
+static bool deliver_by_ipc(const probe_agent_log *rec, uint32_t site) {
+    probe_ipc_request req{};
+    req.op = PROBE_IPC_LOG; req.origin_site = site; req.address = (uint64_t)(uintptr_t)rec;
+    return raise_ipc(&req) && req.result == 1;
+}
+
+// A drainer heartbeat that stopped means a BUSY controller (its writer is applying
+// backpressure) or a DEAD one (killed while attached: the hooks stay, nobody consumes).
+// Only the second may drop -- and must, or every logging thread would wait forever.
+static bool controller_dead(const probe_agent_shared *sh) {
+    if (!sh->controller_pid) return false;
+    HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, sh->controller_pid);
+    if (!h) return GetLastError() == ERROR_INVALID_PARAMETER;          // no such process
+    bool dead = WaitForSingleObject(h, 0) == WAIT_OBJECT_0;
+    CloseHandle(h);
+    return dead;
+}
+
 // Format and stack are produced BEFORE claiming a ring slot so a slot is held only
-// for a memcpy; a full ring drops the record (counted) rather than block the thread.
+// for a copy. A full ring makes the producer wait (backpressure); see the ring's comment in
+// probe_agent_shared.hpp for the only cases that do not end in the ring.
 static void agent_log(probe_context *c, bool stack, const char *format, va_list ap) {
     auto *state = c ? static_cast<AgentState *>(c->controller) : nullptr;
     if (!state || !state->shared || !format) return;
-    char text[PROBE_AGENT_LOG_TEXT_CAP];
+    probe_agent_log local;                     // the record, built on this stack
     // The controller's formatter: an invalid format (%k, %n) used to fast-fail the TARGET
     // through the CRT's invalid-parameter handler; now logged as "[unformattable] <format>".
-    if (!uhh_format_log(text, sizeof(text), format, ap)) return;
-    uint64_t frames[PROBE_STACK_MAX_FRAMES]; uint32_t nframes = 0;
-    if (stack) nframes = capture_stack(c, frames, PROBE_STACK_MAX_FRAMES);
+    int len = uhh_format_log(local.text, sizeof(local.text), format, ap);
+    if (len < 0) return;
+    local.text_len = (uint32_t)len;
+    local.frame_count = stack ? capture_stack(c, local.frames, PROBE_STACK_MAX_FRAMES) : 0;
+    local.has_stack = stack ? 1 : 0;
+    local.probe = state->index; local.tid = c->tid;
     auto *sh = state->shared;
     if (sh->controller_gone) { InterlockedIncrement(&sh->log_dropped); return; }   // nobody will read it
     LONG64 pos = sh->log_head;
     probe_agent_log *rec = nullptr;
-    ULONGLONG last_tick = 0, waited = 0; LONG64 seen_beat = 0, seen_tail = -1;
+    // Heartbeat watch: time is accumulated in small steps so a debugger freezing the whole
+    // process (when nothing here runs) never counts as the controller being idle.
+    ULONGLONG last_tick = 0, idle = 0; LONG64 seen_beat = -1; bool ipc_failed = false;
+    const DWORD me = GetCurrentThreadId();
     for (;;) {
         rec = &sh->logs[(uint64_t)pos % PROBE_AGENT_LOG_CAP];
         LONG64 diff = rec->seq - pos;
         if (diff == 0) {
-            if (InterlockedCompareExchange64(&sh->log_head, pos + 1, pos) == pos) break;
+            // Claim = own the slot FIRST (owner 0 -> this thread), then move the head. Only the
+            // owner can move the head past pos, so a claimed slot always names its producer --
+            // the controller can tell when that producer died. A stale view (the head moved on)
+            // gives the slot back.
+            if (rec->owner == 0 && InterlockedCompareExchange(&rec->owner, (LONG)me, 0) == 0) {
+                if (InterlockedCompareExchange64(&sh->log_head, pos + 1, pos) == pos) break;
+                InterlockedExchange(&rec->owner, 0);
+            }
             pos = sh->log_head;
         } else if (diff < 0) {
-            // Full: the controller's drainer is behind. Wait for a slot (backpressure)
-            // rather than lose the record. Give up only after THIS thread has itself
-            // waited 2 s while the drainer was alive (its heartbeat moving) but the ring did
-            // not move (tail stuck behind a slot whose producer is gone or suspended).
-            // Time is accumulated in small steps so a debugger freezing the whole process
-            // (when nothing here runs) never counts as waiting.
+            // Full: wait for a slot rather than lose the record.
             if (sh->controller_gone) { InterlockedIncrement(&sh->log_dropped); return; }
+            if (sh->ring_stalled && sh->log_ipc && !ipc_failed) {
+                if (deliver_by_ipc(&local, state->index)) return;
+                ipc_failed = true;
+            }
             ULONGLONG now = GetTickCount64();
-            LONG64 beat = sh->drain_beat, tail = sh->log_tail;
-            if (!last_tick || tail != seen_tail) { waited = 0; seen_tail = tail; }
-            else if (beat != seen_beat) waited += (now - last_tick) < 50 ? (now - last_tick) : 50;
-            last_tick = now; seen_beat = beat;
-            if (waited > 2000) { InterlockedIncrement(&sh->log_dropped); return; }
+            LONG64 beat = sh->drain_beat;
+            if (beat != seen_beat) { seen_beat = beat; idle = 0; }
+            else if (last_tick) idle += (now - last_tick) < 50 ? (now - last_tick) : 50;
+            last_tick = now;
+            if (idle > 1000) {
+                idle = 0;
+                if (controller_dead(sh)) {
+                    InterlockedExchange(&sh->controller_gone, 1);
+                    InterlockedIncrement(&sh->log_dropped); return;
+                }
+            }
             SwitchToThread();
             pos = sh->log_head;
         } else {
             pos = sh->log_head;
         }
     }
-    rec->probe = state->index; rec->tid = c->tid;
-    std::memcpy(rec->text, text, sizeof(text));
-    rec->has_stack = stack ? 1 : 0; rec->frame_count = nframes;
-    if (nframes) std::memcpy(rec->frames, frames, nframes * sizeof(uint64_t));
+    rec->probe = local.probe; rec->tid = local.tid;
+    rec->text_len = local.text_len;
+    std::memcpy(rec->text, local.text, local.text_len + 1);
+    rec->has_stack = local.has_stack; rec->frame_count = local.frame_count;
+    if (local.frame_count) std::memcpy(rec->frames, local.frames, local.frame_count * sizeof(uint64_t));
     MemoryBarrier();
     InterlockedExchange64(&rec->seq, pos + 1);                    // publish
 }

@@ -122,6 +122,7 @@ struct probe_session {
     std::thread drainer;                       // empties the agent's log ring continuously
     std::atomic<uint64_t> controller_dropped{0}; // only broken file I/O/allocation can lose controller logs
     std::atomic<bool> drain_stop{false};
+    uint64_t abandoned_slots = 0;              // ring slots skipped: their producer was killed mid-record
     // Both producer paths wait on this bounded queue. The writer never holds queue_mu
     // while symbolizing or writing, so a slow filesystem cannot invert locks with the
     // debugger or the agent-ring drainer.
@@ -242,6 +243,9 @@ static void stop_drainer(probe_session *s);
 static std::string symbolize(probe_session *s, uint64_t addr);
 static bool start_log_output(probe_session *s);
 static bool enqueue_log(probe_session *s, LogRecord &&record);
+static size_t drain_agent_logs(probe_session *s);
+static void deliver_past_stall(probe_session *s);
+static void enqueue_agent_record(probe_session *s, const probe_agent_log &rec);
 static void flush_log_writer(probe_session *s);
 static void stop_log_output(probe_session *s);
 static void release_hw(probe_session *s, Probe &p);
@@ -257,12 +261,37 @@ static std::string win_error(const char *what) {
     return std::string(what) + " (Win32=" + std::to_string(GetLastError()) + ")";
 }
 
+// Length of the well-formed UTF-8 sequence at p (n bytes left), or 0 if it is not one.
+static size_t utf8_sequence(const unsigned char *p, size_t n) {
+    unsigned char c = p[0];
+    size_t len = c >= 0xC2 && c <= 0xDF ? 2 : c >= 0xE0 && c <= 0xEF ? 3 : c >= 0xF0 && c <= 0xF4 ? 4 : 0;
+    if (!len || len > n) return 0;
+    for (size_t i = 1; i < len; ++i) if ((p[i] & 0xC0) != 0x80) return 0;
+    if (c == 0xE0 && p[1] < 0xA0) return 0;              // overlong
+    if (c == 0xED && p[1] >= 0xA0) return 0;             // UTF-16 surrogate
+    if (c == 0xF0 && p[1] < 0x90) return 0;              // overlong
+    if (c == 0xF4 && p[1] >= 0x90) return 0;             // > U+10FFFF
+    return len;
+}
+
+// A JSON string that is always valid JSON and valid UTF-8, and loses nothing: every control
+// character (NUL included) is escaped, and a byte that is not part of well-formed UTF-8 is
+// written as \u00XX (that byte's value) instead of being passed through raw.
 static void append_json_string(std::string &out, const std::string &value) {
+    static const char hex[] = "0123456789abcdef";
     out.push_back('"');
-    for (unsigned char ch : value) {
-        if (ch == '"' || ch == '\\') { out.push_back('\\'); out.push_back((char)ch); }
-        else if (ch == '\n') out += "\\n";
-        else if (ch >= 0x20) out.push_back((char)ch);
+    const auto *p = reinterpret_cast<const unsigned char *>(value.data());
+    for (size_t i = 0, n = value.size(); i < n; ) {
+        unsigned char ch = p[i];
+        if (ch == '"' || ch == '\\') { out.push_back('\\'); out.push_back((char)ch); ++i; continue; }
+        if (ch >= 0x20 && ch < 0x80) { out.push_back((char)ch); ++i; continue; }
+        if (ch == '\n') { out += "\\n"; ++i; continue; }
+        if (ch == '\r') { out += "\\r"; ++i; continue; }
+        if (ch == '\t') { out += "\\t"; ++i; continue; }
+        if (ch >= 0x80) {
+            if (size_t len = utf8_sequence(p + i, n - i)) { out.append(value, i, len); i += len; continue; }
+        }
+        out += "\\u00"; out.push_back(hex[ch >> 4]); out.push_back(hex[ch & 15]); ++i;
     }
     out.push_back('"');
 }
@@ -325,11 +354,16 @@ static bool write_log_batch(probe_session *s, const std::string &bytes, uint64_t
     // separate tailer let stdout fall seconds behind under load). A slow stdout (a
     // console) back-pressures the producers instead -- nothing is dropped; the file
     // above is the complete record either way.
-    if (s->tail_enabled && !write_stdout_chunk(s, bytes.data(), bytes.size())) {
-        writer_failed(s, s->tail_error.empty() ? std::string("write probe logs to stdout") : s->tail_error, 0);
-        return false;
-    }
+    // A stdout that stops taking data (the reader closed the pipe: `| head`) ends the live
+    // tail only -- reported as an error once -- never the file: the file stays the complete
+    // record and no log is counted lost for a reader that went away.
+    bool tail;
     {
+        std::lock_guard<std::mutex> lock(s->tail_mu);
+        tail = s->tail_enabled && !s->tail_failed;
+    }
+    if (tail && !write_stdout_chunk(s, bytes.data(), bytes.size())) tail = false;   // tail_failed() said why
+    if (tail) {
         std::lock_guard<std::mutex> lock(s->tail_mu);
         s->log_bytes_tailed = s->log_bytes_written;
     }
@@ -2644,6 +2678,8 @@ static bool open_agent_section(probe_session *s, uint32_t count) {
     s->shared->request_count = count;
     for (uint32_t i = 0; i < PROBE_AGENT_LOG_CAP; ++i) s->shared->logs[i].seq = i;   // ring: all free
     sync_int3_table(s);                                 // breakpoints armed before the channel existed
+    s->shared->controller_pid = GetCurrentProcessId();
+    s->shared->log_ipc = 1;                     // this debugger services PROBE_IPC_LOG (cleared before it leaves)
     // Benchmark-only knob (not API): compare inline extended-state handling strategies.
     if (const char *m = std::getenv("UHH_BENCH_XSTATE"))
         s->shared->xstate_mode = !std::strcmp(m, "none") ? 1 : !std::strcmp(m, "full") ? 2 : 0;
@@ -3159,9 +3195,13 @@ static void detach(probe_session *s) {
     std::fprintf(stderr, "probe: detach: %zu thread(s) frozen;%s\n", frozen.size(),
                  report_tids.empty() ? " all clean" : report_tids.c_str());
     release_held(s, "detach (late)");                    // belt and braces: never leave a hold behind
-    stop_drainer(s);
+    // No PROBE_IPC_LOG may be raised once the debugger is gone (it would reach the program).
+    if (s->shared) { InterlockedExchange(&s->shared->log_ipc, 0); InterlockedExchange(&s->shared->ring_stalled, 0); }
     if (!s->exited) DebugActiveProcessStop(s->pi.dwProcessId);
     for (HANDLE t : frozen) { ResumeThread(t); CloseHandle(t); }
+    // The final drain runs with the threads RUNNING: one the freeze caught between claiming a
+    // ring slot and publishing it finishes the record first (frozen, it would be lost).
+    stop_drainer(s);
     std::fprintf(stderr, "probe: detached from pid %lu\n", (unsigned long)s->pi.dwProcessId);
 }
 
@@ -3326,6 +3366,25 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
         }
         if (trace_enabled() && n == offsetof(probe_ipc_request, address))
             std::fprintf(stderr, "  ipc op=%u tid=%lu t=%llu\n", head.op, (unsigned long)event.dwThreadId, (unsigned long long)GetTickCount64());
+        if (n == offsetof(probe_ipc_request, address) && head.op == PROBE_IPC_LOG) {
+            // A producer could not get a ring slot (the ring is stalled behind a suspended
+            // producer): the record comes over synchronously. Untrusted like the ring itself;
+            // enqueue_agent_record bounds every field.
+            uint64_t at = (uint64_t)ex.ExceptionInformation[0], where = 0;
+            size_t m = 0, got = 0;
+            auto rec = std::make_unique<probe_agent_log>();
+            int32_t result = 0;
+            if (remote_read(s->pi.hProcess, at + offsetof(probe_ipc_request, address), &where, sizeof(where), &m) &&
+                m == sizeof(where) && remote_read(s->pi.hProcess, where, rec.get(), sizeof(*rec), &got) && got == sizeof(*rec)) {
+                drain_agent_logs(s);                 // whatever the ring can still give goes first
+                deliver_past_stall(s);
+                enqueue_agent_record(s, *rec);
+                result = 1;
+            }
+            size_t wrote = 0;
+            remote_write(s->pi.hProcess, at + offsetof(probe_ipc_request, result), &result, sizeof(result), &wrote);
+            return true;
+        }
         if (n == offsetof(probe_ipc_request, address) && head.op == PROBE_IPC_INSTALL_DONE) {
             // Harmless if forged: acceptance re-checks every request status itself.
             if (!accept_agent_install(s)) { std::fprintf(stderr, "probe: %s\n", s->error.c_str()); }
@@ -4532,6 +4591,28 @@ static bool complete_remote_thread(probe_session *s, DWORD result) {
     return true;
 }
 
+// One ring record (or a PROBE_IPC_LOG copy of one) -> the writer's queue. Never touches
+// s->probes (the debug loop may be growing it); does not hold agent_mu while a full stdout
+// queue applies backpressure.
+static void enqueue_agent_record(probe_session *s, const probe_agent_log &rec) {
+    try {
+        LogRecord r;
+        uint32_t len = rec.text_len < PROBE_AGENT_LOG_TEXT_CAP ? rec.text_len : PROBE_AGENT_LOG_TEXT_CAP - 1;
+        r.text.assign(rec.text, len);
+        r.tid = rec.tid; r.has_stack = rec.has_stack != 0;
+        {
+            std::lock_guard<std::mutex> map_lock(s->agent_mu);
+            r.probe = rec.probe < PROBE_AGENT_MAX_PROBES && s->agent_map[rec.probe] != UINT32_MAX
+                          ? s->agent_map[rec.probe] : rec.probe;
+        }
+        uint32_t n = rec.frame_count > PROBE_STACK_MAX_FRAMES ? PROBE_STACK_MAX_FRAMES : rec.frame_count;
+        r.frames.assign(rec.frames, rec.frames + n);
+        enqueue_log(s, std::move(r));
+    } catch (...) {
+        s->controller_dropped.fetch_add(1, std::memory_order_relaxed);   // out of memory: count it, keep going
+    }
+}
+
 // Move published inline-log records out of the shared ring (single consumer). Called
 // every debug-loop turn, on idle timeouts, and at report, so the ring never fills
 // just because the run is long.
@@ -4543,31 +4624,89 @@ static size_t drain_agent_logs(probe_session *s) {
     for (;;) {
         LONG64 tail = sh->log_tail;
         auto &rec = sh->logs[(uint64_t)tail % PROBE_AGENT_LOG_CAP];
-        if (rec.seq != tail + 1) break;
+        LONG64 seq = rec.seq;
+        if (seq != tail + 1 && seq != -(tail + 1)) break;
         MemoryBarrier();
-        try {
-            LogRecord r;
-            rec.text[PROBE_AGENT_LOG_TEXT_CAP - 1] = 0;
-            r.text = rec.text; r.tid = rec.tid; r.has_stack = rec.has_stack != 0;
-            // Never touch s->probes here (the debug loop may be growing it). Do not retain
-            // agent_mu while a full stdout queue applies backpressure.
-            {
-                std::lock_guard<std::mutex> map_lock(s->agent_mu);
-                r.probe = rec.probe < PROBE_AGENT_MAX_PROBES && s->agent_map[rec.probe] != UINT32_MAX
-                              ? s->agent_map[rec.probe] : rec.probe;
-            }
-            uint32_t n = rec.frame_count > PROBE_STACK_MAX_FRAMES ? PROBE_STACK_MAX_FRAMES : rec.frame_count;
-            r.frames.assign(rec.frames, rec.frames + n);
-            enqueue_log(s, std::move(r));
-        } catch (...) {
-            InterlockedIncrement(&sh->log_dropped);       // out of memory: count it, keep going
-        }
+        if (seq == tail + 1) enqueue_agent_record(s, rec);    // -(tail + 1): delivered past a stall already
+        rec.owner = 0;
         MemoryBarrier();
         InterlockedExchange64(&rec.seq, tail + PROBE_AGENT_LOG_CAP);    // slot free again
         sh->log_tail = tail + 1;
         ++moved;
     }
     return moved;
+}
+
+// The thread that claimed a ring slot is gone (it can never publish it): no such thread,
+// exited, or the id now names a thread of another process.
+static bool ring_owner_gone(probe_session *s, DWORD tid) {
+    HANDLE t = OpenThread(SYNCHRONIZE | THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+    if (!t) return GetLastError() == ERROR_INVALID_PARAMETER;
+    bool gone = WaitForSingleObject(t, 0) == WAIT_OBJECT_0 || GetProcessIdOfThread(t) != s->pi.dwProcessId;
+    CloseHandle(t);
+    return gone;
+}
+
+// The tail is stuck behind an unpublished slot: deliver the PUBLISHED records after it now,
+// in ring order, marking each seq = -(pos + 1) (delivered; drain_agent_logs frees it when the
+// tail gets there). Stops at the next unpublished slot: a record beyond THAT could belong to
+// the same producer as a later one published during the scan (per-thread order).
+static void deliver_past_stall(probe_session *s) {
+    auto *sh = s->shared;
+    std::lock_guard<std::mutex> consume(s->drain_mu);
+    LONG64 tail = sh->log_tail, head = sh->log_head;
+    if (head <= tail || sh->logs[(uint64_t)tail % PROBE_AGENT_LOG_CAP].seq != tail) return;
+    for (LONG64 pos = tail + 1; pos < head; ++pos) {
+        auto &rec = sh->logs[(uint64_t)pos % PROBE_AGENT_LOG_CAP];
+        LONG64 seq = rec.seq;
+        if (seq == -(pos + 1)) continue;
+        if (seq != pos + 1) break;
+        MemoryBarrier();
+        enqueue_agent_record(s, rec);
+        InterlockedExchange64(&rec.seq, -(pos + 1));
+    }
+}
+
+// The drainer found nothing to move. If that is because the slot at the tail is CLAIMED (its
+// owner set) but not published, the ring cannot move until its producer publishes:
+//  - producer dead (TerminateThread / ExitProcess mid-send_log): skip the slot. Its callback
+//    stays counted in flight (callbacks_interrupted), so the hit is accounted; nothing else
+//    is lost. (Dead while only holding the owner of a free slot: give the slot back.)
+//  - producer alive but not running (the program suspended it): the records behind it are
+//    delivered past it, and after 200 ms producers are told the ring is stalled -- they hand
+//    records over by PROBE_IPC_LOG instead of waiting for a free slot.
+struct RingStall { LONG64 tail = -1; ULONGLONG since = 0; };
+static void check_ring_stall(probe_session *s, RingStall &st) {
+    auto *sh = s->shared;
+    LONG64 tail = sh->log_tail, head = sh->log_head;
+    auto &rec = sh->logs[(uint64_t)tail % PROBE_AGENT_LOG_CAP];
+    DWORD owner = (DWORD)rec.owner;
+    ULONGLONG now = GetTickCount64();
+    bool blocked = rec.seq == tail && owner != 0;
+    if (!blocked || tail != st.tail) {
+        st.tail = blocked ? tail : -1; st.since = now;
+        if (sh->ring_stalled) InterlockedExchange(&sh->ring_stalled, 0);
+        return;
+    }
+    if (now - st.since < 20) return;
+    if (ring_owner_gone(s, owner)) {
+        std::lock_guard<std::mutex> consume(s->drain_mu);
+        if (sh->log_tail != tail || rec.seq != tail || (DWORD)rec.owner != owner) return;
+        if (sh->log_head == tail) {                       // died between the owner and head CAS
+            InterlockedCompareExchange(&rec.owner, 0, (LONG)owner);
+            return;
+        }
+        rec.owner = 0;
+        MemoryBarrier();
+        InterlockedExchange64(&rec.seq, tail + PROBE_AGENT_LOG_CAP);
+        sh->log_tail = tail + 1;
+        if (s->abandoned_slots++ == 0)
+            std::fprintf(stderr, "probe: warning: thread %lu was killed while writing a log record; its callback "
+                                 "is counted as interrupted and the log ring moves on\n", (unsigned long)owner);
+        return;
+    }
+    if (head > tail) deliver_past_stall(s);
+    if (now - st.since >= 200 && head > tail && sh->log_ipc && !sh->ring_stalled) InterlockedExchange(&sh->ring_stalled, 1);
 }
 
 // Producers in the target can log at ~1M records/s; the debug loop only gets to the
@@ -4578,24 +4717,31 @@ static void start_drainer(probe_session *s) {
     s->drain_stop = false;
     s->drainer = std::thread([s] {
         unsigned idle = 0;
+        RingStall stall;
         while (!s->drain_stop.load(std::memory_order_relaxed)) {
             InterlockedIncrement64(&s->shared->drain_beat);           // "controller alive"
             if (drain_agent_logs(s)) { idle = 0; continue; }
+            check_ring_stall(s, stall);
             if (++idle < 64) SwitchToThread(); else Sleep(1);
         }
     });
 }
 
-// After the target has exited no producer can still be mid-publish, so records published
-// beyond a slot that was claimed but never published are recovered. Such a slot belongs to a
-// producer killed by the exit in the middle of its callback (a slot is claimed and published
-// inside send_log): that callback is already counted in callbacks_interrupted, so the slot is
-// not counted again as dropped -- logs + log_dropped + callbacks_interrupted == hits.
+// The controller stops consuming (controller_gone is set). Claimed slots are waited for
+// briefly while the target runs (a producer between claim and publish finishes in
+// nanoseconds); then every PUBLISHED record is delivered, also those behind a slot that will
+// never be published. Such a slot's producer was killed or is suspended mid-callback: that
+// callback is still counted in flight (callbacks_interrupted at exit; "in flight" in the
+// detach summary), so the slot is not counted again as dropped --
+// logs + log_dropped + callbacks_interrupted == hits.
 static void drain_final(probe_session *s) {
     if (!s->shared) return;
-    drain_agent_logs(s);
-    if (!s->exited) return;
     auto *sh = s->shared;
+    drain_agent_logs(s);
+    if (!s->exited)
+        for (ULONGLONG until = GetTickCount64() + 500; sh->log_head != sh->log_tail && GetTickCount64() < until; ) {
+            if (!drain_agent_logs(s)) Sleep(1);
+        }
     std::lock_guard<std::mutex> consume(s->drain_mu);
     // head and tail live in memory the TARGET can write: never trust them for the loop
     // bound. At most one ring's worth of slots can hold unread records.
@@ -4604,27 +4750,19 @@ static void drain_final(probe_session *s) {
     if ((uint64_t)head - (uint64_t)tail > PROBE_AGENT_LOG_CAP) head = (LONG64)((uint64_t)tail + PROBE_AGENT_LOG_CAP);
     for (LONG64 pos = tail; pos != head; pos = (LONG64)((uint64_t)pos + 1)) {
         auto &rec = sh->logs[(uint64_t)pos % PROBE_AGENT_LOG_CAP];
-        if (rec.seq != (LONG64)((uint64_t)pos + 1)) continue;   // its producer died mid-callback (see above)
-        try {
-            LogRecord r;
-            rec.text[PROBE_AGENT_LOG_TEXT_CAP - 1] = 0;
-            r.text = rec.text; r.tid = rec.tid; r.has_stack = rec.has_stack != 0;
-            {
-                std::lock_guard<std::mutex> map_lock(s->agent_mu);
-                r.probe = rec.probe < PROBE_AGENT_MAX_PROBES && s->agent_map[rec.probe] != UINT32_MAX
-                              ? s->agent_map[rec.probe] : rec.probe;
-            }
-            uint32_t n = rec.frame_count > PROBE_STACK_MAX_FRAMES ? PROBE_STACK_MAX_FRAMES : rec.frame_count;
-            r.frames.assign(rec.frames, rec.frames + n);
-            enqueue_log(s, std::move(r));
-        }
-        catch (...) { InterlockedIncrement(&sh->log_dropped); }
+        if (rec.seq != pos + 1) continue;                 // its producer died / is stopped mid-callback (see above)
+        MemoryBarrier();
+        enqueue_agent_record(s, rec);
     }
     sh->log_tail = head;
 }
 
 static void stop_drainer(probe_session *s) {
-    if (s->shared) InterlockedExchange(&s->shared->controller_gone, 1);   // producers stop waiting
+    if (s->shared) {
+        InterlockedExchange(&s->shared->log_ipc, 0);
+        InterlockedExchange(&s->shared->ring_stalled, 0);
+        InterlockedExchange(&s->shared->controller_gone, 1);   // producers stop waiting
+    }
     if (!s->drainer.joinable()) { drain_final(s); return; }
     s->drain_stop = true; s->drainer.join();
     drain_final(s);
@@ -4890,13 +5028,9 @@ extern "C" int probe_wait_for_exit(probe_session *s) {
 }
 
 static void json_string(FILE *out, const std::string &value) {
-    std::fputc('\"', out);
-    for (unsigned char ch : value) {
-        if (ch == '\"' || ch == '\\') { std::fputc('\\', out); std::fputc(ch, out); }
-        else if (ch == '\n') std::fputs("\\n", out);
-        else if (ch >= 0x20) std::fputc(ch, out);
-    }
-    std::fputc('\"', out);
+    std::string text;
+    append_json_string(text, value);
+    std::fputs(text.c_str(), out);
 }
 
 extern "C" void probe_report(probe_session *s, FILE *out) {
@@ -4996,10 +5130,13 @@ extern "C" void probe_close(probe_session *s) {
             if (s->shared && (p->flags & PROBE_INLINE)) p->hits = probe_agent_hits(s->shared, p->agent_index);
             if (!p->internal) hits += p->hits;
         }
-        std::fprintf(stderr, "probe: detached: hits=%llu logs_written=%llu log_dropped=%llu\n",
+        // in_flight: inline callbacks still running (or killed/suspended mid-callback by the
+        // program) at the detach -- hits == logs_written + log_dropped + in_flight.
+        std::fprintf(stderr, "probe: detached: hits=%llu logs_written=%llu log_dropped=%llu in_flight=%llu\n",
                      (unsigned long long)hits, (unsigned long long)s->logs_written.load(std::memory_order_relaxed),
                      (unsigned long long)((uint64_t)(s->shared ? s->shared->log_dropped : 0) +
-                                          s->controller_dropped.load(std::memory_order_relaxed)));
+                                          s->controller_dropped.load(std::memory_order_relaxed)),
+                     (unsigned long long)(s->shared ? probe_agent_inflight(s->shared) : 0));
     }
     if (s->pi.hProcess)
         for (uint64_t b : s->scratch_blocks) VirtualFreeEx(s->pi.hProcess, (void *)(uintptr_t)b, 0, MEM_RELEASE);
@@ -5509,11 +5646,17 @@ static void log_common(probe_context *c, bool stack, const char *format, va_list
     char line[PROBE_AGENT_LOG_TEXT_CAP];                      // the same limit inline uses
     // Same formatter as the agent: truncation marked, an invalid format or a faulting
     // argument logged as "[unformattable] <format>" -- never dropped, never fatal.
-    if (!uhh_format_log(line, sizeof(line), format, ap)) return;
+    int len = uhh_format_log(line, sizeof(line), format, ap);
+    if (len < 0) return;
     auto *state = c ? static_cast<CallbackState *>(c->controller) : nullptr;
     if (!state || !state->session) { std::fprintf(stderr, "probe: %s\n", line); return; }
+    // Per-thread order across backends: this thread's earlier INLINE logs are already in the
+    // ring (it is stopped here, so its send_log calls have returned) -- move them to the
+    // queue before this one. (Only a record behind another thread's unfinished slot can
+    // still come later; see docs/ROADMAP.md, "Log delivery findings".)
+    if (state->session->shared) { drain_agent_logs(state->session); deliver_past_stall(state->session); }
     try {
-        LogRecord r; r.text = line; r.tid = c->tid; r.probe = c->site; r.has_stack = stack;
+        LogRecord r; r.text.assign(line, (size_t)len); r.tid = c->tid; r.probe = c->site; r.has_stack = stack;
         if (stack) capture_stack(state->session, c, r.frames);
         if (trace_enabled()) {
             if (stack) std::fprintf(stderr, "probe: %s [+stack %zu frames]\n", line, r.frames.size());
