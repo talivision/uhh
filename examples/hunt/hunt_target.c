@@ -16,7 +16,8 @@
  *   dll     hunt_dll.dll load/unload churn (refcount reaches 0) from 4 threads; DllMain
  *           and HuntWork read; TLS callbacks read on every thread attach/detach
  *   ctx     two reader threads while main suspends one, GetThreadContext(CONTEXT_ALL),
- *           SetThreadContext with the same context, resumes -- N times
+ *           SetThreadContext with the same context, resumes -- N times or for 90 s, whichever
+ *           comes first (reports ctx_rounds / ctx_ms / ctx_max_round_ms)
  *   exit-return / exit-process / exit-terminate   8 readers forever; main leaves after
  *           N ms by return 5 / ExitProcess(6) / TerminateProcess(self, 7)
  *   threads 32 threads x N reads (for slow / call_func callbacks)
@@ -50,6 +51,7 @@ typedef LONG(NTAPI *NtOpenFn)(HANDLE *, ACCESS_MASK, OBJATTR *, CLIENTID *);
 static NtReadFn g_ntread;
 static HANDLE g_proc;
 static volatile LONG g_reads, g_bad, g_foreign, g_early, g_work, g_owndr, g_guards, g_twin;
+static LONG g_ctx_rounds, g_ctx_ms, g_ctx_max_ms;
 static ULONG_PTR g_owndr_addr;
 static unsigned char g_pattern[64];
 static volatile LONG g_stop;
@@ -321,15 +323,26 @@ int main(int argc, char **argv) {
     } else if (!strcmp(sc, "dll")) {
         HANDLE t[4]; for (int i = 0; i < 4; ++i) t[i] = spawn(dll_user, NULL); join(t, 4);
     } else if (!strcmp(sc, "ctx")) {
+        /* N round-trips, or as many as fit in 90 s (a slow or loaded machine: the result must
+           stay exact, the amount of work may shrink); the round count and the slowest round
+           (a stall would show there) are reported. */
         HANDLE r[2]; for (int i = 0; i < 2; ++i) r[i] = spawn(reader_until_stop, NULL);
+        LARGE_INTEGER f, t0, ta, tb; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
         for (DWORD k = 0; k < g_n; ++k) {
             HANDLE t = r[k & 1];
             CONTEXT c; memset(&c, 0, sizeof(c)); c.ContextFlags = CONTEXT_ALL;
+            QueryPerformanceCounter(&ta);
+            if ((ta.QuadPart - t0.QuadPart) / f.QuadPart >= 90) break;
             if (SuspendThread(t) == (DWORD)-1) { InterlockedIncrement(&g_bad); continue; }
             if (!GetThreadContext(t, &c) || !SetThreadContext(t, &c)) InterlockedIncrement(&g_bad);
             ResumeThread(t);
+            QueryPerformanceCounter(&tb);
+            const LONG ms = (LONG)((tb.QuadPart - ta.QuadPart) * 1000 / f.QuadPart);
+            if (ms > g_ctx_max_ms) g_ctx_max_ms = ms;
+            ++g_ctx_rounds;
             if (k % 16 == 0) Sleep(0);
         }
+        QueryPerformanceCounter(&tb); g_ctx_ms = (LONG)((tb.QuadPart - t0.QuadPart) * 1000 / f.QuadPart);
         g_stop = 1; join(r, 2);
     } else if (!strncmp(sc, "exit-", 5)) {
         const char *rd = getenv("HUNT_READERS");
@@ -410,8 +423,9 @@ int main(int argc, char **argv) {
     g_tls_on = 0;
     if (veh) RemoveVectoredExceptionHandler(veh);
     printf("{\"kind\":\"target\",\"scenario\":\"%s\",\"n\":%lu,\"reads\":%ld,\"bad\":%ld,\"foreign\":%ld,"
-           "\"early\":%ld,\"work\":%ld,\"owndr\":%ld,\"guards\":%ld,\"twin\":%ld,\"checksum\":\"%llx\",\"pid\":%lu}\n",
-           sc, g_n, g_reads, g_bad, g_foreign, g_early, g_work, g_owndr, g_guards, g_twin, checksum(), GetCurrentProcessId());
+           "\"early\":%ld,\"work\":%ld,\"owndr\":%ld,\"guards\":%ld,\"twin\":%ld,\"ctx_rounds\":%ld,\"ctx_ms\":%ld,\"ctx_max_round_ms\":%ld,\"checksum\":\"%llx\",\"pid\":%lu}\n",
+           sc, g_n, g_reads, g_bad, g_foreign, g_early, g_work, g_owndr, g_guards, g_twin, g_ctx_rounds, g_ctx_ms, g_ctx_max_ms,
+           checksum(), GetCurrentProcessId());
     fflush(stdout);
     return 0;
 }

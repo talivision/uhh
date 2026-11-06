@@ -399,7 +399,8 @@ struct probe_session {
     // the other threads run then -- and released together. See fair_tick.
     std::vector<std::pair<DWORD, HANDLE>> parked;
     bool parking = false;
-    bool fine_timer = false;                   // timeBeginPeriod(1) held (only while something polls at 1 ms)
+    bool fine_timer = false;
+    ULONGLONG rekick_at = 0;                   // ask the agent's service for another install round then (0: no)                   // timeBeginPeriod(1) held (only while something polls at 1 ms)
     std::chrono::steady_clock::time_point fair_window{}, last_event{};
     std::chrono::steady_clock::duration fair_gaps{};
     // Context round-trips (ROADMAP A4): a thread whose debug event we handled while the target
@@ -5018,7 +5019,11 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
     // process-wide, it also makes every Sleep(1) of the controller's own threads (the log
     // drainer) wake 15x as often -- a writer that never sees its queue empty kept a mid-run
     // probe_report (flush) waiting for the target to finish.
-    const bool fine = !s->parked.empty() || !s->ctx_watch.empty();
+    if (s->rekick_at && GetTickCount64() >= s->rekick_at) {
+        s->rekick_at = 0;
+        if (agent_has_pending(s) && !kick_agent(s)) std::fprintf(stderr, "probe: %s\n", s->error.c_str());
+    }
+    const bool fine = !s->parked.empty() || !s->ctx_watch.empty() || s->rekick_at;
     if (fine != s->fine_timer) { if (fine) timeBeginPeriod(1); else timeEndPeriod(1); s->fine_timer = fine; }
     return fine ? 1 : 20;
 }
@@ -5235,7 +5240,12 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
         if (n == offsetof(probe_ipc_request, address) && head.op == PROBE_IPC_INSTALL_DONE) {
             // Harmless if forged: acceptance re-checks every request status itself.
             if (!accept_agent_install(s)) { std::fprintf(stderr, "probe: %s\n", s->error.c_str()); }
-            if (agent_has_pending(s)) kick_agent(s);
+            // Still pending after a round: its site is not installable YET (a relocated DLL's
+            // code is not executable until the loader has finished relocating it). Asking again
+            // at once made the agent spin round after round, each an event that freezes the
+            // target -- the loading thread starved and the install timed out after 5 s (calls
+            // missed: hunt-dll-work-backend-inline under load). Ask again in 5 ms instead.
+            if (agent_has_pending(s)) s->rekick_at = GetTickCount64() + 5;
             else if (!inline_hold_needed(s)) release_held(s, "inline installs confirmed");
             return true;
         }
@@ -6274,6 +6284,36 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         // A trap at the address of a hardware probe we have RELEASED, raised before the
         // release reached this thread (its debug status no longer names the slot): ours,
         // stale. Clear our slots on the thread, step over with RF, and swallow it.
+        // A stale image of an inline install GATE (the gate is cleared once the hook is in, but
+        // a context record written while it was live -- the restore fixup -- can bring it back
+        // on a thread that has run since): a #DB exactly at one of our inline sites from a slot
+        // we no longer use is ours. Off on this thread; the site runs (its hook) with RF.
+        bool stale_gate = false;
+        for (const auto &p : s->probes)
+            if ((p->flags & PROBE_INLINE) && p->address == address) { stale_gate = true; break; }
+        for (const auto &g : s->gates) if (g.first == address) stale_gate = false;
+        if (stale_gate) {
+            HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
+            CONTEXT w{}; w.ContextFlags = CONTEXT_DEBUG_REGISTERS | CONTEXT_CONTROL;
+            bool ours = false;
+            if (t && GetThreadContext(t, &w)) {
+                for (int slot = 0; slot < 4; ++slot) {
+                    if (!(s->dr_ever & (1u << slot)) || (s->dr_used & (1u << slot)) || !((w.Dr7 >> (slot * 2)) & 3) ||
+                        dr_address(w, slot) != address) continue;
+                    w.Dr7 &= ~((DWORD64)3 << (slot * 2)) & ~((DWORD64)0xF << (16 + slot * 4));
+                    ours = true;
+                }
+                if (ours) {
+                    w.Dr6 = 0;
+                    w.EFlags |= 0x10000u;
+                    SetThreadContext(t, &w);
+                    if (trace_enabled()) std::fprintf(stderr, "  stale gate tid=%lu at 0x%llx\n", (unsigned long)event.dwThreadId,
+                                                      (unsigned long long)address);
+                }
+            }
+            if (t) CloseHandle(t);
+            if (ours) { disposition = DBG_CONTINUE; return true; }
+        }
         if (hw_released_on(s, event.dwThreadId, address) && !probe_any_at(s, address)) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
             CONTEXT w{}; w.ContextFlags = CONTEXT_DEBUG_REGISTERS | CONTEXT_CONTROL;

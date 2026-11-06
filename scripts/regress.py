@@ -4382,6 +4382,10 @@ def check_hunt():
                       tg.get("checksum") == checksum and rd.get("hits") == want_hits and st["read"] == reads and
                       st["unmapped"] == 0 and st["pids"] == {tg.get("pid")} and rep.get("log_dropped") == 0 and
                       rep.get("app_exit") == 0 and st["other"] == 0)
+                if sc == "ctx":
+                    # Exact whatever the machine: N round-trips or 90 s of them (target-side). Not
+                    # starved: at least 100 rounds, no single round over 30 s.
+                    ok = ok and (tg.get("ctx_rounds") or 0) >= min(n, 100) and (tg.get("ctx_max_round_ms") or 0) < 30000
                 if "--work-backend" in extra:
                     ok = ok and wk.get("hits") == tg.get("work") == st["work"] and tg.get("work") == 4 * n
                 if "--tid" in extra:
@@ -4393,6 +4397,8 @@ def check_hunt():
                                  f"dropped={rep.get('log_dropped')} exit={rep.get('app_exit')} rc={rc} timeout={tmo}"
                                  + (f" work={tg.get('work')}/{wk.get('hits')}/{st['work']}" if wk or tg.get("work") else "")
                                  + (f" tid_ok={st['tid_ok']} tid_bad={st['tid_bad']}" if "--tid" in extra else "")
+                                 + (f" rounds={tg.get('ctx_rounds')}/{n} in {tg.get('ctx_ms')}ms max_round={tg.get('ctx_max_round_ms')}ms"
+                                    if sc == "ctx" else "")
                                  + (f" recurse_ok={st['recurse_ok']}" if "--recurse" in extra else "")
                                  + (f" other={st['other']}" if st["other"] else "")
                                  + ("" if ok else f" err={(rep.get('error') or '')[:160]}"))
