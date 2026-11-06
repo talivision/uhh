@@ -1845,6 +1845,7 @@ static void settle_hw_thread(probe_session *s, DWORD tid) {
 }
 
 static void arm_thread_start_fixup(probe_session *s);
+static void guard_sync(probe_session *s);
 #if defined(UHH_TEST_HOOKS)
 // Test-only build (probe_api_testhooks, never shipped): UHH_TEST_DIE_AFTER_ARM=n kills the
 // controller right after it writes its n-th user INT3 or arms its n-th hardware probe on the
@@ -1871,6 +1872,12 @@ static bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
     if (slot >= 0) s->dr_next = (uint8_t)((slot + 1) & 3);
     if (slot < 0) { set_error(s, "no free hardware breakpoint slot (max 4)"); return false; }
     uint32_t rw = 0, len = 0; hw_rw_len(p.flags, rw, len);
+    // The guard's DR mask gets the slot BEFORE any thread has it armed (as for an INT3, see
+    // arm_breakpoint): a controller killed in between left an enabled DR the guard took for
+    // the target's own -- never cleared, its #DB unhandled (0x80000004) at the next hit.
+    const uint8_t ever_before = s->dr_ever;
+    s->dr_ever |= (uint8_t)(1u << slot);
+    guard_sync(s);
     size_t tried = 0, set_ok = 0;
     for (DWORD tid : s->threads) {
         HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
@@ -1883,6 +1890,7 @@ static bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
     if (set_ok && !p.internal) test_die_after_arm();
 #endif
     if (tried && !set_ok) {   // could not arm the DR on any thread -> the probe would never fire
+        s->dr_ever = ever_before; guard_sync(s);
         set_error(s, win_error("set hardware breakpoint on target threads")); return false;
     }
     s->dr_used |= (uint8_t)(1u << slot); s->dr_ever |= (uint8_t)(1u << slot); ++s->hw_active;
@@ -1948,15 +1956,25 @@ static bool arm_breakpoint(probe_session *s, Probe &p, uint64_t base) {
     p.orig_insn.assign(buf, buf + len);
     p.follow.assign(buf + 1, buf + sizeof(buf));
     p.insn_len = len; p.displaced_ok = disp_ok; p.riprel_disp_off = riprel; p.rep_string = rep_str;
+    // Published to the agent's INT3 table (the controller-death guard) BEFORE the byte is
+    // written: a controller killed right after the write left an INT3 neither the guard's VEH
+    // nor its cleanup knew -- the target died at its next execution (unhandled breakpoint).
+    // An entry whose byte is not (yet) 0xCC is harmless: the cleanup writes back the byte that
+    // is already there, an inline get_mem overlays only a 0xCC.
+    const uint64_t old_base = p.base, old_address = p.address;
+    const bool old_active = p.active;
+    p.base = base; p.address = address; p.active = true;
+    sync_int3_table(s);
+    guard_sync(s);
     if (!patch(s->pi.hProcess, address, 0xcc)) {
+        p.base = old_base; p.address = old_address; p.active = old_active;
+        sync_int3_table(s);
         set_error(s, win_error("arm software breakpoint")); return false;
     }
 #if defined(UHH_TEST_HOOKS)
     if (!p.internal) test_die_after_arm();
 #endif
-    p.base = base; p.address = address; p.active = true;
     s->retired_bps.erase(address);
-    sync_int3_table(s);
     if (!p.internal || trace_enabled())       // library-owned probes are not the user's to see
         std::fprintf(stderr, "%s %s -> base=0x%llx addr=0x%llx (was 0x%02x, len=%u, %s)\n",
                      p.internal ? "  internal" : "probe: active", p.location.c_str(), (unsigned long long)base,

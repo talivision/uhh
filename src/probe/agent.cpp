@@ -2019,7 +2019,18 @@ static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
     const uint64_t at = (uint64_t)(uintptr_t)ep->ExceptionRecord->ExceptionAddress;
     if (code == EXCEPTION_BREAKPOINT) {
         unsigned char original = 0;
-        if (!int3_original(at, original)) return EXCEPTION_CONTINUE_SEARCH;
+        if (!int3_original(at, original)) {
+            // The other INT3 of ours a thread can execute: the end of a displaced REP string
+            // copy in one of our scratch blocks (session.cpp: the copy, an INT3 instead of a
+            // trap flag, then a jump back to the code after the site). Skip to the jump back.
+            LONG n = g.block_count; if (n > (LONG)PROBE_AGENT_GUARD_BLOCKS) n = PROBE_AGENT_GUARD_BLOCKS;
+            bool in_block = false;
+            for (LONG i = 0; i < n && !in_block; ++i) in_block = g.blocks[i] && at - g.blocks[i] < 0x10000;
+            if (!in_block) return EXCEPTION_CONTINUE_SEARCH;
+            set_ip(cx, at + 1);
+            if (g_guard_wake) SetEvent(g_guard_wake);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         restore_byte(at, original);
         set_ip(cx, at);                                           // run the original instruction
         if (g_guard_wake) SetEvent(g_guard_wake);
