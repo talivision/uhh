@@ -52,8 +52,8 @@ it. `track_open_process` therefore runs the open itself with `call_original`, re
 handle from `*out` right away, records handle -> pid -> name, and hands the caller the real
 status with `return_from` (the open is not run again). This works for every caller,
 including `kernel32!OpenProcess`, whose `out` is a short-lived local. If `call_original` is
-refused (breakpoint/hw on a CET shadow-stack target), the open runs normally and is logged
-as `unmapped`.
+ever refused, the open runs normally and is logged as `unmapped` (breakpoint/hw no longer
+refuse it under CET shadow stacks: ROADMAP CO5).
 
 ### Inline hooks on ntdll syscall stubs
 

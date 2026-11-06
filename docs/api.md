@@ -1,0 +1,633 @@
+# API reference
+
+The whole public API is `include/probe_api.h` (C, usable from C++). It is frozen; this page
+explains it. When this page and the header disagree, the header wins. Limitations and
+per-backend differences are collected in [limitations.md](limitations.md); messages and
+fixes in [troubleshooting.md](troubleshooting.md).
+
+Contents: [concepts](#concepts) · [types and macros](#types-and-macros) ·
+[probe flags](#probe-flags) · [registers](#registers) · [session functions](#session-functions) ·
+[callback functions](#callback-functions) · [control from a callback](#control-from-a-callback) ·
+[shared state](#shared-state-uhh_shared) · [output](#output-logs-and-report) ·
+[threading](#threading-and-concurrency) · [limits](#limits) ·
+[per-backend differences](#per-backend-differences)
+
+## Concepts
+
+- A **session** (`probe_session *`) is one instrumentation run of one target process. The
+  `probe_*` functions take a session (the control plane).
+- A **context** (`probe_context *`, called `c`) is one probe hit: its registers and memory.
+  The `get_*` / `set_*` / `send_log*` / `call_*` functions take a context (the data plane).
+  Both types are opaque and distinct, so the compiler keeps them apart.
+- A **probe** is a location plus a callback (`void cb(probe_context *c)`) plus a backend.
+  Probes are added before the target starts or from inside any callback.
+- A **backend** is chosen per probe:
+
+| Backend | Mechanism | Code modified | Where the callback runs |
+|---|---|---|---|
+| `PROBE_BREAKPOINT` | INT3 written by the controller (a debugger); displaced stepping | 1 byte | in the controller, on its debugger thread |
+| `PROBE_HW` | execute debug register (DR0-DR3) | none | in the controller, on its debugger thread |
+| `PROBE_INLINE` | SafetyHook mid-function hook installed by `probe_api_agent.dll`, injected into the target | >= 5 bytes | inside the target, on the thread that hit the probe |
+
+  One callback source runs under every backend. The functions below return the same values
+  on every backend for the same arguments, including the documented failure cases.
+  What differs follows from *where* the callback runs; see
+  [per-backend differences](#per-backend-differences).
+
+- UHH is a **debugger** under every backend: the controller launches or attaches to the
+  target with the Windows debug API (inline probes too: the agent's control channel and the
+  hook writes go through the debugger).
+
+### Locations
+
+| Form | Example | Meaning |
+|---|---|---|
+| `module+0xRVA` | `myapp.exe+0x1052` | offset from the module's load base (an RVA from the map file or PDB) |
+| `module!Name` | `ntdll.dll!NtReadVirtualMemory` | an export of the module; if not exported, a symbol from the module's PDB (beside the image, or via `_NT_SYMBOL_PATH`) |
+| `module!Name+0xOFF` | `configparse.dll!ParseConfig+0x16` | an offset from that symbol |
+
+- `module` is matched by **file name**, case-insensitively; a directory part is ignored.
+  A name **without an extension means `<name>.dll`**, as `LoadLibrary`/`GetModuleHandle`
+  read it: `kernel32!CreateFileW` == `kernel32.dll!CreateFileW`. This is one grammar for
+  probe locations (every backend, launch, attach, adds from a callback, `uhh_trace -p`) and
+  [`call_func`](#int-call_funcprobe_context-c-const-char-symbol-uint64_t-ret-int-nargs-).
+- An EXE is named **with** its extension: `probe_app.exe!Func`. `probe_app!Func` names
+  `probe_app.dll`, so it does not match the program; when `probe_app.exe` loads while such
+  a probe is pending, stderr says `probe: warning: probe_app!Func names probe_app.dll (a
+  module name without extension means .dll); the loaded probe_app.exe is not matched --
+  write probe_app.exe!Func to probe it` and the probe stays pending.
+- Offsets are `+0x` hexadecimal only.
+- A probe on a module that is not loaded yet stays **pending** and arms when the module
+  loads (also a DLL loaded at run time). It goes back to pending when the module unloads
+  and re-arms if it loads again.
+- A forwarded export (e.g. `kernel32.dll!HeapAlloc`) is followed to its target; if the
+  target module is not loaded yet the probe waits for it.
+- PDB symbols: see [symbols.md](symbols.md). `uhh_trace --list <module> --mask <pattern>`
+  lists what a module offers.
+
+### When probes go live
+
+- **Launch:** breakpoint and hw probes are armed from the target's first instruction.
+  Inline probes go live at the image entry point; the main thread is held there until the
+  agent confirms the hooks. Loader-time activity (TLS callbacks, static DLL initialisers)
+  is therefore seen only by breakpoint/hw probes.
+- **Attach:** the target keeps running while probes arm. Each probe counts from its
+  `probe: active ...` line on stderr. Breakpoint/hw probes arm once the injected agent's
+  controller-death guard is up (or after 5 s without it, with a warning).
+- A probe added from a callback: breakpoint/hw arm before the target resumes; an inline
+  probe holds the calling thread until its hook is in.
+
+## Types and macros
+
+| Name | Meaning |
+|---|---|
+| `probe_session` | opaque session type |
+| `probe_context` | opaque per-hit context |
+| `probe_callback` | `void (*)(probe_context *)` |
+| `enum probe_flags` | backend and option bits, see [probe flags](#probe-flags) |
+| `enum probe_register` | register ids, see [registers](#registers) |
+| `PROBE_LOG(c, ...)` | same as `send_log(c, ...)` |
+| `UHH_SHARED` | (MSVC) places a global in the shared `uhhshr` section; see [shared state](#shared-state-uhh_shared) |
+
+Callbacks of inline probes, and callbacks of probes added from a callback, must be exported
+by name (`__declspec(dllexport)`): they are found by export name. The examples declare every
+callback `extern "C" __declspec(dllexport)`; that simple rule covers all cases.
+
+## Probe flags
+
+Pass exactly one backend flag, optionally ORed with options. An unknown bit is refused
+(`unknown probe flags`); an option used with the wrong backend is refused
+(`requested probe type/options are unsupported in this build`).
+
+| Flag | Backends | Meaning |
+|---|---|---|
+| `PROBE_BREAKPOINT` | - | software breakpoint (INT3) |
+| `PROBE_HW` | - | hardware execute breakpoint (one of 4 debug registers) |
+| `PROBE_INLINE` | - | inline hook in the target |
+| `PROBE_AT_RETURN` | none | **refused by every backend.** To observe a return, read the return address at the function's entry (`get_mem` at SP) and add a probe there from the callback (`probe_add_address(get_session(c), ret, on_return, flags)`); it fires on every return to that site. |
+| `PROBE_ONCE` | breakpoint, hw | remove the probe after its first hit. Refused with `PROBE_INLINE`. |
+| `PROBE_WATCH_WRITE` | hw | data watchpoint: fire when the address is written. With `probe_watch` it is the default. |
+| `PROBE_WATCH_RW` | hw | data watchpoint: fire when the address is read or written. Exactly one of WRITE / RW. |
+| `PROBE_ALLOW_PREHOOKED` | inline | install over a site another tool already hooked, chaining through its hook. Without it such a site is refused for inline (breakpoint/hw only report it). |
+| `PROBE_FALLBACK_HW` | inline | when the inline site is refused (pre-hooked, unsafe, or overlapping another inline hook), use a hardware execute probe instead (`probe: X -> hardware fallback (...)`). Needs a free debug register. |
+| `PROBE_UNSAFE_FAST_PATCH` | inline | write the hook **without** freezing the target. By default every other thread is suspended while a hook is written (only at install/remove, never per hit) and a thread caught inside the overwritten bytes is moved onto the trampoline. With this flag such a thread can crash. For measurement only. |
+| `PROBE_ALLOW_UNSAFE_SITE` | inline | install even where the site check refuses (code could arrive inside the >= 5 overwritten bytes: a branch target, function start, return point, switch-table target, live code after a ret/jmp, an unresolvable indirect jump, the end of the section). The reason is printed as a warning. You assert nothing reaches those bytes. |
+
+## Registers
+
+`enum probe_register`: `PROBE_REG_AX, BX, CX, DX, SI, DI, BP, SP, R8 ... R15`.
+
+- Each id is the full native register: RAX..R15 on x64, EAX..EBP/ESP on x86.
+- `PROBE_REG_AX` is the return-value register.
+- On x86, R8..R15 read 0 and cannot be set (`set_reg` returns 0).
+- On x86, `set_reg` keeps the low 32 bits (what the register holds); a later `get_reg`
+  returns exactly that.
+- There is no accessor for the instruction pointer, flags, or XMM/x87 registers.
+
+## Session functions
+
+All return `1` on success and `0` on failure unless stated otherwise. A failure prints
+`probe: error: <reason>` on stderr; the first error of a session is also kept and appears
+as `"error"` in the report.
+
+### `probe_session *probe_session_create(void)`
+
+Creates an empty session. Returns NULL only if allocation fails.
+
+### `int probe_add_symbol(probe_session *s, const char *location, probe_callback cb, uint32_t flags)`
+### `int probe_add_symbol_cfg(probe_session *s, const char *location, probe_callback cb, uint32_t flags, const void *config, size_t config_len)`
+
+Adds a probe at a [location](#locations). The `_cfg` form attaches a configuration block:
+it is **copied** at the call, so your buffer can go away afterwards; the callback reads the
+copy with `get_config`. `config_len` may be 0 (no config); a non-zero length with a NULL
+`config` is refused; the limit is 4 GB (`UINT32_MAX` bytes) on every backend.
+
+- Before launch/attach the call validates the location syntax and flags, prints
+  `probe: pending <location>`, and returns 1. Resolution happens when the module loads.
+- A probe added **before** the target starts that cannot be armed when its module loads
+  (unknown export, refused inline site, no free debug register, ...) **fails the session**:
+  `probe_run` returns 0, a launched target is terminated, an attached one is detached.
+- Refused at once: null callback, bad syntax (`location must be module+0xRVA or
+  module!Export[+0xOFF]`, `symbol offset must be +0xHEX`, ...), bad flags, a fifth hw probe
+  (`too many hardware probes (max 4 DR slots)`), a 129th inline probe
+  (`too many inline probes (max 128)`), an inline callback that is not an export
+  (`inline callback is not a named export`), a session whose target already exited.
+- From a callback, see [control from a callback](#control-from-a-callback).
+
+### `int probe_add_address(probe_session *s, uint64_t address, probe_callback cb, uint32_t flags)`
+
+A probe on an absolute address in the target, typically a return address read in a
+callback. Needs a running target (`absolute-address probes need a running target`), so it
+is normally called from a callback. Watch flags are refused here (`use probe_watch for data
+watchpoints`). A probe whose address lies in a DLL that unloads is retired for good
+(`probe: <address> retired: its module unloaded`).
+
+### `int probe_watch(probe_session *s, uint64_t address, probe_callback cb, uint32_t flags)`
+
+A hardware **data** watchpoint on an absolute address: the callback fires when the
+location is written (`PROBE_WATCH_WRITE`, the default when no mode is given) or read or
+written (`PROBE_WATCH_RW`). Optional `| PROBE_ONCE`. No code is modified.
+
+- The watch covers one dword: the address must be 4-byte aligned
+  (`probe_watch address must be 4-byte aligned (watches one dword)`).
+- Counts against the 4 hardware slots, together with `PROBE_HW` execute probes.
+- Needs a running target, like `probe_add_address`. A module variable can also be watched
+  before launch with `probe_add_symbol(s, "module+0xRVA", cb, PROBE_HW | PROBE_WATCH_WRITE)`.
+
+### `int probe_launch(probe_session *s, char *const argv[])`
+
+Starts `argv[0]` (`argv` is NULL-terminated) under UHH and returns once it is created; the
+target runs when `probe_run` runs. One launch or attach per session
+(`session already launched`).
+
+- `argv[0]` is passed to `CreateProcess` as the application name: it is not searched on
+  `PATH` and needs its `.exe` extension; a relative path is relative to the current
+  directory. Give a full path to be safe. The command line is built from all of `argv`,
+  quoted where needed.
+
+- The target must have the controller's bitness (`target is a 32-bit (WOW64) process: use
+  the x86 build of UHH` / `target is a 64-bit process: use the x64 build of UHH`).
+- Only this process is debugged; its children run unprobed.
+- The target inherits the caller's **stdin**.
+- **stdout/stderr**: when the caller's are a console (or NUL) the target writes to them
+  directly. When they are a pipe or a file, the target gets its own pipe and UHH forwards
+  its bytes unchanged, a complete line at a time, so a `probe_log` record is always a whole
+  line of its own. An unfinished line (a prompt, binary output) goes out after ~50 ms
+  without new bytes; records logged meanwhile follow at the target's next newline. A
+  stdout and stderr that are one stream (`2>&1`) share one pipe and keep their order. Only
+  when the target ends inside a line and records or the report still follow does UHH add
+  a `"\n"` first. Output its children still write after it exits is forwarded until
+  `probe_close`.
+- The target is started with `_NO_DEBUG_HEAP=1`, so it gets its normal heap, not the
+  debug heap a debugged process would get.
+- Prints `probe: logs -> <file>` and `probe: symbols via <dbghelp>` on stderr.
+
+### `int probe_attach(probe_session *s, uint32_t pid)`
+
+Attaches to a running process instead of launching one.
+
+- Opens the process with `PROCESS_ALL_ACCESS` and attaches as a debugger. A process that
+  already has a debugger cannot be attached (the second controller fails with Win32 87).
+- Same-bitness rule as `probe_launch`.
+- The agent DLL is injected into **every** attached target, also for breakpoint/hw-only
+  sessions: it is the controller-death guard (if the controller dies, the agent restores
+  breakpoints, clears debug registers and removes hooks). `probe_api_agent.dll` must
+  therefore be next to the controller executable, or the attach fails.
+- Probes resolve against the modules already loaded and any loaded later.
+- `probe_run` returns when the target exits. `probe_close` on a still-running target
+  **detaches**: inline hooks removed, breakpoints restored, debug registers cleared, no
+  thread left mid-step; the target keeps running.
+
+### `int probe_attach_new(probe_session *s, const char *image_name, uint32_t timeout_ms)`
+
+Waits up to `timeout_ms` (0 = forever) for a **new** process whose image name matches
+(e.g. `"probe_app.exe"`; processes already running are ignored) and attaches to it. It
+polls about every millisecond, so the target may run for a few milliseconds before the
+attach lands: instrument what it does after start-up. Any process with that name
+matches, not only children of a particular parent. On timeout:
+`no new <image> appeared`.
+
+### `int probe_run(probe_session *s)`
+
+Runs the session: dispatches debug events, runs breakpoint/hw callbacks, drains inline
+logs, until the target exits or the session is stopped.
+
+- Must be called on the **same thread** that called `probe_launch`/`probe_attach` (Windows
+  binds the debug object to that thread):
+  `probe_run must be called on the thread that called probe_launch/probe_attach`.
+- Once per session (`session already ran`).
+- Returns 1 when the target exited, or the session detached, with no error.
+- On an internal error with an attached target, it detaches on its own thread before
+  returning (`probe: session failed (<reason>): detaching from the target`).
+- **Ctrl+C / Ctrl+Break** while `probe_run` (through `probe_wait_for_exit`) runs ends the
+  session, not the tool: an attached target is detached and keeps running, a launched one
+  is ended, and `probe_run` returns normally so the caller still flushes logs and writes its
+  report. A second press gets the default handling (the tool ends).
+
+### `int probe_wait_for_exit(probe_session *s)`
+
+Call after `probe_run`. Waits until every `probe_log` record is in the session log file and
+the live stdout tail has caught up.
+
+Returns 1 only if the session has no error **and** either the target exited with exit code
+0 or the session was interrupted by Ctrl+C. A target exiting with a non-zero code makes it
+return 0 (the report's `app_exit` shows the code). A stdout reader that went away
+(`| head`) is not an error: the live tail stops with a warning, every record still reaches
+the file, and the report says `"live_output_closed":true`.
+
+### `void probe_report(probe_session *s, FILE *out)`
+
+Catches the stdout tail up, then writes to `out` only the `prehook`, `probe` and
+`probe_report` records (see [output](#output-logs-and-report)). File-backed logs are never
+replayed, also on repeated calls. In an attach that is detached afterwards, counts taken
+before `probe_close` race the running target; `probe_close` prints the final counts.
+
+### `void probe_close(probe_session *s)`
+
+Ends the session and frees it; `s` is invalid afterwards.
+
+- May be called from another thread while `probe_run` runs: it asks `probe_run` to stop
+  (detach an attached target, end a launched one), waits until `probe_run` has returned
+  (`probe: close: still waiting for probe_run to stop (Ns)` every 15 s), then tears down.
+- A launched target that is still running is terminated (exit code 3).
+- An attached target that is still running is detached. stderr then shows
+  `probe: detached: hits=.. logs_written=.. log_dropped=.. in_flight=..`
+  (hits = logs_written + log_dropped + in_flight).
+- Detach waits for inline callbacks that are still running and can finish (see
+  [limitations.md](limitations.md#detach-and-close)).
+- Do not call it while `probe_attach` is still running on another thread.
+
+## Callback functions
+
+These take the hit's context `c`. Passing a NULL context returns 0 / does nothing.
+
+### `uint64_t get_reg(probe_context *c, enum probe_register r)`
+### `int set_reg(probe_context *c, enum probe_register r, uint64_t value)`
+
+Read or write a register of the hit thread. `get_reg` returns 0 for an invalid id (and for
+R8..R15 on x86); `set_reg` returns 0 for those, 1 otherwise. Changes apply when the
+callback returns. A `set_reg` that changes a value is counted in the report's `overrides`.
+`set_reg(c, PROBE_REG_SP, ...)` is honoured on every backend.
+
+### `uint64_t get_func_arg(probe_context *c, size_t index)`
+
+Integer argument `index` at a function **entry** probe (`[SP]` is the return address). The
+index is positional per architecture, because the API cannot know the callee's
+convention:
+
+- **x64** (every convention): 0..3 = RCX, RDX, R8, R9, then `[RSP+8+8*index]`. A
+  float/double among the first four is in XMM (not readable: that index returns the
+  unrelated integer register). A struct of 1/2/4/8 bytes comes by value, any other as a
+  pointer to a caller copy. A hidden return pointer (struct results over 8 bytes) is index 0
+  (member functions: `this` 0, hidden pointer 1) and shifts the rest by one.
+- **x86**: the index-th 4-byte stack slot, `[ESP+4+4*index]`, whatever the convention.
+  Register arguments are not slots; read them with `get_reg`: `__fastcall` ECX, EDX (index 0
+  is the third argument), `__thiscall` ECX = `this` (index 0 is the first declared
+  argument), `__vectorcall` ECX, EDX (XMM0-5 not readable). A 64-bit integer or double takes
+  two slots (low, high), a float one, a struct by value size/4 slots; a hidden return
+  pointer is slot 0.
+- A C++ `this` is `get_reg(c, PROBE_REG_CX)` on both architectures.
+- Mid-function the result is whatever lies at those stack positions. An index whose
+  address cannot be read returns 0.
+
+### `int get_mem(probe_context *c, uint64_t address, void *buffer, size_t size)`
+### `int set_mem(probe_context *c, uint64_t address, const void *buffer, size_t size)`
+
+Copy target memory into `buffer`, or `buffer` into target memory. Return 1 only if the
+whole range was transferred.
+
+- The whole range is checked first (committed, readable / writable, no guard page); if
+  any part fails, nothing is read or written and the call returns 0. A guard page stays
+  armed; a read-only page (code included) is not made writable.
+- `get_mem` of code under a probe returns the **program's** bytes, not UHH's INT3 or hook
+  jump (on every backend, also for another backend's probe).
+- Target pointers are only meaningful through these functions: a breakpoint/hw callback
+  runs in the controller, where a target address is not a valid pointer.
+
+### `const void *get_config(probe_context *c)`
+
+The probe's config block (the copy made by `probe_add_symbol_cfg`), or NULL if it has
+none. The block is 8-byte aligned. Treat it as read-only. A common pattern (all examples)
+is a struct with a cookie field checked before use.
+
+### `void send_log(probe_context *c, const char *format, ...)`
+### `void send_log_stack(probe_context *c, const char *format, ...)`
+### `PROBE_LOG(c, ...)`
+
+Append one `probe_log` record (printf-style formatting). `send_log_stack` adds a snapshot
+of the call stack at the hit to the same record.
+
+- The message is at most 1023 bytes; a longer one is cut and ends in `...[truncated]`.
+- An invalid format or a faulting argument gives `[unformattable] <format>`; it is never
+  fatal and never dropped. `%n` is refused that way. A NULL format sends nothing.
+- Control characters are escaped in the JSON; bytes that are not valid UTF-8 are written
+  as `\u00XX`; embedded NULs are kept.
+- `%s` must point to memory of the process the callback runs in. For a target string,
+  `get_mem` it into a local buffer first (see [B10](limitations.md#formatting-target-strings)).
+- The stack holds up to 32 frames, frame 0 being the probe site. Only raw return addresses
+  are captured at the hit; they are resolved to `module!function+0xoff` (plus `file:line`
+  with PDBs) later on the controller's log-writer thread. Walkers differ per backend; see
+  [symbols.md](symbols.md#stacks-per-backend-send_log_stack).
+- Records are lossless: when the writer is behind, the logging thread waits. Per-thread
+  order is kept, also across backends.
+
+### `int call_func(probe_context *c, const char *symbol, uint64_t *ret, int nargs, ...)`
+
+Calls a function **in the target**, on the thread that hit the probe. Returns 1 if the call
+ran; `*ret` receives the return register.
+
+- `symbol`: `"module!Export[+0xOFF]"`, `"module+0xRVA"` or `"0xADDRESS"`, with the module
+  grammar of [probe locations](#locations): matched by file name (a directory part is
+  ignored); a name without an extension means `<name>.dll` (`"kernel32!X"` ==
+  `"kernel32.dll!X"`). Offsets are `+0x` hex only.
+- Up to 8 integer/pointer arguments (Windows x64 ABI; x86 stack arguments, stdcall or
+  cdecl). The implementation reads each variadic argument as a `uint64_t`, so pass every
+  argument as `uint64_t` (cast constants: `(uint64_t)0`), as the examples do.
+- Returns 0 without calling anything for: an unknown module or export, `nargs` outside
+  0..8, an address that is not committed executable memory.
+- The callee runs with whatever locks the hit thread holds: avoid functions that need them
+  (e.g. the allocator from inside a `malloc` hook).
+- Probes hit inside the callee on the same thread run no callback.
+- The program does not see the callee's last-error value or last NT status: the hit
+  thread's values are restored.
+- For the target's pid/tid, call `kernel32.dll!GetCurrentProcessId` /
+  `GetCurrentThreadId` this way: a direct Win32 call acts on the process the callback runs
+  in.
+- **Breakpoint/hw:** the debugger runs the call on the stopped thread and restores its
+  context exactly. It costs tens of microseconds, so cache results. Other threads keep
+  running; their hits on code probes wait until the call ends (a data-watchpoint hit cannot
+  wait and runs its callback during the call). Calls do not nest: a `call_func` made while
+  another one is in flight returns 0. A call
+  that does not return within 5 s is abandoned (`probe: call_func timed out after 5 s;
+  thread restored`). A callee that raises an exception, even one it handles itself, is
+  abandoned at that exception (returns 0, `*ret` untouched, the target never sees it).
+  Refused when the target has CET shadow stacks.
+- **Inline:** a direct call. An exception in the callee is dispatched in the target as usual
+  (handled inside: returns 1; unhandled: 0), and the target's vectored handlers see it.
+- Prefer `call_original` for the probed function itself, and keep `call_func` to callees
+  that take no locks and do not throw.
+
+### `int call_original(probe_context *c, int nargs, uint64_t *ret)`
+### `void return_from(probe_context *c, uint64_t value, int nargs)`
+
+Detours-style replacement from an **entry** probe (the function's first instruction; also
+a jmp thunk, an import/incremental-link thunk, a tail-call target, an x86 `mov edi,edi`
+prologue). Same source on every backend.
+
+`call_original` runs the probed function now, on the hit thread, with the current argument
+registers and stack (including the callback's `set_reg`/`set_mem` changes). Returns 1 if it
+ran; `*ret` receives the integer return register (x64 RAX; x86 EAX zero-extended).
+
+- `nargs` = the integer/pointer arguments the function takes, 0..16 (e.g. 11 for
+  `NtCreateFile`). It matters to inline only, and only as a minimum: inline copies the
+  first 32 x64 stack arguments / 64 x86 slots anyway (stack arguments beyond 256 bytes are
+  cut off), plus the argument registers and XMM0-5 as at the hit. Register arguments always
+  go as at the hit, so a method with no other arguments is called with `nargs` 0.
+- This probe does not fire for that call. Probes of the same kind hit inside the original
+  (inline in inline; breakpoint/hw in breakpoint/hw), this one included for a recursive
+  function, count their hits but run no callback. Probes of the other kind fire.
+- An exception or `longjmp` out of the original goes to the program's own handlers exactly
+  as without the probe; the body ran once and the rest of the callback does not run (its
+  C++ locals are not destroyed). On breakpoint/hw the same holds for an original that has
+  not returned after 5 s (it is released and runs on) and for a thread that exits inside it.
+- **Breakpoint/hw:** the original runs in place on the hit's own stack; a debug register on
+  that thread catches its return. That needs one of the 4 debug registers for the call: a
+  free one, or, when the hit is itself a hw execute probe, its own slot (a recursive entry
+  on that thread during the call then goes uncounted). Otherwise it is refused
+  (`call_original refused: needs one free debug register (all 4 in use)`). Other threads'
+  hits wait until the call ends.
+- Refused (returns 0, warned once per probe) when the hit is not at a function entry
+  (`[SP]` is not a return address, e.g. a probe after a `push`). On 0 the original has
+  **not** run: do not `return_from`; let the hit fall through.
+
+`return_from` makes the probed function return to its caller when the callback ends,
+without running the body (again). It resumes at a real `ret` with SP at the hit's return
+address, so the normal and shadow stacks stay in sync.
+
+- The caller gets: x64 RAX = `value`; x86 EAX = low half and EDX = high half of `value`.
+  After `call_original`, a `value` whose high half is 0 leaves EDX as the original returned
+  it, so `return_from(c, r, nargs)` passes any integer result through unchanged. (To return
+  a 64-bit value with a zero high half there, `set_reg(c, PROBE_REG_DX, 0)` after
+  `return_from`.)
+- Floating-point results cannot be set. After `call_original` the caller gets the
+  original's XMM0 / x87 ST0, so passing a float result through works; without it the
+  caller gets whatever XMM0/ST0 hold. Do not `return_from` a float function without calling
+  the original.
+- A struct result over 8 bytes goes through the hidden pointer (`get_func_arg(c, 0)`, x64
+  member functions 1): write it with `set_mem` and `return_from(c, pointer, nargs)`.
+- `nargs` (x86 only; ignored on x64) = the **stack** argument slots the callee pops:
+  `__stdcall` all of them (64-bit/double ones count 2), `__fastcall`/`__vectorcall` those
+  after the register ones, `__thiscall` those after `this`; a hidden return pointer counts
+  1. Pass 0 for `__cdecl` and varargs functions (the caller pops). After `call_original` the
+  count the original really popped is used, and a different `nargs` is warned once per
+  probe. Without `call_original` a wrong `nargs` is **not** caught and leaves the caller's
+  ESP off by the difference.
+- Other register changes (`set_reg`) are kept; SP is always the hit's.
+- Refused (no effect, warned once) where `call_original` is refused.
+- `call_original` without `return_from` lets the original run a **second** time on fall
+  through (warned once per probe).
+
+Note the asymmetry: `call_original`'s `nargs` counts the arguments the function takes;
+`return_from`'s counts the x86 stack slots the callee pops (`__thiscall` with no other
+arguments: 0; `NtCreateFile`: 11).
+
+Typical wrap (examples/filetrace):
+
+```cpp
+uint64_t status = 0;
+if (!call_original(c, 11, &status)) return;   // refused: the call runs normally
+/* ... inspect the results ... */
+return_from(c, status, 11);                    // the caller sees the real status
+```
+
+Warnings about `call_original` / `return_from` go to stderr (`probe: warning: <location>:
+...`) and, once per probe, into the log as a `uhh warning: ...` record, on every backend.
+
+### `probe_session *get_session(probe_context *c)`
+
+The session the callback belongs to, for control-plane calls from a callback; see below.
+
+## Control from a callback
+
+`get_session(c)` works in every callback: breakpoint/hw get the real session; inline
+callbacks get a proxy whose calls are forwarded to the controller synchronously. The same
+source works in every backend.
+
+- Only `probe_add_symbol`, `probe_add_symbol_cfg`, `probe_add_address` and `probe_watch` may
+  be called from a callback.
+- The new probe's callback must be **exported** by the module of the calling callback
+  (`a probe added from a callback needs a callback exported by name (dllexport)`): an inline
+  request names it by export and the controller resolves that name there. Keep a callback
+  and the callbacks it adds in one module.
+- A failure returns 0 to the callback and prints `probe: dynamic add failed: <reason>`; it
+  does not become the session's error.
+- A probe added for a module that is not loaded yet returns 1 and stays pending; if it
+  cannot be armed when the module loads, stderr shows `probe: runtime probe <loc> failed to
+  arm: <reason>` and the probe is dropped.
+- Configs and symbols have no extra size limit from a callback.
+
+Example (README): watch the block `malloc` returns.
+
+```c
+void on_write(probe_context *c) { send_log_stack(c, "write to watched block"); }
+
+void on_return(probe_context *c) {                      /* one-shot, at malloc's return  */
+    probe_watch(get_session(c), get_reg(c, PROBE_REG_AX), on_write, PROBE_WATCH_WRITE);
+}
+void on_malloc(probe_context *c) {                      /* malloc entry                  */
+    uint64_t sp = get_reg(c, PROBE_REG_SP), ret = 0;
+    if (get_func_arg(c, 0) != 0x1337) return;           /* only the block we care about  */
+    get_mem(c, sp, &ret, sizeof(void *));               /* return address                */
+    probe_add_address(get_session(c), ret, on_return, PROBE_BREAKPOINT | PROBE_ONCE);
+}
+probe_add_symbol(s, "ucrtbase.dll!malloc", on_malloc, PROBE_BREAKPOINT);
+```
+
+(Full, built version: `examples/dynwatch`.)
+
+## Shared state (`UHH_SHARED`)
+
+Breakpoint/hw callbacks run in the controller and inline callbacks run in the target, so a
+plain global exists once in **each** process. Probes that share state (a handle map, a
+counter) either use one backend, or mark the state `UHH_SHARED`:
+
+```cpp
+UHH_SHARED OpenRecord g_by_handle[kHandleSlots];   // examples/gated_config/callbacks.cpp
+```
+
+- A `UHH_SHARED` global lives in a shared section of the callbacks DLL
+  (`probe_api_agent.dll`). The controller runs those callbacks from its own copy of the same
+  DLL file the target loads, so both processes see the same memory with ordinary access.
+- Rules: constant or zero initialisation only (C++: enforced by `constinit`); no pointers
+  into either process (store values, handles, indices); lock-free atomics for
+  synchronisation (`std::atomic_ref` in the examples).
+- Per session: each session uses its own copy of the agent DLL
+  (`%TEMP%\uhh\<pid>-<tick>-<n>\probe_api_agent.dll`, deleted at close), so separate
+  sessions never share.
+- A breakpoint/hw callback of a module with `UHH_SHARED` globals must be an export that the
+  agent DLL also has (it is run from there): otherwise `callback uses UHH_SHARED state but
+  is not a named export ...` or `UHH_SHARED callback '<name>' is not exported by the agent
+  DLL`.
+- Callbacks of a module without `UHH_SHARED` globals are unaffected.
+
+## Output: logs and report
+
+### Session log file and live tail
+
+Every `send_log`/`send_log_stack` record is appended as one JSON line to a per-session file,
+`%TEMP%\uhh\logs\uhh-<controller pid>-<n>.jsonl`; its path is printed once as
+`probe: logs -> ...`. The file is not deleted at close. A background thread copies new
+complete lines to the controller's stdout (the live tail). Redirect stdout to `NUL` to
+disable the tail and keep only the file. If a console tail falls behind for more than
+about a second, UHH prints a one-time warning suggesting a redirect to a file or pipe.
+Records reach the file within about 10 ms or when the writer is idle.
+
+```json
+{"kind":"probe_log","probe":3,"tid":5124,"message":"read handle=0xa4 pid=7516 name=probe_app.exe addr=0x7ff7fb509690 size=16"}
+{"kind":"probe_log","probe":0,"tid":5124,"message":"write to watched block","stack":["module!function+0x12 (file.c:87) [0x7ff6...]", "..."]}
+```
+
+`probe` is the probe's index in the order the probes were added (0-based); `tid` is the
+target thread that hit it.
+
+### Report (`probe_report`)
+
+```json
+{"kind":"prehook","location":"...","address":"0x...","patched_bytes":5,"pattern":"...","destination":"0x...","via":"","live":"...","original":"...","live_disasm":[...],"original_disasm":[...],"suggest":[...]}
+{"kind":"probe","location":"ntdll.dll!NtReadVirtualMemory","backend":"inline","active":true,"hits":8000}
+{"kind":"probe_report","probes":4,"active":4,"hits":8012,"overrides":1,"log_dropped":0,"callbacks_interrupted":0,"logs_written":8010,"controller_peak_ws_mb":12,"app_exit":0,"live_output_closed":false,"error":null}
+```
+
+| Field | Meaning |
+|---|---|
+| `prehook` record | one per probe site that another tool had already modified (live bytes differ from the file on disk); details also on stderr as `probe: PRE-HOOKED SITE ...` |
+| `probe.backend` | the effective backend (after `PROBE_FALLBACK_HW`) |
+| `probe.active` | armed at report time; false = still pending, refused, or unloaded |
+| `probes`, `active`, `hits` | totals over the user's probes |
+| `overrides` | register changes made by callbacks (`set_reg` with a new value) |
+| `log_dropped` | records lost; non-zero only when the controller stopped consuming (e.g. it died, or its log file failed) |
+| `callbacks_interrupted` | inline callbacks cut off mid-run because the target process died; their hits are counted, their logs never existed |
+| `logs_written` | records written to the session file |
+| `controller_peak_ws_mb` | the controller's peak working set |
+| `app_exit` | the target's exit code (1 if it did not exit, e.g. after a detach) |
+| `live_output_closed` | stdout's reader went away; the file still has every record |
+| `error` | the session's first error, or null |
+
+Accounting: hits = logs + `log_dropped` + `callbacks_interrupted` for a callback that logs
+once per hit (see [limitations.md](limitations.md#logs-and-accounting) for the edge cases).
+
+## Threading and concurrency
+
+| Topic | Breakpoint / hw | Inline |
+|---|---|---|
+| Thread a callback runs on | the controller's debugger thread (the one in `probe_run`) | the target thread that hit the probe |
+| Overlap | callbacks never overlap; the whole target is stopped during each debug event | callbacks of different target threads run at the same time |
+| Static state | plain variables work | must be atomic or locked |
+| `thread_local` | one controller thread for all target threads | per target thread |
+| Per-thread state | key it by the target tid (`call_func(c, "kernel32.dll!GetCurrentThreadId", &tid, 0)`) | same, to stay portable |
+| Re-entrancy | a callback's own Win32 calls run in the controller and hit nothing | a probe hit on the same thread while its callback runs (directly or through `call_func`) is counted, with no callback |
+
+Session functions: call `probe_launch`/`probe_attach` and `probe_run` on one thread.
+`probe_close` may come from another thread (it stops `probe_run` and waits for it). Use
+`get_session(c)` for control calls from callbacks.
+
+A callback that faults or throws is abandoned on every backend: the hit counts, its
+register changes are discarded, `set_mem` writes already made stay, and the program runs
+on (after `call_original`, the caller gets `return_from`'s value if one was set, else the
+original's result). Breakpoint/hw print `probe: warning: callback for <loc> raised 0x...;
+abandoned` once. Inline the exception is raised in the target, so the program's vectored
+exception handlers see it first.
+
+## Limits
+
+| Limit | Value |
+|---|---|
+| Hardware probes (execute + watch) | 4 per session (DR0-DR3) |
+| Inline probes | 128 per session |
+| Software breakpoints armed at once, in a session that also has inline probes | 65536 |
+| Config block | 4 GB (`UINT32_MAX` bytes) |
+| Log message | 1023 bytes, then `...[truncated]` |
+| Stack snapshot | 32 frames |
+| `call_func` arguments | 0..8 |
+| `call_original` arguments | 0..16 |
+| Inline `call_original` stack copy | 32 x64 stack arguments / 64 x86 slots (256 bytes) |
+| `probe_watch` | one aligned dword |
+
+## Per-backend differences
+
+Everything not listed here behaves the same on every backend (checked by the regression
+suite's portability matrix).
+
+| Topic | Breakpoint / hw | Inline |
+|---|---|---|
+| Direct Win32 calls in a callback (`GetCurrentProcessId`, file I/O, allocation...) | act on the controller | act on the target |
+| `%s` of a target pointer in `send_log` | not a valid pointer: `[unformattable] ...` (or controller bytes if mapped there too) | prints the string |
+| Callback that faults/throws | the target never sees the exception | the target's vectored handlers see the first chance |
+| `call_func` callee that raises (even if handled) | abandoned: returns 0 | dispatched in the target: 1 if handled |
+| `call_func` cost | tens of microseconds | a direct call |
+| `PROBE_ONCE` | supported | refused |
+| Visible to the program | INT3 byte (breakpoint) or DR7 (hw) | hook jump in the code; page protection changes when hooks are written |
+| Live from | the first instruction (launch) | the entry point (launch) |
+| Per-hit cost | ~hundreds of us (breakpoint), ~tens of us (hw) | ~tens of ns to ~1 us |
+
+Details and the remaining corner cases are in [limitations.md](limitations.md).

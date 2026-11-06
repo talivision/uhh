@@ -106,15 +106,27 @@ static void fail(Result &r, const char *name, int iter, const char *what) {
 }
 
 // Compare the TEB changes of the probed call (b1 -> a1) against the twin's (b2 -> a2).
-// The stack limit moving down (a callback committing more of the thread's stack) and the
-// heap's affinity hint (a callback's own heap calls) are counted, not failed: see
-// docs/ROADMAP.md "Transparency findings".
+// The stack limit moving DOWN by whole pages (a callback committing more of the thread's
+// stack: growth) and the heap's affinity hint (a callback's own heap calls) are counted, not
+// failed: see docs/ROADMAP.md "Transparency findings". Any other stack-limit change (up, or
+// not page-aligned) is a failure.
+static uintptr_t teb_ptr(const unsigned char *t, size_t off) { uintptr_t v; memcpy(&v, t + off, sizeof(v)); return v; }
 static bool teb_same(const unsigned char *b1, const unsigned char *a1, const unsigned char *b2, const unsigned char *a2,
                      Result &r, char *why, size_t n) {
     for (size_t i = 0; i < TEB_SIZE; ++i) {
         const bool c1 = a1[i] != b1[i], c2 = a2[i] != b2[i];
         if (c1 == c2 && (!c1 || a1[i] == a2[i])) continue;
-        if (i >= TEB_STACK_LIMIT && i < TEB_STACK_LIMIT + sizeof(void *)) { r.stack_moves++; i = TEB_STACK_LIMIT + sizeof(void *) - 1; continue; }
+        if (i >= TEB_STACK_LIMIT && i < TEB_STACK_LIMIT + sizeof(void *)) {
+            const uintptr_t pb = teb_ptr(b1, TEB_STACK_LIMIT), pa = teb_ptr(a1, TEB_STACK_LIMIT);
+            const uintptr_t tb = teb_ptr(b2, TEB_STACK_LIMIT), ta = teb_ptr(a2, TEB_STACK_LIMIT);
+            const bool down = pa <= pb && ta <= tb && !(pa & 0xFFF) && !(ta & 0xFFF);   // growth only
+            if (!down) {
+                snprintf(why, n, "TEB StackLimit moved up / unaligned (probed 0x%llx->0x%llx, twin 0x%llx->0x%llx)",
+                         (unsigned long long)pb, (unsigned long long)pa, (unsigned long long)tb, (unsigned long long)ta);
+                return false;
+            }
+            r.stack_moves++; i = TEB_STACK_LIMIT + sizeof(void *) - 1; continue;
+        }
         if (i >= TEB_HEAP_DATA && i < TEB_HEAP_DATA + 4) { r.heap_hint++; i = TEB_HEAP_DATA + 3; continue; }
         snprintf(why, n, "TEB+0x%zx changed (probed %02x->%02x, twin %02x->%02x)", i, b1[i], a1[i], b2[i], a2[i]);
         return false;

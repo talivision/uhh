@@ -36,6 +36,9 @@ struct Probe {
     std::string location, module, callback_export;
     std::string export_name;   // "module!Export+0xOFF": resolved from the export table at load
     uint64_t sym_offset = 0;
+    // The location named its module without an extension ("kernel32!X"): module is then
+    // "<name>.dll" (module_of_location); warned once if only "<name>.<other ext>" loads.
+    bool bare_module = false, warned_bare = false;
     bool retired = false;      // PROBE_ONCE probe that already fired (kept for the report)
     bool internal = false;     // library-owned (not reported)
     // Breakpoint probes: the original bytes that followed the INT3 (to recognise a copy of the
@@ -1408,14 +1411,31 @@ static bool parse_hex(const char *number, uint64_t &out) {
     out = (uint64_t)v; return true;
 }
 
-// "module+0xRVA" or "module!Export[+0xOFF]".
+// THE module grammar, shared by probe locations (every backend, launch/attach/runtime adds,
+// uhh_trace -p) and call_func (breakpoint/hw here; inline in agent.cpp agent_module, whose
+// GetModuleHandleA reads names the same way): the module is matched by its FILE NAME, case-
+// insensitively (a directory part is ignored), and a name without an extension means
+// "<name>.dll", as LoadLibrary/GetModuleHandle read it: "kernel32" == "kernel32.dll", and
+// "probe_app" names probe_app.dll -- never probe_app.exe (an EXE is named with its ".exe").
+// A trailing dot means "no extension" ("foo." == the file "foo"). Empty = no module named.
+static std::string module_of_location(const std::string &text, bool *bare = nullptr) {
+    std::string m = basename_of(text);
+    if (bare) *bare = false;
+    if (m.empty() || m == ".") return {};
+    if (m.back() == '.') { m.pop_back(); return m; }
+    if (m.find('.') != std::string::npos) return m;
+    if (bare) *bare = true;
+    return m + ".dll";
+}
+
+// "module+0xRVA" or "module!Export[+0xOFF]" (module: see module_of_location).
 static bool parse_location(probe_session *s, const char *text, Probe &p) {
     if (!text || !*text) { set_error(s, "empty probe location"); return false; }
     p.location = text;
     size_t bang = p.location.find('!');
     if (bang != std::string::npos) {
-        if (!bang) { set_error(s, "symbol location has an empty module"); return false; }
-        p.module = basename_of(p.location.substr(0, bang));
+        p.module = module_of_location(p.location.substr(0, bang), &p.bare_module);
+        if (p.module.empty()) { set_error(s, "symbol location has an empty module"); return false; }
         std::string rest = p.location.substr(bang + 1);
         size_t plus = rest.find('+');
         p.export_name = rest.substr(0, plus);
@@ -1434,7 +1454,8 @@ static bool parse_location(probe_session *s, const char *text, Probe &p) {
         p.location[plus + 1] != '0' || (p.location[plus + 2] != 'x' && p.location[plus + 2] != 'X')) {
         set_error(s, "location must be module+0xRVA or module!Export[+0xOFF]"); return false;
     }
-    p.module = basename_of(p.location.substr(0, plus));
+    p.module = module_of_location(p.location.substr(0, plus), &p.bare_module);
+    if (p.module.empty()) { set_error(s, "location has an empty module"); return false; }
     if (!parse_hex(p.location.c_str() + plus + 3, p.rva)) { set_error(s, "location has an invalid RVA"); return false; }
     return true;
 }
@@ -2870,6 +2891,27 @@ static bool arm_probe(probe_session *s, Probe &item, uint64_t base) {
     return item.flags & PROBE_HW ? arm_hw(s, item, base) : resolve_inline(s, item, base);
 }
 
+// "probe_app!X" names probe_app.dll (module_of_location), so it does not match the loaded
+// probe_app.exe and would stay pending in silence: say so, once per probe, when a module of
+// that name with another extension loads.
+static void warn_bare_module(probe_session *s, const std::string &module) {
+    const size_t dot = module.rfind('.');
+    if (dot == std::string::npos || iequals(module.substr(dot), ".dll")) return;
+    const std::string as_dll = module.substr(0, dot) + ".dll";
+    for (size_t i = 0; i < s->probes.size(); ++i) {
+        Probe &item = *s->probes[i];
+        if (!item.bare_module || item.warned_bare || item.active || item.retired || item.address ||
+            !iequals(item.module, as_dll)) continue;
+        item.warned_bare = true;
+        const size_t bang = item.location.find('!');
+        const std::string rest = item.location.substr(bang != std::string::npos ? bang : item.location.rfind('+'));
+        std::fprintf(stderr, "probe: warning: %s names %s (a module name without extension means .dll); "
+                             "the loaded %s is not matched -- write %s%s to probe it\n",
+                     item.location.c_str(), item.module.c_str(), module.c_str(), module.c_str(),
+                     rest.c_str());
+    }
+}
+
 // Launch-time probes that fail to arm fail the session (the user asked for them up
 // front). A probe added at runtime -- possibly pending on a module that loads much
 // later -- only reports its failure and retires; the run and other probes continue.
@@ -2878,6 +2920,7 @@ static bool arm_module(probe_session *s, const std::string &module, uint64_t bas
     // fresh INT3 / debug register / hook after everything was removed (seen: a DLL that
     // reloaded during the drain kept its new INT3 and the detached target died on it).
     if (s->detaching) return true;
+    warn_bare_module(s, module);
     bool all_ok = true;
     for (size_t i = 0; i < s->probes.size(); ++i) {
         Probe &item = *s->probes[i];
@@ -3388,6 +3431,7 @@ extern "C" int probe_add_symbol_cfg(probe_session *s, const char *location, prob
             raw->retired = true; return scope.done(0);
         }
         if (s->launched) {                          // runtime add: arm now if the module is mapped
+            if (raw->bare_module) for (auto &kv : s->module_bases) warn_bare_module(s, kv.first);
             for (auto &kv : s->module_bases)
                 if (iequals(kv.first, raw->module)) {
                     if (!arm_probe(s, *raw, kv.second)) { raw->retired = true; return scope.done(0); }
@@ -6491,10 +6535,10 @@ static uint64_t resolve_symbol(probe_session *s, const char *symbol) {
     if (symbol[0] == '0' && (symbol[1] == 'x' || symbol[1] == 'X')) return std::strtoull(symbol + 2, nullptr, 16);
     Probe tmp; std::string saved = s->error;
     if (!parse_location(s, symbol, tmp)) { s->error = saved; return 0; }
-    // "kernel32!X" names kernel32.dll, as GetModuleHandle (and so inline call_func) reads it.
-    const bool bare = tmp.module.find('.') == std::string::npos;
+    // tmp.module is already in module_of_location's form ("kernel32!X" -> kernel32.dll),
+    // the same match a probe location gets.
     for (auto &kv : s->module_bases)
-        if (iequals(kv.first, tmp.module) || (bare && iequals(kv.first, tmp.module + ".dll"))) {
+        if (iequals(kv.first, tmp.module)) {
             uint64_t rva = tmp.rva;
             if (!tmp.export_name.empty()) {
                 uint64_t exp = 0;

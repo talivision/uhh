@@ -15,7 +15,7 @@
 extern "C" void tp_on_hit(probe_context *);
 extern "C" void tp_on_spawn(probe_context *);
 extern "C" void tp_on_ovf(probe_context *);
-struct tp_cfg { uint32_t mode, nargs, pop, backend; };
+struct tp_cfg { uint32_t mode, nargs, pop, backend, entry; };   // see tp_callbacks.cpp
 
 struct Site { const char *name, *symbol; uint32_t nargs, pop; int special; };   // 1 spawn, 2 ovf
 #if defined(_WIN64)
@@ -52,7 +52,7 @@ int main(int argc, char **argv) {
     if (!s) return 1;
     for (const Site &site : kSites) {
         if (!only.empty() && only.find(std::string(",") + site.name + ",") == std::string::npos) continue;
-        tp_cfg cfg{mode, site.nargs, site.pop, bk};
+        tp_cfg cfg{mode, site.nargs, site.pop, bk, std::strcmp(site.name, "mid") ? 1u : 0u};
         std::string loc = std::string("tp_target.exe!") + site.symbol;
         if (!probe_add_symbol_cfg(s, loc.c_str(), site.special == 1 ? tp_on_spawn : site.special == 2 ? tp_on_ovf : tp_on_hit, bk, &cfg, sizeof(cfg))) {
             std::fprintf(stderr, "tp_driver: add %s failed\n", loc.c_str());

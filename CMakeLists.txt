@@ -192,7 +192,8 @@ add_library(probe_api_agent SHARED
     examples/regtrace/callbacks.cpp
     examples/logs_eval/logs_callbacks.cpp
     examples/agent_review/ar_callbacks.cpp
-    examples/transparency/tp_callbacks.cpp)
+    examples/transparency/tp_callbacks.cpp
+    examples/quickstart/my_callbacks.cpp)
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     target_sources(probe_api_agent PRIVATE src/probe/agent_x64.asm)   # uhh_orig_thunk (call_original)
 endif()
@@ -578,6 +579,13 @@ add_executable(ctrl_driver examples/ctrlreview/ctrl_driver.cpp examples/ctrlrevi
 target_include_directories(ctrl_driver PRIVATE include)
 target_link_libraries(ctrl_driver PRIVATE probe_api)
 add_dependencies(ctrl_driver ctrl_target ctrl_dll probe_api_agent)
+# --- Example: the quickstart's "your own tool" (docs/quickstart.md section 4, regress
+# `quickstart-*`). Its callbacks are also in probe_api_agent's source list above (inline).
+add_executable(my_tool examples/quickstart/main.cpp examples/quickstart/my_callbacks.cpp)
+target_include_directories(my_tool PRIVATE include)
+target_link_libraries(my_tool PRIVATE probe_api)
+add_dependencies(my_tool probe_api_agent probe_app configparse)
+
 # --- New-app examples (regress `newapp-*`): a tool + its fixture each. Each tool's
 # callbacks.cpp is also built into probe_api_agent (inline) -- see its list above.
 add_executable(filetrace examples/filetrace/main.cpp examples/filetrace/callbacks.cpp)

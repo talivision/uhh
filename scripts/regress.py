@@ -50,7 +50,10 @@ Checks:
   - logs-*: adversarial log delivery (examples/logs_eval): exact text for hostile formats on
     every backend, per-thread order across mixed backends, a producer killed/suspended
     mid-record, the controller killed while attached, the stdout reader going away.
-Missing binaries (an example not built) are reported as SKIP, not FAIL.
+A missing project-built binary (an example not built) is a FAIL, never a SKIP (missing_bin()).
+SKIP is only for a check that does not apply to this build (x86-only / x64-only: skip()) or
+an absent OPTIONAL EXTERNAL dependency -- Frida, Intel SDE, a system program this Windows
+does not ship (skip_external(); a FAIL when --only named the check).
 """
 import argparse
 import collections
@@ -163,10 +166,35 @@ def record(name, ok, detail=""):
     live(RESULTS[-1])
 
 
+def missing_bin(name, what):
+    """A PROJECT-BUILT binary (anything this repo's build produces: drivers, targets, DLLs) is
+    absent: a FAILURE, never a skip -- a partial build must never look green."""
+    RESULTS.append((name, "FAIL", f"missing project-built binary: {what}"))
+    live(RESULTS[-1])
+
+
+def explicitly_selected(name):
+    """True when --only names this check (a selector that is a substring of the record name,
+    or of check_<name> / check-<name>)."""
+    under = "check_" + name.replace("-", "_")
+    return any(o in n for o in ONLY for n in (name, under, under.replace("_", "-")))
+
+
+def skip_external(name, dep, why=""):
+    """An OPTIONAL EXTERNAL dependency is absent: Frida, Intel SDE, or a system program this
+    Windows does not ship. A SKIP in a general run; a FAILURE when --only named the check
+    (it was asked for and could not run)."""
+    status = "FAIL" if explicitly_selected(name) else "SKIP"
+    RESULTS.append((name, status, f"optional external dependency absent: {dep}" + (f" ({why})" if why else "")
+                    + (" -- explicitly selected" if status == "FAIL" else "")))
+    live(RESULTS[-1])
+
+
 def skip(name, why):
-    """A check that could not run. A missing binary is a FAILURE (a partial build must never
-    look green); only a check that does not apply to this build (e.g. x86-only) is a SKIP,
-    and a SKIP is never counted as a pass."""
+    """A check that does not APPLY to this build (e.g. x86-only, x64-only). A SKIP is never
+    counted as a pass. Use missing_bin() for an absent project-built binary and skip_external()
+    for an absent optional external dependency. (Safety net for callers that still route a
+    missing binary here: a reason mentioning "missing" is a FAILURE.)"""
     status = "FAIL" if "missing" in why else "SKIP"
     RESULTS.append((name, status, why))
     live(RESULTS[-1])
@@ -208,7 +236,7 @@ def check_sites():
 def check_gated_off():
     p = exe("probe_app.exe")
     if not p:
-        return skip("gated-off", "probe_app.exe missing")
+        return missing_bin("gated-off", "probe_app.exe")
     try:
         r, o = run([p, "--no-wait", "--helpers", HELPERS, "--threads", "4", "--reads", "200"], timeout=60)
         a = app(o)
@@ -266,7 +294,7 @@ def helper_pids(objs):
 
 def check_mix_matrix(threads, reads):
     if not exe("gated_config.exe"):
-        return skip("mix-matrix", "gated_config.exe missing")
+        return missing_bin("mix-matrix", "gated_config.exe")
     total = int(threads) * int(reads)
     # Program correctness: the target's own checksum over everything it read must be the
     # same as an UNINSTRUMENTED run with the feature enabled by config.
@@ -302,7 +330,7 @@ def check_mix_matrix(threads, reads):
 
 def check_multithread_exact(threads, reads):
     if not exe("gated_config.exe"):
-        return skip("multithread-exact", "gated_config.exe missing")
+        return missing_bin("multithread-exact", "gated_config.exe")
     total = int(threads) * int(reads)
     for read_bk in ("inline", "hw", "breakpoint"):
         name = f"exact-{read_bk} {threads}x{reads}"
@@ -366,7 +394,7 @@ def check_attach(threads, reads):
     offset 64 (range [base+64, base+128)). Release the gate and compare."""
     a, p = exe("uhh_attach.exe"), exe("probe_app.exe")
     if not a or not p:
-        return skip("attach", "uhh_attach/probe_app missing")
+        return missing_bin("attach", "uhh_attach/probe_app")
     W, R, N, helper, offset = int(threads), int(reads), HELPERS, 1, 64
     want = predicted_reads(W, R, N, helper, offset)
     for bk in ("breakpoint", "hw", "inline"):
@@ -424,7 +452,7 @@ LOG_OVERHEAD_CEIL_NS = {"inline": 20_000, "hw": 100_000, "breakpoint": 200_000}
 
 def check_log_throughput(threads, reads):
     if not exe("gated_config.exe"):
-        return skip("log-throughput", "gated_config.exe missing")
+        return missing_bin("log-throughput", "gated_config.exe")
     total = int(threads) * int(reads)
     for read_bk in ("inline", "hw", "breakpoint"):
         name = f"log-throughput-{read_bk}"
@@ -449,7 +477,7 @@ def check_volume(volume_reads):
     guarantee instead of leaving it a one-off. Inline is fast at any size; the software
     breakpoint is ~hundreds of us/hit so keep its volume sane unless you have time."""
     if not exe("gated_config.exe"):
-        return skip("volume", "gated_config.exe missing")
+        return missing_bin("volume", "gated_config.exe")
     threads = 8
     total = threads * int(volume_reads)
     for read_bk, timeout in (("inline", 180), ("hw", 900), ("breakpoint", 1800)):
@@ -519,7 +547,7 @@ def stream_volume_once(backend, calls, timeout):
 def check_stream_volume():
     """The controller's peak must be independent of total streamed-log volume."""
     if not exe("hitcost_driver.exe") or not exe("hitcost_target.exe"):
-        return skip("stream-volume", "hitcost driver/target missing")
+        return missing_bin("stream-volume", "hitcost driver/target")
     for backend in ("inline", "hw", "breakpoint"):
         name = f"stream-volume-{backend}"
         try:
@@ -549,7 +577,7 @@ def check_stream_live(calls=2_000_000):
     arrivals and how many logs arrived before the target printed its final line."""
     driver, target = exe("hitcost_driver.exe"), exe("hitcost_target.exe")
     if not driver or not target:
-        return skip("stream-live", "hitcost driver/target missing")
+        return missing_bin("stream-live", "hitcost driver/target")
     import re as _re
     for backend, n in (("inline", calls), ("hw", 50_000), ("breakpoint", 50_000)):
         name = f"stream-live-{backend}"
@@ -597,7 +625,7 @@ def check_stream_sink_speed():
     """Measure the file-backed writer with tailing disabled (NUL) and to a disk file."""
     driver, target = exe("hitcost_driver.exe"), exe("hitcost_target.exe")
     if not driver or not target:
-        return skip("stream-sink-speed", "hitcost driver/target missing")
+        return missing_bin("stream-sink-speed", "hitcost driver/target")
     calls = 2_000_000
     command = [driver, "--backend", "inline", "--method", "send_log", "--",
                target, "--calls", calls, "--threads", 1]
@@ -645,7 +673,7 @@ def trace_logstream(backend, target_args, timeout, consume):
 def check_stream_latency():
     tracer, target = exe("uhh_trace.exe"), exe("logstream_target.exe")
     if not tracer or not target:
-        return skip("stream-latency", "uhh_trace/logstream_target missing")
+        return missing_bin("stream-latency", "uhh_trace/logstream_target")
     for backend in ("inline", "hw", "breakpoint"):
         name = f"stream-latency-{backend}"
         ticks, logs, objects = {}, {}, []
@@ -682,7 +710,7 @@ def check_stream_latency():
 def check_stream_order():
     tracer, target = exe("uhh_trace.exe"), exe("logstream_target.exe")
     if not tracer or not target:
-        return skip("stream-order", "uhh_trace/logstream_target missing")
+        return missing_bin("stream-order", "uhh_trace/logstream_target")
     count = 1000
     by_tid, objects = {}, []
     try:
@@ -720,7 +748,7 @@ def check_breakage():
     baseline of every case must exit 0 too, so 'exit 0' really means 'same as without UHH'."""
     d, h = exe("breakage_driver.exe"), exe("hook_edge.exe")
     if not d or not h:
-        return skip("breakage", "breakage_driver/hook_edge missing")
+        return missing_bin("breakage", "breakage_driver/hook_edge")
     required = {
         ("ShortSite", "breakpoint"): "pass", ("ShortSite", "hw"): "pass",
         ("PrehookSite", "breakpoint"): "pass", ("PrehookSite", "hw"): "pass",
@@ -760,7 +788,7 @@ def check_breakage():
 def check_frida_parity():
     d = exe("frida_parity.exe")
     if not d or not exe("parity_target.exe"):
-        return skip("frida-parity", "frida_parity/parity_target missing")
+        return missing_bin("frida-parity", "frida_parity/parity_target")
     try:
         r = rvas("parity_target.map", "ParityB1Site", "ParityB2Site", "ParityB4Site", "ParityB6Site")
         _, o = run([d, exe("parity_target.exe"), r["ParityB1Site"], r["ParityB2Site"], r["ParityB4Site"], r["ParityB6Site"]], timeout=90)
@@ -778,7 +806,7 @@ def check_frida_parity():
 def check_watchpoint():
     d = exe("watch_driver.exe")
     if not d or not exe("watch_target.exe"):
-        return skip("watchpoint", "watch_driver/watch_target missing")
+        return missing_bin("watchpoint", "watch_driver/watch_target")
     # Same workload both times: 4 threads x 1000 stores, then 1000 loads each, then main
     # reads the value once more for its report line. WRITE must count only the 4000
     # stores; RW must count stores + loads + that final read = 8001.
@@ -799,7 +827,7 @@ def check_watchpoint():
 def check_dynwatch(writes=100):
     d = exe("dynwatch_driver.exe")
     if not d or not exe("dynwatch_target.exe"):
-        return skip("dynwatch", "dynwatch_driver/dynwatch_target missing")
+        return missing_bin("dynwatch", "dynwatch_driver/dynwatch_target")
     want = 2 * writes
     for entry in ("breakpoint", "hw", "inline"):
         name = f"dynwatch-{entry}"
@@ -841,7 +869,7 @@ def check_conformance():
     """Every context method + the control ops, one callback source, every backend."""
     d, t = exe("conformance_driver.exe"), exe("conformance_target.exe")
     if not d or not t:
-        return skip("conformance", "conformance_driver/target missing")
+        return missing_bin("conformance", "conformance_driver/target")
     for bk in ("breakpoint", "hw", "inline"):
         name = f"conformance-{bk}"
         try:
@@ -880,7 +908,7 @@ def check_callorig():
     x86 __stdcall return_from(.., 2) leaves the caller's ESP balanced, cdecl uses nargs=0."""
     d, t = exe("conformance_driver.exe"), exe("conformance_target.exe")
     if not d or not t:
-        return skip("callorig", "conformance_driver/target missing")
+        return missing_bin("callorig", "conformance_driver/target")
     for bk in ("breakpoint", "hw", "inline"):
         name = f"callorig-{bk}"
         try:
@@ -1046,7 +1074,7 @@ def check_portability():
     divergences must have exactly their documented value per backend."""
     d, t = exe("conformance_driver.exe"), exe("conformance_target.exe")
     if not d or not t:
-        return skip("portability", "conformance_driver/target missing")
+        return missing_bin("portability", "conformance_driver/target")
     x86 = pe_is_x86(t)
     docs_seen = {}
     for phase in ("A", "B", "C"):
@@ -1157,7 +1185,7 @@ def check_callorig_hunt():
     row is compared with the uninstrumented run; hits and "co" logs are exact; nothing dropped."""
     d, t = exe("co_driver.exe"), exe("co_target.exe")
     if not d or not t:
-        return skip("callorig-hunt", "co_driver/co_target missing")
+        return missing_bin("callorig-hunt", "co_driver/co_target")
     x86 = pe_is_x86(t)
 
     def co_row(objs):
@@ -1282,7 +1310,7 @@ def check_callconv():
     probes go in groups of 3 (4 debug registers, one kept free for call_original)."""
     d, t = exe("cc_driver.exe"), exe("cc_target.exe")
     if not d or not t:
-        return skip("callconv", "cc_driver/cc_target missing")
+        return missing_bin("callconv", "cc_driver/cc_target")
     x86 = pe_is_x86(t)
     ids = [i for i, n in enumerate(CC_NAMES) if x86 or n not in CC_X86_ONLY]
 
@@ -1339,7 +1367,7 @@ def check_memstress(threads=8, iters=20000):
     access, bad addresses failing closed, nothing else in the target's memory touched."""
     d, t = exe("memstress_driver.exe"), exe("memstress_target.exe")
     if not d or not t:
-        return skip("memstress", "memstress_driver/target missing")
+        return missing_bin("memstress", "memstress_driver/target")
     calls = threads * iters
     for bk in ("inline", "hw", "breakpoint"):
         name = f"memstress-{bk} {threads}x{iters}"
@@ -1377,7 +1405,7 @@ def check_symbols():
     exports -- via the dynamically loaded dbghelp/symsrv (honours _NT_SYMBOL_PATH)."""
     t, d = exe("uhh_trace.exe"), exe("dynwatch_target.exe")
     if not t or not d:
-        return skip("symbols", "uhh_trace/dynwatch_target missing")
+        return missing_bin("symbols", "uhh_trace/dynwatch_target")
     for bk in ("breakpoint", "hw", "inline"):
         try:
             r, o = run([t, "--backend", bk, "-p", "dynwatch_target.exe!worker:x", "--", d, "--no-wait", "--writes", "10"],
@@ -1411,7 +1439,7 @@ def check_realworld_targets():
     """Codex-written behaviour targets: exceptions through probed frames, thread
     lifecycle stress, allocator re-entrancy, and (measured) tamper/debugger visibility."""
     if not exe("uhh_trace.exe"):
-        return skip("realworld-targets", "uhh_trace missing")
+        return missing_bin("realworld-targets", "uhh_trace")
     for bk in ("breakpoint", "hw", "inline"):
         # Exceptions must still be caught by the target with every probe type in the frames.
         x = exe("exceptions_target.exe")
@@ -1557,8 +1585,10 @@ def check_frida_coexist():
     detour with PROBE_ALLOW_PREHOOKED. One case at a time, each with a hard deadline;
     frida_coexist.py kills its children on any failure. (Needs an interpreter with frida;
     on the test VM a frida 16.5.9 venv.)"""
-    if not FRIDA_PY.exists() or not exe("uhh_trace.exe") or not exe("probe_app.exe"):
-        return skip("frida-coexist", "frida interpreter / uhh_trace / probe_app missing")
+    if not exe("uhh_trace.exe") or not exe("probe_app.exe"):
+        return missing_bin("frida-coexist", "uhh_trace / probe_app")
+    if not FRIDA_PY.exists():
+        return skip_external("frida-coexist", f"frida interpreter {FRIDA_PY}")
     script = Path(__file__).with_name("frida_coexist.py")
     for order, bk, flag, want_bk, want_pre in FRIDA_COEXIST_CASES:
         name = f"frida-coexist-{order}-{bk}" + ("" if flag in ("none", "fallback-hw") and want_bk else f"-{flag}")
@@ -1595,7 +1625,7 @@ def check_sidefx(iters=1000, threads=4):
     with stacks, memory reads, a Win32 call that sets last-error). Every backend."""
     d, t = exe("sidefx_driver.exe"), exe("sidefx_target.exe")
     if not d or not t:
-        return skip("sidefx", "sidefx_driver/target missing")
+        return missing_bin("sidefx", "sidefx_driver/target")
     calls = iters * threads
     for bk in ("breakpoint", "hw", "inline"):
         name = f"sidefx-{bk}"
@@ -1617,6 +1647,17 @@ TP_MODES = ("noop", "log", "mem", "sys", "callfn", "co")
 TP_PROBES = ("add", "i64", "dbl", "dblarg", "seterr", "std", "align", "fact", "mid", "spawn", "thread", "peek", "ovf")
 
 
+def tp_co_expected(grp, iters):
+    """Mode co: the successful call_original wraps ("tp co ok" logs) a run must show, from the
+    calls tp_target makes (tp_target.cpp main): each of the 8 functions once per iteration
+    (tp_fact's recursive calls run INSIDE call_original: counted, no callback), tp_spawn once
+    and the thread it creates runs tp_threadfn once (--spawn), tp_peek 12 times (--peek). The
+    mid-function site refuses call_original (no wrap); tp_ovf's callback does not wrap."""
+    per = {p: int(iters) for p in ("add", "i64", "dbl", "dblarg", "seterr", "std", "align", "fact")}
+    per.update({"spawn": 1, "thread": 1 if "spawn" in grp else 0, "peek": 12, "mid": 0, "ovf": 0})
+    return sum(per[p] for p in grp)
+
+
 def check_transparency(iters=30):
     """A hit is invisible to the program (examples/transparency): every probed function has an
     unprobed twin, both called through one assembly harness, and a probed call must leave
@@ -1632,7 +1673,7 @@ def check_transparency(iters=30):
     a probed function. hw: at most 3 probes per run (call_original needs a free DR)."""
     d, t = exe("tp_driver.exe"), exe("tp_target.exe")
     if not d or not t:
-        return skip("transparency", "tp_driver/tp_target missing")
+        return missing_bin("transparency", "tp_driver/tp_target")
     groups = {"breakpoint": [TP_PROBES], "inline": [TP_PROBES],
               "hw": [TP_PROBES[i:i + 3] for i in range(0, len(TP_PROBES), 3)]}
     for bk in ("breakpoint", "hw", "inline"):
@@ -1657,6 +1698,10 @@ def check_transparency(iters=30):
                         if x in grp and tg.get(x) != 1: why.append(f"{x}={tg.get(x)}")
                     if fails: why.append(f"cb={fails[:2]}")
                     if cold: why.append(f"no hits: {cold}")
+                    if mode == "co":
+                        wraps = sum(1 for x in o if x.get("kind") == "probe_log" and x.get("message") == "tp co ok")
+                        if wraps != tp_co_expected(grp, iters):
+                            why.append(f"call_original wraps={wraps} want {tp_co_expected(grp, iters)}")
                     if rep.get("error") is not None or rep.get("app_exit") != 0 or rep.get("log_dropped") != 0:
                         why.append(f"report err={rep.get('error')} exit={rep.get('app_exit')} dropped={rep.get('log_dropped')}")
                     if why:
@@ -1676,8 +1721,27 @@ def check_transparency(iters=30):
                                              "--iters", iters]], capture_output=True, text=True, timeout=300, env=env)
         o = [json.loads(l) for l in r.stdout.splitlines() if l.strip().startswith("{")]
         tg = next((x for x in o if x.get("kind") == "target"), {})
-        record(name, r.returncode == 0 and tg.get("bad") == 0 and report(o).get("error") is None,
-               f"bad={tg.get('bad')} first={tg.get('first')!r} rc={r.returncode}")
+        rep = report(o)
+        rows = probes(o)
+        logs = [str(x.get("message", "")) for x in o if x.get("kind") == "probe_log"]
+        n = int(iters)                                   # TpMid runs once per iteration
+        n_log = sum(1 for m in logs if m.startswith("tp log ax="))
+        n_stack = logs.count("tp stack")
+        fails = [m for m in logs if m.startswith("tp FAIL")]
+        bad = []
+        if r.returncode != 0: bad.append(f"rc={r.returncode}")
+        if not tg or tg.get("bad") != 0: bad.append(f"target bad={tg.get('bad')} first={tg.get('first')!r}")
+        if (len(rows) != 1 or rows[0].get("location") != "tp_target.exe!TpMidHit" or rows[0].get("backend") != "inline"
+                or not rows[0].get("active") or rows[0].get("hits") != n):
+            bad.append(f"probe_rows={rows} (want one active inline TpMidHit row with {n} hits)")
+        if n_log != n or n_stack != n or len(logs) != 2 * n or fails:
+            bad.append(f"callback logs: log={n_log} stack={n_stack} total={len(logs)} want {n}/{n}/{2 * n} fails={fails[:2]}")
+        if (rep.get("error") is not None or rep.get("app_exit") != 0 or rep.get("log_dropped") != 0
+                or rep.get("callbacks_interrupted") != 0 or rep.get("logs_written") != 2 * n):
+            bad.append(f"report err={rep.get('error')} exit={rep.get('app_exit')} dropped={rep.get('log_dropped')} "
+                       f"interrupted={rep.get('callbacks_interrupted')} written={rep.get('logs_written')}")
+        record(name, not bad, " ".join(bad) if bad else
+               f"hits={rows[0].get('hits')} logs={len(logs)} bad=0 first={tg.get('first')!r} rc=0")
     except Exception as e:
         record(name, False, repr(e))
 
@@ -1714,7 +1778,7 @@ def check_edgehunt():
     backend; one-shot probes re-added from a callback every call; two backends on one site."""
     d, t = exe("edge_driver.exe"), exe("edge_target.exe")
     if not d or not t:
-        return skip("edgehunt", "edge_driver/edge_target missing")
+        return missing_bin("edgehunt", "edge_driver/edge_target")
     import struct
     data = Path(t).read_bytes()
     x86 = struct.unpack_from("<H", data, struct.unpack_from("<I", data, 0x3C)[0] + 4)[0] == 0x14C
@@ -1922,7 +1986,7 @@ def check_detach():
     logs_written), and none is dropped."""
     t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
     if not t or not a:
-        return skip("detach", "uhh_trace/probe_app missing")
+        return missing_bin("detach", "uhh_trace/probe_app")
     import time
     for bk, reads in (("inline", 1500000), ("hw", 40000), ("breakpoint", 40000)):
         name = f"detach-{bk}"
@@ -2002,7 +2066,7 @@ def check_ntdll_churn(cycles=8, round_reads=1000000):
     inline cycles took 1.0-2.9 s on x64 and 1.2-8.0 s on x86."""
     t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
     if not t or not a:
-        return skip("ntdll-churn", "uhh_trace/probe_app missing")
+        return missing_bin("ntdll-churn", "uhh_trace/probe_app")
     threads = 4
     for bk in ("inline", "hw", "breakpoint"):
         name = f"ntdll-churn-{bk}"
@@ -2081,7 +2145,7 @@ def check_patch_race(trials=4):
     proof the test can see the race the freeze removes."""
     t, a = exe("uhh_trace.exe"), exe("patchrace_target.exe")
     if not t or not a:
-        return skip("patch-race", "uhh_trace/patchrace_target missing")
+        return missing_bin("patch-race", "uhh_trace/patchrace_target")
     for mode in ("frozen", "unsafe"):
         name = f"patch-race-{mode}"
         exits, cycles_all, notes, torn = [], [], [], []
@@ -2134,7 +2198,7 @@ def check_emulated_sites(threads=8, calls=20000):
     pushed TF=1, the RtlCaptureContext case). hw is run as the reference."""
     t, a = exe("uhh_trace.exe"), exe("patchrace_target.exe")
     if not t or not a:
-        return skip("emulated-sites", "uhh_trace/patchrace_target missing")
+        return missing_bin("emulated-sites", "uhh_trace/patchrace_target")
     for site, mode in (("BranchSite", "branch"), ("PushfSite", "pushf")):
         for bk in ("breakpoint", "hw"):
             name = f"emulated-{mode}-{bk}"
@@ -2209,10 +2273,10 @@ def check_oldcrt(calls=2000):
     CRT the agent is immune: every call is hit, the target finishes, no error."""
     tracer, target = exe("uhh_trace.exe"), exe("oldcrt_target.exe")
     if not tracer or not target:
-        return skip("oldcrt", "uhh_trace/oldcrt_target missing")
+        return missing_bin("oldcrt", "uhh_trace/oldcrt_target")
     old = find_old_msvcp()
     if not old:
-        return skip("oldcrt", "no pre-14.40 msvcp140.dll on this machine (set UHH_OLD_MSVCP)")
+        return skip_external("oldcrt", "a pre-14.40 msvcp140.dll", "none on this machine; set UHH_OLD_MSVCP")
     tmp = Path(tempfile.mkdtemp(prefix="uhh-oldcrt-"))
     try:
         shutil.copy2(target, tmp / "oldcrt_target.exe")
@@ -2244,7 +2308,7 @@ def check_interrupt(threads=4, reads=100_000):
     and completes every read with no error (nothing of the instrumentation left behind)."""
     a, p = exe("uhh_attach.exe"), exe("probe_app.exe")
     if not a or not p:
-        return skip("interrupt", "uhh_attach/probe_app missing")
+        return missing_bin("interrupt", "uhh_attach/probe_app")
     import signal
     W, R, N = int(threads), int(reads), HELPERS
     for bk in ("inline", "hw", "breakpoint"):
@@ -2298,7 +2362,7 @@ def check_gated_filter(threads=4, reads=200):
     from probe_app's deterministic read pattern (read i -> helper i % N, base + 64*((i//N)%4)).
     The --pid filter (helper pids are new on every launch) is covered by attach-*."""
     if not exe("gated_config.exe"):
-        return skip("gated-filter", "gated_config.exe missing")
+        return missing_bin("gated-filter", "gated_config.exe")
     W, R, N = int(threads), int(reads), HELPERS
     rx = re.compile(r"read handle=0x[0-9a-f]+ pid=(\d+) name=\S+ addr=0x([0-9a-f]+) ")
     for bk in ("inline", "breakpoint", "hw"):
@@ -2336,7 +2400,7 @@ def check_gated_map(threads=4, reads=50):
     must agree with that ground truth (no handle-slot, stale or partial mapping). Each open
     backend is mixed with an inline read probe (the map is UHH_SHARED across backends)."""
     if not exe("gated_config.exe"):
-        return skip("gated-map", "gated_config.exe missing")
+        return missing_bin("gated-map", "gated_config.exe")
     rx_open = re.compile(r"open pid=(\d+) name=(\S+)$")
     rx_map = re.compile(r"map handle=0x([0-9a-f]+) -> pid=(\d+) name=(\S+)$")
     rx_read = re.compile(r"read handle=0x([0-9a-f]+) pid=(\d+) name=(\S+) ")
@@ -2411,7 +2475,7 @@ def check_newapp_files(threads=4, files=4, chunks=6):
     plain and overlapped -- and every file reads back intact. All-same and mixed backends."""
     from collections import Counter
     if not exe("filetrace.exe") or not exe("filetrace_target.exe"):
-        return skip("newapp-file", "filetrace.exe / filetrace_target.exe missing")
+        return missing_bin("newapp-file", "filetrace.exe / filetrace_target.exe")
     rx_create = re.compile(r"create path=(.*) access=0x([0-9a-f]+) status=0x([0-9a-f]+) handle=0x([0-9a-f]+)$")
     rx_write = re.compile(r"write path=(.*) handle=0x([0-9a-f]+) len=(\d+) offset=(-?\d+)$")
 
@@ -2473,7 +2537,7 @@ def check_newapp_flag(threads=4, calls=200):
     return_from(1). The target's own counters must show beta's gated path ran on EVERY call and
     alpha's never; the logs must name the right object (`this` == the target's pointer)."""
     if not exe("flagflip.exe") or not exe("flagflip_target.exe") or not exe("flagfeature.dll"):
-        return skip("newapp-flag", "flagflip.exe / flagflip_target.exe / flagfeature.dll missing")
+        return missing_bin("newapp-flag", "flagflip.exe / flagflip_target.exe / flagfeature.dll")
     rx = re.compile(r"IsEnabled this=0x([0-9a-f]+) name=(\S+) original=(\S+) returned=(\d+)$")
     location = "flagfeature.dll!Feature::IsEnabled"
     total = threads * calls
@@ -2523,7 +2587,7 @@ def check_newapp_reg(threads=4, iters=20):
     and call_original on hw needs one free), so hw runs the open group or the value group."""
     from collections import Counter
     if not exe("regtrace.exe") or not exe("regtrace_target.exe"):
-        return skip("newapp-reg", "regtrace.exe / regtrace_target.exe missing")
+        return missing_bin("newapp-reg", "regtrace.exe / regtrace_target.exe")
     rx_open = re.compile(r"(open|create) key=(.*) status=0x([0-9a-f]+) handle=0x([0-9a-f]+)$")
     rx_val = re.compile(r"(query|set) key=(.*) handle=0x([0-9a-f]+) value=(\S*) (class|type)=(\d+)$")
 
@@ -2605,7 +2669,7 @@ def check_agent_crt():
     and an older app-local msvcp140 crashes SafetyHook's std::mutex (_Mtx_* null read)."""
     path = BIN / "probe_api_agent.dll"
     if not path.exists():
-        return skip("agent-crt", "probe_api_agent.dll missing")
+        return missing_bin("agent-crt", "probe_api_agent.dll")
     d = path.read_bytes().lower()
     bad = [n for n in (b"msvcp140", b"vcruntime140", b"api-ms-win-crt-") if n in d]
     record("agent-crt", not bad, "imports " + ",".join(n.decode() for n in bad) if bad else "static CRT")
@@ -2626,7 +2690,7 @@ def check_cet(threads=8, reads=500):
     rows prove only that /CETCOMPAT targets work, not the CET behaviour."""
     pr_exe, tgt, gc, t = exe("cet_probe.exe"), exe("probe_app_cet.exe"), exe("gated_config.exe"), exe("uhh_trace.exe")
     if not pr_exe or not tgt or not gc or not t:
-        return skip("cet", "cet_probe/probe_app_cet/gated_config/uhh_trace missing")
+        return missing_bin("cet", "cet_probe/probe_app_cet/gated_config/uhh_trace")
     try:
         flags = {n: pe_cetcompat(BIN / n) for n in ("probe_app_cet.exe", "cet_probe.exe", "probe_app.exe")}
         record("cet-image", flags["probe_app_cet.exe"] and flags["cet_probe.exe"] and not flags["probe_app.exe"],
@@ -2693,7 +2757,7 @@ def check_ret_probe(threads=2, reads=50):
     with --fallback-hw, move to hw. The target must be unaffected either way."""
     t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
     if not t or not a:
-        return skip("ret-probe", "uhh_trace/probe_app missing")
+        return missing_bin("ret-probe", "uhh_trace/probe_app")
     site, stub = ntopen_ret_site(t)
     if site is None:
         return record("ret-probe", False, f"no ret found in NtOpenProcess stub: {stub.hex()}")
@@ -2725,7 +2789,7 @@ def check_handle_map(threads=4, reads=500, decoys=5000):
     with its helper's pid (unmapped == 0) -- open and read probe on the same backend, and
     across backends through UHH_SHARED."""
     if not exe("gated_config.exe"):
-        return skip("handle-map", "gated_config.exe missing")
+        return missing_bin("handle-map", "gated_config.exe")
     want = threads * reads
     for open_bk, read_bk in (("breakpoint", "breakpoint"), ("hw", "hw"), ("inline", "inline"),
                              ("breakpoint", "inline")):
@@ -2751,7 +2815,7 @@ def check_shared_mix(threads=8, reads=1000):
     map (a shared section of the callbacks DLL). Every read must be logged with the right
     helper pid (unmapped == 0), hits == logs == reads, nothing dropped."""
     if not exe("gated_config.exe"):
-        return skip("shared-mix", "gated_config.exe missing")
+        return missing_bin("shared-mix", "gated_config.exe")
     want = threads * reads
     for open_bk, read_bk in (("breakpoint", "inline"), ("inline", "breakpoint"), ("hw", "inline"), ("inline", "hw")):
         name = f"shared-mix open={open_bk} read={read_bk}"
@@ -2774,7 +2838,7 @@ def check_forwarded_probe():
     the forward target, on every backend; the target is unaffected."""
     t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
     if not t or not a:
-        return skip("forwarded-probe", "uhh_trace/probe_app missing")
+        return missing_bin("forwarded-probe", "uhh_trace/probe_app")
     for bk in ("breakpoint", "hw", "inline"):
         name = f"forwarded-probe-{bk}"
         try:
@@ -2797,7 +2861,7 @@ def check_gated_mem(threads=8, reads=1000):
     one flip; the feature then runs and every read is logged with its pid."""
     d = exe("gated_config_mem.exe")
     if not d:
-        return skip("gated-mem", "gated_config_mem.exe missing")
+        return missing_bin("gated-mem", "gated_config_mem.exe")
     want = threads * reads
     for flag_bk, read_bk in (("breakpoint", "inline"), ("hw", "inline"), ("inline", "inline"), ("inline", "breakpoint")):
         name = f"gated-mem flag={flag_bk} read={read_bk}"
@@ -2827,7 +2891,7 @@ def check_crash_logs(n=5000, threads=4):
     counted as dropped. Single-thread run too: exactly n."""
     d, t = exe("hitcost_driver.exe"), exe("hitcost_target.exe")
     if not d or not t:
-        return skip("crash-logs", "hitcost driver/target missing")
+        return missing_bin("crash-logs", "hitcost driver/target")
     for bk in ("inline", "hw", "breakpoint"):
         for nt in (1, threads):
             name = f"crash-logs-{bk}" + ("" if nt == 1 else f"-{nt}t")
@@ -2856,7 +2920,7 @@ def check_attach_new(threads=2, reads=500):
     stays: attach_new polls, so without it some reads could run before the attach lands."""
     t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
     if not t or not a:
-        return skip("attach-new", "uhh_trace/probe_app missing")
+        return missing_bin("attach-new", "uhh_trace/probe_app")
     for bk in ("breakpoint", "hw", "inline"):
         name = f"attach-new-{bk}"
         decoy = target = tracer = None
@@ -2911,7 +2975,7 @@ def check_refusals(calls=2000):
     call exactly."""
     d, t = exe("refusal_driver.exe"), exe("hitcost_target.exe")
     if not d or not t:
-        return skip("refusals", "refusal_driver/hitcost_target missing")
+        return missing_bin("refusals", "refusal_driver/hitcost_target")
     try:
         _, o = run([d, "--", t, "--calls", calls, "--threads", 1], timeout=300)
         r = next((x for x in o if x.get("kind") == "refusals"), {})
@@ -2960,7 +3024,7 @@ def check_hotpatch_prologue():
     curl.exe, args logged correctly, curl unaffected. (x86 builds only.)"""
     t = exe("uhh_trace.exe")
     if not t:
-        return skip("hotpatch", "uhh_trace missing")
+        return missing_bin("hotpatch", "uhh_trace")
     import struct
     data = Path(t).read_bytes()
     machine = struct.unpack_from("<H", data, struct.unpack_from("<I", data, 0x3C)[0] + 4)[0]
@@ -2969,7 +3033,7 @@ def check_hotpatch_prologue():
     kb = Path(r"C:\Windows\SysWOW64\KernelBase.dll")
     curl = Path(r"C:\Windows\SysWOW64\curl.exe")
     if not kb.exists() or not curl.exists():
-        return skip("hotpatch-prologue", "SysWOW64 KernelBase/curl missing")
+        return skip_external("hotpatch-prologue", "system SysWOW64 KernelBase.dll/curl.exe")
     try:
         head = pe_export_bytes(kb, "CreateFileW") or b""
         r, o = run([t, "--backend", "inline", "-p", "KernelBase.dll!CreateFileW:Wxx", "--",
@@ -2993,7 +3057,7 @@ def check_prehook_attach():
     PROBE_FALLBACK_HW (uhh_trace --fallback-hw), move to the hardware backend."""
     t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
     if not t or not a:
-        return skip("prehook-attach", "uhh_trace/probe_app missing")
+        return missing_bin("prehook-attach", "uhh_trace/probe_app")
     import time
     target = None
     try:
@@ -3028,7 +3092,7 @@ def check_realworld():
     asserts the logged ARGUMENTS match what the program demonstrably did."""
     t = exe("uhh_trace.exe")
     if not t:
-        return skip("realworld", "uhh_trace.exe missing")
+        return missing_bin("realworld", "uhh_trace.exe")
     cases = [
         # (name, probes, argv, regex that must appear in some probe_log message)
         ("curl-file-open", ["KernelBase.dll!CreateFileW:Wxx"],
@@ -3041,7 +3105,7 @@ def check_realworld():
     import re
     for name, specs, argv, pattern in cases:
         if not Path(argv[0]).exists():
-            skip(f"realworld-{name}", f"{argv[0]} missing"); continue
+            skip_external(f"realworld-{name}", f"system program {argv[0]}"); continue
         for bk in ("breakpoint", "hw", "inline"):
             label = f"realworld-{name}-{bk}"
             try:
@@ -3117,7 +3181,7 @@ def check_detours_simple(threads=4, rounds=25):
     with the requested milliseconds; the target's own results equal an uninstrumented run."""
     d, tg_exe = exe("detours_simple.exe"), exe("detours_target.exe")
     if not d or not tg_exe:
-        return skip("detours-simple", "detours_simple/detours_target missing")
+        return missing_bin("detours-simple", "detours_simple/detours_target")
     targs = ["sleep", "--threads", threads, "--rounds", rounds]
     try:
         _, bo, _ = dt_run([tg_exe, *targs], timeout=120)
@@ -3213,7 +3277,7 @@ def check_detours_traceapi(threads=4, iters=5):
     cmd spawning cmd): their output and exit code equal an uninstrumented run."""
     d, tg_exe = exe("detours_traceapi.exe"), exe("detours_target.exe")
     if not d or not tg_exe:
-        return skip("detours-traceapi", "detours_traceapi/detours_target missing")
+        return missing_bin("detours-traceapi", "detours_traceapi/detours_target")
     wd = dt_dir()
     targs = ["api", "--threads", threads, "--iters", iters, "--dir", wd]
     try:
@@ -3330,7 +3394,7 @@ def check_detours_withdll(threads=2, iters=3):
     must finish with every self-check passing."""
     d, tg_exe = exe("detours_traceapi.exe"), exe("detours_target.exe")
     if not d or not tg_exe:
-        return skip("detours-withdll", "detours_traceapi/detours_target missing")
+        return missing_bin("detours-withdll", "detours_traceapi/detours_target")
     wd = dt_dir()
     targs = ["api", "--threads", threads, "--iters", iters, "--dir", wd]
     for bk in (*DT_BACKENDS, "mix"):
@@ -3420,7 +3484,7 @@ def check_detours_retval(threads=4, iters=3):
     CreateFileW equals what the target itself saw, on every backend, from 4 threads."""
     d, tg_exe = exe("detours_retval.exe"), exe("detours_target.exe")
     if not d or not tg_exe:
-        return skip("detours-retval", "detours_retval/detours_target missing")
+        return missing_bin("detours-retval", "detours_retval/detours_target")
     from collections import Counter
     wd = dt_dir()
     for bk, extra in (("breakpoint", []), ("hw", []), ("inline", []), ("inline", ["--fallback-hw"])):
@@ -3507,7 +3571,7 @@ def check_detours_stdin():
     findings.)"""
     d = exe("detours_traceapi.exe")
     if not d:
-        return skip("detours-launch-stdin", "detours_traceapi missing")
+        return missing_bin("detours-launch-stdin", "detours_traceapi")
     sort_exe, feed = str(SYS32 / "sort.exe"), "banana\napple\ncherry\n"
     try:
         br = subprocess.run([sort_exe], capture_output=True, text=True, timeout=60, input=feed)
@@ -3611,7 +3675,7 @@ def check_famous_heap(threads=4, iters=600):
     target's output must equal the uninstrumented run."""
     d, t = exe("famous_driver.exe"), exe("famous_heap_target.exe")
     if not d or not t:
-        return skip("famous-heap", "famous_driver/famous_heap_target missing")
+        return missing_bin("famous-heap", "famous_driver/famous_heap_target")
     argv = [t, "--threads", threads, "--iters", iters]
     try:
         _, base_objs = run(argv, timeout=120)
@@ -3692,7 +3756,7 @@ def check_famous_files(threads=3, chunks=20):
     import shutil
     d, t = exe("famous_driver.exe"), exe("famous_file_target.exe")
     if not d or not t:
-        return skip("famous-files", "famous_driver/famous_file_target missing")
+        return missing_bin("famous-files", "famous_driver/famous_file_target")
     root = Path(os.environ.get("TEMP", ".")) / "uhh_famous"
     root.mkdir(exist_ok=True)
 
@@ -3812,7 +3876,7 @@ def check_famous_tls():
     the logs, and curl must print the same body as uninstrumented."""
     d = exe("famous_driver.exe")
     if not d:
-        return skip("famous-tls", "famous_driver missing")
+        return missing_bin("famous-tls", "famous_driver")
     curl = (Path(r"C:\Windows\SysWOW64") if famous_x86() else SYS32) / "curl.exe"
     if not curl.exists():
         return record("famous-tls", False, f"{curl} not present (offline TLS client needed)")
@@ -3858,7 +3922,7 @@ def check_famous_loader(threads=4):
     the uninstrumented run (the generated code still runs)."""
     d, t = exe("famous_driver.exe"), exe("famous_loader_target.exe")
     if not d or not t:
-        return skip("famous-loader", "famous_driver/famous_loader_target missing")
+        return missing_bin("famous-loader", "famous_driver/famous_loader_target")
     argv = [t, "--threads", threads]
     try:
         _, bo = run(argv, timeout=120)
@@ -3897,7 +3961,7 @@ def check_famous_retval(threads=4, calls=25):
     (the control) is untouched."""
     d, t = exe("famous_driver.exe"), exe("famous_tick_target.exe")
     if not d or not t:
-        return skip("famous-retval", "famous_driver/famous_tick_target missing")
+        return missing_bin("famous-retval", "famous_driver/famous_tick_target")
     argv = [t, "--threads", threads, "--calls", calls]
     total = threads * calls + calls + 2
     try:
@@ -4016,7 +4080,7 @@ def check_hunt():
     (reads, verify failures, foreign debug exceptions, checksum) equals an uninstrumented run."""
     d, t = exe("hunt_driver.exe"), exe("hunt_target.exe")
     if not d or not t or not exe("hunt_dll.dll"):
-        return skip("hunt", "hunt_driver / hunt_target / hunt_dll missing")
+        return missing_bin("hunt", "hunt_driver / hunt_target / hunt_dll")
     _, o = run([t, "threads", "--n", 10], timeout=120)
     checksum = next((x for x in o if x.get("kind") == "target"), {}).get("checksum")
     for bk in ("inline", "hw", "breakpoint"):
@@ -4338,7 +4402,7 @@ def check_stdout_forward():
     holding the pipe does not keep the controller waiting."""
     tr, t = exe("uhh_trace.exe"), exe("stdout_target.exe")
     if not tr or not t:
-        return skip("stdout", "uhh_trace/stdout_target missing")
+        return missing_bin("stdout", "uhh_trace/stdout_target")
     probes_args = [a for p in STDOUT_PROBES for a in ("-p", p)]
     try:
         brc, bout, berr, bseen, _ = stdout_capture([t, "run", "--prompt"], answer=b"go\n", prompt=b"prompt> ")
@@ -4408,7 +4472,7 @@ def check_blog_replicas():
     UHH_BLOG_SCENARIOS=crypto,net limits the scenarios (default: all)."""
     d, t = exe("blog_driver.exe"), exe("blog_target.exe")
     if not d or not t:
-        return skip("blog", "blog_driver/blog_target missing")
+        return missing_bin("blog", "blog_driver/blog_target")
     import os as _os
     want_scn = [x for x in _os.environ.get("UHH_BLOG_SCENARIOS", "").split(",") if x] or list(BLOG_RUNS)
     want_bk = [x for x in _os.environ.get("UHH_BLOG_BACKENDS", "").split(",") if x] or ["breakpoint", "hw", "inline"]
@@ -4469,7 +4533,7 @@ def check_soak(minutes):
     controller's or target's private bytes / handles / threads (or of agent copies loaded in
     the attached target) beyond steady state."""
     if not exe("gated_config.exe") or not exe("uhh_trace.exe") or not exe("probe_app.exe"):
-        return skip("soak", "gated_config/uhh_trace/probe_app missing")
+        return missing_bin("soak", "gated_config/uhh_trace/probe_app")
     sys.path.insert(0, str(Path(__file__).parent))
     import soak
     out = Path(tempfile.gettempdir()) / "uhh" / "soak-regress"
@@ -4502,7 +4566,7 @@ def check_blog_pwsh_attach():
     detach mid-run. PowerShell must finish with the same output and exit code."""
     t = exe("uhh_trace.exe")
     if not t:
-        return skip("blog-pwsh", "uhh_trace.exe missing")
+        return missing_bin("blog-pwsh", "uhh_trace.exe")
     import os as _os
     import struct
     data = Path(t).read_bytes()
@@ -4510,7 +4574,7 @@ def check_blog_pwsh_attach():
     ps = Path(r"C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe") if x86 else \
         SYS32 / "WindowsPowerShell" / "v1.0" / "powershell.exe"
     if not ps.exists():
-        return skip("blog-pwsh", f"{ps} missing")
+        return skip_external("blog-pwsh", f"system program {ps}")
     iters = 400
     # Warm-up first: the first Start-Sleep autoloads Microsoft.PowerShell.Utility (1-2 s on
     # the VM), which would otherwise fill the whole attach window with no script activity.
@@ -4589,7 +4653,7 @@ def check_entry_hold_threads(trials=3):
     are in). Every call must be seen: hits == the target's own counts, on every backend.
     Inline repeats (the miss was a race: such threads ran unheld while the hooks went in)."""
     if not exe("p2edge_driver.exe") or not exe("p2edge_target.exe"):
-        return skip("entry-hold-threads", "p2edge_driver/p2edge_target missing")
+        return missing_bin("entry-hold-threads", "p2edge_driver/p2edge_target")
     for bk in ("breakpoint", "hw", "inline"):
         name = f"entry-hold-threads-{bk}"
         try:
@@ -4618,7 +4682,7 @@ def check_late_dll_worker():
     the linker folds with other empty exported callbacks of the agent DLL: the forwarded name
     is an alias, which the controller must still map to its own copy.)"""
     if not exe("p2edge_driver.exe") or not exe("p2edge_target.exe"):
-        return skip("late-dll-worker", "p2edge_driver/p2edge_target missing")
+        return missing_bin("late-dll-worker", "p2edge_driver/p2edge_target")
     for bk in ("breakpoint", "hw", "inline"):
         name = f"late-dll-worker-{bk}"
         try:
@@ -4724,7 +4788,7 @@ def check_hw_once_slots(threads=4, calls=1000):
     retired, the marker reuses their two slots (an exec probe and a write watch, both exact)
     and a further add is refused again."""
     if not exe("p2edge_driver.exe") or not exe("p2edge_target.exe"):
-        return skip("hw-once-slots", "p2edge_driver/p2edge_target missing")
+        return missing_bin("hw-once-slots", "p2edge_driver/p2edge_target")
     total = threads * calls
     for marker in ("breakpoint", "inline"):
         name = f"hw-once-slots-{marker}"
@@ -4754,7 +4818,7 @@ def check_prehook_chain(threads=4, reads=500):
     its prehook_calls == UHH hits == logs == reads, checksum == a run without UHH."""
     t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
     if not t or not a:
-        return skip("prehook-chain", "uhh_trace/probe_app missing")
+        return missing_bin("prehook-chain", "uhh_trace/probe_app")
     target = None
     total = threads * reads
     common = ["--prehook", "--helpers", "1", "--threads", str(threads), "--reads", str(reads),
@@ -4821,7 +4885,7 @@ def check_stacks():
     stripped) must be IDENTICAL across breakpoint, hw and inline -- frame 0 included."""
     d, t = exe("stacks_driver.exe"), exe("stacks_target.exe")
     if not d or not t:
-        return skip("stacks", "stacks_driver/stacks_target missing")
+        return missing_bin("stacks", "stacks_driver/stacks_target")
     try:
         r = rvas("stacks_target.map", *STACK_SITES.values())
     except Exception as e:
@@ -4904,7 +4968,10 @@ def bigapps_judge(objs, out_text, err_text, bk, specs, required, exact):
     logged = [sp.rsplit(":", 1)[0] for sp in specs if not sp.endswith(":-")]
     want_logs = sum(hits.get(l, 0) for l in logged)
     written = rep.get("logs_written")
-    logs_out = out_text.count('"kind":"probe_log"')
+    # Delivered records: every probe_log line must parse (run() keeps the JSON lines) and their
+    # number must EQUAL logs_written -- fewer is a lost log, more a duplicated one.
+    logs_out = sum(1 for o in objs if o.get("kind") == "probe_log")
+    logs_raw = out_text.count('"kind":"probe_log"')
     unhandled = [l for l in err_text.splitlines() if "target crashed" in l or "unhandled exception" in l][:2]
     bad = []
     if not rep: bad.append("no probe_report")
@@ -4915,10 +4982,21 @@ def bigapps_judge(objs, out_text, err_text, bk, specs, required, exact):
     if missing: bad.append(f"no hits on {missing}")
     if not written: bad.append("no logs")
     if exact and written != want_logs: bad.append(f"logs_written={written} != logged hits={want_logs}")
-    if logs_out < (written or 0): bad.append(f"stdout probe_log lines={logs_out} < logs_written={written}")
+    if logs_raw != logs_out: bad.append(f"malformed/unparsable probe_log lines={logs_raw - logs_out}")
+    # A detach mid-run: the report is a live snapshot taken BEFORE probe_close; the session's
+    # final count is probe_close's "probe: detached: ... logs_written=N" (stderr), and every
+    # record up to it must be on stdout -- exactly.
+    fin = re.findall(r"probe: detached: hits=\d+ logs_written=(\d+) log_dropped=(\d+)", err_text)
+    final_written = int(fin[-1][0]) if fin else written
+    if fin and int(fin[-1][1]) != 0: bad.append(f"final log_dropped={fin[-1][1]}")
+    if '"kind":"detached"' in out_text and not fin: bad.append("detached but no final 'probe: detached:' accounting")
+    if final_written is None or logs_out != final_written:
+        bad.append(f"stdout probe_log records={logs_out} != logs_written={final_written}"
+                   + (" (final, after the detach)" if fin else ""))
     if unhandled: bad.append(f"unhandled={unhandled}")
     short = {k.split("!")[-1]: v for k, v in hits.items()}
-    detail = f"hits={short} logs={written} dropped={rep.get('log_dropped')}"
+    detail = (f"hits={short} logs={written}" + (f" final_logs={final_written}" if fin else "")
+              + f" delivered={logs_out} dropped={rep.get('log_dropped')}")
     return not bad, detail, bad
 
 
@@ -5131,7 +5209,7 @@ def check_bigapps(secs=40, select="all"):
     exception, every probe hit, log_dropped == 0, logs == hits (when run to exit), and after a
     detach the program keeps working (ticks continue, result right, exit 0)."""
     if not exe("uhh_trace.exe"):
-        return skip("bigapps", "uhh_trace.exe missing")
+        return missing_bin("bigapps", "uhh_trace.exe")
     arch = bin_machine()
     ps = Path(r"C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe") if arch == "x86" else \
         SYS32 / "WindowsPowerShell" / "v1.0" / "powershell.exe"
@@ -5238,22 +5316,41 @@ def _snapshot_processes():
                     ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
                     ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
     k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-    snap = k32.CreateToolhelp32Snapshot(2, 0)
-    out, e = {}, PE32()
-    e.dwSize = ctypes.sizeof(PE32)
-    ok = k32.Process32FirstW(snap, ctypes.byref(e))
-    while ok:
-        out[e.th32ProcessID] = e.szExeFile
-        ok = k32.Process32NextW(snap, ctypes.byref(e))
-    k32.CloseHandle(snap)
+    for fn in (k32.Process32FirstW, k32.Process32NextW):
+        fn.argtypes = [wintypes.HANDLE, ctypes.POINTER(PE32)]
+        fn.restype = wintypes.BOOL
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.CloseHandle.restype = wintypes.BOOL
+    INVALID_HANDLE_VALUE, ERROR_NO_MORE_FILES = ctypes.c_void_p(-1).value, 18
+    snap = k32.CreateToolhelp32Snapshot(2, 0)                  # TH32CS_SNAPPROCESS
+    if not snap or snap == INVALID_HANDLE_VALUE:
+        raise RuntimeError(f"Toolhelp oracle: CreateToolhelp32Snapshot failed (error {ctypes.get_last_error()})")
+    try:
+        out, e = {}, PE32()
+        e.dwSize = ctypes.sizeof(PE32)
+        ok = k32.Process32FirstW(snap, ctypes.byref(e))
+        if not ok:
+            raise RuntimeError(f"Toolhelp oracle: Process32FirstW failed (error {ctypes.get_last_error()})")
+        while ok:
+            out[e.th32ProcessID] = e.szExeFile
+            ok = k32.Process32NextW(snap, ctypes.byref(e))
+        err = ctypes.get_last_error()
+        if err != ERROR_NO_MORE_FILES:
+            raise RuntimeError(f"Toolhelp oracle: Process32NextW stopped with error {err}, not ERROR_NO_MORE_FILES")
+    finally:
+        k32.CloseHandle(snap)
+    if not out:
+        raise RuntimeError("Toolhelp oracle: empty process list")
     return out
 
 
 class _ProcPoller:
-    """Every (pid, name) that existed while a run was going on, polled every 20 ms."""
+    """Every (pid, name) that existed while a run was going on, polled every 20 ms. A snapshot
+    failure in the polling thread is re-raised by finish(): the oracle is never silently thin."""
     def __init__(self):
-        self.seen, self.stop = {}, threading.Event()
+        self.seen, self.stop, self.error = {}, threading.Event(), None
         self._add(_snapshot_processes())
         self.t = threading.Thread(target=self._loop, daemon=True)
         self.t.start()
@@ -5265,11 +5362,19 @@ class _ProcPoller:
             self.seen.setdefault(pid, set()).add(name.lower())
 
     def _loop(self):
-        while not self.stop.wait(0.02):
-            self._add(_snapshot_processes())
+        try:
+            while not self.stop.wait(0.02):
+                self._add(_snapshot_processes())
+        except Exception as e:                     # reported by finish()
+            self.error = e
 
     def finish(self):
-        self.stop.set(); self.t.join(timeout=10); self._add(_snapshot_processes())
+        self.stop.set(); self.t.join(timeout=10)
+        if self.t.is_alive():
+            raise RuntimeError("Toolhelp oracle: poller did not stop")
+        if self.error is not None:
+            raise RuntimeError(f"Toolhelp oracle failed while polling: {self.error!r}")
+        self._add(_snapshot_processes())
         return self.seen
 
 
@@ -5378,7 +5483,7 @@ def check_realapps():
     UHH_REALAPPS_ONLY / UHH_REALAPPS_BACKENDS (comma lists) narrow it."""
     drv = exe("realapps_driver.exe")
     if not drv:
-        return skip("realapps", "realapps_driver.exe missing")
+        return missing_bin("realapps", "realapps_driver.exe")
     data = Path(drv).read_bytes()
     x86 = struct.unpack_from("<H", data, struct.unpack_from("<I", data, 0x3C)[0] + 4)[0] == 0x14C
     sysdir = Path(r"C:\Windows\SysWOW64") if x86 else SYS32
@@ -5395,7 +5500,7 @@ def check_realapps():
             if explicit:
                 record(f"realapps-{scen}", False, f"{argv[0]} missing on this system (explicitly selected)")
             else:
-                skip(f"realapps-{scen}", f"{argv[0]} not on this system")
+                skip_external(f"realapps-{scen}", f"system program {argv[0]} (not on this system)")
             continue
         base = None
         bks = env_bks or ["breakpoint", "hw", "inline"]
@@ -5553,11 +5658,12 @@ def check_inplace_shapes():
     not, call rel32 / call [mem], ret, loop/loopz/loopnz/jrcxz incl. address-size forms, pushf
     with a normal stack and into the stack guard page, a segment-relative indirect jmp, x64
     syscall). 8 threads x 1000 calls each (examples/ctrlreview ctrl_target `shape`): hits ==
-    logs == distinct tags == calls, every result equal to the never-probed twin's, no trap flag
-    in a pushed flags image, and the guard-page push grew the stack as without UHH."""
+    logs == calls and the logged tags are EXACTLY the (thread << 20) | i tags of the calls
+    (each once), every result equal to the never-probed twin's, no trap flag in a pushed
+    flags image, and the guard-page push grew the stack as without UHH."""
     d, t = exe("ctrl_driver.exe"), exe("ctrl_target.exe")
     if not d or not t:
-        return skip("inplace", "ctrl_driver/ctrl_target missing")
+        return missing_bin("inplace", "ctrl_driver/ctrl_target")
     x86 = pe_is_x86(t)
     T, n = 8, 1000
     for sh in INPLACE_SHAPES:
@@ -5579,18 +5685,38 @@ def check_inplace_shapes():
             hits = sum(x.get("hits", 0) for x in rows)
             tags = collections.Counter(str(x.get("message", "")) for x in logs)
             calls = T * n
+            # Oracle computed here: thread t (1..T) calls the shape with tag (t << 20) | i for
+            # i < n, and the callback logs "tag=<hex>" of EDX -- every call exactly once.
+            want = collections.Counter(f"tag={(t_ << 20) | i:x}" for t_ in range(1, T + 1) for i in range(n))
+            dups, missed = sum((tags - want).values()), sum((want - tags).values())
             if res.get("calls") != calls: bad.append(f"target={res}")
             if hits != calls: bad.append(f"hits={hits}")
             if len(logs) != calls: bad.append(f"logs={len(logs)}")
-            if len(tags) != calls: bad.append(f"distinct={len(tags)}")
+            if dups: bad.append(f"duplicate_or_foreign_tags={dups} e.g. {sorted((tags - want).elements())[:2]}")
+            if missed: bad.append(f"missed_tags={missed} e.g. {sorted((want - tags).elements())[:2]}")
             if res.get("bad"): bad.append(f"result_differs={res.get('bad')} (first probed={res.get('first_p')} "
                                           f"reference={res.get('first_r')})")
             if res.get("tf"): bad.append(f"tf_in_pushed_flags={res.get('tf')}")
             if res.get("grow_bad"): bad.append(f"stack_not_grown={res.get('grow_bad')}")
             record(name, not bad, (" ".join(bad) + " " if bad else "") +
-                   f"calls={calls} hits={hits} logs={len(logs)} distinct={len(tags)}")
+                   f"calls={calls} hits={hits} logs={len(logs)} exact_tags={len(set(tags) & set(want))}/{calls}")
         except Exception as e:
             record(name, False, repr(e))
+
+
+def own_watch_slots_bad(w, n, bk):
+    """The target's own watch, armed in turn in every debug register FREE on its thread
+    (ctrl_target owndr phase B / owndrx: -1 = slot not free, -2 = SetThreadContext failed,
+    else the traps seen). The expected free set is computed HERE, not from what the fixture
+    found: 4 debug registers minus the one UHH's hw-backend probe holds (hw only). Every other
+    UHH register -- the one-shot probe / watch it released -- must be free again, so exactly
+    that many slots must trap n times and the rest be -1. A released slot left enabled shrinks
+    the free set and fails."""
+    want_free = 4 - (1 if bk == "hw" else 0)
+    got_free = sum(1 for v in w if v == n)
+    if len(w) != 4 or got_free != want_free or any(v not in (-1, n) for v in w):
+        return f"own_watch_per_slot={w} (want {want_free} free slot(s) with {n} traps each, the rest -1)"
+    return ""
 
 
 def check_ctrl_review():
@@ -5613,7 +5739,7 @@ def check_ctrl_review():
         controller at exit."""
     d, t, dll = exe("ctrl_driver.exe"), exe("ctrl_target.exe"), exe("ctrl_dll.dll")
     if not d or not t or not dll:
-        return skip("ctrl-review", "ctrl_driver/ctrl_target/ctrl_dll missing")
+        return missing_bin("ctrl-review", "ctrl_driver/ctrl_target/ctrl_dll")
 
     def go(sc, bk, targs, timeout=180):
         r, o = run([d, "--scenario", sc, "--backend", bk, "--", t, sc, *targs], timeout=timeout)
@@ -5735,7 +5861,8 @@ def check_ctrl_review():
             if res.get("w1_slot", -1) < 0: bad.append(f"w1_slot={res.get('w1_slot')}")
             if res.get("w1") != N: bad.append(f"own_watch_w1={res.get('w1')} (slot {res.get('w1_slot')})")
             w2 = res.get("w2") or []
-            if not any(v == N for v in w2) or any(v not in (-1, N) for v in w2): bad.append(f"own_watch_w2={w2}")
+            slots_bad = own_watch_slots_bad(w2, N, bk)
+            if slots_bad: bad.append("w2 " + slots_bad)
             fails = [str(x.get("message")) for x in logs if "FAIL" in str(x.get("message", ""))]
             if fails: bad.append(f"callback_fail={fails[:2]}")
             tock = [x for x in rows if str(x.get("location", "")).startswith("0x")]
@@ -5776,7 +5903,7 @@ def check_cdx_review():
         backend (inline refused it)."""
     d, t, dll = exe("ctrl_driver.exe"), exe("ctrl_target.exe"), exe("ctrl_dll.dll")
     if not d or not t or not dll:
-        return skip("cdx-review", "ctrl_driver/ctrl_target/ctrl_dll missing")
+        return missing_bin("cdx-review", "ctrl_driver/ctrl_target/ctrl_dll")
 
     def go(sc, bk, targs, timeout=180):
         r, o = run([d, "--scenario", sc, "--backend", bk, "--", t, sc, *targs], timeout=timeout)
@@ -5800,8 +5927,8 @@ def check_cdx_review():
             N = 50
             res, logs, rows, bad = go("owndrx", bk, ["--n", N])
             w = res.get("w") or []
-            if len(w) != 4 or not any(v == N for v in w) or any(v not in (-1, N) for v in w):
-                bad.append(f"own_watch_per_slot={w} (want {N} on every free slot)")
+            slots_bad = own_watch_slots_bad(w, N, bk)
+            if slots_bad: bad.append(slots_bad)
             if not any(m.startswith("ok wonce=1") for m in logs): bad.append(f"no one-shot watch: {logs[:2]}")
             record(name, not bad, " ".join(bad) or f"own watch per slot={w}")
         except Exception as e:
@@ -5816,6 +5943,9 @@ def check_cdx_review():
             if hits != N: bad.append(f"hits={hits}")
             if len(logs) != N: bad.append(f"logs={len(logs)}")
             if res.get("fix") != N: bad.append(f"veh_fixes={res.get('fix')} (want {N})")
+            # The program's own result: every repaired load reads g_good (42), n loads.
+            if res.get("sum") != N * 42 or res.get("n") != N:
+                bad.append(f"target sum={res.get('sum')} n={res.get('n')} (want {N * 42}, {N})")
             if res.get("tf") != 0: bad.append(f"tf_in_handler={res.get('tf')}")   # never UHH's trap flag
             if res.get("stray") != 0: bad.append(f"stray_single_steps={res.get('stray')}")
             record(name, not bad, " ".join(bad) or f"hits={hits} logs={len(logs)} fixes={res.get('fix')}")
@@ -5907,7 +6037,7 @@ def check_logs_format():
     characters and invalid UTF-8 escaped (nothing silently removed), valid UTF-8 untouched,
     every line strict UTF-8 JSON, a stack snapshot on a truncated send_log_stack."""
     if not exe("logs_driver.exe") or not exe("logs_target.exe"):
-        return skip("logs-format", "logs_driver/logs_target missing")
+        return missing_bin("logs-format", "logs_driver/logs_target")
     want = logs_expected_formats()
     seen = {}
     for bk in ("inline", "hw", "breakpoint"):
@@ -5941,29 +6071,46 @@ def check_logs_order(threads=4, count=2000):
     """Per-thread order across MIXED backends: each thread alternates an inline-probed call
     and a breakpoint/hw-probed call (seq 0,1,2,...; the second logs with a stack). Inline
     logs cross the shared ring, breakpoint/hw logs are queued by the debugger -- every
-    thread's records must still arrive in its own order, all of them, nothing dropped."""
+    thread's records must still arrive in its own order, all of them, nothing dropped: each
+    thread's sequence is EXACTLY 0, 1, ..., 2*count-1, no other record, and the report accounts
+    for every call (hits == logs_written == delivered, nothing dropped or interrupted)."""
     if not exe("logs_driver.exe") or not exe("logs_target.exe"):
-        return skip("logs-order", "logs_driver/logs_target missing")
+        return missing_bin("logs-order", "logs_driver/logs_target")
+    want_seq = list(range(2 * count))
     for a, b in (("inline", "breakpoint"), ("inline", "hw")):
         name = f"logs-order-{a}+{b}"
         try:
             r, o, bad = logs_run(a, b, ["--mode", "order", "--threads", threads, "--count", count], timeout=600)
-            by, nostack = {}, 0
+            by, nostack, foreign, delivered = {}, 0, [], 0
             for x in o:
                 if x.get("kind") != "probe_log":
                     continue
+                delivered += 1
                 m = re.fullmatch(r"o (\d+)", str(x.get("message", "")))
-                if m:
-                    v = int(m.group(1))
-                    by.setdefault(x.get("tid"), []).append(v)
-                    nostack += bool(v % 2) and not x.get("stack")
-            inversions = sum(sum(1 for p, q in zip(s, s[1:]) if q <= p) for s in by.values())
+                if not m or not isinstance(x.get("tid"), int):
+                    foreign.append(f"{x.get('tid')}:{str(x.get('message', ''))[:60]!r}")
+                    continue
+                v = int(m.group(1))
+                by.setdefault(x.get("tid"), []).append(v)
+                nostack += bool(v % 2) and not x.get("stack")
+            wrong = {tid: seq for tid, seq in by.items() if seq != want_seq}
+            first_wrong = ""
+            for tid, seq in list(wrong.items())[:1]:
+                i = next((j for j, (p, q) in enumerate(zip(seq, want_seq)) if p != q), min(len(seq), len(want_seq)))
+                first_wrong = f" tid {tid}: len={len(seq)} first diff @{i}: got {seq[i:i + 3]} want {want_seq[i:i + 3]}"
             total = sum(map(len, by.values()))
+            calls = 2 * threads * count
             rep = report(o)
-            ok = (r.returncode == 0 and not bad and len(by) == threads and total == 2 * threads * count and
-                  inversions == 0 and nostack == 0 and rep.get("log_dropped") == 0)
-            record(name, ok, f"threads={len(by)}/{threads} logs={total}/{2 * threads * count} "
-                             f"out_of_order={inversions} stack_missing={nostack} dropped={rep.get('log_dropped')}")
+            acct = {k: rep.get(k) for k in ("hits", "logs_written", "log_dropped", "callbacks_interrupted", "app_exit", "error")}
+            acct_ok = (rep.get("hits") == calls and rep.get("logs_written") == calls == delivered and
+                       rep.get("log_dropped") == 0 and rep.get("callbacks_interrupted") == 0 and
+                       rep.get("app_exit") == 0 and rep.get("error") is None)
+            ok = (r.returncode == 0 and not bad and len(by) == threads and total == calls and not wrong and
+                  not foreign and nostack == 0 and acct_ok)
+            record(name, ok, f"threads={len(by)}/{threads} logs={total}/{calls} wrong_seq_threads={len(wrong)} "
+                             f"foreign={len(foreign)} stack_missing={nostack} report={acct}"
+                             + (first_wrong if wrong else "") + (f" foreign_e.g.={foreign[:2]}" if foreign else "")
+                             + (f" bad_json={bad[:1]}" if bad else ""))
         except Exception as e:
             record(name, False, repr(e))
 
@@ -5980,7 +6127,7 @@ def check_logs_wedge(threads=4, count=3000):
     nothing may be dropped, and the killed callback is accounted as interrupted:
     hits == logs + callbacks_interrupted exactly."""
     if not exe("logs_driver.exe") or not exe("logs_target.exe"):
-        return skip("logs-wedge", "logs_driver/logs_target missing")
+        return missing_bin("logs-wedge", "logs_driver/logs_target")
     for mode in ("kill", "suspend", "exit"):
         name = f"logs-wedge-{mode}"
         try:
@@ -6019,7 +6166,7 @@ def check_logs_controller_killed(threads=4, count=20000):
     is allowed). Order: attach -> target maps the ring -> controller killed -> calls."""
     t, tr = exe("logs_target.exe"), exe("uhh_trace.exe")
     if not t or not tr:
-        return skip("logs-controller-killed", "logs_target/uhh_trace missing")
+        return missing_bin("logs-controller-killed", "logs_target/uhh_trace")
     name = "logs-controller-killed"
     tg = trc = None
     cap = 4096                                                # PROBE_AGENT_LOG_CAP (probe_agent_shared.hpp)
@@ -6076,7 +6223,7 @@ def check_logs_stdout_closed(threads=4):
     going away is not a session error (TH2): the report says "live_output_closed":true and
     stderr carries the warning, never a "probe: error:" line."""
     if not exe("logs_driver.exe") or not exe("logs_target.exe"):
-        return skip("logs-stdout-closed", "logs_driver/logs_target missing")
+        return missing_bin("logs-stdout-closed", "logs_driver/logs_target")
     for bk, count in (("inline", 5000), ("hw", 500)):
         name = f"logs-stdout-closed-{bk}"
         rep_path = Path(tempfile.gettempdir()) / f"uhh-logs-report-{os.getpid()}-{bk}.jsonl"
@@ -6166,7 +6313,7 @@ def check_agent_review():
     uninstrumented run; hits and "ar" logs are exact; nothing dropped or interrupted."""
     d, t = exe("ar_driver.exe"), exe("ar_target.exe")
     if not d or not t:
-        return skip("agent-review", "ar_driver/ar_target missing")
+        return missing_bin("agent-review", "ar_driver/ar_target")
 
     def row(objs, kind="ar"):
         r = dict(next((x for x in objs if x.get("kind") == kind), {}))
@@ -6291,7 +6438,7 @@ def check_callfunc_registry():
     hits and logs."""
     d, t = exe("ar_driver.exe"), exe("ar_target.exe")
     if not d or not t:
-        return skip("callfunc-registry", "ar_driver/ar_target missing")
+        return missing_bin("callfunc-registry", "ar_driver/ar_target")
 
     def go(case, specs, timeout=180):
         args = [d]
@@ -6426,6 +6573,7 @@ def lc_clean(c, attached_ok=False):
     """A check line that says the target is exactly as before any tool came."""
     # (late / stuck: the quit report -- worker threads that did not end, threads left suspended)
     return (not c.get("dead") and not c.get("hung") and c.get("code_diff") == 0 and c.get("dr_dirty") == 0 and
+            c.get("dr_unknown") == 0 and
             c.get("errors") == 0 and not c.get("late") and not c.get("stuck") and (attached_ok or c.get("debugger") == 0))
 
 
@@ -6433,6 +6581,7 @@ def lc_brief(c):
     if c.get("dead") is not None or c.get("hung"):
         return f"DEAD/HUNG {c}"
     return (f"code_diff={c.get('code_diff')} {c.get('code_bad') or ''} dr_dirty={c.get('dr_dirty')} {c.get('dr_bad') or ''} "
+            f"dr_unknown={c.get('dr_unknown')} {c.get('dr_unknown_info') or ''} "
             f"dr_stale={c.get('dr_stale')} dbg={c.get('debugger')} errors={c.get('errors')} {c.get('first_error') or ''} flips={c.get('flips')} "
             f"agent={c.get('agent_loaded')}" + (f" late={c.get('late')} stuck={c.get('stuck_info')} agent_thr={c.get('agent_thr')}" if c.get("late") or c.get("stuck") else "")
             + (f" susp={c.get('susp_info')}" if c.get("susp") else "")
@@ -6491,6 +6640,22 @@ class LcDriver:
         m = next((re.search(r"probe: detached: hits=(\d+) logs_written=(\d+) log_dropped=(\d+)", l) for l in self.err.lines
                   if l.startswith("probe: detached:")), None)
         return tuple(int(x) for x in m.groups()) if m else None
+
+    def accounting(self):
+        """The session's final accounting {hits, logs_written, log_dropped, source}: probe_close's
+        'probe: detached:' line (a detach) or the probe_report record (the session ended on its
+        own -- the target exited/died -- or never attached). None if neither was printed."""
+        f = self.final()
+        if f is not None:
+            return {"hits": f[0], "logs_written": f[1], "log_dropped": f[2], "source": "detached"}
+        rep = report([json.loads(l) for l in self.other if l.startswith('{"kind":"probe_report"')])
+        if rep:
+            return {"hits": rep.get("hits"), "logs_written": rep.get("logs_written"), "log_dropped": rep.get("log_dropped"),
+                    "source": "report"}
+        return None
+
+    def attached(self):
+        return any('"kind":"attached"' in l for l in self.other)
 
     def errors(self):
         return [l[:160] for l in self.err.lines if "error" in l.lower() or "warning" in l.lower() or "failed" in l][:4]
@@ -6596,8 +6761,11 @@ def lc_detach_cases(cfgname, cfg):
 def lc_target_dies(cfgname, cfg):
     """The target dies (TerminateProcess) N ms into the attach / agent injection / install, or
     right after a detach was requested: the controller must notice, end its session and exit on
-    its own (no hang, no crash) with every log it wrote delivered and none dropped."""
-    bad, n = [], 0
+    its own (no hang, no crash) with every log it wrote delivered and none dropped. A session
+    that was established ("attached") must report its final accounting, logs_written == the
+    probe_log records delivered on stdout, log_dropped == 0, driver exit 0; an attach that
+    failed before the session existed must exit 1 with a report of zero logs."""
+    bad, n, seen = [], 0, []
     for when in (0, 2, 10, 40, 150, 600, "detach"):
         n += 1
         tg = d = None
@@ -6614,16 +6782,27 @@ def lc_target_dies(cfgname, cfg):
                 d.detach()                                  # the session may still wait for its detach cue
             fin_ok = d.finish(timeout=60)
             rc = d.p.returncode
-            dropped = (d.final() or (0, 0, 0))[2]
-            if not fin_ok or rc not in (0, 1) or dropped:
-                bad.append(f"kill@{when}: finished={fin_ok} rc={rc} dropped={dropped} err={d.errors()}")
+            acct, session = d.accounting(), d.attached()
+            seen.append(f"{when}:{'S' if session else '-'}{d.logs}")
+            why = []
+            if not fin_ok: why.append("driver did not finish")
+            if acct is None:
+                why.append("no final accounting (neither 'probe: detached:' nor probe_report)")
+            elif acct["logs_written"] != d.logs or acct["log_dropped"] != 0:
+                why.append(f"logs_written={acct['logs_written']} delivered={d.logs} dropped={acct['log_dropped']} "
+                           f"({acct['source']})")
+            if session and rc != 0: why.append(f"rc={rc} after the session was established")
+            if not session and (rc != 1 or (acct or {}).get("logs_written") not in (0, None) or d.logs):
+                why.append(f"attach failed before the session existed but rc={rc} delivered={d.logs}")
+            if why:
+                bad.append(f"kill@{when}: session={session} " + " ".join(why) + f" err={d.errors()}")
         except Exception as e:
             bad.append(f"kill@{when}: {e!r}")
         finally:
             if d: d.kill()
             if tg: tg.kill()
     name = f"lifecycle-target-dies-{cfgname}"
-    record(name, not bad, f"cases={n}" + (f" bad={bad[:3]}" if bad else ""))
+    record(name, not bad, f"cases={n} [when:session?delivered]={' '.join(seen)}" + (f" bad={bad[:3]}" if bad else ""))
 
 
 def lc_two_controllers(cfgname, cfg):
@@ -6809,7 +6988,7 @@ def check_lifecycle():
     two controllers, Ctrl+Break at random points, the controller being killed. UHH_LC=substr
     narrows it (e.g. UHH_LC=reattach,inline)."""
     if not exe("lifecycle_driver.exe") or not exe("lifecycle_target.exe") or not exe("hunt_dll.dll"):
-        return skip("lifecycle", "lifecycle_driver / lifecycle_target / hunt_dll missing")
+        return missing_bin("lifecycle", "lifecycle_driver / lifecycle_target / hunt_dll")
     for cfgname, cfg in LC_CONFIGS.items():
         for fn in (lc_reattach, lc_detach_cases, lc_target_dies, lc_two_controllers, lc_interrupt, lc_controller_killed,
                    lc_agent_refused, lc_install_stuck):
@@ -6849,13 +7028,13 @@ def check_cet_sde(n=20, threads=2, reads=50):
     breakpoint/hw are not measurable under SDE (SKIP rows say why). x86: SKIP (SDE's checker
     reports hundreds of WoW64-transition mismatches on a clean 32-bit run, and Windows does not
     enforce user shadow stacks for WoW64 anyway)."""
-    if not SDE_EXE.exists():
-        return skip("cet-sde", f"Intel SDE not installed ({SDE_EXE}; the CET emulation needs the 9.48 kit)")
     sm, drv, tgt, att, cot, cop = (exe("cet_smash.exe"), exe("cet_sde_driver.exe"), exe("probe_app_cet.exe"),
                                    exe("uhh_attach.exe"), exe("co_target.exe"), exe("conformance_target.exe"))
     pr = exe("cet_probe.exe")
-    if not all((sm, drv, tgt, att, cot, cop, pr)):
-        return skip("cet-sde", "cet_smash/cet_sde_driver/probe_app_cet/uhh_attach/co_target/conformance_target/cet_probe missing")
+    if not all((sm, drv, tgt, att, cot, cop, pr)):     # project-built: checked before the optional SDE
+        return missing_bin("cet-sde", "cet_smash/cet_sde_driver/probe_app_cet/uhh_attach/co_target/conformance_target/cet_probe")
+    if not SDE_EXE.exists():
+        return skip_external("cet-sde", f"Intel SDE {SDE_EXE}", "the CET emulation needs the 9.48 kit")
     if pe_is_x86(sm):
         return skip("cet-sde", "x86: SDE's CET checker is not usable on WoW64 (530 reports on a clean cet_smash run, "
                                "121 with ntdll excluded) and Windows does not enforce user shadow stacks for WoW64")
@@ -7160,7 +7339,7 @@ def check_cxlib():
                   `mid`, a callback doing x87 float work)."""
     d, t, dth = exe("co_driver.exe"), exe("co_target.exe"), exe("co_driver_th.exe")
     if not d or not t or not dth:
-        return skip("cxlib", "co_driver/co_target/co_driver_th missing")
+        return missing_bin("cxlib", "co_driver/co_target/co_driver_th")
 
     # -- (1) a callback faulting after call_original / return_from -------------------------
     want_rets = [i * 3 + 5 + (1000 if i % 3 == 1 else 0) for i in range(9)]
@@ -7356,7 +7535,7 @@ def check_cxlib():
     name = "cxlib-noxsave-inline"
     tpd, tpt = exe("tp_driver.exe"), exe("tp_target.exe")
     if not tpd or not tpt:
-        return skip(name, "tp_driver/tp_target missing")
+        return missing_bin(name, "tp_driver/tp_target")
     try:
         env = dict(os.environ, UHH_BENCH_XSTATE="noxsave")
         bad = []
@@ -7368,6 +7547,120 @@ def check_cxlib():
             if r.returncode != 0 or tg.get("bad") != 0 or rep.get("error") is not None or rep.get("log_dropped") != 0:
                 bad.append(f"[{mode}] rc={r.returncode} bad={tg.get('bad')} first={tg.get('first')!r} err={rep.get('error')}")
         record(name, not bad, " ".join(bad) or "mid/dbl/add (log, sys) identical to the twin without XSAVE")
+    except Exception as e:
+        record(name, False, repr(e))
+
+
+def check_symbols_grammar():
+    """One module grammar for probe locations and call_func (include/probe_api.h): a module
+    name without extension means "<name>.dll". "kernel32!OpenProcess" and
+    "kernel32.dll!OpenProcess" must both arm and see exactly the same calls on every backend
+    (probe_app --open-via kernel32 opens its helpers through kernel32!OpenProcess). An EXE is
+    named with its extension: "probe_app!OpenThunk" names probe_app.dll, so it must NOT match
+    probe_app.exe -- it stays pending with a warning on stderr -- while
+    "probe_app.exe!OpenThunk" sees every open."""
+    t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
+    if not t or not a:
+        return missing_bin("symbols-grammar", "uhh_trace/probe_app")
+    helpers = 2
+
+    def trace(bk, loc, open_via, fmt="-"):
+        args = [t, "--backend", bk, "-p", f"{loc}:{fmt}", "--", a, "--no-wait", "--helpers", helpers,
+                "--threads", 1, "--reads", 4, "--config", "reads_enabled=1"]
+        if open_via:
+            args += ["--open-via", open_via]
+        r, objs = run(args, timeout=300)
+        pr = next((x for x in probes(objs) if x.get("location") == loc), {})
+        return r, objs, pr
+
+    # A freshly built exe's first run can make one extra in-process OpenProcess call (seen once
+    # per arch on the first instrumented run after a build, never again): warm up uninstrumented,
+    # and compare exactly the calls probe_app makes -- OpenProcess(PROCESS_VM_READ, FALSE, pid)
+    # of each of its helpers, logged with their arguments.
+    run([a, "--no-wait", "--helpers", helpers, "--threads", 1, "--reads", 4, "--config", "reads_enabled=1",
+         "--open-via", "kernel32"], timeout=120)
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"symbols-grammar-{bk}"
+        try:
+            seen, ok, detail = {}, True, []
+            for loc in ("kernel32!OpenProcess", "kernel32.dll!OpenProcess", "KERNEL32!OpenProcess"):
+                r, objs, pr = trace(bk, loc, "kernel32", "xxd")
+                res, err = app(objs), report(objs).get("error")
+                pids = {x.get("pid") for x in objs if x.get("kind") == "opened"}
+                opens = [m for m in (str(x.get("message", "")) for x in objs if x.get("kind") == "probe_log")
+                         if m.startswith("OpenProcess(0x10, 0x0, ") and
+                         m[len("OpenProcess(0x10, 0x0, "):].rstrip(")").lstrip("-").isdigit() and
+                         int(m[len("OpenProcess(0x10, 0x0, "):].rstrip(")")) in pids]
+                seen[loc] = len(opens)
+                good = (r.returncode == 0 and pr.get("active") is True and pr.get("backend") == bk and
+                        len(pids) == helpers and len(opens) == helpers and (pr.get("hits") or 0) >= helpers and
+                        res.get("opened") == helpers and res.get("successful_reads") == 4 and err is None)
+                ok = ok and good
+                detail.append(f"{loc}: active={pr.get('active')} helper_opens={len(opens)} hits={pr.get('hits')} "
+                              f"rc={r.returncode}" + ("" if good else f" err={(err or '')[:80]} "
+                              f"stderr={[l[:120] for l in r.stderr.splitlines() if 'probe:' in l][-4:]}"))
+            # Identical helper opens seen for every spelling: one per helper.
+            ok = ok and set(seen.values()) == {helpers}
+            record(name, ok, "; ".join(detail))
+        except Exception as e:
+            record(name, False, repr(e))
+    # The EXE trap: "probe_app!X" is probe_app.dll -- pending + warning, never probe_app.exe.
+    for bk in ("breakpoint", "inline"):
+        name = f"symbols-grammar-exe-{bk}"
+        try:
+            r1, o1, bare = trace(bk, "probe_app!OpenThunk", None)
+            r2, o2, full = trace(bk, "probe_app.exe!OpenThunk", None)
+            warned = any(l.startswith("probe: warning: probe_app!OpenThunk names probe_app.dll") and
+                         "write probe_app.exe!OpenThunk" in l for l in r1.stderr.splitlines())
+            ok = (r1.returncode == 0 and bare.get("active") is False and bare.get("hits") == 0 and warned and
+                  app(o1).get("opened") == helpers and
+                  r2.returncode == 0 and full.get("active") is True and full.get("hits") == helpers and
+                  report(o2).get("error") is None)
+            record(name, ok, f"bare: active={bare.get('active')} hits={bare.get('hits')} warned={warned} "
+                             f"rc={r1.returncode}; full: active={full.get('active')} hits={full.get('hits')} "
+                             f"rc={r2.returncode} err={(report(o2).get('error') or '')[:80]}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+def check_quickstart():
+    """docs/quickstart.md section 4, compiled and run: examples/quickstart (my_tool) launches
+    probe_app with its config DISABLED; the breakpoint at configparse.dll!ParseConfig+0x16
+    flips the flag (one override), and the inline NtReadVirtualMemory probe logs every read
+    (one "read handle=..." log per hit), nothing dropped, exit 0."""
+    m, a = exe("my_tool.exe"), exe("probe_app.exe")
+    if not m or not a:
+        return missing_bin("quickstart-my-tool", "my_tool/probe_app")
+    threads, reads = 4, 200
+    name = "quickstart-my-tool"
+    try:
+        r, objs = run([m, a, "--no-wait", "--threads", threads, "--reads", reads], timeout=300)
+        res, rep = app(objs), report(objs)
+        rd = next((x for x in probes(objs) if x.get("location") == READ_LOCATION), {})
+        fl = next((x for x in probes(objs) if x.get("location") == "configparse.dll!ParseConfig+0x16"), {})
+        logs = sum(1 for x in objs if x.get("kind") == "probe_log" and
+                   str(x.get("message", "")).startswith("read handle=0x"))
+        want = threads * reads
+        ok = (r.returncode == 0 and res.get("reads_enabled") == 1 and res.get("successful_reads") == want and
+              fl.get("hits") == 1 and fl.get("backend") == "breakpoint" and rep.get("overrides") == 1 and
+              rd.get("backend") == "inline" and rd.get("hits") == want and logs == want and
+              rep.get("log_dropped") == 0 and rep.get("error") is None)
+        record(name, ok, f"reads_enabled={res.get('reads_enabled')} reads={res.get('successful_reads')}/{want} "
+                         f"flag_hits={fl.get('hits')} overrides={rep.get('overrides')} read_hits={rd.get('hits')} "
+                         f"logs={logs} dropped={rep.get('log_dropped')} rc={r.returncode} "
+                         f"err={(rep.get('error') or '')[:100]}")
+    except Exception as e:
+        record(name, False, repr(e))
+    # The doc shows the example's files verbatim: each must appear in it byte for byte.
+    name = "quickstart-doc-sync"
+    try:
+        root = Path(__file__).resolve().parent.parent
+        doc = (root / "docs" / "quickstart.md").read_text(encoding="utf-8")
+        stale = [p for p in ("my_callbacks.h", "my_callbacks.cpp", "main.cpp")
+                 if "```cpp\n" + (root / "examples" / "quickstart" / p).read_text(encoding="utf-8").rstrip("\n")
+                 + "\n```" not in doc]
+        record(name, not stale, f"files not shown verbatim in docs/quickstart.md: {stale}" if stale else
+               "docs/quickstart.md shows examples/quickstart verbatim")
     except Exception as e:
         record(name, False, repr(e))
 
@@ -7386,11 +7679,25 @@ def main():
     ap.add_argument("--bigapps-secs", type=int, default=40, help="workload length of each bigapps run")
     ap.add_argument("--soak-minutes", type=float, default=0,
                     help="opt-in soak tier (scripts/soak.py): every phase for this many minutes; 0 skips")
-    ap.add_argument("--only", default="", help="comma-separated substrings of check names to run (default: all)")
+    ap.add_argument("--only", default="",
+                    help="comma-separated substrings of check FUNCTION names (check_logs_order; '-' matches '_', "
+                         "so logs-order and check-logs-order work too) to run (default: all). Record names such as "
+                         "inplace-jmp8 are NOT matched (use inplace). A selector that matches no check function, or a "
+                         "selection that runs no check, is an error (exit 2)")
     args = ap.parse_args()
     BIN = args.bin.resolve()
     only = [x for x in args.only.split(",") if x]
     ONLY[:] = only
+
+    def fn_names(fn):
+        return (fn.__name__, fn.__name__.replace("_", "-"))
+    if only:
+        check_fns = [v for k, v in globals().items() if k.startswith("check_") and callable(v)]
+        unmatched = [o for o in only if not any(o in n for fn in check_fns for n in fn_names(fn))]
+        if unmatched:
+            print(f"regress.py: --only selector(s) {unmatched} match no check function (substrings of check_* "
+                  f"function names; '-' for '_'). Nothing was run.", file=sys.stderr)
+            sys.exit(2)
     feed_keystrokes()
 
     import os as _os
@@ -7413,8 +7720,7 @@ def main():
         sweep_logs()
         # Also matches the hyphenated name (check_logs_order -> check-logs-order), so
         # --only logs- selects the logs-* family by its record-name prefix.
-        names = (fn.__name__, fn.__name__.replace("_", "-"))
-        return not only or any(o in n for o in only for n in names)
+        return not only or any(o in n for o in only for n in fn_names(fn))
     print(f"UHH regression suite — bin={BIN}")
     if want(check_sites): check_sites()
     if want(check_gated_off): check_gated_off()
@@ -7507,6 +7813,12 @@ def main():
     if want(check_lifecycle): check_lifecycle()
     if want(check_cet_sde): check_cet_sde()
     if want(check_cxlib): check_cxlib()
+    if want(check_symbols_grammar): check_symbols_grammar()
+    if want(check_quickstart): check_quickstart()
+    if only and not RESULTS:
+        print(f"regress.py: --only {','.join(only)} selected only opt-in tiers that were not enabled "
+              f"(--bigapps / --soak-minutes / --volume-reads): no check ran.", file=sys.stderr)
+        sys.exit(2)
     print("-" * 72)
     failed = 0
     for name, status, detail in RESULTS:

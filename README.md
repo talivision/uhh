@@ -133,6 +133,13 @@ Copy an example ([`gated_config`](examples/gated_config), or a smaller one:
 - `call_original` takes up to 16 arguments (`NtCreateFile` has 11). On hw it needs a free
   debug register while it runs, so at most 3 hw probes leave room for it.
 
+## Documentation
+
+- [docs/quickstart.md](docs/quickstart.md): build, run `gated_config` (launch and attach), write your own tool.
+- [docs/api.md](docs/api.md): reference for every function, flag and macro in `include/probe_api.h`.
+- [docs/limitations.md](docs/limitations.md): what UHH does not do, or does differently per backend, with workarounds.
+- [docs/troubleshooting.md](docs/troubleshooting.md): stderr messages and common failures, with causes and fixes.
+
 ## Build
 
 Requires Windows, Visual Studio 2022 (MSVC) and CMake -- nothing else, and **no network**:
