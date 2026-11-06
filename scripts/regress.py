@@ -5552,8 +5552,9 @@ def check_inplace_shapes():
     not, call rel32 / call [mem], ret, loop/loopz/loopnz/jrcxz incl. address-size forms, pushf
     with a normal stack and into the stack guard page, a segment-relative indirect jmp, x64
     syscall). 8 threads x 1000 calls each (examples/ctrlreview ctrl_target `shape`): hits ==
-    logs == distinct tags == calls, every result equal to the never-probed twin's, no trap flag
-    in a pushed flags image, and the guard-page push grew the stack as without UHH."""
+    logs == calls and the logged tags are EXACTLY the (thread << 20) | i tags of the calls
+    (each once), every result equal to the never-probed twin's, no trap flag in a pushed
+    flags image, and the guard-page push grew the stack as without UHH."""
     d, t = exe("ctrl_driver.exe"), exe("ctrl_target.exe")
     if not d or not t:
         return missing("inplace", "ctrl_driver/ctrl_target")
@@ -5578,16 +5579,21 @@ def check_inplace_shapes():
             hits = sum(x.get("hits", 0) for x in rows)
             tags = collections.Counter(str(x.get("message", "")) for x in logs)
             calls = T * n
+            # Oracle computed here: thread t (1..T) calls the shape with tag (t << 20) | i for
+            # i < n, and the callback logs "tag=<hex>" of EDX -- every call exactly once.
+            want = collections.Counter(f"tag={(t_ << 20) | i:x}" for t_ in range(1, T + 1) for i in range(n))
+            dups, missed = sum((tags - want).values()), sum((want - tags).values())
             if res.get("calls") != calls: bad.append(f"target={res}")
             if hits != calls: bad.append(f"hits={hits}")
             if len(logs) != calls: bad.append(f"logs={len(logs)}")
-            if len(tags) != calls: bad.append(f"distinct={len(tags)}")
+            if dups: bad.append(f"duplicate_or_foreign_tags={dups} e.g. {sorted((tags - want).elements())[:2]}")
+            if missed: bad.append(f"missed_tags={missed} e.g. {sorted((want - tags).elements())[:2]}")
             if res.get("bad"): bad.append(f"result_differs={res.get('bad')} (first probed={res.get('first_p')} "
                                           f"reference={res.get('first_r')})")
             if res.get("tf"): bad.append(f"tf_in_pushed_flags={res.get('tf')}")
             if res.get("grow_bad"): bad.append(f"stack_not_grown={res.get('grow_bad')}")
             record(name, not bad, (" ".join(bad) + " " if bad else "") +
-                   f"calls={calls} hits={hits} logs={len(logs)} distinct={len(tags)}")
+                   f"calls={calls} hits={hits} logs={len(logs)} exact_tags={len(set(tags) & set(want))}/{calls}")
         except Exception as e:
             record(name, False, repr(e))
 
