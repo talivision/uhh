@@ -418,10 +418,27 @@ add_dependencies(edge_driver edge_target probe_api_agent)
 # --- edge-case hunter: concurrency / lifecycle stress under gated_config instrumentation --
 add_executable(hunt_target examples/hunt/hunt_target.c)
 add_library(hunt_dll SHARED examples/hunt/hunt_dll.c)
+# Two builds of twin.dll (different code at the same RVA) at one fixed base, in twin_a\ and
+# twin_b\ next to hunt_target (scenario "twin").
+foreach(v a b)
+    add_library(twin_${v} SHARED examples/hunt/twin_dll.c)
+    if(v STREQUAL "a")
+        target_compile_definitions(twin_${v} PRIVATE TWIN_VALUE=0x101)
+    else()
+        target_compile_definitions(twin_${v} PRIVATE TWIN_VALUE=0x202)
+    endif()
+    set_target_properties(twin_${v} PROPERTIES OUTPUT_NAME twin
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/$<CONFIG>/twin_${v}
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/$<CONFIG>/twin_${v}
+        ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/twin_${v}_lib/$<CONFIG>
+        PDB_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/$<CONFIG>/twin_${v})
+    target_link_options(twin_${v} PRIVATE /DYNAMICBASE:NO /BASE:0x5E000000 /INCREMENTAL:NO /OPT:NOICF)
+    set_property(TARGET twin_${v} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+endforeach()
 add_executable(hunt_driver examples/hunt/hunt_driver.cpp examples/hunt/hunt_callbacks.cpp examples/gated_config/callbacks.cpp)
 target_include_directories(hunt_driver PRIVATE include examples/gated_config)
 target_link_libraries(hunt_driver PRIVATE probe_api)
-add_dependencies(hunt_driver hunt_target hunt_dll probe_api_agent)
+add_dependencies(hunt_driver hunt_target hunt_dll twin_a twin_b uhh_trace probe_api_agent)
 
 # --- lifecycle: attach / detach / re-attach / close / Ctrl+C / controller death (regress `lifecycle-*`) --
 add_executable(lifecycle_target examples/lifecycle/lifecycle_target.c)
