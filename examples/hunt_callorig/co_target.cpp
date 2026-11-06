@@ -11,6 +11,7 @@
 #include <thread>
 #include <vector>
 #include <atomic>
+#include <algorithm>
 
 #define CO_EXPORT extern "C" __declspec(dllexport) __declspec(noinline)
 
@@ -121,8 +122,97 @@ static int run_late(const char *k) {
     return 0;
 }
 
+// many / manydead (cx2-manythreads): N threads (default 4200, more than the agent's 4096-entry
+// thread table), all alive at once -- so N distinct thread ids -- each make one inline hit
+// (co_add). Then co_late runs on yet another thread and its callback outlives a detach (as in
+// `late`, state 2 comes 8 s later): many -- while the N threads are all still alive;
+// manydead -- after they have all exited. Its log must be delivered.
+struct ManyArg { HANDLE go; std::atomic<long> *called; DWORD *tid; };
+static DWORD WINAPI many_thread(void *p) {
+    auto *a = static_cast<ManyArg *>(p);
+    *a->tid = GetCurrentThreadId();
+    co_add(1, 2);
+    a->called->fetch_add(1);
+    WaitForSingleObject(a->go, INFINITE);
+    return 0;
+}
+static void wait_all(std::vector<HANDLE> &ths) {
+    for (size_t i = 0; i < ths.size(); i += MAXIMUM_WAIT_OBJECTS) {
+        const DWORD n = (DWORD)(ths.size() - i < MAXIMUM_WAIT_OBJECTS ? ths.size() - i : MAXIMUM_WAIT_OBJECTS);
+        WaitForMultipleObjects(n, &ths[i], TRUE, 120000);
+    }
+    for (HANDLE h : ths) CloseHandle(h);
+    ths.clear();
+}
+static int run_many(const char *k, int n) {
+    const bool dead = !strcmp(k, "manydead");
+    HANDLE go = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    std::atomic<long> called{0};
+    std::vector<DWORD> tids((size_t)n, 0);
+    std::vector<ManyArg> args((size_t)n);
+    std::vector<HANDLE> ths;
+    for (int i = 0; i < n; ++i) {
+        args[i] = ManyArg{go, &called, &tids[i]};
+        HANDLE h = CreateThread(nullptr, 64 * 1024, many_thread, &args[i], STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+        if (!h) break;
+        ths.push_back(h);
+    }
+    const long created = (long)ths.size();
+    for (int i = 0; i < 60000 && called.load() < created; ++i) Sleep(5);
+    std::vector<DWORD> u(tids.begin(), tids.begin() + created);
+    std::sort(u.begin(), u.end());
+    const long distinct = (long)(std::unique(u.begin(), u.end()) - u.begin());
+    if (dead) { SetEvent(go); wait_all(ths); }
+    LateArg arg{0, 0};
+    HANDLE th = CreateThread(nullptr, 0, late_thread, &arg, 0, nullptr);
+    if (!th) return 4;
+    for (int i = 0; i < 12000 && arg.state == 0; ++i) Sleep(5);          // the callback has started
+    printf("{\"kind\":\"incb\",\"state\":%ld}\n", (long)arg.state); fflush(stdout);
+    if (arg.state) Sleep(8000);                                           // the test detaches meanwhile
+    InterlockedExchange(&arg.state, 2);
+    const DWORD w = WaitForSingleObject(th, 60000);
+    SetEvent(go); wait_all(ths);
+    printf("{\"kind\":\"co\",\"case\":\"%s\",\"threads\":%ld,\"called\":%ld,\"distinct\":%ld,\"ret\":%lld,"
+           "\"done\":%d}\n", k, created, called.load(), distinct, (long long)arg.ret, w == WAIT_OBJECT_0);
+    fflush(stdout);
+    return 0;
+}
+
+// susp (cx2-touchprog-hw): a worker the PROGRAM holds suspended across an attach whose controller
+// dies inside a context call on it (test-hook build). Afterwards the worker must still be
+// suspended exactly once by the program: it did not run, and the program's ResumeThread
+// reports a previous count of 1.
+static volatile LONG g_spun = 0, g_spin_stop = 0;
+static DWORD WINAPI susp_thread(void *) {
+    while (!g_spin_stop) { InterlockedIncrement(&g_spun); Sleep(1); }
+    return 0;
+}
+static int run_susp(bool gate) {
+    HANDLE w = CreateThread(nullptr, 0, susp_thread, nullptr, 0, nullptr);
+    if (!w) return 4;
+    while (g_spun == 0) Sleep(1);
+    const DWORD first = SuspendThread(w);
+    printf("{\"kind\":\"susp\",\"tid\":%lu}\n", GetThreadId(w)); fflush(stdout);
+    if (gate && !wait_gate()) return 3;
+    const LONG c1 = g_spun;
+    Sleep(300);
+    const LONG c2 = g_spun;
+    const DWORD prev = ResumeThread(w);
+    InterlockedExchange(&g_spin_stop, 1);
+    const DWORD r = prev > 1 ? ResumeThread(w) : 0;     // (never: a count the controller added)
+    (void)r;
+    const DWORD done = WaitForSingleObject(w, 30000);
+    intptr_t sum = 0;
+    for (int i = 0; i < 20; ++i) sum += co_add(i, 5);
+    printf("{\"kind\":\"co\",\"case\":\"susp\",\"first\":%lu,\"prev\":%lu,\"ran_while_suspended\":%ld,"
+           "\"done\":%d,\"sum\":%lld}\n", first, prev, (long)(c2 - c1), done == WAIT_OBJECT_0, (long long)sum);
+    fflush(stdout);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *k = argc > 1 ? argv[1] : "";
+    if (!strcmp(k, "susp")) return run_susp(argc > 2 && !strcmp(argv[2], "--wait"));
     if (argc > 2 && !strcmp(argv[2], "--wait") && !wait_gate()) return 3;
     intptr_t sum = 0, after = 0;
     if (!strcmp(k, "recurse")) {
@@ -225,6 +315,8 @@ int main(int argc, char **argv) {
                (long long)sum, g_body.load(), rets, runs);
     } else if (!strcmp(k, "late") || !strcmp(k, "cfgfree")) {
         return run_late(k);
+    } else if (!strcmp(k, "many") || !strcmp(k, "manydead")) {
+        return run_many(k, 4200);
     } else if (!strcmp(k, "rep")) {                  // cxlib-reptail: big rep stosb fills, verified
         const size_t n = 64u << 20;
         unsigned char *b = (unsigned char *)VirtualAlloc(nullptr, n, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
