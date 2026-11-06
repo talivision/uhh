@@ -318,7 +318,11 @@ struct probe_session {
     ULONGLONG guard_since = 0;
     bool agent_init_started = false;           // this session started the agent's init
     std::vector<DWORD> detach_frozen;          // detach's own freeze of every thread (mirrored for the guard)
-    std::vector<DWORD> handling;               // threads whose debug event is being handled (nested: call_original)
+    // Threads whose debug event is being handled (nested: call_original). `running`: the handling
+    // let its thread run again before it ended (call_func / call_original continued the event,
+    // or call_original released it) -- the guard does not list it then (see guard_sync).
+    struct Handled { DWORD tid; bool running; };
+    std::vector<Handled> handling;
     DWORD debug_tid = 0;                       // the thread that launched/attached: owns the debug object
     DWORD in_call_tid = 0;                     // thread currently running a call_original (in place)
     std::vector<HANDLE> call_deferred;         // other threads' hits during a call_original: rewound + suspended
@@ -3171,15 +3175,20 @@ static void guard_sync(probe_session *s) {
         for (HANDLE t : *list) hold(GetThreadId(t));
     for (const auto &e : s->inplace_suspended) hold(e.first);   // an in-place step window's suspensions
     for (DWORD tid : s->detach_frozen) hold(tid);
-    // The threads whose events are being handled, and a call_original/call_func thread: a
-    // 32-bit (WOW64) controller's Get/SetThreadContext on another thread is an implicit
-    // suspend + resume inside the call, so a controller killed in the middle of one leaves
-    // that thread suspended once with nothing of ours recording it (seen on x86: a thread
-    // parked for good at its NtOpenProcess hit). One resume for each covers it -- a no-op
-    // for a thread that is not suspended.
-    for (DWORD tid : s->handling) hold(tid);
-    hold(s->in_call_tid);
-    for (const auto &c : s->calls) hold(c.first);
+    // The threads whose events are being handled: a 32-bit (WOW64) controller's
+    // Get/SetThreadContext on another thread is an implicit suspend + resume inside the call,
+    // so a controller killed in the middle of one leaves that thread suspended once with
+    // nothing of ours recording it (seen on x86: a thread parked for good at its NtOpenProcess
+    // hit). One resume for each covers it -- a no-op for a thread that is not suspended.
+    // Listed ONLY while the thread is stopped (at its event, or suspended by us for the rest
+    // of its handling): the entry is taken off BEFORE its event is continued (service_event /
+    // fiber_step re-sync first) or right after our suspension of it ends, and
+    // a thread running a call_func / call_original callee is not listed (its context is
+    // touched only at its own trap or under a suspension of ours, each listed then). A stale
+    // entry for a thread that runs again would release a suspension the PROGRAM makes of it
+    // next if the controller died then (Codex review 2, X2 open note; regress cx2-evsusp-*, cx2-cosusp-*).
+    for (const auto &h : s->handling) if (!h.running) hold(h.tid);
+    for (const auto &c : s->calls) if (c.second->call_held) hold(c.first);   // suspended by us
     for (const auto &h : s->watch_deferred) hold(h.ev.dwThreadId);
     g.held_count = (LONG)n;
     n = 0;
@@ -3188,6 +3197,16 @@ static void guard_sync(probe_session *s) {
     g.dr_mask = s->dr_ever | s->dr_used;          // incl. a call_original's return-catch slot
     MemoryBarrier();
     g.enabled = 1;
+}
+// The guard's list rewritten right after a thread of ours was let go outside an event (a
+// suspension of ours ended): its entry goes now, not at the next event (a stale entry would
+// release a suspension the program makes next). Nothing once the target is gone.
+static void guard_resync(probe_session *s) { if (!s->exited) guard_sync(s); }
+// The current handling of `tid` lets its thread run (true) or has it stopped again (false):
+// see probe_session::handling. Callers re-sync the guard before the thread runs.
+static void handling_running(probe_session *s, DWORD tid, bool running) {
+    for (size_t i = s->handling.size(); i--; )
+        if (s->handling[i].tid == tid) { s->handling[i].running = running; return; }
 }
 
 // A lifted (in-place) breakpoint byte may only be re-armed while a breakpoint probe is
@@ -3328,9 +3347,11 @@ static void inplace_begin(probe_session *s, DWORD tid) {
     for (DWORD o : s->threads) if (o != tid) inplace_suspend(s, o);
 }
 static void inplace_release_all(probe_session *s) {
+    const bool any = !s->inplace_suspended.empty();
     for (auto &e : s->inplace_suspended) { ResumeThread(e.second); CloseHandle(e.second); }
     s->inplace_suspended.clear();
     s->inplace_owner = 0;
+    if (any) guard_resync(s);                                // our suspensions are over: off the list
 }
 static void inplace_watchdog(probe_session *s) {
     if (!s->inplace_owner || GetTickCount64() - s->inplace_since < 2000) return;
@@ -3936,6 +3957,7 @@ static void release_held(probe_session *s, const char *why) {
     }
     std::fprintf(stderr, "probe: released %zu held thread(s) (%s)\n", s->held.size(), why);
     s->held.clear();
+    guard_resync(s);                                         // our suspensions are over: off the list
 }
 
 static bool vet_pending_inline(probe_session *s);
@@ -4207,9 +4229,13 @@ static bool fiber_step(probe_session *s, EventFiber *f, const DEBUG_EVENT *ev) {
             CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
             if (l != s->call_late.end() && GetThreadContext(f->resume_after, &c)) l->second.ip = (uint64_t)UHH_PC(c);
             ResumeThread(f->resume_after); CloseHandle(f->resume_after); f->resume_after = nullptr;
+            guard_resync(s);                         // our suspension is over: off the guard's list
         }
-        else if (!s->skip_continue && ev && !ContinueDebugEvent(ev->dwProcessId, ev->dwThreadId, f->disposition)) {
-            set_error(s, win_error("continue debug event")); ok = false;
+        else if (!s->skip_continue && ev) {
+            guard_resync(s);                         // its handling is over: off the guard's list first
+            if (!ContinueDebugEvent(ev->dwProcessId, ev->dwThreadId, f->disposition)) {
+                set_error(s, win_error("continue debug event")); ok = false;
+            }
         }
         f->done = false; f->stop_suspended = false;
         try { s->fiber_pool.push_back(f); } catch (...) { DeleteFiber(f->fiber); delete f; }
@@ -4229,6 +4255,10 @@ static bool call_resume(probe_session *s, DWORD tid, EventFiber::Outcome how, co
     EventFiber *f = it->second;
     s->calls.erase(it);
     f->call_outcome = how;
+    if (ev || f->call_held) {                       // stopped at its trap/fault, or suspended by us
+        handling_running(s, tid, false);
+        guard_resync(s);                             // listed again before its context is touched
+    }
     return fiber_step(s, f, ev);
 }
 // A thread running a call_func or call_original callee: its own probe hits are counted
@@ -4362,6 +4392,7 @@ static bool service_event(probe_session *s, DEBUG_EVENT &ev) {
                 // its first instruction runs.
                 const uint64_t eip = r->second;
                 s->restore_resume.erase(r);
+                GuardTouch touch(s, ev.dwThreadId);         // (not dispatched: no handling lists it)
                 reapply_hw_thread(s, ev.dwThreadId);
                 HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, ev.dwThreadId);
                 CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
@@ -4390,6 +4421,7 @@ static bool service_event(probe_session *s, DEBUG_EVENT &ev) {
                 if (l->second.ip && code != EXCEPTION_BREAKPOINT && code != EXCEPTION_SINGLE_STEP) {
                     HANDLE t = OpenThread(THREAD_GET_CONTEXT, FALSE, ev.dwThreadId);
                     CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
+                    GuardTouch touch(s, ev.dwThreadId);
                     stale = t && GetThreadContext(t, &c) && (uint64_t)UHH_PC(c) == l->second.ip && at != l->second.ip;
                     if (t) CloseHandle(t);
                 }
@@ -4403,6 +4435,7 @@ static bool service_event(probe_session *s, DEBUG_EVENT &ev) {
     s->skip_continue = false;
     DWORD disposition = DBG_CONTINUE;
     bool ok = dispatch_event(s, ev, disposition);
+    if (!s->skip_continue) guard_resync(s);          // its handling is over: off the guard's list first
     if (!s->skip_continue && !ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, disposition)) {
         set_error(s, win_error("continue debug event")); ok = false;
     }
@@ -4719,9 +4752,11 @@ static void release_hw(probe_session *s, Probe &p) {
 // no thread can execute bytes mid-write and the page never has to be made non-executable
 // (which faulted on ntdll's own syscall stubs and raised exceptions the target could see).
 static void ipc_thaw(probe_session *s) {
+    const bool any = !s->ipc_frozen.empty();
     for (HANDLE t : s->ipc_frozen) { ResumeThread(t); CloseHandle(t); }
     s->ipc_frozen.clear();
     s->ipc_freezer = 0;
+    if (any) guard_resync(s);                                // our suspensions are over: off the list
 }
 
 static void ipc_freeze_thread(probe_session *s, DWORD tid) {
@@ -5054,8 +5089,10 @@ static bool defer_hit_during_call(probe_session *s, DWORD tid, uint64_t address,
 }
 
 static void resume_deferred_hits(probe_session *s) {
+    const bool any = !s->call_deferred.empty();
     for (HANDLE t : s->call_deferred) { ResumeThread(t); CloseHandle(t); }
     s->call_deferred.clear();
+    if (any) guard_resync(s);                                // our suspensions are over: off the list
 }
 
 // A data-watch hit while a call is in flight cannot be replayed by re-executing (the access
@@ -6708,13 +6745,13 @@ static void stop_drainer(probe_session *s) {
 // One debug event -> library state changes. Shared by probe_run and the detach path.
 static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &disposition);
 static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposition) {
-    s->handling.push_back(event.dwThreadId);
+    s->handling.push_back({event.dwThreadId, false});
     struct Handling {                                // handlings on fibers can end in any order
         probe_session *s; DWORD tid;
         ~Handling() {
             s->event_tid = prev;
             auto &h = s->handling;
-            for (size_t i = h.size(); i--; ) if (h[i] == tid) { h.erase(h.begin() + (ptrdiff_t)i); break; }
+            for (size_t i = h.size(); i--; ) if (h[i].tid == tid) { h.erase(h.begin() + (ptrdiff_t)i); break; }
         }
         DWORD prev;
     } handling{s, event.dwThreadId, s->event_tid};
@@ -6731,7 +6768,8 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
     inplace_sync(s, event);
     // The guard's mirror, after EVERYTHING this event changed (an in-place window's holds are
     // taken / handed over just above) and before the thread runs again. The event's thread
-    // stays listed until the next sync (its context may still be written before it continues).
+    // stays listed until its event is continued (service_event / fiber_step re-sync just
+    // before; its context may still be touched until then, e.g. a resume_after thread's).
     if (!s->exited) guard_sync(s);
     return ok;
 }
@@ -7492,14 +7530,20 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
     f->call_held = nullptr;
     // Let it run: continue its event -- or, for a replayed data-watch hit, resume it (it
     // was held by suspension, see replay_held_watches); its trap is then a normal event.
+    // The guard stops listing the thread as it runs (guard_sync): taken off before a continue,
+    // right after the resume of our own suspension (which stays covered until it ends).
     bool running = false;
+    handling_running(s, st->tid, true);
     if (f->stop_suspended) {
         running = ResumeThread(f->resume_after) != (DWORD)-1;
         if (running) { CloseHandle(f->resume_after); f->resume_after = nullptr; f->stop_suspended = false; }
+        guard_resync(s);
     } else {
+        guard_resync(s);
         running = !!ContinueDebugEvent(st->pid, st->tid, DBG_CONTINUE);
     }
     if (!running) {
+        handling_running(s, st->tid, false); guard_resync(s);
         s->calls.erase(st->tid); SetThreadContext(thread, &saved); CloseHandle(thread); return 0;
     }
     fiber_park(s, f);                       // the loop runs on; resumed by service_event / poll_calls
@@ -7534,6 +7578,7 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
         // until this handling ends, so the callback's own register changes still land.
         guard_note_hold(s, st->tid);
         if (SuspendThread(thread) != (DWORD)-1) {
+            handling_running(s, st->tid, false);                        // suspended by us: listed (guard_sync)
             SetThreadContext(thread, &saved); teb_errors.restore(s->pi.hProcess);
             f->resume_after = thread; thread = nullptr;
             s->call_late[st->tid] = {};                                // see service_event, fiber_step
@@ -7643,10 +7688,14 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
     if (!SetThreadContext(thread, &w)) { CloseHandle(thread); return 0; }
     s->dr_used |= (uint8_t)(1u << slot);                               // reserved: no probe arms it meanwhile
     s->dr_ever |= (uint8_t)(1u << slot);                               // ours: detach / the guard clear it too
-    guard_sync(s);                                                     // mirrored BEFORE the thread runs with it
     s->in_call_tid = st->tid; s->co_addr = probe->address; s->co_sp = c->hit_sp;
     s->co_borrowed_slot = borrowed ? slot : -1;
     s->co_entry_pending = !(probe->flags & PROBE_HW); s->co_left = false;
+    // Mirrored BEFORE the thread runs with it (the slot) -- and the thread off the guard's list
+    // while it runs the original: a suspension of ours (the polls below) or its stop at the
+    // return catch lists it for exactly that long.
+    handling_running(s, st->tid, true);
+    guard_sync(s);
     auto clear_slot = [&](bool running) {
         if (running) guard_note_hold(s, st->tid);
         if (running && SuspendThread(thread) == (DWORD)-1) return;
@@ -7656,13 +7705,14 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
         } else {
             set_dr_on_thread(thread, slot, 0, false);
         }
-        if (running) ResumeThread(thread);
+        if (running) { ResumeThread(thread); guard_resync(s); }
     };
     if (!ContinueDebugEvent(st->pid, st->tid, DBG_CONTINUE)) {
-        saved.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS;
-        SetThreadContext(thread, &saved);
         if (!borrowed) s->dr_used &= (uint8_t)~(1u << slot);
         s->in_call_tid = 0; s->co_addr = 0; s->co_borrowed_slot = -1;
+        handling_running(s, st->tid, false); guard_sync(s);            // still at its event: listed again
+        saved.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS;
+        SetThreadContext(thread, &saved);
         CloseHandle(thread); return 0;
     }
     bool done = false, thread_gone = false;
@@ -7676,6 +7726,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
             if (ev.dwThreadId == st->tid && ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT &&
                 ev.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP &&
                 (uint64_t)(uintptr_t)ev.u.Exception.ExceptionRecord.ExceptionAddress == ret_addr) {
+                guard_note_hold(s, st->tid);                               // stopped at its event: listed meanwhile
                 CONTEXT &r = st->post; r.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | UHH_CONTEXT_FP;
                 if (GetThreadContext(thread, &r)) {
 #if defined(_WIN64)
@@ -7685,6 +7736,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
 #endif
                     if (sp > s->co_sp && sp <= s->co_sp + ptr + 1024) {   // x86 stdcall: ret N popped the args
                         result = rax; done = true;                         // this event now stands in for the hit
+                        handling_running(s, st->tid, false);               // stopped there: listed (guard_sync)
                         st->have_post = true;
                         st->post_seen = c->regs;
 #if !defined(_WIN64)
@@ -7695,6 +7747,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
                     }
                     r.EFlags |= 0x10000u; SetThreadContext(thread, &r);    // some other return there: run on
                 }
+                guard_resync(s);                                           // runs on: off the guard's list
                 ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
                 continue;
             }
@@ -7722,6 +7775,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
                 }
                 ResumeThread(thread);
             }
+            guard_resync(s);                                               // our suspension is over: off the list
         }
         if (!done && now > until && !s->co_left) {
             s->co_left = true; why = "the original did not return within 5 s (released, it runs on)";
