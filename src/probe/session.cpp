@@ -86,12 +86,20 @@ struct CallbackState {
     bool have_post = false;
     CONTEXT post{};
     probe_regs post_seen{};
+    // The callback faulted after call_original ran the original: the hit returns to its caller
+    // with everything the original left (run_callback), as inline does.
+    bool faulted = false;
 };
 // The floating-point parts of a CONTEXT (x86: the x87 save area and the FXSAVE image with XMM).
 #if defined(_WIN64)
 #define UHH_CONTEXT_FP CONTEXT_FLOATING_POINT
 #else
 #define UHH_CONTEXT_FP (CONTEXT_FLOATING_POINT | CONTEXT_EXTENDED_REGISTERS)
+#endif
+#if defined(_WIN64)
+#define UHH_POST_AX Rax
+#else
+#define UHH_POST_AX Eax
 #endif
 
 // A thread mid-single-step over a software breakpoint. displaced == true means the
@@ -4389,8 +4397,34 @@ static void run_callback(probe_session *s, Probe *probe, probe_context *c) {
     const probe_regs before = c->regs;
     DWORD code = 0;
     if (seh_callback(probe->callback, c, &code)) return;
-    c->regs = before;                                   // no write-back, as inline
-    if (code == UHH_CALL_RELEASED) return;              // call_original ended the callback (see there)
+    if (code == UHH_CALL_RELEASED) { c->regs = before; return; }   // call_original ended the callback (see there)
+    // A faulting callback is a no-op: its register changes are discarded and a return_from it
+    // asked for is dropped (the hit falls through into the original) -- exactly as inline
+    // (agent.cpp call_mid). Unless call_original already RAN the original: falling through
+    // would run it a second time (a double free / double close), so the hooked function
+    // returns to its caller as with return_from -- return_from's value if one was set, else
+    // the original's own result (x86: EDX:EAX and the bytes its `ret N` popped) -- with
+    // everything else the original left (apply_return_from, CallbackState::faulted).
+    auto *st = static_cast<CallbackState *>(c->controller);
+    const bool ran = c->called_original && st && st->have_post;
+    const bool was_returned = c->returned != 0;
+    const uint64_t ax = was_returned ? c->regs.rax : ran ? (uint64_t)st->post.UHH_POST_AX : 0;
+    const uint64_t dx = was_returned ? c->regs.rdx : c->orig_edx;
+    c->regs = before;
+    c->returned = 0;
+    if (ran) {
+        bool ok = true;
+#if !defined(_WIN64)
+        if (!was_returned) {
+            if (c->orig_pop < 0 || c->orig_pop > 1020 || (c->orig_pop & 3)) ok = false;   // not measured: as inline
+            else c->ret_pop = (uint32_t)c->orig_pop;
+        }
+        if (ok) c->regs.rdx = dx;
+#else
+        (void)dx;
+#endif
+        if (ok) { c->regs.rax = ax; c->returned = 1; st->faulted = true; }
+    }
     if (!s->warned_cb_fault) {
         s->warned_cb_fault = true;
         std::fprintf(stderr, "probe: warning: callback for %s raised 0x%08lx; abandoned (hit counted, no register "
@@ -4450,7 +4484,7 @@ static bool apply_return_from(probe_session *s, Probe *probe, const probe_contex
         // ABI) and the volatile GPRs the callback did not set_reg after the call. x86 EDX is
         // already the original's unless return_from set a high half (probe_x86_return_regs).
         const CONTEXT &a = st->post;
-#define UHH_KEEP(f, r) if (c.regs.r == st->post_seen.r) native.f = a.f;
+#define UHH_KEEP(f, r) if (st->faulted || c.regs.r == st->post_seen.r) native.f = a.f;
 #if defined(_WIN64)
         UHH_KEEP(Rcx, rcx) UHH_KEEP(Rdx, rdx) UHH_KEEP(R8, r8) UHH_KEEP(R9, r9) UHH_KEEP(R10, r10) UHH_KEEP(R11, r11)
         native.FltSave = a.FltSave; native.MxCsr = a.MxCsr;
