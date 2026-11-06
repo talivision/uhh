@@ -291,6 +291,10 @@ target_include_directories(uhh_trace PRIVATE include examples/trace)
 target_link_libraries(uhh_trace PRIVATE probe_api)
 add_dependencies(uhh_trace probe_api_agent)
 
+# symfile_test: symbol names come from image files, never the target's memory (regress symbols-file-backed)
+add_executable(symfile_test examples/symbols/symfile_test.cpp)
+target_link_libraries(symfile_test PRIVATE probe_api)
+
 # --- forwarded target stdout/stderr (ROADMAP D2/F8): partial lines vs live log records --
 add_executable(stdout_target examples/targets/stdout/stdout_target.c)
 target_compile_definitions(stdout_target PRIVATE _CRT_SECURE_NO_WARNINGS)
