@@ -5637,6 +5637,21 @@ def check_inplace_shapes():
             record(name, False, repr(e))
 
 
+def own_watch_slots_bad(w, n, bk):
+    """The target's own watch, armed in turn in every debug register FREE on its thread
+    (ctrl_target owndr phase B / owndrx: -1 = slot not free, -2 = SetThreadContext failed,
+    else the traps seen). The expected free set is computed HERE, not from what the fixture
+    found: 4 debug registers minus the one UHH's hw-backend probe holds (hw only). Every other
+    UHH register -- the one-shot probe / watch it released -- must be free again, so exactly
+    that many slots must trap n times and the rest be -1. A released slot left enabled shrinks
+    the free set and fails."""
+    want_free = 4 - (1 if bk == "hw" else 0)
+    got_free = sum(1 for v in w if v == n)
+    if len(w) != 4 or got_free != want_free or any(v not in (-1, n) for v in w):
+        return f"own_watch_per_slot={w} (want {want_free} free slot(s) with {n} traps each, the rest -1)"
+    return ""
+
+
 def check_ctrl_review():
     """Controller review findings (examples/ctrlreview, docs/ROADMAP.md "Controller review
     findings"), each reproduced by its own fixture:
@@ -5780,7 +5795,8 @@ def check_ctrl_review():
             if res.get("w1_slot", -1) < 0: bad.append(f"w1_slot={res.get('w1_slot')}")
             if res.get("w1") != N: bad.append(f"own_watch_w1={res.get('w1')} (slot {res.get('w1_slot')})")
             w2 = res.get("w2") or []
-            if not any(v == N for v in w2) or any(v not in (-1, N) for v in w2): bad.append(f"own_watch_w2={w2}")
+            slots_bad = own_watch_slots_bad(w2, N, bk)
+            if slots_bad: bad.append("w2 " + slots_bad)
             fails = [str(x.get("message")) for x in logs if "FAIL" in str(x.get("message", ""))]
             if fails: bad.append(f"callback_fail={fails[:2]}")
             tock = [x for x in rows if str(x.get("location", "")).startswith("0x")]
@@ -5845,8 +5861,8 @@ def check_cdx_review():
             N = 50
             res, logs, rows, bad = go("owndrx", bk, ["--n", N])
             w = res.get("w") or []
-            if len(w) != 4 or not any(v == N for v in w) or any(v not in (-1, N) for v in w):
-                bad.append(f"own_watch_per_slot={w} (want {N} on every free slot)")
+            slots_bad = own_watch_slots_bad(w, N, bk)
+            if slots_bad: bad.append(slots_bad)
             if not any(m.startswith("ok wonce=1") for m in logs): bad.append(f"no one-shot watch: {logs[:2]}")
             record(name, not bad, " ".join(bad) or f"own watch per slot={w}")
         except Exception as e:
