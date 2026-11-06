@@ -37,9 +37,11 @@ inline int add_read_range(struct read_log_config *cfg, const char *text) {
     return 1;
 }
 
-/* Drivers: the backend for the NtClose probe. Same as the open probe, except hw: there it
-   would take the 4th debug register, and call_original on hw needs one free for the duration
-   of each call (track_open_process). A close is rare -- a software breakpoint costs nothing. */
+/* Drivers: the DEFAULT backend for the NtClose probe (--close-backend overrides it). Same as
+   the open probe, except hw: there it would take a 4th debug register. That works -- with all
+   four taken, call_original on an hw open borrows the open probe's own register on the hit
+   thread for the call (regress gated-e2e-*-fhw-ohw-chw-rhw) -- but a recursive open on that
+   thread meanwhile would go uncounted, and a close is rare: a software breakpoint costs nothing. */
 inline uint32_t close_backend_for(uint32_t open_backend) {
     return open_backend == PROBE_HW ? PROBE_BREAKPOINT : open_backend;
 }
