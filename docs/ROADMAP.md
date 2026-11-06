@@ -1486,6 +1486,23 @@ Real-bug candidates (reproduce on runners, not on the VM so far):
 - Seen once each, undetermined: x86 `logs-wedge-suspend` (`wedged=0`), x64 `detach-inline` (`1 thread(s) frozen;
   all clean` yet FAIL, detail cut).
 
+runfix2 results (2026-11-06/07; diagnostics through a scratch branch `runfix2-diag` whose workflow pushes each job's
+full logs to a `diaglogs/<run>-<job>` branch -- readable with git, no API token):
+- Kill loop (`ci-diag/lckill.py`: lifecycle_target + lifecycle_driver, the driver killed 0.02-0.2 s into the attach):
+  before 3 deaths / ~1130 kills (inline+mixed, windows-2022); with the install fix 0 deaths but 11 hangs / ~2900
+  (inline, 0.04-0.06 s); with both fixes **0 failures / 2557** (x64+x86, windows-2022+2025, run 42217463236).
+- windows-2025 full suite (branch `runfix2-w25`, run 42218924878): x86 transparency/detach rows PASS, cet-hw 48/48
+  (+2 SKIP); remaining failures are other findings (crash-logs-inline-4t, realapps-ps-fileversion x86, wmic/oldcrt
+  absent, known hunt rows), plus single occurrences: attach-new-inline (load flake, above) and
+  `lifecycle-detach-early-120-inline` (target 0xC0000005 in an agent thread while hunt_dll unloads; PRE-EXISTING:
+  the same signature in 1 of 128 rows on merge-frida's agent, 0 of 128 on runfix2, diag run 42224315607 -- L5
+  family, open). `prehook-attach` failed once on windows-2025 (OSError: the target was gone 3 s into the attach);
+  14/14 PASS in reruns on both arches.
+- VM (Windows 10, both arches): `--only transparency,check_detach,conformance,callfunc,check_cet_policy,callorig`
+  x64 88/89, x86 84/85 (the one FAIL both times: `callfunc-kill-reuse` "no thread reused the dead id in 3000
+  threads" -- the check's precondition on that host, unrelated); `UHH_LC=controller-killed,killed-in-freeze
+  --only lifecycle` 3 x 6/6 on each arch.
+
 Environment (runner) effects, not UHH bugs:
 - **patch-race-frozen (x64 + x86, deterministic)**: hook_cycles=[1,1,1,1], need >= 4 in the target's 12 s. Measured
   (diag): one attach -> install -> 400 ms -> detach cycle against 8 spinning threads takes 6-8.5 s on the 2-core
