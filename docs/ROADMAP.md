@@ -1248,6 +1248,54 @@ INT3"); nothing shipped links it. `--only cxlib`.
   millions of parsed lines in Python memory). With the streaming reader, inline cycles took 1.0-2.9 s on
   x64 and 1.2-8.0 s on x86 (hw/breakpoint 0.9-3.3 s): 3/3 PASS per arch, 8 cycles each, rounds 2-5.
 
+## Codex review 2 findings (2026-11-06, code merged that day, regress `cx2-*`)
+A second read-only Codex review (merge-frida 6f0c533) reported 3 high-confidence bugs. Each was
+reproduced by a check that FAILED on the unfixed library (commit 85fd858 + the fixtures only),
+then fixed. Fixtures: `ctrl_target faultmix`, `co_target susp / many / manydead`. `--only cx2`.
+- ✅ (X1) **Real.** breakpoint (647130f): after a faulting probed instruction was passed to the program,
+  the thread's next INT3 at the site was always taken for the handler's RETRY -- also when the handler
+  had SKIPPED the instruction or UNWOUND out of it (SEH `__except`) and the next call executed the site
+  afresh: no callback, no hit (gospel: hits == logs, identical across backends). Reproduced:
+  `cx2-faultfresh-breakpoint` hits=101 logs=101 of 300 calls (retry / skip / unwind in turn), x64 and
+  x86; hw and inline 300/300. Fix (`fault_retried`): the exception's dispatcher frame, still on the
+  thread's stack below the faulting SP, decides. A retry is the first instruction after the handler's
+  CONTEXT was restored: that CONTEXT names the site and holds exactly the thread's registers (whatever
+  the handler repaired); after a skip it names another address, after an unwind it no longer matches
+  (x86: RtlUnwind marks the paired EXCEPTION_RECORD unwinding). The program never sees a trap flag
+  (ctrl-fault-*, cdx-faultreg-* unchanged). After: 300/300 on every backend, x64 and x86.
+  Residual: a hand-rolled x86 unwind (no RtlUnwind) whose next execution of the site has every
+  register identical and the stack below untouched is still taken for a retry.
+- ✅ (X2) **Real.** x86 controller (d7140db): GuardTouch listed a thread touched by a WOW64
+  Get/SetThreadContext (an implicit suspend inside the call) as an unconditional guard hold. A
+  controller killed while the entry was published but the implicit suspension was not in place
+  (before the call, or after it returned) made the guard resume a suspension the PROGRAM held.
+  Reproduced (test-hook build, `UHH_TEST_DIE_IN_TOUCH_MODE=before`): `cx2-touchprog-hw` the program's
+  ResumeThread returned 0 (want 1), its suspended worker ran 20-21 iterations. Fix: guard entries carry
+  a floor (`probe_agent_guard::held_floor`, protocol v21): GuardTouch records the thread's suspend
+  count before the call and the guard resumes it only while the count is above that (conditional
+  entries first, then our own holds once each). The count is NtQueryInformationThread
+  ThreadSuspendCount, which INCLUDES the debug freeze (+1 on every thread while the target is stopped
+  at an event; measured: a program-suspended thread read 2 inside an event, a running one 1 -- the
+  first version of this fix therefore left `cxlib-touchkill-hw` hung); the freeze is read off the
+  agent's service thread, which nobody suspends (`guard.service_tid`), and subtracted. Unknown
+  (no agent service thread, Windows < 8.1): an unconditional entry, as before. The check runs both
+  deaths -- before the implicit suspension and with it in place (on a program-suspended thread):
+  the guard must leave exactly the program's one suspension. After: PASS; `cxlib-touchkill-hw` PASS.
+  Open (same class, not changed): guard_sync's unconditional entries for the event threads and the
+  call_func/call_original thread (`handling`, `in_call_tid`) stay listed until the next sync, i.e.
+  past ContinueDebugEvent; a program that suspends such a thread right then and a controller death
+  before the next event would release it.
+- ✅ (X3) **Real.** inline agent: the thread table held 4096 thread ids and never freed a slot, so
+  after 4096 distinct probe-hitting threads over the process's life every further thread ran its
+  callbacks untracked (no active record): the detach drain counted 0 live callbacks, gave up after
+  three answers and the callback's log was lost (in_flight=1); such threads also had no recursion
+  guard (call_func refused). Reproduced: `cx2-manythreads-inline` / `cx2-manydead-inline` (4200 threads
+  alive at once, one hit each, then a callback outliving a detach, while they live / after they
+  exited): late log delivered=0, in_flight=1, x64 and x86. Fix: a full table takes over a dead
+  thread's slot (marked moving while the owner is re-checked, one sweeper at a time, its own hits
+  pass through); with more than 4096 such threads alive an overflow table (256) holds the rest; a
+  thread with no slot at all is counted live by the drain (`g_untracked_running`). After: PASS both.
+
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`
 - ✅ Per-log overhead ceilings in the suite (`log-throughput-*`)
