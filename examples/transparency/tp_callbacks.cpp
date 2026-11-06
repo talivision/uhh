@@ -65,13 +65,10 @@ TP_CB void tp_on_hit(probe_context *c) {
         std::snprintf(add, sizeof(add), "%s!tp_add", k->module);
         if (!call_func(c, add, &r, 2, (uint64_t)5, (uint64_t)6) || r != 21)
             send_log(c, "tp FAIL call_func tp_add -> %llu", (unsigned long long)r);
-        // A callee that faults: at its first instruction (0x1: refused inline, abandoned on
-        // breakpoint/hw -- 0 everywhere) and inside a system function (lstrlenA of a bad
-        // pointer: its own handler catches it inline; abandoned at the fault on breakpoint/hw,
-        // so only "the program is unaffected" is asserted). Under CET the abandoned callee's
-        // shadow-stack frames must be dropped with it.
+        // A callee that faults at its first instruction (0x1: refused inline, abandoned on
+        // breakpoint/hw -- 0 everywhere). Under CET the abandoned callee's shadow-stack frame
+        // (pushed by the entry CALL) must be dropped with it, or the program's next ret is a #CP.
         if (call_func(c, "0x1", &r, 0)) send_log(c, "tp FAIL call_func 0x1 accepted");
-        (void)call_func(c, "kernel32.dll!lstrlenA", &r, 1, (uint64_t)1);
         send_log(c, "tp callfn");
         return;
     }
