@@ -230,7 +230,7 @@ reads, a slow (50 ms) callback under 32 threads.
 - ✅ (C20) attach_new: `attach-new-{breakpoint,hw,inline}` on ntdll!NtReadVirtualMemory; no sleeps (decoy's gate line, tracer's 'probe: waiting for a new' and 'probe: active' lines). The target gate stays: attach_new polls, so reads could otherwise precede the attach
 - ✅ (C6) anti-tamper/anti-debug: targets take a different path on detection (probed function called with -1); asserted per backend vs an uninstrumented baseline (`antitamper-*`, `antidebug-*`); per-backend visibility documented in examples/realworld/README.md (INT3/inline: code bytes vs disk; hw: DR7 only; debugger visible under every backend -- not hidden)
 - ⬜ (C7) Shared state across backends -- `UHH_SHARED` (user-approved 2026-11-05). Default stays "probes that share state use one backend". Opt-in: globals marked `UHH_SHARED` live in a shared PE section (`/SECTION:uhhshr,RWS`) of the callbacks DLL; the controller runs breakpoint/hw callbacks from ITS copy of that same DLL file and the target runs inline callbacks from its copy, so both see the same physical pages with plain native access. Per-session copy of the DLL (unique path) so separate sessions never share; deleted at close. Rules: no pointers in shared state (bases differ), constant/zero init only, lock-free atomics for sync. Only enabled when the DLL actually has the section (no behaviour change otherwise).
-  - ⬜ test: gated_config with MIXED backends (opens on breakpoint, reads on inline and vice versa) builds one handle->pid map; all reads attributed
+  - ✅ test: gated_config with MIXED backends builds one handle->pid map; all reads attributed -- `gated-e2e-*` (every flag/open/close/read backend assignment, launch + attach before/after the config parse, exact per-thread ground truth from the target; see "E2E gated_config evaluator findings"), plus `shared-mix-*`
   - ⬜ benchmark: per-hit cost with UHH_SHARED state vs plain globals, every backend -- must be equal
 - ⬜ Log sink speed (simple): UHH logs/s to NUL vs a plain writer's rate into a file; one manual console run. Bar: UHH is never the bottleneck.
 - ✗ (C10) helpers in probe_app: requested by the user; (C18) asm configparse: deliberate stable symbol+offset (add a PDB-local compiled variant later); (C19) _NT_SYMBOL_PATH is the requested symbol mechanism (tests may clear it)
@@ -1207,6 +1207,49 @@ INT3"); nothing shipped links it. `--only cxlib`.
   (x87 SW/TW 0041/c000 vs 0000/0000). After (9aef7c1): `--only cxlib,ctrl-review,cdx-review` 38/38 + 1 SKIP
   (touchkill: x86 only) on x64 (cxlib 9/9 on the final build), 39/39 on x86; `--only callorig,lifecycle,
   detach,interrupt,conformance,transparency,agent_review,gated` 146/146 on x64 and 146/146 on x86.
+
+## E2E gated_config evaluator findings (2026-11-06, regress `gated-e2e-*`)
+The flagship use case end to end against ground truth written by the TARGET itself.
+`probe_app --churn --truth FILE` opens its helpers, reads them and closes them over and over:
+first serially (a freed handle value is handed out again at once, for the next helper's pid),
+then 8 threads x 16 rounds at once. Opens alternate ntdll!NtOpenProcess (OpenThunk) and
+kernel32!OpenProcess, reads (1..256 bytes) alternate ReadThunk and kernel32!ReadProcessMemory,
+and every third cycle reads once through a DUPLICATE of the helper's CreateProcess handle
+(NtDuplicateObject: the open probe never sees it, and it nearly always gets the value just
+closed). Each operation is recorded by the thread that made it (tid, handle, pid, address,
+size, in order). Per run: 136 opens, 374 reads (46 through duplicates), 182 closes, handle
+values reused for different pids (4-34 per run), and 42-46 of the 46 duplicates on a value the map knew.
+`--parse-early` loads configparse.dll and parses the config once before the gate.
+The drivers gained per-role backends: `gated_config --close-backend`, and
+`uhh_attach --open/close/read-backend` with optional `--pid`/`--range`.
+- Matrix: every assignment of flag / open / close / read to {breakpoint, hw, inline} (81) x
+  {launch (gated_config); attach-pre (uhh_attach at the gate, configparse.dll not loaded: the flag
+  probe is pending); attach-post (configparse.dll loaded and parsed once before the attach: the
+  flag probe arms on a loaded module, the reload counts)} = 243 runs per arch, ~3.5 min x64 and
+  ~5 min x86. Asserted exactly in each run:
+  - one flag hit and one override;
+  - per target thread, the delivered `open`/`map`/`read` logs equal the target's own record in
+    order: the right pid for a reused handle, no unmapped read, and a duplicate-handle read logged
+    pid=0;
+  - read hits == read logs == truth reads, open hits == truth opens;
+  - logs_written == probe_log lines on stdout == records in the session file, and log_dropped ==
+    callbacks_interrupted == 0;
+  - no warning or refusal on stderr, the checksum equal to an uninstrumented run, exit 0.
+  **x64 244/244 PASS, x86 244/244 PASS** (243 combinations + baseline), twice per arch (the second time inside
+  `--only gated,attach,callorig,quickstart`: 322/322 on x64 and on x86).
+- No combination is refused. At most 4 probes are hw, and with all four on hw (fhw-ohw-chw-rhw),
+  call_original on the hw open borrows that probe's own debug register (session.cpp
+  call_original_in_place). The `close_backend_for` comment in callbacks.h said a 4th hw probe
+  would leave call_original without a register. That is outdated; the comment is corrected.
+  close_backend_for stays the default (a close is rare; bp costs nothing).
+- Sensitivity control: with `forget_closed_handle` disabled (a VM-only mutation, reverted), every
+  sampled combination FAILs: the duplicate-handle read is logged with the stale pid of the closed
+  handle (e.g. `want ('read', 0x140, 0, '?') got ('read', 0x140, 8564, 'probe_app.exe')`). So the
+  close probe is load-bearing and the evaluator sees it.
+- No library discrepancy found: the UHH_SHARED handle map is exact across every backend mix and
+  both attach timings, on both arches (C7's mixed-backend test item is closed by this).
+- Open: these are functional sizes. A long mixed-backend churn soak (`scripts/soak.py` has no
+  churn phase) and the UHH_SHARED per-hit benchmark (C7) are not done.
 
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`

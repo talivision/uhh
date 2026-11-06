@@ -50,6 +50,9 @@ Checks:
   - logs-*: adversarial log delivery (examples/logs_eval): exact text for hostile formats on
     every backend, per-thread order across mixed backends, a producer killed/suspended
     mid-record, the controller killed while attached, the stdout reader going away.
+  - gated-e2e-<mode>-f<b>-o<b>-c<b>-r<b>: the flagship use case end to end, every backend for
+    each of the flag/open/close/read probes, launch and attach (before/after the config parse),
+    compared EXACTLY with the target's own per-thread record (probe_app --churn --truth).
 A missing project-built binary (an example not built) is a FAIL, never a SKIP (missing_bin()).
 SKIP is only for a check that does not apply to this build (x86-only / x64-only: skip()) or
 an absent OPTIONAL EXTERNAL dependency -- Frida, Intel SDE, a system program this Windows
@@ -7658,6 +7661,8 @@ def e2e_expected(truth):
             by[e["tid"]] += [("open", e["pid"], "probe_app.exe"), ("map", e["handle"], e["pid"], "probe_app.exe")]
         elif e["op"] == "read":
             by[e["tid"]].append(("read", e["handle"], e["pid"], "probe_app.exe", e["addr"], e["size"]))
+        elif e["op"] == "read-unmapped":      # through a duplicated handle the map never saw
+            by[e["tid"]].append(("read", e["handle"], 0, "?", e["addr"], e["size"]))
     return by
 
 
@@ -7713,13 +7718,18 @@ def e2e_judge(combo, rc, target_rc, objs, t_objs, stderr_text, truth, base, flag
     fl, op, cl, rd = (pr.get(FLAG_LOCATION, {}), pr.get(OPEN_LOCATION, {}), pr.get(E2E_CLOSE_LOCATION, {}),
                       pr.get(READ_LOCATION, {}))
     t_opens = [e for e in truth if e["op"] == "open"]
-    t_reads = [e for e in truth if e["op"] == "read"]
+    t_reads = [e for e in truth if e["op"] in ("read", "read-unmapped")]
+    t_unmapped = [e for e in truth if e["op"] == "read-unmapped"]
+    t_dups = [e for e in truth if e["op"] == "dup"]
     t_closes = [e for e in truth if e["op"] == "close"]
     # The workload really did reuse handle values for different pids (else this proves nothing).
     pids_of = collections.defaultdict(set)
     for e in t_opens:
         pids_of[e["handle"]].add(e["pid"])
     reused = sum(1 for v in pids_of.values() if len(v) > 1)
+    # A duplicate that got a value the map once knew (so a stale entry would mislabel it).
+    known = {e["handle"] for e in t_opens}
+    stale_bait = sum(1 for e in t_dups if e["handle"] in known)
     if rc != 0 or target_rc != 0 or rep.get("app_exit") not in (0, None):
         bad.append(f"rc={rc}/{target_rc} app_exit={rep.get('app_exit')}")
     if rep.get("error") is not None:
@@ -7728,8 +7738,10 @@ def e2e_judge(combo, rc, target_rc, objs, t_objs, stderr_text, truth, base, flag
             a.get("successful_reads") != base.get("successful_reads") or a.get("opened") != base.get("opened")):
         bad.append(f"app reads_enabled={a.get('reads_enabled')} reads={a.get('successful_reads')}/{base.get('successful_reads')} "
                    f"opened={a.get('opened')}/{base.get('opened')} checksum_same={a.get('checksum') == base.get('checksum')}")
-    if len(t_reads) != base.get("successful_reads") or len(t_opens) != base.get("opened") or not reused:
-        bad.append(f"truth reads={len(t_reads)} opens={len(t_opens)} reused_handles={reused}")
+    if (len(t_reads) != base.get("successful_reads") or len(t_opens) != base.get("opened") or not reused or
+            not stale_bait or len(t_unmapped) != len(t_dups)):
+        bad.append(f"truth reads={len(t_reads)} opens={len(t_opens)} reused_handles={reused} "
+                   f"dups={len(t_dups)} stale_bait={stale_bait} unmapped_reads={len(t_unmapped)}")
     want_bk = {"flag": (fl, fb), "open": (op, ob), "close": (cl, cb), "read": (rd, rb)}
     wrong_bk = {k: p.get("backend") for k, (p, b) in want_bk.items() if p.get("backend") != b or p.get("active") is not True}
     if wrong_bk:
@@ -7737,17 +7749,25 @@ def e2e_judge(combo, rc, target_rc, objs, t_objs, stderr_text, truth, base, flag
     if fl.get("hits") != flag_hits_want or rep.get("overrides") != 1:
         bad.append(f"flag hits={fl.get('hits')} overrides={rep.get('overrides')}")
     want, (got, foreign, extra) = e2e_expected(truth), e2e_got(objs, hp)
-    extra_bad = [x for x in extra if x[1] == "map" and not any(y[1] == "open" and y[2] == x[3] for y in extra)]
+    # Extra (non-helper) opens: per thread, in order, each `open pid=P name=N` is followed by
+    # exactly one `map handle=H -> pid=P name=N` (H != 0) of its own -- nothing else, nothing missing.
+    extra_bad, ex_by = [], collections.defaultdict(list)
+    for x in extra:
+        ex_by[x[0]].append(x[1:])
+    for tid, seq in ex_by.items():
+        if len(seq) % 2 or any(not (o[0] == "open" and m[0] == "map" and m[1] != 0 and m[2] == o[1] and m[3] == o[2])
+                               for o, m in zip(seq[0::2], seq[1::2])):
+            extra_bad.append((tid, seq[:4]))
     if foreign or extra_bad:
-        bad.append(f"foreign={foreign[:2]} extra={extra[:2]}")
+        bad.append(f"foreign={foreign[:2]} extra_unpaired={extra_bad[:2]}")
     if op.get("hits") != len(t_opens) + sum(1 for x in extra if x[1] == "open"):
         bad.append(f"open hits={op.get('hits')} want={len(t_opens)}+{sum(1 for x in extra if x[1] == 'open')} extra")
     n_read_logs = sum(1 for seq in got.values() for t in seq if t[0] == "read")
     if rd.get("hits") != len(t_reads) or n_read_logs != len(t_reads):
         bad.append(f"read hits={rd.get('hits')} logs={n_read_logs} truth={len(t_reads)}")
-    if (cl.get("hits") or 0) < len(t_closes):
+    if (cl.get("hits") or 0) < len(t_closes):        # the program closes other handles too
         bad.append(f"close hits={cl.get('hits')} < truth closes {len(t_closes)}")
-    unmapped_n = sum(1 for seq in got.values() for t in seq if t[0] == "read" and t[2] == 0)
+    unmapped_n = sum(1 for seq in got.values() for t in seq if t[0] == "read" and t[2] == 0) - len(t_unmapped)
     wrong_tids = [tid for tid in set(want) | set(got) if want.get(tid, []) != got.get(tid, [])]
     if wrong_tids:
         tid = wrong_tids[0]
@@ -7764,7 +7784,7 @@ def e2e_judge(combo, rc, target_rc, objs, t_objs, stderr_text, truth, base, flag
     if warns:
         bad.append(f"warnings={warns[:2]}")
     detail = (f"reads={n_read_logs}/{len(t_reads)} opens={op.get('hits')}/{len(t_opens)} closes>={len(t_closes)}:"
-              f"{cl.get('hits')} reused={reused} logs={rep.get('logs_written')}/{delivered}/{in_file} "
+              f"{cl.get('hits')} reused={reused} dup_unmapped={len(t_unmapped)} stale_bait={stale_bait} logs={rep.get('logs_written')}/{delivered}/{in_file} "
               f"flag={fl.get('hits')}/{rep.get('overrides')}" + (f" extra_opens={len(extra)}" if extra else ""))
     return not bad, detail + ("" if not bad else " BAD: " + " | ".join(bad))
 
@@ -7819,7 +7839,7 @@ def e2e_attach(combo, threads, rounds, truth, post):
                 pr.kill()
 
 
-def check_gated_e2e(threads=4, rounds=8):
+def check_gated_e2e(threads=8, rounds=16):
     """The flagship use case (examples/gated_config + examples/attach) end to end with EXACT
     ground truth written by the target itself (probe_app --churn --truth): EVERY assignment of
     the four roles -- flag (configparse.dll!ParseConfig+0x16), open (ntdll!NtOpenProcess,
@@ -7834,7 +7854,9 @@ def check_gated_e2e(threads=4, rounds=8):
     and closed over and over from several threads (handle values reused for different pids;
     asserted). Exact: one flag hit and one override; per target thread the delivered `open`,
     `map` and `read` logs equal the target's own record in order (right pid and name for a
-    reused handle, no unmapped read); read hits == read logs == truth; open hits == truth;
+    reused handle, no unmapped read; a read through a DUPLICATED helper handle -- never seen by
+    the open probe, usually holding a value the map knew -- logged unmapped, pid 0: the close
+    probe forgot the old value); read hits == read logs == truth; open hits == truth;
     logs_written == delivered on stdout == records in the session file; nothing dropped or
     interrupted; no warning; checksum == an uninstrumented run; exit 0 everywhere.
     UHH_E2E=<comma substrings of the record name> runs a subset (debugging)."""
@@ -7850,9 +7872,11 @@ def check_gated_e2e(threads=4, rounds=8):
                      "--config", "reads_enabled=1"], timeout=120)
         base = app(bo)
         bt = e2e_truth(tmp / "base.jsonl")
-        ok = (base.get("reads_enabled") == 1 and base.get("successful_reads") == sum(e["op"] == "read" for e in bt) > 0
-              and base.get("opened") == sum(e["op"] == "open" for e in bt) == sum(e["op"] == "close" for e in bt))
+        ok = (base.get("reads_enabled") == 1 and base.get("successful_reads") == sum(e["op"] in ("read", "read-unmapped") for e in bt) > 0
+              and base.get("opened") + sum(e["op"] == "dup" for e in bt) == sum(e["op"] == "close" for e in bt)
+              and base.get("opened") == sum(e["op"] == "open" for e in bt))
         record("gated-e2e-baseline", ok, f"uninstrumented: reads={base.get('successful_reads')} opens={base.get('opened')} "
+                                         f"dups={sum(e['op'] == 'dup' for e in bt)} "
                                          f"checksum={base.get('checksum')}")
         if not ok:
             return

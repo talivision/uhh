@@ -33,7 +33,9 @@
 // and kernel32!ReadProcessMemory: both end in ntdll!NtReadVirtualMemory), CloseHandle
 // (ntdll!NtClose). Every operation is recorded by the thread that made it (tid, handle, pid,
 // address, size; a global sequence number: an open after it returned, a close before it
-// starts) and written to FILE as JSON lines in sequence order at the end. The schedule and
+// starts) and written to FILE as JSON lines in sequence order at the end. Every third cycle
+// also reads once through a DUPLICATE of the helper's process handle (op "dup", then
+// "read-unmapped"): a handle the open probe never saw, usually with the value just closed. The schedule and
 // the checksum (sum of every byte read) are deterministic, so an uninstrumented run gives
 // the same checksum.
 // --parse-early: load configparse.dll and parse the config once BEFORE the gate too (its
@@ -284,6 +286,21 @@ static bool churn_cycle(const Helper &h, uint64_t t, uint64_t round, ChurnResult
         ok = churn_read(h, handle, size, off, ((k + round) & 1) != 0, r);
     }
     churn_close(handle, h, r);
+    // Every third cycle: a handle the open probe never sees -- a duplicate of the helper's
+    // CreateProcess handle (ntdll!NtDuplicateObject, not NtOpenProcess) -- usually gets the
+    // value just closed, which the map knew for some pid. One read through it must be logged
+    // as UNMAPPED (pid 0): only the close probe forgetting the old value makes that so.
+    if (ok && (t + round) % 3 == 0) {
+        HANDLE dup{};
+        if (!DuplicateHandle(GetCurrentProcess(), h.pi.hProcess, GetCurrentProcess(), &dup, PROCESS_VM_READ, FALSE, 0) || !dup) {
+            r.error = "duplicate of a helper handle failed"; return false;
+        }
+        r.log.push_back({g_seq.fetch_add(1), 'D', GetCurrentThreadId(), (uint64_t)(uintptr_t)dup, h.hello.pid, 0, 0});
+        const unsigned size = kChurnSizes[(t + round) % kChurnSizeCount];
+        ok = churn_read(h, dup, size, (unsigned)((t * 11 + round) % (kBufferSize - size + 1)), (round & 1) != 0, r);
+        if (ok) r.log.back().op = 'U';                       // a read through an unmapped handle
+        churn_close(dup, h, r);
+    }
     return ok && r.error.empty();
 }
 
@@ -318,7 +335,7 @@ static ChurnResult run_churn(std::vector<Helper> &helpers, size_t threads, uint6
     if (FILE *f = std::fopen(truth.c_str(), "wb")) {
         for (const auto &e : all.log)
             std::fprintf(f, "{\"seq\":%llu,\"op\":\"%s\",\"tid\":%lu,\"handle\":%llu,\"pid\":%lu,\"addr\":%llu,\"size\":%u}\n",
-                         (unsigned long long)e.seq, e.op == 'O' ? "open" : e.op == 'R' ? "read" : "close",
+                         (unsigned long long)e.seq, e.op == 'O' ? "open" : e.op == 'R' ? "read" : e.op == 'U' ? "read-unmapped" : e.op == 'D' ? "dup" : "close",
                          (unsigned long)e.tid, (unsigned long long)e.handle, (unsigned long)e.pid,
                          (unsigned long long)e.addr, e.size);
         std::fclose(f);
