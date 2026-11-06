@@ -1417,18 +1417,29 @@ exposes no CET to the guest (`cpuid_cet_ss=0, enforced=false`). On windows-2025 
 the CET item under "Production readiness").
 
 Real-bug candidates (reproduce on runners, not on the VM so far):
-- **crash-logs-inline-4t (both images; x86 8/8 runs, x64 6/8; never on the VM)**: `logs = hits - 1..3` when the
-  target dies (0xC0000005) with 4 inline threads logging. The missing logs are of threads that were counted as a hit
-  but killed by the process death before their callback's `send_log` ran (the gap is always <= threads-1, never on
-  breakpoint/hw, where the callback runs in the controller). So nothing in the ring is lost; the inline hit counter
-  counts a callback that never completed. Owner decision: count inline hits after the callback (or report
-  `callbacks_interrupted`) vs relax the check to `hits - logs <= threads - 1`.
+- ✅ **crash-logs-inline-4t (both images; x86 8/8 runs, x64 6/8; never on the VM)** -- fixed (runfix1). The gap
+  `logs = hits - 1..3` was never a lost log: the report already carried `callbacks_interrupted` and runner diag
+  (runfix1-diag run 42191637133, 72 runs, 6 jobs) showed `hits == logs + interrupted` exactly in 69 -- the check
+  compared logs with hits. The other 3 (x64) exposed a real accounting bug: `logs + interrupted = hits + 1`, a thread
+  killed after publishing its log but before its callback returned was counted as a log AND as interrupted (the
+  documented v20 edge). Fix (agent protocol v21): the callback's FIRST record carries its hit's unaccounted unit
+  (`probe_agent_log::carry`, published by the ring's single seq store) and the controller retires it when it takes
+  the record (ring or PROBE_IPC_LOG); a callback that returns without logging drops it itself; unhook / detach drain
+  wait on a separate `running` count. So a kill at any instant leaves hits == logs + dropped + interrupted exactly.
+  `check_crash_logs` now requires exactly that (dropped 0; inline interrupted <= threads-1; bp/hw 0; 1 thread: n
+  logs, 0 interrupted). Evidence: runner diag 42192716058 84/84 exact (7 jobs, x64+x86), 42194976034 36 full-check
+  runs PASS, VM x64+x86 PASS.
 - **lifecycle-controller-killed-{mixed x64 (full run), inline x86 (diag 1 of 4)}**: kill@early-0.05 -> target DEAD
   0xC0000005, not progressing. The L11 race (controller killed during install) with a new signature (access violation,
   inline/mixed configs). 2 of ~7 runs on windows-2022; 0 on windows-2025.
-- **ret-probe-breakpoint (x64 + x86, 1 of 9 each)**: hits=5 for 4 NtOpenProcess calls (hw: never). Either the
-  breakpoint backend double-reports a `ret` (the hunt-ctx A4 class) or a sporadic 5th NtOpenProcess by a system
-  component in that run; needs the per-hit log (caller/tid) to decide.
+- ✅ **ret-probe-breakpoint (x64 + x86, 1 of 9 each)** -- not a double count: a real 5th NtOpenProcess by the
+  target. Per-hit stacks (runner diag 42192716058): on the FIRST launch of probe_app on a fresh runner (7 of 7 jobs,
+  x64 and x86; never on a later run, so hw -- which runs second -- never saw it) the shim engine opens a process
+  during loader init: `ntdll!LdrInitializeThunk -> LdrInitShimEngineDynamic -> apphelp!SE_InitializeEngine ->
+  apphelp!Sdb* -> KernelBase!OpenProcess -> NtOpenProcess`. The check now takes its ground truth per hit from the
+  stack (`--stack`): hits with a probe_app frame must equal the target's `opened` count, every hit is logged, other
+  hits must be system-only (reported as `system_opens`). Evidence: 42194976034 12/12 jobs `check_ret_probe` first on
+  a fresh runner PASS (4/4) and 36/36 later runs PASS.
 - **x86 transparency-{breakpoint,hw}-callfn on windows-2025 (build 26100)**: `call_func GetThreadPriority` /
   `TlsGetValue` fail in the callback, the hw run's target dies 0xC0000005. Not CET (WoW64 is not enforced); a
   breakpoint/hw `call_func` problem on WoW64 of the newer Windows build. Needs a Windows 11 24H2 / Server 2025 VM.

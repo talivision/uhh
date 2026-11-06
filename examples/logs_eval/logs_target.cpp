@@ -122,9 +122,16 @@ static int wedge(bool kill, bool exit_after = false) {
     probe_agent_shared *sh = map_ring();
     if (!sh) { printf("{\"kind\":\"app\",\"error\":\"no shared ring\"}\n"); return 3; }
     HANDLE w = CreateThread(nullptr, 0, forever_thread, nullptr, 0, nullptr);
+    // The claim->publish window is a few hundred instructions, found by sampling: suspend, look,
+    // resume. Bounded by TIME, not a count (a slow, 2-vCPU CI runner ran out of 200000 tries:
+    // wedged=0 in 1 of ~10 logs-wedge-exit runs), and each sample lands at a varying phase of the
+    // producer's loop (a short random spin), so a sampling rhythm locked to the loop cannot miss it.
     int wedged = 0, tries = 0;
-    for (; tries < 200000 && !wedged; ++tries) {
+    unsigned rnd = GetTickCount() | 1;
+    for (const ULONGLONG until = GetTickCount64() + 60000; !wedged && GetTickCount64() < until; ++tries) {
         Sleep(0);
+        rnd = rnd * 1103515245u + 12345u;
+        for (volatile unsigned spin = (rnd >> 16) & 1023; spin; --spin) {}
         if (SuspendThread(w) == (DWORD)-1) break;
         // A suspend is asynchronous: GetThreadContext waits until the thread really stopped.
         CONTEXT cx{}; cx.ContextFlags = CONTEXT_CONTROL; GetThreadContext(w, &cx);

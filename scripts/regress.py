@@ -6174,8 +6174,10 @@ def check_logs_wedge(threads=4, count=3000):
                           f"undelivered_live={a.get('undelivered_after_phase2')}")
             ok = (live_ok and a.get("wedged") == 1 and rep.get("log_dropped") == 0 and
                   interrupted == (0 if mode == "suspend" else 1) and hits is not None and hits == logs + interrupted)
-            record(name, ok, f"wedged={a.get('wedged')} {detail} hits={hits} logs={logs} interrupted={interrupted} "
-                             f"dropped={rep.get('log_dropped')} rc={r.returncode}")
+            # (exit: rc 1 is expected -- the target exits 7 -- and not checked; wedged=1 is the
+            # precondition: the producer was caught between claiming and publishing its slot.)
+            record(name, ok, f"wedged={a.get('wedged')} tries={a.get('tries')} {detail} hits={hits} logs={logs} "
+                             f"interrupted={interrupted} dropped={rep.get('log_dropped')} rc={r.returncode}")
         except subprocess.TimeoutExpired:
             record(name, False, "session HUNG (180 s): logging stalled behind the unpublished slot")
         except Exception as e:
