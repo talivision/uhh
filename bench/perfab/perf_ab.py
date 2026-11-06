@@ -129,10 +129,10 @@ def run_to_file(side, cmd, timeout, out_name="out.jsonl", stdin=subprocess.DEVNU
 
 
 # ---------------------------------------------------------------- cases
-# Calls PER THREAD per (backend, method); default per backend. Sized for ~1-3 s a run.
+# Calls PER THREAD per (backend, method); default per backend. Sized for seconds a run.
 HIT_CALLS = {
     ("base", None): 10_000_000,
-    ("inline", None): 1_000_000, ("inline", "send_log_stack"): 100_000,
+    ("inline", None): 200_000, ("inline", "send_log_stack"): 50_000,
     ("hw", None): 20_000, ("watch", None): 20_000, ("breakpoint", None): 20_000,
     ("hw", "send_log_stack"): 5_000, ("breakpoint", "send_log_stack"): 5_000,
     ("hw", "call_func"): 5_000, ("breakpoint", "call_func"): 5_000,
