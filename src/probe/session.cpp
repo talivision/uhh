@@ -5137,7 +5137,10 @@ static void park_thread(probe_session *s, DWORD tid, DWORD disposition) {
     HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
     if (!t) return;
     CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
-    const uint64_t stub = GetThreadContext(t, &c) && !in_yield_stub(s, (uint64_t)EMU_IP(c)) ? yield_stub(s, tid) : 0;
+    // Not a thread resuming with RF or TF (a hw hit re-run at its site, a step): the stub's
+    // first instruction would consume the flag, and the site would trap again at the jump back.
+    const uint64_t stub = GetThreadContext(t, &c) && !(c.EFlags & 0x10100u) && !in_yield_stub(s, (uint64_t)EMU_IP(c))
+                          ? yield_stub(s, tid) : 0;
     if (stub) {
         const uint64_t resume = (uint64_t)EMU_IP(c);
         size_t w = 0, w2 = 0;
