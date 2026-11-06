@@ -271,7 +271,7 @@ Ends the session and frees it; `s` is invalid afterwards.
   (`probe: close: still waiting for probe_run to stop (Ns)` every 15 s), then tears down.
 - A launched target that is still running is terminated (exit code 3).
 - An attached target that is still running is detached. stderr then shows
-  `probe: detached: hits=.. logs_written=.. log_dropped=.. in_flight=..`
+  `probe: detached: hits=.. logs_written=.. log_dropped=.. in_flight=.. running=..`
   (hits = logs_written + log_dropped + in_flight).
 - Detach waits for inline callbacks that are still running and can finish (see
   [limitations.md](limitations.md#detach-and-close)).

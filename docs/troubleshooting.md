@@ -121,8 +121,8 @@ following it there`, `probe: repaired hardware breakpoint state on thread N`,
 |---|---|---|
 | `probe: interrupted: detaching (probes removed, the target keeps running)` / `... ending the target` | Ctrl+C / Ctrl+Break ended the session | a second press ends the tool itself |
 | `probe: detach: still waiting for N running callback(s) to finish (Ns)` | inline callbacks are still running; detach delivers their logs first, with no time limit | find what the callback is blocked on (a lock, a wait); a deadlocked callback keeps the detach waiting |
-| `probe: detach: N callback(s) cannot finish now (thread gone or suspended); not waiting for them` | callbacks on dead or suspended threads | none; they appear as `in_flight=` |
-| `probe: detached: hits=.. logs_written=.. log_dropped=.. in_flight=..` | final counts after the detach | hits = logs_written + log_dropped + in_flight |
+| `probe: detach: N callback(s) cannot finish now (thread gone or suspended); not waiting for them` | callbacks on dead or suspended threads | none; they appear as `running=` (and, if they had not logged yet, `in_flight=`) |
+| `probe: detached: hits=.. logs_written=.. log_dropped=.. in_flight=.. running=..` | final counts after the detach | hits = logs_written + log_dropped + in_flight (in_flight: callbacks still running that had not logged yet; running: all still running) |
 | `probe: detach: agent work still pending after 5 s; it will install nothing` | the agent's thread could not start (the target holds its loader lock) | none; nothing is installed after the detach |
 | `probe: detach: N config block(s) left in the target for M callback(s) still in flight` | a deliberate, bounded leak so in-flight callbacks never read freed config | none |
 | `probe: close: still waiting for probe_run to stop (Ns)` | `probe_close` from another thread waits for `probe_run` to finish its detach | wait; see the detach lines |

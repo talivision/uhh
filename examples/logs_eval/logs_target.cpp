@@ -36,7 +36,7 @@ static ring_acct acct(const probe_agent_shared *sh) {
     ring_acct a{};
     MemoryBarrier();
     for (uint32_t p = 0; p < PROBE_AGENT_MAX_PROBES; ++p) a.hits += probe_agent_hits(sh, p);
-    a.inflight = probe_agent_inflight(sh);
+    a.inflight = probe_agent_unlogged(sh);     // records left in the ring carry their hits (v21)
     a.head = (unsigned long long)sh->log_head; a.tail = (unsigned long long)sh->log_tail;
     a.dropped = (unsigned long long)(ULONG)sh->log_dropped;
     return a;

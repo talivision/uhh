@@ -6445,12 +6445,15 @@ extern "C" void probe_close(probe_session *s) {
             if (!p->internal) hits += p->hits;
         }
         // in_flight: inline callbacks still running (or killed/suspended mid-callback by the
-        // program) at the detach -- hits == logs_written + log_dropped + in_flight.
-        std::fprintf(stderr, "probe: detached: hits=%llu logs_written=%llu log_dropped=%llu in_flight=%llu\n",
+        // program) at the detach that had not delivered a log yet -- hits == logs_written +
+        // log_dropped + in_flight. running: inline callbacks still executing, logged or not
+        // (not accounting: a callback that logged is accounted by its log).
+        std::fprintf(stderr, "probe: detached: hits=%llu logs_written=%llu log_dropped=%llu in_flight=%llu running=%llu\n",
                      (unsigned long long)hits, (unsigned long long)s->logs_written.load(std::memory_order_relaxed),
                      (unsigned long long)((uint64_t)(s->shared ? s->shared->log_dropped : 0) +
                                           s->controller_dropped.load(std::memory_order_relaxed)),
-                     (unsigned long long)(s->shared ? probe_agent_inflight(s->shared) : 0));
+                     (unsigned long long)(s->shared ? probe_agent_inflight(s->shared) : 0),
+                     (unsigned long long)(s->shared ? probe_agent_running(s->shared) : 0));
     }
     inplace_release_all(s);
     if (s->pi.hProcess) {

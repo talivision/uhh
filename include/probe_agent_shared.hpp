@@ -219,6 +219,21 @@ inline uint64_t probe_agent_inflight(const probe_agent_shared *sh) {
         for (uint32_t i = 0; i < PROBE_AGENT_STRIPES; ++i) n += (uint64_t)sh->hit_stripes[p][i].value >> 48;
     return n;
 }
+/* Unaccounted hits minus the first records sitting published in the ring (they carry their
+   hit, delivered or not): callbacks that never published a log. Exact when the producers are
+   stopped -- for a reader of the ring other than the controller (e.g. after the controller
+   died); the controller's own counts come after its final drain, where both agree. */
+inline uint64_t probe_agent_unlogged(const probe_agent_shared *sh) {
+    uint64_t n = probe_agent_inflight(sh), carried = 0;
+    const LONG64 tail = sh->log_tail;
+    LONG64 head = sh->log_head;
+    if ((uint64_t)head - (uint64_t)tail > PROBE_AGENT_LOG_CAP) head = (LONG64)((uint64_t)tail + PROBE_AGENT_LOG_CAP);
+    for (LONG64 pos = tail; pos != head; pos = (LONG64)((uint64_t)pos + 1)) {
+        const probe_agent_log &r = sh->logs[(uint64_t)pos % PROBE_AGENT_LOG_CAP];
+        if (r.seq == (LONG64)((uint64_t)pos + 1) && r.carry == 1) ++carried;
+    }
+    return n > carried ? n - carried : 0;
+}
 /* Callbacks executing now (a dead thread's stays counted). */
 inline uint64_t probe_agent_running(const probe_agent_shared *sh) {
     uint64_t n = 0;

@@ -7358,8 +7358,9 @@ def check_cxlib():
                   and the drain's old 15 s allowance): its log after that is delivered, nothing
                   dropped, and its >256-byte config (a block in the target) is still readable;
       cfgfree-inline the program suspends a thread inside an inline callback across the whole
-                  detach and resumes it afterwards: the detach does not wait for it (accounted as
-                  in_flight=1), and the callback's config block is NOT freed under it;
+                  detach and resumes it afterwards: the detach does not wait for it (running=1;
+                  it logged before the suspension, so it is accounted by that log: in_flight=0,
+                  agent v21), and the callback's config block is NOT freed under it;
       killarm-*   the controller dies right after writing an INT3 / arming a hw probe (test-hook
                   build, co_driver_th): the agent's guard must undo it -- the target finishes;
       noxsave-inline the x86 inline fallback without OSXSAVE (forced: UHH_BENCH_XSTATE=noxsave)
@@ -7425,7 +7426,9 @@ def check_cxlib():
         if row.get("ret") != CX_LATE_SUM or row.get("body") != 0 or row.get("done") != 1:
             bad.append(f"target ret={row.get('ret')} want {CX_LATE_SUM} body={row.get('body')} done={row.get('done')} "
                        "(config freed under the callback?)")
-        if sm.get("in_flight") != 1 or sm.get("log_dropped") != 0: bad.append(f"summary={sm} (want in_flight=1 dropped=0)")
+        if (sm.get("in_flight") != 0 or sm.get("running") != 1 or sm.get("log_dropped") != 0 or
+                sm.get("hits") != sm.get("logs_written")):
+            bad.append(f"summary={sm} (want running=1 in_flight=0 dropped=0 hits=logs_written)")
         if took > 12: bad.append(f"detach waited {took:.1f}s for a callback the program holds suspended")
         if arc != 0 or trc != 0: bad.append(f"driver_rc={arc} target_rc={trc}")
         record(name, not bad, " ".join(bad) or f"detach_took={took:.1f}s summary={sm} ret={row.get('ret')}")

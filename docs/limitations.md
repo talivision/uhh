@@ -266,7 +266,8 @@ data) prints on all backends.
   alive, not suspended, still inside its callback), with no time bound; stderr reports
   progress every 15 s. A callback that never returns (deadlocked) keeps the detach waiting.
   Not waited for: a callback whose thread is dead, suspended by the program, or left through
-  a non-unwinding `longjmp`; it stays counted (`in_flight=` in the detach line), and a log it
+  a non-unwinding `longjmp`; it stays counted (`running=` in the detach line, and `in_flight=`
+  if it had not logged yet), and a log it
   sends if the program resumes it later is dropped in the target.
   *Workaround:* keep inline callbacks short and lock-free.
 - **Config blocks can stay in a detached target** (📄 Codex library review (2)): an oversized
