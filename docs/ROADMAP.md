@@ -1872,7 +1872,17 @@ full logs to a `diaglogs/<run>-<job>` branch -- readable with git, no API token)
 - Kill loop (`ci-diag/lckill.py`: lifecycle_target + lifecycle_driver, the driver killed 0.02-0.2 s into the attach):
   before 3 deaths / ~1130 kills (inline+mixed, windows-2022); with the install fix 0 deaths but 11 hangs / ~2900
   (inline, 0.04-0.06 s); with both fixes **0 failures / 2557** (x64+x86, windows-2022+2025, run 42217463236).
-- Final CI on runfix2 (eb4d54d): windows-2022 run 42225278011 1885/1897, windows-2025 run 42225285343 (branch
+- After merging merge-frida b1888e3 (cfnest fibers, runfix1, codex2, pslog, realbig, gatede2e, citune, huntaudit)
+  into runfix2 (91e766b): ONE call_func path -- cfnest's fiber parking / late-trap tombstones / serialization,
+  entered through runfix2's CALL stub (`call rax|eax` at call_trap-2, returning into call_trap, the INT3 that
+  restore_fixup also uses), DF/TF clear, SSP restored on FAULTED/TIMEOUT; the early agent load (A6) now also runs
+  under CET. CI windows-2022 run 42235426997 1992/2001, windows-2025 run 42235435967 1987/1997, cet-hw 49/49 on
+  windows-2025 (the windows-2022 run's cet-hw: 48/49, `cet-sde-sp-inline` a PowerShell process-query timeout);
+  remaining failures are on merge-frida too (stdout-console-*, stacks-identical) or timing flakes of other checks
+  (realbig-robocopy-detach-breakpoint: 2 of 3 FAIL on merge-frida itself, 3 of 3 PASS on runfix2, diag
+  42240423313; attach-new-inline). VM clean build, `--only callfunc,transparency,cet,lifecycle,detach,cxlib,cx2,co`:
+  x64 169/170, x86 148/149 (only `callfunc-kill-reuse`, the VM precondition above).
+- Final CI on runfix2 before the merge (eb4d54d): windows-2022 run 42225278011 1885/1897, windows-2025 run 42225285343 (branch
   `runfix2-w25` = runfix2 + a default `image=windows-2025`, never to be merged) 1876/1891, cet-hw 48/48 (+2 SKIP) on
   both; none of the failures is a runfix2 row (crash-logs-inline-4t, realapps-ps-fileversion x86, patch-race-frozen,
   stream-latency, wmic/oldcrt absent, known hunt rows).
