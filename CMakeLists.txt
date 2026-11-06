@@ -204,6 +204,12 @@ target_compile_definitions(probe_api_agent PRIVATE BREAKAGE_AGENT_ONLY FRIDA_PAR
 # _probe_agent_init@4; the controller resolves them by a fixed bare name).
 target_link_options(probe_api_agent PRIVATE "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/src/probe/agent.def")
 target_link_options(probe_api_agent PRIVATE "/ENTRY:uhh_agent_entry")   # keeps the CRT alive at process exit (agent.cpp)
+# CET shadow stacks: a process with the BlockNonCetBinaries policy maps only /CETCOMPAT images
+# (no inline backend otherwise). Every `ret` in the agent's own code returns through a real
+# call (audited: ROADMAP "BlockNonCetBinaries"; the hook stub ends `pop rsp; jmp`, return_from
+# returns through a `ret` at the hit's own return address, relocated calls stay calls under a
+# shadow stack). Regress cet-agent-*.
+target_link_options(probe_api_agent PRIVATE /CETCOMPAT)
 set_property(TARGET probe_api_agent APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/probe/agent.def")
 
 # --- Example: gated_config (launch) and uhh_attach (attach) -------------------------
@@ -472,6 +478,11 @@ target_include_directories(co_driver_th PRIVATE include)
 target_link_libraries(co_driver_th PRIVATE probe_api_testhooks)
 target_compile_definitions(co_driver_th PRIVATE _CRT_SECURE_NO_WARNINGS)
 add_dependencies(co_driver_th co_target probe_api_agent)
+add_executable(ar_driver_th examples/agent_review/ar_driver.cpp examples/agent_review/ar_callbacks.cpp)   # regress callfunc-late-trap-*
+target_include_directories(ar_driver_th PRIVATE include)
+target_link_libraries(ar_driver_th PRIVATE probe_api_testhooks)
+target_compile_definitions(ar_driver_th PRIVATE _CRT_SECURE_NO_WARNINGS)
+add_dependencies(ar_driver_th ar_target probe_api_agent)
 
 # --- calling conventions: get_func_arg / call_original / return_from per convention (regress `callconv`) --
 # ccfix.dll exports one function per x86/x64 convention and argument/return shape (plus an

@@ -1,6 +1,8 @@
 /* patchrace_target -- threads call RaceSite (a NOP run, see the .asm) in a tight loop
    for --seconds, while a tool hooks and unhooks it from outside.
-     patchrace_target [--threads N] [--seconds S]
+     patchrace_target [--threads N] [--seconds S] [--until-stdin]
+       (--until-stdin: run until stdin reaches end of file, --seconds at most -- the caller
+        decides how long, e.g. "until N hook cycles are done", on a machine of any speed)
      patchrace_target --flags branch|pushf [--threads N] --calls C
        (each thread calls BranchSite/PushfSite C times; prints calls and tf_seen, the
         number of calls whose own pushed flags showed TF -- must be 0)
@@ -46,9 +48,19 @@ static DWORD WINAPI worker(void *arg) {
     return 0;
 }
 
+static DWORD WINAPI drain_stdin(void *unused) {
+    char buf[256];
+    DWORD got;
+    (void)unused;
+    while (ReadFile(GetStdHandle(STD_INPUT_HANDLE), buf, sizeof buf, &got, NULL) && got) {}
+    return 0;
+}
+
 int main(int argc, char **argv) {
     int threads = 8, seconds = 10;
     const char *flags_mode = NULL;
+    int until_stdin = 0;
+    for (int i = 1; i < argc; ++i) if (!strcmp(argv[i], "--until-stdin")) until_stdin = 1;
     for (int i = 1; i + 1 < argc; ++i) {
         if (!strcmp(argv[i], "--threads")) threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--seconds")) seconds = atoi(argv[++i]);
@@ -70,7 +82,12 @@ int main(int argc, char **argv) {
     for (int i = 0; i < threads; ++i) h[i] = CreateThread(NULL, 0, worker, (void *)(size_t)i, 0, NULL);
     printf("{\"kind\":\"ready\",\"pid\":%lu}\n", GetCurrentProcessId());
     fflush(stdout);
-    Sleep((DWORD)seconds * 1000u);
+    if (until_stdin) {
+        HANDLE reader = CreateThread(NULL, 0, drain_stdin, NULL, 0, NULL);
+        if (reader) { WaitForSingleObject(reader, (DWORD)seconds * 1000u); CloseHandle(reader); }
+    } else {
+        Sleep((DWORD)seconds * 1000u);
+    }
     InterlockedExchange(&stop, 1);
     WaitForMultipleObjects((DWORD)threads, h, TRUE, INFINITE);
     LONG64 total = 0;

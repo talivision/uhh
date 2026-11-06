@@ -65,7 +65,9 @@ AR_CB void ar_on_prot(probe_context *c) {
              via_ntdll ? "ntdll" : "other");
 }
 
-// cfkill / cfmany (regress `callfunc-*`): call_func from an inline callback. A probe the
+static SRWLOCK g_cfw_lock = SRWLOCK_INIT;               // cfwatchlock (one callback holds it across call_func)
+// cfkill / cfmany / cflock (regress `callfunc-*`): call_func from a callback (cflock and
+// cfmany also on breakpoint/hw: concurrent calls). A probe the
 // callee hits is counted without a callback (no "ar cf-inner" from inside call_func).
 AR_CB void ar_on_cf(probe_context *c) {
     const uint64_t x = get_func_arg(c, 0);
@@ -73,6 +75,18 @@ AR_CB void ar_on_cf(probe_context *c) {
     if (x == 1) {                                       // the victim: killed inside the callee
         call_func(c, "ar_target.exe!ar_cf_block", &r, 0);
         send_log(c, "ar cf-unblocked");
+    } else if (x == 5) {                                // cfwatch: a slow callee (a watch hit meanwhile)
+        const int ok = call_func(c, "ar_target.exe!ar_cfw_slow", &r, 0);
+        send_log(c, "ar cfw slow ok=%d r=%d", ok, (int)r);
+    } else if (x == 6) {                                // cfwatchlock: a lock held across call_func
+        AcquireSRWLockExclusive(&g_cfw_lock);
+        const int ok = call_func(c, "ar_target.exe!ar_cfw_slow", &r, 0);
+        ReleaseSRWLockExclusive(&g_cfw_lock);
+        send_log(c, "ar cfw slow ok=%d r=%d", ok, (int)r);
+    } else if (x == 2 || x == 4) {                      // cflock: the lock holder / the call waiting for it
+        const int ok = x == 2 ? call_func(c, "ar_target.exe!ar_cf_inner", &r, 1, (uint64_t)2)
+                              : call_func(c, "ar_target.exe!ar_cf_needlock", &r, 0);
+        send_log(c, "ar cf-lock %s ok=%d r=%d", x == 2 ? "holder" : "waiter", ok, (int)r);
     } else if (x >= 1000) {
         const int ok = call_func(c, "ar_target.exe!ar_cf_gate", &r, 1, x);
         send_log(c, "ar cf-many ok=%d good=%d", ok, (uint32_t)r == (uint32_t)(x * 3) ? 1 : 0);
@@ -81,3 +95,56 @@ AR_CB void ar_on_cf(probe_context *c) {
     }
 }
 AR_CB void ar_on_cf_inner(probe_context *c) { send_log(c, "ar cf-inner"); }
+
+// drrestore (regress `hw-dr-restore`): arms the probe on ar_dr_site at runtime, on every thread.
+AR_CB void ar_on_dr_site(probe_context *c) { send_log(c, "ar dr x=%d", (int)get_func_arg(c, 0)); }
+AR_CB void ar_on_dr_arm(probe_context *c) {
+    if (!probe_add_symbol(get_session(c), "ar_target.exe!ar_dr_site", ar_on_dr_site, PROBE_HW)) send_log(c, "ar dr refused");
+}
+
+// absret (regress `inline-absolute-*`): the callee's entry probe adds an inline probe at its
+// return site, BY ADDRESS (once); that site is followed by a loop head inside its 5 bytes.
+AR_CB void ar_on_d5_ret(probe_context *c) { send_log(c, "ar d5 ret"); }
+static void d5_add(probe_context *c, uint32_t flags) {
+    static volatile long once = 0;
+    uint64_t ret = 0;
+    if (InterlockedExchange(&once, 1) || !get_mem(c, get_reg(c, PROBE_REG_SP), &ret, sizeof(void *))) return;
+    send_log(c, "ar d5 add=%d", probe_add_address(get_session(c), ret, ar_on_d5_ret, flags));
+}
+AR_CB void ar_on_d5_callee(probe_context *c) { d5_add(c, PROBE_INLINE); }
+AR_CB void ar_on_d5_callee_fb(probe_context *c) { d5_add(c, PROBE_INLINE | PROBE_FALLBACK_HW); }
+
+// cfwatch (regress `callfunc-watch-*`): a write watch whose callback call_funcs.
+AR_CB void ar_on_cfw_watch(probe_context *c) {
+    uint64_t r = 0;
+    const int ok = call_func(c, "ar_target.exe!ar_cf_inner", &r, 1, (uint64_t)3);
+    send_log(c, "ar cfw watch ok=%d r=%d", ok, (int)r);
+}
+AR_CB void ar_on_cfw_setup(probe_context *c) {
+    send_log(c, "ar cfw setup=%d", probe_watch(get_session(c), get_func_arg(c, 0), ar_on_cfw_watch, PROBE_WATCH_WRITE));
+}
+
+// coborrow (regress `hw-co-borrow-restore`): call_original + return_from.
+AR_CB void ar_on_cob(probe_context *c) {
+    uint64_t r = 0;
+    const int ok = call_original(c, 1, &r);
+    if (ok) return_from(c, r, 0);
+    send_log(c, "ar cob ok=%d r=%d", ok, (int)r);
+}
+// cfwatchlock: the watch callback takes the lock another callback holds across call_func.
+AR_CB void ar_on_cfwl_watch(probe_context *c) {
+    AcquireSRWLockExclusive(&g_cfw_lock);
+    uint64_t r = 0;
+    const int ok = call_func(c, "ar_target.exe!ar_cf_inner", &r, 1, (uint64_t)3);
+    ReleaseSRWLockExclusive(&g_cfw_lock);
+    send_log(c, "ar cfw watch ok=%d r=%d", ok, (int)r);
+}
+AR_CB void ar_on_cfwl_setup(probe_context *c) {
+    send_log(c, "ar cfw setup=%d", probe_watch(get_session(c), get_func_arg(c, 0), ar_on_cfwl_watch, PROBE_WATCH_WRITE));
+}
+
+// drresume (regress `hw-dr-restore-first`): a hw probe at the given address.
+AR_CB void ar_on_dr2_site(probe_context *c) { send_log(c, "ar dr2 hit"); }
+AR_CB void ar_on_dr2_arm(probe_context *c) {
+    if (!probe_add_address(get_session(c), get_func_arg(c, 0), ar_on_dr2_site, PROBE_HW)) send_log(c, "ar dr2 refused");
+}
