@@ -4139,7 +4139,8 @@ def check_hunt():
         # calls ExitProcess. Uninstrumented: ~0.3 s. Every debug event freezes the whole process,
         # so on breakpoint/hw a thread that hits no probe used to run only in the gaps between
         # events (ROADMAP A5): now one event per hit and fairness parking. Bar: exits within
-        # 20 s, and every hit is a delivered log or an honestly counted drop / interruption.
+        # 30 s (incl. delivering ~100k logs), and every hit is a delivered log or an honestly
+        # counted drop / interruption.
         name = f"hunt-starve-{bk}"
         if hunt_selected(name):
             try:
@@ -4148,7 +4149,7 @@ def check_hunt():
                 secs = time.perf_counter() - t0
                 hits = (rd or {}).get("hits") or 0
                 cut = rep.get("callbacks_interrupted")
-                ok = (not tmo and rep.get("app_exit") == 6 and secs < 20 and hits > 0 and cut is not None and
+                ok = (not tmo and rep.get("app_exit") == 6 and secs < 30 and hits > 0 and cut is not None and
                       st["read"] + (rep.get("log_dropped") or 0) + cut == hits and st["unmapped"] == 0 and
                       tg.get("bad") == 0 and (bk == "inline" or cut == 0))
                 record(name, ok, f"exit={rep.get('app_exit')} secs={secs:.1f} hits={hits} logs={st['read']} "

@@ -4421,6 +4421,26 @@ static uint64_t displaced_trampoline(probe_session *s, Probe &p) {
     s->dtramps[at] = d;
     return at;
 }
+// A hardware execute probe's site as a displaced trampoline: an execute hit resumes there
+// instead of at the site with RF. RF lives only until the instruction runs; a context the
+// target captures in between (Suspend + Get/SetThreadContext, ROADMAP A4) comes back with RF
+// clear, and the same call was reported twice. Rebuilt whenever the code at the site is not
+// what the copy holds (the program may patch its own code: hardware probes never do).
+// 0 = not displaceable (the caller sets RF as before).
+static uint64_t hw_trampoline(probe_session *s, Probe &p) {
+    if (!(p.flags & PROBE_HW) || (p.flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) || !p.address) return 0;
+    unsigned char buf[16]; size_t got = 0;
+    if (!remote_read(s->pi.hProcess, p.address, buf, sizeof(buf), &got) || got != sizeof(buf) || buf[0] == 0xcc) return 0;
+    if (p.dtramp && p.dtramp_site == p.address && p.insn_len && p.insn_len <= sizeof(buf) &&
+        p.orig_insn.size() == p.insn_len && !std::memcmp(buf, p.orig_insn.data(), p.insn_len))
+        return p.dtramp;
+    uint32_t len = 0; bool disp_ok = false, rep_str = false; int riprel = -1;
+    if (!decode_site(buf, sizeof(buf), len, disp_ok, riprel, &rep_str) || !len || len > sizeof(buf) || !disp_ok) return 0;
+    p.orig_insn.assign(buf, buf + len); p.insn_len = len; p.displaced_ok = true; p.riprel_disp_off = riprel;
+    p.rep_string = rep_str;
+    p.dtramp = 0; p.dtramp_site = 0;                       // the old copy (if any) stays for threads inside it
+    return displaced_trampoline(s, p);
+}
 // The displaced trampoline `a` lies in (its copy or the jump right after it), if any.
 static const probe_session::DTramp *dtramp_at(const probe_session *s, uint64_t a, uint64_t *start) {
     auto it = s->dtramps.upper_bound(a);
@@ -4458,12 +4478,9 @@ static int our_suspends(const probe_session *s, DWORD tid) {
     for (const auto &w : s->ctx_watch) n += w->tid == tid;
     return n;
 }
-// The thread's suspend count (THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME), -1 = unknown.
+// The thread's suspend count (THREAD_SUSPEND_RESUME), -1 = unknown. (Not ThreadSuspendCount:
+// it reads one higher for a thread stopped at a debug event.)
 static long suspend_count(HANDLE t) {
-    using QueryFn = LONG(NTAPI *)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-    static auto query = reinterpret_cast<QueryFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
-    ULONG n = 0;
-    if (query && query(t, 35 /* ThreadSuspendCount */, &n, sizeof(n), nullptr) >= 0) return (long)n;
     const DWORD prev = SuspendThread(t);
     if (prev == (DWORD)-1) return -1;
     ResumeThread(t);
@@ -5250,7 +5267,21 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
     // RF only for EXECUTE breakpoints (fault-type: the instruction has not run yet). Data
     // watchpoints are trap-type -- the access already happened -- and RF would wrongly
     // suppress an execute breakpoint on the very next instruction.
-    if (exec_hit) native.EFlags |= 0x10000u;
+    // Execute hits resume in the site's trampoline when the instruction can run there (no RF
+    // to lose, see hw_trampoline) -- not for a #DB that is also the target's own (it sees this
+    // context) nor if a callback moved the thread.
+    if (exec_hit) {
+        uint64_t tr = 0;
+        if (!(native.Dr6 & 0xF & theirs) && !(native.EFlags & 0x100u) && !served.empty()) {
+            Probe *first = const_cast<Probe *>(served.front());
+            bool same = true;
+            for (const Probe *q : served)
+                same = same && !(q->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) && q->address == first->address;
+            if (same && (uint64_t)EMU_IP(native) == first->address) tr = hw_trampoline(s, *first);
+        }
+        if (tr) EMU_IP(native) = (decltype(EMU_IP(native)))tr;
+        else native.EFlags |= 0x10000u;
+    }
     // Callbacks may have armed/released hardware probes (probe_watch, PROBE_ONCE), which
     // rewrote THIS thread's debug registers. Take the live DR image, not the stale one
     // captured before the callbacks, so the write-back below does not undo them.
@@ -5620,6 +5651,8 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             w.Eip = (DWORD)step->second.site;
 #endif
             if (owner) w.EFlags |= 0x100u; else w.EFlags &= ~0x100u;
+            // A hardware probe's trampoline: the re-run at the site must not hit its DR again.
+            if (!owner && step->second.probe && (step->second.probe->flags & PROBE_HW)) w.EFlags |= 0x10000u;
             ok = ok && SetThreadContext(t, &w);
             if (t) CloseHandle(t);
             if (!ok) { set_error(s, win_error("re-run faulting displaced instruction")); return false; }
