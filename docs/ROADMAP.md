@@ -610,7 +610,7 @@ process would differ anyway: Chromium's sandbox patches ntdll stubs in its rende
   controller peak 1-7 MB private, growth <= 3 MB over a run.
 - (test-side) `realbig-robocopy-detach-inline` once finished the copy before its detach (a warm
   copy is ~4 s under inline; the plain first copy of fresh files 15-55 s): it now attaches as the
-  copy starts and detaches 1.5 s later.
+  copy starts and detaches 1.5 s later. (Still too fast for a runner once: now gated, see Follow-ups F2.)
 - (test-side, realapps) `realapps-ps-fileversion-*` failed twice on x64 with one `powershell.exe`
   / `conhost.exe` row "missing": a bare image path stands for every process of that image, and
   another agent's instance that ended between the plain runs and the instrumented one was counted
@@ -1482,10 +1482,10 @@ then fixed. Fixtures: `ctrl_target faultmix`, `co_target susp / many / manydead`
   (no agent service thread, Windows < 8.1): an unconditional entry, as before. The check runs both
   deaths -- before the implicit suspension and with it in place (on a program-suspended thread):
   the guard must leave exactly the program's one suspension. After: PASS; `cxlib-touchkill-hw` PASS.
-  Open (same class, not changed): guard_sync's unconditional entries for the event threads and the
-  call_func/call_original thread (`handling`, `in_call_tid`) stay listed until the next sync, i.e.
-  past ContinueDebugEvent; a program that suspends such a thread right then and a controller death
-  before the next event would release it.
+  Open note (same class) -- ✅ closed by the follow-ups (F4 below): guard_sync's unconditional
+  entries for the event threads and the call_func/call_original thread (`handling`, `in_call_tid`)
+  stayed listed until the next sync, i.e. past ContinueDebugEvent; a program that suspended such a
+  thread right then and a controller death before the next event released it.
 - ✅ (X3) **Real.** inline agent: the thread table held 4096 thread ids and never freed a slot, so
   after 4096 distinct probe-hitting threads over the process's life every further thread ran its
   callbacks untracked (no active record): the detach drain counted 0 live callbacks, gave up after
@@ -1500,6 +1500,88 @@ then fixed. Fixtures: `ctrl_target faultmix`, `co_target susp / many / manydead`
   lifecycle,detach,callorig` 138/138 on x86, 136/137 + 1 SKIP on x64 -- `cxlib-killarm-hw` once:
   "controller-death guard unavailable (agent not ready within 5 s)" under VM load, so the hw probe was
   armed without the guard; `--only cxlib` 3 x 9/9 on reruns.
+
+## Follow-ups (2026-11-07, branch `followups`, regress `stream-live-*`, `realbig-robocopy-detach-*`, `lifecycle-target-dies-*`, `cx2-evsusp-*` / `cx2-cosusp-*`)
+- ✅ (F1, test-side) **`stream-live-*` absolute p99 bound vs a loaded machine.** Same build, VM under load:
+  p99 0.7-253 ms over 18 runs with every log delivered; one FAIL at 253 ms (x86 breakpoint), earlier 1102 ms
+  (x64 hw). Fix: the stream-latency calibration (citune) applied -- an uninstrumented writer (logstream_target,
+  a QPC-stamped line every ~5 ms) runs alongside as the noise sampler; arrivals are stamped with
+  QueryPerformanceCounter (the target's own clock, us). Quiet run (the sampler saw < 50 ms of stall): p99 < 250 ms
+  absolute, as before; noisy: p99 of (lag - the stall the sampler saw in that log's own window [event, arrival])
+  < 250 ms, so a real UHH latency regression on top of the machine's stalls still fails. TEMP = the build dir's
+  `uhh-latency-tmp` (as stream-latency: the profile's AV scan of the session file is not UHH's pipeline). Also
+  required as before: every log delivered, >= 90% before the target's final line. `_NoiseSampler.noise` is indexed
+  (bisect; equal to the old scan on random data) for ~31k samples per inline run. Evidence: VM (shared, other
+  agents' builds running) 3 runs x 3 backends per arch, 18/18 PASS: inline p99 11.6-74 ms, hw/breakpoint 0.9-144
+  ms; one x86 hw run was noisy (sampler stall 114.7 ms: judged on p99 net of it, 2.0 ms). CI: 10 runs per arch
+  (2 full-suite pushes + 2 x 4 repetitions, branch `followups-reps`), all PASS. Not discounted, reported:
+  `disk_run_max` (the sampler's own 120-byte appends) -- one quiet x86 inline run had a 622 ms disk stall and a
+  724 ms lag_max (p99 74 ms): a stall of the session file's disk still delays the writer's next batch (as in
+  stream-latency, by design not discounted); it would fail only if it held > 1% of the samples. The earlier
+  253 / 1102 ms failures could not be reproduced on demand (no before/after pair): they were single runs under load.
+- ✅ (F2, test-side) **`realbig-robocopy-detach-*` "robocopy ended during the attach"** (CI 42213960508, x86
+  breakpoint: a fast runner finished the whole copy during the attach; accounting exact). Fix: a gate -- the last
+  file of the tree in robocopy's order is held open with no sharing until the detach and the residue check are
+  done; robocopy (`/R:600 /W:1` in this scenario) retries it and finishes after the gate opens, exit 1, the copy
+  exact. On any machine the detach now lands while robocopy runs; `files_at_detach` reports how far the copy had
+  got. Before: merge-frida 921820c's CI (42225208495) failed this row on x64 AND x86. After: VM 2 runs per arch PASS
+  (files_at_detach 347-4266 of 10000, exit 1, copy exact, residue clean); CI 10 runs per arch PASS.
+- ✅ (F3) **No final accounting when the target dies right after a detach request** (x86
+  `lifecycle-target-dies-breakpoint`, ~1 in 20). Cause: probe_close from another thread asks probe_run to detach;
+  a target killed 0-5 ms later can end the session on its EXIT_PROCESS before probe_run acts on the request. Then
+  probe_run returns with the target exited and NOT detached, so probe_close printed no `probe: detached:` line --
+  and the caller had no way left to take the totals (lifecycle_driver's runner had yielded the report to the
+  closing thread; the session is gone after probe_close). Fix: probe_close prints `probe: ended: the target exited
+  before the detach (exit code N): hits= logs_written= log_dropped= in_flight=` (in_flight: callbacks the end
+  interrupted, as probe_report's callbacks_interrupted) whenever it asked a live session to stop and the target
+  ended first. Checks: `lifecycle-target-dies-*` gains `detach0` (killed at once after the request) and `late`
+  (test-hook `lifecycle_driver_th`, `UHH_TEST_STOP_LATE_MS=400`: probe_run acts on the request 400 ms late while
+  dispatching, the target dies 50 ms after it -- the race forced; must report via `probe: ended:`). Before (VM,
+  test hooks on 921820c's library): `late` FAILED 16/16 (4 configs x 2 runs x 2 arches, "no final accounting"),
+  and the natural race once more (x86 mixed `detach0`); 48 runs of `detach`/`detach0` without the hook passed
+  otherwise. After: VM 6 runs x 4 configs per arch PASS; `late` reported via `probe: ended:` 48/48, the natural race
+  hit once more (x86 `detach0`) and also reported `ended`; CI 10 runs per arch PASS (`late` in 5 of them).
+- ✅ (F4) **Guard event/call-thread window (X2 open note).** The controller-death guard listed, unconditionally,
+  each thread whose event was being handled until the NEXT guard sync (past its ContinueDebugEvent), the
+  call_original thread and every call_func callee thread for the whole call, and call_original's 20 ms poll
+  appended one entry per poll until the next event. A program that suspended such a thread after it ran on, then
+  a controller death: the guard resumed it, releasing the PROGRAM's suspension (side effect). Reproduced (new
+  `susp_target`, driven by `co_driver_th --module susp_target.exe`): `cx2-evsusp-<b>` -- the test-hook build
+  (`UHH_TEST_DIE_AFTER_HIT_MS=1500`) dies 1.5 s after continuing a probe hit's last event while the program has
+  suspended that thread (no event, no sync in between); `cx2-cosusp-<b>` -- the controller is killed while
+  call_original runs the original on a thread the program suspended. Before (unfixed library, VM): all four FAIL
+  on x64 and on x86, 2 of 2 runs per arch (the program's ResumeThread returned 0, want 1; the worker ran 17-21
+  iterations while "suspended"; the dying controller's guard list held the worker). Fix (a list of exactly the
+  suspensions in place, no new protocol): the handling of an event records whether its thread runs again
+  (call_func / call_original continued it, or call_original released it); guard_sync lists only stopped ones (at
+  the event, or suspended by us for the rest of the handling) plus call_func threads held by us (`call_held`);
+  the list is rewritten right before every continue of a handled event and right after each of our own
+  suspensions ends (call_original's poll and clear_slot, resume_after, release_held, ipc_thaw, the in-place
+  window, deferred hits); call_original's return catch is listed while its context is touched; the two context
+  calls on undispatched events (restore-resume, a late callee fault) are GuardTouch'd. Residual (microseconds):
+  between our ResumeThread of an explicit suspension and the re-sync right after it; and an event thread the
+  program suspended in the instant before its exception was reported (listed unconditionally while stopped).
+  After: VM `--only cx2` x86 10/10, x64 9/9 + touchprog SKIP (x64 has no implicit suspend); the dying
+  controller's guard list no longer held the worker; CI 10 runs per arch PASS; `--only cxlib` (the guard's
+  controller-death checks) PASS on both arches, VM and CI. Agent protocol unchanged (controller-side only).
+- (F5, finding, open) **breakpoint/hw call_original left by an exception: later hits deeper on the stack get no
+  callback.** Adding two cases to co_target first (since moved to susp_target) changed its x86 code layout, and
+  `callorig-hunt-cppthrow-{breakpoint,hw}` x86 then failed deterministically on the VM -- with AND without the F4
+  fix -- `co after` hits=3 logs=0 (CI 42227764189 likewise); co_target as in 921820c: 45/45. The release of a
+  call_original whose original was left by an exception relies on the thread being seen at or above the hit's
+  frame (a probe hit there, or the 20 ms poll). Probably `after3` was no longer inlined, so co_after's hits came
+  from a deeper frame: each was taken for a hit inside the original (counted, no callback) until the 5 s
+  release. A gospel gap (hits without logs) for programs that catch an exception thrown through a probed
+  function and then call probed code from a deeper frame. Not fixed here (no reliable "the original's frame is
+  gone" signal yet: the stale return address can stay on the stack; x86 could check the SEH chain / x64 the
+  unwind); recorded for the owners.
+- Open, not caused here: x86 `lifecycle-controller-killed-inline` kill@early-0.05 target DEAD (0xC0000005 /
+  0xC00000FD) on windows-2022 runners, 2 of 8 reps (the known runner finding in the CI section, 2 of ~7 before).
+  Also failing on merge-frida 921820c's CI and unchanged here: `stdout-console-*` on both arches (runner console).
+- Verification (VM, c19bbd9 = the final code): `--only stream,realbig,lifecycle,cxlib,cx2` x64 81/81 + 2 SKIP
+  (x86-only touch checks), x86 81/81 + 2 SKIP (x64-only Edge rows); `--only callorig_hunt` 45/45 on both arches.
+  CI: full suite on 79d71e7 and c19bbd9 plus 2 x 4 repetitions of stream-live/realbig/lifecycle/cx2
+  (`followups-reps`): every row of the four items PASS on both arches.
 
 ## PowerShell capture findings (2026-11-06, owner: "high volume drops lines logged -- powershell logging"; the session file was complete, the PowerShell console showed fewer lines; regress `stdout-powershell-*`, `stdout-console-*`)
 

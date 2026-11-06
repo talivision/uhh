@@ -478,11 +478,20 @@ target_include_directories(co_driver_th PRIVATE include)
 target_link_libraries(co_driver_th PRIVATE probe_api_testhooks)
 target_compile_definitions(co_driver_th PRIVATE _CRT_SECURE_NO_WARNINGS)
 add_dependencies(co_driver_th co_target probe_api_agent)
+add_executable(susp_target examples/hunt_callorig/susp_target.cpp)   # regress cx2-evsusp-* / cx2-cosusp-*
+target_compile_definitions(susp_target PRIVATE _CRT_SECURE_NO_WARNINGS)
+add_dependencies(co_driver_th susp_target)
 add_executable(ar_driver_th examples/agent_review/ar_driver.cpp examples/agent_review/ar_callbacks.cpp)   # regress callfunc-late-trap-*
 target_include_directories(ar_driver_th PRIVATE include)
 target_link_libraries(ar_driver_th PRIVATE probe_api_testhooks)
 target_compile_definitions(ar_driver_th PRIVATE _CRT_SECURE_NO_WARNINGS)
 add_dependencies(ar_driver_th ar_target probe_api_agent)
+add_executable(lifecycle_driver_th examples/lifecycle/lifecycle_driver.cpp examples/lifecycle/lifecycle_callbacks.cpp
+               examples/hunt/hunt_callbacks.cpp examples/gated_config/callbacks.cpp)   # regress lifecycle-target-dies-* ("late")
+target_include_directories(lifecycle_driver_th PRIVATE include examples/gated_config)
+target_link_libraries(lifecycle_driver_th PRIVATE probe_api_testhooks)
+target_compile_definitions(lifecycle_driver_th PRIVATE _CRT_SECURE_NO_WARNINGS)
+add_dependencies(lifecycle_driver_th lifecycle_target hunt_dll configparse probe_api_agent)
 
 # --- calling conventions: get_func_arg / call_original / return_from per convention (regress `callconv`) --
 # ccfix.dll exports one function per x86/x64 convention and argument/return shape (plus an

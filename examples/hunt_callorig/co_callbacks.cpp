@@ -28,6 +28,7 @@ CO_CB void co_on_add(probe_context *c) { wrap(c, "add", 2, 0, 0); }
 CO_CB void co_on_outer(probe_context *c) { wrap(c, "outer", 1, 0, 0); }
 CO_CB void co_on_slow(probe_context *c) { wrap(c, "slow", 1, 0, 0); }
 CO_CB void co_on_vslow(probe_context *c) { wrap(c, "vslow", 1, 0, 0); }
+CO_CB void co_on_hold(probe_context *c) { wrap(c, "hold", 1, 0, 0); }
 CO_CB void co_on_after(probe_context *c) { send_log(c, "co after"); }
 CO_CB void co_on_inner(probe_context *c) { send_log(c, "co inner"); }
 // nargs larger than the real count (co_add takes 2): harmless, and the delta shows return_from.
