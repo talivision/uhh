@@ -7137,11 +7137,13 @@ def lc_install_stuck(cfgname, cfg):
 
 def lc_killed_in_freeze(cfgname, cfg, repeats=5):
     """L11, runner signature (controller killed 0.05 s into an attach, target dead 0xC0000005
-    with no unhandled report): the controller dies while the agent's install round waits on its
-    FREEZE request (UHH_TEST_FREEZE_STALL_MS parks the controller exactly there). The raise then
-    comes back unserviced; the agent must NOT write the hooks unfrozen (SafetyHook's own trap
-    path made the ntdll stub page non-executable under the installer and every other thread).
-    The target must run on, untouched and unhooked."""
+    with no unhandled report; then, with that fixed, HUNG): the controller dies while the agent's
+    first install round waits on its FREEZE request, every other thread already suspended
+    (UHH_TEST_FREEZE_STALL_MS parks the controller exactly there). The raise then comes back
+    unserviced; the agent must NOT write the hooks unfrozen (SafetyHook's own trap path made the
+    ntdll stub page non-executable under the installer and every other thread), and must resume
+    the threads the dead controller froze although no service thread watches it yet (its named
+    event died with it). The target must run on, untouched and unhooked."""
     if "inline" not in cfg.values():
         return
     bad, n = [], 0

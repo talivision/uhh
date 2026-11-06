@@ -2234,8 +2234,12 @@ static DWORD WINAPI service_main(void *) {
         }
         const bool polling = ctl_gone_at && !g_orphan_cleaned && shared->guard.enabled &&
                              GetTickCount64() - ctl_gone_at < 30000;
+        // A guarded session whose controller never handed over its process handle (it died
+        // first): watch its pid instead.
+        const bool watch_pid = !g_ctl && !ctl_gone_at && !g_orphan_cleaned && shared->guard.enabled;
         HANDLE waits[3] = {service_event, g_guard_wake, g_ctl};
-        DWORD w = WaitForMultipleObjects(g_ctl ? 3 : 2, waits, FALSE, polling ? 10 : INFINITE);
+        DWORD w = WaitForMultipleObjects(g_ctl ? 3 : 2, waits, FALSE, polling ? 10 : watch_pid ? 100 : INFINITE);
+        if (w == WAIT_TIMEOUT && watch_pid && controller_dead(shared)) ctl_gone_at = GetTickCount64();
         if (w == WAIT_OBJECT_0) {
             // A detach drain asking how many callbacks can still finish: answer only -- the
             // session is over, so no install round (and no INSTALL_DONE raised to nobody).
@@ -2318,6 +2322,15 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
                 if (service_up) WaitForSingleObject(service_up, 5000);
             }
         }
+    }
+    // The controller died DURING this init (killed early in an attach), before anything could
+    // watch it: its named service event went with it (no service thread) or it never handed
+    // over its process handle. Nobody else would then undo what it left -- the threads it had
+    // frozen for this install round stayed suspended and the target hung (runner kill loop).
+    // Clean up here, once the kernel has dropped the debug port.
+    if (shared->guard.enabled && !g_orphan_cleaned && controller_dead(shared)) {
+        for (const ULONGLONG t0 = GetTickCount64(); !no_debug_port() && GetTickCount64() - t0 < 30000; ) Sleep(10);
+        if (guard_orphaned()) guard_cleanup();
     }
     return 0;
 }
