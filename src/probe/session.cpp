@@ -400,7 +400,8 @@ struct probe_session {
     std::vector<std::pair<DWORD, HANDLE>> parked;
     bool parking = false;
     bool fine_timer = false;
-    ULONGLONG rekick_at = 0;                   // ask the agent's service for another install round then (0: no)                   // timeBeginPeriod(1) held (only while something polls at 1 ms)
+    ULONGLONG rekick_at = 0;
+    std::unordered_set<uint64_t> early_unloaded;   // instances torn down at a newer LOAD (their late UNLOAD skipped)                   // ask the agent's service for another install round then (0: no)                   // timeBeginPeriod(1) held (only while something polls at 1 ms)
     std::chrono::steady_clock::time_point fair_window{}, last_event{};
     std::chrono::steady_clock::duration fair_gaps{};
     // Context round-trips (ROADMAP A4): a thread whose debug event we handled while the target
@@ -7331,6 +7332,66 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
     if (!s->exited) guard_sync(s);
     return ok;
 }
+// A module instance at `base` is gone: its symbols, its recorded base, and its probes (absolute
+// ones retired; module ones back to pending, re-armed when the module loads again).
+static void module_unloaded(probe_session *s, uint64_t base) {
+    sym_unload(s, base);
+    uint64_t size = 0;
+    if (auto sz = s->module_sizes.find(base); sz != s->module_sizes.end()) { size = sz->second; s->module_sizes.erase(sz); }
+    for (auto it = s->module_bases.begin(); it != s->module_bases.end(); )
+        if (it->second == base) it = s->module_bases.erase(it); else ++it;
+    for (auto &p : s->probes) {
+        // Absolute-address probes (probe_add_address / probe_watch: base 0) inside the
+        // module go with it, for good: there is no module to re-resolve them against, and
+        // a stale one would keep its debug register, shadow a new probe at a reused address
+        // (its saved instruction bytes run instead) and mask the new code's bytes.
+        if (!p->active || p->base || !size || p->address < base || p->address - base >= size) continue;
+        std::fprintf(stderr, "probe: %s retired: its module unloaded\n", p->location.c_str());
+        if (p->flags & PROBE_INLINE) {
+            if (s->shared && p->agent_index < PROBE_AGENT_MAX_PROBES)
+                InterlockedExchange(&s->shared->requests[p->agent_index].status, PROBE_AGENT_UNLOADED);
+            p->active = false;
+        } else if (p->flags & PROBE_HW) {
+            release_hw(s, *p);
+        } else {
+            p->active = false;
+            sync_int3_table(s);      // the agent's copy too: a stale entry masks reused memory
+        }
+        p->retired = true;
+    }
+    for (auto &p : s->probes) if (p->active && p->base == base) {
+        if (p->flags & PROBE_INLINE) {
+            // The hooked code went away with its module. The probe goes back to pending,
+            // exactly like breakpoint/hw probes: if the module loads again (anywhere),
+            // the agent installs a fresh hook at the new address.
+            std::fprintf(stderr, "probe: %s unloaded with its module; pending until it loads again\n", p->location.c_str());
+            p->active = false; p->vetted = false; p->base = p->address = 0;
+            // Tell the agent: its hook there now points at unmapped (or reused) memory,
+            // so detach must not write the original bytes back.
+            if (s->shared && p->agent_index < PROBE_AGENT_MAX_PROBES)
+                InterlockedExchange(&s->shared->requests[p->agent_index].status, PROBE_AGENT_UNLOADED);
+        } else if (p->flags & PROBE_HW) {
+            // Fully release the hardware breakpoint: clear its DR on every thread,
+            // free the slot, and drop the active count. A half-disarm (just
+            // clearing active/address) leaks the DR slot and strands the physical
+            // breakpoint on the unloaded address -> later slot exhaustion / crash.
+            release_hw(s, *p);
+            p->base = p->address = 0;
+        } else { p->active = false; p->base = p->address = 0; sync_int3_table(s); }
+    }
+}
+// After an instance went away while a newer one of the same module is already mapped at
+// `base`: arm the module's pending probes there, with the same install path as a LOAD.
+static bool arm_after_reload(probe_session *s, const std::string &name, uint64_t base) {
+    bool ok = arm_module(s, name, base);
+    if (trace_enabled()) std::fprintf(stderr, "  re-arm %s at 0x%llx after a late unload\n", name.c_str(), (unsigned long long)base);
+    if (ok && agent_has_pending(s)) {
+        if (s->shared->service_ready && s->svc_event) { arm_gates_for_pending(s); ok = kick_agent(s); }
+        else if (s->remote_agent && s->remote_work == probe_session::REMOTE_NONE) ok = start_agent_init(s);
+    }
+    return ok;
+}
+
 static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &disposition) {
     disposition = DBG_CONTINUE; bool ok = true;
     settle_hw_thread(s, event.dwThreadId);           // released hardware probes: still ours on it?
@@ -7409,6 +7470,31 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
         // active at this base belong to the OLD view: the fresh mapping has neither our INT3
         // nor our hook. Re-arm them in it (a hardware probe's debug register is per address:
         // it stays). ROADMAP A8.
+        s->early_unloaded.erase(base);                      // a new instance here
+        if (!s->detaching) {
+            // ... and at ANOTHER base: an older instance of this module whose image is gone but
+            // whose UNLOAD has not been reported yet keeps its probes marked active, so this
+            // instance would not be armed until that late unload (calls to it missed: seen,
+            // hunt-dll-work-backend-inline). Tear the old one down now; its late UNLOAD is then
+            // skipped (early_unloaded).
+            const std::string nm = event_module_name(s->pi.hProcess, event.u.LoadDll.hFile, base);
+            std::vector<uint64_t> gone;
+            for (auto &p : s->probes) {
+                if (!p->active || !p->base || p->base == base || !iequals(p->module, nm)) continue;
+                if (std::find(gone.begin(), gone.end(), p->base) != gone.end()) continue;
+                MEMORY_BASIC_INFORMATION mbi{};
+                const bool mapped = VirtualQueryEx(s->pi.hProcess, (void *)(uintptr_t)p->base, &mbi, sizeof(mbi)) &&
+                                    mbi.State == MEM_COMMIT && mbi.Type == MEM_IMAGE &&
+                                    (uint64_t)(uintptr_t)mbi.AllocationBase == p->base;
+                if (!mapped) gone.push_back(p->base);
+            }
+            for (uint64_t g : gone) {
+                if (trace_enabled()) std::fprintf(stderr, "  load at 0x%llx: older instance at 0x%llx gone, torn down now\n",
+                                                  (unsigned long long)base, (unsigned long long)g);
+                module_unloaded(s, g);
+                s->early_unloaded.insert(g);
+            }
+        }
         if (!s->detaching)
             for (auto &p : s->probes) {
                 if (!p->active || p->base != base || !base || (p->flags & PROBE_HW)) continue;
@@ -7463,49 +7549,16 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
                 break;
             }
         }
-        sym_unload(s, base);
-        uint64_t size = 0;
-        if (auto sz = s->module_sizes.find(base); sz != s->module_sizes.end()) { size = sz->second; s->module_sizes.erase(sz); }
-        for (auto it = s->module_bases.begin(); it != s->module_bases.end(); )
-            if (it->second == base) it = s->module_bases.erase(it); else ++it;
-        for (auto &p : s->probes) {
-            // Absolute-address probes (probe_add_address / probe_watch: base 0) inside the
-            // module go with it, for good: there is no module to re-resolve them against, and
-            // a stale one would keep its debug register, shadow a new probe at a reused address
-            // (its saved instruction bytes run instead) and mask the new code's bytes.
-            if (!p->active || p->base || !size || p->address < base || p->address - base >= size) continue;
-            std::fprintf(stderr, "probe: %s retired: its module unloaded\n", p->location.c_str());
-            if (p->flags & PROBE_INLINE) {
-                if (s->shared && p->agent_index < PROBE_AGENT_MAX_PROBES)
-                    InterlockedExchange(&s->shared->requests[p->agent_index].status, PROBE_AGENT_UNLOADED);
-                p->active = false;
-            } else if (p->flags & PROBE_HW) {
-                release_hw(s, *p);
-            } else {
-                p->active = false;
-                sync_int3_table(s);      // the agent's copy too: a stale entry masks reused memory
-            }
-            p->retired = true;
-        }
-        for (auto &p : s->probes) if (p->active && p->base == base) {
-            if (p->flags & PROBE_INLINE) {
-                // The hooked code went away with its module. The probe goes back to pending,
-                // exactly like breakpoint/hw probes: if the module loads again (anywhere),
-                // the agent installs a fresh hook at the new address.
-                std::fprintf(stderr, "probe: %s unloaded with its module; pending until it loads again\n", p->location.c_str());
-                p->active = false; p->vetted = false; p->base = p->address = 0;
-                // Tell the agent: its hook there now points at unmapped (or reused) memory,
-                // so detach must not write the original bytes back.
-                if (s->shared && p->agent_index < PROBE_AGENT_MAX_PROBES)
-                    InterlockedExchange(&s->shared->requests[p->agent_index].status, PROBE_AGENT_UNLOADED);
-            } else if (p->flags & PROBE_HW) {
-                // Fully release the hardware breakpoint: clear its DR on every thread,
-                // free the slot, and drop the active count. A half-disarm (just
-                // clearing active/address) leaks the DR slot and strands the physical
-                // breakpoint on the unloaded address -> later slot exhaustion / crash.
-                release_hw(s, *p);
-                p->base = p->address = 0;
-            } else { p->active = false; p->base = p->address = 0; sync_int3_table(s); }
+        if (s->early_unloaded.erase(base)) break;           // torn down already, at a newer instance's LOAD
+        {
+            std::vector<std::string> mods;
+            for (auto &p : s->probes) if (p->active && p->base == base && !p->module.empty()) mods.push_back(p->module);
+            module_unloaded(s, base);
+            // A newer instance of the module mapped ELSEWHERE already reported its load (its
+            // probes were still marked active here, so it was not armed): arm it now.
+            for (const auto &m : mods)
+                for (const auto &kv : s->module_bases)
+                    if (iequals(kv.first, m)) { ok = arm_after_reload(s, kv.first, kv.second) && ok; break; }
         }
         break;
     }
