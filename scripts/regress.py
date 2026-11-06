@@ -2793,6 +2793,107 @@ def check_cet(threads=8, reads=500):
         record("cet-ret-breakpoint", False, repr(e))
 
 
+# Exploit-protection policies per image name (Image File Execution Options MitigationOptions,
+# 24 bytes, as Set-ProcessMitigation writes them): user shadow stacks byte 15 (0x10 on, 0x30
+# strict mode); byte 16 continues the CET policy2 nibbles: SetContext IP validation 0x01
+# (0x03 relaxed), BlockNonCetBinaries 0x10 (0x30 non-EHCONT). Measured on windows-2025: these
+# bytes make cet_probe report EnableUserShadowStackStrictMode / BlockNonCetBinaries /
+# SetContextIpValidationRelaxedMode = 1 (Set-ProcessMitigation has no BlockNonCetBinaries).
+CET_POLICIES = {"strict": (0x30, 0x00), "block": (0x10, 0x10)}
+
+
+def cet_policy_copy(name, policy):
+    """BIN/<name>.exe copied to BIN/<name>_<policy>.exe with that IFEO policy set (admin);
+    returns the copy's path, or raises. cet_policy_clear removes the IFEO keys again."""
+    import winreg
+    src = BIN / f"{name}.exe"
+    dst = BIN / f"{name}_{policy}.exe"
+    shutil.copyfile(src, dst)
+    b = bytearray(24); b[15], b[16] = CET_POLICIES[policy]
+    k = winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, rf"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\{dst.name}",
+                           0, winreg.KEY_WRITE | winreg.KEY_WOW64_64KEY)
+    winreg.SetValueEx(k, "MitigationOptions", 0, winreg.REG_BINARY, bytes(b))
+    winreg.CloseKey(k)
+    return dst
+
+
+def cet_policy_clear(paths):
+    import winreg
+    for p in paths:
+        try:
+            winreg.DeleteKeyEx(winreg.HKEY_LOCAL_MACHINE, rf"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\{Path(p).name}",
+                               winreg.KEY_WOW64_64KEY, 0)
+        except OSError:
+            pass
+
+
+def check_cet_policy(threads=4, reads=200):
+    """CET under the strictest process policies (Exploit protection, per image; set through
+    IFEO on renamed copies, removed afterwards). STRICT MODE (cet-strict-*): every shadow-stack
+    mismatch is fatal, also in non-image code the kernel would fix up in compatibility mode --
+    the transparency fixture (call_func, call_original + return_from) and gated_config on every
+    backend. BlockNonCetBinaries (cet-block-*): only /CETCOMPAT images may load; breakpoint/hw
+    need nothing in the target; inline needs the agent (and the callback module) loaded.
+    The detail says whether the machine enforced the policy (cet_probe of the same policy);
+    on a machine without CET the rows prove only that the policy copies run."""
+    pr_exe, tpd, gc = exe("cet_probe.exe"), exe("tp_driver.exe"), exe("gated_config.exe")
+    if not pr_exe or not tpd or not gc or not exe("tp_target_cet.exe") or not exe("probe_app_cet.exe"):
+        return missing_bin("cet-policy", "cet_probe/tp_driver/tp_target_cet/probe_app_cet/gated_config")
+    made = []
+    try:
+        for policy in CET_POLICIES:
+            try:
+                copies = {n: cet_policy_copy(n, policy) for n in ("cet_probe", "tp_target_cet", "probe_app_cet")}
+                made += copies.values()
+            except Exception as e:
+                record(f"cet-{policy}-setup", False, f"cannot set the IFEO policy (admin needed): {e!r}")
+                continue
+            r, o = run([copies["cet_probe"]], timeout=60)
+            info = next((x for x in o if x.get("kind") == "cet_probe"), {})
+            pol = info.get("policy", {})
+            key = {"strict": "EnableUserShadowStackStrictMode", "block": "BlockNonCetBinaries"}[policy]
+            on = bool(info.get("enforced")) and pol.get(key) == 1
+            record(f"cet-{policy}-probe", r.returncode == 0 and (pol.get(key) == 1 or not info.get("enforced")),
+                   f"enforced={info.get('enforced')} {key}={pol.get(key)} (policy {'IN EFFECT' if on else 'not in effect'})")
+            for bk in ("breakpoint", "hw", "inline"):
+                for mode in (("callfn", "co") if policy == "strict" else ("log",)):
+                    name = f"cet-{policy}-tp-{bk}-{mode}"
+                    try:
+                        bad, rows = tp_runs(tpd, copies["tp_target_cet"], bk, mode, 5)
+                        if policy == "block" and bk == "inline" and on:
+                            # The agent / callback module must be /CETCOMPAT to load; until then
+                            # the refusal must be clean (the error names the agent load).
+                            r2, o2 = run([tpd, "--backend", bk, "--mode", mode, "--probes", "add", "--",
+                                          copies["tp_target_cet"], "--iters", 2], timeout=120)
+                            err = (report(o2).get("error") or "")
+                            if bad and "probe_api_agent" in err:
+                                record(name, True, f"policy IN EFFECT: inline refused cleanly: {err[:100]}")
+                                continue
+                        record(name, not bad, f"policy {'IN EFFECT' if on else 'not in effect'} " +
+                               ("; ".join(bad) if bad else f"{len(TP_GROUPS[bk])} run(s), all calls identical to the twin"))
+                    except Exception as e:
+                        record(name, False, repr(e))
+                if policy == "strict":
+                    name = f"cet-{policy}-gated-{bk}"
+                    try:
+                        total = threads * reads
+                        r, o = run([gc, "--flag-backend", bk, "--read-backend", bk, "--open-backend", bk, FLAG_LOCATION,
+                                    READ_LOCATION, "--", copies["probe_app_cet"], "--no-wait", "--helpers", HELPERS,
+                                    "--threads", threads, "--reads", reads], timeout=300)
+                        rep, rd, a = report(o), read_probe(o), app(o)
+                        logs, dropped = read_logs(o)
+                        ok = (r.returncode == 0 and rep.get("overrides") == 1 and rd.get("hits") == total and logs == total
+                              and dropped == 0 and unmapped(o) == 0 and rep.get("error") is None
+                              and a.get("successful_reads") == total)
+                        record(name, ok, f"policy {'IN EFFECT' if on else 'not in effect'} target_ssp={a.get('shadow_stack')} "
+                                         f"hits={rd.get('hits')}/{total} logs={logs} dropped={dropped} rc={r.returncode} "
+                                         f"exit={rep.get('app_exit')} err={(rep.get('error') or '')[:100]}")
+                    except Exception as e:
+                        record(name, False, repr(e))
+    finally:
+        cet_policy_clear(made)
+
+
 def check_ret_probe(threads=2, reads=50):
     """A probe on a function's own `ret` -- the natural way to see a return (no special
     flag): ntdll!NtOpenProcess's ret, found by decoding the stub in the DLL file. probe_app
@@ -8118,6 +8219,7 @@ def main():
     if want(check_agent_crt): check_agent_crt()
     if want(check_oldcrt): check_oldcrt()
     if want(check_cet): check_cet()
+    if want(check_cet_policy): check_cet_policy()
     if want(check_shared_mix): check_shared_mix()
     if want(check_handle_map): check_handle_map()
     if want(check_gated_mem): check_gated_mem()
