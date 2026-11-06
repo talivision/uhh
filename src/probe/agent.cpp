@@ -61,6 +61,18 @@ static RegionCache *region_cache() { return tls_ready() ? &t_region : nullptr; }
 static bool range_ok(uintptr_t a, size_t n, bool write) {
     if (!n) return true;
     if (a + n < a) return false;
+    // This thread's own stack from this frame up to its base: committed read/write memory by
+    // construction (the guard page is below the lowest frame) -- no query. An inline callback
+    // runs on the hit thread, so the hit's stack arguments (get_func_arg on x86, every hit) are
+    // there: a VirtualQuery per hit cost x86 send_log ~1 us. A stack the TEB does not describe
+    // (switched without updating it) fails the bounds and is queried as before.
+    {
+        const NT_TIB *tib = reinterpret_cast<const NT_TIB *>(NtCurrentTeb());
+        const uintptr_t here = (uintptr_t)_AddressOfReturnAddress();
+        if (here >= (uintptr_t)tib->StackLimit && here < (uintptr_t)tib->StackBase &&
+            a >= here && a + n <= (uintptr_t)tib->StackBase)
+            return true;
+    }
     RegionCache scratch, *cache = region_cache();
     if (!cache) cache = &scratch;
     uintptr_t end = a + n;
@@ -629,6 +641,7 @@ static void test_wedge_point(const probe_agent_log &rec) {
 struct HitScope;
 static HitScope *log_carrier(probe_context *c);
 static void log_carried(HitScope *h, bool dropped);
+static uint32_t log_carry_block(const HitScope *h);
 
 // Format and stack are produced BEFORE claiming a ring slot so a slot is held only
 // for a copy. A full ring makes the producer wait (backpressure); see the ring's comment in
@@ -648,7 +661,8 @@ static void agent_log(probe_context *c, bool stack, const char *format, va_list 
     // The callback's first record carries its hit's unaccounted unit (probe_agent_stripe):
     // from the publish on, the hit is accounted by this record, not as interrupted.
     HitScope *const carrier = log_carrier(c);
-    local.carry = carrier ? 1 : 0; local.reserved = 0;
+    local.carry = carrier ? 1 : 0;
+    local.reserved = log_carry_block(carrier);
     auto *sh = state->shared;
     if (sh->controller_gone) {                                    // nobody will read it
         InterlockedIncrement(&sh->log_dropped); log_carried(carrier, true); return;
@@ -702,7 +716,7 @@ static void agent_log(probe_context *c, bool stack, const char *format, va_list 
     rec->text_len = local.text_len;
     std::memcpy(rec->text, local.text, local.text_len + 1);
     rec->has_stack = local.has_stack; rec->frame_count = local.frame_count;
-    rec->carry = local.carry; rec->reserved = 0;
+    rec->carry = local.carry; rec->reserved = local.reserved;
     if (local.frame_count) std::memcpy(rec->frames, local.frames, local.frame_count * sizeof(uint64_t));
     MemoryBarrier();
     InterlockedExchange64(&rec->seq, pos + 1);                    // publish (with carry: the unit goes with it)
@@ -943,16 +957,25 @@ struct HitScope;
    every hit, and -- when those are reused too -- by its creation time, read once per new
    identity and again only when a stale record turns up (a dead owner's, or this thread's
    own after a non-unwinding longjmp, see hit_scope_live). */
+// Where a hit is counted: the owner's per-thread block (blk, the common path: plain stores,
+// see probe_agent_tblock) or, for a thread without one, its hit_stripes line (interlocked).
+struct HitAcct { probe_agent_tblock *blk; probe_agent_stripe *line; uint32_t probe; };
 struct ThreadSlot {
     volatile LONG tid;
     HitScope *active;                    // the hit whose callback this thread is running
-    probe_agent_stripe *active_line;     // that hit's hit_stripes line
+    HitAcct active_acct;                 // where that hit is counted
     volatile LONG active_logged;         // ... and its unaccounted unit left with its first log
     uintptr_t moved_from, moved_to;      // a fault moved out of a trampoline (tramp_veh)
     const void *teb;                     // the owner's identity: TEB, stack base, creation time
     uintptr_t stack;
     uint64_t born;
     volatile LONG busy;                  // reading `born`: a probe hit meanwhile passes straight through
+    // The slot's hit block in the CURRENT shared block (blk_gen == g_tblock_gen; null: none was
+    // free -- the stripes). It stays with the slot when the slot passes to a new owner (the
+    // dead one writes nothing more), and moves to another slot only from a dead owner's.
+    probe_agent_tblock *blk;
+    LONG blk_gen;
+    ULONGLONG blk_retry;
 };
 constexpr uint32_t AGENT_THREAD_SLOTS = 4096;
 static ThreadSlot g_threads[AGENT_THREAD_SLOTS];
@@ -1009,7 +1032,7 @@ static ThreadSlot *take_dead_slot(ThreadSlot *table, uint32_t size, DWORD tid) {
         if (!t || t == SLOT_MOVING || t == (LONG)tid || !slot_owner_gone(t)) continue;
         if (InterlockedCompareExchange(&s.tid, SLOT_MOVING, t) != t) continue;
         if (!slot_owner_gone(t)) { InterlockedExchange(&s.tid, t); continue; }   // the id lives again: leave it
-        s.active = nullptr; s.active_line = nullptr; s.active_logged = 0; s.moved_from = s.moved_to = 0;
+        s.active = nullptr; s.active_acct = {}; s.active_logged = 0; s.moved_from = s.moved_to = 0;
         s.teb = nullptr; s.stack = 0; s.born = 0; s.busy = 0;
         InterlockedExchange(&s.tid, (LONG)tid);
         return &s;
@@ -1053,6 +1076,76 @@ static ThreadSlot *own_thread_slot(DWORD tid) {
     return ts;
 }
 
+// This thread's slot, cached in a dynamic TLS slot (TlsAlloc'd at init; read straight from the
+// TEB's TlsSlots, which exist from a thread's first instruction -- unlike implicit TLS, see
+// tls_ready): the lookup and identity check run once per thread, not per hit. A slot passes
+// to another thread only from a dead owner, so a cached slot stays this thread's.
+static DWORD g_slot_tls = TLS_OUT_OF_INDEXES;    // < 64 or unused
+static inline ThreadSlot *cached_slot() {
+    const DWORD i = g_slot_tls;
+    if (i >= 64) return nullptr;
+#if defined(_WIN64)
+    return reinterpret_cast<ThreadSlot *>(__readgsqword(0x1480 + i * 8));
+#else
+    return reinterpret_cast<ThreadSlot *>(__readfsdword(0xE10 + i * 4));
+#endif
+}
+static inline void cache_slot(ThreadSlot *ts) {
+    const DWORD i = g_slot_tls;
+    if (i >= 64) return;
+#if defined(_WIN64)
+    __writegsqword(0x1480 + i * 8, (unsigned __int64)(uintptr_t)ts);
+#else
+    __writefsdword(0xE10 + i * 4, (unsigned long)(uintptr_t)ts);
+#endif
+}
+static ThreadSlot *my_slot(DWORD tid) {
+    ThreadSlot *ts = cached_slot();
+    if (!ts && (ts = own_thread_slot(tid)) != nullptr) cache_slot(ts);
+    return ts;
+}
+
+// Hit blocks (probe_agent_tblock). A new shared block (init) starts a generation: every slot
+// claims a block again. Claim: a free block, else (at most every 100 ms) one held by a slot
+// whose owner is gone -- its counts stay in the block (a hit its owner left in flight stays
+// unaccounted, as with the stripes), the new owner adds to them.
+static volatile LONG g_tblock_gen = 1;
+static volatile LONG64 g_tsteal_after;
+static probe_agent_tblock *steal_tblock(ThreadSlot *table, uint32_t size, DWORD tid) {
+    for (uint32_t n = 0; n < size; ++n) {
+        ThreadSlot &d = table[n];
+        const LONG t = d.tid;
+        if (!t || t == SLOT_MOVING || t == (LONG)tid || !d.blk || d.blk_gen != g_tblock_gen || !slot_owner_gone(t)) continue;
+        if (InterlockedCompareExchange(&d.tid, SLOT_MOVING, t) != t) continue;
+        probe_agent_tblock *b = nullptr;
+        if (slot_owner_gone(t) && d.blk && d.blk_gen == g_tblock_gen) {
+            b = d.blk; d.blk = nullptr; d.active = nullptr; d.active_acct = {};
+        }
+        InterlockedExchange(&d.tid, t);
+        if (b) return b;
+    }
+    return nullptr;
+}
+static probe_agent_tblock *slot_block(ThreadSlot *ts, DWORD tid) {
+    const LONG gen = g_tblock_gen;
+    if (ts->blk_gen == gen && (ts->blk || GetTickCount64() < ts->blk_retry)) return ts->blk;
+    probe_agent_tblock *b = nullptr;
+    for (uint32_t i = 0; i < PROBE_AGENT_TBLOCKS && !b; ++i)
+        if (!shared->tblocks[i].owner && InterlockedCompareExchange(&shared->tblocks[i].owner, (LONG)tid, 0) == 0)
+            b = &shared->tblocks[i];
+    if (!b && GetTickCount64() >= (ULONGLONG)g_tsteal_after &&
+        InterlockedCompareExchange(&g_sweeper, (LONG)tid, 0) == 0) {          // one sweeper (see take_dead_slot)
+        b = steal_tblock(g_threads, AGENT_THREAD_SLOTS, tid);
+        if (!b) b = steal_tblock(g_overflow, AGENT_OVERFLOW_SLOTS, tid);
+        if (!b) InterlockedExchange64(&g_tsteal_after, (LONG64)GetTickCount64() + 100);
+        InterlockedExchange(&g_sweeper, 0);
+        if (b) InterlockedExchange(&b->owner, (LONG)tid);
+    }
+    ts->blk = b; ts->blk_gen = gen;
+    if (!b) ts->blk_retry = GetTickCount64() + 100;   // none free: the stripes; look again in 100 ms
+    return b;
+}
+
 // The thread's last NT status (TEB LastStatusValue), beside GetLastError.
 #if defined(_WIN64)
 static inline volatile DWORD *teb_last_status() { return (volatile DWORD *)((unsigned char *)NtCurrentTeb() + 0x1250); }
@@ -1070,7 +1163,7 @@ struct OrigPost {                    // x64: written by uhh_orig_thunk (gpr +0x0
 };
 static_assert(offsetof(OrigPost, xmm) == 0x30, "uhh_orig_thunk layout");
 struct HitScope {
-    probe_agent_stripe *line;       // hit_stripes line: its unaccounted unit and running count
+    HitAcct acct;                   // where it is counted: its unaccounted unit and running count
     ThreadSlot *slot;               // this thread's slot (null: none free, see thread_slot)
     volatile LONG abandoned = 0;
     bool logged = false;            // its first log carried the unaccounted unit (see agent_log)
@@ -1380,9 +1473,15 @@ static volatile LONG g_stopping;
 // callbacks_interrupted (probe_agent_stripe).
 // A callback ended (returned, or was unwound past): it no longer runs, and its unaccounted
 // unit goes -- unless its first log already carried it (probe_agent_stripe).
-static void hit_settle(probe_agent_stripe *line, bool logged) {
-    if (!logged) InterlockedExchangeAdd64(&line->value, -PROBE_AGENT_INFLIGHT_ONE);
-    InterlockedDecrement64(&line->running);
+static void hit_settle(const HitAcct &a, bool logged) {
+    if (probe_agent_tblock *b = a.blk) {                 // the owner's block: plain stores
+        if (!logged) probe_agent_store64(&b->done, probe_agent_load64(&b->done) + 1);
+        b->running = b->running - 1;
+        return;
+    }
+    if (!a.line) return;
+    if (!logged) InterlockedExchangeAdd64(&a.line->value, -PROBE_AGENT_INFLIGHT_ONE);
+    InterlockedDecrement64(&a.line->running);
 }
 // An exception or longjmp left the original (call_original) and is unwinding past this
 // hit's callback: settle what call_mid would have on return (once).
@@ -1390,23 +1489,31 @@ static void hit_scope_abandon(HitScope *h) {
     if (InterlockedExchange(&h->abandoned, 1)) return;
     if (h->slot && h->slot->active == h) h->slot->active = nullptr;
     if (!h->slot) InterlockedDecrement(&g_untracked_running);   // call_mid's own decrement never runs now
-    hit_settle(h->line, h->logged);
+    hit_settle(h->acct, h->logged);
 }
 // The hit a record from c may carry: c's own, on its own thread while its callback runs (the
 // slot names it), and only for its first record. A thread without a slot (the table is full)
 // carries nothing: its unit leaves when the callback returns, as before v23.
 static HitScope *log_carrier(probe_context *c) {
     if (!c || !c->hit_scope) return nullptr;
-    ThreadSlot *ts = thread_slot(GetCurrentThreadId(), false);
+    ThreadSlot *ts = cached_slot();
+    if (!ts) ts = thread_slot(GetCurrentThreadId(), false);
     if (!ts || ts->active != c->hit_scope) return nullptr;
     auto *h = static_cast<HitScope *>(c->hit_scope);
     return h->logged ? nullptr : h;
+}
+// The block a carried record names (probe_agent_log::reserved): index + 1, 0 = the stripes.
+static uint32_t log_carry_block(const HitScope *h) {
+    return h && h->acct.blk && shared ? (uint32_t)(h->acct.blk - shared->tblocks) + 1 : 0;
 }
 // The carrier's record was published / handed over (the controller retires the unit), or
 // dropped (counted in log_dropped: the unit goes here).
 static void log_carried(HitScope *h, bool dropped) {
     if (!h) return;
-    if (dropped) InterlockedExchangeAdd64(&h->line->value, -PROBE_AGENT_INFLIGHT_ONE);
+    if (dropped) {
+        if (probe_agent_tblock *b = h->acct.blk) probe_agent_store64(&b->done, probe_agent_load64(&b->done) + 1);
+        else if (h->acct.line) InterlockedExchangeAdd64(&h->acct.line->value, -PROBE_AGENT_INFLIGHT_ONE);
+    }
     h->logged = true;
     if (h->slot) InterlockedExchange(&h->slot->active_logged, 1);
 }
@@ -1537,23 +1644,36 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     if (g_agent_threads.has(c.tid) || g_sweeper == (LONG)c.tid) return false;   // the agent's own work: see g_agent_threads, take_dead_slot
     const probe_callback cb = callbacks[index];
     if (!cb) return false;
-    ThreadSlot *const ts = own_thread_slot(c.tid);
+    ThreadSlot *const ts = my_slot(c.tid);
     if (ts && ts->busy) return false;                      // the agent's own query: see ThreadSlot
-    uint32_t stripe = (c.tid >> 2) & (PROBE_AGENT_STRIPES - 1);
-    probe_agent_stripe &line = shared->hit_stripes[index][stripe];
-    volatile LONG64 &cell = line.value;
-    // ONE atomic add counts the hit and its unaccounted unit (see probe_agent_stripe): a thread
-    // killed between two separate counters left a hit that was neither logged nor interrupted.
-    // `running` is separate: it is not accounting (a kill between the two adds is harmless).
-    InterlockedExchangeAdd64(&cell, 1 + PROBE_AGENT_INFLIGHT_ONE);
-    InterlockedIncrement64(&line.running);
-    // g_stopping is checked only once this hit is running: probe_agent_stop sets it and then
-    // waits for running callbacks, so a hit is either seen by that wait or sees the flag
-    // (both sides use full-barrier interlocked operations). Checked first, a thread between
-    // the check and the add ran its callback after the detach (its IPC then raised an
-    // exception nobody handled, visible to the target).
+    // Count the hit and its unaccounted unit FIRST (a thread killed at any later instant leaves
+    // it counted: probe_agent_tblock), then mark a callback running.
+    HitAcct acct{ts ? slot_block(ts, c.tid) : nullptr, nullptr, index};
+    if (probe_agent_tblock *b = acct.blk) {
+        probe_agent_store64(&b->hits[index], probe_agent_load64(&b->hits[index]) + 1);
+        b->running = b->running + 1;
+    } else {
+        // ONE atomic add counts the hit and its unaccounted unit (see probe_agent_stripe): a
+        // thread killed between two separate counters left a hit that was neither logged nor
+        // interrupted. `running` is separate: it is not accounting.
+        acct.line = &shared->hit_stripes[index][(c.tid >> 2) & (PROBE_AGENT_STRIPES - 1)];
+        InterlockedExchangeAdd64(&acct.line->value, 1 + PROBE_AGENT_INFLIGHT_ONE);
+        InterlockedIncrement64(&acct.line->running);
+    }
+    _ReadWriteBarrier();
+    // g_stopping is checked only once this hit is running: probe_agent_stop sets it, then
+    // FlushProcessWriteBuffers (every processor's pending stores land: an asymmetric fence --
+    // the block's plain stores need no LOCK here), then waits for running callbacks. So a hit is
+    // either seen by that wait or sees the flag. Checked first, a thread between the check and
+    // the count ran its callback after the detach (its IPC then raised an exception nobody
+    // handled, visible to the target).
     if (g_stopping) {
-        InterlockedExchangeAdd64(&cell, -(1 + PROBE_AGENT_INFLIGHT_ONE)); InterlockedDecrement64(&line.running);
+        if (probe_agent_tblock *b = acct.blk) {
+            probe_agent_store64(&b->hits[index], probe_agent_load64(&b->hits[index]) - 1);
+            b->running = b->running - 1;
+        } else {
+            InterlockedExchangeAdd64(&acct.line->value, -(1 + PROBE_AGENT_INFLIGHT_ONE)); InterlockedDecrement64(&acct.line->running);
+        }
         return false;
     }
     // A probe hit by code the callback itself runs (call_func of a probed function, or a
@@ -1566,12 +1686,12 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
         // stack were reused too, a dead thread's: another creation time. That hit stays in
         // flight (interrupted).
         const uint64_t now = thread_born(ts);
-        if (!ts->born || !now || now == ts->born) hit_settle(ts->active_line, ts->active_logged != 0);
+        if (!ts->born || !now || now == ts->born) hit_settle(ts->active_acct, ts->active_logged != 0);
         ts->born = now;
         ts->active = nullptr;
     }
     if (ts && ts->active) {
-        hit_settle(&line, false); return false;
+        hit_settle(acct, false); return false;
     }
     // The mid-hook stub preserves GPRs, flags and XMM0-15 only. The callback (and the CRT
     // it calls) may touch x87/MXCSR/YMM/ZMM state -- e.g. vzeroupper -- which the target
@@ -1580,21 +1700,21 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     // Extended state (MXCSR, AVX/AVX-512) and DF are handled in mid_entry, BEFORE any of
     // this C code runs -- see there.
     forget_region();     // validated regions are trusted within ONE hit only (see RegionCache)
-    HitScope scope{&line, ts};
+    HitScope scope{acct, ts};
     scope.canary = (uintptr_t)&scope ^ HIT_CANARY;
 #if defined(_WIN64)
     scope.xmm6 = &native.xmm6;
 #endif
     scope.xmm0 = &native.xmm0;
     scope.x87_post = x87_post;
-    if (ts) { ts->active_line = &line; ts->active_logged = 0; ts->active = &scope; }
+    if (ts) { ts->active_acct = acct; ts->active_logged = 0; ts->active = &scope; }
     else InterlockedIncrement(&g_untracked_running);       // no slot at all: see count_live_callbacks
     c.hit_scope = &scope;
     bool callback_ok = run_callback(cb, &c);
     if (ts) ts->active = nullptr;
     else InterlockedDecrement(&g_untracked_running);
     scope.canary = 0;
-    hit_settle(&line, scope.logged);
+    hit_settle(acct, scope.logged);
     if (!callback_ok) {
         // A faulting callback is a no-op: its register changes are discarded -- unless it had
         // already run the original (call_original). Falling through would run the original a
@@ -2508,6 +2628,12 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
     InterlockedExchange(&g_orphan_cleaned, 0);   // a new session: guard it afresh
     InterlockedExchange(&g_cleared_n, 0);
     if (g_guard_wake) SetEvent(g_guard_wake);    // the service thread takes the new controller handle
+    InterlockedIncrement(&g_tblock_gen);   // a new (zeroed) channel: every thread claims a hit block again
+    if (g_slot_tls == TLS_OUT_OF_INDEXES) {
+        const DWORD i = TlsAlloc();             // per-thread slot cache (cached_slot): only the TEB's 64 inline slots
+        if (i != TLS_OUT_OF_INDEXES && i >= 64) TlsFree(i);
+        else g_slot_tls = i;
+    }
     InterlockedExchange(&g_stopping, 0);   // a new session after a detach: callbacks run again
     resolve_callbacks();
     install_pending();
@@ -2557,6 +2683,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_stop(void *) {
     if (!shared) return 0;                               // loaded but never initialised: nothing to undo
     AcquireSRWLockExclusive(&g_install_lock);            // after any install round in progress
     InterlockedExchange(&g_stopping, 1);
+    FlushProcessWriteBuffers();                          // see call_mid: hits count with plain stores
     // 2 s of wall time: 2000 x Sleep(1) was up to ~31 s at the default 15.6 ms timer, past the
     // controller's 5 s wait for this thread -- the detach then skipped its log drain (dropped
     // the late logs of a callback still running) and reported the hooks as not removed.

@@ -11,7 +11,7 @@
 #include <intrin.h>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 24;   /* 24: huntaudit early_init (on top of 23: runfix1 log carry + running count; 21: held_floor) */
+constexpr uint32_t PROBE_AGENT_VERSION = 25;   /* 25: per-thread hit blocks (tblocks); 24: huntaudit early_init (on top of 23: runfix1 log carry + running count; 21: held_floor) */
 constexpr uint32_t PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH = 1u << 9;   /* agent side only needs this one */   /* == PROBE_UNSAFE_FAST_PATCH (asserted in session.cpp) */
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 128;   /* inline probes per session; the 129th is refused */
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
@@ -86,7 +86,7 @@ struct probe_agent_log {
     uint32_t carry;                /* 1: the FIRST record of a running callback -- it carries that hit's
                                       unaccounted unit (hit_stripes[probe][stripe of tid]); the controller
                                       retires the unit when it takes the record (v23, see hit_stripes) */
-    uint32_t reserved;
+    uint32_t reserved;             /* v25: with carry, the producer's hit block + 1 (0: the stripes) */
     uint64_t frames[32];           /* == PROBE_STACK_MAX_FRAMES */
 };
 
@@ -173,6 +173,46 @@ constexpr uint32_t PROBE_AGENT_HOLD_OURS = 0xFFFFFFFFu;
 constexpr uint32_t PROBE_AGENT_STRIPES = 16;
 struct alignas(64) probe_agent_stripe { volatile LONG64 value; volatile LONG64 running; char pad[48]; };
 
+/* Per-thread hit blocks (v25): the common path. A thread that hits inline probes owns one block
+   and is its ONLY writer -- plain stores, no LOCKed instruction per hit (on x86 every 64-bit
+   interlocked operation is a LOCK CMPXCHG8B loop; the shared stripes cost ~2x main's per-hit
+   time there). The stripes above remain for threads without a block (more than
+   PROBE_AGENT_TBLOCKS probe-hitting threads alive at once). In a block:
+   hits[p]  every hit of probe p by the owner -- the FIRST store of a hit, so a thread killed at
+            any later instant leaves its hit counted (and unaccounted, below);
+   done     the owner's callbacks that ended WITHOUT a carried record: returned without logging,
+            or their first record was dropped (one store, made when that happens);
+   running  1 while the owner runs a callback (detach / unhook drains wait for 0);
+   retired  written ONLY by the controller: carried first records it took (log_carry names
+            the block, probe_agent_log::reserved = index + 1).
+   Unaccounted hits of a block = sum(hits) - done - retired: a callback that has neither ended
+   unlogged nor had its carried record taken -- exactly the stripes' high bits. A thread killed
+   at any instant leaves hits == logs + dropped + unaccounted, as before. 64-bit fields are
+   read and written whole (probe_agent_load64 / store64: one MOVQ on x86, never torn). */
+constexpr uint32_t PROBE_AGENT_TBLOCKS = 256;
+struct alignas(64) probe_agent_tblock {
+    volatile LONG owner;           /* agent bookkeeping: the owner's tid (0 free) */
+    volatile LONG running;
+    volatile LONG64 done;
+    volatile LONG64 retired;
+    char pad[40];
+    volatile LONG64 hits[PROBE_AGENT_MAX_PROBES];
+};
+inline LONG64 probe_agent_load64(const volatile LONG64 *p) {
+#if defined(_WIN64)
+    return *p;
+#else
+    return __iso_volatile_load64((const volatile __int64 *)p);
+#endif
+}
+inline void probe_agent_store64(volatile LONG64 *p, LONG64 v) {
+#if defined(_WIN64)
+    *p = v;
+#else
+    __iso_volatile_store64((volatile __int64 *)p, v);
+#endif
+}
+
 struct probe_agent_shared {
     uint32_t magic;
     uint32_t version;
@@ -214,6 +254,7 @@ struct probe_agent_shared {
        No new thread can start before process initialisation ends, so init must not wait for
        its service thread (it reports itself ready once it runs). */
     volatile LONG early_init;
+    probe_agent_tblock tblocks[PROBE_AGENT_TBLOCKS];   /* v25: per-thread hit accounting (see probe_agent_tblock) */
 };
 
 constexpr LONG64 PROBE_AGENT_INFLIGHT_ONE = 1LL << 48;   /* one unaccounted hit in a hit_stripes cell */
@@ -221,8 +262,16 @@ constexpr LONG64 PROBE_AGENT_INFLIGHT_ONE = 1LL << 48;   /* one unaccounted hit 
 inline uint64_t probe_agent_hits(const probe_agent_shared *sh, uint32_t index) {
     uint64_t n = 0;
     for (uint32_t i = 0; i < PROBE_AGENT_STRIPES; ++i)
-        n += (uint64_t)sh->hit_stripes[index][i].value & ((1ULL << 48) - 1);
+        n += (uint64_t)probe_agent_load64(&sh->hit_stripes[index][i].value) & ((1ULL << 48) - 1);
+    for (uint32_t b = 0; b < PROBE_AGENT_TBLOCKS; ++b) n += (uint64_t)probe_agent_load64(&sh->tblocks[b].hits[index]);
     return n;
+}
+/* A block's unaccounted hits (never below zero: the block lives in memory the target can write). */
+inline uint64_t probe_agent_tblock_unaccounted(const probe_agent_tblock &t) {
+    uint64_t hits = 0;
+    for (uint32_t p = 0; p < PROBE_AGENT_MAX_PROBES; ++p) hits += (uint64_t)probe_agent_load64(&t.hits[p]);
+    const uint64_t out = (uint64_t)probe_agent_load64(&t.done) + (uint64_t)probe_agent_load64(&t.retired);
+    return hits > out ? hits - out : 0;
 }
 
 /* Unaccounted hits (see probe_agent_stripe): callbacks without a delivered log that have not
@@ -231,7 +280,8 @@ inline uint64_t probe_agent_hits(const probe_agent_shared *sh, uint32_t index) {
 inline uint64_t probe_agent_inflight(const probe_agent_shared *sh) {
     uint64_t n = 0;
     for (uint32_t p = 0; p < PROBE_AGENT_MAX_PROBES; ++p)
-        for (uint32_t i = 0; i < PROBE_AGENT_STRIPES; ++i) n += (uint64_t)sh->hit_stripes[p][i].value >> 48;
+        for (uint32_t i = 0; i < PROBE_AGENT_STRIPES; ++i) n += (uint64_t)probe_agent_load64(&sh->hit_stripes[p][i].value) >> 48;
+    for (uint32_t b = 0; b < PROBE_AGENT_TBLOCKS; ++b) n += probe_agent_tblock_unaccounted(sh->tblocks[b]);
     return n;
 }
 /* Unaccounted hits minus the first records sitting published in the ring (they carry their
@@ -253,7 +303,8 @@ inline uint64_t probe_agent_unlogged(const probe_agent_shared *sh) {
 inline uint64_t probe_agent_running(const probe_agent_shared *sh) {
     uint64_t n = 0;
     for (uint32_t p = 0; p < PROBE_AGENT_MAX_PROBES; ++p)
-        for (uint32_t i = 0; i < PROBE_AGENT_STRIPES; ++i) n += (uint64_t)sh->hit_stripes[p][i].running;
+        for (uint32_t i = 0; i < PROBE_AGENT_STRIPES; ++i) n += (uint64_t)probe_agent_load64(&sh->hit_stripes[p][i].running);
+    for (uint32_t b = 0; b < PROBE_AGENT_TBLOCKS; ++b) n += (uint64_t)(sh->tblocks[b].running != 0);
     return n;
 }
 /* The controller took a record with carry = 1: retire its hit's unaccounted unit. The record
@@ -261,6 +312,12 @@ inline uint64_t probe_agent_running(const probe_agent_shared *sh) {
    carry cannot borrow from the hit count). */
 inline void probe_agent_retire_carry(probe_agent_shared *sh, const probe_agent_log &rec) {
     if (rec.carry != 1 || rec.probe >= PROBE_AGENT_MAX_PROBES) return;
+    if (rec.reserved) {                         /* the owner's block (v25): the controller's own counter */
+        if (rec.reserved > PROBE_AGENT_TBLOCKS) return;
+        probe_agent_tblock &t = sh->tblocks[rec.reserved - 1];
+        if (probe_agent_tblock_unaccounted(t)) InterlockedIncrement64(&t.retired);
+        return;
+    }
     volatile LONG64 &cell = sh->hit_stripes[rec.probe][(rec.tid >> 2) & (PROBE_AGENT_STRIPES - 1)].value;
     for (LONG64 v = cell; ((uint64_t)v >> 48) != 0; v = cell)
         if (InterlockedCompareExchange64(&cell, v - PROBE_AGENT_INFLIGHT_ONE, v) == v) return;
