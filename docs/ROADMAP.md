@@ -1113,6 +1113,10 @@ by itself, nothing dropped), detach while callbacks run / block in call_original
   failing). Residual: a WOW64 implicit suspend of a thread that is neither the event's nor the
   call's (e.g. arming a hardware probe on every thread) is not covered; the guard's extra
   resume can undo a suspension the PROGRAM made of one of those threads at that instant.
+- Merge verification (2026-11-06, VM, after L12/L13): `--only lifecycle,interrupt,attach,gated,detach,
+  transparency,callorig,callfunc` 151/151 on x64 and 151/151 on x86; L11
+  (`lifecycle-controller-killed-breakpoint`, now also failing on a thread left suspended) 11/11 on x64
+  and 6/6 on x86 on the final code, no unhandled #DB/INT3 seen in any run since the merge.
 - Merged into merge-frida (agent protocol v19 = v18 + the guard): the guard takes the armed INT3s
   from merge-frida's INT3 table (every armed breakpoint, sorted; was its own 512-entry copy, so a
   session with more breakpoints left the rest unguarded), resumes the threads an in-place step
