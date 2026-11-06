@@ -6142,8 +6142,11 @@ def check_logs_order(threads=4, count=2000):
 
 
 def check_logs_wedge(threads=4, count=3000):
-    """A producer stopped BETWEEN claiming a ring slot and publishing it (the target finds that
-    instant through the shared ring and freezes the thread there):
+    """A producer stopped BETWEEN claiming a ring slot and publishing it -- deterministically: its
+    record "UHH_TEST_WEDGE o N" stops in the agent's test stop right after the claim (enabled by
+    UHH_TEST_LOG_WEDGE=1, which logs_target sets in itself; agent.cpp test_wedge_point) and the
+    target confirms the claimed, unpublished slot in the shared ring. (It used to sample a running
+    producer with SuspendThread for that instant: wedged=0 on slow CI runners.) Then:
       kill:    TerminateThread there. Its slot can never be published.
       suspend: the program's own SuspendThread, held while the other threads log.
       exit:    ExitProcess kills it there, and the exiting thread then logs more records than
@@ -6162,7 +6165,10 @@ def check_logs_wedge(threads=4, count=3000):
                                  timeout=180)
             a, rep = app(o), report(o)
             hits = next(iter(probes(o)), {}).get("hits")
-            logs = sum(1 for x in o if x.get("kind") == "probe_log" and str(x.get("message", "")).startswith("o "))
+            # the producer's stopped record ("UHH_TEST_WEDGE o N", agent test stop) is delivered
+            # only in suspend mode (resumed): it counts as a log like any other
+            logs = sum(1 for x in o if x.get("kind") == "probe_log" and
+                       str(x.get("message", "")).startswith(("o ", "UHH_TEST_WEDGE o ")))
             interrupted = rep.get("callbacks_interrupted")
             if mode == "exit":
                 live_ok = rep.get("app_exit") == 7

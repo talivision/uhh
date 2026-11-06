@@ -605,6 +605,27 @@ static bool controller_dead(const probe_agent_shared *sh) {
     return dead;
 }
 
+// Test stop (regress logs-wedge): "a producer stopped between claiming its ring slot and
+// publishing it" made deterministic -- sampling a running producer for that instant failed on
+// slow CI runners (wedged=0). Only a record whose text starts with "UHH_TEST_WEDGE " in a
+// process whose environment has UHH_TEST_LOG_WEDGE=1 (set by the test target itself) stops
+// here, after its claim: it signals Local\uhh_test_wedge_<pid> and waits for
+// Local\uhh_test_wedge_go_<pid> (the target then kills, suspends or exits around it). Any other
+// record pays one byte compare.
+static void test_wedge_point(const probe_agent_log &rec) {
+    static const char tag[] = "UHH_TEST_WEDGE ";
+    if (rec.text_len < sizeof(tag) - 1 || rec.text[0] != 'U' || std::memcmp(rec.text, tag, sizeof(tag) - 1)) return;
+    char on[4] = {};
+    if (!GetEnvironmentVariableA("UHH_TEST_LOG_WEDGE", on, sizeof(on)) || on[0] != '1') return;
+    wchar_t at[64], go[64];
+    _snwprintf_s(at, _countof(at), _TRUNCATE, L"Local\\uhh_test_wedge_%lu", GetCurrentProcessId());
+    _snwprintf_s(go, _countof(go), _TRUNCATE, L"Local\\uhh_test_wedge_go_%lu", GetCurrentProcessId());
+    HANDLE a = OpenEventW(EVENT_MODIFY_STATE, FALSE, at), g = OpenEventW(SYNCHRONIZE, FALSE, go);
+    if (a && g) { SetEvent(a); WaitForSingleObject(g, INFINITE); }
+    if (a) CloseHandle(a);
+    if (g) CloseHandle(g);
+}
+
 struct HitScope;
 static HitScope *log_carrier(probe_context *c);
 static void log_carried(HitScope *h, bool dropped);
@@ -676,6 +697,7 @@ static void agent_log(probe_context *c, bool stack, const char *format, va_list 
             pos = sh->log_head;
         }
     }
+    test_wedge_point(local);                                      // (test only: see there)
     rec->probe = local.probe; rec->tid = local.tid;
     rec->text_len = local.text_len;
     std::memcpy(rec->text, local.text, local.text_len + 1);

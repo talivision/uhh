@@ -1455,9 +1455,19 @@ Real-bug candidates (reproduce on runners, not on the VM so far):
   `probe_api_agent.dll+0x13339`, and every later case of the same run had no target row. The same shard passed on a
   Xeon 8573C in the next run. Candidate: TR9's stack-overflow recovery depends on the host (exception-dispatch stack
   needs grow with the XSAVE area: AVX-512 / AMX hosts); the CPU column now recorded per shard will tell.
-- **ntdll-churn-{hw,breakpoint} (x64, 2 of 5 runs, Xeon 8370C in the last)**: some of the 8 attach/detach cycles see
-  0 hits (`cycle2: rc=0 detached=True backend=hw hits=0 ... err=probe...`, text cut in the annotation) while the
-  target's reads stay exact. New check (b65175d); needs the full log (gh auth) to see the error.
+- 🔧 **ntdll-churn-{hw,breakpoint} (x64, 2 of 5 runs, Xeon 8370C in the last)** -- cause found and fixed; a rarer
+  residue open. The zero-hit cycles were probes that never became ACTIVE inside the 300 ms window: the report says
+  `active:false`, no `probe: active` line, nothing lost. On attach, breakpoint/hw probes arm only once the agent's
+  controller-death guard is up (agent init on a remote thread). With 4 target threads spinning on a 2-vCPU runner a
+  new normal-priority thread waits a whole quantum (Server: ~190 ms) at its start and at every wake-up, so arming took
+  0.3-1.5 s and so did the detach (its remote stop thread). Fix: the controller's remote threads (agent load / init /
+  stop) and the agent's service thread run at THREAD_PRIORITY_HIGHEST (they never spin; the program loses nothing
+  but those milliseconds). A/B on runners (runfix1-diag 42192716058, same build, `UHH_DIAG_NOBOOST` knob, 7 jobs x
+  4 runs x 7 cycles): without the boost 11 zero-hit cycles of 196 and activations up to 0.41 s; with it 0 of 196.
+  42201061531 (`churnx`: inline+hw+breakpoint on fresh targets as the check does, PROBE_TRACE): 0 of 252. Open:
+  the full check still showed `cycle2` (right after the agent-loading cycle 1) at 0 hits for breakpoint in 3 of ~58
+  runner runs (42194976034, 42196642047); activations cluster at ~0.2 s after the attach line, so the 300 ms window
+  has ~100 ms margin -- see the timelines in the next diag.
 - Seen once each, undetermined: x86 `logs-wedge-suspend` (`wedged=0`), x64 `detach-inline` (`1 thread(s) frozen;
   all clean` yet FAIL, detail cut).
 
