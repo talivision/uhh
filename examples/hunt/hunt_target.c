@@ -25,6 +25,11 @@
  *   owndr-live  the same, but DR0 is armed on the worker while it RUNS (it waits on an event;
  *           main suspends it, GetThreadContext, sets DR0, SetThreadContext, resumes) -- over
  *           whatever DR0 held then (a debugger's hardware probe, if any)
+ *   guard   N times: a fresh PAGE_GUARD page touched through guard_touch (its first instruction
+ *           is the access): the program's __except must see exactly one guard violation each
+ *           time, the second touch reads the value (probe guard_touch, e.g. with uhh_trace)
+ *   twin    N times: twin_a\twin.dll (TwinWork returns 1), unload, twin_b\twin.dll (returns 2)
+ *           -- the same base, different code at the same RVA (probe twin.dll!TwinWork)
  *   early   the handle is opened and one read made in a TLS callback at process attach
  *           (before the entry point); then N reads from main
  * Output: {"kind":"target","scenario":...,"reads":R,"bad":B,"foreign":F,...}
@@ -41,7 +46,7 @@ typedef struct { HANDLE UniqueProcess, UniqueThread; } CLIENTID;
 typedef LONG(NTAPI *NtOpenFn)(HANDLE *, ACCESS_MASK, OBJATTR *, CLIENTID *);
 static NtReadFn g_ntread;
 static HANDLE g_proc;
-static volatile LONG g_reads, g_bad, g_foreign, g_early, g_work, g_owndr;
+static volatile LONG g_reads, g_bad, g_foreign, g_early, g_work, g_owndr, g_guards, g_twin;
 static ULONG_PTR g_owndr_addr;
 static unsigned char g_pattern[64];
 static volatile LONG g_stop;
@@ -224,6 +229,25 @@ static DWORD WINAPI owndr_worker(void *p) {
     return 0;
 }
 
+/* ---- guard: an instruction displaced by a probe touches a guard page ---- */
+__declspec(dllexport) __declspec(noinline) int __fastcall guard_touch(volatile char *p) { return *p; }
+static int guard_filter(DWORD code) {
+    return code == STATUS_GUARD_PAGE_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* ---- twin: two builds of one DLL at the same base ---- */
+typedef int (*TwinFn)(void);
+static int twin_call(const char *dir, const char *sub) {
+    char path[MAX_PATH];
+    _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\%s\\twin.dll", dir, sub);
+    HMODULE h = LoadLibraryA(path);
+    if (!h) return -1;
+    TwinFn f = (TwinFn)GetProcAddress(h, "TwinWork");
+    int v = f ? f() : -2;
+    FreeLibrary(h);
+    return v;
+}
+
 /* ---- ctx / exit ---- */
 static DWORD WINAPI reader_until_stop(void *p) { (void)p; while (!g_stop) hunt_read(); return 0; }
 
@@ -318,6 +342,28 @@ int main(int argc, char **argv) {
             WaitForSingleObject(t, INFINITE); CloseHandle(t);
         }
         if ((DWORD)g_owndr != g_n) InterlockedIncrement(&g_bad);
+    } else if (!strcmp(sc, "guard")) {
+        for (DWORD i = 0; i < g_n; ++i) {
+            char *page = (char *)VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            DWORD old = 0; int v = -1;
+            if (!page) { InterlockedIncrement(&g_bad); continue; }
+            page[0] = (char)(i & 0x7F);
+            if (!VirtualProtect(page, 4096, PAGE_READWRITE | PAGE_GUARD, &old)) InterlockedIncrement(&g_bad);
+            __try { v = guard_touch(page); }
+            __except (guard_filter(GetExceptionCode())) { InterlockedIncrement(&g_guards); }
+            if (v != -1) InterlockedIncrement(&g_bad);            /* the guard did not fire */
+            if (guard_touch(page) != (int)(i & 0x7F)) InterlockedIncrement(&g_bad);
+            VirtualFree(page, 0, MEM_RELEASE);
+        }
+        if ((DWORD)g_guards != g_n) InterlockedIncrement(&g_bad);
+    } else if (!strcmp(sc, "twin")) {
+        char dir[MAX_PATH]; DWORD n = GetModuleFileNameA(NULL, dir, MAX_PATH);
+        while (n && dir[n - 1] != '\\') --n;
+        dir[n ? n - 1 : 0] = 0;
+        for (DWORD i = 0; i < g_n; ++i) {
+            if (twin_call(dir, "twin_a") != 1) InterlockedIncrement(&g_bad); else InterlockedIncrement(&g_twin);
+            if (twin_call(dir, "twin_b") != 2) InterlockedIncrement(&g_bad); else InterlockedIncrement(&g_twin);
+        }
     } else if (!strcmp(sc, "early")) {
         for (DWORD i = 0; i < g_n; ++i) hunt_read();
     } else if (!strcmp(sc, "threads")) {
@@ -328,8 +374,8 @@ int main(int argc, char **argv) {
     g_tls_on = 0;
     if (veh) RemoveVectoredExceptionHandler(veh);
     printf("{\"kind\":\"target\",\"scenario\":\"%s\",\"n\":%lu,\"reads\":%ld,\"bad\":%ld,\"foreign\":%ld,"
-           "\"early\":%ld,\"work\":%ld,\"owndr\":%ld,\"checksum\":\"%llx\",\"pid\":%lu}\n",
-           sc, g_n, g_reads, g_bad, g_foreign, g_early, g_work, g_owndr, checksum(), GetCurrentProcessId());
+           "\"early\":%ld,\"work\":%ld,\"owndr\":%ld,\"guards\":%ld,\"twin\":%ld,\"checksum\":\"%llx\",\"pid\":%lu}\n",
+           sc, g_n, g_reads, g_bad, g_foreign, g_early, g_work, g_owndr, g_guards, g_twin, checksum(), GetCurrentProcessId());
     fflush(stdout);
     return 0;
 }

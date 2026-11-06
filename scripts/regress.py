@@ -4135,6 +4135,30 @@ def check_hunt():
                                  f"reads_at_print={tg.get('reads_at_exit')} rc={rc} timeout={tmo}")
             except Exception as e:
                 record(name, False, repr(e))
+        # A displaced copy that faults (guard page: the program must still see its guard
+        # violation, once, at the real instruction -- every backend, incl. a hw probe's
+        # trampoline) and a DLL rebuilt at the same base (twin: the probe re-armed in the new
+        # image must run the NEW instruction, not a cached copy of the old one).
+        for sc, loc, n in (("guard", "hunt_target.exe!guard_touch", 50), ("twin", "twin.dll!TwinWork", 30)):
+            name = f"hunt-{sc}-{bk}"
+            if not hunt_selected(name):
+                continue
+            tr = exe("uhh_trace.exe")
+            if not tr or (sc == "twin" and not (BIN / "twin_a" / "twin.dll").exists()):
+                missing_bin(name, "uhh_trace / twin_a,twin_b")
+                continue
+            try:
+                _, o = run([tr, "--backend", bk, "-p", loc + ":-", "--", t, sc, "--n", n], timeout=180)
+                tg = next((x for x in o if x.get("kind") == "target"), {})
+                pr = next((x for x in o if x.get("kind") == "probe"), {})
+                rep = report(o)
+                ok = (tg.get("bad") == 0 and pr.get("hits") == 2 * n and rep.get("app_exit") == 0 and
+                      rep.get("log_dropped") == 0 and
+                      (tg.get("guards") == n if sc == "guard" else tg.get("twin") == 2 * n))
+                record(name, ok, f"bad={tg.get('bad')} guards={tg.get('guards')} twin={tg.get('twin')} "
+                                 f"hits={pr.get('hits')}/{2 * n} exit={rep.get('app_exit')} err={(rep.get('error') or '')[:120]}")
+            except Exception as e:
+                record(name, False, repr(e))
         # Starvation: 8 threads hitting the probe back to back while main sleeps 300 ms and
         # calls ExitProcess. Uninstrumented: ~0.3 s. Every debug event freezes the whole process,
         # so on breakpoint/hw a thread that hits no probe used to run only in the gaps between
