@@ -2066,7 +2066,16 @@ def check_ntdll_churn(cycles=8, round_reads=1000000):
     hits, 1.2-2.6 s). The uninstrumented run takes ~6.8 s, so a fixed count fits too few
     inline cycles. Inherent to logging every call, not a wait: the check now sets the run
     length instead of the machine. Log lines are counted as they stream (never held); with that,
-    inline cycles took 1.0-2.9 s on x64 and 1.2-8.0 s on x86."""
+    inline cycles took 1.0-2.9 s on x64 and 1.2-8.0 s on x86.
+
+    Cycle 1 runs 3 s (the others 300 ms). On attach, breakpoint/hw probes arm only once the agent's
+    controller-death guard is up, and the first cycle loads the agent and runs its first init (which
+    starts its service thread). On a 2-vCPU CI runner with 4 spinning threads that took longer than
+    300 ms; a detach between the load and the init left the first init -- and a zero-hit window --
+    to cycle 2 (runfix1: 3 of ~58 runner runs, always cycle 2 right after a short cycle 1). The
+    remote agent threads now run above normal priority (0 zero-hit cycles in 511 runner cycles
+    after the first), and cycle 1 gets the time to finish the setup, so every later cycle tests
+    install/remove churn with the agent ready."""
     t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
     if not t or not a:
         return missing_bin("ntdll-churn", "uhh_trace/probe_app")
@@ -2091,8 +2100,11 @@ def check_ntdll_churn(cycles=8, round_reads=1000000):
                     bad.append(f"target ended before cycle {c}")
                     break
                 t0 = time.time()
-                tr = subprocess.Popen([str(t), "--backend", bk, "--attach", str(target.pid), "--detach-after-ms", "300",
-                                       "-p", "ntdll.dll!NtReadVirtualMemory:xxxx"],
+                # Cycle 1 sets the agent up in the target (load, first init, its service thread):
+                # it gets 3 s, so every later cycle starts with the agent ready and must see hits
+                # within 300 ms (see the docstring).
+                tr = subprocess.Popen([str(t), "--backend", bk, "--attach", str(target.pid), "--detach-after-ms",
+                                       "3000" if c == 1 else "300", "-p", "ntdll.dll!NtReadVirtualMemory:xxxx"],
                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 terr = Lines(tr.stderr)
                 logs, objs = 0, []
