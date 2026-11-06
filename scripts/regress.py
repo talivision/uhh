@@ -7023,6 +7023,49 @@ def lc_install_stuck(cfgname, cfg):
             if x: x.kill()
 
 
+def lc_killed_in_freeze(cfgname, cfg, repeats=5):
+    """L11, runner signature (controller killed 0.05 s into an attach, target dead 0xC0000005
+    with no unhandled report): the controller dies while the agent's install round waits on its
+    FREEZE request (UHH_TEST_FREEZE_STALL_MS parks the controller exactly there). The raise then
+    comes back unserviced; the agent must NOT write the hooks unfrozen (SafetyHook's own trap
+    path made the ntdll stub page non-executable under the installer and every other thread).
+    The target must run on, untouched and unhooked."""
+    if "inline" not in cfg.values():
+        return
+    bad, n = [], 0
+    for i in range(repeats):
+        n += 1
+        tg = d = None
+        try:
+            tg = LcTarget("--threads", 4, "--churn", pace=0 if cfgname == "inline" else 1)
+            old = os.environ.get("UHH_TEST_FREEZE_STALL_MS")
+            os.environ["UHH_TEST_FREEZE_STALL_MS"] = "3000"
+            try:
+                d = LcDriver(tg.pid, cfg)
+            finally:
+                if old is None: os.environ.pop("UHH_TEST_FREEZE_STALL_MS", None)
+                else: os.environ["UHH_TEST_FREEZE_STALL_MS"] = old
+            if not d.err.wait_for(lambda l: l.startswith("probe: test: install freeze stalled"), 30):
+                raise RuntimeError(f"no install freeze seen: {d.err.lines[-3:]}")
+            d.kill(); d.finish(timeout=30)
+            time.sleep(3.0)
+            c = tg.check()
+            time.sleep(1.0)
+            c2 = tg.check()
+            progressed = (c2.get("iterations") or 0) > (c.get("iterations") or 0)
+            if not lc_clean(c2) or not progressed:
+                bad.append(f"#{i}: progressed={progressed} {lc_brief(c2)} unhandled={tg.unhandled()}")
+            a = tg.quit()
+            if (a.get("rc") != 0 or a.get("late") or a.get("stuck")) and not any(x.startswith(f"#{i}") for x in bad):
+                bad.append(f"#{i}: exit={a.get('rc')} {lc_brief(a)} unhandled={tg.unhandled()}")
+        except Exception as e:
+            bad.append(f"#{i}: {e!r}")
+        finally:
+            if d: d.kill()
+            if tg: tg.kill()
+    record(f"lifecycle-killed-in-freeze-{cfgname}", not bad, f"cases={n}" + (f" bad={bad[:3]}" if bad else ""))
+
+
 def check_lifecycle():
     """Lifecycle edge cases (examples/lifecycle) under every backend and mixed: repeated
     attach/detach/re-attach, detach at awkward moments, the target dying under the controller,
@@ -7032,7 +7075,7 @@ def check_lifecycle():
         return missing_bin("lifecycle", "lifecycle_driver / lifecycle_target / hunt_dll")
     for cfgname, cfg in LC_CONFIGS.items():
         for fn in (lc_reattach, lc_detach_cases, lc_target_dies, lc_two_controllers, lc_interrupt, lc_controller_killed,
-                   lc_agent_refused, lc_install_stuck):
+                   lc_killed_in_freeze, lc_agent_refused, lc_install_stuck):
             tag = fn.__name__[3:].replace("_", "-")
             if fn is lc_detach_cases or lc_selected(f"lifecycle-{tag}-{cfgname}"):
                 fn(cfgname, cfg)

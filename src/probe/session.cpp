@@ -4347,6 +4347,10 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
             uint64_t mask = 0; size_t m = 0;
             remote_read(s->pi.hProcess, (uint64_t)ex.ExceptionInformation[0] + offsetof(probe_ipc_request, address), &mask, sizeof(mask), &m);
             if (head.op == PROBE_IPC_THAW) { if (s->ipc_freezer == event.dwThreadId) ipc_thaw(s); return true; }
+            // Test hook (regress lifecycle-killed-in-freeze): stall with an install's FREEZE pending,
+            // so the test can kill the controller exactly there.
+            static const unsigned long stall_ms = [] { const char *v = std::getenv("UHH_TEST_FREEZE_STALL_MS"); return v ? std::strtoul(v, nullptr, 10) : 0ul; }();
+            if (stall_ms && mask) { std::fprintf(stderr, "probe: test: install freeze stalled\n"); std::fflush(stderr); Sleep(stall_ms); }
             int32_t result = ipc_freeze(s, event.dwThreadId, m == sizeof(mask) ? mask : 0);
             size_t wrote = 0;
             remote_write(s->pi.hProcess, (uint64_t)ex.ExceptionInformation[0] + offsetof(probe_ipc_request, result), &result, sizeof(result), &wrote);
