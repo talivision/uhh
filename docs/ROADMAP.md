@@ -175,6 +175,13 @@ reads, a slow (50 ms) callback under 32 threads.
   (logs < hits, log_dropped 0). The in-flight counter now lives in the shared block and the report
   carries `callbacks_interrupted`; logs + log_dropped + callbacks_interrupted == hits exactly.
   Breakpoint/hw always complete callbacks (0). `hunt-exit-{return,process,terminate}-*`
+  Open residual (seen in the huntaudit runs, x64 and x86, ~1 run in 8, always +1): logs +
+  interrupted == hits + 1 -- a thread killed AFTER its callback published its log but BEFORE the
+  agent took the callback off the in-flight count (run_callback's return .. the stripe decrement
+  in call_mid) is counted as delivered AND interrupted. Not fixable by reordering (the log's
+  publication and the in-flight decrement are two stores); exactness needs the accounting
+  carried in the log record itself (e.g. per-thread hit sequence numbers in the records and the
+  in-flight word, reconciled by the controller at exit). hunt-exit-*-inline flake by one
 - ✅ (A4) breakpoint/hw + a target that round-trips its own threads' contexts (SuspendThread +
   GetThreadContext + SetThreadContext, as GCs/profilers do): a context captured while the thread
   sat in a UHH debug event and written back after UHH resumed it undid UHH's fix-up (breakpoint:
