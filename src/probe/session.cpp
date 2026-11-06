@@ -189,6 +189,14 @@ struct probe_session {
     bool fwd_finished = false;
     std::atomic<bool> out_midline{false};      // stdout ends inside a target line (under stdout_mu)
     std::atomic<uint64_t> logs_written{0};
+    // Self-verifying output: every probe_log record carries "seq" (0, 1, 2, ... in file order,
+    // assigned by the writer thread), and the report states how many records reached stdout
+    // ("stdout_logs"), so a capture with a gap or a missing tail shows it from its own lines.
+    uint64_t log_seq = 0;                      // next seq (writer thread only)
+    uint64_t logs_enqueued = 0;                // records accepted into log_queue (queue_mu)
+    uint64_t stdout_logs = 0;                  // records written to stdout by the live tail (tail_mu)
+    bool reported_to_stdout = false;           // a probe_report went to stdout ...
+    uint64_t reported_stdout_logs = 0;         // ... stating this stdout_logs
     bool sym_ready = false;    // dbghelp initialised on the target (stack walk + symbolize)
     std::unordered_map<std::string, uint64_t> module_bases;
     std::unordered_map<std::string, std::string> module_paths;   // name -> on-disk image (prehook diff)
@@ -383,7 +391,7 @@ static bool enqueue_log(probe_session *s, LogRecord &&record);
 static size_t drain_agent_logs(probe_session *s);
 static void deliver_past_stall(probe_session *s);
 static void enqueue_agent_record(probe_session *s, const probe_agent_log &rec);
-static void flush_log_writer(probe_session *s);
+static void flush_log_writer(probe_session *s, bool up_to_now = false);
 static void stop_log_output(probe_session *s);
 static void forward_finish(probe_session *s);
 static void forward_stop(probe_session *s);
@@ -450,7 +458,9 @@ static std::string format_log_line(probe_session *s, const LogRecord &r) {
         }
         line.push_back(']');
     }
-    line += "}\n";
+    // Last, so every consumer matching the line's start keeps working (fields only added).
+    n = std::snprintf(prefix, sizeof(prefix), ",\"seq\":%llu}\n", (unsigned long long)s->log_seq++);
+    line.append(prefix, n > 0 ? (size_t)n : 0);
     return line;
 }
 
@@ -473,7 +483,7 @@ static void writer_failed(probe_session *s, const std::string &message, uint64_t
     s->queue_flushed.notify_all();
 }
 
-static bool write_stdout_chunk(probe_session *s, const char *bytes, size_t size);
+static bool write_stdout_chunk(probe_session *s, const char *bytes, size_t size, uint64_t records);
 static void tail_catch_up_locked(probe_session *s, const char *fresh, size_t fresh_size, uint64_t fresh_end);
 static bool write_log_batch(probe_session *s, const std::string &bytes, uint64_t records) {
     if (bytes.empty()) return true;
@@ -486,6 +496,8 @@ static bool write_log_batch(probe_session *s, const std::string &bytes, uint64_t
         return false;
     }
     s->logs_written.fetch_add(records, std::memory_order_relaxed);
+    { std::lock_guard<std::mutex> lock(s->queue_mu); }   // no lost wakeup: a live probe_report waits for a mark
+    s->queue_flushed.notify_all();
     uint64_t end = 0;
     {
         std::lock_guard<std::mutex> lock(s->tail_mu);
@@ -509,7 +521,7 @@ static bool write_log_batch(probe_session *s, const std::string &bytes, uint64_t
         tail_catch_up_locked(s, bytes.data(), bytes.size(), end);
         tail = false;                                   // tail_catch_up_locked tracked the bytes
     }
-    if (tail && !write_stdout_chunk(s, bytes.data(), bytes.size())) tail = false;   // tail_failed() said why
+    if (tail && !write_stdout_chunk(s, bytes.data(), bytes.size(), records)) tail = false;   // tail_failed() said why
     if (tail) {
         std::lock_guard<std::mutex> lock(s->tail_mu);
         s->log_bytes_tailed = s->log_bytes_written;
@@ -646,7 +658,9 @@ static void tail_flush_failed(probe_session *s) {
     tail_failed(s, "flush controller stdout before probe logs");
 }
 
-static bool write_stdout_chunk(probe_session *s, const char *bytes, size_t size) {
+// records: the probe_log lines in bytes; counted in stdout_logs while stdout_mu is still held,
+// so a report (which holds stdout_mu) never sees records on stdout that it does not count.
+static bool write_stdout_chunk(probe_session *s, const char *bytes, size_t size, uint64_t records) {
     if (!size) return true;
     std::lock_guard<std::mutex> out_lock(s->stdout_mu);
     // The driver still owns the CRT FILE*. Empty it before the raw-handle write so its
@@ -659,6 +673,10 @@ static bool write_stdout_chunk(probe_session *s, const char *bytes, size_t size)
     if (s->stdout_handle == nullptr || s->stdout_handle == INVALID_HANDLE_VALUE || size > MAXDWORD ||
         !WriteFile(s->stdout_handle, bytes, (DWORD)size, &wrote, nullptr) || (size_t)wrote != size) {
         tail_write_failed(s, "tail probe logs to stdout"); return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(s->tail_mu);
+        s->stdout_logs += records;
     }
     if (s->stdout_is_console && std::chrono::steady_clock::now() - started >= std::chrono::seconds(1))
         warn_console_once(s);
@@ -698,6 +716,7 @@ static void tail_catch_up_locked(probe_session *s, const char *fresh, size_t fre
     if (tailed >= fresh_end) return;
     if (std::fflush(stdout) != 0) { tail_flush_failed(s); return; }
     const uint64_t file_end = fresh_end - fresh_size;
+    uint64_t records = 0;
     while (tailed < file_end) {
         char buffer[64 * 1024];
         OVERLAPPED at{}; at.Offset = (DWORD)tailed; at.OffsetHigh = (DWORD)(tailed >> 32);
@@ -707,6 +726,7 @@ static void tail_catch_up_locked(probe_session *s, const char *fresh, size_t fre
         }
         if (!write_all(s->stdout_handle, buffer, got)) { tail_write_failed(s, "tail probe logs to stdout"); return; }
         tailed += got;
+        records += (uint64_t)std::count(buffer, buffer + got, '\n');   // one '\n' per record (JSON escapes the rest)
     }
     if (tailed < fresh_end) {
         size_t skip = (size_t)(fresh_size - (fresh_end - tailed));
@@ -714,10 +734,12 @@ static void tail_catch_up_locked(probe_session *s, const char *fresh, size_t fre
             tail_write_failed(s, "tail probe logs to stdout"); return;
         }
         tailed = fresh_end;
+        records += (uint64_t)std::count(fresh + skip, fresh + fresh_size, '\n');
     }
     {
         std::lock_guard<std::mutex> lock(s->tail_mu);
         s->log_bytes_tailed = tailed;
+        s->stdout_logs += records;
     }
     s->tail_caught_up.notify_all();
 }
@@ -932,7 +954,7 @@ static void log_tailer_main(probe_session *s) {
                         if (newline == std::string::npos) break;
                     }
                     size_t chunk = newline + 1;          // every raw stdout write ends on a line boundary
-                    if (!write_stdout_chunk(s, pending.data(), chunk)) return;
+                    if (!write_stdout_chunk(s, pending.data(), chunk, (uint64_t)std::count(pending.data(), pending.data() + chunk, '\n'))) return;
                     pending.erase(0, chunk);
                     {
                         std::lock_guard<std::mutex> lock(s->tail_mu);
@@ -1052,19 +1074,26 @@ static bool enqueue_log(probe_session *s, LogRecord &&record) {
         s->controller_dropped.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+    ++s->logs_enqueued;
     lock.unlock();
     if (warned) warn_console_once(s);
     s->queue_readable.notify_one();
     return true;
 }
 
-static void flush_log_writer(probe_session *s) {
+// up_to_now: wait only for the records queued when the call started, not for an empty queue
+// -- a report on a target that is still running (an attach reported before its detach) would
+// otherwise wait as long as the target keeps logging faster than stdout takes it (seen: a
+// report that came 5.3M records later, its hit snapshot far below its logs_written).
+static void flush_log_writer(probe_session *s, bool up_to_now) {
     if (s->log_file == INVALID_HANDLE_VALUE) return;
     std::string error;
     {
         std::unique_lock<std::mutex> lock(s->queue_mu);
-        s->queue_flushed.wait(lock, [s] {
-            return (s->log_queue.empty() && !s->writer_busy) || s->writer_failed;
+        const uint64_t mark = s->logs_enqueued;
+        s->queue_flushed.wait(lock, [s, up_to_now, mark] {
+            return (s->log_queue.empty() && !s->writer_busy) || s->writer_failed ||
+                   (up_to_now && s->logs_written.load() >= mark);
         });
         error = s->writer_error;
     }
@@ -6313,29 +6342,60 @@ static void json_string(FILE *out, const std::string &value) {
 
 extern "C" void probe_report(probe_session *s, FILE *out) {
     if (!s || !out) return;
+    if (s->exited) stop_drainer(s); else drain_agent_logs(s);
+    // All probe_log lines precede report records -- on a target still running (not exited,
+    // not detached), the ones logged up to now: it may keep logging during the report.
+    flush_log_writer(s, !s->exited && !s->detached);
+    // Report lines and log batches never interleave mid-line on a shared stdout.
+    std::unique_lock<std::mutex> out_lock(s->stdout_mu, std::defer_lock);
+    if (out == stdout) out_lock.lock();
+    // The forwarded target left its last line unfinished: report records start on their own line.
+    // Records that waited behind that line go out now, BEFORE the report: the report is the
+    // last word on what stdout carries.
+    if (out == stdout && s->fwd_out_active && s->out_midline) {
+        std::fputc('\n', out); s->out_midline = false;
+        tail_catch_up_locked(s, nullptr, 0, 0);
+    }
+    // The counts, in causal order: stdout_logs (frozen while stdout_mu is held), then
+    // logs_written (a record reaches the file before stdout), then the hits (a hit is counted
+    // before its log exists). So stdout_logs <= logs_written <= hits even on a target that is
+    // still running; once it exited or was detached they are exact. (The hits used to be read
+    // BEFORE the flush: a report on a live target that flushed 5.3M records showed a probe's
+    // hits far below its own logs_written.)
+    bool live_closed, tail_on;
+    uint64_t stdout_logs;
+    std::string tail_error;
+    {
+        std::lock_guard<std::mutex> lock(s->tail_mu);
+        live_closed = s->live_output_closed;
+        stdout_logs = s->stdout_logs;
+        tail_on = s->tail_enabled;
+        if (s->tail_failed && !s->live_output_closed) tail_error = s->tail_error;
+    }
+    const uint64_t written = s->logs_written.load();
     if (s->shared) {
         MemoryBarrier();
         for (auto &p : s->probes) if (p->flags & PROBE_INLINE)
             p->hits = probe_agent_hits(s->shared, p->agent_index);
     }
-    if (s->exited) stop_drainer(s); else drain_agent_logs(s);
-    flush_log_writer(s);                         // all probe_log lines precede report records
-    // Report lines and log batches never interleave mid-line on a shared stdout.
-    std::unique_lock<std::mutex> out_lock(s->stdout_mu, std::defer_lock);
-    if (out == stdout) out_lock.lock();
-    // The forwarded target left its last line unfinished: report records start on their own line.
-    if (out == stdout && s->fwd_out_active && s->out_midline) { std::fputc('\n', out); s->out_midline = false; }
+    // One snapshot of each probe's hits serves its probe record AND the total: on a live
+    // target the debug loop keeps counting breakpoint/hw hits while the report is written.
+    std::vector<uint64_t> snap;
+    snap.reserve(s->probes.size());
+    for (const auto &p : s->probes) snap.push_back(p->hits);
     for (const auto &j : s->prehooks) { std::fputs(j.c_str(), out); std::fputc('\n', out); }
-    for (const auto &p : s->probes) {
+    for (size_t i = 0; i < snap.size(); ++i) {
+        const auto &p = s->probes[i];
         if (p->internal) continue;
         std::fputs("{\"kind\":\"probe\",\"location\":", out); json_string(out, p->location);
         std::fprintf(out, ",\"backend\":\"%s\",\"active\":%s,\"hits\":%llu}\n",
                      p->flags & PROBE_INLINE ? "inline" : p->flags & PROBE_HW ? "hw" : "breakpoint",
-                     p->active ? "true" : "false", (unsigned long long)p->hits);
+                     p->active ? "true" : "false", (unsigned long long)snap[i]);
     }
     uint64_t hits = 0, active = 0;
     size_t visible = 0;
-    for (const auto &p : s->probes) if (!p->internal) { hits += p->hits; active += p->active; ++visible; }
+    for (size_t i = 0; i < snap.size(); ++i)
+        if (!s->probes[i]->internal) { hits += snap[i]; active += s->probes[i]->active; ++visible; }
     PROCESS_MEMORY_COUNTERS memory{}; memory.cb = (DWORD)sizeof(memory);
     uint64_t peak_mb = GetProcessMemoryInfo(GetCurrentProcess(), &memory, (DWORD)sizeof(memory))
                            ? ((uint64_t)memory.PeakWorkingSetSize + (1024 * 1024 - 1)) / (1024 * 1024) : 0;
@@ -6347,20 +6407,25 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
     uint64_t interrupted = 0;
     if (s->exited && s->shared)
         interrupted = probe_agent_inflight(s->shared);
-    bool live_closed;
-    {
-        std::lock_guard<std::mutex> lock(s->tail_mu);
-        live_closed = s->live_output_closed;
-    }
     std::fprintf(out, "{\"kind\":\"probe_report\",\"probes\":%llu,\"active\":%llu,"
                  "\"hits\":%llu,\"overrides\":%llu,\"log_dropped\":%llu,\"callbacks_interrupted\":%llu,"
                  "\"logs_written\":%llu,\"controller_peak_ws_mb\":%llu,\"app_exit\":%lu,"
-                 "\"live_output_closed\":%s,\"error\":",
+                 "\"live_output_closed\":%s,",
                  (unsigned long long)visible, (unsigned long long)active,
                  (unsigned long long)hits, (unsigned long long)(s->overrides + (s->shared ? (uint64_t)s->shared->overrides : 0)),
                  (unsigned long long)dropped, (unsigned long long)interrupted,
-                 (unsigned long long)s->logs_written.load(std::memory_order_relaxed),
+                 (unsigned long long)written,
                  (unsigned long long)peak_mb, s->exit_code, live_closed ? "true" : "false");
+    // stdout_logs: probe_log records the live tail wrote to stdout -- equal to logs_written
+    // unless stdout is NUL (no tail: null), its reader went away (live_output_closed) or a
+    // stdout write failed (live_output_error, also on stderr and in "error"). A capture is
+    // complete when it holds stdout_logs probe_log lines with seq 0..stdout_logs-1.
+    if (out == stdout) { s->reported_to_stdout = true; s->reported_stdout_logs = stdout_logs; }
+    if (tail_on) std::fprintf(out, "\"stdout_logs\":%llu,", (unsigned long long)stdout_logs);
+    else std::fputs("\"stdout_logs\":null,", out);
+    std::fputs("\"live_output_error\":", out);
+    if (tail_error.empty()) std::fputs("null", out); else json_string(out, tail_error);
+    std::fputs(",\"error\":", out);
     if (s->error.empty()) std::fputs("null", out); else json_string(out, s->error);
     std::fputs("}\n", out); std::fflush(out);
 }
@@ -6418,11 +6483,30 @@ extern "C" void probe_close(probe_session *s) {
         }
         // in_flight: inline callbacks still running (or killed/suspended mid-callback by the
         // program) at the detach -- hits == logs_written + log_dropped + in_flight.
+        const uint64_t written = s->logs_written.load(std::memory_order_relaxed);
+        const uint64_t dropped = (uint64_t)(s->shared ? s->shared->log_dropped : 0) +
+                                 s->controller_dropped.load(std::memory_order_relaxed);
+        const uint64_t in_flight = s->shared ? probe_agent_inflight(s->shared) : 0;
         std::fprintf(stderr, "probe: detached: hits=%llu logs_written=%llu log_dropped=%llu in_flight=%llu\n",
-                     (unsigned long long)hits, (unsigned long long)s->logs_written.load(std::memory_order_relaxed),
-                     (unsigned long long)((uint64_t)(s->shared ? s->shared->log_dropped : 0) +
-                                          s->controller_dropped.load(std::memory_order_relaxed)),
-                     (unsigned long long)(s->shared ? probe_agent_inflight(s->shared) : 0));
+                     (unsigned long long)hits, (unsigned long long)written, (unsigned long long)dropped,
+                     (unsigned long long)in_flight);
+        // The probe_report on stdout was taken before this detach (uhh_trace --detach-after-ms)
+        // and records followed it: give stdout a last word too, so a capture that ends with
+        // them still states its own total.
+        uint64_t tailed;
+        bool live;
+        {
+            std::lock_guard<std::mutex> lock(s->tail_mu);
+            tailed = s->stdout_logs; live = s->tail_enabled && !s->tail_failed;
+        }
+        if (live && s->reported_to_stdout && tailed != s->reported_stdout_logs) {
+            std::lock_guard<std::mutex> out_lock(s->stdout_mu);
+            std::fprintf(stdout, "{\"kind\":\"probe_final\",\"hits\":%llu,\"logs_written\":%llu,\"log_dropped\":%llu,"
+                                 "\"in_flight\":%llu,\"stdout_logs\":%llu}\n",
+                         (unsigned long long)hits, (unsigned long long)written, (unsigned long long)dropped,
+                         (unsigned long long)in_flight, (unsigned long long)tailed);
+            std::fflush(stdout);
+        }
     }
     inplace_release_all(s);
     if (s->pi.hProcess) {

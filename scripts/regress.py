@@ -7665,6 +7665,165 @@ def check_quickstart():
         record(name, False, repr(e))
 
 
+def verify_capture(path):
+    """Stream a captured stdout file (any encoding PowerShell writes: UTF-16 BOM, UTF-8 BOM,
+    plain UTF-8) and check it is SELF-VERIFYINGLY complete: every probe_log line is valid
+    JSON, the records carry seq 0, 1, 2, ... with no gap, and the probe_report (after the last
+    record) states stdout_logs == the records present. Returns a dict (streamed: never holds
+    the records in memory)."""
+    import codecs
+    head = Path(path).read_bytes()[:4] if Path(path).exists() else b""
+    enc = ("utf-16" if head[:2] in (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE) else
+           "utf-8-sig" if head[:3] == codecs.BOM_UTF8 else "utf-8")
+    st = {"lines": 0, "logs": 0, "bad": 0, "gaps": 0, "next": 0, "after_report": 0,
+          "report": None, "probes": [], "sample": "", "encoding": enc}
+    if not head:
+        return st
+    with open(path, encoding=enc, errors="replace", newline="") as f:
+        for raw in f:
+            st["lines"] += 1
+            line = raw.rstrip("\r\n")
+            if '"kind":"probe_log"' in line:
+                st["logs"] += 1
+                if st["report"] is not None:
+                    st["after_report"] += 1
+                try:
+                    seq = json.loads(line).get("seq")
+                except json.JSONDecodeError:
+                    st["bad"] += 1
+                    st["sample"] = st["sample"] or line[:120]
+                    continue
+                if seq != st["next"]:
+                    st["gaps"] += 1
+                    st["sample"] = st["sample"] or f"seq={seq} want={st['next']}"
+                st["next"] = (seq if isinstance(seq, int) else st["next"]) + 1
+            elif line.startswith("{"):
+                try:
+                    o = json.loads(line)
+                except json.JSONDecodeError:
+                    st["bad"] += 1
+                    st["sample"] = st["sample"] or line[:120]
+                    continue
+                if o.get("kind") == "probe_report":
+                    st["report"] = o
+                elif o.get("kind") == "probe":
+                    st["probes"].append(o)
+    return st
+
+
+def check_stdout_powershell():
+    """Owner bug: "high volume drops lines logged -- powershell logging" (stack dumps). Logs are
+    consumed through Windows PowerShell 5.1 the way a user does: `| Out-File`, `>` (UTF-16),
+    `| Set-Content`, `| Tee-Object`, and `2>&1 | Out-File` (stderr merged). High volume, every
+    record with a symbolized --stack, every backend. Each capture must be complete and prove it
+    from its own lines: every probe_log line valid JSON, seq 0..N-1 contiguous, the probe_report
+    last with stdout_logs == logs_written == hits == the records captured, nothing dropped --
+    and the session's JSONL file equally complete."""
+    tracer, target = exe("uhh_trace.exe"), exe("logstream_target.exe")
+    if not tracer or not target:
+        return missing_bin("stdout-powershell", "uhh_trace/logstream_target")
+    ps = SYS32 / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    if not ps.exists():
+        return skip_external("stdout-powershell", "Windows PowerShell 5.1 (powershell.exe)")
+    modes = {
+        "outfile": "& $tr @a | Out-File -FilePath $o",
+        "redirect": "& $tr @a > $o",
+        "setcontent": "& $tr @a | Set-Content -Path $o",
+        "tee": "& $tr @a | Tee-Object -FilePath $o | Out-Null",
+        "merged": "& $tr @a 2>&1 | Out-File -FilePath $o -Encoding utf8",
+    }
+    volume = {"inline": (4, 25000), "breakpoint": (4, 2500), "hw": (4, 2500)}
+    for backend, (threads, count) in volume.items():
+        for mode, pipeline in modes.items():
+            if backend != "inline" and mode not in ("outfile", "merged"):
+                continue                      # every mode once at the highest volume; the rest per backend
+            name = f"stdout-powershell-{mode}-{backend}"
+            work = Path(tempfile.mkdtemp(prefix="uhh-pslog-"))
+            try:
+                out = work / "out.txt"
+                a = ["--backend", backend, "--stack", "-p", "logstream_target.exe!LogSite:d", "--",
+                     str(target), "--count", str(count), "--threads", str(threads), "--delay", "0", "--no-ticks"]
+                lit = ",".join("'" + x.replace("'", "''") + "'" for x in a)
+                script = (f"$ErrorActionPreference='Continue'; $tr='{tracer}'; $o='{out}'; $a=@({lit}); "
+                          + pipeline)
+                env = dict(os.environ, TEMP=str(work), TMP=str(work))
+                r = subprocess.run([str(ps), "-NoProfile", "-NonInteractive", "-Command", script],
+                                   capture_output=True, text=True, errors="replace", timeout=900, env=env)
+                cap = verify_capture(out)
+                sessions = list((work / "uhh" / "logs").glob("*.jsonl"))
+                sess = verify_capture(sessions[0]) if len(sessions) == 1 else {}
+                rep = cap["report"] or {}
+                hits = sum(p.get("hits") or 0 for p in cap["probes"])
+                want = threads * count
+                ok = (bool(rep) and hits == want and cap["logs"] == want and
+                      rep.get("hits") == hits == (rep.get("logs_written") or 0) + (rep.get("log_dropped") or 0)
+                      + (rep.get("callbacks_interrupted") or 0) and
+                      cap["bad"] == 0 and cap["gaps"] == 0 and cap["after_report"] == 0 and
+                      rep.get("logs_written") == want and rep.get("stdout_logs") == want and
+                      rep.get("log_dropped") == 0 and rep.get("error") is None and
+                      rep.get("live_output_error") is None and not rep.get("live_output_closed") and
+                      sess.get("logs") == want and sess.get("gaps") == 0 and sess.get("bad") == 0)
+                record(name, ok, f"captured={cap['logs']}/{want} bad={cap['bad']} seq_gaps={cap['gaps']} "
+                                 f"after_report={cap['after_report']} hits={hits} written={rep.get('logs_written')} "
+                                 f"stdout_logs={rep.get('stdout_logs')} dropped={rep.get('log_dropped')} "
+                                 f"file={sess.get('logs')}/gaps={sess.get('gaps')} enc={cap['encoding']} rc={r.returncode}"
+                                 + (f" sample={cap['sample']!r}" if cap["sample"] else "")
+                                 + ("" if ok else f" stderr={r.stderr.strip().splitlines()[-2:]}"))
+            except Exception as e:
+                record(name, False, repr(e))
+            finally:
+                shutil.rmtree(work, ignore_errors=True)
+    # An attach reported BEFORE its detach (uhh_trace --detach-after-ms) on a target that keeps
+    # logging at full speed into a slow PowerShell pipeline. The report's counts must be
+    # causally consistent (stdout_logs <= logs_written <= hits: the hits were read before a
+    # long flush and came out far BELOW logs_written), and the records after the report must
+    # end in a probe_final whose counts close the books: hits == logs_written + log_dropped +
+    # in_flight, and the capture holds exactly its stdout_logs records, seq without a gap.
+    for backend in ("inline", "breakpoint"):
+        name = f"stdout-powershell-detach-{backend}"
+        work = Path(tempfile.mkdtemp(prefix="uhh-pslog-"))
+        tgt = None
+        try:
+            out = work / "out.txt"
+            tgt = subprocess.Popen([str(target), "--count", "100000000", "--threads", "4", "--delay", "0",
+                                    "--no-ticks"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(1)
+            a = ["--backend", backend, "--stack", "-p", "logstream_target.exe!LogSite:d",
+                 "--attach", str(tgt.pid), "--detach-after-ms", "4000"]
+            lit = ",".join("'" + x.replace("'", "''") + "'" for x in a)
+            script = (f"$ErrorActionPreference='Continue'; $tr='{tracer}'; $o='{out}'; $a=@({lit}); "
+                      "& $tr @a | Out-File -FilePath $o -Encoding utf8")
+            env = dict(os.environ, TEMP=str(work), TMP=str(work))
+            r = subprocess.run([str(ps), "-NoProfile", "-NonInteractive", "-Command", script],
+                               capture_output=True, text=True, errors="replace", timeout=240, env=env)
+            alive = tgt.poll() is None
+            cap = verify_capture(out)
+            rep = cap["report"] or {}
+            hits = sum(p.get("hits") or 0 for p in cap["probes"])
+            fin = {}
+            with open(out, encoding=cap["encoding"], errors="replace") as f:
+                for line in f:
+                    if '"kind":"probe_final"' in line:
+                        fin = json.loads(line)
+            consistent = (rep.get("stdout_logs") is not None and rep.get("logs_written") is not None and
+                          rep["stdout_logs"] <= rep["logs_written"] <= hits == rep.get("hits"))
+            closed = bool(fin) and fin.get("hits") == (fin.get("logs_written") or 0) + (fin.get("log_dropped") or 0) \
+                + (fin.get("in_flight") or 0) and fin.get("stdout_logs") == fin.get("logs_written") == cap["logs"]
+            ok = (consistent and closed and cap["bad"] == 0 and cap["gaps"] == 0 and
+                  fin.get("log_dropped") == 0 and rep.get("error") is None and cap["logs"] > 0)
+            record(name, ok, f"report: hits={hits} written={rep.get('logs_written')} stdout_logs={rep.get('stdout_logs')} "
+                             f"consistent={consistent} final={ {k: fin.get(k) for k in ('hits', 'logs_written', 'log_dropped', 'in_flight', 'stdout_logs')} } "
+                             f"captured={cap['logs']} bad={cap['bad']} seq_gaps={cap['gaps']} target_alive={alive}"
+                             + ("" if ok else f" stderr={r.stderr.strip().splitlines()[-2:]}"))
+        except Exception as e:
+            record(name, False, repr(e))
+        finally:
+            if tgt and tgt.poll() is None:
+                tgt.kill()
+                tgt.wait()
+            shutil.rmtree(work, ignore_errors=True)
+
+
 def main():
     global BIN
     ap = argparse.ArgumentParser()
@@ -7815,6 +7974,7 @@ def main():
     if want(check_cxlib): check_cxlib()
     if want(check_symbols_grammar): check_symbols_grammar()
     if want(check_quickstart): check_quickstart()
+    if want(check_stdout_powershell): check_stdout_powershell()
     if only and not RESULTS:
         print(f"regress.py: --only {','.join(only)} selected only opt-in tiers that were not enabled "
               f"(--bigapps / --soak-minutes / --volume-reads): no check ran.", file=sys.stderr)

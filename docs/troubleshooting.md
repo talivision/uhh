@@ -128,6 +128,50 @@ following it there`, `probe: repaired hardware breakpoint state on thread N`,
 | `probe: close: still waiting for probe_run to stop (Ns)` | `probe_close` from another thread waits for `probe_run` to finish its detach | wait; see the detach lines |
 | `probe: session failed (<reason>): detaching from the target` | an internal error ended an attached session; the target was released cleanly | fix `<reason>` |
 
+## Is my captured output complete?
+
+A capture of stdout proves its own completeness; never judge it by how its end looks.
+
+- Every `probe_log` record is exactly one line and carries `"seq"`: 0, 1, 2, ... in the
+  order of the session file. A gap is a lost record, a repeat a duplicate.
+- The `probe_report` line comes after the last record and states `stdout_logs` (records
+  written to stdout), `logs_written` (records in the session file), `log_dropped`,
+  `live_output_closed` and `live_output_error`. When records follow the report (an attach
+  detached by `probe_close` after `probe_report`, e.g. `uhh_trace --detach-after-ms`), the
+  capture ends with a `probe_final` line with the final counts instead.
+- **No `probe_report` (or `probe_final`) line at the end = the capture is incomplete**,
+  whatever the last records look like: the tool was killed, or the consumer stopped reading.
+  The session file (`probe: logs -> ...` on stderr) has every record that was written.
+
+Check a capture (streams the file; any encoding PowerShell wrote) with:
+
+```powershell
+$n = 0; $gap = $null; $last = $null
+foreach ($l in [IO.File]::ReadLines((Resolve-Path out.txt))) {
+  if ($l.StartsWith('{"kind":"probe_log"')) {
+    if ($l -notmatch ',"seq":(\d+)\}$' -or [uint64]$Matches[1] -ne $n) { if ($gap -eq $null) { $gap = $n } }
+    $n++
+  } elseif ($l.StartsWith('{"kind":"probe_report"') -or $l.StartsWith('{"kind":"probe_final"')) { $last = $l | ConvertFrom-Json }
+}
+if ($last -and $gap -eq $null -and $last.stdout_logs -eq $n) { "complete: $n records" }
+else { "INCOMPLETE: $n records, first gap at seq $gap, last report says stdout_logs=$($last.stdout_logs)" }
+```
+
+### Capturing from PowerShell
+
+Measured with Windows PowerShell 5.1 (regress `stdout-powershell-*`, ROADMAP "PowerShell
+capture findings"): `| Out-File`, `>`, `| Set-Content`, `| Tee-Object`, `| ForEach-Object`,
+`2>&1 | Out-File`, `Start-Process -RedirectStandardOutput` and the console itself deliver every
+record, byte for byte, at any volume (1.2M stack records tested). What does lose the end:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| The capture stops short and has no `probe_report`; stderr has no `probe: interrupted` line | **Ctrl+C while UHH runs inside a PowerShell pipeline** (`... \| Out-File`, `> file`, `\| Tee-Object`, `Start-Process -Wait`): PowerShell stops reading and terminates the native command at once, so UHH's own Ctrl+C handling (end the session, flush, report) never runs. A non-UHH program shows the same: its last lines and its final line never reach the file. The session file stops there too | stop with Ctrl+C only when stdout is the console or redirected by cmd: `cmd /c "uhh_trace ... > out.jsonl"`; or end the target instead (close it, `--detach-after-ms`) |
+| Non-ASCII text (paths, symbols) garbled in a PowerShell capture | PowerShell decodes a native command's output with `[Console]::OutputEncoding` (the OEM code page), then re-encodes it (UTF-16 for `>` / `Out-File` in 5.1) | `[Console]::OutputEncoding = [Text.UTF8Encoding]::new()` first, or capture with `cmd /c ... > file` (bytes untouched) |
+| The capture is much slower than the run without it | PowerShell handles every line as an object (1.2M stack records: `cmd /c >` 19 s, `>` 46 s, `Out-File` 110 s); UHH back-pressures the target instead of dropping | `cmd /c "... > file"`, or stdout to `NUL` and read the session file |
+| The beginning of a long run is missing in the console window | the console keeps only its screen buffer (e.g. 9001 lines) | capture to a file |
+| `2>&1` puts `uhh_trace.exe : probe: ...` blocks between the records | PowerShell 5.1 wraps each stderr line in an error record | do not merge stderr (`2> err.txt`), or ignore lines that do not start with `{` |
+
 ## Environment
 
 - **Symbols.** `probe: symbols via <path>` names the DbgHelp in use, with
