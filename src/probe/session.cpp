@@ -215,6 +215,7 @@ struct probe_session {
     uint64_t entry_addr = 0;                   // image entry point (hold-for-install point)
     bool entry_seen = false;
     bool thread_start_fixup = false;           // library INT3 at ntdll!RtlUserThreadStart armed
+    bool thread_start_due = false;             // a hw probe was released: arm it after this event
     HANDLE svc_event = nullptr;                // agent service: "install pending requests"
     std::vector<HANDLE> held;                  // threads held until inline installs confirm
     ULONGLONG held_since = 0;                       // slots we have ever owned (stale-#DB filter)
@@ -231,6 +232,21 @@ struct probe_session {
     std::unordered_map<DWORD, HwUnsettled> hw_unsettled;
     DWORD hw_stale_tid = 0;                    // the thread of the event being handled, if it was unsettled
     std::unordered_set<uint64_t> hw_stale;     // ...and the released addresses still ours on it
+    // Every released address not re-armed since. A thread still STARTING at the release
+    // (LdrInitializeThunk) runs past the clear and then restores, by NtContinue, the DR image
+    // captured at its first entry to user mode -- the released slot enabled again, on a thread
+    // that "has run" (so not unsettled). At its arrival at RtlUserThreadStart (thread-start
+    // fixup) nothing it runs later has set its DRs yet: an image of one of these there is ours.
+    std::unordered_set<uint64_t> hw_released;
+    // Writing a thread's debug registers zeroes its DR6, also the status of a #DB already raised
+    // there and still QUEUED: that hit then arrives with no B-bit (an execute hit is recovered by
+    // address; a watchpoint's cannot be). The status read just before the write is kept with the
+    // thread's registers; at its next event, unchanged registers mean it has not run since -- that
+    // event IS the queued #DB -- and the status is carried into its handling (dr6_carry).
+    struct Dr6Lost { CONTEXT regs{}; DWORD64 bits = 0; };
+    std::unordered_map<DWORD, Dr6Lost> dr6_lost;
+    DWORD dr6_carry_tid = 0;
+    DWORD64 dr6_carry = 0;
     std::vector<HANDLE> ipc_frozen;            // threads suspended for an agent hook write (FREEZE..THAW)
     DWORD ipc_freezer = 0;                     // the agent thread doing that write (0 = no freeze)
     int hw_active = 0;
@@ -1786,6 +1802,20 @@ static bool same_thread_regs(const CONTEXT &a, const CONTEXT &b) {
            a.Ecx == b.Ecx && a.Edx == b.Edx && a.Esi == b.Esi && a.Edi == b.Edi && a.Ebp == b.Ebp;
 #endif
 }
+// Before writing ANOTHER thread's debug registers: keep the status of a #DB queued on it (see
+// probe_session::dr6_lost). The event's own thread is handled from the context already read.
+static void keep_queued_dr6(probe_session *s, DWORD tid, HANDLE t) {
+    if (!s->handling.empty() && s->handling.back() == tid) return;
+    CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS;
+    if (!GetThreadContext(t, &c) || !(c.Dr6 & 0xF)) return;
+    auto &l = s->dr6_lost[tid];
+    if (l.bits && !same_thread_regs(l.regs, c)) l.bits = 0;
+    l.regs = c; l.bits |= c.Dr6 & 0xF;
+}
+// The debug status lost by such a write, for the event of `tid` being handled (0 if none).
+static DWORD64 dr6_carried(const probe_session *s, DWORD tid) {
+    return s->dr6_carry_tid == tid ? s->dr6_carry : 0;
+}
 // A hardware probe at `address` was just released (its DR cleared on every thread): until
 // each thread reports an event, an image of it there may be our stale one. A thread that has
 // run since an earlier release settled that one (our clear reached it): only the new counts.
@@ -1800,10 +1830,13 @@ static void retire_hw_address(probe_session *s, uint64_t address) {
         if (got && (!u.have_regs || u.addrs.empty())) { u.regs = now; u.have_regs = true; }
         u.addrs.insert(address);
     }
+    s->hw_released.insert(address);
+    s->thread_start_due = true;
 }
 // Re-armed by us: no image of it is stale any more.
 static void unretire_hw_address(probe_session *s, uint64_t address) {
     s->hw_stale.erase(address);
+    s->hw_released.erase(address);
     for (auto it = s->hw_unsettled.begin(); it != s->hw_unsettled.end(); ) {
         it->second.addrs.erase(address);
         it = it->second.addrs.empty() ? s->hw_unsettled.erase(it) : std::next(it);
@@ -1812,6 +1845,16 @@ static void unretire_hw_address(probe_session *s, uint64_t address) {
 // At each debug event of `tid`, before it is handled: settle it (see hw_unsettled).
 static void settle_hw_thread(probe_session *s, DWORD tid) {
     s->hw_stale_tid = 0; s->hw_stale.clear();
+    s->dr6_carry_tid = 0; s->dr6_carry = 0;
+    if (const auto l = s->dr6_lost.find(tid); l != s->dr6_lost.end()) {
+        HANDLE t = OpenThread(THREAD_GET_CONTEXT, FALSE, tid);
+        CONTEXT now{}; now.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        if (t && GetThreadContext(t, &now) && same_thread_regs(l->second.regs, now)) {
+            s->dr6_carry_tid = tid; s->dr6_carry = l->second.bits;
+        }
+        if (t) CloseHandle(t);
+        s->dr6_lost.erase(l);
+    }
     const auto it = s->hw_unsettled.find(tid);
     if (it == s->hw_unsettled.end()) return;
     probe_session::HwUnsettled u = std::move(it->second);
@@ -1857,6 +1900,7 @@ static bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
         HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
         if (!t) continue;
         ++tried;
+        keep_queued_dr6(s, tid, t);
         if (set_dr_on_thread(t, slot, address, true, rw, len)) ++set_ok;
         CloseHandle(t);
     }
@@ -3039,7 +3083,7 @@ static void reapply_all_hw(probe_session *s) {
         uint32_t rw = 0, len = 0; hw_rw_len(p->flags, rw, len);
         for (DWORD tid : s->threads) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
-            if (t) { set_dr_on_thread(t, p->dr_slot, p->address, true, rw, len); CloseHandle(t); }
+            if (t) { keep_queued_dr6(s, tid, t); set_dr_on_thread(t, p->dr_slot, p->address, true, rw, len); CloseHandle(t); }
         }
     }
 }
@@ -3070,12 +3114,28 @@ static void arm_entry_fixup(probe_session *s, uint64_t entry) {
 // return-site probe added while they were starting). A library-owned breakpoint at
 // RtlUserThreadStart re-applies the active hardware probes to each thread arriving there,
 // i.e. right after its context was restored. Armed the first time a hardware probe is
-// armed while the process is already running.
+// armed -- or released -- while the process is already running.
 static uint64_t resolve_symbol(probe_session *s, const char *symbol);
+// The same restore brings back a hardware probe RELEASED while the thread was starting
+// (see probe_session::hw_released): clear such slots before the program runs on it.
 static void reapply_hw_thread(probe_session *s, DWORD tid) {
-    if (!s->hw_active) return;
+    if (!s->hw_active && s->hw_released.empty()) return;
     HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
     if (!t) return;
+    CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (!s->hw_released.empty() && GetThreadContext(t, &c)) {
+        bool changed = false;
+        for (int slot = 0; slot < 4; ++slot) {
+            if (!(s->dr_ever & (1u << slot)) || (s->dr_used & (1u << slot)) || !((c.Dr7 >> (slot * 2)) & 3) ||
+                !s->hw_released.count(dr_address(c, slot))) continue;
+            c.Dr7 &= ~((decltype(c.Dr7))3 << (slot * 2)) & ~((decltype(c.Dr7))0xF << (16 + slot * 4));
+            changed = true;
+        }
+        if (changed) {
+            if (trace_enabled()) std::fprintf(stderr, "  thread-start: released DR image cleared on %lu\n", (unsigned long)tid);
+            SetThreadContext(t, &c);
+        }
+    }
     for (auto &p : s->probes) {
         if (!p->active || !(p->flags & PROBE_HW)) continue;
         uint32_t rw = 0, len = 0; hw_rw_len(p->flags, rw, len);
@@ -3467,7 +3527,7 @@ static bool arm_gates_for_pending(probe_session *s) {
         const int slot = slots[i];
         for (DWORD tid : s->threads) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
-            if (t) { set_dr_on_thread(t, slot, sites[i], true); CloseHandle(t); }
+            if (t) { keep_queued_dr6(s, tid, t); set_dr_on_thread(t, slot, sites[i], true); CloseHandle(t); }
         }
         s->dr_used |= (uint8_t)(1u << slot); s->dr_ever |= (uint8_t)(1u << slot);
         s->gates.push_back({sites[i], slot});
@@ -3480,7 +3540,7 @@ static void clear_gates(probe_session *s) {
     for (auto &g : s->gates) {
         for (DWORD tid : s->threads) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
-            if (t) { set_dr_on_thread(t, g.second, 0, false); CloseHandle(t); }
+            if (t) { keep_queued_dr6(s, tid, t); set_dr_on_thread(t, g.second, 0, false); CloseHandle(t); }
         }
         s->dr_used &= (uint8_t)~(1u << g.second);
         retire_hw_address(s, g.first);                       // a #DB already in flight is stale
@@ -3496,6 +3556,7 @@ static bool handle_gate(probe_session *s, const DEBUG_EVENT &event) {
     CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS;
     bool hit = false;
     if (GetThreadContext(thread, &c)) {
+        c.Dr6 |= dr6_carried(s, event.dwThreadId);
         for (auto &g : s->gates)
             if (c.Dr6 & (1u << g.second)) { hit = true; c.Dr6 &= ~(DWORD64)(1u << g.second); }
         if (hit) { c.EFlags |= 0x10000u; SetThreadContext(thread, &c); }   // RF: run the site once resumed
@@ -4003,7 +4064,7 @@ static void release_hw(probe_session *s, Probe &p) {
     if (p.dr_slot < 0) return;
     for (DWORD tid : s->threads) {
         HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
-        if (t) { set_dr_on_thread(t, p.dr_slot, 0, false); CloseHandle(t); }
+        if (t) { keep_queued_dr6(s, tid, t); set_dr_on_thread(t, p.dr_slot, 0, false); CloseHandle(t); }
     }
     if (p.address) retire_hw_address(s, p.address);
     s->dr_used &= (uint8_t)~(1u << p.dr_slot);
@@ -4470,6 +4531,7 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
     if (!thread) { set_error(s, win_error("open hw event thread")); return false; }
     CONTEXT native{}; native.ContextFlags = CONTEXT_ALL;
     if (!GetThreadContext(thread, &native)) { CloseHandle(thread); set_error(s, win_error("get hw context")); return false; }
+    native.Dr6 |= dr6_carried(s, event.dwThreadId);           // a status our own DR write zeroed
     const uint8_t theirs = target_slots(s, event.dwThreadId, native);       // the target's own slots on this thread
     if (!(native.Dr6 & 0xF & s->dr_used) && !(native.Dr6 & 0xF & theirs) && !(native.Dr6 & 0x4000) &&
         !(native.EFlags & 0x100u)) {
@@ -5646,6 +5708,13 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
     } handling{s};
     guard_note_hold(s, event.dwThreadId);            // see guard_sync: until the event is continued
     const bool ok = dispatch_event_impl(s, event, disposition);
+    // A hardware probe was released while the process runs: threads still starting must meet
+    // the thread-start fixup (see probe_session::hw_released). Armed here, outside the loops
+    // over the probes that release them, and before any thread runs on.
+    if (ok && s->thread_start_due && (s->entry_seen || s->attached) && !s->detaching && !s->exited) {
+        s->thread_start_due = false;
+        arm_thread_start_fixup(s);
+    }
     inplace_sync(s, event);
     // The guard's mirror, after EVERYTHING this event changed (an in-place window's holds are
     // taken / handed over just above) and before the thread runs again. The event's thread
@@ -5700,6 +5769,7 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
         s->threads.erase(event.dwThreadId);
         s->refault.erase(event.dwThreadId);
         s->hw_unsettled.erase(event.dwThreadId);
+        s->dr6_lost.erase(event.dwThreadId);
         auto it = s->stepping.find(event.dwThreadId);
         if (ok && it != s->stepping.end()) {
             // Only the in-place path lifted the byte; a displaced step left it armed.
