@@ -5276,22 +5276,41 @@ def _snapshot_processes():
                     ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
                     ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
     k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-    snap = k32.CreateToolhelp32Snapshot(2, 0)
-    out, e = {}, PE32()
-    e.dwSize = ctypes.sizeof(PE32)
-    ok = k32.Process32FirstW(snap, ctypes.byref(e))
-    while ok:
-        out[e.th32ProcessID] = e.szExeFile
-        ok = k32.Process32NextW(snap, ctypes.byref(e))
-    k32.CloseHandle(snap)
+    for fn in (k32.Process32FirstW, k32.Process32NextW):
+        fn.argtypes = [wintypes.HANDLE, ctypes.POINTER(PE32)]
+        fn.restype = wintypes.BOOL
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.CloseHandle.restype = wintypes.BOOL
+    INVALID_HANDLE_VALUE, ERROR_NO_MORE_FILES = ctypes.c_void_p(-1).value, 18
+    snap = k32.CreateToolhelp32Snapshot(2, 0)                  # TH32CS_SNAPPROCESS
+    if not snap or snap == INVALID_HANDLE_VALUE:
+        raise RuntimeError(f"Toolhelp oracle: CreateToolhelp32Snapshot failed (error {ctypes.get_last_error()})")
+    try:
+        out, e = {}, PE32()
+        e.dwSize = ctypes.sizeof(PE32)
+        ok = k32.Process32FirstW(snap, ctypes.byref(e))
+        if not ok:
+            raise RuntimeError(f"Toolhelp oracle: Process32FirstW failed (error {ctypes.get_last_error()})")
+        while ok:
+            out[e.th32ProcessID] = e.szExeFile
+            ok = k32.Process32NextW(snap, ctypes.byref(e))
+        err = ctypes.get_last_error()
+        if err != ERROR_NO_MORE_FILES:
+            raise RuntimeError(f"Toolhelp oracle: Process32NextW stopped with error {err}, not ERROR_NO_MORE_FILES")
+    finally:
+        k32.CloseHandle(snap)
+    if not out:
+        raise RuntimeError("Toolhelp oracle: empty process list")
     return out
 
 
 class _ProcPoller:
-    """Every (pid, name) that existed while a run was going on, polled every 20 ms."""
+    """Every (pid, name) that existed while a run was going on, polled every 20 ms. A snapshot
+    failure in the polling thread is re-raised by finish(): the oracle is never silently thin."""
     def __init__(self):
-        self.seen, self.stop = {}, threading.Event()
+        self.seen, self.stop, self.error = {}, threading.Event(), None
         self._add(_snapshot_processes())
         self.t = threading.Thread(target=self._loop, daemon=True)
         self.t.start()
@@ -5303,11 +5322,19 @@ class _ProcPoller:
             self.seen.setdefault(pid, set()).add(name.lower())
 
     def _loop(self):
-        while not self.stop.wait(0.02):
-            self._add(_snapshot_processes())
+        try:
+            while not self.stop.wait(0.02):
+                self._add(_snapshot_processes())
+        except Exception as e:                     # reported by finish()
+            self.error = e
 
     def finish(self):
-        self.stop.set(); self.t.join(timeout=10); self._add(_snapshot_processes())
+        self.stop.set(); self.t.join(timeout=10)
+        if self.t.is_alive():
+            raise RuntimeError("Toolhelp oracle: poller did not stop")
+        if self.error is not None:
+            raise RuntimeError(f"Toolhelp oracle failed while polling: {self.error!r}")
+        self._add(_snapshot_processes())
         return self.seen
 
 
