@@ -2316,7 +2316,10 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_stop(void *) {
     if (!shared) return 0;                               // loaded but never initialised: nothing to undo
     AcquireSRWLockExclusive(&g_install_lock);            // after any install round in progress
     InterlockedExchange(&g_stopping, 1);
-    for (int i = 0; i < 2000 && any_inflight(); ++i) Sleep(1);
+    // 2 s of wall time: 2000 x Sleep(1) was up to ~31 s at the default 15.6 ms timer, past the
+    // controller's 5 s wait for this thread -- the detach then skipped its log drain (dropped
+    // the late logs of a callback still running) and reported the hooks as not removed.
+    for (const ULONGLONG t0 = GetTickCount64(); any_inflight() && GetTickCount64() - t0 < 2000; ) Sleep(1);
     for (auto &sh : g_shadow) if (sh.lo) { sh.lo = 0; InterlockedDecrement(&g_shadow_count); }
     frozen(slot_set{}, [] {
         for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i)
