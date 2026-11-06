@@ -241,7 +241,7 @@ tracker, file monitor incl. attach mid-run and real findstr/cmd, TLS plaintext f
 curl.exe, loader/RWX watcher, return-value override), each one callback source under
 breakpoint/hw/inline on x64+x86, compared with the uninstrumented run (`regress.py --only famous`).
 - ✅ (F1) HW: a hardware probe armed at RUNTIME (from a callback, or at a later DLL load) was lost for whole threads still in loader initialisation: thread start ends in NtContinue with the creation-time context, debug registers included (the initial-thread entry fixup's mechanism, for every other thread). Found by `famous-retval-hw` (return-site probes added while workers start: whole workers 0/25 overridden). Fix: library-owned INT3 at `ntdll!RtlUserThreadStart` (armed the first time a hw probe is armed after entry/attach) re-applies the active DRs to each arriving thread. Test: `famous-retval-hw` x3 (+ 8/8 manual)
-- ✅ (F2) HW: target killed by STATUS_SINGLE_STEP. Arming a hw probe writes every thread's debug registers -- DR6 included -- and on a thread whose #DB is still waiting to be reported that zeroes the B-bit, so the hit looked foreign and was passed to the target. Fix: a #DB with no B-bit exactly at an active, enabled hw EXECUTE probe is that probe's hit (`hw-dr6-lost` under PROBE_TRACE). Test: `famous-retval-hw`. Open: the same lost bit on a data WATCHPOINT cannot be inferred by address
+- ✅ (F2) HW: target killed by STATUS_SINGLE_STEP. Arming a hw probe writes every thread's debug registers -- DR6 included -- and on a thread whose #DB is still waiting to be reported that zeroes the B-bit, so the hit looked foreign and was passed to the target. Fix: a #DB with no B-bit exactly at an active, enabled hw EXECUTE probe is that probe's hit (`hw-dr6-lost` under PROBE_TRACE). Test: `famous-retval-hw`. The same lost bit on a data WATCHPOINT: fixed by H2 (status kept across our DR writes)
 - ✅ (F3) Inline: target died (STATUS_STACK_OVERFLOW, "probe_agent_init failed 0xC000041D") in ~half of short runs of an inline `RtlAllocateHeap` probe whose callback calls `call_func`: (a) the agent's thread_local region cache was touched before a starting thread had TLS (LdrpInitializeThread allocates it through the probed allocator) -> AV; (b) allocations inside call_func's own resolution/callee hit the probe again -> unbounded recursion. Fix: TLS presence checked (no cache until then); inline call_func now suppresses callbacks on its own thread for its duration -- the documented contract the breakpoint/hw path already kept. Test: `famous-heap-inline-reentry` (12 runs)
 - ⬜ (F4) Same NtContinue/RtlRestoreContext wipe class, not covered: a thread inside exception dispatch when a hw probe is armed resumes with the old DRs
 - ⬜ (F5) `call_func` from a breakpoint/hw callback returns 0 while another thread's callback is inside one (no nesting: the other thread's event is dispatched inside the first call). A Process.mainModule lookup via call_func silently skips that racing call; famous_common.h falls back to walking to the PE header. Library options: document in probe_api.h, or defer (replay) other threads' probe hits during a call
@@ -1207,6 +1207,41 @@ INT3"); nothing shipped links it. `--only cxlib`.
   (x87 SW/TW 0041/c000 vs 0000/0000). After (9aef7c1): `--only cxlib,ctrl-review,cdx-review` 38/38 + 1 SKIP
   (touchkill: x86 only) on x64 (cxlib 9/9 on the final build), 39/39 on x86; `--only callorig,lifecycle,
   detach,interrupt,conformance,transparency,agent_review,gated` 146/146 on x64 and 146/146 on x86.
+
+## hw ONCE / ntdll-churn findings (2026-11-06, regress `hw-once-slots-*`, `ntdll-churn-*`, `cdx-owndrx-*`, `ctrl-owndr-*`)
+- ✅ (H1) hw: **target killed by STATUS_SINGLE_STEP after a PROBE_ONCE hw probe retired** (`hw-once-slots`
+  failed on every run since the Codex controller review, x64 and x86: the ONCE probes fired once, then a
+  worker died at HwSite / after the `lock inc` on g_w1). Cause: a thread still STARTING (in
+  LdrInitializeThunk) at the release ran past our DR clear and then restored, by NtContinue, the DR image
+  captured at its first entry to user mode -- the released slots enabled again (PROBE_TRACE: dr7 0x455 ->
+  0x44 at the release, 0x455 at the thread's first hit). Per-thread hw retirement (c487aa2) took such a
+  slot for the target's own once the thread "had run" since the release, so its #DB was passed to the
+  program. Bisect (x64, `--only hw_once` x3): 358b98d 6/6 PASS, c487aa2 6/6 FAIL. The same stale image
+  is what left a released one-shot slot looking taken in `ctrl-owndr` / `cdx-owndrx` (`[-1,50,50,50]`).
+  Fix: released addresses are remembered until re-armed (`hw_released`); a release while the process
+  runs arms the thread-start fixup (INT3 at RtlUserThreadStart, which already re-applied ACTIVE DRs after
+  that restore), and the fixup now also clears an enabled image of a released address there (nothing
+  of the program has set the thread's DRs yet: the restore wiped whatever start-up code set). The
+  target's own later use of a released address stays its own (`cdx-owndrx`).
+- ✅ (H2) hw: closes F2's open item. Writing another thread's debug registers zeroes its DR6, also the
+  status of a #DB already QUEUED there (PROBE_TRACE: dr6 0xffff0ff3 -> 0 across our write); an execute hit
+  was recovered by address, a WATCHPOINT hit arrived with no B-bit and was passed to the target. Every
+  all-thread DR write (arm, release, gates, entry re-apply) now keeps the status read just before it with
+  the thread's registers; at the thread's next event, unchanged registers mean that event is the queued
+  #DB and the status is carried into its handling.
+  After H1+H2 (merge-frida 2715fab merged): see the verification counts below.
+- ✅ (H3) `ntdll-churn-inline` fitted only 2-4 attach/hook/detach cycles (hw/breakpoint 10-12) before the
+  target's fixed 4 x 4,000,000 reads ended. Measured per cycle (x64): attach incl. uhh_trace start 0.4-3.0 s
+  on every backend, hook active 0.05-0.1 s later; then inline is dominated by its own logs -- callbacks run
+  at full speed, every call is logged, none dropped, and the hook stays in while uhh_trace's report drains
+  them: 0.3-5.4 M log lines per cycle, 2.9-16.8 s (hw/breakpoint ~2-3 k hits, 1.2-2.6 s); the
+  uninstrumented run is ~6.8 s. Inherent to logging every call, no stray wait. The check now keeps the
+  target reading until told to stop (probe_app `--until-key`: rounds of the same read pattern, "rounds" in
+  its app line) and runs exactly 8 cycles on every backend: every cycle detached with hits (after the
+  first), stdout logs == the detach line's hits == logs_written, none dropped; exit 0, reads and checksum
+  exactly rounds x an uninstrumented round's. Log lines are counted as they stream (the old check held
+  millions of parsed lines in Python memory). With the streaming reader, inline cycles took 1.0-2.9 s on
+  x64 and 1.2-8.0 s on x86 (hw/breakpoint 0.9-3.3 s): 3/3 PASS per arch, 8 cycles each, rounds 2-5.
 
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`
