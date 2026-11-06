@@ -1165,7 +1165,7 @@ Two decisions that reverse earlier work:
   "controller-crash self-unhook: not worth the cost; the analyst sees the controller died and restarts the
   target". Now (as on main f9f3436): the agent goes in at launch/attach if inline probes are registered, or
   lazily when a callback/runtime add requests the first inline probe. bp/hw-only sessions inject nothing,
-  arm at the attach's break-in (no 5 s agent wait), and do not need the agent DLL.
+  arm at once (no 5 s agent wait), and do not need the agent DLL.
   Found on the way (CI + VM PROBE_TRACE, `lifecycle-{reattach,detach-early,interrupt}-hw`, x64 and x86): hw-only
   targets died of an unhandled single step at a probed address during the detach drain. A worker's #DB was in
   flight when the detach released the probes (its DRs cleared); delivering it restored the debug registers

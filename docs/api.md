@@ -72,8 +72,8 @@ Contents: [concepts](#concepts) · [types and macros](#types-and-macros) ·
   agent confirms the hooks. Loader-time activity (TLS callbacks, static DLL initialisers)
   is therefore seen only by breakpoint/hw probes.
 - **Attach:** the target keeps running while probes arm. Each probe counts from its
-  `probe: active ...` line on stderr. Breakpoint/hw-only sessions arm at the attach's
-  break-in, milliseconds later (nothing is injected). In a session with inline probes, breakpoint/hw probes arm once the injected
+  `probe: active ...` line on stderr. Breakpoint/hw-only sessions arm at once (nothing is
+  injected). In a session with inline probes, breakpoint/hw probes arm once the injected
   agent's controller-death guard is up (or after 5 s without it, with a warning).
 - A probe added from a callback: breakpoint/hw arm before the target resumes; an inline
   probe holds the calling thread until its hook is in.
