@@ -6751,6 +6751,36 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         bool hw_live_here = false;
         for (const auto &p : s->probes)
             if (p->active && (p->flags & PROBE_HW) && p->address == address) { hw_live_here = true; break; }
+        // Detaching: every probe is released and nothing of ours gets armed again, so a #DB from a
+        // slot we have used, holding an address we armed, is ours however the thread got it: its
+        // #DB was in flight when the release cleared the slot (delivering it restores the debug
+        // registers captured at the raise, all of ours still enabled) and the thread no longer
+        // counts as unsettled. Passed on, it killed the target (lifecycle-{reattach,interrupt}-hw;
+        // the agent's guard VEH used to swallow it). Off on this thread, the instruction runs.
+        if (s->detaching && !hw_live_here) {
+            HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
+            CONTEXT w{}; w.ContextFlags = CONTEXT_DEBUG_REGISTERS | CONTEXT_CONTROL;
+            bool ours = false;
+            if (t && GetThreadContext(t, &w)) {
+                for (int slot = 0; slot < 4; ++slot) {
+                    if (!(s->dr_ever & (1u << slot)) || !((w.Dr7 >> (slot * 2)) & 3) ||
+                        !s->hw_armed_ever.count(dr_address(w, slot)))
+                        continue;
+                    ours = ours || (w.Dr6 & (1u << slot)) || dr_address(w, slot) == address;
+                    w.Dr7 &= ~((DWORD64)3 << (slot * 2)) & ~((DWORD64)0xF << (16 + slot * 4));
+                }
+                if (ours) {
+                    if (!(w.Dr7 & 0xFF)) w.Dr7 &= ~(decltype(w.Dr7))0x300;
+                    w.Dr6 = 0;
+                    w.EFlags |= 0x10000u;                              // RF: run the instruction once
+                    SetThreadContext(t, &w);
+                    if (trace_enabled()) std::fprintf(stderr, "  detach-stale #DB tid=%lu at 0x%llx\n",
+                                                      (unsigned long)event.dwThreadId, (unsigned long long)address);
+                }
+            }
+            if (t) CloseHandle(t);
+            if (ours) { disposition = DBG_CONTINUE; return true; }
+        }
         if (hw_released_on(s, event.dwThreadId, address) && !hw_live_here) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
             CONTEXT w{}; w.ContextFlags = CONTEXT_DEBUG_REGISTERS | CONTEXT_CONTROL;
