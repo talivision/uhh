@@ -204,6 +204,12 @@ target_compile_definitions(probe_api_agent PRIVATE BREAKAGE_AGENT_ONLY FRIDA_PAR
 # _probe_agent_init@4; the controller resolves them by a fixed bare name).
 target_link_options(probe_api_agent PRIVATE "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/src/probe/agent.def")
 target_link_options(probe_api_agent PRIVATE "/ENTRY:uhh_agent_entry")   # keeps the CRT alive at process exit (agent.cpp)
+# CET shadow stacks: a process with the BlockNonCetBinaries policy maps only /CETCOMPAT images
+# (no inline backend otherwise). Every `ret` in the agent's own code returns through a real
+# call (audited: ROADMAP "BlockNonCetBinaries"; the hook stub ends `pop rsp; jmp`, return_from
+# returns through a `ret` at the hit's own return address, relocated calls stay calls under a
+# shadow stack). Regress cet-agent-*.
+target_link_options(probe_api_agent PRIVATE /CETCOMPAT)
 set_property(TARGET probe_api_agent APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/probe/agent.def")
 
 # --- Example: gated_config (launch) and uhh_attach (attach) -------------------------

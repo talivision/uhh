@@ -138,6 +138,23 @@ struct LogRecord {
     uint64_t sym_unload = 0, sym_size = 0;
 };
 
+// A debug event handled on a fiber of the debug thread (see "Callback fibers"): its
+// callback can park inside call_func while the loop dispatches other events.
+struct EventFiber {
+    probe_session *s = nullptr;
+    void *fiber = nullptr, *return_to = nullptr;
+    DEBUG_EVENT ev{};                         // the event this handling started with
+    DWORD disposition = DBG_CONTINUE;
+    bool ok = true, done = false;
+    // Parked in call_func: until when, and how the call ended (set by whoever resumes it).
+    enum Outcome { WAITING, TRAPPED, FAULTED, TIMEOUT, GONE, EXITED };
+    ULONGLONG call_start = 0, call_deadline = 0;
+    Outcome call_outcome = WAITING;
+    bool call_seen_waiting = false;           // the callee's thread was blocked at the last stall sample
+    HANDLE call_held = nullptr;               // the callee returned while a call_original ran: thread suspended by us
+    HANDLE resume_after = nullptr;            // the thread is suspended for the rest of the handling: resume, never continue
+};
+
 struct probe_session {
     std::vector<std::unique_ptr<Probe>> probes;
     std::mutex agent_mu;
@@ -231,6 +248,7 @@ struct probe_session {
     uint64_t entry_addr = 0;                   // image entry point (hold-for-install point)
     bool entry_seen = false;
     bool thread_start_fixup = false;           // library INT3 at ntdll!RtlUserThreadStart armed
+    bool restore_fixup = false;                // library INT3s at ntdll!NtContinue[Ex] armed
     HANDLE svc_event = nullptr;                // agent service: "install pending requests"
     std::vector<HANDLE> held;                  // threads held until inline installs confirm
     ULONGLONG held_since = 0;                       // slots we have ever owned (stale-#DB filter)
@@ -272,10 +290,20 @@ struct probe_session {
     std::vector<DWORD> detach_frozen;          // detach's own freeze of every thread (mirrored for the guard)
     std::vector<DWORD> handling;               // threads whose debug event is being handled (nested: call_original)
     DWORD debug_tid = 0;                       // the thread that launched/attached: owns the debug object
-    DWORD in_call_tid = 0;                     // thread currently running a call_func callee
-    std::vector<HANDLE> call_deferred;         // other threads' hits during a call_func: rewound + suspended
-    bool skip_continue = false;                // call_func already continued the current event
+    DWORD in_call_tid = 0;                     // thread currently running a call_original (in place)
+    std::vector<HANDLE> call_deferred;         // other threads' hits during a call_original: rewound + suspended
+    bool skip_continue = false;                // the handling already continued (or released) the current event
     uint64_t call_trap = 0;                    // INT3 the callee returns into
+    // Callback fibers (breakpoint/hw call_func, see there): the debug thread's own fiber, idle
+    // event fibers, the one running now (nullptr: the debug thread's own stack), and the
+    // threads running a call_func callee -> the fiber parked on it.
+    void *main_fiber = nullptr;
+    bool fiber_converted = false, calls_closing = false, call_fiber_warned = false;
+    bool calls_stalled = false;                // a callee is blocked: other threads' hits run now (see poll_calls)
+    ULONGLONG stall_next = 0;
+    std::vector<EventFiber *> fiber_pool;
+    EventFiber *cur_fiber = nullptr;
+    std::unordered_map<DWORD, EventFiber *> calls;
     // call_original in flight (breakpoint/hw, see call_original): the probe address the call
     // starts at, the hit's SP, whether the breakpoint entry pass is still pending (the call's
     // own first INT3 execution: not a hit), and whether the thread was seen OUTSIDE the call
@@ -2557,7 +2585,20 @@ static bool patch_in_code_section(probe_session *s, uint64_t base, uint64_t lo, 
 //   [reloc]    a rel8-only branch (jrcxz/jecxz/loop*) inside it cannot be relocated
 // (Threads executing inside the patch when it is written are handled by the freeze.)
 // Not visible to any static check: jumps into this function from OTHER code.
+// A probe added BY ADDRESS has no module base of its own: the image mapped around the
+// address (if any) is analysed the same way -- otherwise only the bytes of the patch itself
+// would be judged (a return site followed by a loop head was hooked without a word).
+static uint64_t image_base_of(probe_session *s, uint64_t address) {
+    for (auto &kv : s->module_bases) {
+        if (address < kv.second) continue;
+        auto sz = s->module_sizes.find(kv.second);
+        const uint64_t size = sz != s->module_sizes.end() ? sz->second : remote_image_size(s->pi.hProcess, kv.second);
+        if (address - kv.second < size) return kv.second;
+    }
+    return 0;
+}
 static bool inline_site_unsafe(probe_session *s, const Probe &p, std::string &why) {
+    const uint64_t base = p.base ? p.base : image_base_of(s, p.address);
     unsigned char b[32] = {}; size_t n = 0;
     if (!remote_read(s->pi.hProcess, p.address, b, sizeof(b), &n) || n < 5) return false;
     // Decode the PROGRAM's bytes: our own INT3s read as the instruction they replace.
@@ -2581,7 +2622,7 @@ static bool inline_site_unsafe(probe_session *s, const Probe &p, std::string &wh
                       "(probe that instruction with one of breakpoint / inline, or use hw with either)",
                       len, (unsigned long long)(own_bp - p.address));
         reason = buf;
-    } else if (p.base && !patch_in_code_section(s, p.base, p.address, p.address + len, secname)) {
+    } else if (base && !patch_in_code_section(s, base, p.address, p.address + len, secname)) {
         std::snprintf(buf, sizeof(buf), "%u-byte hook would be written across the end of section %s", len, secname.c_str());
         reason = buf;
     } else if (code_after_exit) {
@@ -2616,7 +2657,7 @@ static bool inline_site_unsafe(probe_session *s, const Probe &p, std::string &wh
         }
     }
     SiteAnalysis a;
-    if (p.base) analyse_site(s, p.base, p.address, a);
+    if (base) analyse_site(s, base, p.address, a);
     if (reason.empty()) {
         auto it = a.entries.upper_bound(p.address);
         if (it != a.entries.end() && *it < p.address + len) {
@@ -2633,9 +2674,10 @@ static bool inline_site_unsafe(probe_session *s, const Probe &p, std::string &wh
                       "with unknown targets", len, (unsigned long long)a.indirect_jumps.front());
         reason = buf;
     }
-    if (reason.empty() && p.base && !a.func_start) {
-        // No function bounds (no .pdata/PDB entry): walk forward from the site to the end of
-        // its block and check every direct branch met there (catches loops back into it).
+    if (reason.empty() && !a.func_start) {
+        // No function bounds (no .pdata/PDB entry, or no image at all): walk forward from the
+        // site to the end of its block and check every direct branch met there (catches
+        // loops back into it).
         ZydisDecoder dec;
 #if defined(_WIN64)
         ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
@@ -2668,7 +2710,7 @@ static bool inline_site_unsafe(probe_session *s, const Probe &p, std::string &wh
     // Suggest instruction boundaries in this function where the whole patch passes the same
     // checks, nearest first. The callback would run at a different instruction there.
     std::string modname;
-    for (auto &kv : s->module_bases) if (kv.second == p.base) { modname = kv.first; break; }
+    for (auto &kv : s->module_bases) if (kv.second == base) { modname = kv.first; break; }
     std::vector<std::pair<uint64_t, uint64_t>> cands;    // (distance, address)
     const bool fn_ok = !(!a.indirect_jumps.empty() && !a.tables);
     for (uint64_t x : a.insns) {
@@ -2687,7 +2729,7 @@ static bool inline_site_unsafe(probe_session *s, const Probe &p, std::string &wh
     for (size_t i = 0; i < cands.size() && i < 3; ++i) {
         const uint64_t x = cands[i].second;
         std::snprintf(buf, sizeof(buf), "%s%s+0x%llx (%s%llu bytes)", sugg.empty() ? "" : ", ",
-                      modname.empty() ? "module" : modname.c_str(), (unsigned long long)(x - p.base),
+                      modname.empty() ? "module" : modname.c_str(), (unsigned long long)(x - base),
                       x < p.address ? "-" : "+", (unsigned long long)cands[i].first);
         sugg += buf;
     }
@@ -2946,6 +2988,7 @@ static void guard_sync(probe_session *s) {
     // for a thread that is not suspended.
     for (DWORD tid : s->handling) if (n < PROBE_AGENT_GUARD_TIDS) g.held_tids[n++] = tid;
     if (s->in_call_tid && n < PROBE_AGENT_GUARD_TIDS) g.held_tids[n++] = s->in_call_tid;
+    for (const auto &c : s->calls) if (n < PROBE_AGENT_GUARD_TIDS) g.held_tids[n++] = c.first;
     g.held_count = (LONG)n;
     n = 0;
     for (uint64_t b : s->scratch_blocks) if (n < PROBE_AGENT_GUARD_BLOCKS) g.blocks[n++] = b;
@@ -3247,7 +3290,9 @@ static void thread_start_fixup(probe_context *c) {
     if (probe_session *s = get_session(c)) reapply_hw_thread(s, c->tid);
 }
 
+static void arm_restore_fixup(probe_session *s);
 static void arm_thread_start_fixup(probe_session *s) {
+    arm_restore_fixup(s);
     if (s->thread_start_fixup || !(s->entry_seen || s->attached)) return;
     uint64_t at = resolve_symbol(s, "ntdll.dll!RtlUserThreadStart");
     if (!at) return;
@@ -3878,16 +3923,265 @@ static bool continue_foreign_event(const probe_session *s, const DEBUG_EVENT &ev
     return true;
 }
 
+// ---- Callback fibers: concurrent call_func on breakpoint/hw ------------------------------
+// A breakpoint/hw callback runs on the debug thread while its target thread is stopped at
+// its event; call_func runs the callee ON that thread, so the callback has to wait while
+// the loop keeps dispatching (the callee's own events, every other thread's hits). Each
+// exception event is therefore handled on a fiber of the debug thread: call_func continues
+// the event, parks the fiber and returns to whichever loop resumed it; the callee's return
+// trap (or its fault, the 5 s timeout, the thread's or the process's end) resumes it. Other
+// threads' callbacks -- their own call_func included -- run meanwhile and finish in any
+// order, as concurrent inline callbacks do. (A single nested wait could not: an outer call
+// had to wait for every inner one, and other threads' hits were refused or held back --
+// a callee needing a lock one of those threads held then deadlocked until the timeout.)
+// Only one event is outstanding per process at any time: a fiber parks only after
+// continuing its own, and is resumed only at the event that ends its call.
+struct FiberHost {               // the debug thread as a fiber host while the session dispatches
+    probe_session *s; bool outer = false;
+    explicit FiberHost(probe_session *ss) : s(ss) {
+        if (s->main_fiber) return;
+        outer = true;
+        if (IsThreadAFiber()) s->main_fiber = GetCurrentFiber();
+        else if ((s->main_fiber = ConvertThreadToFiberEx(nullptr, FIBER_FLAG_FLOAT_SWITCH)) != nullptr) s->fiber_converted = true;
+    }
+    ~FiberHost() { end(); }
+    void end() {                 // explicit where the session must not be touched afterwards
+        if (!outer) return;
+        outer = false;
+        for (EventFiber *f : s->fiber_pool) { DeleteFiber(f->fiber); delete f; }   // idle (parked ones were finished)
+        s->fiber_pool.clear();
+        if (s->fiber_converted) ConvertFiberToThread();
+        s->fiber_converted = false; s->main_fiber = nullptr;
+    }
+};
+static void WINAPI event_fiber_main(void *p) {
+    auto *f = static_cast<EventFiber *>(p);
+    for (;;) {
+        f->disposition = DBG_CONTINUE;
+        try { f->ok = dispatch_event(f->s, f->ev, f->disposition); }
+        catch (const std::exception &e) { set_error(f->s, std::string("debug event: ") + e.what()); f->ok = false; }
+        f->done = true;
+        SwitchToFiber(f->return_to);
+    }
+}
+static EventFiber *fiber_get(probe_session *s) {
+    if (!s->main_fiber) return nullptr;
+    if (!s->fiber_pool.empty()) { EventFiber *f = s->fiber_pool.back(); s->fiber_pool.pop_back(); return f; }
+    auto *f = new (std::nothrow) EventFiber;
+    if (!f) return nullptr;
+    f->s = s;
+    f->fiber = CreateFiberEx(64 * 1024, 1024 * 1024, FIBER_FLAG_FLOAT_SWITCH, event_fiber_main, f);
+    if (!f->fiber) { delete f; return nullptr; }
+    return f;
+}
+// Run f until its handling finishes or parks in call_func. Finished: `ev` (the event f now
+// stands at) is continued -- unless the handling did that itself, or its thread is held
+// for it (resumed instead).
+static bool fiber_step(probe_session *s, EventFiber *f, const DEBUG_EVENT *ev) {
+    const bool outer_skip = s->skip_continue;
+    EventFiber *const outer = s->cur_fiber;
+    const DWORD outer_cb = s->cb_tid;
+    s->skip_continue = false;
+    f->return_to = GetCurrentFiber();
+    s->cur_fiber = f;
+    SwitchToFiber(f->fiber);
+    s->cur_fiber = outer; s->cb_tid = outer_cb;
+    bool ok = true;
+    if (f->done) {
+        ok = f->ok;
+        if (f->resume_after) { ResumeThread(f->resume_after); CloseHandle(f->resume_after); f->resume_after = nullptr; }
+        else if (!s->skip_continue && ev && !ContinueDebugEvent(ev->dwProcessId, ev->dwThreadId, f->disposition)) {
+            set_error(s, win_error("continue debug event")); ok = false;
+        }
+        f->done = false;
+        try { s->fiber_pool.push_back(f); } catch (...) { DeleteFiber(f->fiber); delete f; }
+    }
+    s->skip_continue = outer_skip;
+    return ok;
+}
+// Called on a parked fiber by call_func: back to the loop that resumed it.
+static void fiber_park(probe_session *s, EventFiber *f) {
+    const DWORD cb = s->cb_tid;
+    SwitchToFiber(f->return_to);
+    s->cb_tid = cb;
+}
+static bool call_resume(probe_session *s, DWORD tid, EventFiber::Outcome how, const DEBUG_EVENT *ev) {
+    auto it = s->calls.find(tid);
+    if (it == s->calls.end()) return true;
+    EventFiber *f = it->second;
+    s->calls.erase(it);
+    f->call_outcome = how;
+    return fiber_step(s, f, ev);
+}
+// A thread running a call_func or call_original callee: its own probe hits are counted
+// without a callback (no re-entry, as inline).
+static bool thread_in_call(const probe_session *s, DWORD tid) {
+    return tid && (tid == s->in_call_tid || s->calls.count(tid));
+}
+// Other threads' probe hits while a call_func or call_original is in flight. By default
+// they are held back (defer_hit_during_call) and replayed when it is over: callbacks never
+// overlap (the documented breakpoint/hw contract), so a callback may hold a lock of its own
+// across call_func. But a callee that needs something one of those held threads must do
+// first -- a lock it holds at its probe hit, a barrier all threads reach -- would then wait
+// for the timeout, where inline (callbacks on their own threads) runs on. So once a callee
+// is seen BLOCKED (a wait state in two samples, after 300 ms), the held hits are released
+// and from then on, until no call is in flight, other threads' callbacks run at once, each
+// on its own fiber with its own call_func. (A callback holding a lock across such a
+// blocked call_func would then block the debug thread if another one takes the same lock:
+// documented.)
+static void resume_deferred_hits(probe_session *s);
+static void release_deferred(probe_session *s) {
+    if (!s->in_call_tid && (s->calls.empty() || s->calls_stalled)) resume_deferred_hits(s);
+}
+static bool defer_hits_now(const probe_session *s, DWORD tid) {
+    if (s->in_call_tid) return tid != s->in_call_tid;                  // call_original: always
+    return !s->calls.empty() && !s->calls_stalled && !s->calls.count(tid);
+}
+// One sample of the target's thread states: tid -> blocked (waiting, but not suspended).
+static void sample_blocked_threads(DWORD pid, std::unordered_map<DWORD, bool> &out) {
+    struct SysThread {                    // SYSTEM_THREAD_INFORMATION
+        LARGE_INTEGER kernel_time, user_time, create_time;
+        ULONG wait_time; PVOID start; HANDLE pid, tid; LONG priority, base_priority;
+        ULONG switches, state, wait_reason;
+    };
+    struct SysProcess {                   // SYSTEM_PROCESS_INFORMATION, up to its thread array
+        ULONG next, threads; LARGE_INTEGER ws_private; ULONG hard_faults, threads_high; ULONGLONG cycles;
+        LARGE_INTEGER create_time, user_time, kernel_time;
+        USHORT image_len, image_max; PWSTR image; LONG base_priority; HANDLE pid, parent; ULONG handles, session; ULONG_PTR key;
+        SIZE_T peak_vsize, vsize; ULONG page_faults; SIZE_T peak_ws, ws, quota[4], pagefile, peak_pagefile, private_pages;
+        LARGE_INTEGER io[6];
+    };
+    static_assert(sizeof(SysThread) == (sizeof(void *) == 8 ? 0x50 : 0x40) &&
+                  sizeof(SysProcess) == (sizeof(void *) == 8 ? 0x100 : 0xB8), "SYSTEM_*_INFORMATION layout");
+    using QueryFn = LONG(NTAPI *)(ULONG, PVOID, ULONG, PULONG);
+    static const auto query = reinterpret_cast<QueryFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation"));
+    out.clear();
+    if (!query) return;
+    std::vector<unsigned char> buf(256 * 1024);
+    for (int tries = 0; tries < 4; ++tries) {
+        ULONG need = 0;
+        const LONG st = query(5 /* SystemProcessInformation */, buf.data(), (ULONG)buf.size(), &need);
+        if (st == (LONG)0xC0000004 /* STATUS_INFO_LENGTH_MISMATCH */) { buf.resize(std::max<size_t>(need, buf.size()) + 64 * 1024); continue; }
+        if (st < 0) return;
+        for (size_t at = 0;;) {
+            const auto *p = reinterpret_cast<const SysProcess *>(buf.data() + at);
+            if ((DWORD)(uintptr_t)p->pid == pid) {
+                const auto *t = reinterpret_cast<const SysThread *>(p + 1);
+                for (ULONG i = 0; i < p->threads; ++i)
+                    out[(DWORD)(uintptr_t)t[i].tid] = t[i].state == 5 /* Waiting */ && t[i].wait_reason != 5 /* Suspended */;
+                return;
+            }
+            if (!p->next) return;
+            at += p->next;
+        }
+    }
+}
+// The 5 s call_func timeout; calls whose callee returned while a call_original ran
+// (resumed once it is over: call_original allows no other one meanwhile); blocked callees.
+static bool poll_calls(probe_session *s) {
+    bool ok = true;
+    for (bool again = !s->calls.empty(); again; ) {
+        again = false;
+        const ULONGLONG now = GetTickCount64();
+        for (auto &c : s->calls) {
+            EventFiber *f = c.second;
+            EventFiber::Outcome how = EventFiber::WAITING;
+            if (f->call_held && !s->in_call_tid) how = f->call_outcome;
+            else if (!f->call_held && now > f->call_deadline) how = EventFiber::TIMEOUT;
+            if (how == EventFiber::WAITING) continue;
+            ok = call_resume(s, c.first, how, nullptr) && ok;   // may add/remove calls: rescan
+            again = true; break;
+        }
+    }
+    if (s->calls.empty()) { s->calls_stalled = false; return ok; }
+    const ULONGLONG now = GetTickCount64();
+    if (s->calls_stalled || s->call_deferred.empty() || s->in_call_tid || now < s->stall_next) return ok;
+    s->stall_next = now + 50;
+    bool old = false;
+    for (auto &c : s->calls) old = old || (!c.second->call_held && now - c.second->call_start >= 300);
+    if (!old) return ok;
+    std::unordered_map<DWORD, bool> blocked;
+    sample_blocked_threads(s->pi.dwProcessId, blocked);
+    for (auto &c : s->calls) {
+        EventFiber *f = c.second;
+        auto b = blocked.find(c.first);
+        const bool waiting = !f->call_held && b != blocked.end() && b->second;
+        if (waiting && f->call_seen_waiting && now - f->call_start >= 300) s->calls_stalled = true;
+        f->call_seen_waiting = waiting;
+    }
+    if (s->calls_stalled) {
+        if (trace_enabled())
+            std::fprintf(stderr, "  call_func: callee blocked; releasing %zu held hit(s)\n", s->call_deferred.size());
+        release_deferred(s);
+    }
+    return ok;
+}
+// End every parked call (the process is gone, or the session stops dispatching).
+static void finish_calls(probe_session *s) {
+    s->calls_closing = true;
+    while (!s->calls.empty()) {
+        auto it = s->calls.begin();
+        EventFiber::Outcome how = s->exited ? EventFiber::EXITED : it->second->call_held ? it->second->call_outcome
+                                                                                          : EventFiber::TIMEOUT;
+        call_resume(s, it->first, how, nullptr);
+    }
+    s->calls_closing = false;
+    s->calls_stalled = false;
+    if (!s->exited) release_deferred(s);
+}
+// Dispatch one debug event of this session and continue it -- or hand it to the call_func
+// it ends. Every loop that waits for debug events goes through here.
+static bool service_event(probe_session *s, DEBUG_EVENT &ev) {
+    if (ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
+        auto it = s->calls.find(ev.dwThreadId);
+        if (it != s->calls.end()) {
+            const auto &er = ev.u.Exception.ExceptionRecord;
+            const bool trap = er.ExceptionCode == EXCEPTION_BREAKPOINT && (uint64_t)(uintptr_t)er.ExceptionAddress == s->call_trap;
+            if (trap || !(er.ExceptionCode == EXCEPTION_BREAKPOINT || er.ExceptionCode == EXCEPTION_SINGLE_STEP)) {
+                const EventFiber::Outcome how = trap ? EventFiber::TRAPPED : EventFiber::FAULTED;
+                if (!s->in_call_tid || s->calls_closing) return call_resume(s, ev.dwThreadId, how, &ev);
+                // A call_original is running: hold this thread at its trap/fault until it is
+                // over (its callback could call_original as well).
+                EventFiber *f = it->second;
+                HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION, FALSE, ev.dwThreadId);
+                guard_note_hold(s, ev.dwThreadId);
+                if (t && SuspendThread(t) != (DWORD)-1) {
+                    f->call_held = t; f->call_outcome = how;
+                    if (!ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE)) {
+                        set_error(s, win_error("continue debug event")); return false;
+                    }
+                    return true;
+                }
+                if (t) CloseHandle(t);
+                return call_resume(s, ev.dwThreadId, how, &ev);
+            }
+            if (trace_enabled())
+                std::fprintf(stderr, "  call_func: own-thread event 0x%08lx at 0x%llx\n", (unsigned long)er.ExceptionCode,
+                             (unsigned long long)(uintptr_t)er.ExceptionAddress);
+        }
+        if (EventFiber *f = fiber_get(s)) { f->ev = ev; return fiber_step(s, f, &ev); }
+    }
+    const bool outer_skip = s->skip_continue;
+    s->skip_continue = false;
+    DWORD disposition = DBG_CONTINUE;
+    bool ok = dispatch_event(s, ev, disposition);
+    if (!s->skip_continue && !ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, disposition)) {
+        set_error(s, win_error("continue debug event")); ok = false;
+    }
+    s->skip_continue = outer_skip;
+    if (ev.dwDebugEventCode == EXIT_THREAD_DEBUG_EVENT && s->calls.count(ev.dwThreadId))
+        ok = call_resume(s, ev.dwThreadId, EventFiber::GONE, nullptr) && ok;      // ended inside the callee
+    return ok;
+}
+
 static void pump(probe_session *s, DWORD ms) {
     DEBUG_EVENT event{};
     ULONGLONG until = GetTickCount64() + ms;
     while (!s->exited && GetTickCount64() < until) {
+        poll_calls(s);
         if (!WaitForDebugEvent(&event, 20)) continue;
         if (continue_foreign_event(s, event)) continue;
-        DWORD disposition = DBG_CONTINUE;
-        dispatch_event(s, event, disposition);
-        if (s->skip_continue) { s->skip_continue = false; continue; }
-        ContinueDebugEvent(event.dwProcessId, event.dwThreadId, disposition);
+        service_event(s, event);
         if (s->remote_work == probe_session::REMOTE_NONE && s->stepping.empty() && ms == 0) break;
     }
 }
@@ -3896,6 +4190,11 @@ static void ipc_thaw(probe_session *s);
 static void pump(probe_session *s, DWORD ms);
 static void detach(probe_session *s) {
     s->error.clear();
+    FiberHost fibers(s);
+    // Callbacks inside call_func: let their callees return first (bounded by their timeout).
+    for (ULONGLONG until = GetTickCount64() + 6000; !s->calls.empty() && !s->exited && GetTickCount64() < until; )
+        pump(s, 20);
+    finish_calls(s);
     // From here on nothing may start new agent work, arm anything, gate or hold a thread: the
     // event pumping below dispatches events (an agent load completing, a DLL with pending
     // sites loading, the initial breakpoint) that would otherwise start an init AFTER the stop
@@ -3986,11 +4285,9 @@ static void detach(probe_session *s) {
                          (unsigned long long)(uintptr_t)ev.u.Exception.ExceptionRecord.ExceptionAddress,
                          (unsigned long)ev.u.Exception.dwFirstChance);
         }
-        DWORD disposition = DBG_CONTINUE;
-        dispatch_event(s, ev, disposition);
-        if (s->skip_continue) { s->skip_continue = false; continue; }
-        ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, disposition);
+        service_event(s, ev);
     }
+    finish_calls(s);                                         // a call started while draining
     for (HANDLE t : frozen) {                                // freeze again for the fix-ups below
         const DWORD tid = GetThreadId(t);
         guard_note_hold(s, tid);
@@ -4400,13 +4697,67 @@ static void enforce_owned_drs(const probe_session *s, DWORD tid, CONTEXT &c) {
     }
 }
 
-// While one callback's call_func runs its callee, another thread that hits a probe must
-// not run ITS callback now: that callback may call call_func too, and only one call can be
-// in flight (it used to get 0 -- the same callback source failed only under concurrency).
-// Instead the hit is undone -- the thread is put back AT the probe address (an INT3 hit
-// rewinds over the 0xCC; an execute #DB has not run the instruction) and suspended. When
-// the call finishes it is resumed and hits the probe again, normally: counted once, its
-// callback runs with call_func available.
+// The same wipe through EVERY context restore: a thread inside exception dispatch (an
+// exception filter, a vectored handler) or a user APC when a hardware probe is armed or
+// released resumes through NtContinue with the context the kernel captured BEFORE that --
+// debug registers included -- so the new probe never fires on it (or a released one comes
+// back). Library-owned breakpoints at ntdll!NtContinue / NtContinueEx bring the debug-register
+// image of the context about to be restored up to date first: our slots only, exactly as at
+// a hardware hit (enforce_owned_drs; the target's own slots are left as it set them). Armed
+// with the thread-start fixup: once a hardware probe is armed or released at runtime.
+static void restore_fixup(probe_context *c) {
+    probe_session *s = get_session(c);
+    if (!s || !s->dr_ever) return;
+    uint64_t rec = 0;
+#if defined(_WIN64)
+    rec = c->regs.rcx;                                       // NtContinue[Ex](PCONTEXT, ...)
+#else
+    uint32_t r32 = 0; size_t n = 0;                          // stdcall: [esp] = return, [esp+4] = PCONTEXT
+    if (!remote_read(s->pi.hProcess, c->regs.rsp + 4, &r32, 4, &n) || n != 4) return;
+    rec = r32;
+#endif
+    CONTEXT img{};
+    const size_t at = offsetof(CONTEXT, ContextFlags), len = offsetof(CONTEXT, Dr7) + sizeof(img.Dr7) - at;
+    size_t n = 0;
+    if (!rec || !remote_read(s->pi.hProcess, rec + at, reinterpret_cast<char *>(&img) + at, len, &n) || n != len) return;
+    if ((img.ContextFlags & CONTEXT_DEBUG_REGISTERS) != CONTEXT_DEBUG_REGISTERS) return;   // DRs not restored
+    const CONTEXT before = img;
+    enforce_owned_drs(s, c->tid, img);
+    if (img.Dr0 == before.Dr0 && img.Dr1 == before.Dr1 && img.Dr2 == before.Dr2 && img.Dr3 == before.Dr3 &&
+        img.Dr7 == before.Dr7) return;
+    if (trace_enabled())
+        std::fprintf(stderr, "  restore-fixup tid=%lu dr7 0x%llx -> 0x%llx\n", (unsigned long)c->tid,
+                     (unsigned long long)before.Dr7, (unsigned long long)img.Dr7);
+    const size_t d0 = offsetof(CONTEXT, Dr0), dn = offsetof(CONTEXT, Dr6) - d0;     // Dr0..Dr3
+    remote_write(s->pi.hProcess, rec + d0, reinterpret_cast<char *>(&img) + d0, dn, &n);
+    remote_write(s->pi.hProcess, rec + offsetof(CONTEXT, Dr7), &img.Dr7, sizeof(img.Dr7), &n);
+}
+static void arm_restore_fixup(probe_session *s) {
+    if (s->restore_fixup || !(s->entry_seen || s->attached)) return;
+    s->restore_fixup = true;
+    static const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");   // same bitness and build as the target's
+    for (const char *name : {"NtContinue", "NtContinueEx"}) {
+        if (!GetProcAddress(ntdll, name)) continue;          // NtContinueEx: Windows 10 2004+
+        const uint64_t at = resolve_symbol(s, (std::string("ntdll.dll!") + name).c_str());
+        if (!at || probe_at(s, at)) continue;                // a user probe owns the site: rare, left as is
+        try {
+            auto p = std::make_unique<Probe>();
+            p->location = "<context-restore>"; p->flags = PROBE_BREAKPOINT; p->callback = restore_fixup;
+            p->rva = at; p->internal = true;
+            Probe *raw = p.get(); s->probes.push_back(std::move(p));
+            std::string saved = s->error;
+            if (!arm_breakpoint(s, *raw, 0)) { raw->retired = true; s->error = saved; }
+        } catch (...) {}
+    }
+}
+
+// While one callback's call_original runs the original in place, another thread that hits
+// a probe must not run ITS callback now: that callback may call call_original too, and only
+// one can be in flight. Instead the hit is undone -- the thread is put back AT the probe
+// address (an INT3 hit rewinds over the 0xCC; an execute #DB has not run the instruction)
+// and suspended. When the call finishes it is resumed and hits the probe again, normally:
+// counted once, its callback runs with call_original available. (call_func needs none of
+// this: concurrent calls each park on their own fiber, see "Callback fibers".)
 static bool defer_hit_during_call(probe_session *s, DWORD tid, uint64_t address, bool rewind_ip) {
     HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
                           FALSE, tid);                     // (QUERY_LIMITED: GetThreadId, guard_sync)
@@ -4681,7 +5032,7 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
                 p->address == pc)
                 native.Dr6 |= (DWORD64)1 << p->dr_slot;
     }
-    if (s->in_call_tid && event.dwThreadId != s->in_call_tid && (native.Dr6 & 0xF)) {
+    if (defer_hits_now(s, event.dwThreadId) && (native.Dr6 & 0xF)) {
         // Only pure execute hits can be replayed (a data watch has already happened).
         bool exec_only = true;
 #if defined(_WIN64)
@@ -4759,8 +5110,8 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
         context.config = probe->config.empty() ? nullptr : probe->config.data();
         context.tid = event.dwThreadId;
         CallbackState state{s, probe, event.dwProcessId, event.dwThreadId}; context.controller = &state;
-        if (event.dwThreadId == s->in_call_tid) {                                 // inside call_func: no re-entry
-            if (s->co_addr && !(probe->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW))) {
+        if (thread_in_call(s, event.dwThreadId)) {                    // inside call_func/call_original: no re-entry
+            if (s->co_addr && event.dwThreadId == s->in_call_tid && !(probe->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW))) {
 #if defined(_WIN64)
                 const uint64_t sp = native.Rsp;
 #else
@@ -5322,7 +5673,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     if (!GetThreadContext(thread, &native)) {
         CloseHandle(thread); set_error(s, win_error("get breakpoint context")); return false;
     }
-    if (s->in_call_tid && event.dwThreadId != s->in_call_tid && !probe->internal &&
+    if (defer_hits_now(s, event.dwThreadId) && !probe->internal &&
         defer_hit_during_call(s, event.dwThreadId, address, true)) {
         CloseHandle(thread); disposition = DBG_CONTINUE; return true;
     }
@@ -5351,7 +5702,9 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     context.tid = event.dwThreadId;
     CallbackState state{s, probe, event.dwProcessId, event.dwThreadId}; context.controller = &state;
     s->cb_tid = event.dwThreadId;
-    if (event.dwThreadId != s->in_call_tid && !restart)   // a probe hit INSIDE call_func's callee: step over it
+    // A probe hit INSIDE a call_func/call_original callee: step over it (the library's own
+    // internal breakpoints still do their work there).
+    if ((probe->internal || !thread_in_call(s, event.dwThreadId)) && !restart)
     try { run_callback(s, probe, &context); s->cb_tid = 0; }
     catch (const std::exception &e) {
         CloseHandle(thread); set_error(s, std::string("probe callback: ") + e.what()); return false;
@@ -5920,10 +6273,13 @@ static void stop_drainer(probe_session *s) {
 static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &disposition);
 static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposition) {
     s->handling.push_back(event.dwThreadId);
-    struct Handling {
-        probe_session *s;
-        ~Handling() { s->handling.pop_back(); }
-    } handling{s};
+    struct Handling {                                // handlings on fibers can end in any order
+        probe_session *s; DWORD tid;
+        ~Handling() {
+            auto &h = s->handling;
+            for (size_t i = h.size(); i--; ) if (h[i] == tid) { h.erase(h.begin() + (ptrdiff_t)i); break; }
+        }
+    } handling{s, event.dwThreadId};
     guard_note_hold(s, event.dwThreadId);            // see guard_sync: until the event is continued
     const bool ok = dispatch_event_impl(s, event, disposition);
     inplace_sync(s, event);
@@ -6159,6 +6515,7 @@ extern "C" int probe_run(probe_session *s) {
     s->running = true;                     // before `ran`: probe_close waits on (ran && !running)
     s->ran = true;
     ctrl_enter(s);
+    FiberHost fibers(s);
     if (g_ctrl_runs.fetch_add(1) == 0 && g_runs_done) ResetEvent(g_runs_done);
     DEBUG_EVENT event{};
     while (!s->exited) {
@@ -6184,6 +6541,7 @@ extern "C" int probe_run(probe_session *s) {
             if (trace_enabled()) trace_thread_stacks(s, "install timeout");
             release_held(s, "install timeout");
         }
+        if (!poll_calls(s)) break;                          // call_func timeouts
         if (!WaitForDebugEvent(&event, 20)) {                         // short: also polls stop requests
             if (GetLastError() == ERROR_SEM_TIMEOUT) {      // idle: drain and wait again
                 inplace_watchdog(s);
@@ -6193,17 +6551,13 @@ extern "C" int probe_run(probe_session *s) {
             set_error(s, win_error("wait for debug event")); break;
         }
         if (continue_foreign_event(s, event)) continue;
-        DWORD disposition = DBG_CONTINUE;
-        bool ok = dispatch_event(s, event, disposition);
-        if (s->skip_continue) { s->skip_continue = false; if (!ok) break; continue; }
-        if (!ContinueDebugEvent(event.dwProcessId, event.dwThreadId, disposition)) {
-            set_error(s, win_error("continue debug event")); ok = false;
-        }
+        bool ok = service_event(s, event);
 #if defined(UHH_TEST_HOOKS)
         if (g_test_die_on_continue) { std::fflush(nullptr); TerminateProcess(GetCurrentProcess(), 97); }
 #endif
         if (!ok) break;
     }
+    finish_calls(s);                                      // callbacks still parked in call_func
     // An attached target is still running and the loop is leaving for some other reason
     // than a detach (an error: agent load/init failure, a failed context get/set or debug
     // wait): let go of it HERE, on the thread that owns the debug object -- INT3s restored,
@@ -6222,6 +6576,7 @@ extern "C" int probe_run(probe_session *s) {
     if (!s->exited && s->pi.hProcess && !s->attached) TerminateProcess(s->pi.hProcess, 3);
     if (s->exited && has_inline(s) && !s->inline_ready) set_error(s, "target exited before inline probes were ready");
     int result = (s->exited || s->detached) && s->error.empty();
+    fibers.end();
     if (g_ctrl_runs.fetch_sub(1) == 1 && g_runs_done) SetEvent(g_runs_done);   // a closing console may go on
     s->running = false;                                   // last touch of s on this thread
     return result;
@@ -6527,9 +6882,19 @@ struct TebErrors {
     }
 };
 
-static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint64_t *ret, int nargs, const uint64_t *args,
-                          const probe_context *seed = nullptr) {
-    if (s->in_call_tid || nargs < 0 || nargs > 8) return 0;           // no nesting
+static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint64_t *ret, int nargs, const uint64_t *args) {
+    if (nargs < 0 || nargs > 8 || st->released || s->exited || s->calls_closing) return 0;
+    // The callback must run on its own event's fiber, stopped at that event (see "Callback
+    // fibers"): that is where it can wait for the callee. Otherwise (no fiber could be
+    // made, or the thread is already held after a timed-out call) the call is refused.
+    EventFiber *const f = s->cur_fiber;
+    if (!f || f->ev.dwThreadId != st->tid || f->resume_after || s->calls.count(st->tid)) {
+        if (!f && !s->call_fiber_warned) {
+            s->call_fiber_warned = true;
+            std::fprintf(stderr, "probe: call_func refused: no callback fiber available\n");
+        }
+        return 0;
+    }
     // Hardware shadow stacks (CET): the callee is entered by SetThreadContext, not a CALL,
     // so its `ret` to call_trap does not match the shadow stack -> #CP in the target
     // (fatal in strict mode and when the callee's module is CETCOMPAT). Refuse cleanly
@@ -6556,7 +6921,6 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
     if (!GetThreadContext(thread, &saved)) { CloseHandle(thread); return 0; }
     TebErrors teb_errors; teb_errors.save(s->pi.hProcess, thread, saved);
     CONTEXT w = saved; size_t wrote = 0; bool ok = true;
-    if (seed) to_context(*seed, w);                                    // call_original: the callback's registers
 #if defined(_WIN64)
     uint64_t sp = ((saved.Rsp - 512) & ~(uint64_t)0xF) - 8;           // entry rsp == 8 mod 16
     uint64_t frame[13] = {s->call_trap};                               // ret, shadow x4, stack args
@@ -6575,62 +6939,60 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
     w.EFlags &= ~0x100u;
     w.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
     if (!ok || !SetThreadContext(thread, &w)) { CloseHandle(thread); return 0; }
-    s->in_call_tid = st->tid;
-    if (!ContinueDebugEvent(st->pid, st->tid, DBG_CONTINUE)) { s->in_call_tid = 0; SetThreadContext(thread, &saved); CloseHandle(thread); return 0; }
-    int result = 0; bool trapped = false;
-    ULONGLONG until = GetTickCount64() + 5000;
-    DEBUG_EVENT ev{};
-    while (!s->exited) {
-        if (!WaitForDebugEvent(&ev, 20)) {
-            if (GetTickCount64() > until) break;
-            continue;
-        }
-        if (continue_foreign_event(s, ev)) continue;
-        if (ev.dwThreadId == st->tid && ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
-            auto &er = ev.u.Exception.ExceptionRecord;
-            if (er.ExceptionCode == EXCEPTION_BREAKPOINT && (uint64_t)(uintptr_t)er.ExceptionAddress == s->call_trap) {
-                CONTEXT r{}; r.ContextFlags = CONTEXT_INTEGER;
-                if (GetThreadContext(thread, &r)) {
+    try { s->calls.emplace(st->tid, f); } catch (...) { SetThreadContext(thread, &saved); CloseHandle(thread); return 0; }
+    f->call_start = GetTickCount64(); f->call_deadline = f->call_start + 5000;
+    f->call_outcome = EventFiber::WAITING; f->call_seen_waiting = false;
+    f->call_held = nullptr;
+    if (!ContinueDebugEvent(st->pid, st->tid, DBG_CONTINUE)) {
+        s->calls.erase(st->tid); SetThreadContext(thread, &saved); CloseHandle(thread); return 0;
+    }
+    fiber_park(s, f);                       // the loop runs on; resumed by service_event / poll_calls
+    // The outcome. TRAPPED / FAULTED: the thread is stopped at that event -- or, if it came
+    // while a call_original ran, suspended by us (call_held) -- and it now stands in for the
+    // original hit: the thread is put back exactly as it was at the hit.
+    int result = 0;
+    const HANDLE held = f->call_held;
+    f->call_held = nullptr;
+    switch (f->call_outcome) {
+    case EventFiber::TRAPPED: {
+        CONTEXT r{}; r.ContextFlags = CONTEXT_INTEGER;
+        if (GetThreadContext(thread, &r)) {
 #if defined(_WIN64)
-                    if (ret) *ret = r.Rax;
+            if (ret) *ret = r.Rax;
 #else
-                    if (ret) *ret = r.Eax;                     // pointer-sized return (EAX)
+            if (ret) *ret = r.Eax;                                     // pointer-sized return (EAX)
 #endif
-                    result = 1;
-                }
-                trapped = true; break;                             // leave this event pending
-            }
-            if (!(er.ExceptionCode == EXCEPTION_BREAKPOINT || er.ExceptionCode == EXCEPTION_SINGLE_STEP)) {
-                if (trace_enabled())
-                    std::fprintf(stderr, "  call_func: callee raised 0x%08lx at 0x%llx; abandoned\n", (unsigned long)er.ExceptionCode,
-                                 (unsigned long long)(uintptr_t)er.ExceptionAddress);
-                trapped = true; break;                             // the callee faulted: abandon the call
-            }
-            if (trace_enabled())
-                std::fprintf(stderr, "  call_func: own-thread event 0x%08lx at 0x%llx\n", (unsigned long)er.ExceptionCode,
-                             (unsigned long long)(uintptr_t)er.ExceptionAddress);
+            result = 1;
         }
-        DWORD disposition = DBG_CONTINUE;
-        dispatch_event(s, ev, disposition);                        // other threads keep working
-        if (s->skip_continue) { s->skip_continue = false; continue; }
-        ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, disposition);
     }
-    s->in_call_tid = 0;
-    resume_deferred_hits(s);                                       // they hit their probes again now
-    if (trapped) {
-        SetThreadContext(thread, &saved);                          // exactly as it was at the hit
-        teb_errors.restore(s->pi.hProcess);                        // and its last error / status
-        // The pending trap/fault event on this thread now stands in for the original one.
-    } else if (!s->exited) {
-        // Timed out with the callee still running: stop it, put the context back, and tell
-        // the loop the original event is already continued (there is nothing to continue).
-        SuspendThread(thread); SetThreadContext(thread, &saved); teb_errors.restore(s->pi.hProcess); ResumeThread(thread);
-        s->skip_continue = true;
+        [[fallthrough]];
+    case EventFiber::FAULTED:
+        if (f->call_outcome == EventFiber::FAULTED && trace_enabled())
+            std::fprintf(stderr, "  call_func: callee raised an exception on thread %lu; abandoned\n", (unsigned long)st->tid);
+        SetThreadContext(thread, &saved);                              // exactly as it was at the hit
+        teb_errors.restore(s->pi.hProcess);                            // and its last error / status
+        if (held) f->resume_after = held;                              // no event to continue: resume it
+        break;
+    case EventFiber::TIMEOUT:
+        // The callee is still running: stop it and put the context back. It stays suspended
+        // until this handling ends, so the callback's own register changes still land.
+        guard_note_hold(s, st->tid);
+        if (SuspendThread(thread) != (DWORD)-1) {
+            SetThreadContext(thread, &saved); teb_errors.restore(s->pi.hProcess);
+            f->resume_after = thread; thread = nullptr;
+        } else {
+            st->released = true;                                       // cannot stop it: nothing to write back
+        }
         std::fprintf(stderr, "probe: call_func timed out after 5 s; thread restored\n");
-    } else {
-        s->skip_continue = true;
+        break;
+    default:                                                           // GONE / EXITED: nothing left to restore
+        if (held) { ResumeThread(held); CloseHandle(held); }
+        st->released = true;
+        break;
     }
-    CloseHandle(thread);
+    if (thread) CloseHandle(thread);
+    if (s->calls.empty()) s->calls_stalled = false;
+    release_deferred(s);                                               // held hits replay now
     return result;
 }
 
@@ -6782,11 +7144,9 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
             if (ev.dwThreadId == st->tid && ev.dwDebugEventCode == EXIT_THREAD_DEBUG_EVENT) {
                 thread_gone = true; why = "the thread exited inside the original";
             }
-            DWORD disposition = DBG_CONTINUE;
-            dispatch_event(s, ev, disposition);                            // everything else as usual
-            if (s->skip_continue) s->skip_continue = false;
-            else ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, disposition);
+            service_event(s, ev);                                          // everything else as usual
         }
+        poll_calls(s);
         const ULONGLONG now = GetTickCount64();
         if (now >= next_poll && !s->co_left && !thread_gone && !s->exited) {
             // Left without a probe hit to show it (e.g. an exception caught by the caller):
@@ -6830,7 +7190,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
         clear_slot(true);
     }
     if (!borrowed) s->dr_used &= (uint8_t)~(1u << slot);
-    resume_deferred_hits(s);                           // they hit their probes again now
+    release_deferred(s);                               // they hit their probes again now
     CloseHandle(thread);
     if (done) {
         c->called_original = 1;
@@ -6854,6 +7214,7 @@ extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
     }
     if (st->probe->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) return 0;
     if (st->session->in_call_tid) return 0;                            // no nesting
+    if (st->session->cur_fiber && st->session->cur_fiber->resume_after) return 0;   // held after a call_func timeout
     return call_original_in_place(st->session, st, c, out);
 }
 extern "C" void return_from(probe_context *c, uint64_t value, int nargs) {

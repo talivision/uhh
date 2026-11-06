@@ -7805,6 +7805,41 @@ def check_cet_agent():
         record("cet-agent-block-noncet", False, repr(e))
 
 
+def check_sessions_repeat(n=60):
+    """Many sessions one after the other in ONE controller process (ROADMAP "x86 cumulative-
+    session flakiness"): ar_driver --repeat, backends in turn (breakpoint, hw, inline), each
+    session the cflock case (call_func from two threads' callbacks, one needing the other's
+    lock). Every session exact (row, both logs, nothing dropped), and the controller's handle
+    count flat after warm-up (a leaked or double-closed handle shows here or as a failure)."""
+    d, t = exe("ar_driver.exe"), exe("ar_target.exe")
+    if not d or not t:
+        return missing_bin("sessions-repeat", "ar_driver/ar_target")
+    try:
+        r, o = run([d, "--backend", "cycle", "--repeat", n, "--probe", "ar_target.exe!ar_cf_site=ar_on_cf", "--", t, "cflock"],
+                   timeout=60 + 15 * n)
+        iters = [x for x in o if x.get("kind") == "iter"]
+        rows = [x for x in o if x.get("kind") == "ar"]
+        reps = [x for x in o if x.get("kind") == "probe_report"]
+        msgs = Counter(str(x.get("message", "")) for x in o if x.get("kind") == "probe_log")
+        bad = []
+        failed = [(x.get("i"), x.get("backend")) for x in iters if x.get("ok") != 1]
+        if len(iters) != n or failed: bad.append(f"iters={len(iters)}/{n} failed={failed[:6]}")
+        wrong = [i for i, x in enumerate(rows) if (x.get("inside"), x.get("joined"), x.get("held"), x.get("waiter")) != (1, 1, 2, 4)]
+        if len(rows) != n or wrong: bad.append(f"rows={len(rows)}/{n} wrong={wrong[:6]}")
+        want = {"ar cf-lock holder ok=1 r=6": n, "ar cf-lock waiter ok=1 r=7": n}
+        if dict(msgs) != want: bad.append(f"logs={dict(msgs)}")
+        drops = [i for i, x in enumerate(reps) if x.get("log_dropped") != 0 or x.get("error") is not None]
+        if len(reps) != n or drops: bad.append(f"reports={len(reps)}/{n} bad={drops[:6]}")
+        h = [x.get("handles", 0) for x in iters]
+        growth = (h[-1] - h[2]) if len(h) > 3 else None
+        if growth is None or growth > 24: bad.append(f"controller handles {h[:3]}..{h[-3:]} (growth {growth})")
+        if r.returncode != 0: bad.append(f"rc={r.returncode}")
+        record("sessions-repeat", not bad, "; ".join(bad) + ("" if not bad else f" stderr={(r.stderr or '')[-300:]!r}")
+               or f"{n} sessions exact; controller handles {h[2]} -> {h[-1]}")
+    except Exception as e:
+        record("sessions-repeat", False, repr(e))
+
+
 def main():
     global BIN
     ap = argparse.ArgumentParser()
@@ -7959,6 +7994,7 @@ def main():
     if want(check_hw_dr_restore): check_hw_dr_restore()
     if want(check_inline_absolute): check_inline_absolute()
     if want(check_cet_agent): check_cet_agent()
+    if want(check_sessions_repeat): check_sessions_repeat()
     if only and not RESULTS:
         print(f"regress.py: --only {','.join(only)} selected only opt-in tiers that were not enabled "
               f"(--bigapps / --soak-minutes / --volume-reads): no check ran.", file=sys.stderr)
