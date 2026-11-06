@@ -181,7 +181,8 @@ reads, a slow (50 ms) callback under 32 threads.
   in call_mid) is counted as delivered AND interrupted. Not fixable by reordering (the log's
   publication and the in-flight decrement are two stores); exactness needs the accounting
   carried in the log record itself (e.g. per-thread hit sequence numbers in the records and the
-  in-flight word, reconciled by the controller at exit). hunt-exit-*-inline flake by one
+  in-flight word, reconciled by the controller at exit). hunt-exit-*-inline flake by one.
+  runfix1 (protocol 23: the log carry per hit, a separate running count) is that design.
 - ✅ (A4) breakpoint/hw + a target that round-trips its own threads' contexts (SuspendThread +
   GetThreadContext + SetThreadContext, as GCs/profilers do): a context captured while the thread
   sat in a UHH debug event and written back after UHH resumed it undid UHH's fix-up (breakpoint:
@@ -226,7 +227,7 @@ reads, a slow (50 ms) callback under 32 threads.
   bound): the hooks are in before the first TLS callback / DllMain. The agent's PROBE_IPC
   requests (its hook-write freeze) are serviced during that call, probes it hits are not
   counted (the library's own work), and init does not wait for its service thread (agent
-  protocol v22 `early_init`: that thread starts once process init ends and reports ready then;
+  protocol v24 `early_init`: that thread starts once process init ends and reports ready then;
   the entry hold waits for it as before). Falls back to the old remote-thread load on CET shadow
   stacks or if the call fails before loading. In gated_config terms an NtOpenProcess in a TLS
   callback is now mapped. `hunt-early-{inline,hw,breakpoint}`
@@ -455,11 +456,11 @@ PowerShell + detach) under every backend, against an uninstrumented baseline.
 - ✅ A relocated INT3 whose adoption failed was passed to the target as unhandled: now rewound
 - ✅ (call_original hunter) breakpoint/hw counted the call_original pass-through as a second hit;
   inline call_original swallowed the original's exceptions -- see "call_original findings"
-- 📄 Accounting edge: a callback killed by process exit AFTER publishing its log but BEFORE returning
-  is reported both as a delivered log and in callbacks_interrupted (logs + dropped + interrupted can
-  exceed hits by the number of such threads). No log is lost; closing it exactly needs a per-callback
-  serial carried in the log record and matched by the controller. (The reverse window -- a hit counted
-  with no log and not interrupted -- is closed: hit and in-flight are one atomic add.)
+- ✅ Accounting edge (closed 2026-11-06, runfix1, agent v23): a callback killed by process exit AFTER
+  publishing its log but BEFORE returning was reported both as a delivered log and in
+  callbacks_interrupted (seen on CI runners: 3 of 36 crash-logs-inline-4t runs). Now the callback's
+  first record carries the hit's unaccounted unit (one store: the ring's seq) and the controller retires
+  it when it takes the record, so hits == logs + dropped + interrupted exactly (see "Runner findings").
 ## call_original findings (2026-11-05, `examples/hunt_callorig`, regress `callorig-hunt-*`)
 Edge-case hunt on `call_original` / `return_from`, every backend x x64/x86, each run compared
 with the uninstrumented target and with exact hits / "co" logs / `log_dropped == 0`.
@@ -1631,18 +1632,31 @@ exposes no CET to the guest (`cpuid_cet_ss=0, enforced=false`). On windows-2025 
 the CET item under "Production readiness").
 
 Real-bug candidates (reproduce on runners, not on the VM so far):
-- **crash-logs-inline-4t (both images; x86 8/8 runs, x64 6/8; never on the VM)**: `logs = hits - 1..3` when the
-  target dies (0xC0000005) with 4 inline threads logging. The missing logs are of threads that were counted as a hit
-  but killed by the process death before their callback's `send_log` ran (the gap is always <= threads-1, never on
-  breakpoint/hw, where the callback runs in the controller). So nothing in the ring is lost; the inline hit counter
-  counts a callback that never completed. Owner decision: count inline hits after the callback (or report
-  `callbacks_interrupted`) vs relax the check to `hits - logs <= threads - 1`.
+- ✅ **crash-logs-inline-4t (both images; x86 8/8 runs, x64 6/8; never on the VM)** -- fixed (runfix1). The gap
+  `logs = hits - 1..3` was never a lost log: the report already carried `callbacks_interrupted` and runner diag
+  (runfix1-diag run 42191637133, 72 runs, 6 jobs) showed `hits == logs + interrupted` exactly in 69 -- the check
+  compared logs with hits. The other 3 (x64) exposed a real accounting bug: `logs + interrupted = hits + 1`, a thread
+  killed after publishing its log but before its callback returned was counted as a log AND as interrupted (the
+  documented v20 edge). Fix (agent protocol v23): the callback's FIRST record carries its hit's unaccounted unit
+  (`probe_agent_log::carry`, published by the ring's single seq store) and the controller retires it when it takes
+  the record (ring or PROBE_IPC_LOG); a callback that returns without logging drops it itself; unhook / detach drain
+  wait on a separate `running` count. So a kill at any instant leaves hits == logs + dropped + interrupted exactly.
+  `check_crash_logs` now requires exactly that (dropped 0; inline interrupted <= threads-1; bp/hw 0; 1 thread: n
+  logs, 0 interrupted). Evidence: runner diag 42192716058 84/84 exact (7 jobs, x64+x86), 42194976034 36 full-check
+  runs PASS, VM x64+x86 PASS. The same v20 edge made `hunt-exit-process-inline` report `logs + interrupted == hits +
+  1` in ~1 of 8 runner runs (huntaudit): 42212077320 ran every `hunt-exit-*` 12 times on 5 jobs (x64+x86): 540/540
+  PASS, 180 inline runs exact with interrupted 0-8.
 - **lifecycle-controller-killed-{mixed x64 (full run), inline x86 (diag 1 of 4)}**: kill@early-0.05 -> target DEAD
   0xC0000005, not progressing. The L11 race (controller killed during install) with a new signature (access violation,
   inline/mixed configs). 2 of ~7 runs on windows-2022; 0 on windows-2025.
-- **ret-probe-breakpoint (x64 + x86, 1 of 9 each)**: hits=5 for 4 NtOpenProcess calls (hw: never). Either the
-  breakpoint backend double-reports a `ret` (the hunt-ctx A4 class) or a sporadic 5th NtOpenProcess by a system
-  component in that run; needs the per-hit log (caller/tid) to decide.
+- ✅ **ret-probe-breakpoint (x64 + x86, 1 of 9 each)** -- not a double count: a real 5th NtOpenProcess by the
+  target. Per-hit stacks (runner diag 42192716058): on the FIRST launch of probe_app on a fresh runner (7 of 7 jobs,
+  x64 and x86; never on a later run, so hw -- which runs second -- never saw it) the shim engine opens a process
+  during loader init: `ntdll!LdrInitializeThunk -> LdrInitShimEngineDynamic -> apphelp!SE_InitializeEngine ->
+  apphelp!Sdb* -> KernelBase!OpenProcess -> NtOpenProcess`. The check now takes its ground truth per hit from the
+  stack (`--stack`): hits with a probe_app frame must equal the target's `opened` count, every hit is logged, other
+  hits must be system-only (reported as `system_opens`). Evidence: 42194976034 12/12 jobs `check_ret_probe` first on
+  a fresh runner PASS (4/4) and 36/36 later runs PASS.
 - **x86 transparency-{breakpoint,hw}-callfn on windows-2025 (build 26100)**: `call_func GetThreadPriority` /
   `TlsGetValue` fail in the callback, the hw run's target dies 0xC0000005. Not CET (WoW64 is not enforced); a
   breakpoint/hw `call_func` problem on WoW64 of the newer Windows build. Needs a Windows 11 24H2 / Server 2025 VM.
@@ -1652,17 +1666,54 @@ Real-bug candidates (reproduce on runners, not on the VM so far):
 - **attach-new-inline x64 windows-2025 (1 run)**: "probe never became active" -- the load flake also seen once on
   the VM (Lifecycle section).
 
-- **transparency-* (x64, all 18 rows, once in 5 runs; run 42185253728 shard x64-04, CPU not yet recorded then)**: the
-  `ovf` case (a callback that overflows its stack, TR9) was not survived: breakpoint/hw controllers died 0xC00000FD /
-  0xC0000005 (callbacks run there), inline targets died with the stack trace recursing in
-  `probe_api_agent.dll+0x13339`, and every later case of the same run had no target row. The same shard passed on a
-  Xeon 8573C in the next run. Candidate: TR9's stack-overflow recovery depends on the host (exception-dispatch stack
-  needs grow with the XSAVE area: AVX-512 / AMX hosts); the CPU column now recorded per shard will tell.
-- **ntdll-churn-{hw,breakpoint} (x64, 2 of 5 runs, Xeon 8370C in the last)**: some of the 8 attach/detach cycles see
-  0 hits (`cycle2: rc=0 detached=True backend=hw hits=0 ... err=probe...`, text cut in the annotation) while the
-  target's reads stay exact. New check (b65175d); needs the full log (gh auth) to see the error.
-- Seen once each, undetermined: x86 `logs-wedge-suspend` (`wedged=0`), x64 `detach-inline` (`1 thread(s) frozen;
-  all clean` yet FAIL, detail cut).
+- 🔧 **transparency-* (x64, all 18 rows, once in 5 runs)** -- host found: it is the **Intel Xeon 6973P-C** runner
+  (Granite Rapids; AMX enabled in XCR0 = 0x600e7, XSAVE area 11008 bytes; GetEnabledXStateFeatures 0x608e7),
+  1 in ~15 x64 windows-2022 jobs (runfix1-diag 42192716058 x64-a, 42194976034 x64-g: every `ovf` row fails there,
+  every other CPU passes: EPYC 7763 / 9V74 / 9V45, Xeon 8370C / 8573C -- AVX-512, no AMX). The `ovf` case (TR9) has
+  a callback overflow its stack: on that host the overflow's exception frame (a CONTEXT with the XSAVE area of every
+  XCR0 feature, ~12 KB) does not fit the stack Windows leaves after the guard page. Fixed for the controller: its
+  callback thread runs under a stack guarantee of CONTEXT + XCR0 XSAVE + 16 KB (`probe_callback_stack_guarantee`,
+  SetThreadStackGuarantee): breakpoint/hw callbacks' overflows are caught there now ("callback raised 0xc00000fd;
+  abandoned"). Inline: the agent raises the program thread's TEB guarantee for the callback only and restores it
+  (the first version never applied it -- a probe request below the effective default is a no-op; fixed in 16c87b3:
+  the VM shows `tp ovf guarantee teb=20480` inside the inline callback, and every transparency row -- which compares
+  every TEB byte with the unprobed twin -- passes on the VM and runners; not yet seen on the AMX host). Open: on the AMX host
+  the TARGET's own later overflow (`overflow_caught`, no probe on it) dies under breakpoint/hw (AV in the unwind,
+  `read of ... reserved, not committed`) although the same target without UHH survives it; a bare ctypes debugger
+  (`ci-diag/dbgtest.py` on runfix1-diag) and a probe on another function only (`ovfx`) are queued to tell "any
+  debugger on AMX" (environment) from UHH; the gated AMX-host jobs (25-30 per diag run, `cpu: 6973P`) have not
+  landed on one since.
+- ✅ **ntdll-churn-{hw,breakpoint} (x64, 2 of 5 runs, Xeon 8370C in the last)** -- the probes never became ACTIVE
+  inside the 300 ms window (report `active:false`, no `probe: active` line, nothing lost). On attach, breakpoint/hw
+  probes arm only once the agent's controller-death guard is up (agent init on a remote thread). With 4 target
+  threads spinning on a 2-vCPU runner a new normal-priority thread waits a whole quantum (Server: ~190 ms) at its
+  start and at every wake-up, so arming took 0.3-1.5 s, and the detach as long (its remote stop thread). Fix: the
+  controller's remote threads (agent load / init / stop) and the agent's service thread run at
+  THREAD_PRIORITY_HIGHEST (they never spin; the program loses nothing but those milliseconds). A/B on runners
+  (runfix1-diag 42192716058, one build, `UHH_DIAG_NOBOOST` knob, 7 jobs x 4 runs x 7 cycles after the first):
+  without the boost 11 zero-hit cycles of 196 (activations up to 0.41 s), with it 0 of 196; 42201061531 /
+  42203401040 (`churnx`: inline + hw + breakpoint on fresh targets as the check does, PROBE_TRACE timelines): 0 of
+  315. The check's other assumption -- only cycle 1 may set the agent up -- also failed: a detach between the
+  agent's load and its first init (which starts its service thread) left that init and a zero-hit window to cycle 2
+  (3 of ~58 runner check runs, always cycle 2 after a short cycle 1). Cycle 1 now gets 3 s; every later cycle keeps
+  300 ms and must see hits.
+- ✅ **logs-wedge-{kill,suspend,exit} `wedged=0`** (x86 and x64, several runs, e.g. 42190450176, 42194952645,
+  42203177441) -- the check's precondition never formed: logs_target sampled a running producer with
+  SuspendThread (200000 tries) for the few hundred instructions between claiming a ring slot and publishing it; on
+  the 2-vCPU runners it gave up (on a fast EPYC it needed 5 k-120 k tries). The accounting was right every time
+  (`hits == logs + interrupted`; `rc=1` in exit mode is the target's exit 7, not checked). Now deterministic: the
+  producer's record `UHH_TEST_WEDGE o N` stops in the agent right after its claim (`test_wedge_point`, enabled only
+  by `UHH_TEST_LOG_WEDGE=1`, which logs_target sets in itself; every other record pays one byte compare) and the
+  target confirms the claimed, unpublished slot in the ring before it kills / suspends / exits around it -- the
+  same condition, created instead of hunted. (The live-delivery half of logs-wedge-suspend, `undelivered_live`, is
+  pslog's.)
+- Seen once, undetermined: x64 `detach-inline` (`1 thread(s) frozen; all clean` yet FAIL, detail cut); x86
+  `hw-once-slots-breakpoint` (run 42194952645: `HwSite[once,all]=[1, 75]`, the run ended after 75 of 4000 calls).
+- v23 (runfix1) follow-ups found by the full suite (42194952645): `cxlib-cfgfree-inline` wanted `in_flight=1` for a callback the
+  program suspends across the detach AFTER it logged -- now accounted by its log (`in_flight=0`); the detach line
+  gained `running=` (callbacks still executing, not accounting) and the check wants `running=1 in_flight=0`.
+  `logs-controller-killed` reads the orphaned ring itself: first records left in it carry their hits, so the target
+  counts with `probe_agent_unlogged` (unaccounted minus carried records still in the ring).
 
 Environment (runner) effects, and how the checks were made robust without proving less (branch `citune`; full
 run 42203177441 at df3bddc, windows-2022 + cet-hw: 1830/1843 ok; every check below PASS on both arches; longest

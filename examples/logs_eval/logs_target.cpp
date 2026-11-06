@@ -3,8 +3,10 @@
 //
 //   --mode format        one thread, LogSiteA(0x100 + k, k) for every format case k
 //   --mode order         T threads, each: LogSiteA(0xA, 2i), LogSiteB(0xB, 2i+1)   (per-thread order)
-//   --mode wedge-kill    a lone producer is caught (suspended, via the shared ring) between
-//                        claiming a ring slot and publishing it, and TerminateThread'ed there;
+//   --mode wedge-kill    a lone producer is stopped between claiming a ring slot and publishing
+//                        it (deterministically: its record "UHH_TEST_WEDGE o N" hits the agent's
+//                        test stop, see agent.cpp test_wedge_point; the ring confirms the claimed,
+//                        unpublished slot), and TerminateThread'ed there;
 //                        then T threads log M records each (timed)
 //   --mode wedge-suspend the same, but the producer is left SUSPENDED (the app's own
 //                        SuspendThread) for the whole second phase, then resumed
@@ -36,7 +38,7 @@ static ring_acct acct(const probe_agent_shared *sh) {
     ring_acct a{};
     MemoryBarrier();
     for (uint32_t p = 0; p < PROBE_AGENT_MAX_PROBES; ++p) a.hits += probe_agent_hits(sh, p);
-    a.inflight = probe_agent_inflight(sh);
+    a.inflight = probe_agent_unlogged(sh);     // records left in the ring carry their hits (v23)
     a.head = (unsigned long long)sh->log_head; a.tail = (unsigned long long)sh->log_tail;
     a.dropped = (unsigned long long)(ULONG)sh->log_dropped;
     return a;
@@ -57,8 +59,9 @@ static DWORD WINAPI order_thread(void *) {
     for (unsigned i = 0; i < (unsigned)g_count; ++i) { LogSiteA(0xA, 2 * i); LogSiteB(0xB, 2 * i + 1); }
     return 0;
 }
+static const unsigned WEDGE_SEQ = 1000;     // the producer's call that stops in its claimed slot
 static DWORD WINAPI forever_thread(void *) {
-    for (unsigned i = 0; !g_stop; ++i) LogSiteA(0xA, i);
+    for (unsigned i = 0; !g_stop; ++i) LogSiteA(i == WEDGE_SEQ ? 0xE : 0xA, i);
     return 0;
 }
 static volatile LONG64 g_phase2_calls;
@@ -121,15 +124,19 @@ static int run_phase2() {
 static int wedge(bool kill, bool exit_after = false) {
     probe_agent_shared *sh = map_ring();
     if (!sh) { printf("{\"kind\":\"app\",\"error\":\"no shared ring\"}\n"); return 3; }
+    // The producer stops in its claimed slot at its WEDGE_SEQ-th call (the agent's test stop):
+    // wait for that, then check the ring shows a claimed, unpublished slot. With it stopped there
+    // the program's own SuspendThread (suspend mode) holds it exactly where sampling used to.
+    wchar_t at_name[64], go_name[64];
+    swprintf_s(at_name, L"Local\\uhh_test_wedge_%lu", GetCurrentProcessId());
+    swprintf_s(go_name, L"Local\\uhh_test_wedge_go_%lu", GetCurrentProcessId());
+    HANDLE at = CreateEventW(nullptr, FALSE, FALSE, at_name), go = CreateEventW(nullptr, TRUE, FALSE, go_name);
+    SetEnvironmentVariableA("UHH_TEST_LOG_WEDGE", "1");
     HANDLE w = CreateThread(nullptr, 0, forever_thread, nullptr, 0, nullptr);
     int wedged = 0, tries = 0;
-    for (; tries < 200000 && !wedged; ++tries) {
-        Sleep(0);
-        if (SuspendThread(w) == (DWORD)-1) break;
-        // A suspend is asynchronous: GetThreadContext waits until the thread really stopped.
-        CONTEXT cx{}; cx.ContextFlags = CONTEXT_CONTROL; GetThreadContext(w, &cx);
-        if (claimed_unpublished(sh)) { wedged = 1; break; }
-        ResumeThread(w);
+    if (at && go && WaitForSingleObject(at, 60000) == WAIT_OBJECT_0) {
+        for (; tries < 1000 && !wedged; ++tries) { wedged = claimed_unpublished(sh) ? 1 : 0; if (!wedged) Sleep(1); }
+        if (wedged && !kill && SuspendThread(w) == (DWORD)-1) wedged = 0;   // the program's own suspension
     }
     if (exit_after) {
         printf("{\"kind\":\"app\",\"mode\":\"wedge-exit\",\"wedged\":%d,\"tries\":%d,\"detach_logs\":%d}\n",
@@ -150,8 +157,12 @@ static int wedge(bool kill, bool exit_after = false) {
         if (!published_behind) break;
         Sleep(10);
     }
-    if (!kill) { InterlockedExchange(&g_stop, 1); if (wedged) ResumeThread(w); else ResumeThread(w); WaitForSingleObject(w, 10000); }
-    else if (!wedged) { InterlockedExchange(&g_stop, 1); ResumeThread(w); WaitForSingleObject(w, 10000); }
+    InterlockedExchange(&g_stop, 1);
+    if (go) SetEvent(go);                                     // the stopped producer may finish its record
+    if (!kill) { if (wedged) ResumeThread(w); WaitForSingleObject(w, 10000); }
+    else if (!wedged) WaitForSingleObject(w, 10000);
+    if (at) CloseHandle(at);
+    if (go) CloseHandle(go);
     CloseHandle(w);
     printf("{\"kind\":\"app\",\"mode\":\"%s\",\"wedged\":%d,\"tries\":%d,\"phase2_calls\":%lld,\"phase2_want\":%d,"
            "\"phase2_ms\":%d,\"undelivered_after_phase2\":%lld}\n",

@@ -271,7 +271,7 @@ Ends the session and frees it; `s` is invalid afterwards.
   (`probe: close: still waiting for probe_run to stop (Ns)` every 15 s), then tears down.
 - A launched target that is still running is terminated (exit code 3).
 - An attached target that is still running is detached. stderr then shows
-  `probe: detached: hits=.. logs_written=.. log_dropped=.. in_flight=..`
+  `probe: detached: hits=.. logs_written=.. log_dropped=.. in_flight=.. running=..`
   (hits = logs_written + log_dropped + in_flight).
 - Detach waits for inline callbacks that are still running and can finish (see
   [limitations.md](limitations.md#detach-and-close)).
@@ -566,7 +566,7 @@ target thread that hit it.
 | `probes`, `active`, `hits` | totals over the user's probes |
 | `overrides` | register changes made by callbacks (`set_reg` with a new value) |
 | `log_dropped` | records lost; non-zero only when the controller stopped consuming (e.g. it died, or its log file failed) |
-| `callbacks_interrupted` | inline callbacks cut off mid-run because the target process died; their hits are counted, their logs never existed |
+| `callbacks_interrupted` | inline callbacks cut off by the target process dying before their first log; their hits are counted, their logs never existed (one killed after its first log counts as that log) |
 | `logs_written` | records written to the session file |
 | `controller_peak_ws_mb` | the controller's peak working set |
 | `app_exit` | the target's exit code (1 if it did not exit, e.g. after a detach) |

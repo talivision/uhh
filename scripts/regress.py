@@ -2290,7 +2290,16 @@ def check_ntdll_churn(cycles=8, round_reads=1000000):
     hits, 1.2-2.6 s). The uninstrumented run takes ~6.8 s, so a fixed count fits too few
     inline cycles. Inherent to logging every call, not a wait: the check now sets the run
     length instead of the machine. Log lines are counted as they stream (never held); with that,
-    inline cycles took 1.0-2.9 s on x64 and 1.2-8.0 s on x86."""
+    inline cycles took 1.0-2.9 s on x64 and 1.2-8.0 s on x86.
+
+    Cycle 1 runs 3 s (the others 300 ms). On attach, breakpoint/hw probes arm only once the agent's
+    controller-death guard is up, and the first cycle loads the agent and runs its first init (which
+    starts its service thread). On a 2-vCPU CI runner with 4 spinning threads that took longer than
+    300 ms; a detach between the load and the init left the first init -- and a zero-hit window --
+    to cycle 2 (runfix1: 3 of ~58 runner runs, always cycle 2 right after a short cycle 1). The
+    remote agent threads now run above normal priority (0 zero-hit cycles in 511 runner cycles
+    after the first), and cycle 1 gets the time to finish the setup, so every later cycle tests
+    install/remove churn with the agent ready."""
     t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
     if not t or not a:
         return missing_bin("ntdll-churn", "uhh_trace/probe_app")
@@ -2315,8 +2324,11 @@ def check_ntdll_churn(cycles=8, round_reads=1000000):
                     bad.append(f"target ended before cycle {c}")
                     break
                 t0 = time.time()
-                tr = subprocess.Popen([str(t), "--backend", bk, "--attach", str(target.pid), "--detach-after-ms", "300",
-                                       "-p", "ntdll.dll!NtReadVirtualMemory:xxxx"],
+                # Cycle 1 sets the agent up in the target (load, first init, its service thread):
+                # it gets 3 s, so every later cycle starts with the agent ready and must see hits
+                # within 300 ms (see the docstring).
+                tr = subprocess.Popen([str(t), "--backend", bk, "--attach", str(target.pid), "--detach-after-ms",
+                                       "3000" if c == 1 else "300", "-p", "ntdll.dll!NtReadVirtualMemory:xxxx"],
                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 terr = Lines(tr.stderr)
                 logs, objs = 0, []
@@ -2999,7 +3011,14 @@ def check_ret_probe(threads=2, reads=50):
     flag): ntdll!NtOpenProcess's ret, found by decoding the stub in the DLL file. probe_app
     opens each helper once. breakpoint and hw must fire once per open. inline must be REFUSED cleanly (the 5-byte jump would run past the ret
     into code only a jump reaches -- the int 2e tail on x64, the next stub on x86) or,
-    with --fallback-hw, move to hw. The target must be unaffected either way."""
+    with --fallback-hw, move to hw. The target must be unaffected either way.
+    Ground truth is per hit, from its stack (--stack): the target's opens are the hits with a
+    probe_app frame, and must be exactly its `opened` count; every hit is logged. Other hits are
+    allowed only from system code alone: the first launch of probe_app on a fresh machine
+    (every CI runner) runs the shim engine at process init (ntdll!LdrInitShimEngineDynamic ->
+    apphelp!SE_InitializeEngine -> KernelBase!OpenProcess) -- a real 5th NtOpenProcess of the
+    target, seen as hits=5 on the first breakpoint run only (runner diag: 7 of 7 jobs, never
+    on a later run)."""
     t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
     if not t or not a:
         return missing_bin("ret-probe", "uhh_trace/probe_app")
@@ -3010,19 +3029,26 @@ def check_ret_probe(threads=2, reads=50):
     for bk, extra in (("breakpoint", []), ("hw", []), ("inline", []), ("inline", ["--fallback-hw"])):
         name = f"ret-probe-{bk}{'-fallback' if extra else ''}"
         try:
-            r, objs = run([t, "--backend", bk, *extra, "-p", f"{site}:x", "--", a, "--no-wait", "--helpers", helpers,
-                           "--threads", threads, "--reads", reads, "--config", "reads_enabled=1"], timeout=300)
+            r, objs = run([t, "--backend", bk, *extra, "--stack", "-p", f"{site}:x", "--", a, "--no-wait", "--helpers",
+                           helpers, "--threads", threads, "--reads", reads, "--config", "reads_enabled=1"], timeout=300)
             res = next((x for x in objs if x.get("kind") == "app"), {})
             pr = next((x for x in objs if x.get("kind") == "probe"), {})
             rep = report(objs)
             app_ok = res.get("opened") == helpers and res.get("successful_reads") == threads * reads
+            stacks = [x.get("stack") or [] for x in objs if x.get("kind") == "probe_log"]
+            own = sum(1 for st in stacks if any(str(f).lower().startswith("probe_app") for f in st))
+            other = [" < ".join(str(f).split(" [")[0] for f in st[1:4]) for st in stacks
+                     if not any(str(f).lower().startswith("probe_app") for f in st)]
             if bk == "inline" and not extra:
                 ok = r.returncode != 0 and "would be written across" in (rep.get("error") or "") and "PROBE_ALLOW_UNSAFE_SITE" in (rep.get("error") or "") and not pr.get("hits")
             else:
                 want_bk = "hw" if extra else bk
-                ok = app_ok and pr.get("backend") == want_bk and pr.get("hits") == helpers
-            record(name, ok, f"site={site} backend={pr.get('backend')} hits={pr.get('hits')} opened={res.get('opened')} "
-                             f"reads={res.get('successful_reads')} rc={r.returncode} err={(rep.get('error') or '')[:120]}")
+                ok = (app_ok and pr.get("backend") == want_bk and own == helpers and pr.get("hits") == len(stacks)
+                      and all(stacks))
+            record(name, ok, f"site={site} backend={pr.get('backend')} hits={pr.get('hits')} target_opens={own} "
+                             f"system_opens={len(other)}{other[:2] if other else ''} logs={len(stacks)} "
+                             f"opened={res.get('opened')} reads={res.get('successful_reads')} rc={r.returncode} "
+                             f"err={(rep.get('error') or '')[:120]}")
         except Exception as e:
             record(name, False, repr(e))
 
@@ -3131,9 +3157,14 @@ def check_gated_mem(threads=8, reads=1000):
 def check_crash_logs(n=5000, threads=4):
     """Log delivery when the TARGET crashes: several threads log on every probed call; the
     first to reach n calls dies with an unhandled access violation while the others are
-    still logging. Every hit counted must have its log delivered (logs == hits, at least
-    n) -- for inline they sit in the shared ring at the moment of death -- and none may be
-    counted as dropped. Single-thread run too: exactly n."""
+    still logging. Every hit is accounted EXACTLY (the gospel): hits == logs + log_dropped +
+    callbacks_interrupted, with log_dropped == 0 and hits >= n. Inline: the process death
+    kills the other threads wherever they are -- one killed inside its callback before its
+    log was published is callbacks_interrupted (at most one per thread); one killed after
+    publishing is a delivered log and NOT interrupted (its record carried the hit's unit,
+    probe_agent_shared v23; v20 counted it twice -- 3 of 36 runner runs). breakpoint/hw run
+    callbacks in the controller: interrupted == 0, logs == hits. Single-thread run too:
+    exactly n logs, nothing interrupted (the thread crashes after its hit returned)."""
     d, t = exe("hitcost_driver.exe"), exe("hitcost_target.exe")
     if not d or not t:
         return missing_bin("crash-logs", "hitcost driver/target")
@@ -3148,9 +3179,13 @@ def check_crash_logs(n=5000, threads=4):
                 tids = {x.get("tid") for x in o if x.get("kind") == "probe_log"}
                 pr = next(iter(probes(o)), {})
                 hits = pr.get("hits") or 0
-                ok = (rep.get("app_exit") == 0xC0000005 and logs == hits and rep.get("log_dropped") == 0 and
-                      (hits == n if nt == 1 else hits >= n and len(tids) == nt))
-                record(name, ok, f"exit=0x{(rep.get('app_exit') or 0):x} hits={hits} logs={logs} (n={n}) "
+                intr = rep.get("callbacks_interrupted")
+                exact = intr is not None and hits == logs + (rep.get("log_dropped") or 0) + intr
+                ok = (rep.get("app_exit") == 0xC0000005 and exact and rep.get("log_dropped") == 0 and
+                      (hits == n and logs == n and intr == 0 if nt == 1 else
+                       hits >= n and len(tids) == nt and intr <= (nt - 1 if bk == "inline" else 0)))
+                record(name, ok, f"exit=0x{(rep.get('app_exit') or 0):x} hits={hits} logs={logs} "
+                                 f"interrupted={intr} (hits == logs + dropped + interrupted: {exact}; n={n}) "
                                  f"threads_logging={len(tids)}/{nt} dropped={rep.get('log_dropped')}")
             except Exception as e:
                 record(name, False, repr(e))
@@ -6435,8 +6470,11 @@ def check_logs_order(threads=4, count=2000):
 
 
 def check_logs_wedge(threads=4, count=3000):
-    """A producer stopped BETWEEN claiming a ring slot and publishing it (the target finds that
-    instant through the shared ring and freezes the thread there):
+    """A producer stopped BETWEEN claiming a ring slot and publishing it -- deterministically: its
+    record "UHH_TEST_WEDGE o N" stops in the agent's test stop right after the claim (enabled by
+    UHH_TEST_LOG_WEDGE=1, which logs_target sets in itself; agent.cpp test_wedge_point) and the
+    target confirms the claimed, unpublished slot in the shared ring. (It used to sample a running
+    producer with SuspendThread for that instant: wedged=0 on slow CI runners.) Then:
       kill:    TerminateThread there. Its slot can never be published.
       suspend: the program's own SuspendThread, held while the other threads log.
       exit:    ExitProcess kills it there, and the exiting thread then logs more records than
@@ -6455,7 +6493,10 @@ def check_logs_wedge(threads=4, count=3000):
                                  timeout=180)
             a, rep = app(o), report(o)
             hits = next(iter(probes(o)), {}).get("hits")
-            logs = sum(1 for x in o if x.get("kind") == "probe_log" and str(x.get("message", "")).startswith("o "))
+            # the producer's stopped record ("UHH_TEST_WEDGE o N", agent test stop) is delivered
+            # only in suspend mode (resumed): it counts as a log like any other
+            logs = sum(1 for x in o if x.get("kind") == "probe_log" and
+                       str(x.get("message", "")).startswith(("o ", "UHH_TEST_WEDGE o ")))
             interrupted = rep.get("callbacks_interrupted")
             if mode == "exit":
                 live_ok = rep.get("app_exit") == 7
@@ -6467,8 +6508,10 @@ def check_logs_wedge(threads=4, count=3000):
                           f"undelivered_live={a.get('undelivered_after_phase2')}")
             ok = (live_ok and a.get("wedged") == 1 and rep.get("log_dropped") == 0 and
                   interrupted == (0 if mode == "suspend" else 1) and hits is not None and hits == logs + interrupted)
-            record(name, ok, f"wedged={a.get('wedged')} {detail} hits={hits} logs={logs} interrupted={interrupted} "
-                             f"dropped={rep.get('log_dropped')} rc={r.returncode}")
+            # (exit: rc 1 is expected -- the target exits 7 -- and not checked; wedged=1 is the
+            # precondition: the producer was caught between claiming and publishing its slot.)
+            record(name, ok, f"wedged={a.get('wedged')} tries={a.get('tries')} {detail} hits={hits} logs={logs} "
+                             f"interrupted={interrupted} dropped={rep.get('log_dropped')} rc={r.returncode}")
         except subprocess.TimeoutExpired:
             record(name, False, "session HUNG (180 s): logging stalled behind the unpublished slot")
         except Exception as e:
@@ -7649,8 +7692,9 @@ def check_cxlib():
                   and the drain's old 15 s allowance): its log after that is delivered, nothing
                   dropped, and its >256-byte config (a block in the target) is still readable;
       cfgfree-inline the program suspends a thread inside an inline callback across the whole
-                  detach and resumes it afterwards: the detach does not wait for it (accounted as
-                  in_flight=1), and the callback's config block is NOT freed under it;
+                  detach and resumes it afterwards: the detach does not wait for it (running=1;
+                  it logged before the suspension, so it is accounted by that log: in_flight=0,
+                  agent v23), and the callback's config block is NOT freed under it;
       killarm-*   the controller dies right after writing an INT3 / arming a hw probe (test-hook
                   build, co_driver_th): the agent's guard must undo it -- the target finishes;
       noxsave-inline the x86 inline fallback without OSXSAVE (forced: UHH_BENCH_XSTATE=noxsave)
@@ -7716,7 +7760,9 @@ def check_cxlib():
         if row.get("ret") != CX_LATE_SUM or row.get("body") != 0 or row.get("done") != 1:
             bad.append(f"target ret={row.get('ret')} want {CX_LATE_SUM} body={row.get('body')} done={row.get('done')} "
                        "(config freed under the callback?)")
-        if sm.get("in_flight") != 1 or sm.get("log_dropped") != 0: bad.append(f"summary={sm} (want in_flight=1 dropped=0)")
+        if (sm.get("in_flight") != 0 or sm.get("running") != 1 or sm.get("log_dropped") != 0 or
+                sm.get("hits") != sm.get("logs_written")):
+            bad.append(f"summary={sm} (want running=1 in_flight=0 dropped=0 hits=logs_written)")
         if took > 12: bad.append(f"detach waited {took:.1f}s for a callback the program holds suspended")
         if arc != 0 or trc != 0: bad.append(f"driver_rc={arc} target_rc={trc}")
         record(name, not bad, " ".join(bad) or f"detach_took={took:.1f}s summary={sm} ret={row.get('ret')}")

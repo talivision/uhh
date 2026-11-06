@@ -257,15 +257,15 @@ data) prints on all backends.
 
 ## Logs and accounting
 
-- **Hits = logs + `log_dropped` + `callbacks_interrupted`**, with two inherent edges (📄 Code
-  review of the 2026-11-05 merges; Log delivery findings): a thread killed after publishing
-  its log but before its callback returns is counted both as logged and as interrupted (at
-  most one per killed thread, never a lost hit); a producer that claims a slot in the few
-  instructions after the final drain at detach/close loses that record uncounted.
+- **Hits = logs + `log_dropped` + `callbacks_interrupted`** exactly for a callback that logs
+  once per hit, also when the process dies at any instant: a callback's first log carries its
+  hit, so a thread killed after publishing it is a delivered log, not interrupted (agent v23;
+  runfix1). One inherent edge (Log delivery findings): a producer that claims a slot in the
+  few instructions after the final drain at detach/close loses that record uncounted.
 - **Per-thread order** is kept across backends, except that a record behind two unfinished
   ring slots of other threads at the same instant can be overtaken (Log delivery findings).
-- **Inline callbacks killed by process exit** (ExitProcess/TerminateProcess) are reported as
-  `callbacks_interrupted`; their logs never existed (Hunter A3).
+- **Inline callbacks killed by process exit** (ExitProcess/TerminateProcess) before their
+  first log are reported as `callbacks_interrupted`; their logs never existed (Hunter A3).
 - **Session log files are not deleted.** They accumulate in `%TEMP%\uhh\logs`.
   *Workaround:* delete old `uhh-*.jsonl` files yourself.
 - **A console is a slow log sink.** *Workaround:* redirect stdout to a file or pipe, or to
@@ -278,7 +278,8 @@ data) prints on all backends.
   alive, not suspended, still inside its callback), with no time bound; stderr reports
   progress every 15 s. A callback that never returns (deadlocked) keeps the detach waiting.
   Not waited for: a callback whose thread is dead, suspended by the program, or left through
-  a non-unwinding `longjmp`; it stays counted (`in_flight=` in the detach line), and a log it
+  a non-unwinding `longjmp`; it stays counted (`running=` in the detach line, and `in_flight=`
+  if it had not logged yet), and a log it
   sends if the program resumes it later is dropped in the target.
   *Workaround:* keep inline callbacks short and lock-free.
 - **Config blocks can stay in a detached target** (📄 Codex library review (2)): an oversized
