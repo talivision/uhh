@@ -7674,9 +7674,10 @@ def check_cx2_review():
         in between: one hit, one log per call on every backend (breakpoint took it for a retry
         of the faulted execution: no callback, no hit), the handler never sees a trap flag.
       cx2-touchprog-hw (x86 controller): the PROGRAM holds a thread suspended; the controller
-        dies inside a context call on that thread before the implicit WOW64 suspension (test-hook
-        build). The guard must not release the program's suspension (it resumed every thread the
-        call had listed, once).
+        arms a hw probe at attach (a context call on every thread) and dies inside the call on
+        that thread, before the implicit WOW64 suspension and (second run) with it in place
+        (test-hook build). The guard must leave exactly the program's suspension (it resumed
+        every thread the call had listed, once: the program's suspension was released).
       cx2-manythreads-inline / cx2-manydead-inline: 4200 threads (all alive at once: distinct
         ids, more than the agent's 4096-entry thread table) make one inline hit each; then a
         callback on yet another thread outlives a detach -- while those threads still live, and
@@ -7717,42 +7718,53 @@ def check_cx2_review():
     if not pe_is_x86(t):
         skip(name, "x86 only (an x64 controller has no implicit suspend)")
     else:
-        procs = []
+        def touchprog(mode):
+            """co_target susp: the controller dies in its context call on the program-suspended
+            worker, before (mode "before") or inside (default: suspended) the implicit suspension."""
+            procs = []
+            try:
+                tgt = subprocess.Popen([str(t), "susp", "--wait"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, text=True)
+                procs.append(tgt)
+                tout = Lines(tgt.stdout)
+                sl = tout.wait_for(lambda l: '"kind":"susp"' in l, 30)
+                w = tout.wait_for(lambda l: '"kind":"waiting"' in l, 30)
+                if not sl or not w:
+                    raise RuntimeError("target never reached its gate")
+                env = dict(os.environ, UHH_TEST_DIE_IN_TOUCH=str(json.loads(sl)["tid"]))
+                if mode:
+                    env["UHH_TEST_DIE_IN_TOUCH_MODE"] = mode
+                att = subprocess.Popen([str(dth), "--backend", "hw", "--case", "susp", "--attach", str(json.loads(w)["pid"])],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env)
+                procs.append(att)
+                aerr = Lines(att.stderr)
+                att.wait(timeout=90)                       # dies arming the hw probe on every thread
+                aerr.t.join(timeout=30)
+                tgt.stdin.write("x"); tgt.stdin.flush()
+                tgt.wait(timeout=90)
+                row = next((x for x in tout.objs() if x.get("kind") == "co"), {})
+                rc = tgt.returncode & 0xFFFFFFFF
+                bad = []
+                if att.returncode != 98: bad.append(f"controller_rc={att.returncode} (98: died in the touch)")
+                died = next((l for l in aerr.lines if l.startswith("probe: test: dying")), "")
+                if "enabled=1" not in died: bad.append(f"not killed in a guarded touch: {died!r}")
+                if rc != 0: bad.append(f"target_rc=0x{rc:x}")
+                if row.get("first") != 0 or row.get("prev") != 1 or row.get("ran_while_suspended") != 0:
+                    bad.append(f"ResumeThread prev={row.get('prev')} (want 1: the program's own suspension) "
+                               f"ran_while_suspended={row.get('ran_while_suspended')} (want 0)")
+                if row.get("done") != 1 or row.get("sum") != sum(i * 3 + 5 for i in range(20)):
+                    bad.append(f"target row={row}")
+                return bad
+            finally:
+                for q in procs:
+                    if q.poll() is None:
+                        q.kill()
         try:
-            tgt = subprocess.Popen([str(t), "susp", "--wait"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                   stderr=subprocess.DEVNULL, text=True)
-            procs.append(tgt)
-            tout = Lines(tgt.stdout)
-            sl = tout.wait_for(lambda l: '"kind":"susp"' in l, 30)
-            w = tout.wait_for(lambda l: '"kind":"waiting"' in l, 30)
-            if not sl or not w:
-                raise RuntimeError("target never reached its gate")
-            env = dict(os.environ, UHH_TEST_DIE_IN_TOUCH=str(json.loads(sl)["tid"]), UHH_TEST_DIE_IN_TOUCH_MODE="before")
-            att = subprocess.Popen([str(dth), "--backend", "hw", "--case", "susp", "--attach", str(json.loads(w)["pid"])],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, env=env)
-            procs.append(att)
-            att.wait(timeout=90)
-            time.sleep(2.0)
-            tgt.stdin.write("x"); tgt.stdin.flush()
-            tgt.wait(timeout=60)
-            row = next((x for x in tout.objs() if x.get("kind") == "co"), {})
-            rc = tgt.returncode & 0xFFFFFFFF
-            bad = []
-            if att.returncode != 98: bad.append(f"controller_rc={att.returncode} (98: died in the touch)")
-            if rc != 0: bad.append(f"target_rc=0x{rc:x}")
-            if row.get("first") != 0 or row.get("prev") != 1 or row.get("ran_while_suspended") != 0:
-                bad.append(f"program's suspension released: ResumeThread prev={row.get('prev')} (want 1) "
-                           f"ran_while_suspended={row.get('ran_while_suspended')} (want 0)")
-            if row.get("done") != 1 or row.get("sum") != sum(i * 3 + 5 for i in range(20)):
-                bad.append(f"target row={row}")
-            record(name, not bad, " ".join(bad) or f"controller_rc=98 prev={row.get('prev')} "
-                                                   f"ran_while_suspended={row.get('ran_while_suspended')}")
+            bad = [f"[{m or 'suspended'}] {x}" for m in ("before", None) for x in touchprog(m)]
+            record(name, not bad, " ".join(bad) or "died before / inside the implicit suspension: the program's "
+                                                   "suspension kept (prev=1, worker never ran) both times")
         except Exception as e:
             record(name, False, repr(e))
-        finally:
-            for q in procs:
-                if q.poll() is None:
-                    q.kill()
 
     for case in ("many", "manydead"):
         name = f"cx2-{case}threads-inline" if case == "many" else "cx2-manydead-inline"

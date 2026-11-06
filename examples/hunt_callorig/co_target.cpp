@@ -178,8 +178,9 @@ static int run_many(const char *k, int n) {
     return 0;
 }
 
-// susp (cx2-touchprog-hw): a worker the PROGRAM holds suspended across an attach whose controller
-// dies inside a context call on it (test-hook build). Afterwards the worker must still be
+// susp (cx2-touchprog-hw): a worker the PROGRAM holds suspended while the controller attaches,
+// arms a hw probe -- a context call on every thread -- and dies inside the call on the worker
+// (test-hook build). Once the agent's guard has cleaned up after it, the worker must still be
 // suspended exactly once by the program: it did not run, and the program's ResumeThread
 // reports a previous count of 1.
 static volatile LONG g_spun = 0, g_spin_stop = 0;
@@ -194,6 +195,9 @@ static int run_susp(bool gate) {
     const DWORD first = SuspendThread(w);
     printf("{\"kind\":\"susp\",\"tid\":%lu}\n", GetThreadId(w)); fflush(stdout);
     if (gate && !wait_gate()) return 3;
+    BOOL dbg = TRUE;                                     // the controller is gone: wait for the debug port to go,
+    for (int i = 0; i < 3000 && CheckRemoteDebuggerPresent(GetCurrentProcess(), &dbg) && dbg; ++i) Sleep(10);
+    Sleep(1500);                                         // then for the guard's cleanup (it polls for that)
     const LONG c1 = g_spun;
     Sleep(300);
     const LONG c2 = g_spun;
@@ -205,7 +209,8 @@ static int run_susp(bool gate) {
     intptr_t sum = 0;
     for (int i = 0; i < 20; ++i) sum += co_add(i, 5);
     printf("{\"kind\":\"co\",\"case\":\"susp\",\"first\":%lu,\"prev\":%lu,\"ran_while_suspended\":%ld,"
-           "\"done\":%d,\"sum\":%lld}\n", first, prev, (long)(c2 - c1), done == WAIT_OBJECT_0, (long long)sum);
+           "\"done\":%d,\"sum\":%lld}\n", first, prev, (long)(c2 - c1), done == WAIT_OBJECT_0,
+           (long long)sum);
     fflush(stdout);
     return 0;
 }
