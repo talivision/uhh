@@ -224,9 +224,12 @@ static DWORD WINAPI dll_user(void *p) {
 /* ---- owndr: the target arms DR0 on one of its own functions and handles it in its VEH ---- */
 __declspec(dllexport) __declspec(noinline) int own_dr_site(int x) { return x * 3 + 1; }
 static volatile int g_own_sink;
-static HANDLE g_owndr_go;
+static HANDLE g_owndr_go, g_owndr_ready;
 static DWORD WINAPI owndr_worker(void *p) {
     (void)p;
+    /* live: running its own code (past its loader initialisation, whose closing NtContinue
+       would restore the context it was created with -- the DR0 set meanwhile with it) */
+    if (g_owndr_ready) SetEvent(g_owndr_ready);
     if (g_owndr_go) WaitForSingleObject(g_owndr_go, INFINITE);
     for (DWORD i = 0; i < g_n; ++i) { g_own_sink += own_dr_site((int)i); hunt_read(); }
     return 0;
@@ -341,11 +344,14 @@ int main(int argc, char **argv) {
         return 5;
     } else if (!strcmp(sc, "owndr") || !strcmp(sc, "owndr-live")) {
         const int live = !strcmp(sc, "owndr-live");
-        if (live) g_owndr_go = CreateEventA(NULL, TRUE, FALSE, NULL);
+        if (live) { g_owndr_go = CreateEventA(NULL, TRUE, FALSE, NULL); g_owndr_ready = CreateEventA(NULL, TRUE, FALSE, NULL); }
         HANDLE t = CreateThread(NULL, 0, owndr_worker, NULL, live ? 0 : CREATE_SUSPENDED, NULL);
         CONTEXT c; memset(&c, 0, sizeof(c)); c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
         g_owndr_addr = (ULONG_PTR)own_dr_site;
-        if (live && t) { Sleep(50); if (SuspendThread(t) == (DWORD)-1) InterlockedIncrement(&g_bad); }   /* it waits on the event */
+        if (live && t) {                                  /* it runs, then waits on the event */
+            WaitForSingleObject(g_owndr_ready, INFINITE); Sleep(20);
+            if (SuspendThread(t) == (DWORD)-1) InterlockedIncrement(&g_bad);
+        }
         if (!t || !GetThreadContext(t, &c)) { InterlockedIncrement(&g_bad); }
         else {
             c.Dr0 = g_owndr_addr; c.Dr7 = (c.Dr7 & ~(ULONG_PTR)0xF0003) | 1;   /* L0, execute, len 1 */
