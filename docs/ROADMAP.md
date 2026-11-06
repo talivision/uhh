@@ -1455,21 +1455,37 @@ Real-bug candidates (reproduce on runners, not on the VM so far):
   `probe_api_agent.dll+0x13339`, and every later case of the same run had no target row. The same shard passed on a
   Xeon 8573C in the next run. Candidate: TR9's stack-overflow recovery depends on the host (exception-dispatch stack
   needs grow with the XSAVE area: AVX-512 / AMX hosts); the CPU column now recorded per shard will tell.
-- 🔧 **ntdll-churn-{hw,breakpoint} (x64, 2 of 5 runs, Xeon 8370C in the last)** -- cause found and fixed; a rarer
-  residue open. The zero-hit cycles were probes that never became ACTIVE inside the 300 ms window: the report says
-  `active:false`, no `probe: active` line, nothing lost. On attach, breakpoint/hw probes arm only once the agent's
-  controller-death guard is up (agent init on a remote thread). With 4 target threads spinning on a 2-vCPU runner a
-  new normal-priority thread waits a whole quantum (Server: ~190 ms) at its start and at every wake-up, so arming took
-  0.3-1.5 s and so did the detach (its remote stop thread). Fix: the controller's remote threads (agent load / init /
-  stop) and the agent's service thread run at THREAD_PRIORITY_HIGHEST (they never spin; the program loses nothing
-  but those milliseconds). A/B on runners (runfix1-diag 42192716058, same build, `UHH_DIAG_NOBOOST` knob, 7 jobs x
-  4 runs x 7 cycles): without the boost 11 zero-hit cycles of 196 and activations up to 0.41 s; with it 0 of 196.
-  42201061531 (`churnx`: inline+hw+breakpoint on fresh targets as the check does, PROBE_TRACE): 0 of 252. Open:
-  the full check still showed `cycle2` (right after the agent-loading cycle 1) at 0 hits for breakpoint in 3 of ~58
-  runner runs (42194976034, 42196642047); activations cluster at ~0.2 s after the attach line, so the 300 ms window
-  has ~100 ms margin -- see the timelines in the next diag.
-- Seen once each, undetermined: x86 `logs-wedge-suspend` (`wedged=0`), x64 `detach-inline` (`1 thread(s) frozen;
-  all clean` yet FAIL, detail cut).
+- ✅ **ntdll-churn-{hw,breakpoint} (x64, 2 of 5 runs, Xeon 8370C in the last)** -- the probes never became ACTIVE
+  inside the 300 ms window (report `active:false`, no `probe: active` line, nothing lost). On attach, breakpoint/hw
+  probes arm only once the agent's controller-death guard is up (agent init on a remote thread). With 4 target
+  threads spinning on a 2-vCPU runner a new normal-priority thread waits a whole quantum (Server: ~190 ms) at its
+  start and at every wake-up, so arming took 0.3-1.5 s, and the detach as long (its remote stop thread). Fix: the
+  controller's remote threads (agent load / init / stop) and the agent's service thread run at
+  THREAD_PRIORITY_HIGHEST (they never spin; the program loses nothing but those milliseconds). A/B on runners
+  (runfix1-diag 42192716058, one build, `UHH_DIAG_NOBOOST` knob, 7 jobs x 4 runs x 7 cycles after the first):
+  without the boost 11 zero-hit cycles of 196 (activations up to 0.41 s), with it 0 of 196; 42201061531 /
+  42203401040 (`churnx`: inline + hw + breakpoint on fresh targets as the check does, PROBE_TRACE timelines): 0 of
+  315. The check's other assumption -- only cycle 1 may set the agent up -- also failed: a detach between the
+  agent's load and its first init (which starts its service thread) left that init and a zero-hit window to cycle 2
+  (3 of ~58 runner check runs, always cycle 2 after a short cycle 1). Cycle 1 now gets 3 s; every later cycle keeps
+  300 ms and must see hits.
+- ✅ **logs-wedge-{kill,suspend,exit} `wedged=0`** (x86 and x64, several runs, e.g. 42190450176, 42194952645,
+  42203177441) -- the check's precondition never formed: logs_target sampled a running producer with
+  SuspendThread (200000 tries) for the few hundred instructions between claiming a ring slot and publishing it; on
+  the 2-vCPU runners it gave up (on a fast EPYC it needed 5 k-120 k tries). The accounting was right every time
+  (`hits == logs + interrupted`; `rc=1` in exit mode is the target's exit 7, not checked). Now deterministic: the
+  producer's record `UHH_TEST_WEDGE o N` stops in the agent right after its claim (`test_wedge_point`, enabled only
+  by `UHH_TEST_LOG_WEDGE=1`, which logs_target sets in itself; every other record pays one byte compare) and the
+  target confirms the claimed, unpublished slot in the ring before it kills / suspends / exits around it -- the
+  same condition, created instead of hunted. (The live-delivery half of logs-wedge-suspend, `undelivered_live`, is
+  pslog's.)
+- Seen once, undetermined: x64 `detach-inline` (`1 thread(s) frozen; all clean` yet FAIL, detail cut); x86
+  `hw-once-slots-breakpoint` (run 42194952645: `HwSite[once,all]=[1, 75]`, the run ended after 75 of 4000 calls).
+- v21 follow-ups found by the full suite (42194952645): `cxlib-cfgfree-inline` wanted `in_flight=1` for a callback the
+  program suspends across the detach AFTER it logged -- now accounted by its log (`in_flight=0`); the detach line
+  gained `running=` (callbacks still executing, not accounting) and the check wants `running=1 in_flight=0`.
+  `logs-controller-killed` reads the orphaned ring itself: first records left in it carry their hits, so the target
+  counts with `probe_agent_unlogged` (unaccounted minus carried records still in the ring).
 
 Environment (runner) effects, not UHH bugs:
 - **patch-race-frozen (x64 + x86, deterministic)**: hook_cycles=[1,1,1,1], need >= 4 in the target's 12 s. Measured
