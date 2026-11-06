@@ -112,7 +112,7 @@ jobs:
   # windows-2022 guests expose no CET. So every push also runs the CET checks on real CET hardware.
   cet-hw:
     needs: plan
-    if: needs.plan.outputs.cet == 'true'
+    if: ${{ needs.plan.outputs.cet == 'true' && !contains(github.event.head_commit.message, '[diag-only]') }}   # TEMP diag-only toggle (citune)
     runs-on: windows-2025
     timeout-minutes: 45
     env:
@@ -164,6 +164,7 @@ jobs:
 
   test:
     needs: [plan, build]
+    if: ${{ !contains(github.event.head_commit.message, '[diag-only]') }}   # TEMP diag-only toggle (citune)
     runs-on: ${{ needs.plan.outputs.image }}
     timeout-minutes: 100
     strategy:
@@ -249,7 +250,7 @@ jobs:
 
   summary:
     needs: [plan, build, test, cet-hw]
-    if: always() && needs.plan.result == 'success'
+    if: ${{ always() && needs.plan.result == 'success' && !contains(github.event.head_commit.message, '[diag-only]') }}   # TEMP diag-only toggle (citune)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -279,7 +280,7 @@ jobs:
         burn: [0, 2, 4]
     name: diag latency ${{ matrix.arch }} burn${{ matrix.burn }}
     env:
-      CI_NOTICE_RE: 'stream-latency'
+      CI_NOTICE_RE: 'stream-latency|patch-race'
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -294,6 +295,7 @@ jobs:
         run: |
           $b = @(); for ($i = 0; $i -lt ${{ matrix.burn }}; $i++) { $b += Start-Process -PassThru -WindowStyle Hidden python -ArgumentList '-c', 'while True: pass' }
           $u = (1..8 | % { 'check_stream_latency' }) -join ','
+          if (${{ matrix.burn }} -eq 0) { $u += ',check_patch_race' }
           python -u scripts/ci_shards.py run --arch ${{ matrix.arch }} --units $u --bin build-${{ matrix.arch }}/Release --out ci-logs --name lat-${{ matrix.arch }}-b${{ matrix.burn }}
           $rc = $LASTEXITCODE
           $b | % { Stop-Process -Id $_.Id -Force -EA SilentlyContinue }
@@ -307,6 +309,7 @@ jobs:
 
   diag-2025:
     needs: plan
+    if: ${{ !contains(github.event.head_commit.message, '[diag-only]') }}
     runs-on: windows-2025
     timeout-minutes: 60
     strategy:

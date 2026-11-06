@@ -735,6 +735,70 @@ class _NoiseSampler:
         return worst
 
 
+def _trace_logstream_staged(backend, consume, file_seen, timeout=120):
+    """trace_logstream, plus the session log file watched as it grows: file_seen[i] = QPC when
+    LogSite(i)'s record was in the FILE (UHH writes each batch to the file, then to stdout), so a
+    late record shows which stage held it: before the file (queue / writer) or after (stdout)."""
+    tracer, target = exe("uhh_trace.exe"), exe("logstream_target.exe")
+    proc = subprocess.Popen([str(tracer), "--backend", backend, "-p", "logstream_target.exe!LogSite:d", "--",
+                             str(target)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    path, have_path, done, timed_out = [], threading.Event(), threading.Event(), threading.Event()
+
+    def drain_stderr():
+        for line in proc.stderr:
+            if line.startswith("probe: logs -> ") and not path:
+                path.append(line[len("probe: logs -> "):].strip()); have_path.set()
+
+    def watch():
+        if not have_path.wait(60):
+            return
+        try:
+            f = open(path[0], "rb")
+        except OSError:
+            return
+        with f:
+            buf = b""
+            while True:
+                last = done.is_set()
+                chunk = f.read()
+                if chunk:
+                    now = _qpc_now()
+                    buf += chunk
+                    *lines, buf = buf.split(b"\n")
+                    for l in lines:
+                        m = re.search(rb'"message":"LogSite\((-?\d+)\)"', l)
+                        if m:
+                            file_seen.setdefault(int(m.group(1)), now)
+                elif last:
+                    return
+                else:
+                    time.sleep(0.001)
+
+    threads = [threading.Thread(target=drain_stderr, daemon=True), threading.Thread(target=watch, daemon=True)]
+    for t in threads:
+        t.start()
+    timer = threading.Timer(timeout, lambda: (timed_out.set(), proc.kill()))
+    timer.daemon = True
+    timer.start()
+    try:
+        for line in proc.stdout:
+            consume(line.rstrip("\r\n"), None)
+        proc.wait()
+    finally:
+        timer.cancel()
+        if proc.poll() is None:
+            proc.kill(); proc.wait()
+        done.set()
+        for t in threads:
+            t.join(timeout=30)
+        if path:
+            try:
+                Path(path[0]).unlink()
+            except OSError:
+                pass
+    return proc.returncode, timed_out.is_set()
+
+
 def check_stream_latency():
     """Live log latency: a record reaches the controller's stdout reader promptly after the
     event that made it. logstream_target calls LogSite(i) every 100 ms (50 calls) and stamps,
@@ -742,23 +806,26 @@ def check_stream_latency():
     own stdout lines (field "w"); the reader stamps arrivals with the same counter. Per
     backend: all 50 records arrive, each once and in call order, never before its event
     (clock sanity), nothing dropped, and the latency event -> arrival meets the bar:
-      - quiet machine (the concurrent noise sampler, an uninstrumented writer, saw < 20 ms of
+      - quiet machine (the concurrent noise sampler, an uninstrumented writer, saw < 50 ms of
         stall in the whole run): p99 < 100 ms, absolute (the original bar);
       - noisy machine (a shared VM, a 2-core cloud runner): p99 of (latency - the stall the
         sampler saw in that same record's window) < 100 ms -- the machine's own stalls are not
         UHH's, but any latency UHH adds on top of them still fails.
     The target's own lines are forwarded by UHH separately from the records (a pipe and a
     forwarder thread), so a record can reach stdout before the tick line written just before
-    its event: reported (log_before_tick), not required (no such cross-stream promise)."""
+    its event: reported (log_before_tick), not required (no such cross-stream promise).
+    Diagnosis of a late record: the session log file is watched too (UHH writes each batch to
+    it, then to stdout): in_file / p99_to_file = event -> in the file, p99_file_to_out = file
+    -> stdout."""
     tracer, target = exe("uhh_trace.exe"), exe("logstream_target.exe")
     if not tracer or not target:
         return missing_bin("stream-latency", "uhh_trace/logstream_target")
     freq = _qpc_freq()
     ms = lambda ticks: ticks * 1000.0 / freq
-    quiet_ms, bar_ms, n = 20.0, 100.0, 50
+    quiet_ms, bar_ms, n = 50.0, 100.0, 50      # quiet: < ~3 timer quanta (15.6 ms) of stall
     for backend in ("inline", "hw", "breakpoint"):
         name = f"stream-latency-{backend}"
-        ticks, logs, log_seq, objects = {}, {}, [], []
+        ticks, logs, log_seq, objects, in_file = {}, {}, [], [], {}
         sampler = None
         try:
             def consume(line, _arrival):
@@ -782,7 +849,7 @@ def check_stream_latency():
 
             sampler = _NoiseSampler(target)
             time.sleep(0.2)
-            rc, timed_out = trace_logstream(backend, [], 120, consume)
+            rc, timed_out = _trace_logstream_staged(backend, consume, in_file)
             sampler.stop()
             # event i's stamp travels in tick i+1 ("t"); a tick's own write stamp is "w"
             events = {i: ticks[i + 1][2] for i in range(n) if i + 1 in ticks and (ticks[i + 1][2] or 0) > 0}
@@ -809,7 +876,9 @@ def check_stream_latency():
                    f"pairs={len(lat)}/{n} ticks={len(ticks)}/{n + 1} in_order={in_order} causal={causal} "
                    f"{'quiet' if quiet else 'noisy'}: bar={'p99' if quiet else 'p99(latency-noise)'}<{bar_ms:.0f}ms "
                    f"p50={ms(p50):.1f}ms p99={ms(p99):.1f}ms p99_excess={ms(p99_excess):.1f}ms "
-                   f"worst(ms,noise)={[(i, round(ms(lat[i]), 1), round(ms(noise[i]), 1)) for i in worst]} "
+                   f"worst(#,ms,noise,in_file)={[(i, round(ms(lat[i]), 1), round(ms(noise[i]), 1), round(ms(in_file[i] - events[i]), 1) if i in in_file else None) for i in worst]} "
+                   f"p99_to_file={ms(pct([in_file[i] - events[i] for i in lat if i in in_file], .99)):.1f}ms "
+                   f"p99_file_to_out={ms(pct([logs[i] - in_file[i] for i in lat if i in in_file], .99)):.1f}ms "
                    f"noise_run_max={ms(run_noise):.1f}ms sampler={len(sampler.samples)}@{ms(sampler.period):.1f}ms "
                    f"fwd_p99={ms(pct(fwd, .99)):.1f}ms log_before_tick={before_tick} "
                    f"written={rep.get('logs_written')} dropped={rep.get('log_dropped')} rc={rc}"
@@ -2262,7 +2331,9 @@ def check_patch_race(trials=4):
     machine: the target runs until its stdin is closed (--until-stdin). A cycle against 8
     spinning threads takes ~1 s on the 4-core VM but 6-8.5 s on a 2-core CI runner; a fixed
     12 s window fitted only one there. A trial that cannot finish MIN_CYCLES within
-    TRIAL_BUDGET seconds fails (a hang or a pathological slowdown, not a pass)."""
+    TRIAL_BUDGET seconds fails (a hang or a pathological slowdown, not a pass). Every cycle
+    after the first (which loads the agent) must have hit the hook: hits counted up to its
+    removal (the detach summary), not only in the report taken 400 ms after the attach."""
     MIN_CYCLES, MIN_SECONDS, TRIAL_BUDGET = 4, 12, 300
     t, a = exe("uhh_trace.exe"), exe("patchrace_target.exe")
     if not t or not a:
@@ -2291,8 +2362,13 @@ def check_patch_race(trials=4):
                     if target.poll() is not None:
                         break
                     cycles += 1
-                    if pr.get("backend") != "inline" or (not pr.get("hits") and cycles > 1):   # first cycle loads the agent
-                        notes.append(f"backend={pr.get('backend')} hits={pr.get('hits')} "
+                    # This cycle's hook really ran: hits by the time it was removed (the detach
+                    # summary). The report, taken 400 ms after the attach, can still say 0 on a
+                    # 2-core runner where the install against 8 spinning threads takes longer.
+                    m = re.search(r"probe: detached: hits=(\d+)", tr.stderr or "")
+                    hits = max(pr.get("hits") or 0, int(m.group(1)) if m else 0)
+                    if pr.get("backend") != "inline" or (not hits and cycles > 1):   # first cycle loads the agent
+                        notes.append(f"backend={pr.get('backend')} hits={hits} at_report={pr.get('hits')} "
                                      f"err={(report(objs).get('error') or '')[:80]}")
                 secs.append(round(time.monotonic() - t0))
                 try:
