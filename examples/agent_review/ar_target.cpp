@@ -17,6 +17,21 @@
 //   cfkill      a thread killed (TerminateThread) while its callback is inside call_func, then
 //               short threads until one gets the dead thread's id; each hits the probe
 //   cfmany      100 threads inside call_func at once, the callee hitting another probe
+//   cflock      a call_func callee needing a lock another thread holds at its own probe hit
+//   absret      a call whose return site is followed within 5 bytes by a loop head (machine
+//               code placed in .text, no unwind data), probed BY ADDRESS from a callback
+//   cfmanyq     cfmany without the barrier (the callee does not wait for the others)
+//   cfwatch     a data-watch hit (whose callback call_funcs) while another thread's callback
+//               is inside call_func
+//   cfwatchlock cfwatch, the call_func'ing callback holding a lock the watch callback takes
+//   drresume    a hw probe armed (from a callback) AT the instruction a thread inside a user APC
+//               resumes at (after NtDelayExecution's syscall): the very first instruction after
+//               the context restore must hit it
+//   coborrow    breakpoint/hw call_original on a hw probe that has to lend its own DR (all 4
+//               used), the original raising and continuing an exception (NtContinue)
+//   drrestore   a hw probe armed (from a callback) while one thread is inside an exception
+//               filter and another inside a user APC: both resume through NtContinue with a
+//               context captured BEFORE the arm, then call the probed function
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <setjmp.h>
@@ -126,7 +141,8 @@ static intptr_t jump_call(intptr_t x, int *jumped) {
 }
 
 // ---- cfkill / cfmany: inline call_func's recursion guard (regress `callfunc-*`) ----------
-AR_EXPORT intptr_t ar_cf_site(intptr_t x) { return x + (intptr_t)g_zero; }    // probed: ar_on_cf
+static volatile intptr_t g_cf_seen;                     // (distinct body: no linker folding)
+AR_EXPORT intptr_t ar_cf_site(intptr_t x) { g_cf_seen = x; return x; }        // probed: ar_on_cf
 static HANDLE g_cf_in;                                  // set once the victim is inside call_func
 AR_EXPORT intptr_t ar_cf_block() { SetEvent(g_cf_in); Sleep(INFINITE); return 0; }
 AR_EXPORT intptr_t ar_cf_inner(intptr_t x) { return x * 3 + (intptr_t)g_zero; } // probed: ar_on_cf_inner
@@ -138,6 +154,121 @@ AR_EXPORT intptr_t ar_cf_gate(intptr_t x) {
     for (int i = 0; i < 10000 && g_cf_arrived.load() < g_cf_need; ++i) Sleep(1);
     if (g_cf_arrived.load() >= g_cf_need) g_cf_together++;
     return ar_cf_inner(x);
+}
+// cflock: a callee that needs a lock another thread holds AT ITS OWN probe hit. It only
+// completes if that thread's callback runs (and returns) while this call is in flight.
+static CRITICAL_SECTION g_cf_cs;
+static HANDLE g_cf_waiting;
+AR_EXPORT intptr_t ar_cf_needlock() {
+    SetEvent(g_cf_waiting);
+    EnterCriticalSection(&g_cf_cs); LeaveCriticalSection(&g_cf_cs);
+    return 7 + (intptr_t)g_zero;
+}
+static DWORD WINAPI cf_waiter(void *) { return (DWORD)ar_cf_site(4); }
+// ---- cfwatch (regress `callfunc-watch-*`) ------------------------------------------------
+static volatile LONG g_cfw_var;
+static volatile intptr_t g_cfw_seen;
+static HANDLE g_cfw_in;
+AR_EXPORT intptr_t ar_cfw_setup(intptr_t addr) { g_cfw_seen = addr; return addr; }   // probed: watches addr
+AR_EXPORT intptr_t ar_cfw_slow() { SetEvent(g_cfw_in); Sleep(500); return 11; }    // call_func'd
+static intptr_t g_cfw_x = 5;                             // 6: cfwatchlock (the callback holds a lock)
+static DWORD WINAPI cfw_caller(void *) { return (DWORD)ar_cf_site(g_cfw_x); }
+
+// ---- drresume (regress `hw-dr-restore-first`) -------------------------------------------
+static volatile intptr_t g_dr2_seen;
+AR_EXPORT intptr_t ar_dr2_arm(intptr_t at) { g_dr2_seen = at; return at; }       // probed: arms a hw probe AT `at`
+static DWORD g_dr2_tid;
+static DWORD WINAPI dr2_apc_thread(void *) {
+    g_dr2_tid = GetCurrentThreadId();
+    SleepEx(15000, TRUE);                                // the APC ends with NtContinue back into the wait's return
+    return 0;
+}
+// Where a thread interrupted in NtDelayExecution resumes: right after its kernel transition
+// (x64: after `syscall`; x86 WOW64: after `call edx`).
+static uintptr_t delay_resume_site() {
+    const auto *p = (const unsigned char *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtDelayExecution");
+    for (int i = 0; p && i < 32; ++i) {
+#if defined(_WIN64)
+        if (p[i] == 0x0F && p[i + 1] == 0x05) return (uintptr_t)(p + i + 2);
+#else
+        if (p[i] == 0xFF && p[i + 1] == 0xD2) return (uintptr_t)(p + i + 2);
+#endif
+    }
+    return 0;
+}
+
+// ---- coborrow (regress `hw-co-borrow-restore`) ------------------------------------------
+static volatile intptr_t g_cob_seen;
+static LONG cob_filter() { return EXCEPTION_CONTINUE_EXECUTION; }
+AR_EXPORT intptr_t ar_cob_other(intptr_t x) { g_cob_seen = x; return x; }          // a third hw probe
+AR_EXPORT intptr_t ar_cob_orig(intptr_t x) {                                       // call_original'd
+    __try { RaiseException(0xE0C0B001u, 0, 0, nullptr); } __except (cob_filter()) {}
+    return x * 2 + (intptr_t)g_zero;
+}
+
+// ---- absret (regress `inline-absolute-*`) -------------------------------------------------
+// ar_d5_code(n): calls its callee (at the end: returns n), then a loop starting 3 bytes after
+// that call's return site adds n more -> 2n. A 5-byte hook at the return site would cover
+// the loop head. Code bytes in .text, so it is image code with no .pdata / PDB function.
+#pragma section(".text")
+#if defined(_WIN64)
+extern "C" __declspec(dllexport) __declspec(allocate(".text")) const unsigned char ar_d5_code[] = {
+    0x53,                               //  0 push rbx
+    0x48, 0x83, 0xEC, 0x20,             //  1 sub rsp, 20h
+    0x48, 0x89, 0xCB,                   //  5 mov rbx, rcx
+    0xE8, 0x14, 0x00, 0x00, 0x00,       //  8 call callee (+33)
+    0x48, 0x89, 0xC2,                   // 13 mov rdx, rax       <- return site
+    0x48, 0xFF, 0xC2,                   // 16 inc rdx            <- loop head
+    0x48, 0xFF, 0xCB,                   // 19 dec rbx
+    0x75, 0xF8,                         // 22 jnz 16
+    0x48, 0x89, 0xD0,                   // 24 mov rax, rdx
+    0x48, 0x83, 0xC4, 0x20,             // 27 add rsp, 20h
+    0x5B,                               // 31 pop rbx
+    0xC3,                               // 32 ret
+    0x48, 0x89, 0xC8,                   // 33 callee: mov rax, rcx
+    0x48, 0x83, 0xC0, 0x00,             // 36 add rax, 0
+    0xC3,                               // 40 ret
+};
+#else
+extern "C" __declspec(dllexport) __declspec(allocate(".text")) const unsigned char ar_d5_code[] = {
+    0x53,                               //  0 push ebx
+    0x8B, 0x5C, 0x24, 0x08,             //  1 mov ebx, [esp+8]
+    0x53,                               //  5 push ebx
+    0xE8, 0x09, 0x00, 0x00, 0x00,       //  6 call callee (+20)
+    0x83, 0xC4, 0x04,                   // 11 add esp, 4         <- return site
+    0x40,                               // 14 inc eax            <- loop head
+    0x4B,                               // 15 dec ebx
+    0x75, 0xFC,                         // 16 jnz 14
+    0x5B,                               // 18 pop ebx
+    0xC3,                               // 19 ret
+    0x8B, 0x44, 0x24, 0x04,             // 20 callee: mov eax, [esp+4]
+    0x83, 0xC0, 0x00,                   // 24 add eax, 0
+    0xC3,                               // 27 ret
+};
+#endif
+
+// ---- drrestore (regress `hw-dr-restore`) ---------------------------------------------------
+// (Distinct bodies: identical ones are folded into ONE function by the linker -- /OPT:ICF.)
+static volatile intptr_t g_dr_seen_arm, g_dr_seen_site;
+AR_EXPORT intptr_t ar_dr_arm(intptr_t x) { g_dr_seen_arm = x; return x; }     // probed: arms ar_dr_site (hw)
+AR_EXPORT intptr_t ar_dr_site(intptr_t x) { g_dr_seen_site = x; return x; }   // the runtime-armed hw probe
+static HANDLE g_dr_inside[2], g_dr_go;
+static std::atomic<long> g_dr_calls[3];
+static LONG dr_filter() {
+    SetEvent(g_dr_inside[0]);
+    WaitForSingleObject(g_dr_go, 15000);
+    return EXCEPTION_CONTINUE_EXECUTION;                 // NtContinue with the context captured at the raise
+}
+static DWORD WINAPI dr_exception_thread(void *) {
+    __try { RaiseException(0xE0D40001u, 0, 0, nullptr); } __except (dr_filter()) {}
+    for (int i = 0; i < 10; ++i) { ar_dr_site(200 + i); g_dr_calls[1]++; }
+    return 0;
+}
+static VOID CALLBACK dr_apc(ULONG_PTR) { SetEvent(g_dr_inside[1]); WaitForSingleObject(g_dr_go, 15000); }
+static DWORD WINAPI dr_apc_thread(void *) {
+    SleepEx(15000, TRUE);                                // the APC returns through NtContinue
+    for (int i = 0; i < 10; ++i) { ar_dr_site(300 + i); g_dr_calls[2]++; }
+    return 0;
 }
 struct CfReuse { DWORD victim; std::atomic<long> calls{0}, reused{0}; };
 static DWORD WINAPI cf_short(void *p) {
@@ -230,9 +361,69 @@ int main(int argc, char **argv) {
         }
         printf("{\"kind\":\"ar\",\"case\":\"cfkill\",\"killed\":%d,\"reused\":%ld,\"threads\":%d,\"calls\":%ld}\n",
                killed, r.reused.load(), threads, r.calls.load());
-    } else if (!strcmp(k, "cfmany")) {
+    } else if (!strcmp(k, "cflock")) {
+        InitializeCriticalSection(&g_cf_cs);
+        g_cf_waiting = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        EnterCriticalSection(&g_cf_cs);
+        HANDLE w = CreateThread(nullptr, 0, cf_waiter, nullptr, 0, nullptr);   // its callee waits for the lock
+        const int inside = WaitForSingleObject(g_cf_waiting, 10000) == WAIT_OBJECT_0;
+        const intptr_t held = ar_cf_site(2);              // a probe hit while holding it
+        LeaveCriticalSection(&g_cf_cs);
+        const int joined = WaitForSingleObject(w, 15000) == WAIT_OBJECT_0;
+        DWORD e = 0; GetExitCodeThread(w, &e); CloseHandle(w);
+        printf("{\"kind\":\"ar\",\"case\":\"cflock\",\"inside\":%d,\"joined\":%d,\"held\":%lld,\"waiter\":%lu}\n",
+               inside, joined, (long long)held, e);
+    } else if (!strcmp(k, "absret")) {
+        auto f = reinterpret_cast<intptr_t (*)(intptr_t)>(reinterpret_cast<uintptr_t>(ar_d5_code));
+        intptr_t sum = 0;
+        for (int i = 0; i < 3; ++i) sum += f(5);
+        printf("{\"kind\":\"ar\",\"case\":\"absret\",\"sum\":%lld}\n", (long long)sum);
+    } else if (!strcmp(k, "drrestore")) {
+        for (auto &e : g_dr_inside) e = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        g_dr_go = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        HANDLE te = CreateThread(nullptr, 0, dr_exception_thread, nullptr, 0, nullptr);
+        HANDLE ta = CreateThread(nullptr, 0, dr_apc_thread, nullptr, 0, nullptr);
+        Sleep(100);                                       // ta in its alertable wait
+        QueueUserAPC(dr_apc, ta, 0);
+        const int inside = WaitForMultipleObjects(2, g_dr_inside, TRUE, 15000) == WAIT_OBJECT_0;
+        ar_dr_arm(1);                                     // its callback arms ar_dr_site now
+        for (int i = 0; i < 10; ++i) { ar_dr_site(100 + i); g_dr_calls[0]++; }
+        SetEvent(g_dr_go);
+        WaitForSingleObject(te, 15000); WaitForSingleObject(ta, 15000);
+        CloseHandle(te); CloseHandle(ta);
+        printf("{\"kind\":\"ar\",\"case\":\"drrestore\",\"inside\":%d,\"main\":%ld,\"exception\":%ld,\"apc\":%ld}\n",
+               inside, g_dr_calls[0].load(), g_dr_calls[1].load(), g_dr_calls[2].load());
+    } else if (!strcmp(k, "cfwatch") || !strcmp(k, "cfwatchlock")) {
+        if (!strcmp(k, "cfwatchlock")) g_cfw_x = 6;
+        g_cfw_in = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        ar_cfw_setup((intptr_t)&g_cfw_var);               // its callback watches g_cfw_var
+        HANDLE a = CreateThread(nullptr, 0, cfw_caller, nullptr, 0, nullptr);
+        const int inside = WaitForSingleObject(g_cfw_in, 10000) == WAIT_OBJECT_0;
+        g_cfw_var = 1;                                    // the watch hit, while a's callee runs
+        WaitForSingleObject(a, 15000);
+        DWORD e = 0; GetExitCodeThread(a, &e); CloseHandle(a);
+        printf("{\"kind\":\"ar\",\"case\":\"%s\",\"inside\":%d,\"caller\":%lu,\"var\":%ld}\n", k, inside, e, g_cfw_var);
+    } else if (!strcmp(k, "drresume")) {
+        for (auto &e : g_dr_inside) e = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        g_dr_go = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        HANDLE ta = CreateThread(nullptr, 0, dr2_apc_thread, nullptr, 0, nullptr);
+        Sleep(100);                                       // ta in its alertable wait
+        QueueUserAPC(dr_apc, ta, 0);
+        const int inside = WaitForSingleObject(g_dr_inside[1], 15000) == WAIT_OBJECT_0;
+        const uintptr_t site = delay_resume_site();
+        if (site) ar_dr2_arm((intptr_t)site);             // its callback: a hw probe at the resume site
+        SetEvent(g_dr_go);
+        WaitForSingleObject(ta, 15000); CloseHandle(ta);
+        printf("{\"kind\":\"ar\",\"case\":\"drresume\",\"inside\":%d,\"site\":%d,\"apc_tid\":%lu}\n",
+               inside, site ? 1 : 0, g_dr2_tid);
+    } else if (!strcmp(k, "coborrow")) {
+        ar_dr_arm(1);                                     // arms ar_dr_site at runtime: 4 DRs in use
+        intptr_t other = ar_cob_other(3), sum = 0;
+        for (intptr_t i = 0; i < 5; ++i) sum += ar_cob_orig(i);
+        printf("{\"kind\":\"ar\",\"case\":\"coborrow\",\"sum\":%lld,\"other\":%lld}\n", (long long)sum, (long long)other);
+    } else if (!strcmp(k, "cfmany") || !strcmp(k, "cfmanyq")) {
         const int n = 100;
-        g_cf_need = n;
+        g_cf_need = !strcmp(k, "cfmany") ? n : 1;
         std::vector<HANDLE> ts;
         for (int i = 0; i < n; ++i) ts.push_back(CreateThread(nullptr, 0, cf_many, (void *)(intptr_t)(1000 + i), 0, nullptr));
         long long sum = 0;

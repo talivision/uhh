@@ -16,16 +16,30 @@ __declspec(noinline) void LogSite(int i) {
     InterlockedAdd(&g_sink, i);
 }
 
+/* Each tick line carries "w" (QueryPerformanceCounter right before the line is written) and
+   "t" (QPC of the previous LogSite call, the moment that call's record came into being; -1
+   for the first): a reader on the same machine timestamps arrivals with QPC too, so a
+   record's latency is measured from the event itself and a plain line's from its write --
+   independent of how the two streams interleave on the way. */
 static DWORD WINAPI run_sequence(void *unused) {
     int i;
+    LARGE_INTEGER w, t;
+    long long prev_t = -1;
     (void)unused;
     for (i = 0; i < g_count; ++i) {
         if (g_ticks) {
-            printf("{\"kind\":\"tick\",\"i\":%d}\n", i);
+            QueryPerformanceCounter(&w);
+            printf("{\"kind\":\"tick\",\"i\":%d,\"w\":%lld,\"t\":%lld}\n", i, (long long)w.QuadPart, prev_t);
             fflush(stdout);
         }
+        QueryPerformanceCounter(&t);
+        prev_t = (long long)t.QuadPart;
         LogSite(i);
         if (g_delay_ms) Sleep((DWORD)g_delay_ms);
+    }
+    if (g_ticks) {   /* the last call's event time */
+        printf("{\"kind\":\"tick\",\"i\":%d,\"w\":-1,\"t\":%lld}\n", g_count, prev_t);
+        fflush(stdout);
     }
     return 0;
 }

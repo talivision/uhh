@@ -94,7 +94,7 @@ First steps for any problem:
 | `call_original without return_from -- the original runs again on fall-through` | the callback called the original but did not `return_from` | add `return_from(c, ret, nargs)` |
 | `return_from nargs=N but the original popped M bytes (ret M); the original's count is used` | wrong x86 `nargs` for the convention | pass the stack slots the callee pops ([api.md](api.md#callback-functions)) |
 | `probe: warning: <loc>: the original did not return within 5 s (released, it runs on)` / `... left without returning (exception or longjmp)` / `... the thread exited inside the original` | breakpoint/hw `call_original` ended abnormally; the rest of the callback did not run | expected for blocking, throwing or exiting functions |
-| `call_func` returns 0 | unknown module/export, `nargs` outside 0..8, address not executable code; on breakpoint/hw also: the callee raised an exception, another `call_func` was in flight, or the 5 s timeout (`probe: call_func timed out after 5 s; thread restored`) | pass every argument as `uint64_t`; call only lock-free, non-throwing callees; cache results |
+| `call_func` returns 0 | unknown module/export, `nargs` outside 0..8, address not executable code; on breakpoint/hw also: the callee raised an exception, or the 5 s timeout (`probe: call_func timed out after 5 s; thread restored`) | pass every argument as `uint64_t`; call only non-blocking, non-throwing callees; cache results |
 | `probe: logs are being written to a console, which is slowing the target; ...` | the live tail to a console is slow | redirect stdout to a file or pipe (or `NUL`: the file keeps everything) |
 | `probe: warning: live output closed (Win32=...)` | stdout's reader went away (`| head`) | not an error; the session file has every record (`"live_output_closed":true`) |
 | `probe: <time> target crashed: tid=N exception 0x... at module+0x...` plus a stack | the target died of an unhandled exception | compare with an uninstrumented run; check `set_reg`/`set_mem`/`return_from` in your callbacks; try another backend |
@@ -121,12 +121,56 @@ following it there`, `probe: repaired hardware breakpoint state on thread N`,
 |---|---|---|
 | `probe: interrupted: detaching (probes removed, the target keeps running)` / `... ending the target` | Ctrl+C / Ctrl+Break ended the session | a second press ends the tool itself |
 | `probe: detach: still waiting for N running callback(s) to finish (Ns)` | inline callbacks are still running; detach delivers their logs first, with no time limit | find what the callback is blocked on (a lock, a wait); a deadlocked callback keeps the detach waiting |
-| `probe: detach: N callback(s) cannot finish now (thread gone or suspended); not waiting for them` | callbacks on dead or suspended threads | none; they appear as `in_flight=` |
-| `probe: detached: hits=.. logs_written=.. log_dropped=.. in_flight=..` | final counts after the detach | hits = logs_written + log_dropped + in_flight |
+| `probe: detach: N callback(s) cannot finish now (thread gone or suspended); not waiting for them` | callbacks on dead or suspended threads | none; they appear as `running=` (and, if they had not logged yet, `in_flight=`) |
+| `probe: detached: hits=.. logs_written=.. log_dropped=.. in_flight=.. running=..` | final counts after the detach | hits = logs_written + log_dropped + in_flight (in_flight: callbacks still running that had not logged yet; running: all still running) |
 | `probe: detach: agent work still pending after 5 s; it will install nothing` | the agent's thread could not start (the target holds its loader lock) | none; nothing is installed after the detach |
 | `probe: detach: N config block(s) left in the target for M callback(s) still in flight` | a deliberate, bounded leak so in-flight callbacks never read freed config | none |
 | `probe: close: still waiting for probe_run to stop (Ns)` | `probe_close` from another thread waits for `probe_run` to finish its detach | wait; see the detach lines |
 | `probe: session failed (<reason>): detaching from the target` | an internal error ended an attached session; the target was released cleanly | fix `<reason>` |
+
+## Is my captured output complete?
+
+A capture of stdout proves its own completeness; never judge it by how its end looks.
+
+- Every `probe_log` record is exactly one line and carries `"seq"`: 0, 1, 2, ... in the
+  order of the session file. A gap is a lost record, a repeat a duplicate.
+- The `probe_report` line comes after the last record and states `stdout_logs` (records
+  written to stdout), `logs_written` (records in the session file), `log_dropped`,
+  `live_output_closed` and `live_output_error`. When records follow the report (an attach
+  detached by `probe_close` after `probe_report`, e.g. `uhh_trace --detach-after-ms`), the
+  capture ends with a `probe_final` line with the final counts instead.
+- **No `probe_report` (or `probe_final`) line at the end = the capture is incomplete**,
+  whatever the last records look like: the tool was killed, or the consumer stopped reading.
+  The session file (`probe: logs -> ...` on stderr) has every record that was written.
+
+Check a capture (streams the file; any encoding PowerShell wrote) with:
+
+```powershell
+$n = 0; $gap = $null; $last = $null
+foreach ($l in [IO.File]::ReadLines((Resolve-Path out.txt))) {
+  if ($l.StartsWith('{"kind":"probe_log"')) {
+    if ($l -notmatch ',"seq":(\d+)\}$' -or [uint64]$Matches[1] -ne $n) { if ($gap -eq $null) { $gap = $n } }
+    $n++
+  } elseif ($l.StartsWith('{"kind":"probe_report"') -or $l.StartsWith('{"kind":"probe_final"')) { $last = $l | ConvertFrom-Json }
+}
+if ($last -and $gap -eq $null -and $last.stdout_logs -eq $n) { "complete: $n records" }
+else { "INCOMPLETE: $n records, first gap at seq $gap, last report says stdout_logs=$($last.stdout_logs)" }
+```
+
+### Capturing from PowerShell
+
+Measured with Windows PowerShell 5.1 (regress `stdout-powershell-*`, ROADMAP "PowerShell
+capture findings"): `| Out-File`, `>`, `| Set-Content`, `| Tee-Object`, `| ForEach-Object`,
+`2>&1 | Out-File`, `Start-Process -RedirectStandardOutput` and the console itself deliver every
+record, byte for byte, at any volume (1.2M stack records tested). What does lose the end:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| The capture stops short and has no `probe_report`; stderr has no `probe: interrupted` line | **Ctrl+C while UHH runs inside a PowerShell pipeline** (`... \| Out-File`, `> file`, `\| Tee-Object`, `Start-Process -Wait`): PowerShell stops reading and terminates the native command at once, so UHH's own Ctrl+C handling (end the session, flush, report) never runs. A non-UHH program shows the same: its last lines and its final line never reach the file. The session file keeps what UHH wrote until it was killed (measured: a few hundred records more than the capture) | stop with Ctrl+C only when stdout is the console or redirected by cmd: `cmd /c "uhh_trace ... > out.jsonl"`; or end the target instead (close it, `--detach-after-ms`) |
+| Non-ASCII text (paths, symbols) garbled in a PowerShell capture | PowerShell decodes a native command's output with `[Console]::OutputEncoding` (the OEM code page), then re-encodes it (UTF-16 for `>` / `Out-File` in 5.1) | `[Console]::OutputEncoding = [Text.UTF8Encoding]::new()` first, or capture with `cmd /c ... > file` (bytes untouched) |
+| The capture is much slower than the run without it | PowerShell handles every line as an object (1.2M stack records: `cmd /c >` 19 s, `>` 46 s, `Out-File` 110 s); UHH back-pressures the target instead of dropping | `cmd /c "... > file"`, or stdout to `NUL` and read the session file |
+| The console shows fewer records than the session file (high volume), `stdout_logs == logs_written` | not lost by UHH: every record was written to the console. A console keeps only a finite history (9001 rows by default; a `--stack` record takes several rows), a pseudo console (Windows Terminal, ssh) renders frames: a program writing faster than it renders loses lines on screen (reproduced with WriteConsoleW; UHH writes with WriteFile and was complete at 2M records). A run stopped with Ctrl+C inside a PowerShell pipeline also ends short (row above) | the session file (`probe: logs -> ...`) is the archive: read it, or capture stdout to a file with `cmd /c "... > out.jsonl"`; never judge completeness from the screen |
+| `2>&1` puts `uhh_trace.exe : probe: ...` blocks between the records | PowerShell 5.1 wraps each stderr line in an error record | do not merge stderr (`2> err.txt`), or ignore lines that do not start with `{` |
 
 ## Environment
 

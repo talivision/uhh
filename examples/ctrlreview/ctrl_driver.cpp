@@ -1,4 +1,4 @@
-// ctrl_driver --scenario fault|faultreg|inplace|absunload|symunload|owndr|owndrx|absreuse|int3cap|
+// ctrl_driver --scenario fault|faultreg|faultmix|inplace|absunload|symunload|owndr|owndrx|absreuse|int3cap|
 //                        bigcfg|headcorrupt|shape [--shape S] --backend b
 //             -- <ctrl_target.exe> <scenario> [opts]
 // Instruments ctrl_target for one controller-review finding (see ctrl_target.cpp) with
@@ -46,7 +46,7 @@ int main(int argc, char **argv) {
     ctrl_cfg k{backend, 0};
     bool ok = s != nullptr;
     if (ok) {
-        if (sc == "fault" || sc == "faultreg")
+        if (sc == "fault" || sc == "faultreg" || sc == "faultmix")
             ok = probe_add_symbol(s, "ctrl_target.exe!CtrlLoadInsn", ctrl_on_load, backend);
         else if (sc == "inplace")
             ok = probe_add_symbol(s, "ctrl_target.exe!CtrlLoopInsn", ctrl_on_loop, backend);
