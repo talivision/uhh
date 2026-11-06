@@ -485,8 +485,30 @@ static void writer_failed(probe_session *s, const std::string &message, uint64_t
 
 static bool write_stdout_chunk(probe_session *s, const char *bytes, size_t size, uint64_t records);
 static void tail_catch_up_locked(probe_session *s, const char *fresh, size_t fresh_size, uint64_t fresh_end);
+static bool write_stdout_locked(probe_session *s, const char *bytes, size_t size, uint64_t records);
 static bool write_log_batch(probe_session *s, const std::string &bytes, uint64_t records) {
     if (bytes.empty()) return true;
+    // Live output: the SAME batch goes to stdout right away, from this thread (the
+    // separate tailer let stdout fall seconds behind under load). A slow stdout (a
+    // console) back-pressures the producers instead -- nothing is dropped.
+    // A stdout that stops taking data (the reader closed the pipe: `| head`) ends the live
+    // tail only -- reported once -- never the file: the file stays the complete record and
+    // no log is counted lost for a reader that went away.
+    // stdout BEFORE the file: a file write held up (real-time AV scanning the growing file in
+    // %TEMP%) held live output 0.1-2.5 s and released it in bursts (CI and VM, reproduced);
+    // stdout no longer waits for the file. stdout_mu is held across both writes, so a report
+    // (which holds stdout_mu) sees a batch on stdout and in logs_written, or in neither.
+    bool tail;
+    {
+        std::lock_guard<std::mutex> lock(s->tail_mu);
+        tail = s->tail_enabled && !s->tail_failed;
+    }
+    const bool direct = tail && !s->fwd_out_active;
+    std::unique_lock<std::mutex> out_lock(s->stdout_mu, std::defer_lock);
+    if (direct) {
+        out_lock.lock();
+        if (!write_stdout_locked(s, bytes.data(), bytes.size(), records)) tail = false;   // tail_failed() said why
+    }
     DWORD wrote = 0;
     if (s->log_file == nullptr || s->log_file == INVALID_HANDLE_VALUE ||
         bytes.size() > MAXDWORD ||
@@ -502,29 +524,14 @@ static bool write_log_batch(probe_session *s, const std::string &bytes, uint64_t
     {
         std::lock_guard<std::mutex> lock(s->tail_mu);
         end = s->log_bytes_written += bytes.size();
+        if (direct && tail) s->log_bytes_tailed = s->log_bytes_written;
     }
-    // Live output: the SAME batch goes to stdout right away, from this thread (the
-    // separate tailer let stdout fall seconds behind under load). A slow stdout (a
-    // console) back-pressures the producers instead -- nothing is dropped; the file
-    // above is the complete record either way.
-    // A stdout that stops taking data (the reader closed the pipe: `| head`) ends the live
-    // tail only -- reported as an error once -- never the file: the file stays the complete
-    // record and no log is counted lost for a reader that went away.
-    bool tail;
-    {
-        std::lock_guard<std::mutex> lock(s->tail_mu);
-        tail = s->tail_enabled && !s->tail_failed;
-    }
+    if (direct) out_lock.unlock();
     if (tail && s->fwd_out_active) {
-        // The target's stdout is forwarded: the batch goes out only at a line boundary of it.
-        std::lock_guard<std::mutex> out_lock(s->stdout_mu);
+        // The target's stdout is forwarded: the batch goes out only at a line boundary of it
+        // (records deferred behind an unfinished target line are replayed from the file).
+        std::lock_guard<std::mutex> fwd_lock(s->stdout_mu);
         tail_catch_up_locked(s, bytes.data(), bytes.size(), end);
-        tail = false;                                   // tail_catch_up_locked tracked the bytes
-    }
-    if (tail && !write_stdout_chunk(s, bytes.data(), bytes.size(), records)) tail = false;   // tail_failed() said why
-    if (tail) {
-        std::lock_guard<std::mutex> lock(s->tail_mu);
-        s->log_bytes_tailed = s->log_bytes_written;
     }
     s->tail_changed.notify_one();
     s->tail_caught_up.notify_all();
@@ -661,8 +668,13 @@ static void tail_flush_failed(probe_session *s) {
 // records: the probe_log lines in bytes; counted in stdout_logs while stdout_mu is still held,
 // so a report (which holds stdout_mu) never sees records on stdout that it does not count.
 static bool write_stdout_chunk(probe_session *s, const char *bytes, size_t size, uint64_t records) {
-    if (!size) return true;
     std::lock_guard<std::mutex> out_lock(s->stdout_mu);
+    return write_stdout_locked(s, bytes, size, records);
+}
+
+// stdout_mu held.
+static bool write_stdout_locked(probe_session *s, const char *bytes, size_t size, uint64_t records) {
+    if (!size) return true;
     // The driver still owns the CRT FILE*. Empty it before the raw-handle write so its
     // own complete lines cannot remain buffered behind newer tailed log lines.
     if (std::fflush(stdout) != 0) {
@@ -6357,9 +6369,9 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
     if (out == stdout) out_lock.lock();
     // The forwarded target left its last line unfinished: report records start on their own line.
     if (out == stdout && s->fwd_out_active && s->out_midline) { std::fputc('\n', out); s->out_midline = false; }
-    // The counts, in causal order: stdout_logs (frozen while stdout_mu is held), then
-    // logs_written (a record reaches the file before stdout), then the hits (a hit is counted
-    // before its log exists). So stdout_logs <= logs_written <= hits even on a target that is
+    // The counts, in causal order: stdout_logs and logs_written (both frozen while stdout_mu is
+    // held: the writer holds it across a batch's stdout AND file write), then the hits (a hit
+    // is counted before its log exists). So stdout_logs <= logs_written <= hits even on a target that is
     // still running; once it exited or was detached they are exact. (The hits used to be read
     // BEFORE the flush: a report on a live target that flushed 5.3M records showed a probe's
     // hits far below its own logs_written.)

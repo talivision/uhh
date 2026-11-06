@@ -1282,8 +1282,8 @@ the report (count, valid JSON per line, CRC multiset of the lines, `seq` coverag
   WriteFile (`os.write`, like UHH) 2,000,000/2,000,000 (579 s). UHH writes with WriteFile,
   which conhost processes in step with rendering: no loss above, at any volume measured.
 - PowerShell displaying the records itself (its host writes the console): `& uhh_trace ... |
-  Tee-Object x.txt` and `& uhh_trace ... 2>&1` in a pseudo console, inline `--stack` 1M records:
-  1,000,000/1,000,000 rendered each (Tee 1077 s, merged 171 s). PowerShell is slower than the
+  Tee-Object x.txt`, `| ForEach-Object { $_ }` and `2>&1` in a pseudo console, inline `--stack` 1M records:
+  1,000,000/1,000,000 rendered each (Tee 1077 s, ForEach 889 s, merged 171 s; plain 158 s). PowerShell is slower than the
   renderer, so it does not hit the WriteConsoleW loss above.
 - The one reproduced "console short, session file more complete": **Ctrl+C in a PowerShell
   pipeline** (below): the capture/console stops a few hundred records before the session file
