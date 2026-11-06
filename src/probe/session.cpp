@@ -4610,10 +4610,31 @@ static bool seh_callback(probe_callback cb, probe_context *c, DWORD *code) {
     if (*code == EXCEPTION_STACK_OVERFLOW) _resetstkoflw();      // the guard page, for the next overflow
     return false;
 }
+// Hardware shadow stacks (CET): after a completed in-place call_original the original's own
+// `ret` has popped this frame's shadow-stack entry, and Windows refuses to move SSP back down
+// (measured, windows-2025). The hooked function therefore cannot run a second time on
+// fall-through: it returns to its caller with the original's result (as for a faulting
+// callback), with one warning. Without shadow stacks nothing changes.
+static void cet_after_original(probe_session *s, Probe *probe, probe_context *c) {
+    auto *st = static_cast<CallbackState *>(c->controller);
+    if (!c->called_original || c->returned || !st || !st->have_post || !target_has_shadow_stack(s)) return;
+#if !defined(_WIN64)
+    if (c->orig_pop < 0 || c->orig_pop > 1020 || (c->orig_pop & 3)) return;
+    c->ret_pop = (uint32_t)c->orig_pop; c->regs.rdx = c->orig_edx;
+#endif
+    c->regs.rax = (uint64_t)st->post.UHH_POST_AX;
+    c->returned = 1;
+    if (!probe->warned_double_run) {
+        probe->warned_double_run = true;
+        std::fprintf(stderr, "probe: warning: %s: call_original without return_from under CET shadow stacks: the "
+                     "original's result is returned (it cannot run twice). Further cases are not reported.\n",
+                     probe->location.c_str());
+    }
+}
 static void run_callback(probe_session *s, Probe *probe, probe_context *c) {
     const probe_regs before = c->regs;
     DWORD code = 0;
-    if (seh_callback(probe->callback, c, &code)) return;
+    if (seh_callback(probe->callback, c, &code)) { cet_after_original(s, probe, c); return; }
     if (code == UHH_CALL_RELEASED) { c->regs = before; return; }   // call_original ended the callback (see there)
     // A faulting callback is a no-op: its register changes are discarded and a return_from it
     // asked for is dropped (the hit falls through into the original) -- exactly as inline
@@ -4721,6 +4742,21 @@ static bool apply_return_from(probe_session *s, Probe *probe, const probe_contex
                          probe->location.c_str());
         }
         return false;
+    }
+    // CET: the original already returned for real (its `ret` popped the shadow stack), so the
+    // gadget's `ret` would pop the CALLER's shadow entry -- a #CP the kernel fixes up only in
+    // compatibility mode (non-image code), fatal in strict mode. Resume directly where that
+    // `ret` goes instead: the return address at the hit's SP, the stack popped past it.
+    if (c.called_original && st && st->have_post && target_has_shadow_stack(s)) {
+        uint64_t ra = 0; size_t n = 0;
+        if (remote_read(s->pi.hProcess, c.hit_sp, &ra, sizeof(void *), &n) && n == sizeof(void *)) {
+#if defined(_WIN64)
+            native.Rip = ra; native.Rsp = c.hit_sp + 8 + c.ret_pop;
+#else
+            native.Eip = (DWORD)ra; native.Esp = (DWORD)(c.hit_sp + 4 + c.ret_pop);
+#endif
+            return true;
+        }
     }
 #if defined(_WIN64)
     native.Rip = g; native.Rsp = c.hit_sp;
@@ -6856,12 +6892,6 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
     if (!thread) return 0;
     CONTEXT saved{}; saved.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | UHH_CONTEXT_FP | CONTEXT_DEBUG_REGISTERS;
     if (!GetThreadContext(thread, &saved)) { CloseHandle(thread); return 0; }
-    // CET: the original's own `ret` pops this frame's shadow-stack entry; putting the thread
-    // back at the hit must put SSP back too, or return_from's `ret` (and a fall-through) pops
-    // the CALLER's entry: a #CP -- fixed up by the kernel in compatibility mode (the ret
-    // gadget is not image code), fatal under strict mode (Exploit protection).
-    uint64_t hit_ssp = 0;
-    const bool have_ssp = target_has_shadow_stack(s) && thread_ssp(thread, &hit_ssp, nullptr);
     int slot = -1;
     for (int k = 0; k < 4 && slot < 0; ++k)
         if (!(s->dr_used & (1u << k)) && !((saved.Dr7 >> (k * 2)) & 3)) slot = k;
@@ -6997,14 +7027,8 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
         }
         saved.Dr6 = 0;
         saved.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | UHH_CONTEXT_FP | CONTEXT_DEBUG_REGISTERS;
-        SetThreadContext(thread, &saved);              // exactly as it was at the hit
-        uint64_t now_ssp = 0;
-        if (have_ssp && thread_ssp(thread, &now_ssp, nullptr) && now_ssp != hit_ssp) {
-            const bool set = thread_ssp(thread, nullptr, &hit_ssp);
-            if (trace_enabled() || !set)
-                std::fprintf(stderr, "probe: call_original: shadow-stack pointer 0x%llx -> 0x%llx %s\n", (unsigned long long)now_ssp,
-                             (unsigned long long)hit_ssp, set ? "restored" : "NOT restored (the kernel refused)");
-        }
+        SetThreadContext(thread, &saved);              // exactly as it was at the hit (CET: SSP stays popped,
+                                                       // see apply_return_from / cet_after_original)
     } else if (!s->exited && !thread_gone) {
         clear_slot(true);
     }
