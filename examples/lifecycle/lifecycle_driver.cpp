@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <string>
 #include <thread>
 
@@ -70,14 +71,21 @@ int main(int argc, char **argv) {
     }
     // The debug object belongs to the thread that attached: attach and run on a worker,
     // probe_close from here.
+    // A session that ends on its own (the target exited / died) before the detach cue gets
+    // its final accounting from probe_report on the runner (probe_close prints none then);
+    // a detach reports through probe_close's "probe: detached:" line. phase: 0 running,
+    // 1 runner reporting, 2 reported, 3 main closing -- never both, never concurrently.
     HANDLE attached = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     bool attach_ok = false; int run_ok = 0;
+    std::atomic<int> phase{0};
     std::thread runner([&] {
         attach_ok = probe_attach(s, pid);
         SetEvent(attached);
         if (attach_ok) {
             std::printf("{\"kind\":\"attached\",\"pid\":%lu}\n", (unsigned long)pid); std::fflush(stdout);
             run_ok = probe_run(s);
+            int idle = 0;
+            if (phase.compare_exchange_strong(idle, 1)) { probe_report(s, stdout); phase = 2; }
         }
     });
     WaitForSingleObject(attached, INFINITE);
@@ -85,6 +93,8 @@ int main(int argc, char **argv) {
     if (!attach_ok) { runner.join(); probe_report(s, stdout); probe_close(s); return 1; }
     if (detach_stdin) { char line[64]; if (!std::fgets(line, sizeof(line), stdin)) {} }
     else Sleep(detach_ms);
+    int idle = 0;
+    if (!phase.compare_exchange_strong(idle, 3)) while (phase.load() != 2) Sleep(1);   // the runner is reporting
     probe_close(s);                       // detach (or nothing, if the target already exited)
     runner.join();
     std::printf("{\"kind\":\"detached\",\"pid\":%lu,\"run_ok\":%d}\n", (unsigned long)pid, run_ok);

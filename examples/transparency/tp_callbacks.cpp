@@ -9,7 +9,9 @@
 
 #define TP_CB extern "C" __declspec(dllexport)
 
-struct tp_cfg { uint32_t mode, nargs, pop, backend; };
+// entry: 1 = the probe is at a function entry (call_original must work), 0 = the mid-function
+// site (call_original must be refused there: the one deliberately unsupported place).
+struct tp_cfg { uint32_t mode, nargs, pop, backend, entry; };
 enum { TP_NOOP, TP_LOG, TP_MEM, TP_SYS, TP_CALLFN, TP_CO };
 
 // x86: a double comes back in ST0 -- the callback's own x87 traffic.
@@ -64,9 +66,17 @@ TP_CB void tp_on_hit(probe_context *c) {
         return;
     }
     case TP_CO: {
+        // Every successful wrap is logged ("tp co ok": the suite counts them against the calls
+        // the target makes); a refusal is allowed ONLY at the mid-function site.
         uint64_t r = 0;
-        if (call_original(c, (int)k->nargs, &r)) return_from(c, r, (int)k->pop);
-        return;                          // refused (the mid-function site): falls through
+        if (call_original(c, (int)k->nargs, &r)) {
+            if (!k->entry) { send_log(c, "tp FAIL call_original accepted mid-function"); return; }
+            send_log(c, "tp co ok");
+            return_from(c, r, (int)k->pop);
+        } else if (k->entry) {
+            send_log(c, "tp FAIL call_original refused at a function entry");
+        }
+        return;                          // refused at the mid-function site: falls through
     }
     default:
         send_log(c, "tp FAIL mode %u", k->mode);
