@@ -7707,6 +7707,104 @@ def check_callfunc_concurrent():
             record(name, False, repr(e))
 
 
+def check_hw_dr_restore():
+    """ROADMAP F4: a hw probe armed at runtime (from a callback) while one thread sits in an
+    exception filter and another inside a user APC. Both later resume through NtContinue
+    with a context the kernel captured BEFORE the arm -- debug registers included -- which
+    put the old DRs back: that thread never hit the probe again. Every call of the probed
+    function on all three threads must be seen (30 hits, one log each)."""
+    d, t = exe("ar_driver.exe"), exe("ar_target.exe")
+    if not d or not t:
+        return missing_bin("hw-dr-restore", "ar_driver/ar_target")
+    try:
+        r, o = run([d, "--backend", "hw", "--probe", "ar_target.exe!ar_dr_arm=ar_on_dr_arm", "--", t, "drrestore"], timeout=120)
+        rw = next((x for x in o if x.get("kind") == "ar"), {})
+        rep, bad = report(o), []
+        got = Counter(int(m.group(1)) for x in o if x.get("kind") == "probe_log"
+                      for m in [re.match(r"ar dr x=(\d+)$", str(x.get("message", "")))] if m)
+        want = Counter(list(range(100, 110)) + list(range(200, 210)) + list(range(300, 310)))
+        hits = next((p.get("hits") for p in probes(o) if "ar_dr_site" in str(p.get("location", ""))), None)
+        if (rw.get("inside"), rw.get("main"), rw.get("exception"), rw.get("apc")) != (1, 10, 10, 10): bad.append(f"row={rw}")
+        if got != want:
+            miss = want - got
+            bad.append(f"logs missing={sorted(miss)[:5]}.. ({sum(miss.values())}: main={sum(1 for x in miss if x < 200)} "
+                       f"exception={sum(1 for x in miss if 200 <= x < 300)} apc={sum(1 for x in miss if x >= 300)}) "
+                       f"extra={sorted((got - want).elements())[:5]}")
+        if hits != 30: bad.append(f"hits={hits} want=30")
+        if rep.get("log_dropped") != 0: bad.append(f"dropped={rep.get('log_dropped')}")
+        if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
+        record("hw-dr-restore", not bad, "; ".join(bad) or f"row={rw} hits={hits}")
+    except Exception as e:
+        record("hw-dr-restore", False, repr(e))
+
+
+def check_inline_absolute():
+    """ROADMAP D5: an inline probe added BY ADDRESS (probe_add_address from a callback, here
+    at a call's return site) gets the same site checks as one added by symbol. ar_d5_code's
+    return site is followed by a loop head 3 bytes later: a 5-byte hook there would split
+    the loop's target. inline-absolute-refused: refused (the program's result unchanged, no
+    hit); inline-absolute-fallback: with PROBE_FALLBACK_HW it runs as a hw probe instead.
+    (Address probes used to skip the function-bounds / branch-target part of the check.)"""
+    d, t = exe("ar_driver.exe"), exe("ar_target.exe")
+    if not d or not t:
+        return missing_bin("inline-absolute", "ar_driver/ar_target")
+    callee = "ar_target.exe!ar_d5_code+" + ("0x14" if pe_is_x86(t) else "0x21")
+    for kind, cb in (("refused", "ar_on_d5_callee"), ("fallback", "ar_on_d5_callee_fb")):
+        name = f"inline-absolute-{kind}"
+        try:
+            r, o = run([d, "--backend", "inline", "--probe", f"{callee}={cb}", "--", t, "absret"], timeout=120)
+            rw, rep, bad = next((x for x in o if x.get("kind") == "ar"), {}), report(o), []
+            msgs = [str(x.get("message", "")) for x in o if x.get("kind") == "probe_log"]
+            ret = next((p for p in probes(o) if str(p.get("location", "")).startswith("0x")), {})
+            if rw.get("sum") != 30: bad.append(f"row={rw} (want sum=30)")
+            if msgs.count("ar d5 add=1") != 1: bad.append(f"add logs={[m for m in msgs if 'add=' in m]}")
+            refused = "would be written across a jump" in (r.stderr or "")
+            if kind == "refused":
+                if not refused: bad.append("no refusal on stderr")
+                if ret.get("hits") or msgs.count("ar d5 ret"): bad.append(f"return probe ran: {ret}")
+            else:
+                # (armed before or after the first call returns: 2 or 3 returns seen, each logged)
+                if ret.get("backend") != "hw" or ret.get("hits") not in (2, 3) or msgs.count("ar d5 ret") != ret.get("hits"):
+                    bad.append(f"return probe={ret} logs={msgs.count('ar d5 ret')} (want hw, 2-3)")
+            if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
+            record(name, not bad, "; ".join(bad) + ("" if not bad else f" stderr={(r.stderr or '')[-400:]!r}")
+                   or f"sum={rw.get('sum')} return_probe={ret.get('backend')}/{ret.get('hits')}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+def check_cet_agent():
+    """The injected inline agent (probe_api_agent.dll) must load into a process whose policy
+    is BlockNonCetBinaries: it is linked /CETCOMPAT (every `ret` in its own code returns
+    through a real call: audited, ROADMAP "BlockNonCetBinaries"). cet-agent-image: the bit
+    is set. cet-agent-block-noncet: cet_probe turns the policy on for itself at runtime,
+    then maps a non-CETCOMPAT DLL (configparse.dll: refused) and the agent (must map). SKIP
+    when this Windows does not let a process set the policy at runtime."""
+    agent, pr_exe, other = BIN / "probe_api_agent.dll", exe("cet_probe.exe"), BIN / "configparse.dll"
+    if not agent.exists() or not pr_exe or not other.exists():
+        return missing_bin("cet-agent", "probe_api_agent.dll/cet_probe/configparse.dll")
+    try:
+        record("cet-agent-image", pe_cetcompat(agent) and not pe_cetcompat(other),
+               f"probe_api_agent.dll:CETCOMPAT={pe_cetcompat(agent)} configparse.dll:CETCOMPAT={pe_cetcompat(other)}")
+    except Exception as e:
+        record("cet-agent-image", False, repr(e))
+    try:
+        r, o = run([pr_exe, "--block-non-cet", str(other), str(agent)], timeout=60)
+        blk = next((x for x in o if x.get("kind") == "cet_block"), {})
+        loads = {x.get("dll"): x for x in o if x.get("kind") == "cet_block_load"}
+        a, c = loads.get("probe_api_agent.dll", {}), loads.get("configparse.dll", {})
+        detail = (f"set={blk.get('set')} set_error={blk.get('set_error')} policy={blk.get('BlockNonCetBinaries')} "
+                  f"configparse={c.get('loaded')}/{c.get('error')} agent={a.get('loaded')}/{a.get('error')}")
+        if blk.get("set") != 1 or blk.get("BlockNonCetBinaries") != 1:
+            skip("cet-agent-block-noncet", f"BlockNonCetBinaries cannot be set at runtime here: {detail}")
+        elif c.get("loaded") != 0:
+            skip("cet-agent-block-noncet", f"the policy is set but not enforced (a non-CET DLL still maps): {detail}")
+        else:
+            record("cet-agent-block-noncet", a.get("loaded") == 1, detail)
+    except Exception as e:
+        record("cet-agent-block-noncet", False, repr(e))
+
+
 def main():
     global BIN
     ap = argparse.ArgumentParser()
@@ -7858,6 +7956,9 @@ def main():
     if want(check_symbols_grammar): check_symbols_grammar()
     if want(check_quickstart): check_quickstart()
     if want(check_callfunc_concurrent): check_callfunc_concurrent()
+    if want(check_hw_dr_restore): check_hw_dr_restore()
+    if want(check_inline_absolute): check_inline_absolute()
+    if want(check_cet_agent): check_cet_agent()
     if only and not RESULTS:
         print(f"regress.py: --only {','.join(only)} selected only opt-in tiers that were not enabled "
               f"(--bigapps / --soak-minutes / --volume-reads): no check ran.", file=sys.stderr)

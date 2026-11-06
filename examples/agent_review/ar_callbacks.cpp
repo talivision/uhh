@@ -86,3 +86,21 @@ AR_CB void ar_on_cf(probe_context *c) {
     }
 }
 AR_CB void ar_on_cf_inner(probe_context *c) { send_log(c, "ar cf-inner"); }
+
+// drrestore (regress `hw-dr-restore`): arms the probe on ar_dr_site at runtime, on every thread.
+AR_CB void ar_on_dr_site(probe_context *c) { send_log(c, "ar dr x=%d", (int)get_func_arg(c, 0)); }
+AR_CB void ar_on_dr_arm(probe_context *c) {
+    if (!probe_add_symbol(get_session(c), "ar_target.exe!ar_dr_site", ar_on_dr_site, PROBE_HW)) send_log(c, "ar dr refused");
+}
+
+// absret (regress `inline-absolute-*`): the callee's entry probe adds an inline probe at its
+// return site, BY ADDRESS (once); that site is followed by a loop head inside its 5 bytes.
+AR_CB void ar_on_d5_ret(probe_context *c) { send_log(c, "ar d5 ret"); }
+static void d5_add(probe_context *c, uint32_t flags) {
+    static volatile long once = 0;
+    uint64_t ret = 0;
+    if (InterlockedExchange(&once, 1) || !get_mem(c, get_reg(c, PROBE_REG_SP), &ret, sizeof(void *))) return;
+    send_log(c, "ar d5 add=%d", probe_add_address(get_session(c), ret, ar_on_d5_ret, flags));
+}
+AR_CB void ar_on_d5_callee(probe_context *c) { d5_add(c, PROBE_INLINE); }
+AR_CB void ar_on_d5_callee_fb(probe_context *c) { d5_add(c, PROBE_INLINE | PROBE_FALLBACK_HW); }

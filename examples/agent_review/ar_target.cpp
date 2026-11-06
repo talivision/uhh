@@ -17,6 +17,12 @@
 //   cfkill      a thread killed (TerminateThread) while its callback is inside call_func, then
 //               short threads until one gets the dead thread's id; each hits the probe
 //   cfmany      100 threads inside call_func at once, the callee hitting another probe
+//   cflock      a call_func callee needing a lock another thread holds at its own probe hit
+//   absret      a call whose return site is followed within 5 bytes by a loop head (machine
+//               code placed in .text, no unwind data), probed BY ADDRESS from a callback
+//   drrestore   a hw probe armed (from a callback) while one thread is inside an exception
+//               filter and another inside a user APC: both resume through NtContinue with a
+//               context captured BEFORE the arm, then call the probed function
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <setjmp.h>
@@ -149,6 +155,68 @@ AR_EXPORT intptr_t ar_cf_needlock() {
     return 7 + (intptr_t)g_zero;
 }
 static DWORD WINAPI cf_waiter(void *) { return (DWORD)ar_cf_site(4); }
+// ---- absret (regress `inline-absolute-*`) -------------------------------------------------
+// ar_d5_code(n): calls its callee (at the end: returns n), then a loop starting 3 bytes after
+// that call's return site adds n more -> 2n. A 5-byte hook at the return site would cover
+// the loop head. Code bytes in .text, so it is image code with no .pdata / PDB function.
+#pragma section(".text")
+#if defined(_WIN64)
+extern "C" __declspec(dllexport) __declspec(allocate(".text")) const unsigned char ar_d5_code[] = {
+    0x53,                               //  0 push rbx
+    0x48, 0x83, 0xEC, 0x20,             //  1 sub rsp, 20h
+    0x48, 0x89, 0xCB,                   //  5 mov rbx, rcx
+    0xE8, 0x14, 0x00, 0x00, 0x00,       //  8 call callee (+33)
+    0x48, 0x89, 0xC2,                   // 13 mov rdx, rax       <- return site
+    0x48, 0xFF, 0xC2,                   // 16 inc rdx            <- loop head
+    0x48, 0xFF, 0xCB,                   // 19 dec rbx
+    0x75, 0xF8,                         // 22 jnz 16
+    0x48, 0x89, 0xD0,                   // 24 mov rax, rdx
+    0x48, 0x83, 0xC4, 0x20,             // 27 add rsp, 20h
+    0x5B,                               // 31 pop rbx
+    0xC3,                               // 32 ret
+    0x48, 0x89, 0xC8,                   // 33 callee: mov rax, rcx
+    0x48, 0x83, 0xC0, 0x00,             // 36 add rax, 0
+    0xC3,                               // 40 ret
+};
+#else
+extern "C" __declspec(dllexport) __declspec(allocate(".text")) const unsigned char ar_d5_code[] = {
+    0x53,                               //  0 push ebx
+    0x8B, 0x5C, 0x24, 0x08,             //  1 mov ebx, [esp+8]
+    0x53,                               //  5 push ebx
+    0xE8, 0x09, 0x00, 0x00, 0x00,       //  6 call callee (+20)
+    0x83, 0xC4, 0x04,                   // 11 add esp, 4         <- return site
+    0x40,                               // 14 inc eax            <- loop head
+    0x4B,                               // 15 dec ebx
+    0x75, 0xFC,                         // 16 jnz 14
+    0x5B,                               // 18 pop ebx
+    0xC3,                               // 19 ret
+    0x8B, 0x44, 0x24, 0x04,             // 20 callee: mov eax, [esp+4]
+    0x83, 0xC0, 0x00,                   // 24 add eax, 0
+    0xC3,                               // 27 ret
+};
+#endif
+
+// ---- drrestore (regress `hw-dr-restore`) ---------------------------------------------------
+AR_EXPORT intptr_t ar_dr_arm(intptr_t x) { return x + (intptr_t)g_zero; }    // probed: arms ar_dr_site (hw)
+AR_EXPORT intptr_t ar_dr_site(intptr_t x) { return x + (intptr_t)g_zero; }   // the runtime-armed hw probe
+static HANDLE g_dr_inside[2], g_dr_go;
+static std::atomic<long> g_dr_calls[3];
+static LONG dr_filter() {
+    SetEvent(g_dr_inside[0]);
+    WaitForSingleObject(g_dr_go, 15000);
+    return EXCEPTION_CONTINUE_EXECUTION;                 // NtContinue with the context captured at the raise
+}
+static DWORD WINAPI dr_exception_thread(void *) {
+    __try { RaiseException(0xE0D40001u, 0, 0, nullptr); } __except (dr_filter()) {}
+    for (int i = 0; i < 10; ++i) { ar_dr_site(200 + i); g_dr_calls[1]++; }
+    return 0;
+}
+static VOID CALLBACK dr_apc(ULONG_PTR) { SetEvent(g_dr_inside[1]); WaitForSingleObject(g_dr_go, 15000); }
+static DWORD WINAPI dr_apc_thread(void *) {
+    SleepEx(15000, TRUE);                                // the APC returns through NtContinue
+    for (int i = 0; i < 10; ++i) { ar_dr_site(300 + i); g_dr_calls[2]++; }
+    return 0;
+}
 struct CfReuse { DWORD victim; std::atomic<long> calls{0}, reused{0}; };
 static DWORD WINAPI cf_short(void *p) {
     auto *r = (CfReuse *)p;
@@ -252,6 +320,26 @@ int main(int argc, char **argv) {
         DWORD e = 0; GetExitCodeThread(w, &e); CloseHandle(w);
         printf("{\"kind\":\"ar\",\"case\":\"cflock\",\"inside\":%d,\"joined\":%d,\"held\":%lld,\"waiter\":%lu}\n",
                inside, joined, (long long)held, e);
+    } else if (!strcmp(k, "absret")) {
+        auto f = reinterpret_cast<intptr_t (*)(intptr_t)>(reinterpret_cast<uintptr_t>(ar_d5_code));
+        intptr_t sum = 0;
+        for (int i = 0; i < 3; ++i) sum += f(5);
+        printf("{\"kind\":\"ar\",\"case\":\"absret\",\"sum\":%lld}\n", (long long)sum);
+    } else if (!strcmp(k, "drrestore")) {
+        for (auto &e : g_dr_inside) e = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        g_dr_go = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        HANDLE te = CreateThread(nullptr, 0, dr_exception_thread, nullptr, 0, nullptr);
+        HANDLE ta = CreateThread(nullptr, 0, dr_apc_thread, nullptr, 0, nullptr);
+        Sleep(100);                                       // ta in its alertable wait
+        QueueUserAPC(dr_apc, ta, 0);
+        const int inside = WaitForMultipleObjects(2, g_dr_inside, TRUE, 15000) == WAIT_OBJECT_0;
+        ar_dr_arm(1);                                     // its callback arms ar_dr_site now
+        for (int i = 0; i < 10; ++i) { ar_dr_site(100 + i); g_dr_calls[0]++; }
+        SetEvent(g_dr_go);
+        WaitForSingleObject(te, 15000); WaitForSingleObject(ta, 15000);
+        CloseHandle(te); CloseHandle(ta);
+        printf("{\"kind\":\"ar\",\"case\":\"drrestore\",\"inside\":%d,\"main\":%ld,\"exception\":%ld,\"apc\":%ld}\n",
+               inside, g_dr_calls[0].load(), g_dr_calls[1].load(), g_dr_calls[2].load());
     } else if (!strcmp(k, "cfmany")) {
         const int n = 100;
         g_cf_need = n;
