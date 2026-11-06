@@ -409,12 +409,6 @@ struct probe_session {
     uint32_t fair_events = 0;                   // debug events in the current fairness window
     LONGLONG round_wake = 0;                    // the current yield round ends (system time, 100 ns)
     std::unordered_set<DWORD> yielded_round;    // threads that yielded in the current round (once each)
-    // Yield-round back-off (fair_tick): the window between rounds, 20 ms, doubled (to 80 ms) after
-    // each round in which no thread that did not yield ran -- nothing was starved: the threads
-    // that hit nothing were all blocked -- and back to 20 ms as soon as one did.
-    uint32_t fair_period_ms = 20;
-    bool round_probe = false;                   // a round started: its other threads' cycles were sampled
-    std::unordered_map<DWORD, uint64_t> round_cycles;   // QueryThreadCycleTime of every thread at round start
     uint64_t park_rounds = 0, parked_total = 0;   // fairness statistics (PROBE_TRACE: printed at the end)
     // Yield stubs (see yield_thread): per thread, `resume address; code`, carved from blocks that
     // are never freed (a thread may sleep inside one across a detach).
@@ -5103,7 +5097,7 @@ static void park_release(probe_session *s) {
                      (long long)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
     for (auto &e : s->parked) { ResumeThread(e.second); CloseHandle(e.second); }
     s->parked.clear();
-    s->parking = false; s->fair_period_ms = 20; s->round_probe = false;
+    s->parking = false;
     s->fair_window = std::chrono::steady_clock::now(); s->fair_gaps = {};
 }
 // Park the thread whose hit is about to be continued (see probe_session::parked). Never a
@@ -5246,34 +5240,6 @@ static void retarget_pending(probe_session *s) {
     for (const auto &a : arm) arm_quietly(s, a.first, a.second);
     if (moved) arm_gates_for_pending(s);
 }
-// CPU cycles each target thread has used so far (QueryThreadCycleTime: exact, unlike the
-// tick-granular GetThreadTimes). Empty when the target has more threads than is cheap to read
-// every round (no back-off then: every window is 20 ms, as before).
-static std::unordered_map<DWORD, uint64_t> thread_cycles(probe_session *s) {
-    std::unordered_map<DWORD, uint64_t> out;
-    if (s->threads.size() > 64) return out;
-    for (DWORD tid : s->threads) {
-        HANDLE t = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
-        if (!t) continue;
-        ULONG64 c = 0;
-        if (QueryThreadCycleTime(t, &c)) out[tid] = c;
-        CloseHandle(t);
-    }
-    return out;
-}
-// Did a thread that did not yield in the round just ended run during it (more than a trace of
-// CPU: a starved thread given the round's ~4 ms uses far more)? Unknown counts as yes.
-static bool round_others_ran(probe_session *s) {
-    if (s->round_cycles.empty()) return true;
-    const auto now = thread_cycles(s);
-    if (now.empty()) return true;
-    for (const auto &e : now) {
-        if (s->yielded_round.count(e.first) || agent_thread(s, e.first)) continue;
-        const auto was = s->round_cycles.find(e.first);
-        if (was == s->round_cycles.end() || e.second - was->second > 200000) return true;   // new, or ran (~60 us)
-    }
-    return false;
-}
 static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blocked, bool got) {
     using namespace std::chrono;
     const auto now = steady_clock::now();
@@ -5281,15 +5247,7 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
     s->fair_gaps += blocked;
     if (got) s->last_event = now;
     if (got) ++s->fair_events;
-    if (now - s->fair_window >= milliseconds(s->fair_period_ms)) {
-        // Back-off (measured: a yield round every 20 ms cost a lone hot thread ~30% of its
-        // breakpoint/hw hit rate, for no thread at all when the others were blocked): a round
-        // in which nothing else of the target ran makes the next window twice as long, to
-        // 80 ms; a round in which something did (a starved thread got the CPU) keeps 20 ms.
-        if (s->round_probe) {
-            s->fair_period_ms = round_others_ran(s) ? 20 : std::min<uint32_t>(80, s->fair_period_ms * 2);
-            s->round_probe = false;
-        }
+    if (now - s->fair_window >= milliseconds(20)) {
         const bool was = s->parking;
         // Dense debug events (>= 2000/s: the target is mostly frozen) -- or little unfrozen
         // time -- start a yield round: every thread whose hit is continued in the next window
@@ -5301,7 +5259,6 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
         s->fair_events = 0;
         if (s->parking) {
             ++s->park_rounds; s->yielded_round.clear();
-            s->round_cycles = thread_cycles(s); s->round_probe = true;
             FILETIME ft; GetSystemTimeAsFileTime(&ft);
             s->round_wake = (LONGLONG)(((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime) + 40000;   // now + 4 ms
         }
@@ -5310,7 +5267,6 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
                 std::fprintf(stderr, "  park-start t=%lld\n",
                              (long long)duration_cast<microseconds>(now.time_since_epoch()).count());
         }
-        if (!s->parking) s->fair_period_ms = 20;      // dense events again are noticed within 20 ms
         s->fair_window = now; s->fair_gaps = {};
     }
     // 1 ms timer resolution only while a parked thread or a context watch waits on this loop:
