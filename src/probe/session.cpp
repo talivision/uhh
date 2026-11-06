@@ -4675,7 +4675,10 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
 // once) can be lost -- seen as a hw probe added from a callback (e.g. a return-address
 // probe) that never fires on that thread. Re-asserting our slots at the thread's own
 // event repairs it before it runs on.
-static void enforce_owned_drs(const probe_session *s, DWORD tid, CONTEXT &c) {
+// clear_stale = false: only re-assert the active probes' slots (a context image the PROGRAM
+// may have just edited -- an exception handler arming its own DR in the record -- keeps every
+// other slot as it is).
+static void enforce_owned_drs(const probe_session *s, DWORD tid, CONTEXT &c, bool clear_stale = true) {
     for (int slot = 0; slot < 4; ++slot) {
         if (!(s->dr_ever & (1u << slot))) continue;
         // call_original borrowed its probe's slot on THIS thread for the return catch: on
@@ -4696,7 +4699,7 @@ static void enforce_owned_drs(const probe_session *s, DWORD tid, CONTEXT &c) {
             default: c.Dr3 = (decltype(c.Dr3))owner->address; break;
             }
             dr7 = (dr7 & ~fieldmask) | ln | ((DWORD64)(((len & 3u) << 2) | (rw & 3u)) << (16 + slot * 4));
-        } else if (!(s->dr_used & (1u << slot)) && !target_owns_slot(s, tid, c, slot)) {
+        } else if (clear_stale && !(s->dr_used & (1u << slot)) && !target_owns_slot(s, tid, c, slot)) {
             dr7 &= ~(ln | fieldmask);                           // our stale slot (never the target's own)
         }
         c.Dr7 = (decltype(c.Dr7))dr7;
@@ -4709,7 +4712,8 @@ static void enforce_owned_drs(const probe_session *s, DWORD tid, CONTEXT &c) {
 // debug registers included -- so the new probe never fires on it (or a released one comes
 // back). Library-owned breakpoints at ntdll!NtContinue / NtContinueEx bring the debug-register
 // image of the context about to be restored up to date first: our slots only, exactly as at
-// a hardware hit (enforce_owned_drs; the target's own slots are left as it set them). Armed
+// a hardware hit, minus the generic stale-slot clear: a handler may have just armed its own
+// DR in that record (regress cdx-owndrx). Armed
 // with the thread-start fixup: once a hardware probe is armed or released at runtime.
 static void restore_fixup(probe_context *c) {
     probe_session *s = get_session(c);
@@ -4726,14 +4730,17 @@ static void restore_fixup(probe_context *c) {
     const size_t at = offsetof(CONTEXT, ContextFlags), len = offsetof(CONTEXT, Dr7) + sizeof(img.Dr7) - at;
     size_t n = 0;
     if (!rec || !remote_read(s->pi.hProcess, rec + at, reinterpret_cast<char *>(&img) + at, len, &n) || n != len) return;
+    if (trace_enabled())
+        std::fprintf(stderr, "  restore-fixup tid=%lu flags=0x%lx dr7=0x%llx\n", (unsigned long)c->tid,
+                     (unsigned long)img.ContextFlags, (unsigned long long)img.Dr7);
     if ((img.ContextFlags & CONTEXT_DEBUG_REGISTERS) != CONTEXT_DEBUG_REGISTERS) return;   // DRs not restored
     const CONTEXT before = img;
     clear_released_images(s, img);                           // a released probe captured in the image
-    enforce_owned_drs(s, c->tid, img);
+    enforce_owned_drs(s, c->tid, img, false);                // our active probes; the rest as the program left it
     if (img.Dr0 == before.Dr0 && img.Dr1 == before.Dr1 && img.Dr2 == before.Dr2 && img.Dr3 == before.Dr3 &&
         img.Dr7 == before.Dr7) return;
     if (trace_enabled())
-        std::fprintf(stderr, "  restore-fixup tid=%lu dr7 0x%llx -> 0x%llx\n", (unsigned long)c->tid,
+        std::fprintf(stderr, "  restore-fixup tid=%lu rewritten dr7 0x%llx -> 0x%llx\n", (unsigned long)c->tid,
                      (unsigned long long)before.Dr7, (unsigned long long)img.Dr7);
     const size_t d0 = offsetof(CONTEXT, Dr0), dn = offsetof(CONTEXT, Dr6) - d0;     // Dr0..Dr3
     remote_write(s->pi.hProcess, rec + d0, reinterpret_cast<char *>(&img) + d0, dn, &n);
