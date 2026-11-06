@@ -51,7 +51,7 @@ jobs:
           ONLY: ${{ inputs.only }}
           ARCHES: ${{ inputs.arches || 'x64,x86' }}
           SHARDS: ${{ inputs.shards || '0' }}
-          IMAGE: ${{ inputs.image || 'windows-2022' }}   # pushes and pull requests: windows-2022
+          IMAGE: ${{ inputs.image || 'windows-2025' }}   # TEMPORARY: one push run on the CET-enforcing image
         run: |
           case "$IMAGE" in windows-20[0-9][0-9]) ;; *) echo "bad image $IMAGE"; exit 1;; esac
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
