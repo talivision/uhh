@@ -269,7 +269,25 @@ static int overflow_caught() {
     __except (GetExceptionCode() == EXCEPTION_STACK_OVERFLOW ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {}
     return _resetstkoflw() ? 1 : 0;
 }
+// The stack this thread keeps for dispatching its own overflow (SetThreadStackGuarantee), as a
+// program that relies on catching it must: the exception frame holds a CONTEXT plus an XSAVE
+// area of every XCR0 feature -- ~3.4 KB with AVX-512, ~12.4 KB with AMX tiles (Xeon 6973P-C
+// runners, measured) -- and Windows' default leaves 12-16 KB below the faulting frame, so on an
+// AMX CPU the dispatch, the filter and RtlUnwindEx ran into reserved memory at random
+// (depending on where in a page the overflow struck) WITH OR WITHOUT any tool attached (ROADMAP
+// "CI residuals" R1). Reserved here, the check measures UHH only: the guard page is still there
+// after a probe's callback overflowed. TP_OVF_NO_GUARANTEE=1: Windows' default (diagnostics).
+static void ovf_guarantee() {
+    if (GetEnvironmentVariableA("TP_OVF_NO_GUARANTEE", nullptr, 0)) return;
+    int r[4] = {};
+    __cpuid(r, 1);
+    unsigned long xsave = 0;
+    if (r[2] & (1 << 27)) { __cpuidex(r, 0xD, 0); xsave = (unsigned long)r[1]; }
+    ULONG g = (ULONG)((sizeof(CONTEXT) + xsave + 64 + 16384 + 4095) & ~4095ul);
+    SetThreadStackGuarantee(&g);
+}
 static DWORD WINAPI ovf_thread(void *out) {
+    ovf_guarantee();
     tp_ovf(41);                                     // its probe overflows (inline: on THIS stack)
     *(int *)out = overflow_caught();                // the program's own overflow is still catchable
     return 0;
