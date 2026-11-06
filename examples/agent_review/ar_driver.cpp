@@ -13,12 +13,13 @@
 #include <vector>
 
 #define CB(n) extern "C" void n(probe_context *);
-CB(ar_on_site) CB(ar_on_fault_ret) CB(ar_on_fault_noret) CB(ar_on_alloc) CB(ar_on_jump) CB(ar_on_after) CB(ar_on_prot) CB(ar_on_cf) CB(ar_on_cf_inner) CB(ar_on_dr_arm) CB(ar_on_d5_callee) CB(ar_on_d5_callee_fb)
+CB(ar_on_site) CB(ar_on_fault_ret) CB(ar_on_fault_noret) CB(ar_on_alloc) CB(ar_on_jump) CB(ar_on_after) CB(ar_on_prot) CB(ar_on_cf) CB(ar_on_cf_inner) CB(ar_on_dr_arm) CB(ar_on_d5_callee) CB(ar_on_d5_callee_fb) CB(ar_on_cfw_setup) CB(ar_on_cob)
 static const struct { const char *name; probe_callback fn; } k_callbacks[] = {
     {"ar_on_site", ar_on_site}, {"ar_on_fault_ret", ar_on_fault_ret}, {"ar_on_fault_noret", ar_on_fault_noret},
     {"ar_on_alloc", ar_on_alloc}, {"ar_on_jump", ar_on_jump}, {"ar_on_after", ar_on_after}, {"ar_on_prot", ar_on_prot},
     {"ar_on_cf", ar_on_cf}, {"ar_on_cf_inner", ar_on_cf_inner}, {"ar_on_dr_arm", ar_on_dr_arm},
     {"ar_on_d5_callee", ar_on_d5_callee}, {"ar_on_d5_callee_fb", ar_on_d5_callee_fb},
+    {"ar_on_cfw_setup", ar_on_cfw_setup}, {"ar_on_cob", ar_on_cob},
 };
 
 static uint32_t backend_of(const char *b) {

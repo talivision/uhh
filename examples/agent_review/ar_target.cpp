@@ -20,6 +20,11 @@
 //   cflock      a call_func callee needing a lock another thread holds at its own probe hit
 //   absret      a call whose return site is followed within 5 bytes by a loop head (machine
 //               code placed in .text, no unwind data), probed BY ADDRESS from a callback
+//   cfmanyq     cfmany without the barrier (the callee does not wait for the others)
+//   cfwatch     a data-watch hit (whose callback call_funcs) while another thread's callback
+//               is inside call_func
+//   coborrow    breakpoint/hw call_original on a hw probe that has to lend its own DR (all 4
+//               used), the original raising and continuing an exception (NtContinue)
 //   drrestore   a hw probe armed (from a callback) while one thread is inside an exception
 //               filter and another inside a user APC: both resume through NtContinue with a
 //               context captured BEFORE the arm, then call the probed function
@@ -132,7 +137,8 @@ static intptr_t jump_call(intptr_t x, int *jumped) {
 }
 
 // ---- cfkill / cfmany: inline call_func's recursion guard (regress `callfunc-*`) ----------
-AR_EXPORT intptr_t ar_cf_site(intptr_t x) { return x + (intptr_t)g_zero; }    // probed: ar_on_cf
+static volatile intptr_t g_cf_seen;                     // (distinct body: no linker folding)
+AR_EXPORT intptr_t ar_cf_site(intptr_t x) { g_cf_seen = x; return x; }        // probed: ar_on_cf
 static HANDLE g_cf_in;                                  // set once the victim is inside call_func
 AR_EXPORT intptr_t ar_cf_block() { SetEvent(g_cf_in); Sleep(INFINITE); return 0; }
 AR_EXPORT intptr_t ar_cf_inner(intptr_t x) { return x * 3 + (intptr_t)g_zero; } // probed: ar_on_cf_inner
@@ -155,6 +161,23 @@ AR_EXPORT intptr_t ar_cf_needlock() {
     return 7 + (intptr_t)g_zero;
 }
 static DWORD WINAPI cf_waiter(void *) { return (DWORD)ar_cf_site(4); }
+// ---- cfwatch (regress `callfunc-watch-*`) ------------------------------------------------
+static volatile LONG g_cfw_var;
+static volatile intptr_t g_cfw_seen;
+static HANDLE g_cfw_in;
+AR_EXPORT intptr_t ar_cfw_setup(intptr_t addr) { g_cfw_seen = addr; return addr; }   // probed: watches addr
+AR_EXPORT intptr_t ar_cfw_slow() { SetEvent(g_cfw_in); Sleep(500); return 11; }    // call_func'd
+static DWORD WINAPI cfw_caller(void *) { return (DWORD)ar_cf_site(5); }
+
+// ---- coborrow (regress `hw-co-borrow-restore`) ------------------------------------------
+static volatile intptr_t g_cob_seen;
+static LONG cob_filter() { return EXCEPTION_CONTINUE_EXECUTION; }
+AR_EXPORT intptr_t ar_cob_other(intptr_t x) { g_cob_seen = x; return x; }          // a third hw probe
+AR_EXPORT intptr_t ar_cob_orig(intptr_t x) {                                       // call_original'd
+    __try { RaiseException(0xE0C0B001u, 0, 0, nullptr); } __except (cob_filter()) {}
+    return x * 2 + (intptr_t)g_zero;
+}
+
 // ---- absret (regress `inline-absolute-*`) -------------------------------------------------
 // ar_d5_code(n): calls its callee (at the end: returns n), then a loop starting 3 bytes after
 // that call's return site adds n more -> 2n. A 5-byte hook at the return site would cover
@@ -342,9 +365,23 @@ int main(int argc, char **argv) {
         CloseHandle(te); CloseHandle(ta);
         printf("{\"kind\":\"ar\",\"case\":\"drrestore\",\"inside\":%d,\"main\":%ld,\"exception\":%ld,\"apc\":%ld}\n",
                inside, g_dr_calls[0].load(), g_dr_calls[1].load(), g_dr_calls[2].load());
-    } else if (!strcmp(k, "cfmany")) {
+    } else if (!strcmp(k, "cfwatch")) {
+        g_cfw_in = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        ar_cfw_setup((intptr_t)&g_cfw_var);               // its callback watches g_cfw_var
+        HANDLE a = CreateThread(nullptr, 0, cfw_caller, nullptr, 0, nullptr);
+        const int inside = WaitForSingleObject(g_cfw_in, 10000) == WAIT_OBJECT_0;
+        g_cfw_var = 1;                                    // the watch hit, while a's callee runs
+        WaitForSingleObject(a, 15000);
+        DWORD e = 0; GetExitCodeThread(a, &e); CloseHandle(a);
+        printf("{\"kind\":\"ar\",\"case\":\"cfwatch\",\"inside\":%d,\"caller\":%lu,\"var\":%ld}\n", inside, e, g_cfw_var);
+    } else if (!strcmp(k, "coborrow")) {
+        ar_dr_arm(1);                                     // arms ar_dr_site at runtime: 4 DRs in use
+        intptr_t other = ar_cob_other(3), sum = 0;
+        for (intptr_t i = 0; i < 5; ++i) sum += ar_cob_orig(i);
+        printf("{\"kind\":\"ar\",\"case\":\"coborrow\",\"sum\":%lld,\"other\":%lld}\n", (long long)sum, (long long)other);
+    } else if (!strcmp(k, "cfmany") || !strcmp(k, "cfmanyq")) {
         const int n = 100;
-        g_cf_need = n;
+        g_cf_need = !strcmp(k, "cfmany") ? n : 1;
         std::vector<HANDLE> ts;
         for (int i = 0; i < n; ++i) ts.push_back(CreateThread(nullptr, 0, cf_many, (void *)(intptr_t)(1000 + i), 0, nullptr));
         long long sum = 0;

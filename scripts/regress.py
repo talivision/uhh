@@ -7666,16 +7666,17 @@ def check_quickstart():
 
 
 def check_callfunc_concurrent():
-    """call_func from several threads' breakpoint/hw callbacks at once (ROADMAP F5/D3): each
-    callback parks on its own fiber while its callee runs, so the calls overlap and finish in
-    any order, as on inline.
-    callfunc-lock-<backend>: thread W's callback call_funcs a callee that needs a lock the main
-    thread holds AT ITS OWN probe hit; the main thread's callback (a call_func of its own) has
-    to run while W's call is in flight. (Holding other threads' hits back during a call --
-    the former behaviour -- deadlocked the callee until the 5 s timeout: ok=0.)
-    callfunc-many-<backend>: 100 threads' callbacks inside call_func together (the callee waits
-    for all of them), the callee hitting another probe on its own thread (counted, no
-    callback); every call returns its value, exact hits and logs."""
+    """call_func from several threads' callbacks (ROADMAP F5/D3). Breakpoint/hw keep their
+    documented contract -- callbacks never overlap: other threads' code-probe hits wait while a
+    call is in flight -- and every call of every thread succeeds, none is lost.
+    callfunc-many-<bp/hw>: 100 threads hit the probe at once, each callback call_funcs a callee
+    that hits another probe on its own thread (counted, no callback): 100 calls ok, exact hits.
+    callfunc-watch-<backend>: a data-watch hit -- which cannot be held back -- arrives while
+    another thread's callback is inside call_func (a 500 ms callee); the watch callback's own
+    call_func must work (it returned 0: "no nesting") and both calls return their values.
+    callfunc-lock-inline: the inline reference for a callee needing a lock another thread
+    holds at its own probe hit (breakpoint/hw: that thread waits until the call is over, so the
+    call times out -- documented, limitations.md)."""
     d, t = exe("ar_driver.exe"), exe("ar_target.exe")
     if not d or not t:
         return missing_bin("callfunc-concurrent", "ar_driver/ar_target")
@@ -7706,36 +7707,74 @@ def check_callfunc_concurrent():
         if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
         if "timed out" in (r.stderr or ""): bad.append("call_func timed out")
 
-    for bk in ("breakpoint", "hw", "inline"):
-        name = f"callfunc-lock-{bk}"
-        try:
-            r, o = go(bk, "cflock", ["ar_target.exe!ar_cf_site=ar_on_cf"], 90)
-            rw, rep, lg, bad = row(o), report(o), logs(o), []
-            if (rw.get("inside"), rw.get("joined"), rw.get("held"), rw.get("waiter")) != (1, 1, 2, 4): bad.append(f"row={rw}")
-            want_logs = {"ar cf-lock holder ok=1 r=6": 1, "ar cf-lock waiter ok=1 r=7": 1}
-            if lg != want_logs: bad.append(f"logs={lg}")
-            if hits_of(o, "ar_cf_site") != 2: bad.append(f"hits={hits_of(o, 'ar_cf_site')} want=2")
-            common(r, rep, bad)
-            record(name, not bad, "; ".join(bad) + ("" if not bad else f" stderr={(r.stderr or '')[-300:]!r}")
-                   or f"row={rw} logs={lg}")
-        except Exception as e:
-            record(name, False, repr(e))
+    def rec(name, bad, ok_detail, r):
+        record(name, not bad, ("; ".join(bad) + f" stderr={(r.stderr or '')[-300:]!r}") if bad else ok_detail)
 
     n = 100
     for bk in ("breakpoint", "hw"):
         name = f"callfunc-many-{bk}"
         try:
-            r, o = go(bk, "cfmany", ["ar_target.exe!ar_cf_site=ar_on_cf", "ar_target.exe!ar_cf_inner=ar_on_cf_inner"], 120)
+            r, o = go(bk, "cfmanyq", ["ar_target.exe!ar_cf_site=ar_on_cf", "ar_target.exe!ar_cf_inner=ar_on_cf_inner"], 180)
             rw, rep, lg, bad = row(o), report(o), logs(o), []
             hs, hi = hits_of(o, "ar_cf_site"), hits_of(o, "ar_cf_inner")
-            if rw.get("sum") != sum(range(1000, 1000 + n)): bad.append(f"row={rw}")
-            if rw.get("together") != n: bad.append(f"only {rw.get('together')}/{n} threads were inside call_func together")
+            if rw.get("sum") != sum(range(1000, 1000 + n)) or rw.get("arrived") != n: bad.append(f"row={rw}")
             if hs != n or hi != n: bad.append(f"hits site={hs} inner={hi} want={n}")
             if lg != {"ar cf-many ok=1 good=1": n}: bad.append(f"logs={lg}")
             common(r, rep, bad)
-            record(name, not bad, "; ".join(bad) or f"row={rw} hits={hs}/{hi} logs={lg}")
+            rec(name, bad, f"row={rw} hits={hs}/{hi} logs={lg}", r)
         except Exception as e:
             record(name, False, repr(e))
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"callfunc-watch-{bk}"
+        try:
+            r, o = go(bk, "cfwatch", ["ar_target.exe!ar_cf_site=ar_on_cf", "ar_target.exe!ar_cfw_setup=ar_on_cfw_setup"], 90)
+            rw, rep, lg, bad = row(o), report(o), logs(o), []
+            if (rw.get("inside"), rw.get("caller"), rw.get("var")) != (1, 5, 1): bad.append(f"row={rw}")
+            want = {"ar cfw setup=1": 1, "ar cfw slow ok=1 r=11": 1, "ar cfw watch ok=1 r=9": 1}
+            if lg != want: bad.append(f"logs={lg}")
+            common(r, rep, bad)
+            rec(name, bad, f"row={rw} logs={lg}", r)
+        except Exception as e:
+            record(name, False, repr(e))
+    name = "callfunc-lock-inline"
+    try:
+        r, o = go("inline", "cflock", ["ar_target.exe!ar_cf_site=ar_on_cf"], 90)
+        rw, rep, lg, bad = row(o), report(o), logs(o), []
+        if (rw.get("inside"), rw.get("joined"), rw.get("held"), rw.get("waiter")) != (1, 1, 2, 4): bad.append(f"row={rw}")
+        if lg != {"ar cf-lock holder ok=1 r=6": 1, "ar cf-lock waiter ok=1 r=7": 1}: bad.append(f"logs={lg}")
+        if hits_of(o, "ar_cf_site") != 2: bad.append(f"hits={hits_of(o, 'ar_cf_site')} want=2")
+        common(r, rep, bad)
+        rec(name, bad, f"row={rw} logs={lg}", r)
+    except Exception as e:
+        record(name, False, repr(e))
+
+
+def check_hw_co_borrow():
+    """Codex review of the NtContinue fixup (F4): breakpoint/hw call_original on a hw probe
+    with all 4 DRs in use lends the probe's own slot to the return catch on that thread. The
+    original raises an exception and continues it (filter -> NtContinue): the context-restore
+    fixup must leave that thread's borrowed slot alone, or the return is missed and the
+    callback abandoned. 5 calls, each call_original ok with the original's value."""
+    d, t = exe("ar_driver.exe"), exe("ar_target.exe")
+    if not d or not t:
+        return missing_bin("hw-co-borrow-restore", "ar_driver/ar_target")
+    try:
+        r, o = run([d, "--backend", "hw", "--probe", "ar_target.exe!ar_dr_arm=ar_on_dr_arm",
+                    "--probe", "ar_target.exe!ar_cob_other=ar_on_site", "--probe", "ar_target.exe!ar_cob_orig=ar_on_cob",
+                    "--", t, "coborrow"], timeout=120)
+        rw, rep, bad = next((x for x in o if x.get("kind") == "ar"), {}), report(o), []
+        msgs = Counter(str(x.get("message", "")) for x in o if x.get("kind") == "probe_log")
+        want = Counter({f"ar cob ok=1 r={2 * i}": 1 for i in range(5)})
+        want["ar site"] = 1
+        if (rw.get("sum"), rw.get("other")) != (20, 3): bad.append(f"row={rw}")
+        if msgs != want: bad.append(f"logs={dict(msgs)}")
+        if "hw DR3" not in (r.stderr or ""): bad.append("4th debug register not in use (no borrowing)")
+        if "without returning" in (r.stderr or "") or "did not return" in (r.stderr or ""): bad.append("call_original released")
+        if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
+        record("hw-co-borrow-restore", not bad, ("; ".join(bad) + f" stderr={(r.stderr or '')[-300:]!r}") if bad
+               else f"row={rw} logs exact")
+    except Exception as e:
+        record("hw-co-borrow-restore", False, repr(e))
 
 
 def check_hw_dr_restore():
@@ -7842,15 +7881,16 @@ def check_cet_agent():
 def check_sessions_repeat(n=60):
     """Many sessions one after the other in ONE controller process (ROADMAP "x86 cumulative-
     session flakiness"): ar_driver --repeat, backends in turn (breakpoint, hw, inline), each
-    session the cflock case (call_func from two threads' callbacks, one needing the other's
-    lock). Every session exact (row, both logs, nothing dropped), and the controller's handle
-    count flat after warm-up (a leaked or double-closed handle shows here or as a failure)."""
+    session the cfwatch case (a callback inside call_func on one thread while a data watch
+    added from a callback fires on another and call_funcs too). Every session exact (row,
+    every log, nothing dropped), and the controller's handle count flat after warm-up (a
+    leaked or double-closed handle shows here or as a failure)."""
     d, t = exe("ar_driver.exe"), exe("ar_target.exe")
     if not d or not t:
         return missing_bin("sessions-repeat", "ar_driver/ar_target")
     try:
-        r, o = run([d, "--backend", "cycle", "--repeat", n, "--probe", "ar_target.exe!ar_cf_site=ar_on_cf", "--", t, "cflock"],
-                   timeout=60 + 15 * n)
+        r, o = run([d, "--backend", "cycle", "--repeat", n, "--probe", "ar_target.exe!ar_cf_site=ar_on_cf",
+                    "--probe", "ar_target.exe!ar_cfw_setup=ar_on_cfw_setup", "--", t, "cfwatch"], timeout=60 + 15 * n)
         iters = [x for x in o if x.get("kind") == "iter"]
         rows = [x for x in o if x.get("kind") == "ar"]
         reps = [x for x in o if x.get("kind") == "probe_report"]
@@ -7858,9 +7898,9 @@ def check_sessions_repeat(n=60):
         bad = []
         failed = [(x.get("i"), x.get("backend")) for x in iters if x.get("ok") != 1]
         if len(iters) != n or failed: bad.append(f"iters={len(iters)}/{n} failed={failed[:6]}")
-        wrong = [i for i, x in enumerate(rows) if (x.get("inside"), x.get("joined"), x.get("held"), x.get("waiter")) != (1, 1, 2, 4)]
+        wrong = [i for i, x in enumerate(rows) if (x.get("inside"), x.get("caller"), x.get("var")) != (1, 5, 1)]
         if len(rows) != n or wrong: bad.append(f"rows={len(rows)}/{n} wrong={wrong[:6]}")
-        want = {"ar cf-lock holder ok=1 r=6": n, "ar cf-lock waiter ok=1 r=7": n}
+        want = {"ar cfw setup=1": n, "ar cfw slow ok=1 r=11": n, "ar cfw watch ok=1 r=9": n}
         if dict(msgs) != want: bad.append(f"logs={dict(msgs)}")
         drops = [i for i, x in enumerate(reps) if x.get("log_dropped") != 0 or x.get("error") is not None]
         if len(reps) != n or drops: bad.append(f"reports={len(reps)}/{n} bad={drops[:6]}")
@@ -7868,11 +7908,10 @@ def check_sessions_repeat(n=60):
         growth = (h[-1] - h[2]) if len(h) > 3 else None
         if growth is None or growth > 24: bad.append(f"controller handles {h[:3]}..{h[-3:]} (growth {growth})")
         if r.returncode != 0: bad.append(f"rc={r.returncode}")
-        record("sessions-repeat", not bad, "; ".join(bad) + ("" if not bad else f" stderr={(r.stderr or '')[-300:]!r}")
-               or f"{n} sessions exact; controller handles {h[2]} -> {h[-1]}")
+        record("sessions-repeat", not bad, ("; ".join(bad) + f" stderr={(r.stderr or '')[-300:]!r}") if bad
+               else f"{n} sessions exact; controller handles {h[2]} -> {h[-1]}")
     except Exception as e:
         record("sessions-repeat", False, repr(e))
-
 
 def main():
     global BIN
@@ -8026,6 +8065,7 @@ def main():
     if want(check_quickstart): check_quickstart()
     if want(check_callfunc_concurrent): check_callfunc_concurrent()
     if want(check_hw_dr_restore): check_hw_dr_restore()
+    if want(check_hw_co_borrow): check_hw_co_borrow()
     if want(check_inline_absolute): check_inline_absolute()
     if want(check_cet_agent): check_cet_agent()
     if want(check_sessions_repeat): check_sessions_repeat()

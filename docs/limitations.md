@@ -60,10 +60,9 @@ from where the callback runs: breakpoint/hw in the controller, inline inside the
   `GetCurrentProcessId()` in a breakpoint/hw callback is the controller's pid.
   *Workaround:* `call_func(c, "kernel32.dll!GetCurrentProcessId", &v, 0)` (or
   `GetCurrentThreadId`); target memory only through `get_mem`/`set_mem`.
-- **D2: concurrency.** Breakpoint/hw callbacks never overlap -- except while one waits in a
-  `call_func` whose callee is blocked (see [call_func](#call_func-and-call_original)): then
-  other threads' callbacks run meanwhile; inline callbacks of different target threads run at
-  the same time. `thread_local` is per target thread
+- **D2: concurrency.** Breakpoint/hw callbacks never overlap (a data-watch hit during a
+  `call_func` is the one exception, see [call_func](#call_func-and-call_original)); inline
+  callbacks of different target threads run at the same time. `thread_local` is per target thread
   inline, but one controller thread for all target threads on breakpoint/hw.
   *Workaround:* make shared state atomic or locked; key per-thread state by the target tid.
 - **D3: a faulting or throwing callback** is abandoned on every backend (hit counted,
@@ -128,25 +127,17 @@ data) prints on all backends.
 
 - **`call_func` on breakpoint/hw is a debugger-driven call** (✗ Controller static review,
   "call_func under contention"; Evaluator round 3 #6). Other threads' code-probe hits wait
-  during the call (so a callback may hold a lock of its own across `call_func`). If the
-  callee BLOCKS -- it waits for something one of those threads must do first, e.g. a lock it
-  holds at its probe hit -- the waiting hits are let go after ~300 ms of the callee in a wait
-  state: their callbacks run (each with its own `call_func`) while the call is in flight,
-  as inline (✅ Detours D3 / Frida F5, regress `callfunc-lock-*`, `callfunc-many-*`). The one
-  case inline handles and breakpoint/hw does not: a callback holding a lock ACROSS such a
-  blocked `call_func` while another callback takes the same lock -- both run on the
-  controller's debug thread, which then waits for itself. A callee still running after 5 s
-  is abandoned mid-run (timeout); a first-chance exception inside the callee abandons it too.
-  Owner decision: no further hardening.
-  *Workaround:* call only non-throwing callees that do not block; do not hold a lock across
-  a `call_func` that may block; cache results; prefer `call_original` for the probed
-  function.
-- **Concurrent `call_func` calls on breakpoint/hw** (✅ Detours D3, Frida F5, Hunter A2):
-  every exception event is handled on a fiber of the debug thread, and a callback waiting
-  in `call_func` parks its fiber, so calls from several threads' callbacks -- a data-watch
-  callback's during another call included -- overlap and finish in any order (they used to
-  return 0 while another one was in flight). `call_original` still runs one at a time:
-  other threads' code-probe hits wait for it.
+  during the call (callbacks never overlap, so a callback may hold its own lock across
+  `call_func`); if one of them holds a lock the callee needs, the call times out after 5 s
+  and the callee is abandoned mid-wait (inline: both run). A first-chance exception inside
+  the callee also abandons it. Owner decision: no further hardening.
+  *Workaround:* call only non-blocking, non-throwing callees; cache results; prefer
+  `call_original` for the probed function.
+- **Concurrent `call_func` on breakpoint/hw** (✅ Detours D3, Frida F5, Hunter A2): calls from
+  several threads' callbacks all succeed, one after the other (the held hits replay when the
+  call is over). A data-watch hit cannot be held back: its callback runs during another
+  thread's call (its own `call_func` works -- it used to return 0); it must not take a lock
+  that callback holds across `call_func`. `call_original` likewise runs one at a time.
 - **Inline `call_original` is a real call from the agent** (📄 Transparency findings). The
   original sees the agent's return address (`_ReturnAddress()`), a new frame for its stack
   arguments, and only the hit's argument registers (x64 RCX RDX R8 R9 XMM0-5; x86 EAX ECX

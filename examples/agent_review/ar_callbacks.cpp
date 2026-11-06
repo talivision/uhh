@@ -74,6 +74,9 @@ AR_CB void ar_on_cf(probe_context *c) {
     if (x == 1) {                                       // the victim: killed inside the callee
         call_func(c, "ar_target.exe!ar_cf_block", &r, 0);
         send_log(c, "ar cf-unblocked");
+    } else if (x == 5) {                                // cfwatch: a slow callee (a watch hit meanwhile)
+        const int ok = call_func(c, "ar_target.exe!ar_cfw_slow", &r, 0);
+        send_log(c, "ar cfw slow ok=%d r=%d", ok, (int)r);
     } else if (x == 2 || x == 4) {                      // cflock: the lock holder / the call waiting for it
         const int ok = x == 2 ? call_func(c, "ar_target.exe!ar_cf_inner", &r, 1, (uint64_t)2)
                               : call_func(c, "ar_target.exe!ar_cf_needlock", &r, 0);
@@ -104,3 +107,21 @@ static void d5_add(probe_context *c, uint32_t flags) {
 }
 AR_CB void ar_on_d5_callee(probe_context *c) { d5_add(c, PROBE_INLINE); }
 AR_CB void ar_on_d5_callee_fb(probe_context *c) { d5_add(c, PROBE_INLINE | PROBE_FALLBACK_HW); }
+
+// cfwatch (regress `callfunc-watch-*`): a write watch whose callback call_funcs.
+AR_CB void ar_on_cfw_watch(probe_context *c) {
+    uint64_t r = 0;
+    const int ok = call_func(c, "ar_target.exe!ar_cf_inner", &r, 1, (uint64_t)3);
+    send_log(c, "ar cfw watch ok=%d r=%d", ok, (int)r);
+}
+AR_CB void ar_on_cfw_setup(probe_context *c) {
+    send_log(c, "ar cfw setup=%d", probe_watch(get_session(c), get_func_arg(c, 0), ar_on_cfw_watch, PROBE_WATCH_WRITE));
+}
+
+// coborrow (regress `hw-co-borrow-restore`): call_original + return_from.
+AR_CB void ar_on_cob(probe_context *c) {
+    uint64_t r = 0;
+    const int ok = call_original(c, 1, &r);
+    if (ok) return_from(c, r, 0);
+    send_log(c, "ar cob ok=%d r=%d", ok, (int)r);
+}
