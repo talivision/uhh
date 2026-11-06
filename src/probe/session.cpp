@@ -6584,6 +6584,9 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             const bool ok = !!SetThreadContext(thread, &native);
             CloseHandle(thread);
             if (!ok) { set_error(s, win_error("enter displaced trampoline")); return false; }
+#if defined(UHH_TEST_HOOKS)
+            if (probe->rep_string && !probe->internal) test_note_repcopy();   // a thread now in the string copy
+#endif
             if (trace_enabled())
                 std::fprintf(stderr, "  tramp tid=%lu site=0x%llx tramp=0x%llx\n", (unsigned long)event.dwThreadId,
                              (unsigned long long)probe->address, (unsigned long long)tr);

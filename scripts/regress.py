@@ -7762,9 +7762,10 @@ def check_cxlib():
                 if q.poll() is None:
                     q.kill()
 
-    # -- (3, extra) the other INT3 of ours a thread can execute: the end of a displaced REP
-    # string copy (in UHH's scratch, no trap flag). The controller dies right after sending a
-    # thread into one (test-hook build): the guard must take that INT3 too.
+    # -- (3, extra) a thread inside a displaced REP string copy when the controller dies (test-
+    # hook build: right after sending a thread into one). The copy is the site's trampoline
+    # (it jumps back by itself, ROADMAP A5); a program single-stepping itself still gets the
+    # older copy ended by an INT3 of ours, which the guard takes. Either way: the target runs on.
     name = "cxlib-reptail-breakpoint"
     procs = []
     try:
