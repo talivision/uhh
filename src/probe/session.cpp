@@ -248,6 +248,7 @@ struct probe_session {
     bool entry_seen = false;
     bool thread_start_fixup = false;           // library INT3 at ntdll!RtlUserThreadStart armed
     bool restore_fixup = false;                // library INT3s at ntdll!NtContinue[Ex] armed
+    std::unordered_set<DWORD> restore_step;    // x86: a WOW64 restore without DRs, trap set (restore_fixup)
     bool thread_start_due = false;             // a hw probe was released: arm it after this event
     HANDLE svc_event = nullptr;                // agent service: "install pending requests"
     std::vector<HANDLE> held;                  // threads held until inline installs confirm
@@ -4733,7 +4734,22 @@ static void restore_fixup(probe_context *c) {
     if (trace_enabled())
         std::fprintf(stderr, "  restore-fixup tid=%lu flags=0x%lx dr7=0x%llx\n", (unsigned long)c->tid,
                      (unsigned long)img.ContextFlags, (unsigned long long)img.Dr7);
-    if ((img.ContextFlags & CONTEXT_DEBUG_REGISTERS) != CONTEXT_DEBUG_REGISTERS) return;   // DRs not restored
+    if ((img.ContextFlags & CONTEXT_DEBUG_REGISTERS) != CONTEXT_DEBUG_REGISTERS) {
+#if !defined(_WIN64)
+        // WOW64: a 32-bit record WITHOUT debug registers (a user APC's: flags 0x10003) is
+        // continued by the 64-bit layer from ITS copy of the context -- the DR image captured
+        // before the arm, out of a 32-bit debugger's reach. Re-apply after the restore
+        // instead: the trap flag in the record stops the thread one instruction after it
+        // (restore_step_done). Not when the program set the trap flag itself.
+        if (!s->hw_active || !(img.ContextFlags & CONTEXT_CONTROL & ~CONTEXT_i386)) return;
+        DWORD fl = 0; size_t got = 0;
+        if (!remote_read(s->pi.hProcess, rec + offsetof(CONTEXT, EFlags), &fl, 4, &got) || got != 4 || (fl & 0x100)) return;
+        fl |= 0x100;
+        if (remote_write(s->pi.hProcess, rec + offsetof(CONTEXT, EFlags), &fl, 4, &got) && got == 4)
+            s->restore_step.insert(c->tid);
+#endif
+        return;                                              // DRs not restored from this record
+    }
     const CONTEXT before = img;
     clear_released_images(s, img);                           // a released probe captured in the image
     enforce_owned_drs(s, c->tid, img, false);                // our active probes; the rest as the program left it
@@ -4745,6 +4761,29 @@ static void restore_fixup(probe_context *c) {
     const size_t d0 = offsetof(CONTEXT, Dr0), dn = offsetof(CONTEXT, Dr6) - d0;     // Dr0..Dr3
     remote_write(s->pi.hProcess, rec + d0, reinterpret_cast<char *>(&img) + d0, dn, &n);
     remote_write(s->pi.hProcess, rec + offsetof(CONTEXT, Dr7), &img.Dr7, sizeof(img.Dr7), &n);
+}
+// The trap restore_fixup set (x86): the thread is past its context restore -- re-apply our
+// debug registers now and swallow the step. A hardware hit at that same instruction is
+// still handled (its status bits stay; only the single-step bit and the trap flag go).
+static bool restore_step_done(probe_session *s, const DEBUG_EVENT &ev) {
+    if (s->restore_step.empty() || !s->restore_step.count(ev.dwThreadId)) return false;
+    if (s->stepping.count(ev.dwThreadId)) return false;      // our own step over the NtContinue INT3 first
+    const DWORD code = ev.u.Exception.ExceptionRecord.ExceptionCode;
+    if (code != EXCEPTION_SINGLE_STEP && code != 0x4000001E /* STATUS_WX86_SINGLE_STEP */) return false;
+    s->restore_step.erase(ev.dwThreadId);
+    reapply_hw_thread(s, ev.dwThreadId);
+    HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, ev.dwThreadId);
+    if (!t) return true;
+    CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS;
+    bool rest = false;
+    if (GetThreadContext(t, &c)) {
+        c.EFlags &= ~0x100u; c.Dr6 &= ~(decltype(c.Dr6))0x4000;
+        rest = (c.Dr6 & 0xF) != 0;
+        SetThreadContext(t, &c);
+    }
+    CloseHandle(t);
+    if (trace_enabled()) std::fprintf(stderr, "  restore-step tid=%lu: DRs re-applied\n", (unsigned long)ev.dwThreadId);
+    return !rest;                                            // a DR hit too: handled as usual
 }
 static void arm_restore_fixup(probe_session *s) {
     if (s->restore_fixup || !(s->entry_seen || s->attached)) return;
@@ -6362,6 +6401,7 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
         s->refault.erase(event.dwThreadId);
         s->hw_unsettled.erase(event.dwThreadId);
         s->dr6_lost.erase(event.dwThreadId);
+        s->restore_step.erase(event.dwThreadId);
         auto it = s->stepping.find(event.dwThreadId);
         if (ok && it != s->stepping.end()) {
             // Only the in-place path lifted the byte; a displaced step left it armed.
@@ -6466,6 +6506,7 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
         break;
     }
     case EXCEPTION_DEBUG_EVENT:
+        if (restore_step_done(s, event)) break;
         ok = handle_exception(s, event, s->stepping, s->initial_break, disposition);
         s->cb_tid = 0;
         for (DWORD tid : s->pending_hold) hold_thread(s, tid);
