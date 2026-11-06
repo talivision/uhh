@@ -405,7 +405,10 @@ struct probe_session {
     // Every mapped instance of every module, in LOAD order (module_bases keeps only the latest):
     // a DLL loaded concurrently can be mapped twice, one mapping discarded. See retarget_pending.
     std::vector<std::pair<std::string, uint64_t>> module_instances;
-    std::vector<uint64_t> extra_gates;             // other instances' copies of pending inline sites (gated too)                   // ask the agent's service for another install round then (0: no)                   // timeBeginPeriod(1) held (only while something polls at 1 ms)
+    // Other instances' copies of inline sites (gated too, see LOAD_DLL): a thread hitting one
+    // proves that instance is the live one -- its probe moves there (handle_gate).
+    struct ExtraGate { uint64_t site = 0, base = 0; Probe *probe = nullptr; };
+    std::vector<ExtraGate> extra_gates;                   // ask the agent's service for another install round then (0: no)                   // timeBeginPeriod(1) held (only while something polls at 1 ms)
     std::chrono::steady_clock::time_point fair_window{}, last_event{};
     std::chrono::steady_clock::duration fair_gaps{};
     // Context round-trips (ROADMAP A4): a thread whose debug event we handled while the target
@@ -4022,7 +4025,8 @@ static bool arm_gates_for_pending(probe_session *s) {
             for (auto &g : s->gates) if (g.first == p->address) gated = true;
             if (!gated) sites.push_back(p->address);
         }
-    for (uint64_t x : s->extra_gates) {
+    for (const auto &e : s->extra_gates) {
+        const uint64_t x = e.site;
         bool gated = std::find(sites.begin(), sites.end(), x) != sites.end();
         for (auto &g : s->gates) if (g.first == x) gated = true;
         if (!gated) sites.push_back(x);
@@ -4054,8 +4058,15 @@ static bool arm_gates_for_pending(probe_session *s) {
 }
 
 static void clear_gates(probe_session *s) {
-    s->extra_gates.clear();
+    // A gate on another instance's copy of an ACTIVE probe's site stays until a thread hits it
+    // (the probe moves there) or the probe leaves that instance; the rest go.
+    std::vector<probe_session::ExtraGate> keep;
+    for (const auto &e : s->extra_gates)
+        if (e.probe && e.probe->active && !e.probe->retired && e.probe->address != e.site && !s->detaching) keep.push_back(e);
+    s->extra_gates = keep;
+    std::vector<std::pair<uint64_t, int>> kept;
     for (auto &g : s->gates) {
+        if (std::any_of(keep.begin(), keep.end(), [&](const auto &e) { return e.site == g.first; })) { kept.push_back(g); continue; }
         for (DWORD tid : s->threads) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
             GuardTouch touch(s, tid);
@@ -4064,7 +4075,7 @@ static void clear_gates(probe_session *s) {
         s->dr_used &= (uint8_t)~(1u << g.second);
         retire_hw_address(s, g.first);                       // a #DB already in flight is stale
     }
-    s->gates.clear();
+    s->gates = kept;
 }
 
 // A gate fired: hold this thread at the site until the hook is confirmed.
@@ -4081,7 +4092,30 @@ static bool handle_gate(probe_session *s, const DEBUG_EVENT &event) {
         if (hit) { c.EFlags |= 0x10000u; SetThreadContext(thread, &c); }   // RF: run the site once resumed
     }
     CloseHandle(thread);
-    if (hit) hold_thread(s, event.dwThreadId);
+    if (hit) {
+        hold_thread(s, event.dwThreadId);
+#if defined(_WIN64)
+        const uint64_t pc = c.Rip;
+#else
+        const uint64_t pc = c.Eip;
+#endif
+        // Another instance's copy of a probe's site, now running: that instance is the live
+        // one. The probe moves there (the old instance keeps its hook until it is unmapped;
+        // its calls still count), and this thread waits for the new hook like any gated one.
+        for (auto it = s->extra_gates.begin(); it != s->extra_gates.end(); ++it) {
+            if (it->site != pc || !it->probe) continue;
+            Probe &p = *it->probe;
+            const uint64_t base = it->base;
+            s->extra_gates.erase(it);
+            if (p.address == pc || p.retired) break;
+            if (trace_enabled()) std::fprintf(stderr, "  gate: %s moves to the live instance at 0x%llx\n", p.location.c_str(),
+                                              (unsigned long long)base);
+            p.active = false; p.vetted = false; p.base = p.address = 0;
+            arm_module(s, p.module, base);
+            if (agent_has_pending(s)) kick_agent(s);
+            break;
+        }
+    }
     return hit;
 }
 
@@ -7379,6 +7413,23 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
 // A module instance at `base` is gone: its symbols, its recorded base, and its probes (absolute
 // ones retired; module ones back to pending, re-armed when the module loads again).
 static void module_unloaded(probe_session *s, uint64_t base) {
+    // Gates on this instance's copies of other instances' probe sites: gone with it.
+    for (auto it = s->extra_gates.begin(); it != s->extra_gates.end(); ) {
+        if (it->base != base) { ++it; continue; }
+        const uint64_t site = it->site;
+        it = s->extra_gates.erase(it);
+        for (auto g = s->gates.begin(); g != s->gates.end(); ) {
+            if (g->first != site) { ++g; continue; }
+            for (DWORD tid : s->threads) {
+                HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+                GuardTouch touch(s, tid);
+                if (t) { keep_queued_dr6(s, tid, t); set_dr_on_thread(t, g->second, 0, false); CloseHandle(t); }
+            }
+            s->dr_used &= (uint8_t)~(1u << g->second);
+            retire_hw_address(s, g->first);
+            g = s->gates.erase(g);
+        }
+    }
     s->module_instances.erase(std::remove_if(s->module_instances.begin(), s->module_instances.end(),
                                              [base](const auto &m) { return m.second == base; }), s->module_instances.end());
     sym_unload(s, base);
@@ -7564,11 +7615,18 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
         // one DLL, one of them discarded -- which one is not known yet): gate this copy of the
         // site as well until the hook is in; retarget_pending moves the probe if its own copy
         // never becomes installable.
-        if (!s->detaching)
+        // The same for an ACTIVE probe whose instance is still mapped: an older instance that is
+        // being unloaded (its DllMain detach runs) while this one is already in use by another
+        // thread -- calls to this one would go unhooked until the late UNLOAD.
+        bool extra = false;
+        if (!s->detaching && s->shared && s->shared->service_ready && s->svc_event)
             for (auto &p : s->probes)
-                if ((p->flags & PROBE_INLINE) && p->address && p->base && p->base != base && !p->active && !p->retired &&
-                    iequals(p->module, name))
-                    s->extra_gates.push_back(base + (p->address - p->base));
+                if ((p->flags & PROBE_INLINE) && p->address && p->base && p->base != base && !p->retired &&
+                    iequals(p->module, name)) {
+                    probe_session::ExtraGate e; e.site = base + (p->address - p->base); e.base = base; e.probe = p.get();
+                    s->extra_gates.push_back(e); extra = true;
+                }
+        if (extra && !agent_has_pending(s)) arm_gates_for_pending(s);   // (with pending ones: below)
         if (iequals(name, "probe_api_agent.dll")) {
             s->remote_agent = base;
         }
