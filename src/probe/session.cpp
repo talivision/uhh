@@ -6992,6 +6992,20 @@ static void ctrl_leave(probe_session *s) {
 }
 
 #if defined(UHH_TEST_HOOKS)
+// UHH_TEST_STOP_LATE_MS=ms (test-only build): probe_run acts on a probe_close's detach request
+// only ms after it first sees it, dispatching events meanwhile -- the debug loop busy when the
+// request comes, forced: a target that dies right after the request ends the session on its
+// EXIT_PROCESS first (regress lifecycle-target-dies-*, case "late").
+static bool test_stop_late() {
+    static const long ms = [] { const char *v = std::getenv("UHH_TEST_STOP_LATE_MS"); return v ? std::atol(v) : 0L; }();
+    static ULONGLONG first = 0;
+    if (ms <= 0) return false;
+    if (!first) {
+        first = GetTickCount64();
+        std::fprintf(stderr, "probe: test: acting on the detach request %ld ms late\n", ms);
+    }
+    return GetTickCount64() - first < (ULONGLONG)ms;
+}
 // UHH_TEST_DIE_AFTER_HIT_MS=ms (test-only build): once a user probe has been hit, after the
 // first exception event that was continued with its thread not mid-step (the hit's thread
 // runs on), wait ms -- no event, no guard sync meanwhile -- and die (rc 96). The program
@@ -7037,6 +7051,9 @@ extern "C" int probe_run(probe_session *s) {
             std::fprintf(stderr, "probe: interrupted: %s\n", s->attached
                          ? "detaching (probes removed, the target keeps running)" : "ending the target");
         }
+#if defined(UHH_TEST_HOOKS)
+        if (s->stop_requested && s->attached && test_stop_late()) {} else      // keeps dispatching meanwhile
+#endif
         if (s->stop_requested) {
             // probe_close was called on another thread. The debug API binds the debug object
             // to THIS thread, so the detach (or termination) happens here.

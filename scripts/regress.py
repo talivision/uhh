@@ -6966,14 +6966,15 @@ def lc_brief(c):
 class LcDriver:
     """lifecycle_driver: stdout probe_log lines are only COUNTED (never kept)."""
 
-    def __init__(self, pid, cfg, *extra, group=False):
-        args = [str(exe("lifecycle_driver.exe")), str(pid)]
+    def __init__(self, pid, cfg, *extra, group=False, driver="lifecycle_driver.exe", env=None):
+        args = [str(exe(driver)), str(pid)]
         for k in ("open", "close", "read", "flag", "slow", "work"):
             args += [f"--{k}", cfg.get(k, "none")]
         args += [str(x) for x in extra]
         self.probes = sum(1 for k in ("open", "close", "read", "flag", "slow", "work") if cfg.get(k, "none") != "none")
         self.p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                  creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if group else 0)
+                                  creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if group else 0,
+                                  env=dict(os.environ, **env) if env else None)
         self.logs, self.other, self.cv = 0, [], threading.Condition()
         self.t = threading.Thread(target=self._pump, daemon=True); self.t.start()
         self.err = Lines(self.p.stderr)
@@ -7140,8 +7141,9 @@ def lc_detach_cases(cfgname, cfg):
 def lc_target_dies(cfgname, cfg):
     """The target dies (TerminateProcess) N ms into the attach / agent injection / install, or
     right after a detach was requested (5 ms after; "detach0": at once, so the death races the
-    request -- the session can end on the target's EXIT_PROCESS before probe_run sees the
-    request): the controller must notice, end its session and exit on its own (no hang, no
+    request; "late": the test-hook driver acts on the request 400 ms late, the target dies 50 ms
+    after it -- forced, the session ends on the target's EXIT_PROCESS before probe_run acts on
+    the request, as seen once in ~20 x86 runs: no final accounting was printed): the controller must notice, end its session and exit on its own (no hang, no
     crash) with every log it wrote delivered and none dropped. A session that was established
     ("attached") must report its final accounting (hits, logs_written, log_dropped, in_flight:
     probe_close's detached/ended line or the runner's probe_report), logs_written == the
@@ -7149,16 +7151,25 @@ def lc_target_dies(cfgname, cfg):
     before the session existed must exit 1 with a report of zero logs. (Not every lifecycle
     probe logs every hit, so hits are not balanced against logs here; realbig/stdout do that.)"""
     bad, n, seen = [], 0, []
-    for when in (0, 2, 10, 40, 150, 600, "detach", "detach0"):
+    if not exe("lifecycle_driver_th.exe"):
+        bad.append("missing project-built binary lifecycle_driver_th.exe")
+    for when in (0, 2, 10, 40, 150, 600, "detach", "detach0", "late"):
         n += 1
         tg = d = None
+        if when == "late" and not exe("lifecycle_driver_th.exe"):
+            continue
         try:
             tg = LcTarget("--threads", 4, "--churn")
-            d = LcDriver(tg.pid, cfg, "--detach-on-stdin")
-            if when in ("detach", "detach0"):
+            if when == "late":
+                d = LcDriver(tg.pid, cfg, "--detach-on-stdin", driver="lifecycle_driver_th.exe",
+                             env={"UHH_TEST_STOP_LATE_MS": "400"})
+            else:
+                d = LcDriver(tg.pid, cfg, "--detach-on-stdin")
+            if when in ("detach", "detach0", "late"):
                 d.wait_attached(); d.wait_active(timeout=30)
                 d.detach()
                 if when == "detach": time.sleep(0.005)
+                if when == "late": time.sleep(0.05)
             else:
                 time.sleep(when / 1000.0)
             tg.kill()
@@ -7177,6 +7188,8 @@ def lc_target_dies(cfgname, cfg):
                            f"({acct['source']})")
 
             if session and rc != 0: why.append(f"rc={rc} after the session was established")
+            if when == "late" and session and (acct or {}).get("source") != "ended":
+                why.append(f"forced late stop: accounting from {(acct or {}).get('source')} (want 'probe: ended:')")
             if not session and (rc != 1 or (acct or {}).get("logs_written") not in (0, None) or d.logs):
                 why.append(f"attach failed before the session existed but rc={rc} delivered={d.logs}")
             if why:
