@@ -7952,6 +7952,309 @@ def check_quickstart():
         record(name, False, repr(e))
 
 
+def check_callfunc_concurrent():
+    """call_func from several threads' callbacks (ROADMAP F5/D3). Breakpoint/hw keep their
+    documented contract -- callbacks never overlap: other threads' code-probe hits wait while a
+    call is in flight -- and every call of every thread succeeds, none is lost.
+    callfunc-many-<bp/hw>: 100 threads hit the probe at once, each callback call_funcs a callee
+    that hits another probe on its own thread (counted, no callback): 100 calls ok, exact hits.
+    callfunc-watch-<backend>: a data-watch hit -- which cannot be held back -- arrives while
+    another thread's callback is inside call_func (a 500 ms callee); the watch callback's own
+    call_func must work (it returned 0: "no nesting") and both calls return their values.
+    callfunc-lock-inline: the inline reference for a callee needing a lock another thread
+    holds at its own probe hit (breakpoint/hw: that thread waits until the call is over, so the
+    call times out -- documented, limitations.md)."""
+    d, t = exe("ar_driver.exe"), exe("ar_target.exe")
+    if not d or not t:
+        return missing_bin("callfunc-concurrent", "ar_driver/ar_target")
+
+    def go(bk, case, specs, timeout):
+        args = [d, "--backend", bk]
+        for sp in specs:
+            args += ["--probe", sp]
+        return run(args + ["--", t, case], timeout=timeout)
+
+    def logs(o):
+        cnt = {}
+        for x in o:
+            m = str(x.get("message", ""))
+            if x.get("kind") == "probe_log" and m.startswith(("ar ", "uhh warning")):
+                cnt[m] = cnt.get(m, 0) + 1
+        return cnt
+
+    def hits_of(o, sym):
+        return next((p.get("hits") for p in probes(o) if sym in str(p.get("location", ""))), None)
+
+    def row(o):
+        return next((x for x in o if x.get("kind") == "ar"), {})
+
+    def common(r, rep, bad):
+        if rep.get("log_dropped") != 0: bad.append(f"dropped={rep.get('log_dropped')}")
+        if rep.get("callbacks_interrupted", 0) != 0: bad.append(f"intr={rep.get('callbacks_interrupted')}")
+        if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
+        if "timed out" in (r.stderr or ""): bad.append("call_func timed out")
+
+    def rec(name, bad, ok_detail, r):
+        record(name, not bad, ("; ".join(bad) + f" stderr={(r.stderr or '')[-300:]!r}") if bad else ok_detail)
+
+    n = 100
+    for bk in ("breakpoint", "hw"):
+        name = f"callfunc-many-{bk}"
+        try:
+            r, o = go(bk, "cfmanyq", ["ar_target.exe!ar_cf_site=ar_on_cf", "ar_target.exe!ar_cf_inner=ar_on_cf_inner"], 180)
+            rw, rep, lg, bad = row(o), report(o), logs(o), []
+            hs, hi = hits_of(o, "ar_cf_site"), hits_of(o, "ar_cf_inner")
+            if rw.get("sum") != sum(range(1000, 1000 + n)) or rw.get("arrived") != n: bad.append(f"row={rw}")
+            if hs != n or hi != n: bad.append(f"hits site={hs} inner={hi} want={n}")
+            if lg != {"ar cf-many ok=1 good=1": n}: bad.append(f"logs={lg}")
+            common(r, rep, bad)
+            rec(name, bad, f"row={rw} hits={hs}/{hi} logs={lg}", r)
+        except Exception as e:
+            record(name, False, repr(e))
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"callfunc-watch-{bk}"
+        try:
+            r, o = go(bk, "cfwatch", ["ar_target.exe!ar_cf_site=ar_on_cf", "ar_target.exe!ar_cfw_setup=ar_on_cfw_setup"], 90)
+            rw, rep, lg, bad = row(o), report(o), logs(o), []
+            if (rw.get("inside"), rw.get("caller"), rw.get("var")) != (1, 5, 1): bad.append(f"row={rw}")
+            want = {"ar cfw setup=1": 1, "ar cfw slow ok=1 r=11": 1, "ar cfw watch ok=1 r=9": 1}
+            if lg != want: bad.append(f"logs={lg}")
+            common(r, rep, bad)
+            rec(name, bad, f"row={rw} logs={lg}", r)
+        except Exception as e:
+            record(name, False, repr(e))
+    for bk in ("breakpoint", "hw"):
+        # Codex review: the watch callback takes a lock the call_func'ing callback holds across
+        # the call. A data-watch hit must wait like any other hit (callbacks never overlap);
+        # run during the parked call it blocked the debug thread for good (timeout: hang).
+        name = f"callfunc-watch-lock-{bk}"
+        try:
+            r, o = go(bk, "cfwatchlock", ["ar_target.exe!ar_cf_site=ar_on_cf", "ar_target.exe!ar_cfw_setup=ar_on_cfwl_setup"], 60)
+            rw, rep, lg, bad = row(o), report(o), logs(o), []
+            if (rw.get("inside"), rw.get("caller"), rw.get("var")) != (1, 6, 1): bad.append(f"row={rw}")
+            want = {"ar cfw setup=1": 1, "ar cfw slow ok=1 r=11": 1, "ar cfw watch ok=1 r=9": 1}
+            if lg != want: bad.append(f"logs={lg}")
+            common(r, rep, bad)
+            rec(name, bad, f"row={rw} logs={lg}", r)
+        except Exception as e:
+            record(name, False, repr(e))
+    dth = exe("ar_driver_th.exe")
+    for bk in ("breakpoint", "hw"):
+        # Codex review: a call_func timing out while its callee's return trap is already queued
+        # (the timeout ran first: forced by the UHH_TEST_LATE_TRAP hook, every call). The late
+        # trap belongs to the abandoned call: swallowed -- it reached the target as an unknown
+        # breakpoint (the target died). Every call returns 0, the program is unaffected.
+        name = f"callfunc-late-trap-{bk}"
+        if not dth:
+            missing_bin(name, "ar_driver_th"); continue
+        try:
+            env = dict(os.environ, UHH_TEST_LATE_TRAP="1")
+            r = subprocess.run([str(dth), "--backend", bk, "--probe", "ar_target.exe!ar_cf_site=ar_on_cf", "--", str(t), "cfmanyq"],
+                               capture_output=True, text=True, timeout=300, env=env)
+            o = [json.loads(x) for x in r.stdout.splitlines() if x.strip().startswith("{")]
+            rw, rep, lg, bad = row(o), report(o), logs(o), []
+            if rw.get("sum") != sum(range(1000, 1000 + n)) or rw.get("arrived") != n: bad.append(f"row={rw}")
+            if lg != {"ar cf-many ok=0 good=0": n}: bad.append(f"logs={lg} (want every call timed out)")
+            if hits_of(o, "ar_cf_site") != n: bad.append(f"hits={hits_of(o, 'ar_cf_site')} want={n}")
+            if "target crashed" in (r.stderr or ""): bad.append("target crashed")
+            if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
+            rec(name, bad, f"{n} late return traps swallowed, row={rw}", r)
+        except Exception as e:
+            record(name, False, repr(e))
+    name = "callfunc-lock-inline"
+    try:
+        r, o = go("inline", "cflock", ["ar_target.exe!ar_cf_site=ar_on_cf"], 90)
+        rw, rep, lg, bad = row(o), report(o), logs(o), []
+        if (rw.get("inside"), rw.get("joined"), rw.get("held"), rw.get("waiter")) != (1, 1, 2, 4): bad.append(f"row={rw}")
+        if lg != {"ar cf-lock holder ok=1 r=6": 1, "ar cf-lock waiter ok=1 r=7": 1}: bad.append(f"logs={lg}")
+        if hits_of(o, "ar_cf_site") != 2: bad.append(f"hits={hits_of(o, 'ar_cf_site')} want=2")
+        common(r, rep, bad)
+        rec(name, bad, f"row={rw} logs={lg}", r)
+    except Exception as e:
+        record(name, False, repr(e))
+
+
+def check_hw_co_borrow():
+    """Codex review of the NtContinue fixup (F4): breakpoint/hw call_original on a hw probe
+    with all 4 DRs in use lends the probe's own slot to the return catch on that thread. The
+    original raises an exception and continues it (filter -> NtContinue): the context-restore
+    fixup must leave that thread's borrowed slot alone, or the return is missed and the
+    callback abandoned. 5 calls, each call_original ok with the original's value."""
+    d, t = exe("ar_driver.exe"), exe("ar_target.exe")
+    if not d or not t:
+        return missing_bin("hw-co-borrow-restore", "ar_driver/ar_target")
+    try:
+        r, o = run([d, "--backend", "hw", "--probe", "ar_target.exe!ar_dr_arm=ar_on_dr_arm",
+                    "--probe", "ar_target.exe!ar_cob_other=ar_on_site", "--probe", "ar_target.exe!ar_cob_orig=ar_on_cob",
+                    "--", t, "coborrow"], timeout=120)
+        rw, rep, bad = next((x for x in o if x.get("kind") == "ar"), {}), report(o), []
+        msgs = Counter(str(x.get("message", "")) for x in o if x.get("kind") == "probe_log")
+        want = Counter({f"ar cob ok=1 r={2 * i}": 1 for i in range(5)})
+        want["ar site"] = 1
+        if (rw.get("sum"), rw.get("other")) != (20, 3): bad.append(f"row={rw}")
+        if msgs != want: bad.append(f"logs={dict(msgs)}")
+        if "hw DR3" not in (r.stderr or ""): bad.append("4th debug register not in use (no borrowing)")
+        if "without returning" in (r.stderr or "") or "did not return" in (r.stderr or ""): bad.append("call_original released")
+        if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
+        record("hw-co-borrow-restore", not bad, ("; ".join(bad) + f" stderr={(r.stderr or '')[-300:]!r}") if bad
+               else f"row={rw} logs exact")
+    except Exception as e:
+        record("hw-co-borrow-restore", False, repr(e))
+
+
+def check_hw_dr_restore():
+    """ROADMAP F4: a hw probe armed at runtime (from a callback) while one thread sits in an
+    exception filter and another inside a user APC. Both later resume through NtContinue
+    with a context the kernel captured BEFORE the arm -- debug registers included -- which
+    put the old DRs back: that thread never hit the probe again. Every call of the probed
+    function on all three threads must be seen (30 hits, one log each)."""
+    d, t = exe("ar_driver.exe"), exe("ar_target.exe")
+    if not d or not t:
+        return missing_bin("hw-dr-restore", "ar_driver/ar_target")
+    try:
+        r, o = run([d, "--backend", "hw", "--probe", "ar_target.exe!ar_dr_arm=ar_on_dr_arm", "--", t, "drrestore"], timeout=120)
+        rw = next((x for x in o if x.get("kind") == "ar"), {})
+        rep, bad = report(o), []
+        got = Counter(int(m.group(1)) for x in o if x.get("kind") == "probe_log"
+                      for m in [re.match(r"ar dr x=(\d+)$", str(x.get("message", "")))] if m)
+        want = Counter(list(range(100, 110)) + list(range(200, 210)) + list(range(300, 310)))
+        hits = next((p.get("hits") for p in probes(o) if "ar_dr_site" in str(p.get("location", ""))), None)
+        if (rw.get("inside"), rw.get("main"), rw.get("exception"), rw.get("apc")) != (1, 10, 10, 10): bad.append(f"row={rw}")
+        if got != want:
+            miss = want - got
+            bad.append(f"logs missing={sorted(miss)[:5]}.. ({sum(miss.values())}: main={sum(1 for x in miss if x < 200)} "
+                       f"exception={sum(1 for x in miss if 200 <= x < 300)} apc={sum(1 for x in miss if x >= 300)}) "
+                       f"extra={sorted((got - want).elements())[:5]}")
+        if hits != 30: bad.append(f"hits={hits} want=30")
+        arm = next((p.get("hits") for p in probes(o) if "ar_dr_arm" in str(p.get("location", ""))), None)
+        site_rows = sum(1 for p in probes(o) if "ar_dr_site" in str(p.get("location", "")))
+        if arm != 1 or site_rows != 1: bad.append(f"arm hits={arm} site probes={site_rows} (want 1, 1)")
+        if rep.get("log_dropped") != 0: bad.append(f"dropped={rep.get('log_dropped')}")
+        if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
+        record("hw-dr-restore", not bad, "; ".join(bad) or f"row={rw} hits={hits}")
+    except Exception as e:
+        record("hw-dr-restore", False, repr(e))
+    # Codex review: the FIRST instruction after the restore. A hw probe is armed (from a
+    # callback) exactly where a thread inside a user APC resumes -- right after its wait's
+    # kernel transition in NtDelayExecution. That instruction must hit it: on x86 the old DRs
+    # were re-applied only after it had run (trap flag) and the hit was lost.
+    try:
+        r, o = run([d, "--backend", "hw", "--probe", "ar_target.exe!ar_dr2_arm=ar_on_dr2_arm", "--", t, "drresume"], timeout=120)
+        rw, rep, bad = next((x for x in o if x.get("kind") == "ar"), {}), report(o), []
+        tid = rw.get("apc_tid")
+        mine = [x for x in o if x.get("kind") == "probe_log" and x.get("message") == "ar dr2 hit" and x.get("tid") == tid]
+        if (rw.get("inside"), rw.get("site")) != (1, 1): bad.append(f"row={rw}")
+        if len(mine) != 1: bad.append(f"resume-site hits on the APC thread={len(mine)} (want 1)")
+        if any(x.get("message") == "ar dr2 refused" for x in o if x.get("kind") == "probe_log"): bad.append("arm refused")
+        if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
+        record("hw-dr-restore-first", not bad, "; ".join(bad) or f"row={rw} hit at the first resumed instruction")
+    except Exception as e:
+        record("hw-dr-restore-first", False, repr(e))
+
+
+def check_inline_absolute():
+    """ROADMAP D5: an inline probe added BY ADDRESS (probe_add_address from a callback, here
+    at a call's return site) gets the same site checks as one added by symbol. ar_d5_code's
+    return site is followed by a loop head 3 bytes later: a 5-byte hook there would split
+    the loop's target. inline-absolute-refused: refused (the program's result unchanged, no
+    hit); inline-absolute-fallback: with PROBE_FALLBACK_HW it runs as a hw probe instead.
+    (Address probes used to skip the function-bounds / branch-target part of the check.)"""
+    d, t = exe("ar_driver.exe"), exe("ar_target.exe")
+    if not d or not t:
+        return missing_bin("inline-absolute", "ar_driver/ar_target")
+    callee = "ar_target.exe!ar_d5_code+" + ("0x14" if pe_is_x86(t) else "0x21")
+    for kind, cb in (("refused", "ar_on_d5_callee"), ("fallback", "ar_on_d5_callee_fb")):
+        name = f"inline-absolute-{kind}"
+        try:
+            r, o = run([d, "--backend", "inline", "--probe", f"{callee}={cb}", "--", t, "absret"], timeout=120)
+            rw, rep, bad = next((x for x in o if x.get("kind") == "ar"), {}), report(o), []
+            msgs = [str(x.get("message", "")) for x in o if x.get("kind") == "probe_log"]
+            ret = next((p for p in probes(o) if str(p.get("location", "")).startswith("0x")), {})
+            if rw.get("sum") != 30: bad.append(f"row={rw} (want sum=30)")
+            if msgs.count("ar d5 add=1") != 1: bad.append(f"add logs={[m for m in msgs if 'add=' in m]}")
+            refused = "would be written across a jump" in (r.stderr or "")
+            if kind == "refused":
+                if not refused: bad.append("no refusal on stderr")
+                if ret.get("hits") or msgs.count("ar d5 ret"): bad.append(f"return probe ran: {ret}")
+            else:
+                # (armed before or after the first call returns: 2 or 3 returns seen, each logged)
+                if ret.get("backend") != "hw" or ret.get("hits") not in (2, 3) or msgs.count("ar d5 ret") != ret.get("hits"):
+                    bad.append(f"return probe={ret} logs={msgs.count('ar d5 ret')} (want hw, 2-3)")
+            if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
+            record(name, not bad, "; ".join(bad) + ("" if not bad else f" stderr={(r.stderr or '')[-400:]!r}")
+                   or f"sum={rw.get('sum')} return_probe={ret.get('backend')}/{ret.get('hits')}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+def check_cet_agent():
+    """The injected inline agent (probe_api_agent.dll) must load into a process whose policy
+    is BlockNonCetBinaries: it is linked /CETCOMPAT (every `ret` in its own code returns
+    through a real call: audited, ROADMAP "BlockNonCetBinaries"). cet-agent-image: the bit
+    is set. cet-agent-block-noncet: cet_probe turns the policy on for itself at runtime,
+    then maps a non-CETCOMPAT DLL (configparse.dll: refused) and the agent (must map). SKIP
+    when this Windows does not let a process set the policy at runtime."""
+    agent, pr_exe, other = BIN / "probe_api_agent.dll", exe("cet_probe.exe"), BIN / "configparse.dll"
+    if not agent.exists() or not pr_exe or not other.exists():
+        return missing_bin("cet-agent", "probe_api_agent.dll/cet_probe/configparse.dll")
+    try:
+        record("cet-agent-image", pe_cetcompat(agent) and not pe_cetcompat(other),
+               f"probe_api_agent.dll:CETCOMPAT={pe_cetcompat(agent)} configparse.dll:CETCOMPAT={pe_cetcompat(other)}")
+    except Exception as e:
+        record("cet-agent-image", False, repr(e))
+    try:
+        r, o = run([pr_exe, "--block-non-cet", str(other), str(agent)], timeout=60)
+        blk = next((x for x in o if x.get("kind") == "cet_block"), {})
+        loads = {x.get("dll"): x for x in o if x.get("kind") == "cet_block_load"}
+        a, c = loads.get("probe_api_agent.dll", {}), loads.get("configparse.dll", {})
+        detail = (f"set={blk.get('set')} set_error={blk.get('set_error')} policy={blk.get('BlockNonCetBinaries')} "
+                  f"configparse={c.get('loaded')}/{c.get('error')} agent={a.get('loaded')}/{a.get('error')}")
+        if blk.get("set") != 1 or blk.get("BlockNonCetBinaries") != 1:
+            skip("cet-agent-block-noncet", f"BlockNonCetBinaries cannot be set at runtime here: {detail}")
+        elif c.get("loaded") != 0:
+            skip("cet-agent-block-noncet", f"the policy is set but not enforced (a non-CET DLL still maps): {detail}")
+        else:
+            record("cet-agent-block-noncet", a.get("loaded") == 1, detail)
+    except Exception as e:
+        record("cet-agent-block-noncet", False, repr(e))
+
+
+def check_sessions_repeat(n=60):
+    """Many sessions one after the other in ONE controller process (ROADMAP "x86 cumulative-
+    session flakiness"): ar_driver --repeat, backends in turn (breakpoint, hw, inline), each
+    session the cfwatch case (a callback inside call_func on one thread while a data watch
+    added from a callback fires on another and call_funcs too). Every session exact (row,
+    every log, nothing dropped), and the controller's handle count flat after warm-up (a
+    leaked or double-closed handle shows here or as a failure)."""
+    d, t = exe("ar_driver.exe"), exe("ar_target.exe")
+    if not d or not t:
+        return missing_bin("sessions-repeat", "ar_driver/ar_target")
+    try:
+        r, o = run([d, "--backend", "cycle", "--repeat", n, "--probe", "ar_target.exe!ar_cf_site=ar_on_cf",
+                    "--probe", "ar_target.exe!ar_cfw_setup=ar_on_cfw_setup", "--", t, "cfwatch"], timeout=60 + 15 * n)
+        iters = [x for x in o if x.get("kind") == "iter"]
+        rows = [x for x in o if x.get("kind") == "ar"]
+        reps = [x for x in o if x.get("kind") == "probe_report"]
+        msgs = Counter(str(x.get("message", "")) for x in o if x.get("kind") == "probe_log")
+        bad = []
+        failed = [(x.get("i"), x.get("backend")) for x in iters if x.get("ok") != 1]
+        if len(iters) != n or failed: bad.append(f"iters={len(iters)}/{n} failed={failed[:6]}")
+        wrong = [i for i, x in enumerate(rows) if (x.get("inside"), x.get("caller"), x.get("var")) != (1, 5, 1)]
+        if len(rows) != n or wrong: bad.append(f"rows={len(rows)}/{n} wrong={wrong[:6]}")
+        want = {"ar cfw setup=1": n, "ar cfw slow ok=1 r=11": n, "ar cfw watch ok=1 r=9": n}
+        if dict(msgs) != want: bad.append(f"logs={dict(msgs)}")
+        drops = [i for i, x in enumerate(reps) if x.get("log_dropped") != 0 or x.get("error") is not None]
+        if len(reps) != n or drops: bad.append(f"reports={len(reps)}/{n} bad={drops[:6]}")
+        h = [x.get("handles", 0) for x in iters]
+        growth = (h[-1] - h[2]) if len(h) > 3 else None
+        if growth is None or growth > 24: bad.append(f"controller handles {h[:3]}..{h[-3:]} (growth {growth})")
+        if r.returncode != 0: bad.append(f"rc={r.returncode}")
+        record("sessions-repeat", not bad, ("; ".join(bad) + f" stderr={(r.stderr or '')[-300:]!r}") if bad
+               else f"{n} sessions exact; controller handles {h[2]} -> {h[-1]}")
+    except Exception as e:
+        record("sessions-repeat", False, repr(e))
+
+
 # --- gated-e2e-*: the flagship use case end to end, against the TARGET's own ground truth ------
 E2E_BACKENDS = ("breakpoint", "hw", "inline")
 E2E_SHORT = {"breakpoint": "bp", "hw": "hw", "inline": "in"}
@@ -9071,6 +9374,12 @@ def main():
     if want(check_cx2_review): check_cx2_review()
     if want(check_symbols_grammar): check_symbols_grammar()
     if want(check_quickstart): check_quickstart()
+    if want(check_callfunc_concurrent): check_callfunc_concurrent()
+    if want(check_hw_dr_restore): check_hw_dr_restore()
+    if want(check_hw_co_borrow): check_hw_co_borrow()
+    if want(check_inline_absolute): check_inline_absolute()
+    if want(check_cet_agent): check_cet_agent()
+    if want(check_sessions_repeat): check_sessions_repeat()
     if want(check_gated_e2e): check_gated_e2e()
     if want(check_realbig): check_realbig("" if args.bigapps else REALBIG_DEFAULT)
     if only and not RESULTS:
