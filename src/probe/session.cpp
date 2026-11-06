@@ -401,7 +401,11 @@ struct probe_session {
     bool parking = false;
     bool fine_timer = false;
     ULONGLONG rekick_at = 0;
-    std::unordered_set<uint64_t> early_unloaded;   // instances torn down at a newer LOAD (their late UNLOAD skipped)                   // ask the agent's service for another install round then (0: no)                   // timeBeginPeriod(1) held (only while something polls at 1 ms)
+    std::unordered_set<uint64_t> early_unloaded;   // instances torn down at a newer LOAD (their late UNLOAD skipped)
+    // Every mapped instance of every module, in LOAD order (module_bases keeps only the latest):
+    // a DLL loaded concurrently can be mapped twice, one mapping discarded. See retarget_pending.
+    std::vector<std::pair<std::string, uint64_t>> module_instances;
+    std::vector<uint64_t> extra_gates;             // other instances' copies of pending inline sites (gated too)                   // ask the agent's service for another install round then (0: no)                   // timeBeginPeriod(1) held (only while something polls at 1 ms)
     std::chrono::steady_clock::time_point fair_window{}, last_event{};
     std::chrono::steady_clock::duration fair_gaps{};
     // Context round-trips (ROADMAP A4): a thread whose debug event we handled while the target
@@ -4018,6 +4022,11 @@ static bool arm_gates_for_pending(probe_session *s) {
             for (auto &g : s->gates) if (g.first == p->address) gated = true;
             if (!gated) sites.push_back(p->address);
         }
+    for (uint64_t x : s->extra_gates) {
+        bool gated = std::find(sites.begin(), sites.end(), x) != sites.end();
+        for (auto &g : s->gates) if (g.first == x) gated = true;
+        if (!gated) sites.push_back(x);
+    }
     std::vector<int> slots;
     const uint8_t foreign = sites.empty() ? 0 : target_slots_any(s);
     for (int slot = 0; slot < 4 && slots.size() < sites.size(); ++slot)
@@ -4045,6 +4054,7 @@ static bool arm_gates_for_pending(probe_session *s) {
 }
 
 static void clear_gates(probe_session *s) {
+    s->extra_gates.clear();
     for (auto &g : s->gates) {
         for (DWORD tid : s->threads) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
@@ -5002,6 +5012,35 @@ static void park_thread(probe_session *s, DWORD tid) {
 // Called by the event loop around every wait. `blocked`: how long the last wait for a debug
 // event blocked (the target ran unfrozen meanwhile, give or take), `got`: an event came.
 // Returns the next wait's timeout.
+static bool arm_module(probe_session *s, const std::string &module, uint64_t base);
+static bool arm_gates_for_pending(probe_session *s);
+static bool site_executable(HANDLE h, uint64_t a) {
+    MEMORY_BASIC_INFORMATION m{};
+    return a && VirtualQueryEx(h, (void *)(uintptr_t)a, &m, sizeof(m)) && m.State == MEM_COMMIT && !(m.Protect & PAGE_GUARD) &&
+           (m.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+}
+// An install round made no progress: a pending inline probe whose site is not installable (not
+// executable code -- an instance still relocating, or a mapping the loader discards) while
+// another instance of its module has that site as code: move the probe there (newest first).
+static void retarget_pending(probe_session *s) {
+    bool moved = false;
+    for (auto &p : s->probes) {
+        if (!(p->flags & PROBE_INLINE) || !p->address || !p->base || p->active || p->retired) continue;
+        if (site_executable(s->pi.hProcess, p->address)) continue;
+        const uint64_t off = p->address - p->base;
+        for (auto it = s->module_instances.rbegin(); it != s->module_instances.rend(); ++it) {
+            if (it->second == p->base || !iequals(it->first, p->module)) continue;
+            if (!site_executable(s->pi.hProcess, it->second + off)) continue;
+            if (trace_enabled()) std::fprintf(stderr, "  retarget %s 0x%llx -> 0x%llx\n", p->location.c_str(),
+                                              (unsigned long long)p->address, (unsigned long long)(it->second + off));
+            p->base = p->address = 0; p->vetted = false;
+            arm_module(s, it->first, it->second);
+            moved = true;
+            break;
+        }
+    }
+    if (moved) arm_gates_for_pending(s);
+}
 static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blocked, bool got) {
     using namespace std::chrono;
     const auto now = steady_clock::now();
@@ -5022,6 +5061,7 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
     // probe_report (flush) waiting for the target to finish.
     if (s->rekick_at && GetTickCount64() >= s->rekick_at) {
         s->rekick_at = 0;
+        if (agent_has_pending(s)) retarget_pending(s);
         if (agent_has_pending(s) && !kick_agent(s)) std::fprintf(stderr, "probe: %s\n", s->error.c_str());
     }
     const bool fine = !s->parked.empty() || !s->ctx_watch.empty() || s->rekick_at;
@@ -7339,6 +7379,8 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
 // A module instance at `base` is gone: its symbols, its recorded base, and its probes (absolute
 // ones retired; module ones back to pending, re-armed when the module loads again).
 static void module_unloaded(probe_session *s, uint64_t base) {
+    s->module_instances.erase(std::remove_if(s->module_instances.begin(), s->module_instances.end(),
+                                             [base](const auto &m) { return m.second == base; }), s->module_instances.end());
     sym_unload(s, base);
     uint64_t size = 0;
     if (auto sz = s->module_sizes.find(base); sz != s->module_sizes.end()) { size = sz->second; s->module_sizes.erase(sz); }
@@ -7515,8 +7557,18 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
             }
         std::string name = event_module_name(s->pi.hProcess, event.u.LoadDll.hFile, base);
         if (!name.empty()) s->module_bases[name] = base;
+        if (!name.empty()) s->module_instances.emplace_back(name, base);
         sym_register(s, event.u.LoadDll.hFile, base);
         ok = arm_module(s, name, base);
+        // A pending inline probe of this module resolved in ANOTHER instance (two mappings of
+        // one DLL, one of them discarded -- which one is not known yet): gate this copy of the
+        // site as well until the hook is in; retarget_pending moves the probe if its own copy
+        // never becomes installable.
+        if (!s->detaching)
+            for (auto &p : s->probes)
+                if ((p->flags & PROBE_INLINE) && p->address && p->base && p->base != base && !p->active && !p->retired &&
+                    iequals(p->module, name))
+                    s->extra_gates.push_back(base + (p->address - p->base));
         if (iequals(name, "probe_api_agent.dll")) {
             s->remote_agent = base;
         }
