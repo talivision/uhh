@@ -121,7 +121,12 @@ enum probe_register {
    callback via get_session(c). From a callback, breakpoint/hw probes arm before the
    target resumes; an inline probe holds the calling thread until its hook is in. */
 probe_session *probe_session_create(void);
-/* "module+0xRVA" or "module!Export[+0xOFF]" -- resolved when the module loads.
+/* "module+0xRVA" or "module!Export[+0xOFF]" -- resolved when the module loads (an export,
+   else a PDB symbol). The grammar is call_func's, on every backend: the module is matched by
+   its file name, case-insensitively (a directory part is ignored), and a name without
+   extension means "<name>.dll" ("kernel32!X" == "kernel32.dll!X"); an EXE is named with
+   its extension ("probe_app.exe!X": "probe_app!X" names probe_app.dll, and a warning on
+   stderr says so when probe_app.exe loads instead). Offsets are "+0x" hex only.
    Limits, the same on every backend and from a callback: a config is at most 4 GB
    (UINT32_MAX bytes); in a session that also has inline probes at most 65536 software-
    breakpoint probes are armed at once (the next one is refused: inline get_mem must see the

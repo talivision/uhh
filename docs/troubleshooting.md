@@ -68,7 +68,7 @@ First steps for any problem:
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Probe stays `pending`, report `"active":false`, `hits` 0 | the module never loaded under that file name. A module name **without extension** (`kernel32!X`) never matches for probes | write the full file name (`kernel32.dll!CreateFileW`, `app.exe!Func`); check the module really loads (`probe: pending` but no `active`) |
+| Probe stays `pending`, report `"active":false`, `hits` 0 | the module never loaded under that file name. A module name **without extension** means `<name>.dll` (`kernel32!X` == `kernel32.dll!X`), so `app!Func` does not match `app.exe` (stderr warns: `probe: warning: app!Func names app.dll ...`) | name an EXE with its extension (`app.exe!Func`); check the module really loads (`probe: pending` but no `active`) |
 | `export 'X' not found` (the session fails when the module loads) | not exported, and not found in the module's PDB | put the PDB beside the image or set `_NT_SYMBOL_PATH` ([symbols.md](symbols.md)); list names with `uhh_trace --list <module> --mask *X*`; or use `module+0xRVA` |
 | `could not decode probe site instruction` | the RVA is not on an instruction boundary | take the RVA from the map/PDB/disassembly |
 | `inline probe <loc> refused: N-byte hook would be written across <what> at +0x... Override with PROBE_ALLOW_UNSAFE_SITE.` | the inline site check: code could arrive inside the overwritten bytes | use a suggested offset from `probe: <loc>: inline-safe nearby: ...`, or `PROBE_FALLBACK_HW`, or breakpoint/hw on that site; `PROBE_ALLOW_UNSAFE_SITE` only if you are sure |

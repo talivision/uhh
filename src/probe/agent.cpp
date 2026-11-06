@@ -705,9 +705,11 @@ extern "C" const void *get_config(probe_context *c) {
 // The controller's grammar exactly (session.cpp parse_location / resolve_symbol), so a
 // call_func symbol resolves -- or is refused -- the same on every backend: "0xADDRESS",
 // "module+0xRVA", "module!Export[+0xOFF]"; offsets need "0x" and hex digits only; the module
-// is matched by its file name (a directory part is ignored) and must include the extension.
-// (GetModuleHandleA alone appended ".dll" to "kernel32" and searched a full path as given;
-// _strtoui64 accepted "+0", "+0xZZ" and "+10"; the controller refuses all of those.)
+// is matched by its file name (a directory part is ignored), and a name without extension
+// means "<name>.dll" -- GetModuleHandleA's own reading, which the controller's
+// module_of_location (session.cpp, also used for every probe location) mirrors exactly.
+// (GetModuleHandleA alone searched a full path as given; _strtoui64 accepted "+0", "+0xZZ"
+// and "+10"; the controller refuses all of those.)
 static bool agent_parse_hex(const char *p, const char *end, uint64_t *out) {
     if (end - p < 3 || p[0] != '0' || (p[1] != 'x' && p[1] != 'X')) return false;
     uint64_t v = 0;

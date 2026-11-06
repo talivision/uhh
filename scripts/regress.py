@@ -7520,6 +7520,120 @@ def check_cxlib():
         record(name, False, repr(e))
 
 
+def check_symbols_grammar():
+    """One module grammar for probe locations and call_func (include/probe_api.h): a module
+    name without extension means "<name>.dll". "kernel32!OpenProcess" and
+    "kernel32.dll!OpenProcess" must both arm and see exactly the same calls on every backend
+    (probe_app --open-via kernel32 opens its helpers through kernel32!OpenProcess). An EXE is
+    named with its extension: "probe_app!OpenThunk" names probe_app.dll, so it must NOT match
+    probe_app.exe -- it stays pending with a warning on stderr -- while
+    "probe_app.exe!OpenThunk" sees every open."""
+    t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
+    if not t or not a:
+        return missing_bin("symbols-grammar", "uhh_trace/probe_app")
+    helpers = 2
+
+    def trace(bk, loc, open_via, fmt="-"):
+        args = [t, "--backend", bk, "-p", f"{loc}:{fmt}", "--", a, "--no-wait", "--helpers", helpers,
+                "--threads", 1, "--reads", 4, "--config", "reads_enabled=1"]
+        if open_via:
+            args += ["--open-via", open_via]
+        r, objs = run(args, timeout=300)
+        pr = next((x for x in probes(objs) if x.get("location") == loc), {})
+        return r, objs, pr
+
+    # A freshly built exe's first run can make one extra in-process OpenProcess call (seen once
+    # per arch on the first instrumented run after a build, never again): warm up uninstrumented,
+    # and compare exactly the calls probe_app makes -- OpenProcess(PROCESS_VM_READ, FALSE, pid)
+    # of each of its helpers, logged with their arguments.
+    run([a, "--no-wait", "--helpers", helpers, "--threads", 1, "--reads", 4, "--config", "reads_enabled=1",
+         "--open-via", "kernel32"], timeout=120)
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"symbols-grammar-{bk}"
+        try:
+            seen, ok, detail = {}, True, []
+            for loc in ("kernel32!OpenProcess", "kernel32.dll!OpenProcess", "KERNEL32!OpenProcess"):
+                r, objs, pr = trace(bk, loc, "kernel32", "xxd")
+                res, err = app(objs), report(objs).get("error")
+                pids = {x.get("pid") for x in objs if x.get("kind") == "opened"}
+                opens = [m for m in (str(x.get("message", "")) for x in objs if x.get("kind") == "probe_log")
+                         if m.startswith("OpenProcess(0x10, 0x0, ") and
+                         m[len("OpenProcess(0x10, 0x0, "):].rstrip(")").lstrip("-").isdigit() and
+                         int(m[len("OpenProcess(0x10, 0x0, "):].rstrip(")")) in pids]
+                seen[loc] = len(opens)
+                good = (r.returncode == 0 and pr.get("active") is True and pr.get("backend") == bk and
+                        len(pids) == helpers and len(opens) == helpers and (pr.get("hits") or 0) >= helpers and
+                        res.get("opened") == helpers and res.get("successful_reads") == 4 and err is None)
+                ok = ok and good
+                detail.append(f"{loc}: active={pr.get('active')} helper_opens={len(opens)} hits={pr.get('hits')} "
+                              f"rc={r.returncode}" + ("" if good else f" err={(err or '')[:80]} "
+                              f"stderr={[l[:120] for l in r.stderr.splitlines() if 'probe:' in l][-4:]}"))
+            # Identical helper opens seen for every spelling: one per helper.
+            ok = ok and set(seen.values()) == {helpers}
+            record(name, ok, "; ".join(detail))
+        except Exception as e:
+            record(name, False, repr(e))
+    # The EXE trap: "probe_app!X" is probe_app.dll -- pending + warning, never probe_app.exe.
+    for bk in ("breakpoint", "inline"):
+        name = f"symbols-grammar-exe-{bk}"
+        try:
+            r1, o1, bare = trace(bk, "probe_app!OpenThunk", None)
+            r2, o2, full = trace(bk, "probe_app.exe!OpenThunk", None)
+            warned = any(l.startswith("probe: warning: probe_app!OpenThunk names probe_app.dll") and
+                         "write probe_app.exe!OpenThunk" in l for l in r1.stderr.splitlines())
+            ok = (r1.returncode == 0 and bare.get("active") is False and bare.get("hits") == 0 and warned and
+                  app(o1).get("opened") == helpers and
+                  r2.returncode == 0 and full.get("active") is True and full.get("hits") == helpers and
+                  report(o2).get("error") is None)
+            record(name, ok, f"bare: active={bare.get('active')} hits={bare.get('hits')} warned={warned} "
+                             f"rc={r1.returncode}; full: active={full.get('active')} hits={full.get('hits')} "
+                             f"rc={r2.returncode} err={(report(o2).get('error') or '')[:80]}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+def check_quickstart():
+    """docs/quickstart.md section 4, compiled and run: examples/quickstart (my_tool) launches
+    probe_app with its config DISABLED; the breakpoint at configparse.dll!ParseConfig+0x16
+    flips the flag (one override), and the inline NtReadVirtualMemory probe logs every read
+    (one "read handle=..." log per hit), nothing dropped, exit 0."""
+    m, a = exe("my_tool.exe"), exe("probe_app.exe")
+    if not m or not a:
+        return missing_bin("quickstart-my-tool", "my_tool/probe_app")
+    threads, reads = 4, 200
+    name = "quickstart-my-tool"
+    try:
+        r, objs = run([m, a, "--no-wait", "--threads", threads, "--reads", reads], timeout=300)
+        res, rep = app(objs), report(objs)
+        rd = next((x for x in probes(objs) if x.get("location") == READ_LOCATION), {})
+        fl = next((x for x in probes(objs) if x.get("location") == "configparse.dll!ParseConfig+0x16"), {})
+        logs = sum(1 for x in objs if x.get("kind") == "probe_log" and
+                   str(x.get("message", "")).startswith("read handle=0x"))
+        want = threads * reads
+        ok = (r.returncode == 0 and res.get("reads_enabled") == 1 and res.get("successful_reads") == want and
+              fl.get("hits") == 1 and fl.get("backend") == "breakpoint" and rep.get("overrides") == 1 and
+              rd.get("backend") == "inline" and rd.get("hits") == want and logs == want and
+              rep.get("log_dropped") == 0 and rep.get("error") is None)
+        record(name, ok, f"reads_enabled={res.get('reads_enabled')} reads={res.get('successful_reads')}/{want} "
+                         f"flag_hits={fl.get('hits')} overrides={rep.get('overrides')} read_hits={rd.get('hits')} "
+                         f"logs={logs} dropped={rep.get('log_dropped')} rc={r.returncode} "
+                         f"err={(rep.get('error') or '')[:100]}")
+    except Exception as e:
+        record(name, False, repr(e))
+    # The doc shows the example's files verbatim: each must appear in it byte for byte.
+    name = "quickstart-doc-sync"
+    try:
+        root = Path(__file__).resolve().parent.parent
+        doc = (root / "docs" / "quickstart.md").read_text(encoding="utf-8")
+        stale = [p for p in ("my_callbacks.h", "my_callbacks.cpp", "main.cpp")
+                 if "```cpp\n" + (root / "examples" / "quickstart" / p).read_text(encoding="utf-8").rstrip("\n")
+                 + "\n```" not in doc]
+        record(name, not stale, f"files not shown verbatim in docs/quickstart.md: {stale}" if stale else
+               "docs/quickstart.md shows examples/quickstart verbatim")
+    except Exception as e:
+        record(name, False, repr(e))
+
+
 def main():
     global BIN
     ap = argparse.ArgumentParser()
@@ -7668,6 +7782,8 @@ def main():
     if want(check_lifecycle): check_lifecycle()
     if want(check_cet_sde): check_cet_sde()
     if want(check_cxlib): check_cxlib()
+    if want(check_symbols_grammar): check_symbols_grammar()
+    if want(check_quickstart): check_quickstart()
     if only and not RESULTS:
         print(f"regress.py: --only {','.join(only)} selected only opt-in tiers that were not enabled "
               f"(--bigapps / --soak-minutes / --volume-reads): no check ran.", file=sys.stderr)

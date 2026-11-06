@@ -47,9 +47,15 @@ Contents: [concepts](#concepts) · [types and macros](#types-and-macros) ·
 | `module!Name+0xOFF` | `configparse.dll!ParseConfig+0x16` | an offset from that symbol |
 
 - `module` is matched by **file name**, case-insensitively; a directory part is ignored.
-  For probes, write the extension (`kernel32.dll`, `probe_app.exe`): a probe's module name
-  without it never matches a loaded module, so the probe stays pending.
-  (`call_func` is more lenient, see there.)
+  A name **without an extension means `<name>.dll`**, as `LoadLibrary`/`GetModuleHandle`
+  read it: `kernel32!CreateFileW` == `kernel32.dll!CreateFileW`. This is one grammar for
+  probe locations (every backend, launch, attach, adds from a callback, `uhh_trace -p`) and
+  [`call_func`](#int-call_funcprobe_context-c-const-char-symbol-uint64_t-ret-int-nargs-).
+- An EXE is named **with** its extension: `probe_app.exe!Func`. `probe_app!Func` names
+  `probe_app.dll`, so it does not match the program; when `probe_app.exe` loads while such
+  a probe is pending, stderr says `probe: warning: probe_app!Func names probe_app.dll (a
+  module name without extension means .dll); the loaded probe_app.exe is not matched --
+  write probe_app.exe!Func to probe it` and the probe stays pending.
 - Offsets are `+0x` hexadecimal only.
 - A probe on a module that is not loaded yet stays **pending** and arms when the module
   loads (also a DLL loaded at run time). It goes back to pending when the module unloads
@@ -350,9 +356,10 @@ of the call stack at the hit to the same record.
 Calls a function **in the target**, on the thread that hit the probe. Returns 1 if the call
 ran; `*ret` receives the return register.
 
-- `symbol`: `"module!Export[+0xOFF]"`, `"module+0xRVA"` or `"0xADDRESS"`. The module is
-  matched by file name (a directory part is ignored); a name without an extension means
-  `<name>.dll` (`"kernel32!X"` == `"kernel32.dll!X"`). Offsets are `+0x` hex only.
+- `symbol`: `"module!Export[+0xOFF]"`, `"module+0xRVA"` or `"0xADDRESS"`, with the module
+  grammar of [probe locations](#locations): matched by file name (a directory part is
+  ignored); a name without an extension means `<name>.dll` (`"kernel32!X"` ==
+  `"kernel32.dll!X"`). Offsets are `+0x` hex only.
 - Up to 8 integer/pointer arguments (Windows x64 ABI; x86 stack arguments, stdcall or
   cdecl). The implementation reads each variadic argument as a `uint64_t`, so pass every
   argument as `uint64_t` (cast constants: `(uint64_t)0`), as the examples do.
