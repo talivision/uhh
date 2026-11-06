@@ -6856,6 +6856,12 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
     if (!thread) return 0;
     CONTEXT saved{}; saved.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | UHH_CONTEXT_FP | CONTEXT_DEBUG_REGISTERS;
     if (!GetThreadContext(thread, &saved)) { CloseHandle(thread); return 0; }
+    // CET: the original's own `ret` pops this frame's shadow-stack entry; putting the thread
+    // back at the hit must put SSP back too, or return_from's `ret` (and a fall-through) pops
+    // the CALLER's entry: a #CP -- fixed up by the kernel in compatibility mode (the ret
+    // gadget is not image code), fatal under strict mode (Exploit protection).
+    uint64_t hit_ssp = 0;
+    const bool have_ssp = target_has_shadow_stack(s) && thread_ssp(thread, &hit_ssp, nullptr);
     int slot = -1;
     for (int k = 0; k < 4 && slot < 0; ++k)
         if (!(s->dr_used & (1u << k)) && !((saved.Dr7 >> (k * 2)) & 3)) slot = k;
@@ -6992,6 +6998,13 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
         saved.Dr6 = 0;
         saved.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | UHH_CONTEXT_FP | CONTEXT_DEBUG_REGISTERS;
         SetThreadContext(thread, &saved);              // exactly as it was at the hit
+        uint64_t now_ssp = 0;
+        if (have_ssp && thread_ssp(thread, &now_ssp, nullptr) && now_ssp != hit_ssp) {
+            const bool set = thread_ssp(thread, nullptr, &hit_ssp);
+            if (trace_enabled() || !set)
+                std::fprintf(stderr, "probe: call_original: shadow-stack pointer 0x%llx -> 0x%llx %s\n", (unsigned long long)now_ssp,
+                             (unsigned long long)hit_ssp, set ? "restored" : "NOT restored (the kernel refused)");
+        }
     } else if (!s->exited && !thread_gone) {
         clear_slot(true);
     }

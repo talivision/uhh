@@ -2006,11 +2006,14 @@ def check_detach():
         try:
             threads = 4
             total = threads * reads
-            _, bo = run([a, "--no-wait", "--threads", threads, "--reads", reads, "--config", "reads_enabled=1"],
+            # inline paced (200k reads/s per thread, >= 7.5 s): an unpaced inline target on a fast
+            # host finished every read before the detach completed (not mid-run).
+            pace = ["--pace", "200000"] if bk == "inline" else []
+            _, bo = run([a, "--no-wait", "--threads", threads, "--reads", reads, "--config", "reads_enabled=1"] + pace,
                         timeout=600)
             base = app(bo)
             target = subprocess.Popen([str(a), "--threads", str(threads), "--reads", str(reads),
-                                       "--config", "reads_enabled=1"],
+                                       "--config", "reads_enabled=1"] + pace,
                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             while True:                                          # wait until it is at its gate
                 line = target.stdout.readline().decode(errors="replace")
