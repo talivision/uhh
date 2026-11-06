@@ -9137,7 +9137,13 @@ def check_cx2_review():
     # controller's in place at a sample is visible to the program (SuspendThread returns 1, not 0):
     # call_original's 20 ms "left the original?" poll suspended the thread for its context read,
     # and a program suspending that thread at that moment got prev=1 (cx2-cosusp-breakpoint on CI,
-    # run 42256070700). The poll now reads the context without a suspension.
+    # run 42256070700). The poll now reads the context without a suspension: x64 must show none.
+    # x86 (a 32-bit controller, WOW64): GetThreadContext on another thread suspends it INSIDE the
+    # call (measured on Windows 10 19045, a standalone 32-bit program reading another thread's
+    # context once per ms: ~0.1% of a sampler's SuspendThread calls return 1; ThreadWow64Context
+    # is refused to 32-bit callers (STATUS_INVALID_INFO_CLASS) and Wow64GetThreadContext suspends
+    # the same way). That residual is inherent to a 32-bit debugger and bounded here at 1%.
+    x86 = pe_is_x86(st) if st else False
     for bk in ("breakpoint", "hw"):
         name = f"cx2-cosample-{bk}"
         if not st:
@@ -9165,12 +9171,16 @@ def check_cx2_review():
             bad = []
             if tgt.returncode != 0: bad.append(f"target_rc={tgt.returncode}")
             if att.returncode != 0: bad.append(f"controller_rc={att.returncode}")
-            if row.get("foreign") != 0: bad.append(f"foreign={row.get('foreign')} of {row.get('samples')} samples (want 0)")
+            foreign, samples = row.get("foreign"), row.get("samples") or 0
+            if foreign is None or (foreign != 0 if not x86 else foreign > samples // 100):
+                bad.append(f"foreign={foreign} of {samples} samples (want {'<= 1% (WOW64 residual)' if x86 else 0})")
             if (row.get("samples") or 0) < 100 or row.get("in_original") != 1:
                 bad.append(f"samples={row.get('samples')} in_original={row.get('in_original')} (want >= 100, 1)")
             if row.get("done") != 1 or row.get("ret") != 38 or wraps != 1:
                 bad.append(f"target row={row} hold_logs={wraps}")
-            record(name, not bad, " ".join(bad) or f"samples={row.get('samples')} foreign=0 ret=38 call_original completed")
+            record(name, not bad, " ".join(bad) or f"samples={samples} foreign={foreign}"
+                   + (" (x86: WOW64 GetThreadContext's implicit suspension, residual)" if x86 and foreign else "")
+                   + " ret=38 call_original completed")
         except Exception as e:
             record(name, False, repr(e))
         finally:
