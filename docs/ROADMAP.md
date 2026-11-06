@@ -211,17 +211,21 @@ reads, a slow (50 ms) callback under 32 threads.
   with no trap flag, so there is no single-step completion event; a fault in the copy is mapped
   back to the real instruction (re-run in place, as before), a watch hit in it reports the real
   pc, a thread inside one at a detach is moved to the real code. A program that single-steps
-  itself (TF set at the hit) keeps the stepped copy. (2) fairness parking: when the target ran
-  unfrozen for less than a tenth of the last 20 ms (the debugger's wait for events blocked < 2 ms),
-  the threads whose exception events are continued are parked (suspended) until the event queue
-  has been empty for 2 ms -- the threads that hit nothing run then -- and released together.
-  Never parked: a thread mid-step / owning an in-place window, a call_func/call_original thread,
-  the agent's threads; released before any call_func and at detach; listed for the controller-
-  death guard. `hunt-starve-*` (8 readers; main's OWN progress, measured by the target: how late
-  its Sleep(300) returns and how long its one line takes to go out, each within 1.5 s + 10x the
-  same workload uninstrumented on the same machine in the same check -- a wall-time bar failed on
-  a VM loaded by other jobs (37.6 s, mostly delivering 266k logs); logs + dropped + interrupted
-  == hits); the exit checks now use 8 readers on every backend
+  itself (TF set at the hit) keeps the stepped copy. (2) fairness by YIELD rounds: when debug
+  events are dense (>= 2000/s) or the target ran unfrozen for less than a tenth of the last
+  20 ms, each thread whose hit is continued in the next window is sent once through a per-thread
+  yield stub (registers, flags, XMM saved; ntdll!NtDelayExecution until a deadline common to the
+  round, ~4 ms; everything restored; a jump to where it was going), so the hot threads are off
+  the CPU together for a moment and the threads that hit nothing run. Not done: CET shadow
+  stacks, a program that probes NtDelayExecution itself, a thread mid-step / in a call. A first
+  version SUSPENDED the hot threads instead -- a thread suspended inside its debug event keeps
+  the whole target frozen until it runs again, so main's Sleep(300) still returned 3-20 s late
+  (measured once main's own progress was measured, below). Detach rewrites a sleeping thread's
+  resume address out of a trampoline. `hunt-starve-*` (8 readers; judged in a unit machine load
+  does not distort: the probe hits the session handled between main's Sleep(300) falling due and
+  main running again, counted by the target -- yield rounds 1.5k-6.5k, suspension parking
+  45k-234k; bar 20000; wall time reported; logs + dropped + interrupted
+== hits); the exit checks now use 8 readers on every backend
 - ✅ (A6) inline missed calls made BEFORE the image entry point (TLS callbacks at process attach,
   static-import DllMain): the agent was loaded by a new thread, which cannot start before process
   initialisation ends, so hooks went in at the entry hold. Fixed (huntaudit): a launched target's
