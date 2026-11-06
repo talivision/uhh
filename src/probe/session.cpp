@@ -211,6 +211,10 @@ struct probe_session {
     std::map<std::pair<DWORD, uint64_t>, uint64_t> scratch;
     std::map<uint64_t, std::vector<uint64_t>> scratch_free;   // region -> free slots
     std::vector<uint64_t> scratch_blocks;
+    // Blocks holding inline configs larger than the request's buffer (fill_request): an inline
+    // callback reads its config from there, so after a detach they are freed only if no
+    // callback is still in flight (probe_close).
+    std::vector<uint64_t> config_blocks;
     // Live target threads + hardware-breakpoint state. HW probes set a debug
     // register on EVERY thread (and each new one), so there is no code to modify
     // and no re-arm race: exact under threads for any instruction, up to 4 slots.
@@ -3355,7 +3359,7 @@ static bool open_agent_section(probe_session *s, uint32_t count) {
 }
 
 // A config larger than the request's inline buffer goes to a block allocated in the target
-// (freed at close), so an inline probe takes the same configs as a breakpoint/hw probe. If
+// (freed at close unless a callback may still read it), so an inline probe takes the same configs as a breakpoint/hw probe. If
 // that block cannot be made, config_remote stays 0 and the agent refuses the request.
 static void fill_request(probe_session *s, const Probe &p) {
     auto &request = s->shared->requests[p.agent_index]; request.flags = p.flags;
@@ -3370,7 +3374,7 @@ static void fill_request(probe_session *s, const Probe &p) {
     if (!mem) return;
     if (!remote_write(s->pi.hProcess, (uint64_t)(uintptr_t)mem, p.config.data(), p.config.size(), &wrote) ||
         wrote != p.config.size()) { VirtualFreeEx(s->pi.hProcess, mem, 0, MEM_RELEASE); return; }
-    s->scratch_blocks.push_back((uint64_t)(uintptr_t)mem);
+    s->config_blocks.push_back((uint64_t)(uintptr_t)mem);
     request.config_remote = (uint64_t)(uintptr_t)mem;
 }
 
@@ -5679,11 +5683,32 @@ static void drain_final(probe_session *s) {
     sh->log_tail = head;
 }
 
+// How many in-flight inline callbacks can still finish (probe_agent_shared::live_query),
+// answered by the agent's service thread. False: no answer (no service thread, or it cannot
+// run) -- the caller falls back to a bounded wait.
+static bool query_live_callbacks(probe_session *s, LONG &live) {
+    if (!s->svc_event || !s->shared) return false;
+    auto *sh = s->shared;
+    const LONG seq = sh->live_seq;
+    InterlockedExchange(&sh->live_query, 1);
+    SetEvent(s->svc_event);
+    for (ULONGLONG until = GetTickCount64() + 1000; GetTickCount64() < until; Sleep(1)) {
+        MemoryBarrier();
+        if (sh->live_seq != seq) { MemoryBarrier(); live = sh->live_callbacks; return true; }
+    }
+    return false;
+}
+
 static void stop_drainer(probe_session *s) {
     // Detached from a live target: its hooks are gone, but a callback that was already running
     // (e.g. blocked in call_original longer than the agent's 2 s unhook wait) may still log.
-    // Keep draining until none is in flight (bounded) BEFORE telling producers nobody listens,
-    // so its logs are delivered rather than dropped.
+    // Keep draining BEFORE telling producers nobody listens, so its logs are delivered rather
+    // than dropped -- for as long as any in-flight callback can still finish (no time bound: a
+    // slow detach is reported, never cut short). Callbacks that cannot finish now -- their
+    // thread is gone, or suspended by the program, or left through a non-unwinding longjmp --
+    // are not waited for: they stay counted in flight (the detach summary's in_flight), and a
+    // log one sends if the program resumes it later is counted dropped in the target. Without
+    // an answer from the agent (no service thread) the wait is bounded (15 s), as before.
     if (s->shared && !s->exited && s->drainer.joinable()) {
         MemoryBarrier();
         if (const uint64_t running = probe_agent_inflight(s->shared))
@@ -5691,9 +5716,39 @@ static void stop_drainer(probe_session *s) {
                          s->detached_hooks ? "detach" : "close", (unsigned long long)running);
     }
     if (s->shared && s->detached_hooks && !s->exited && s->drainer.joinable()) {
-        for (ULONGLONG until = GetTickCount64() + 15000; GetTickCount64() < until; Sleep(5)) {
+        const ULONGLONG start = GetTickCount64();
+        ULONGLONG next_note = start + 15000;
+        int idle_answers = 0;
+        bool answered = false;
+        for (;;) {
             MemoryBarrier();
-            if (!probe_agent_inflight(s->shared) && s->shared->log_head == s->shared->log_tail) break;
+            const uint64_t inflight = probe_agent_inflight(s->shared);
+            if (!inflight && s->shared->log_head == s->shared->log_tail) break;
+            const ULONGLONG now = GetTickCount64();
+            if (inflight) {
+                LONG live = 0;
+                if (query_live_callbacks(s, live)) {
+                    answered = true;
+                    // Three answers in a row (~50 ms apart): a callback between its in-flight
+                    // count and its record (nanoseconds) is not missed.
+                    if (live > 0) idle_answers = 0;
+                    else if (++idle_answers >= 3) {
+                        std::fprintf(stderr, "probe: detach: %llu callback(s) cannot finish now (thread gone or suspended); "
+                                             "not waiting for them\n", (unsigned long long)inflight);
+                        break;
+                    }
+                } else if (!answered && now - start >= 15000) {
+                    break;                                      // nobody answers: the old bound
+                }
+            } else if (now - start >= 15000) {
+                break;                                          // ring not empty with nothing in flight
+            }
+            if (now >= next_note) {
+                next_note += 15000;
+                std::fprintf(stderr, "probe: detach: still waiting for %llu running callback(s) to finish (%llus)\n",
+                             (unsigned long long)inflight, (unsigned long long)((now - start) / 1000));
+            }
+            Sleep(inflight ? 50 : 5);
         }
     }
     if (s->shared) {
@@ -6142,8 +6197,18 @@ extern "C" void probe_close(probe_session *s) {
                      (unsigned long long)(s->shared ? probe_agent_inflight(s->shared) : 0));
     }
     inplace_release_all(s);
-    if (s->pi.hProcess)
+    if (s->pi.hProcess) {
         for (uint64_t b : s->scratch_blocks) VirtualFreeEx(s->pi.hProcess, (void *)(uintptr_t)b, 0, MEM_RELEASE);
+        // A config block stays in a detached target while any inline callback is still in flight
+        // there (its thread suspended by the program, or past the drain): that callback's
+        // get_config points into it. Freed, it read freed (or reused) memory.
+        const uint64_t left = s->detached && !s->exited && s->shared ? probe_agent_inflight(s->shared) : 0;
+        if (left && !s->config_blocks.empty())
+            std::fprintf(stderr, "probe: detach: %zu config block(s) left in the target for %llu callback(s) still in flight\n",
+                         s->config_blocks.size(), (unsigned long long)left);
+        else
+            for (uint64_t b : s->config_blocks) VirtualFreeEx(s->pi.hProcess, (void *)(uintptr_t)b, 0, MEM_RELEASE);
+    }
     if (s->sym_ready) uhh_sym::cleanup(s->pi.hProcess);
     if (s->remote_thread) CloseHandle(s->remote_thread);
     if (s->svc_event) CloseHandle(s->svc_event);

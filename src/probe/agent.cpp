@@ -2122,6 +2122,52 @@ static void guard_cleanup() {
     probe_agent_stop(nullptr);                                  // inline hooks out (no-op without any)
     InterlockedExchange(&g_self_freeze, 0);
 }
+// Detach drain (probe_agent_shared::live_query): the in-flight callbacks that can still finish
+// and send a log -- on a thread that exists, is not suspended and is still inside the callback
+// its slot records (the record's frame is on the thread's stack, above its SP, canary intact).
+// Dead / suspended threads and records a non-unwinding longjmp left behind are not counted.
+static LONG count_live_callbacks() {
+    LONG n = 0;
+    const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    for (ThreadSlot &ts : g_threads) {
+        const DWORD tid = (DWORD)ts.tid;
+        const HitScope *h = ts.active;
+        if (!tid || !h || tid == self) continue;
+        HANDLE t = OpenThread(THREAD_QUERY_LIMITED_INFORMATION | THREAD_GET_CONTEXT | SYNCHRONIZE, FALSE, tid);
+        if (!t) continue;                                          // gone
+        bool live = WaitForSingleObject(t, 0) == WAIT_TIMEOUT && GetProcessIdOfThread(t) == pid;
+        if (live && g_nt_qit) {                                    // suspended (by the program): cannot finish now
+            ULONG suspended = 0;
+            if (g_nt_qit(t, 35 /* ThreadSuspendCount */, &suspended, sizeof(suspended), nullptr) >= 0 && suspended)
+                live = false;
+        }
+        if (live) {
+            CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
+            if (GetThreadContext(t, &c)) {
+#if defined(_WIN64)
+                const uintptr_t sp = (uintptr_t)c.Rsp;
+#else
+                const uintptr_t sp = (uintptr_t)c.Esp;
+#endif
+                const uintptr_t a = (uintptr_t)h;
+                live = a > sp && (!ts.stack || a + sizeof(HitScope) <= ts.stack);
+                if (live) {
+                    __try { live = h->canary == (a ^ HIT_CANARY); }
+                    __except (EXCEPTION_EXECUTE_HANDLER) { live = false; }
+                }
+            }
+        }
+        CloseHandle(t);
+        n += live;
+    }
+    return n;
+}
+static void answer_live_query() {
+    shared->live_callbacks = count_live_callbacks();
+    MemoryBarrier();
+    InterlockedIncrement(&shared->live_seq);
+}
+
 static HANDLE service_event;
 static volatile LONG service_running;   // service_main has started (past its loader init)
 static HANDLE service_up;               // set by service_main once it runs (init waits for it)
@@ -2155,7 +2201,12 @@ static DWORD WINAPI service_main(void *) {
                              GetTickCount64() - ctl_gone_at < 30000;
         HANDLE waits[3] = {service_event, g_guard_wake, g_ctl};
         DWORD w = WaitForMultipleObjects(g_ctl ? 3 : 2, waits, FALSE, polling ? 10 : INFINITE);
-        if (w == WAIT_OBJECT_0) { install_pending(); notify_installed(); continue; }
+        if (w == WAIT_OBJECT_0) {
+            // A detach drain asking how many callbacks can still finish: answer only -- the
+            // session is over, so no install round (and no INSTALL_DONE raised to nobody).
+            if (InterlockedExchange(&shared->live_query, 0)) { answer_live_query(); continue; }
+            install_pending(); notify_installed(); continue;
+        }
         if (w == WAIT_OBJECT_0 + 2) { CloseHandle(g_ctl); g_ctl = nullptr; ctl_gone_at = GetTickCount64(); }
         else if (w == WAIT_FAILED) {
             if (!g_ctl) return 1;

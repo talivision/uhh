@@ -10,7 +10,7 @@
 #include <cstdio>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 19;
+constexpr uint32_t PROBE_AGENT_VERSION = 20;
 constexpr uint32_t PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH = 1u << 9;   /* agent side only needs this one */   /* == PROBE_UNSAFE_FAST_PATCH (asserted in session.cpp) */
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 128;   /* inline probes per session; the 129th is refused */
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
@@ -172,6 +172,16 @@ struct probe_agent_shared {
     volatile LONG int3_count;
     probe_agent_int3 int3[PROBE_AGENT_INT3_CAP];
     probe_agent_guard guard;
+    /* Detach drain (v20). Logs are never dropped while a callback can still send one: after a
+       detach the controller keeps delivering until no in-flight callback can still finish. It
+       sets live_query and signals the service event; the agent's service thread answers in
+       live_callbacks -- callbacks in flight on a thread that exists, is not suspended and is
+       still inside that callback (its record's frame is on the stack, canary intact) -- and
+       then bumps live_seq. A callback whose thread is dead, suspended (by the program) or left
+       through a non-unwinding longjmp cannot finish now: it stays counted in flight. */
+    volatile LONG live_query;
+    volatile LONG live_seq;
+    volatile LONG live_callbacks;
 };
 
 constexpr LONG64 PROBE_AGENT_INFLIGHT_ONE = 1LL << 48;   /* one running callback in a hit_stripes cell */
