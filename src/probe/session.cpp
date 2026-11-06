@@ -4591,6 +4591,14 @@ static const DWORD UHH_CALL_RELEASED = 0xE0554843u;
 // callback threw" on breakpoint/hw only). Caught by SEH on purpose: under /EHsc a C++
 // try/catch around a call through an extern "C" callback pointer may be elided.
 static bool seh_callback(probe_callback cb, probe_context *c, DWORD *code) {
+    // Enough stack left for a callback's own stack overflow to reach the __except below
+    // (probe_callback_stack_guarantee): set once per callback thread, raised only.
+    static thread_local bool guaranteed = false;
+    if (!guaranteed) {
+        guaranteed = true;
+        ULONG now = 0, want = probe_callback_stack_guarantee();
+        if (SetThreadStackGuarantee(&now) && now < want) SetThreadStackGuarantee(&want);
+    }
     __try { cb(c); return true; }
     __except (*code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {}
     if (*code == EXCEPTION_STACK_OVERFLOW) _resetstkoflw();      // the guard page, for the next overflow

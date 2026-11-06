@@ -1367,6 +1367,27 @@ static struct XState { bool ok = false, compact = false, xinuse = false; uint64_
 
 
 
+// A callback's stack overflow must reach run_callback's __except: on a CPU with a large XSAVE
+// area (AMX) the overflow's exception frame does not fit the stack Windows leaves by default
+// and the TARGET died (probe_callback_stack_guarantee). The callback runs on the program's
+// thread, so its guarantee (TEB GuaranteedStackBytes, what SetThreadStackGuarantee sets and
+// the kernel reads at a guard-page fault) is raised for the callback only and put back after:
+// the program's own TEB and overflow behaviour are unchanged. The offset is checked once (on
+// the agent's own thread, against SetThreadStackGuarantee) before it is ever written.
+#if defined(_WIN64)
+static inline volatile ULONG *teb_stack_guarantee() { return (volatile ULONG *)((unsigned char *)NtCurrentTeb() + 0x1748); }
+#else
+static inline volatile ULONG *teb_stack_guarantee() { return (volatile ULONG *)((unsigned char *)NtCurrentTeb() + 0xF78); }
+#endif
+static ULONG g_cb_guarantee;             // 0: unknown offset / not needed -- left alone
+static void probe_stack_guarantee_offset() {   // on an agent thread (its guarantee is ours to change)
+    ULONG prev = 0;
+    if (!SetThreadStackGuarantee(&prev) || *teb_stack_guarantee() != prev) return;
+    ULONG want = prev + 4096;
+    if (!SetThreadStackGuarantee(&want) || *teb_stack_guarantee() != prev + 4096) return;
+    g_cb_guarantee = probe_callback_stack_guarantee();
+}
+
 // The callback runs on the target's own thread: any Win32 call it (or the library) makes
 // can change the thread's last-error / last-status, which the target may read right
 // after the probed instruction. Save and restore both (plain TEB fields: ~free) -- to what
@@ -1376,11 +1397,16 @@ static bool run_callback(probe_callback cb, probe_context *c) {
     __writeeflags(__readeflags() & ~(uintptr_t)0x400);
     bool ok = true;
     DWORD code = 0;
+    volatile ULONG *const guarantee = teb_stack_guarantee();
+    const ULONG program_guarantee = g_cb_guarantee ? *guarantee : 0;
+    const bool lift = g_cb_guarantee > program_guarantee;
+    if (lift) *guarantee = g_cb_guarantee;
     __try { cb(c); }
     __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) { ok = false; }
     // A callback that overflowed the stack used up the thread's guard page (the target's
     // stack): restore it, or the program's own next overflow is no longer catchable.
     if (code == EXCEPTION_STACK_OVERFLOW) _resetstkoflw();
+    if (lift) *guarantee = program_guarantee;
     if (const auto *h = static_cast<const HitScope *>(c->hit_scope); h && h->orig_ran) {
         last_error = h->orig_error; last_status = h->orig_status;
     }
@@ -2297,6 +2323,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
         if (!shared || shared->magic != PROBE_AGENT_MAGIC || shared->version != PROBE_AGENT_VERSION) return 2;
     }
     if (shared->request_count > PROBE_AGENT_MAX_PROBES) return 3;
+    if (!g_cb_guarantee) probe_stack_guarantee_offset();   // this remote thread is ours (see run_callback)
     make_ret_thunks();
     static PVOID veh = nullptr;
     if (!veh) {

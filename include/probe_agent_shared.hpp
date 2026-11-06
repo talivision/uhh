@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <cstdint>
 #include <cstdio>
+#include <intrin.h>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
 constexpr uint32_t PROBE_AGENT_VERSION = 21;
@@ -233,6 +234,23 @@ inline void probe_agent_retire_carry(probe_agent_shared *sh, const probe_agent_l
     volatile LONG64 &cell = sh->hit_stripes[rec.probe][(rec.tid >> 2) & (PROBE_AGENT_STRIPES - 1)].value;
     for (LONG64 v = cell; ((uint64_t)v >> 48) != 0; v = cell)
         if (InterlockedCompareExchange64(&cell, v - PROBE_AGENT_INFLIGHT_ONE, v) == v) return;
+}
+
+/* The stack a thread needs left when a CALLBACK overflows its stack, so the overflow can be
+   dispatched to the guard that abandons the callback: the exception frame holds a CONTEXT with
+   the full extended state of every XCR0 feature -- with AMX tiles (Xeon 6973P-C CI runners,
+   XCR0 0x600e7) an 11 KB XSAVE area, more than Windows leaves by default, and the process died
+   (0xC00000FD / 0xC0000005) instead (transparency TR9 `ovf`, every row, on those runners only).
+   CONTEXT + the XCR0 XSAVE size + 16 KB for the dispatcher and the vectored handlers, in pages.
+   Callbacks run under at least this stack guarantee (controller: SetThreadStackGuarantee on
+   the callback thread; inline agent: for the callback only, see agent.cpp run_callback). */
+inline unsigned long probe_callback_stack_guarantee() {
+    int r[4] = {};
+    __cpuid(r, 1);
+    unsigned long xsave = 0;
+    if (r[2] & (1 << 27)) { __cpuidex(r, 0xD, 0); xsave = (unsigned long)r[1]; }   /* OSXSAVE: XCR0's area */
+    const unsigned long need = (unsigned long)sizeof(CONTEXT) + xsave + 64 + 16384;
+    return (need + 4095) & ~4095ul;
 }
 
 inline void probe_agent_mapping_name(DWORD pid, wchar_t (&name)[64]) {

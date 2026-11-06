@@ -2757,7 +2757,14 @@ def check_ret_probe(threads=2, reads=50):
     flag): ntdll!NtOpenProcess's ret, found by decoding the stub in the DLL file. probe_app
     opens each helper once. breakpoint and hw must fire once per open. inline must be REFUSED cleanly (the 5-byte jump would run past the ret
     into code only a jump reaches -- the int 2e tail on x64, the next stub on x86) or,
-    with --fallback-hw, move to hw. The target must be unaffected either way."""
+    with --fallback-hw, move to hw. The target must be unaffected either way.
+    Ground truth is per hit, from its stack (--stack): the target's opens are the hits with a
+    probe_app frame, and must be exactly its `opened` count; every hit is logged. Other hits are
+    allowed only from system code alone: the first launch of probe_app on a fresh machine
+    (every CI runner) runs the shim engine at process init (ntdll!LdrInitShimEngineDynamic ->
+    apphelp!SE_InitializeEngine -> KernelBase!OpenProcess) -- a real 5th NtOpenProcess of the
+    target, seen as hits=5 on the first breakpoint run only (runner diag: 7 of 7 jobs, never
+    on a later run)."""
     t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
     if not t or not a:
         return missing_bin("ret-probe", "uhh_trace/probe_app")
@@ -2768,19 +2775,26 @@ def check_ret_probe(threads=2, reads=50):
     for bk, extra in (("breakpoint", []), ("hw", []), ("inline", []), ("inline", ["--fallback-hw"])):
         name = f"ret-probe-{bk}{'-fallback' if extra else ''}"
         try:
-            r, objs = run([t, "--backend", bk, *extra, "-p", f"{site}:x", "--", a, "--no-wait", "--helpers", helpers,
-                           "--threads", threads, "--reads", reads, "--config", "reads_enabled=1"], timeout=300)
+            r, objs = run([t, "--backend", bk, *extra, "--stack", "-p", f"{site}:x", "--", a, "--no-wait", "--helpers",
+                           helpers, "--threads", threads, "--reads", reads, "--config", "reads_enabled=1"], timeout=300)
             res = next((x for x in objs if x.get("kind") == "app"), {})
             pr = next((x for x in objs if x.get("kind") == "probe"), {})
             rep = report(objs)
             app_ok = res.get("opened") == helpers and res.get("successful_reads") == threads * reads
+            stacks = [x.get("stack") or [] for x in objs if x.get("kind") == "probe_log"]
+            own = sum(1 for st in stacks if any(str(f).lower().startswith("probe_app") for f in st))
+            other = [" < ".join(str(f).split(" [")[0] for f in st[1:4]) for st in stacks
+                     if not any(str(f).lower().startswith("probe_app") for f in st)]
             if bk == "inline" and not extra:
                 ok = r.returncode != 0 and "would be written across" in (rep.get("error") or "") and "PROBE_ALLOW_UNSAFE_SITE" in (rep.get("error") or "") and not pr.get("hits")
             else:
                 want_bk = "hw" if extra else bk
-                ok = app_ok and pr.get("backend") == want_bk and pr.get("hits") == helpers
-            record(name, ok, f"site={site} backend={pr.get('backend')} hits={pr.get('hits')} opened={res.get('opened')} "
-                             f"reads={res.get('successful_reads')} rc={r.returncode} err={(rep.get('error') or '')[:120]}")
+                ok = (app_ok and pr.get("backend") == want_bk and own == helpers and pr.get("hits") == len(stacks)
+                      and all(stacks))
+            record(name, ok, f"site={site} backend={pr.get('backend')} hits={pr.get('hits')} target_opens={own} "
+                             f"system_opens={len(other)}{other[:2] if other else ''} logs={len(stacks)} "
+                             f"opened={res.get('opened')} reads={res.get('successful_reads')} rc={r.returncode} "
+                             f"err={(rep.get('error') or '')[:120]}")
         except Exception as e:
             record(name, False, repr(e))
 
