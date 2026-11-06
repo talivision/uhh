@@ -335,8 +335,17 @@ int main(int argc, char **argv) {
         const char *rd = getenv("HUNT_READERS");
         int readers = rd ? atoi(rd) : 8;
         for (int i = 0; i < readers; ++i) CloseHandle(spawn(reader_until_stop, NULL));
+        /* main's own progress, the thing a debugger that freezes the process starves: how late
+           its Sleep returns, and how long its one report line takes to go out */
+        LARGE_INTEGER f, t0, t1, t2;
+        QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
         Sleep(g_n);
-        printf("{\"kind\":\"target\",\"scenario\":\"%s\",\"reads_at_exit\":%ld,\"bad\":%ld}\n", sc, g_reads, g_bad);
+        QueryPerformanceCounter(&t1);
+        printf("{\"kind\":\"target\",\"scenario\":\"%s\",\"reads_at_exit\":%ld,\"bad\":%ld,\"sleep_ms\":%lld}\n", sc, g_reads,
+               g_bad, (long long)((t1.QuadPart - t0.QuadPart) * 1000 / f.QuadPart));
+        fflush(stdout);
+        QueryPerformanceCounter(&t2);
+        printf("{\"kind\":\"main_exit\",\"print_ms\":%lld}\n", (long long)((t2.QuadPart - t1.QuadPart) * 1000 / f.QuadPart));
         fflush(stdout);
         if (getenv("HUNT_TRACE_EXIT")) { atexit(trace_atexit); fprintf(stderr, "[main-leaving tid=%lu]\n", GetCurrentThreadId()); }
         if (!strcmp(sc, "exit-process")) ExitProcess(6);

@@ -217,8 +217,11 @@ reads, a slow (50 ms) callback under 32 threads.
   has been empty for 2 ms -- the threads that hit nothing run then -- and released together.
   Never parked: a thread mid-step / owning an in-place window, a call_func/call_original thread,
   the agent's threads; released before any call_func and at detach; listed for the controller-
-  death guard. `hunt-starve-*` (8 readers: exit within 30 s incl. ~100k logs, logs + dropped +
-  interrupted == hits); the exit checks now use 8 readers on every backend
+  death guard. `hunt-starve-*` (8 readers; main's OWN progress, measured by the target: how late
+  its Sleep(300) returns and how long its one line takes to go out, each within 1.5 s + 10x the
+  same workload uninstrumented on the same machine in the same check -- a wall-time bar failed on
+  a VM loaded by other jobs (37.6 s, mostly delivering 266k logs); logs + dropped + interrupted
+  == hits); the exit checks now use 8 readers on every backend
 - ✅ (A6) inline missed calls made BEFORE the image entry point (TLS callbacks at process attach,
   static-import DllMain): the agent was loaded by a new thread, which cannot start before process
   initialisation ends, so hooks went in at the entry hold. Fixed (huntaudit): a launched target's
@@ -260,6 +263,13 @@ reads, a slow (50 ms) callback under 32 threads.
   of the old one at the same base (the case the guard handles; never observed in this audit), a
   breakpoint/inline probe still marked active there is re-armed in the fresh mapping, which has
   neither the INT3 nor the hook (hw: the DR is per address and stays). `hunt-dll-work-backend-*`
+  Follow-up (huntaudit, after the merge): the same loss hit the INLINE probe in the reloaded DLL
+  (hunt-dll-work-backend-inline, x86, once in a suite run; under load with tracing 20 of 180
+  runs, 1-5 of 240 calls): its install GATE (a debug register on the pending site until the hook
+  is in, arm_gates_for_pending) was wiped on a thread still starting (or inside an NtContinue
+  restore), which then ran the site unhooked and uncaught. Gates are now re-applied by the
+  thread-start and context-restore fixups like hardware probes (armed when a gate is), and
+  enforce_owned_drs treats a gate's slot as owned.
 - ✅ (A9, found in this audit) breakpoint: an instruction at a probe site that faults (a guard
   page, an access violation the program catches) is re-run at the real address so the program
   sees its own fault there; the thread's next arrival at the site was then ALWAYS taken for the

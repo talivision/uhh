@@ -3618,7 +3618,7 @@ static bool clear_released_images(const probe_session *s, CONTEXT &c) {
     return changed;
 }
 static void reapply_hw_thread(probe_session *s, DWORD tid) {
-    if (!s->hw_active && s->hw_released.empty()) return;
+    if (!s->hw_active && s->hw_released.empty() && s->gates.empty()) return;
     HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
     if (!t) return;
     CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
@@ -3634,6 +3634,7 @@ static void reapply_hw_thread(probe_session *s, DWORD tid) {
         uint32_t rw = 0, len = 0; hw_rw_len(p->flags, rw, len);
         set_dr_on_thread(t, p->dr_slot, p->address, true, rw, len, s);
     }
+    for (auto &g : s->gates) set_dr_on_thread(t, g.second, g.first, true, 0, 0, s);   // inline install gates too
     CloseHandle(t);
 }
 
@@ -4030,6 +4031,12 @@ static bool arm_gates_for_pending(probe_session *s) {
         }
         s->dr_used |= (uint8_t)(1u << slot); s->dr_ever |= (uint8_t)(1u << slot);
         s->gates.push_back({sites[i], slot});
+        // A thread still in its loader initialisation, or inside exception dispatch / an APC,
+        // resumes through NtContinue with the debug registers it had before -- without this
+        // gate -- and could run the site uncaught before its hook is in (seen: hunt-dll-work-
+        // backend-inline, x86 under load, 1-5 of 240 calls missed). The thread-start and
+        // context-restore fixups put gates back as they do hardware probes (after this event).
+        s->thread_start_due = true;
         if (trace_enabled()) std::fprintf(stderr, "  gate 0x%llx DR%d\n", (unsigned long long)sites[i], slot);
     }
     return true;
@@ -5313,16 +5320,20 @@ static void enforce_owned_drs(const probe_session *s, DWORD tid, CONTEXT &c, boo
         const Probe *owner = nullptr;
         for (const auto &p : s->probes)
             if (p->active && (p->flags & PROBE_HW) && p->dr_slot == slot) { owner = p.get(); break; }
+        // An inline install gate (arm_gates_for_pending) owns its slot like a probe: execute.
+        uint64_t want = owner ? owner->address : 0;
+        if (!owner) for (const auto &g : s->gates) if (g.second == slot) { want = g.first; break; }
         const DWORD64 ln = (DWORD64)1 << (slot * 2), fieldmask = (DWORD64)0xF << (16 + slot * 4);
         DWORD64 dr7 = c.Dr7;
-        if (owner && hw_yielded(s, c, slot)) continue;           // the program's own breakpoint: left alone
-        if (owner) {
-            uint32_t rw = 0, len = 0; hw_rw_len(owner->flags, rw, len);
+        if (want && hw_yielded(s, c, slot)) continue;            // the program's own breakpoint: left alone
+        if (want) {
+            uint32_t rw = 0, len = 0;
+            if (owner) hw_rw_len(owner->flags, rw, len);
             switch (slot) {
-            case 0: c.Dr0 = (decltype(c.Dr0))owner->address; break;
-            case 1: c.Dr1 = (decltype(c.Dr1))owner->address; break;
-            case 2: c.Dr2 = (decltype(c.Dr2))owner->address; break;
-            default: c.Dr3 = (decltype(c.Dr3))owner->address; break;
+            case 0: c.Dr0 = (decltype(c.Dr0))want; break;
+            case 1: c.Dr1 = (decltype(c.Dr1))want; break;
+            case 2: c.Dr2 = (decltype(c.Dr2))want; break;
+            default: c.Dr3 = (decltype(c.Dr3))want; break;
             }
             dr7 = (dr7 & ~fieldmask) | ln | ((DWORD64)(((len & 3u) << 2) | (rw & 3u)) << (16 + slot * 4));
         } else if (clear_stale && !(s->dr_used & (1u << slot)) && !target_owns_slot(s, tid, c, slot)) {
@@ -5366,7 +5377,7 @@ static void restore_fixup(probe_context *c) {
         // before the arm, out of a 32-bit debugger's reach. Re-apply after the restore and
         // BEFORE the first instruction runs: the record resumes at our private INT3
         // (call_trap), where restore_resume_hit puts the DRs back and the thread at its real EIP.
-        if (!s->hw_active || !(img.ContextFlags & CONTEXT_CONTROL & ~CONTEXT_i386) || !ensure_call_trap(s)) return;
+        if ((!s->hw_active && s->gates.empty()) || !(img.ContextFlags & CONTEXT_CONTROL & ~CONTEXT_i386) || !ensure_call_trap(s)) return;
         DWORD eip = 0; size_t got = 0;
         const uint64_t at_eip = rec + offsetof(CONTEXT, Eip);
         if (!remote_read(s->pi.hProcess, at_eip, &eip, 4, &got) || got != 4 || eip == (DWORD)s->call_trap) return;
