@@ -9318,7 +9318,7 @@ def check_cx2_review():
                                f"ran_while_suspended={row.get('ran_while_suspended')} (want 0)")
                 if row.get("done") != 1 or row.get("sum") != sum(i * 3 + 5 for i in range(20)):
                     bad.append(f"target row={row}")
-                return bad
+                return bad + ([f"died={died[:200]!r}"] if bad else [])
             finally:
                 for q in procs:
                     if q.poll() is None:
@@ -10587,7 +10587,16 @@ def check_stdout_powershell():
                           rep["stdout_logs"] <= rep["logs_written"] <= hits == rep.get("hits"))
             closed = bool(fin) and fin.get("hits") == (fin.get("logs_written") or 0) + (fin.get("log_dropped") or 0) \
                 + (fin.get("in_flight") or 0) and fin.get("stdout_logs") == fin.get("logs_written") == cap["logs"]
-            ok = (alive and finals == 1 and after_final == 0 and consistent and closed and cap["bad"] == 0 and cap["gaps"] == 0 and
+            # No record after the report (the detach came before the next hit -- breakpoint, now
+            # that a breakpoint-only attach has no agent to stop): no probe_final by design (api.md);
+            # the report itself then closes the books, equal to the detach's own final line.
+            det = re.search(r"probe: detached: hits=(\d+) logs_written=(\d+) log_dropped=(\d+) in_flight=(\d+)", r.stderr or "")
+            if not finals and det and consistent:
+                dh, dw, dd, di = (int(x) for x in det.groups())
+                closed = (dh == rep.get("hits") and dw == rep.get("logs_written") == rep.get("stdout_logs") == cap["logs"]
+                          and dh == dw + dd + di)
+                fin = {"hits": dh, "logs_written": dw, "log_dropped": dd, "in_flight": di, "stdout_logs": cap["logs"]}
+            ok = (alive and finals <= 1 and after_final == 0 and consistent and closed and cap["bad"] == 0 and cap["gaps"] == 0 and
                   fin.get("log_dropped") == 0 and rep.get("error") is None and cap["logs"] > 0)
             record(name, ok, f"report: hits={hits} written={rep.get('logs_written')} stdout_logs={rep.get('stdout_logs')} "
                              f"consistent={consistent} final={ {k: fin.get(k) for k in ('hits', 'logs_written', 'log_dropped', 'in_flight', 'stdout_logs')} } "

@@ -448,6 +448,12 @@ static bool register_runtime_inline(probe_session *s, Probe &p);
 // no-op even when the PROGRAM holds the thread suspended (an unconditional resume would have
 // released the program's own suspension). Taken off again right after the call. x64
 // controllers have no implicit suspend: nothing to do.
+#if defined(UHH_TEST_HOOKS)
+// Test-only: UHH_TEST_DIE_IN_TOUCH fires only in a touch made while arming a user hw probe on
+// every thread (arm_hw) -- the window its checks are about, whatever other touches (an inline
+// install's freeze, with --guard's inline probe in the session) come first.
+static bool g_test_in_arm_hw = false;
+#endif
 struct GuardTouch {
 #if !defined(_WIN64)
     probe_agent_guard *g = nullptr;
@@ -503,13 +509,14 @@ GuardTouch::GuardTouch(const probe_session *s, DWORD tid) {
         g = &gg; n = count;
     }
 #if defined(UHH_TEST_HOOKS)
-    // UHH_TEST_DIE_IN_TOUCH=<tid>: at the first such call on that thread, do what the kernel
+    // UHH_TEST_DIE_IN_TOUCH=<tid>: at the first such call on that thread while arming a user hw
+    // probe (g_test_in_arm_hw), do what the kernel
     // does inside it (suspend the thread) and die there -- the WOW64 implicit-suspend window.
     // UHH_TEST_DIE_IN_TOUCH_MODE=before: die with the touch recorded but BEFORE the implicit
     // suspension (regress cx2-touchprog-hw: the guard must leave the program's own suspension).
     static const DWORD die_tid = [] { const char *v = std::getenv("UHH_TEST_DIE_IN_TOUCH"); return v ? (DWORD)std::strtoul(v, nullptr, 10) : 0u; }();
     static const bool die_before = [] { const char *v = std::getenv("UHH_TEST_DIE_IN_TOUCH_MODE"); return v && !std::strcmp(v, "before"); }();
-    if (die_tid && tid == die_tid && (!die_before || gg.enabled)) {
+    if (die_tid && tid == die_tid && g_test_in_arm_hw && (!die_before || gg.enabled)) {
         DWORD prev = (DWORD)-1;
         if (!die_before)
             if (HANDLE t = OpenThread(THREAD_SUSPEND_RESUME, FALSE, tid)) prev = SuspendThread(t);
@@ -2281,6 +2288,9 @@ static bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
     s->hw_armed_ever.insert(address);
     guard_sync(s);
     size_t tried = 0, set_ok = 0;
+#if defined(UHH_TEST_HOOKS)
+    g_test_in_arm_hw = !p.internal;
+#endif
     for (DWORD tid : s->threads) {
         HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
         if (!t) continue;
@@ -2290,6 +2300,9 @@ static bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
         if (set_dr_on_thread(t, slot, address, true, rw, len, s)) ++set_ok;
         CloseHandle(t);
     }
+#if defined(UHH_TEST_HOOKS)
+    g_test_in_arm_hw = false;
+#endif
 #if defined(UHH_TEST_HOOKS)
     if (set_ok && !p.internal) test_die_after_arm();
 #endif
