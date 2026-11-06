@@ -234,15 +234,22 @@ reads, a slow (50 ms) callback under 32 threads.
   SetThreadContext). `hunt-owndr-*` (DR0 set on a suspended new thread), `hunt-owndr-live-*`
   (DR0 set over UHH's on a running thread)
 - ✅ (A8) hw: a hardware probe inside a DLL that 4 threads keep LoadLibrary/FreeLibrary-ing missed
-  hits (60-125 of 240). Cause (the leading suspect, confirmed by its fix): the UNLOAD_DLL of the
-  old instance reached the debugger AFTER the LOAD_DLL of a new instance mapped at the same base
-  (the unmapping thread reports after the view is gone), and the base-matched UNLOAD released the
-  probe the new instance had just armed. The lifecycle work (6d0147a) made a late UNLOAD of a base
-  that holds an image again a no-op; since then hunt-dll-work-backend-hw is exact (x64 and x86,
-  every run in this audit). Completed (huntaudit): with LOAD(new) before UNLOAD(old), a
-  breakpoint/inline probe was still marked active at that base although the fresh mapping has
-  neither the INT3 nor the hook -- LOAD now re-arms such probes (hw: the DR is per address and
-  stays). `hunt-dll-work-backend-{hw,breakpoint,inline}`
+  hits (60-125 of 240, "whole threads"). Proven cause (huntaudit): NOT the late UNLOAD suspected
+  here -- with the stale-unload guard of 6d0147a disabled, 24 runs (x64 + x86) saw no late unload
+  at all and were exact. The probe is (re)armed at the DLL's LOAD while other threads of the
+  target are still in their loader initialisation (DLL_THREAD_ATTACH, TLS callbacks); such a
+  thread resumes at ntdll!RtlUserThreadStart through LdrInitializeThunk's NtContinue with the
+  debug registers captured when it was created, i.e. WITHOUT the new probe, and misses it until
+  the next re-arm -- the DLL really unloads only a few times per run (3-6 loads in 240 calls), so
+  that is most of the thread's calls. Evidence, x86, hunt_driver --work-backend hw dll --n 60: the
+  A8 commit 9b045a6 missed hits in 4 of 14 runs (134, 65, 182, 180 of 240); the same commit plus
+  e2cbfc5 alone (re-apply the hardware probes at ntdll!RtlUserThreadStart -- merged into
+  merge-frida before the hunt suite was) 10 of 10 exact; the current code exact in every run of
+  this audit (hunt-dll-work-backend-hw 3 x86 + 3 x64 suite runs, plus 24 direct runs).
+  Defensive completion (huntaudit): should a LOAD of a new instance ever arrive before the UNLOAD
+  of the old one at the same base (the case the guard handles; never observed in this audit), a
+  breakpoint/inline probe still marked active there is re-armed in the fresh mapping, which has
+  neither the INT3 nor the hook (hw: the DR is per address and stays). `hunt-dll-work-backend-*`
 - ✅ (A9, found in this audit) breakpoint: an instruction at a probe site that faults (a guard
   page, an access violation the program catches) is re-run at the real address so the program
   sees its own fault there; the thread's next arrival at the site was then ALWAYS taken for the
