@@ -9639,16 +9639,203 @@ def run_in_conpty(cmdline, out_path, timeout, cols=120, rows=30):
     return code, elapsed
 
 
-def count_vt_seq(path):
-    """Stream a ConPTY capture: VT sequences and line breaks removed, the unique probe_log seq
-    values (bit set), the highest one, and the last probe_report seen."""
-    vt = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]")
+class VtScreen:
+    """A minimal VT terminal (what a ConPTY capture needs): a rows x cols grid with autowrap,
+    cursor addressing, erase/insert/delete and scrolling. ConPTY renders the console as a
+    screen, not as the bytes the program wrote: it repaints only cells that changed, moves the
+    cursor over cells the screen already shows, and may repaint rows out of order -- so text
+    is only reconstructible by emulating the screen. Every row that leaves the screen (scrolled
+    off the top or erased) and, at the end, every row still on it is passed to emit(text) --
+    a row that autowrapped keeps its full width and no line break; any other row is
+    right-stripped and ends in '\\n'."""
+    SEQ = re.compile(r"\x1b\[([0-?]*)([ -/]*)([@-~])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[P^_][^\x1b]*\x1b\\"
+                     r"|\x1b[ -/]*[0-~]|[\x00-\x1f\x7f]")
+    MOVES = set("HfABeCaDEFG`dKJX@PLMSTbr")
+    PARTIAL = re.compile(r"\x1b(?:\[[0-?]*[ -/]*|\][^\x07\x1b]*|[P^_][^\x1b]*|[ -/]*)?\Z")
+
+    def __init__(self, cols, rows, emit):
+        self.cols, self.rows, self.emit = cols, rows, emit
+        self.grid = [[" "] * cols for _ in range(rows)]
+        self.wrapped = [False] * rows
+        self.dirty = [False] * rows          # anything written since the row was last blank
+        self.x = self.y = 0
+        self.pending = False                 # deferred autowrap: the last column was written
+        self.top, self.bottom = 0, rows - 1
+        self.last = " "
+        self.carry = ""
+
+    def _row_text(self, y):
+        t = "".join(self.grid[y])
+        return t if self.wrapped[y] else t.rstrip(" ") + "\n"
+
+    def _blank(self, y):
+        self.grid[y] = [" "] * self.cols
+        self.wrapped[y] = self.dirty[y] = False
+
+    def _flush_row(self, y):
+        if self.dirty[y]:
+            self.emit(self._row_text(y))
+        self._blank(y)
+
+    def _scroll_up(self, n=1):
+        for _ in range(n):
+            if self.top == 0:
+                self._flush_row(self.top)
+            del self.grid[self.top]; del self.wrapped[self.top]; del self.dirty[self.top]
+            self.grid.insert(self.bottom, [" "] * self.cols)
+            self.wrapped.insert(self.bottom, False); self.dirty.insert(self.bottom, False)
+
+    def _scroll_down(self, n=1):
+        for _ in range(n):
+            del self.grid[self.bottom]; del self.wrapped[self.bottom]; del self.dirty[self.bottom]
+            self.grid.insert(self.top, [" "] * self.cols)
+            self.wrapped.insert(self.top, False); self.dirty.insert(self.top, False)
+
+    def _linefeed(self):
+        self.pending = False
+        if self.y == self.bottom:
+            self._scroll_up()
+        elif self.y < self.rows - 1:
+            self.y += 1
+
+    def _text(self, s):
+        i, n = 0, len(s)
+        while i < n:
+            if self.pending:
+                self.wrapped[self.y] = True
+                self.x = 0
+                self._linefeed()
+            take = min(n - i, self.cols - self.x)
+            self.grid[self.y][self.x:self.x + take] = s[i:i + take]
+            self.dirty[self.y] = True
+            self.x += take
+            i += take
+            if self.x >= self.cols:
+                self.x, self.pending = self.cols - 1, True
+        self.last = s[-1]
+
+    def _erase(self, y, a, b):
+        self.grid[y][a:b] = [" "] * (b - a)
+        if b >= self.cols:
+            self.wrapped[y] = False
+
+    def _csi(self, params, inter, final):
+        private = params[:1] in ("?", ">", "<", "=")
+        nums = [int(p) if p.isdigit() else 0 for p in (params[1:] if private else params).split(";")] if params else []
+        def arg(i=0, d=1):
+            return nums[i] if len(nums) > i and nums[i] else d
+        if private or inter or final not in self.MOVES:
+            return                 # SGR, modes (?25l cursor, ?1049h ...): no text, no cursor motion
+        c, r = self.cols, self.rows
+        if final in "Hf":
+            self.y, self.x = min(arg(0) - 1, r - 1), min(arg(1) - 1, c - 1)
+        elif final == "A":
+            self.y = max(self.y - arg(), 0)
+        elif final in "Be":
+            self.y = min(self.y + arg(), r - 1)
+        elif final in "Ca":
+            self.x = min(self.x + arg(), c - 1)
+        elif final == "D":
+            self.x = max(self.x - arg(), 0)
+        elif final == "E":
+            self.y, self.x = min(self.y + arg(), r - 1), 0
+        elif final == "F":
+            self.y, self.x = max(self.y - arg(), 0), 0
+        elif final in "G`":
+            self.x = min(arg() - 1, c - 1)
+        elif final == "d":
+            self.y = min(arg() - 1, r - 1)
+        elif final == "K":
+            m = arg(0, 0)
+            self._erase(self.y, *((self.x, c) if m == 0 else (0, self.x + 1) if m == 1 else (0, c)))
+        elif final == "J":
+            m = arg(0, 0)
+            if m == 0:
+                self._erase(self.y, self.x, c)
+                for y in range(self.y + 1, r): self._blank(y)
+            elif m == 1:
+                self._erase(self.y, 0, self.x + 1)
+                for y in range(0, self.y): self._blank(y)
+            elif m == 2:                             # clear: what it held was shown -- pass it on
+                for y in range(r): self._flush_row(y)
+        elif final == "X":
+            self._erase(self.y, self.x, min(self.x + arg(), c))
+        elif final == "@":
+            row = self.grid[self.y]; k = min(arg(), c - self.x)
+            row[self.x:] = [" "] * k + row[self.x:c - k]
+        elif final == "P":
+            row = self.grid[self.y]; k = min(arg(), c - self.x)
+            row[self.x:] = row[self.x + k:] + [" "] * k
+        elif final in "LM" and self.top <= self.y <= self.bottom:
+            top, self.top = self.top, self.y
+            (self._scroll_down if final == "L" else self._scroll_up)(min(arg(), self.bottom - self.y + 1))
+            self.top = top
+        elif final == "S":
+            self._scroll_up(arg())
+        elif final == "T":
+            self._scroll_down(arg())
+        elif final == "b":
+            self._text(self.last * arg())
+            return
+        elif final == "r":
+            t, b = arg(0, 1) - 1, arg(1, r) - 1
+            if 0 <= t < b < r:
+                self.top, self.bottom = t, b
+            self.x = self.y = 0
+        self.pending = False
+
+    def feed(self, data):
+        data = self.carry + data
+        m = self.PARTIAL.search(data)
+        cut = m.start() if m else len(data)
+        self.carry = data[cut:]
+        pos = 0
+        for m in self.SEQ.finditer(data, 0, cut):
+            if m.start() > pos:
+                self._text(data[pos:m.start()])
+            pos = m.end()
+            t = m.group(0)
+            if m.group(3):
+                self._csi(m.group(1), m.group(2), m.group(3))
+            elif t == "\r":
+                self.x, self.pending = 0, False
+            elif t in "\n\x0b\x0c":
+                self._linefeed()
+            elif t == "\x08":
+                self.x, self.pending = max(self.x - 1, 0), False
+            elif t == "\t":
+                self.x = min((self.x // 8 + 1) * 8, self.cols - 1)
+            elif t == "\x1bM":                       # reverse index
+                if self.y == self.top: self._scroll_down()
+                else: self.y = max(self.y - 1, 0)
+            elif t == "\x1bD":
+                self._linefeed()
+            elif t == "\x1bE":
+                self.x = 0; self._linefeed()
+            elif t == "\x1bc":
+                for y in range(self.rows): self._flush_row(y)
+                self.x = self.y = 0
+        if cut > pos:
+            self._text(data[pos:cut])
+
+    def close(self):
+        for y in range(self.rows):
+            self._flush_row(y)
+
+
+def count_vt_seq(path, cols=120, rows=30):
+    """Stream a ConPTY capture (cols x rows, as run_in_conpty created it) through VtScreen and
+    read the reconstructed text, line breaks removed: the unique probe_log seq values (bit
+    set), the highest one, and the last probe_report seen (parsed whole, however the renderer
+    wrapped or repainted it)."""
+    import codecs
     token = re.compile(r'"seq":(\d+)\}')
     seen, count, top, report_text, carry = bytearray(1 << 16), 0, -1, None, ""
+    pieces = []
+    screen = VtScreen(cols, rows, pieces.append)
 
-    def scan(text):
+    def scan(flat):
         nonlocal seen, count, top, report_text
-        flat = vt.sub("", text).replace("\r", "").replace("\n", "").replace("\x08", "")   # BS: ConPTY wrap artefact
         for m in token.finditer(flat):
             v = int(m.group(1))
             if v >= len(seen):
@@ -9659,26 +9846,32 @@ def count_vt_seq(path):
             top = max(top, v)
         at = flat.rfind('{"kind":"probe_report"')
         if at >= 0:
-            report_text = flat[at:at + 600]
+            report_text = flat[at:at + 16384]
+
+    def drain(final):
+        nonlocal carry
+        text = carry + "".join(pieces).replace("\n", "")
+        pieces.clear()
+        cut = len(text) if final else max(text.rfind('{"kind"', 0, max(0, len(text) - 16384)), 0)
+        scan(text[:cut])
+        carry = text[cut:]
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
     with open(path, "rb") as f:
         while True:
             chunk = f.read(1 << 22)
             if not chunk:
                 break
-            text = carry + chunk.decode("utf-8", "replace")
-            cut = text.rfind('{"kind"', 0, max(0, len(text) - 4096))
-            cut = max(cut, 0)
-            scan(text[:cut])
-            carry = text[cut:]
-    scan(carry)
+            screen.feed(decoder.decode(chunk))
+            drain(False)
+    screen.feed(decoder.decode(b"", final=True))
+    screen.close()
+    drain(True)
     report_obj = None
     if report_text:
-        m = re.match(r'\{"kind":"probe_report".*?"error":(?:null|"(?:[^"\\]|\\.)*")\}', report_text)
-        if m:
-            try:
-                report_obj = json.loads(m.group(0))
-            except json.JSONDecodeError:
-                report_obj = None
+        try:
+            report_obj, _ = json.JSONDecoder().raw_decode(report_text)
+        except json.JSONDecodeError:
+            report_obj = None
     return {"unique": count, "max": top, "missing": (top + 1 - count) if top >= 0 else 0, "report": report_obj}
 
 
@@ -9837,6 +10030,9 @@ def check_stdout_console(big=0):
                    f'--delay 0 --no-ticks"')
             code, secs = run_in_conpty(cmd, work / "vt.bin", timeout=600 + want / 500)
             seen = count_vt_seq(work / "vt.bin")
+            with open(work / "vt.bin", "rb") as f:          # the capture's end: the report's rendering
+                f.seek(max(0, (work / "vt.bin").stat().st_size - 2600))
+                vt_tail = f.read()
             (work / "vt.bin").unlink()
             rep = seen["report"] or {}
             sessions = list((work / "uhh" / "logs").glob("*.jsonl"))
@@ -9848,7 +10044,8 @@ def check_stdout_console(big=0):
                   sess.get("logs") == want and sess.get("gaps") == 0)
             record(name, ok, f"console_seq={seen['unique']}/{want} missing={seen['missing']} report={'yes' if rep else 'no'} "
                              f"hits={rep.get('hits')} written={rep.get('logs_written')} stdout_logs={rep.get('stdout_logs')} "
-                             f"live_error={rep.get('live_output_error')} file={sess.get('logs')} rc={code} {secs:.0f}s")
+                             f"live_error={rep.get('live_output_error')} file={sess.get('logs')} rc={code} {secs:.0f}s"
+                             + ("" if ok else f" vt_tail={vt_tail!r}"))
         except Exception as e:
             record(name, False, repr(e))
         finally:
