@@ -5762,7 +5762,7 @@ static void stop_drainer(probe_session *s) {
         const ULONGLONG start = GetTickCount64();
         ULONGLONG next_note = start + 15000;
         int idle_answers = 0;
-        bool answered = false;
+        ULONGLONG last_answer = start;
         for (;;) {
             MemoryBarrier();
             const uint64_t inflight = probe_agent_inflight(s->shared);
@@ -5771,7 +5771,7 @@ static void stop_drainer(probe_session *s) {
             if (inflight) {
                 LONG live = 0;
                 if (query_live_callbacks(s, live)) {
-                    answered = true;
+                    last_answer = GetTickCount64();
                     // Three answers in a row (~50 ms apart): a callback between its in-flight
                     // count and its record (nanoseconds) is not missed.
                     if (live > 0) idle_answers = 0;
@@ -5780,8 +5780,8 @@ static void stop_drainer(probe_session *s) {
                                              "not waiting for them\n", (unsigned long long)inflight);
                         break;
                     }
-                } else if (!answered && now - start >= 15000) {
-                    break;                                      // nobody answers: the old bound
+                } else if (now - last_answer >= 15000) {
+                    break;                                      // nobody answers (any more): the old bound
                 }
             } else if (now - start >= 15000) {
                 break;                                          // ring not empty with nothing in flight
