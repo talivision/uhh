@@ -4088,6 +4088,7 @@ static void clear_gates(probe_session *s) {
 }
 
 // A gate fired: hold this thread at the site until the hook is confirmed.
+static bool arm_quietly(probe_session *s, const std::string &name, uint64_t base);
 static bool handle_gate(probe_session *s, const DEBUG_EVENT &event) {
     if (s->gates.empty()) return false;
     HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
@@ -4120,7 +4121,7 @@ static bool handle_gate(probe_session *s, const DEBUG_EVENT &event) {
             if (trace_enabled()) std::fprintf(stderr, "  gate: %s moves to the live instance at 0x%llx\n", p.location.c_str(),
                                               (unsigned long long)base);
             p.active = false; p.vetted = false; p.base = p.address = 0;
-            arm_module(s, p.module, base);
+            arm_quietly(s, p.module, base);
             if (agent_has_pending(s)) kick_agent(s);
             break;
         }
@@ -5162,6 +5163,7 @@ static void park_thread(probe_session *s, DWORD tid, DWORD disposition) {
 // Returns the next wait's timeout.
 static bool arm_module(probe_session *s, const std::string &module, uint64_t base);
 static bool arm_gates_for_pending(probe_session *s);
+static bool arm_quietly(probe_session *s, const std::string &name, uint64_t base);
 static bool site_executable(HANDLE h, uint64_t a) {
     MEMORY_BASIC_INFORMATION m{};
     return a && VirtualQueryEx(h, (void *)(uintptr_t)a, &m, sizeof(m)) && m.State == MEM_COMMIT && !(m.Protect & PAGE_GUARD) &&
@@ -5188,7 +5190,7 @@ static void retarget_pending(probe_session *s) {
             break;
         }
     }
-    for (const auto &a : arm) arm_module(s, a.first, a.second);
+    for (const auto &a : arm) arm_quietly(s, a.first, a.second);
     if (moved) arm_gates_for_pending(s);
 }
 static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blocked, bool got) {
@@ -7610,8 +7612,30 @@ static void module_unloaded(probe_session *s, uint64_t base) {
 }
 // After an instance went away while a newer one of the same module is already mapped at
 // `base`: arm the module's pending probes there, with the same install path as a LOAD.
+// The other instance may itself be gone already (a mapping the loader discarded): then the probes
+// stay pending for the next LOAD -- never a session error.
+static bool image_at(probe_session *s, uint64_t base) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    return VirtualQueryEx(s->pi.hProcess, (void *)(uintptr_t)base, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
+           mbi.Type == MEM_IMAGE && (uint64_t)(uintptr_t)mbi.AllocationBase == base;
+}
+static bool arm_quietly(probe_session *s, const std::string &name, uint64_t base) {
+    if (!image_at(s, base)) return false;
+    const std::string saved = s->error;
+    std::vector<std::pair<Probe *, bool>> was;                 // the module's probes: retired before?
+    for (auto &p : s->probes) if (iequals(p->module, name)) was.emplace_back(p.get(), p->retired);
+    const bool ok = arm_module(s, name, base);
+    if (!ok) {
+        if (trace_enabled()) std::fprintf(stderr, "  re-arm %s at 0x%llx failed (%s): pending\n", name.c_str(),
+                                          (unsigned long long)base, s->error.c_str());
+        s->error = saved;
+        for (auto &w : was)                                      // not armed there: pending again, not retired
+            if (!w.first->active) { w.first->retired = w.second; w.first->address = w.first->base = 0; w.first->vetted = false; }
+    }
+    return ok;
+}
 static bool arm_after_reload(probe_session *s, const std::string &name, uint64_t base) {
-    bool ok = arm_module(s, name, base);
+    bool ok = arm_quietly(s, name, base) || true;
     if (trace_enabled()) std::fprintf(stderr, "  re-arm %s at 0x%llx after a late unload\n", name.c_str(), (unsigned long long)base);
     if (ok && agent_has_pending(s)) {
         if (s->shared->service_ready && s->svc_event) { arm_gates_for_pending(s); ok = kick_agent(s); }
