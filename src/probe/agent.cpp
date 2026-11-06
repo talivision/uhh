@@ -1558,6 +1558,26 @@ static __declspec(noinline) bool mid_entry_fx(safetyhook::Context &native, uint3
     return x87;
 }
 
+// Regress knob (xstate_mode 3, UHH_BENCH_XSTATE=noxsave): the no-XSAVE fallback on a CPU that
+// HAS AVX. A CPU without OSXSAVE has no AVX state at all; this one does, so the AVX components
+// alone are kept by XSAVE around the fallback, which is then tested for what it is responsible
+// for -- x87, MXCSR -- exactly as without OSXSAVE.
+static __declspec(noinline) bool mid_entry_noxsave_sim(safetyhook::Context &native, uint32_t index, uint64_t avx,
+                                                       unsigned char *x87_post) {
+    alignas(64) unsigned char area[4096];
+    __stosb(area + 512, 0, 64);
+#if defined(_WIN64)
+    if (g_xs.compact) _xsavec64(area, avx); else _xsave64(area, avx);
+    const bool x87 = mid_entry_fx(native, index, x87_post);
+    _xrstor64(area, avx);
+#else
+    if (g_xs.compact) _xsavec(area, avx); else _xsave(area, avx);
+    const bool x87 = mid_entry_fx(native, index, x87_post);
+    _xrstor(area, avx);
+#endif
+    return x87;
+}
+
 static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
     __writeeflags(__readeflags() & ~(uintptr_t)0x400);    // DF=0 before ANY C code
 #if defined(_WIN64)
@@ -1576,6 +1596,8 @@ static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
         else mask = g_xs.avx_mask;                         // liveness unknown: keep AVX state
     }
     if (xmode == 1) x87 = call_mid(native, index, x87_post);
+    else if (xmode == 3 && g_xs.ok && (g_xs.mask & 0xE4ull))
+        x87 = mid_entry_noxsave_sim(native, index, g_xs.mask & 0xE4ull, x87_post);
     else if (mask) x87 = mid_entry_saved(native, index, mask, x87_post);
     else if (!xs_ok) x87 = mid_entry_fx(native, index, x87_post);   // no XSAVE: x87 + MXCSR by FXSAVE
     else {
