@@ -580,33 +580,54 @@ def check_stream_volume():
 
 def check_stream_live(calls=2_000_000):
     """Logs arrive LIVE under full load, not in a burst at the end. hitcost_target passes a
-    QueryPerformanceCounter timestamp (ns) as the probed function's argument; send_log logs
-    it; this reader timestamps each chunk of stdout as it arrives with the SAME clock
-    (time.perf_counter_ns) and computes the lag of every 64th log, plus the gaps between
-    arrivals and how many logs arrived before the target printed its final line."""
-    driver, target = exe("hitcost_driver.exe"), exe("hitcost_target.exe")
-    if not driver or not target:
-        return missing_bin("stream-live", "hitcost driver/target")
+    QueryPerformanceCounter timestamp (us, low 31 bits) as the probed function's argument;
+    send_log logs it; this reader stamps each chunk of stdout as it arrives with the SAME
+    counter and computes the lag of every 64th log, plus the gaps between arrivals and how
+    many logs arrived before the target printed its final line. Bar (as stream-latency, whose
+    calibration this reuses): every log delivered, >= 90% of them before the target's final
+    line, and the lag
+      - quiet machine (the concurrent noise sampler -- an uninstrumented writer, a line every
+        ~5 ms -- saw < 50 ms of stall in the whole run): p99 < 250 ms, absolute (the original bar);
+      - noisy machine (a shared VM, a 2-core runner): p99 of (lag - the stall the sampler saw in
+        that log's own window [event, arrival]) < 250 ms -- the machine's stalls are not UHH's
+        (same build, VM under load: p99 0.7-253 ms over 18 runs, one 1102 ms), but latency UHH
+        adds on top of them still fails.
+    The controller's %TEMP% (its session file) is <build dir>/uhh-latency-tmp, as stream-latency's
+    (a local, AV-excluded dir on the test machines: the check measures UHH, not the profile's AV)."""
+    driver, target, sampler_exe = exe("hitcost_driver.exe"), exe("hitcost_target.exe"), exe("logstream_target.exe")
+    if not driver or not target or not sampler_exe:
+        return missing_bin("stream-live", "hitcost driver/target, logstream_target")
     import re as _re
+    freq = _qpc_freq()
+    tms = lambda ticks: ticks * 1000.0 / freq
+    tmp = Path(BIN).resolve().parent / "uhh-latency-tmp"
+    tmp.mkdir(exist_ok=True)
+    env = dict(os.environ, TEMP=str(tmp), TMP=str(tmp))
+    quiet_ms, bar_ms = 50.0, 250.0
+    pct = lambda vals, q: sorted(vals)[max(0, math.ceil(q * len(vals)) - 1)] if vals else float("inf")
     for backend, n in (("inline", calls), ("hw", 50_000), ("breakpoint", 50_000)):
         name = f"stream-live-{backend}"
+        sampler = None
         try:
+            sampler = _NoiseSampler(sampler_exe, tmp)
+            time.sleep(0.2)
             p = subprocess.Popen([str(driver), "--backend", backend, "--method", "send_log", "--",
                                   str(target), "--calls", str(n), "--threads", "1", "--no-wait", "--qpc-arg"],
-                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            lags, gaps, logs, before_exit, exited, last, buf = [], [], 0, 0, False, None, b""
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
+            samples, gaps, logs, before_exit, exited, last, buf = [], [], 0, 0, False, None, b""
             rx = _re.compile(rb'"message":"hit (-?\d+)"')
             while True:
                 chunk = p.stdout.read1(1 << 20)
                 if not chunk:
                     break
-                now = time.perf_counter_ns()
+                now = _qpc_now()
+                now_us = (now // freq) * 1_000_000 + (now % freq) * 1_000_000 // freq   # the target's formula
                 if last is not None:
                     gaps.append(now - last)
                 last = now
                 buf += chunk
                 lines = buf.split(b"\n"); buf = lines.pop()
-                for k, line in enumerate(lines):
+                for line in lines:
                     if b'"kind":"probe_log"' in line:
                         logs += 1
                         if not exited:
@@ -614,19 +635,30 @@ def check_stream_live(calls=2_000_000):
                         if logs % 64 == 0:
                             m = rx.search(line)
                             if m:
-                                lags.append((((now // 1000) - int(m.group(1))) & 0x7FFFFFFF) * 1000)   # us, 31-bit wrap
+                                lag = ((now_us - int(m.group(1))) & 0x7FFFFFFF) * freq // 1_000_000   # ticks, 31-bit us wrap
+                                samples.append((lag, now - lag, now))       # (lag, event, arrival)
                     elif b'"kind":"target"' in line:
                         exited = True
             p.wait(timeout=600)
-            lags.sort(); ms = lambda v: round(v / 1e6, 1)
-            p50 = ms(lags[len(lags) // 2]) if lags else None
-            p99 = ms(lags[int(len(lags) * 0.99)]) if lags else None
-            gmax = ms(max(gaps)) if gaps else None
+            sampler.stop()
+            lags = [x[0] for x in samples]
+            excess = [lag - sampler.noise(ev, arr) for lag, ev, arr in samples]
+            run_noise = max([0] + [late for _, _, late in sampler.late] + [arr - w for w, arr in sampler.samples])
+            quiet = tms(run_noise) < quiet_ms and len(sampler.samples) >= 100
+            p50, p99, p99x = pct(lags, .5), pct(lags, .99), pct(excess, .99)
             frac = before_exit / logs if logs else 0
-            ok = (p.returncode == 0 and logs == n and p99 is not None and p99 < 250 and frac >= 0.9)
-            record(name, ok, f"logs={logs:,}/{n:,} lag_p50={p50}ms lag_p99={p99}ms max_gap={gmax}ms "
+            lat_ok = bool(samples) and tms(p99 if quiet else p99x) < bar_ms
+            ok = p.returncode == 0 and logs == n and lat_ok and frac >= 0.9
+            record(name, ok, f"logs={logs:,}/{n:,} {'quiet' if quiet else 'noisy'}: "
+                             f"bar={'p99' if quiet else 'p99(lag-noise)'}<{bar_ms:.0f}ms lag_p50={tms(p50):.1f}ms "
+                             f"lag_p99={tms(p99):.1f}ms p99_excess={tms(p99x):.1f}ms lag_max={tms(max(lags, default=0)):.1f}ms "
+                             f"max_gap={tms(max(gaps, default=0)):.1f}ms noise_run_max={tms(run_noise):.1f}ms "
+                             f"sampler={len(sampler.samples)}@{tms(sampler.period):.1f}ms "
+                             f"disk_run_max={tms(max((e - b for b, e in sampler.disk), default=0)):.1f}ms "
                              f"before_target_exit={frac:.1%} rc={p.returncode}")
         except Exception as e:
+            if sampler and sampler.p.poll() is None:
+                sampler.p.kill()
             record(name, False, repr(e))
 
 
@@ -753,16 +785,29 @@ class _NoiseSampler:
         self.period = gaps[len(gaps) // 2] if gaps else 0         # the writer's normal period (median)
         # per interval between consecutive writes: (start, end, lateness) ; per write: delivery latency
         self.late = [(a[0], b[0], max(0, b[0] - a[0] - self.period)) for a, b in zip(s, s[1:])]
+        # Indexes for noise(): the intervals are consecutive (starts and ends ascending), the
+        # write stamps ascending (one writer); a write delivered at or after a was written at or
+        # after a - the longest delivery.
+        self._starts = [x[0] for x in self.late]
+        self._ends = [x[1] for x in self.late]
+        self._lates = [x[2] for x in self.late]
+        self._ws = [w for w, _ in s]
+        self._maxdel = max((arr - w for w, arr in s), default=0)
         return self
 
     def noise(self, a, b):
         """Worst write lateness / delivery latency (QPC ticks) overlapping [a, b]."""
+        import bisect
         worst = 0
-        for start, end, late in self.late:
-            if start <= b and end >= a:
-                worst = max(worst, late)
-        for w, arr in self.samples:
-            if w <= b and arr >= a:
+        i0, i1 = bisect.bisect_left(self._ends, a), bisect.bisect_right(self._starts, b)
+        if i0 < i1:
+            worst = max(self._lates[i0:i1])
+        j = bisect.bisect_right(self._ws, b)
+        floor = a - self._maxdel
+        while j > 0 and self._ws[j - 1] >= floor:
+            j -= 1
+            w, arr = self.samples[j]
+            if arr >= a:
                 worst = max(worst, arr - w)
         return worst
 
