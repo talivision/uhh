@@ -1771,6 +1771,16 @@ the report (count, valid JSON per line, CRC multiset of the lines, `seq` coverag
 - ✅ Inline extended-state strategy measured (`bench/hitcost`): gated save = +1-5% vs +70% for a full save; gated is default
 - 🔧 Inline hot path (striped counters implemented; measurement pending): ~75 ns/hit is high for a mid-hook — 3 shared atomics per hit (hit count + in-flight); stripe/per-thread them, keep exact
 - ⬜ Per-method, per-backend benchmark table (hit, get_reg/set_reg, get_mem, send_log, send_log_stack, call_func, control ops)
+- ✅ main (f9f3436) vs merge-frida (034b245) vs agentscope (7f09697), per probe type x arch, 2026-11-07 --
+  `bench/results/main-vs-merge-frida-2026-11-07.md` (harness `bench/perfab`: interleaved rounds, shared targets,
+  quiet gate; `sampler.py` profiler). Breakpoint -22..-28% per hit (one event per hit); hw and hw data watch
+  +50..+73% per hit -- measured cause: the A5 fairness yield rounds (~30% of a lone hot thread's breakpoint/hw
+  hit rate even when nothing is starved) plus ~5 us/hit of ctx_watch_begin; inline +27 ns x64 / +111 ns x86
+  per empty hit (per-hit accounting, not yet pinned to one change); x86 send_log +58%; bp/hw attach
+  45 -> ~200 ms (agent on every attach), fixed by agentscope (45 ms).
+  - ⬜ Fairness back-off (4ac7ef6 on `perf`, rounds 20 -> 80 ms while no non-yielding thread runs): unbuilt, unmeasured;
+    needs hitcost A/B + hunt-starve/detach on both arches
+  - ⬜ Root-cause inline (x86 especially) and x86 send_log per-hit growth; ctx_watch_begin's Suspend/Resume pair per event
 
 ## Real-world cases
 - ✅ Microsoft Detours samples replicated (`examples/famous/detours_*`: simple, traceapi, withdll/attach, retval) -- findings above

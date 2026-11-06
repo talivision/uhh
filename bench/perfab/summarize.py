@@ -6,10 +6,12 @@
 Per (case, metric): the median of each side over rounds and its spread ((max - min) / median);
 for every side after the first (the reference), the delta vs the reference and a verdict:
 gain / REGRESSION only when the two sides' ranges do not overlap (every round of one beat every
-round of the other) -- else "~" (within noise). Runs with ok=false are counted and excluded.
+round of the other) and the medians differ by >= 5% -- else "~". Runs with ok=false are counted and excluded.
 """
 import argparse, json, statistics
 from collections import defaultdict
+
+MATERIAL_PCT = 5.0    # a non-overlapping difference smaller than this is reported as "~" (immaterial)
 
 # metric, better ("lo" | "hi"), unit/format
 METRICS = {
@@ -75,7 +77,7 @@ def main():
                         deltas.append("-"); continue
                     d = (mb - ma) / ma * 100
                     verdict = "~"
-                    if max(vb) < min(va) or min(vb) > max(va):
+                    if (max(vb) < min(va) or min(vb) > max(va)) and abs(d) >= MATERIAL_PCT:
                         good = (max(vb) < min(va)) == (better == "lo")
                         verdict = "**gain**" if good else "**REGRESSION**"
                     deltas.append(f"{d:+.1f}% {verdict}")
