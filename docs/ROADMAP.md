@@ -1295,6 +1295,10 @@ then fixed. Fixtures: `ctrl_target faultmix`, `co_target susp / many / manydead`
   thread's slot (marked moving while the owner is re-checked, one sweeper at a time, its own hits
   pass through); with more than 4096 such threads alive an overflow table (256) holds the rest; a
   thread with no slot at all is counted live by the drain (`g_untracked_running`). After: PASS both.
+- Verification (e4efa5d): `--only cx2` 2 x 5/5 + 1 SKIP on x64, 2 x 6/6 on x86; `--only ctrl,cdx,cxlib,
+  lifecycle,detach,callorig` 138/138 on x86, 136/137 + 1 SKIP on x64 -- `cxlib-killarm-hw` once:
+  "controller-death guard unavailable (agent not ready within 5 s)" under VM load, so the hw probe was
+  armed without the guard; `--only cxlib` 3 x 9/9 on reruns.
 
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`
