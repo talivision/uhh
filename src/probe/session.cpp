@@ -391,6 +391,7 @@ struct probe_session {
     // the other threads run then -- and released together. See fair_tick.
     std::vector<std::pair<DWORD, HANDLE>> parked;
     bool parking = false;
+    bool fine_timer = false;                   // timeBeginPeriod(1) held (only while something polls at 1 ms)
     std::chrono::steady_clock::time_point fair_window{}, last_event{};
     std::chrono::steady_clock::duration fair_gaps{};
     // Context round-trips (ROADMAP A4): a thread whose debug event we handled while the target
@@ -4964,7 +4965,13 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
         if (!s->parking && got && s->fair_gaps * 10 < now - s->fair_window) s->parking = true;
         s->fair_window = now; s->fair_gaps = {};
     }
-    return (!s->parked.empty() || !s->ctx_watch.empty()) ? 1 : 20;
+    // 1 ms timer resolution only while a parked thread or a context watch waits on this loop:
+    // process-wide, it also makes every Sleep(1) of the controller's own threads (the log
+    // drainer) wake 15x as often -- a writer that never sees its queue empty kept a mid-run
+    // probe_report (flush) waiting for the target to finish.
+    const bool fine = !s->parked.empty() || !s->ctx_watch.empty();
+    if (fine != s->fine_timer) { if (fine) timeBeginPeriod(1); else timeEndPeriod(1); s->fine_timer = fine; }
+    return fine ? 1 : 20;
 }
 
 // Re-apply OUR changes (after vs before) to a context the target wrote back: a field the target
@@ -7460,7 +7467,6 @@ extern "C" int probe_run(probe_session *s) {
     if (g_ctrl_runs.fetch_add(1) == 0 && g_runs_done) ResetEvent(g_runs_done);
     DEBUG_EVENT event{};
     DWORD wait_ms = 20;
-    timeBeginPeriod(1);                    // fairness parking and context repairs poll at ~1 ms
     while (!s->exited) {
         if (g_ctrl_hit && !s->interrupted) {
             s->interrupted = true; s->stop_requested = true;
@@ -7520,7 +7526,7 @@ extern "C" int probe_run(probe_session *s) {
     }
     park_release(s);
     ctx_watch_poll(s, true);
-    timeEndPeriod(1);
+    if (s->fine_timer) { timeEndPeriod(1); s->fine_timer = false; }
     release_held(s, "session end");
     stop_drainer(s);
     flush_log_writer(s);
