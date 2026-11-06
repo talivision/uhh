@@ -83,50 +83,62 @@ Options (from `examples/gated_config/main.cpp`): `--flag-backend b`, `--read-bac
 `--open-backend b` (`b` = `breakpoint`, `hw` or `inline`), `--no-log` (count hits only),
 `--pid P` (log only reads of that process), `--range BASE:SIZE` (repeatable, up to 8).
 
-**stderr** shows the session's progress (addresses vary):
+**stderr** shows the session's progress (captured on x64; pids, tids and addresses vary):
 
 ```text
 probe: pending configparse.dll!ParseConfig+0x16
 probe: pending ntdll.dll!NtOpenProcess
 probe: pending ntdll.dll!NtClose
 probe: pending ntdll.dll!NtReadVirtualMemory
-probe: logs -> C:\Users\...\AppData\Local\Temp\uhh\logs\uhh-1234-0.jsonl
-probe: symbols via ...
-probe: resolved ntdll.dll!NtOpenProcess -> base=0x... addr=0x... (awaiting agent)
-...
-probe: active ntdll.dll!NtOpenProcess -> addr=0x... (inline)
-probe: active ntdll.dll!NtClose -> addr=0x... (inline)
-probe: active ntdll.dll!NtReadVirtualMemory -> addr=0x... (inline)
-probe: active configparse.dll!ParseConfig+0x16 -> base=0x... addr=0x... (was 0x.., len=.., ...)
+probe: logs -> C:\Users\admin\AppData\Local\Temp\uhh\logs\uhh-10384-0.jsonl
+probe: symbols via C:\Windows\system32\dbghelp.dll
+probe: resolved ntdll.dll!NtOpenProcess -> base=0x7ffe2e050000 addr=0x7ffe2e0eda50 (awaiting agent)
+probe: resolved ntdll.dll!NtClose -> base=0x7ffe2e050000 addr=0x7ffe2e0ed770 (awaiting agent)
+probe: resolved ntdll.dll!NtReadVirtualMemory -> base=0x7ffe2e050000 addr=0x7ffe2e0edd70 (awaiting agent)
+probe: holding thread 9732 until inline installs confirm
+probe: active ntdll.dll!NtOpenProcess -> addr=0x7ffe2e0eda50 (inline)
+probe: active ntdll.dll!NtClose -> addr=0x7ffe2e0ed770 (inline)
+probe: active ntdll.dll!NtReadVirtualMemory -> addr=0x7ffe2e0edd70 (inline)
+probe: released 1 held thread(s) (inline installs confirmed)
+probe: active configparse.dll!ParseConfig+0x16 -> base=0x7ffe28950000 addr=0x7ffe28951116 (was 0x89, len=2, displaced)
 ```
 
 The flag probe stays `pending` until `probe_app` loads `configparse.dll`; it arms at that
 load. Inline probes become `active` once the injected agent confirms each hook.
 
-**stdout** (`run.jsonl`) holds, in order: the target's own lines, the `probe_log` records
-as they happen, and the report written by `probe_report`:
+**stdout** (`run.jsonl`) holds the target's own lines and the `probe_log` records,
+interleaved as they reach UHH (inline records travel through a ring the controller drains,
+so the target's `app` line can arrive before the last `read` logs), then the report written
+by `probe_report` (captured on x64, 823 lines, trimmed):
 
 ```text
-{"kind":"helper","index":0,"pid":6936,"base":140703050012240,"size":256}
+{"kind":"helper","index":0,"pid":10152,"base":140700647678496,"size":256}
 ...
-{"kind":"probe_log","probe":1,"tid":...,"message":"open pid=6936 name=probe_app.exe"}
-{"kind":"probe_log","probe":1,"tid":...,"message":"map handle=0xa4 -> pid=6936 name=probe_app.exe"}
+{"kind":"waiting","pid":8684,"helpers":4}
+{"kind":"opened","pid":10152,"handle":320}
 ...
-{"kind":"probe_log","probe":3,"tid":...,"message":"read handle=0xa4 pid=6936 name=probe_app.exe addr=0x7ff7fb509650 size=16"}
+{"kind":"probe_log","probe":1,"tid":9732,"message":"open pid=10152 name=probe_app.exe"}
+{"kind":"probe_log","probe":1,"tid":9732,"message":"map handle=0x140 -> pid=10152 name=probe_app.exe"}
 ...
-{"kind":"app","reads_enabled":1,"helpers":4,"opened":4,"threads":4,"reads_per_thread":200,"successful_reads":800,...}
+{"kind":"probe_log","probe":3,"tid":2012,"message":"read handle=0x140 pid=10152 name=probe_app.exe addr=0x7ff76c1fe220 size=16"}
+...
+{"kind":"app","reads_enabled":1,"helpers":4,"opened":4,"threads":4,"reads_per_thread":200,"successful_reads":800,"checksum":76800,"elapsed_ns":3260700,"prehook":false,"prehook_calls":0,"configparse_base":140729579274240,"shadow_stack":false}
+{"kind":"probe_log","probe":3,"tid":2420,"message":"read handle=0x148 pid=10004 name=probe_app.exe addr=0x7ff76c1fe260 size=16"}
+...
 {"kind":"probe","location":"configparse.dll!ParseConfig+0x16","backend":"breakpoint","active":true,"hits":1}
-{"kind":"probe","location":"ntdll.dll!NtOpenProcess","backend":"inline","active":true,"hits":...}
-{"kind":"probe","location":"ntdll.dll!NtClose","backend":"inline","active":true,"hits":...}
+{"kind":"probe","location":"ntdll.dll!NtOpenProcess","backend":"inline","active":true,"hits":4}
+{"kind":"probe","location":"ntdll.dll!NtClose","backend":"inline","active":true,"hits":77}
 {"kind":"probe","location":"ntdll.dll!NtReadVirtualMemory","backend":"inline","active":true,"hits":800}
-{"kind":"probe_report","probes":4,"active":4,"hits":...,"overrides":1,"log_dropped":0,"callbacks_interrupted":0,"logs_written":...,"controller_peak_ws_mb":...,"app_exit":0,"live_output_closed":false,"error":null}
+{"kind":"probe_report","probes":4,"active":4,"hits":882,"overrides":1,"log_dropped":0,"callbacks_interrupted":0,"logs_written":808,"controller_peak_ws_mb":14,"app_exit":0,"live_output_closed":false,"error":null}
 ```
 
 What to check:
 
 - `"reads_enabled":1` in the target's `app` line: the flag was flipped.
 - `"overrides":1`: one register change (the flag), counted by the library.
-- `NtReadVirtualMemory` `hits` = threads x reads (here 4 x 200 = 800), one `read` log each.
+- `NtReadVirtualMemory` `hits` = threads x reads (here 4 x 200 = 800), one `read` log each
+  (`logs_written` 808 = 800 reads + 4 `open` + 4 `map` logs; `NtClose` hits vary from run
+  to run: every handle the process closes is seen).
 - `"log_dropped":0` and `"error":null`.
 - The `"probe"` field of a log is the probe's index in the order it was added
   (0 = the flag probe, 1 = NtOpenProcess, 2 = NtClose, 3 = NtReadVirtualMemory).
@@ -152,18 +164,19 @@ Use two consoles in the build directory.
 
    ```text
    > probe_app.exe --helpers 4 --threads 8 --reads 1000
-   {"kind":"helper","index":0,"pid":6936,"base":140703050012240,"size":256}
-   {"kind":"helper","index":1,"pid":7516,"base":140703050012240,"size":256}
-   ...
-   {"kind":"waiting","pid":3964,"helpers":4}
+   {"kind":"helper","index":0,"pid":8828,"base":140700647678496,"size":256}
+   {"kind":"helper","index":1,"pid":5260,"base":140700647678496,"size":256}
+   {"kind":"helper","index":2,"pid":5064,"base":140700647678496,"size":256}
+   {"kind":"helper","index":3,"pid":8832,"base":140700647678496,"size":256}
+   {"kind":"waiting","pid":9964,"helpers":4}
    ```
 
 2. Console B: attach. This logs only the reads of helper 1 at offset 64 of its buffer
    (`base + 64`, 64 bytes long):
 
    ```text
-   > uhh_attach.exe 3964 --pid 7516 --range 140703050012304:64 --backend inline
-   {"kind":"attached","pid":3964}
+   > uhh_attach.exe 9964 --pid 5260 --range 140700647678560:64 --backend inline
+   {"kind":"attached","pid":9964}
    ```
 
    Wait for the `probe: active ntdll.dll!NtOpenProcess ...` and
@@ -173,9 +186,25 @@ Use two consoles in the build directory.
 3. Console A: press a key. `probe_app` loads `configparse.dll`, the breakpoint flips the
    flag, and the reads run.
 
-4. Console B prints the matching `read` logs, then the report, and exits when the target
-   exits. Expected: `"overrides":1`, `NtReadVirtualMemory` `hits` = 8 x 1000 = 8000 (every
-   read is seen), and exactly 500 logged reads (helper 1 at offset 64 gets every 16th read).
+4. Console B prints the `open`/`map` logs and the matching `read` logs, then the report,
+   and exits when the target exits (captured on x64, trimmed):
+
+   ```text
+   {"kind":"probe_log","probe":1,"tid":7612,"message":"open pid=8828 name=probe_app.exe"}
+   {"kind":"probe_log","probe":1,"tid":7612,"message":"map handle=0xec -> pid=8828 name=probe_app.exe"}
+   ...
+   {"kind":"probe_log","probe":3,"tid":7756,"message":"read handle=0xf4 pid=5260 name=probe_app.exe addr=0x7ff76c1fe260 size=16"}
+   ...
+   {"kind":"probe","location":"configparse.dll!ParseConfig+0x16","backend":"breakpoint","active":true,"hits":1}
+   {"kind":"probe","location":"ntdll.dll!NtOpenProcess","backend":"inline","active":true,"hits":4}
+   {"kind":"probe","location":"ntdll.dll!NtClose","backend":"inline","active":true,"hits":44}
+   {"kind":"probe","location":"ntdll.dll!NtReadVirtualMemory","backend":"inline","active":true,"hits":8000}
+   {"kind":"probe_report","probes":4,"active":4,"hits":8049,"overrides":1,"log_dropped":0,"callbacks_interrupted":0,"logs_written":508,"controller_peak_ws_mb":14,"app_exit":0,"live_output_closed":false,"error":null}
+   ```
+
+   Expected: `"overrides":1`, `NtReadVirtualMemory` `hits` = 8 x 1000 = 8000 (every
+   read is seen), and exactly 500 logged reads (helper 1 at offset 64 gets every 16th read;
+   `logs_written` 508 = 500 reads + 4 `open` + 4 `map`).
 
 Usage: `uhh_attach <target_pid> --pid P --range BASE:SIZE [--backend breakpoint|hw|inline] [--flag-backend b]`.
 See [examples/attach/README.md](../examples/attach/README.md) for the derivation of the
@@ -197,6 +226,12 @@ uhh_trace --backend hw --stack -p "ntdll.dll!NtCreateFile:xxO" --attach 1234
 uhh_trace --list kernelbase.dll --mask *CreateFile*
 ```
 
+The program after `--` is started as given: it is **not** searched on `PATH`, so name a
+system program by its path (`-- C:\Windows\System32\cmd.exe /c ...`; plain `cmd.exe` fails
+with `probe: error: debug launch (Win32=2)`). Module names in `-p` follow the
+[location grammar](api.md#locations): `kernel32!X` is `kernel32.dll!X`, and the program
+itself is named with its extension (`app.exe!Func`).
+
 Other options: `--attach-new <image> [--timeout ms]`, `--fallback-hw`,
 `--allow-unsafe-site`, `--allow-prehooked`, `--unsafe-fast-patch` (see the flags in
 [api.md](api.md#probe-flags)).
@@ -214,13 +249,16 @@ A tool has two parts, laid out like every example (`gated_config`, `filetrace`,
   reports and closes.
 
 The minimal tool below keeps the flagship technique: the config stays disabled, a probe
-turns the feature on, and a second probe logs the reads. The callback bodies are those of
-`examples/gated_config/callbacks.cpp` (`enable_reads`, and `log_read` without the
-handle map and filters); the driver is `examples/gated_config/main.cpp` without its option
-parsing. The names carry a `my_` prefix because the agent DLL already exports
-`enable_reads` and `log_read` from gated_config: export names must be unique in the agent.
+turns the feature on, and a second probe logs the reads. It is a real example, built with
+the others: [`examples/quickstart/`](../examples/quickstart) (target `my_tool`; the regress
+check `quickstart-my-tool` runs it). The code below is those files, verbatim.
+The callback bodies are those of `examples/gated_config/callbacks.cpp` (`enable_reads`,
+and `log_read` without the handle map and filters); the driver is
+`examples/gated_config/main.cpp` without its option parsing. The names carry a `my_`
+prefix because the agent DLL already exports `enable_reads` and `log_read` from
+gated_config: export names must be unique in the agent.
 
-`examples/my_tool/my_callbacks.h`:
+`examples/quickstart/my_callbacks.h`:
 
 ```cpp
 #pragma once
@@ -234,7 +272,7 @@ __declspec(dllexport) void my_log_read(probe_context *);
 }
 ```
 
-`examples/my_tool/my_callbacks.cpp`:
+`examples/quickstart/my_callbacks.cpp`:
 
 ```cpp
 #include "my_callbacks.h"
@@ -253,7 +291,7 @@ extern "C" void my_log_read(probe_context *c) {
 }
 ```
 
-`examples/my_tool/main.cpp`:
+`examples/quickstart/main.cpp`:
 
 ```cpp
 #include "my_callbacks.h"
@@ -277,29 +315,62 @@ int main(int argc, char **argv) {
 
 `argv + 1` works because `argv` is NULL-terminated, which is what `probe_launch` expects.
 
-Add the tool to `CMakeLists.txt`, next to the other examples:
+The tool in `CMakeLists.txt`, next to the other examples:
 
 ```cmake
-add_executable(my_tool examples/my_tool/main.cpp examples/my_tool/my_callbacks.cpp)
+add_executable(my_tool examples/quickstart/main.cpp examples/quickstart/my_callbacks.cpp)
 target_include_directories(my_tool PRIVATE include)
 target_link_libraries(my_tool PRIVATE probe_api)
 add_dependencies(my_tool probe_api_agent probe_app configparse)
 ```
 
-and add `examples/my_tool/my_callbacks.cpp` to the source list of
+and `examples/quickstart/my_callbacks.cpp` is in the source list of
 `add_library(probe_api_agent SHARED ...)` in the same file. Without that, the inline probe
 fails to install (`inline agent failed to install ntdll.dll!NtReadVirtualMemory
-(status=-2)`, and the session ends): the agent cannot find `my_log_read`.
+(status=-2)`, and the session ends): the agent cannot find `my_log_read`. For a tool of
+your own, copy the directory, rename the target and the exports, and add the same lines.
 
-Build and run:
+Build and run (from the repository root):
 
 ```bat
 cmake --build build-x64 --config Release --target my_tool
 build-x64\Release\my_tool.exe build-x64\Release\probe_app.exe --no-wait --threads 4 --reads 200
 ```
 
-Expected: `"reads_enabled":1` in the target's last line, one `read ...` log per read, and
-`"overrides":1` in the report.
+stderr (captured on x64):
+
+```text
+probe: pending configparse.dll!ParseConfig+0x16
+probe: pending ntdll.dll!NtReadVirtualMemory
+probe: logs -> C:\Users\admin\AppData\Local\Temp\uhh\logs\uhh-6448-0.jsonl
+probe: symbols via C:\Windows\system32\dbghelp.dll
+probe: resolved ntdll.dll!NtReadVirtualMemory -> base=0x7ffe2e050000 addr=0x7ffe2e0edd70 (awaiting agent)
+probe: holding thread 8636 until inline installs confirm
+probe: active ntdll.dll!NtReadVirtualMemory -> addr=0x7ffe2e0edd70 (inline)
+probe: released 1 held thread(s) (inline installs confirmed)
+probe: active configparse.dll!ParseConfig+0x16 -> base=0x7ffe28950000 addr=0x7ffe28951116 (was 0x89, len=2, displaced)
+```
+
+stdout (813 lines, trimmed):
+
+```text
+{"kind":"helper","index":0,"pid":1948,"base":140700647678496,"size":256}
+...
+{"kind":"waiting","pid":8296,"helpers":4}
+{"kind":"opened","pid":1948,"handle":196}
+...
+{"kind":"app","reads_enabled":1,"helpers":4,"opened":4,"threads":4,"reads_per_thread":200,"successful_reads":800,"checksum":76800,"elapsed_ns":1672500,"prehook":false,"prehook_calls":0,"configparse_base":140729579274240,"shadow_stack":false}
+{"kind":"probe_log","probe":1,"tid":5244,"message":"read handle=0xc4 addr=0x7ff76c1fe220 size=16"}
+{"kind":"probe_log","probe":1,"tid":5928,"message":"read handle=0xc4 addr=0x7ff76c1fe2a0 size=16"}
+...
+{"kind":"probe","location":"configparse.dll!ParseConfig+0x16","backend":"breakpoint","active":true,"hits":1}
+{"kind":"probe","location":"ntdll.dll!NtReadVirtualMemory","backend":"inline","active":true,"hits":800}
+{"kind":"probe_report","probes":2,"active":2,"hits":801,"overrides":1,"log_dropped":0,"callbacks_interrupted":0,"logs_written":800,"controller_peak_ws_mb":14,"app_exit":0,"live_output_closed":false,"error":null}
+```
+
+Expected: `"reads_enabled":1` in the target's `app` line, one `read ...` log per read
+(800 = `logs_written` = the read probe's `hits`), and `"overrides":1` in the report. The
+x86 build gives the same counts (`build-x86\Release\...`).
 
 To change a backend, change only the flag in `main.cpp` (`PROBE_BREAKPOINT`, `PROBE_HW` or
 `PROBE_INLINE`). The callbacks stay the same.
