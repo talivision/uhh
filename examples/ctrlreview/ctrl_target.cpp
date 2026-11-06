@@ -17,6 +17,8 @@
 //   ctrl_target headcorrupt             write a huge log_head into the agent's shared section
 //   ctrl_target faultreg [--n N]        the probed load faults; the VEH repairs it by pointing the
 //                                       base register at valid memory and retries (cdx-faultreg)
+//   ctrl_target faultmix [--n N]        the probed load faults; the handler retries it, skips it or
+//                                       unwinds out of it (SEH), in turn (cx2-faultfresh)
 //   ctrl_target owndrx [--n N]          the target's own watch on an address UHH watched once and
 //                                       released, from a thread that existed then (cdx-owndrx)
 //   ctrl_target absreuse                absolute INT3 in an unloaded DLL; its address reused (cdx-absreuse)
@@ -311,6 +313,64 @@ static int run_faultreg(int n) {
     return 0;
 }
 
+// ---- faultmix: after a faulting probed load the program's handler retries it, SKIPS it,
+// or UNWINDS out of it (SEH __except); the next call is a fresh execution of the site on the
+// same thread with no other event in between: every call must be one hit (cx2-faultfresh).
+static volatile LONG g_mix_mode = 0;                   // 0 retry (commit), 1 skip, 2 unwind
+static volatile LONG g_skip = 0, g_retry = 0, g_unwind = 0;
+static LONG CALLBACK faultmix_veh(EXCEPTION_POINTERS *e) {
+    const DWORD code = e->ExceptionRecord->ExceptionCode;
+    if (code == EXCEPTION_SINGLE_STEP) {
+        InterlockedIncrement(&g_stray);
+        e->ContextRecord->EFlags &= ~0x100u;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (code != EXCEPTION_ACCESS_VIOLATION || e->ExceptionRecord->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    char *a = (char *)e->ExceptionRecord->ExceptionInformation[1];
+    if (!g_page || a < g_page || a >= g_page + 4096) return EXCEPTION_CONTINUE_SEARCH;
+    if (e->ContextRecord->EFlags & 0x100u) InterlockedIncrement(&g_tf);
+    if (g_mix_mode == 0) {                                  // commit the page, retry the load
+        if (!VirtualAlloc(g_page, 4096, MEM_COMMIT, PAGE_READWRITE)) return EXCEPTION_CONTINUE_SEARCH;
+        InterlockedIncrement(&g_retry);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (g_mix_mode == 1) {                                  // emulate it: skip `mov eax, [rcx]` (8B 01)
+#if defined(_WIN64)
+        e->ContextRecord->Rip += 2; e->ContextRecord->Rax = 5;
+#else
+        e->ContextRecord->Eip += 2; e->ContextRecord->Eax = 5;
+#endif
+        InterlockedIncrement(&g_skip);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;                        // the frame's __except unwinds
+}
+static int faultmix_unwind(const int *p) {
+    __try { return CtrlLoad(p); }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        InterlockedIncrement(&g_unwind);
+        return 9;
+    }
+}
+static int run_faultmix(int n) {
+    PVOID h = AddVectoredExceptionHandler(1, faultmix_veh);
+    long long sum = 0, want = 0;
+    for (int i = 0; i < n; ++i) {
+        char *p = (char *)VirtualAlloc(nullptr, 4096, MEM_RESERVE, PAGE_NOACCESS);
+        if (!p) { std::printf("{\"kind\":\"ctrl_result\",\"error\":\"alloc\"}\n"); return 1; }
+        g_mix_mode = i % 3;
+        g_page = p;
+        sum += g_mix_mode == 2 ? faultmix_unwind((const int *)p) : CtrlLoad((const int *)p);
+        want += g_mix_mode == 0 ? 0 : g_mix_mode == 1 ? 5 : 9;
+        g_page = nullptr;
+        VirtualFree(p, 0, MEM_RELEASE);
+    }
+    RemoveVectoredExceptionHandler(h);
+    std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"faultmix\",\"n\":%d,\"retry\":%ld,\"skip\":%ld,\"unwind\":%ld,"
+                "\"tf\":%ld,\"stray\":%ld,\"sum\":%lld,\"want\":%lld}\n", n, g_retry, g_skip, g_unwind, g_tf, g_stray, sum, want);
+    return 0;
+}
+
 // ---- cdx-owndrx: the target's own watch on an address UHH watched once and released -----
 static volatile LONG g_var3 = 0;
 static LONG g_wx[4] = {-1, -1, -1, -1};
@@ -484,6 +544,7 @@ int main(int argc, char **argv) {
     else if (sc == "owndr") rc = run_owndr(arg_int(argc, argv, "--n", 50));
     else if (sc == "headcorrupt") rc = run_headcorrupt();
     else if (sc == "faultreg") rc = run_faultreg(arg_int(argc, argv, "--n", 200));
+    else if (sc == "faultmix") rc = run_faultmix(arg_int(argc, argv, "--n", 300));
     else if (sc == "owndrx") rc = run_owndrx(arg_int(argc, argv, "--n", 50));
     else if (sc == "absreuse") rc = run_absreuse();
     else if (sc == "int3cap") rc = run_int3cap(arg_int(argc, argv, "--n", 1200));

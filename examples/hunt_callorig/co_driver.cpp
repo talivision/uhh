@@ -74,11 +74,13 @@ int main(int argc, char **argv) {
     else if (k == "cbfault") ok = add("co_cbf", co_on_cbf, bk);
     else if (k == "spin") ok = add("co_add", co_on_spin, bk);
     else if (k == "rep") ok = add("CoRepSite", co_on_spin, bk);
-    else if (k == "late" || k == "cfgfree") {
+    else if (k == "susp") ok = add("co_add", co_on_spin, bk);
+    else if (k == "late" || k == "cfgfree" || k == "many" || k == "manydead") {
         static co_bigcfg big{};                  // larger than PROBE_AGENT_CONFIG_CAP (256)
         big.backend = bk; big.n = (uint32_t)sizeof(big.pat);
         for (uint32_t j = 0; j < big.n; ++j) big.pat[j] = (unsigned char)((j * 7 + 3) & 0xFF);
         ok = probe_add_symbol_cfg(s, "co_target.exe!co_late", co_on_late, bk, &big, sizeof(big)) != 0;
+        if (k == "many" || k == "manydead") ok = ok && add("co_add", co_on_spin, bk);
     }
     else { std::fprintf(stderr, "co_driver: unknown case %s\n", k.c_str()); return 2; }
     if (!ok) { std::fprintf(stderr, "co_driver: add failed\n"); probe_close(s); return 1; }

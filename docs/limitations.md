@@ -33,6 +33,14 @@ Contents: [scope](#scope) · [resource limits](#resource-limits) ·
 - **No accessor for XMM/x87 registers, the instruction pointer or flags** (📄 Calling-convention
   CC7). Float/double arguments in XMM cannot be read; a float result cannot be set.
   *Workaround:* pass float results through with `call_original` + `return_from`.
+- **Sandboxed processes that admit only Microsoft-signed DLLs (Code Integrity Guard: every
+  Chromium/Edge renderer, most of their utility processes) cannot load the agent** (Real large
+  apps RB2). An inline session attached to one fails cleanly (`LoadLibraryW failed for
+  probe_api_agent.dll (the target admits only Microsoft-signed DLLs ...)`, detached, target
+  untouched); breakpoint/hw sessions work, but without the agent there is no controller-death
+  guard (stderr: `controller-death guard unavailable`): a controller killed while attached
+  leaves its INT3s/DRs in the target.
+  *Workaround:* breakpoint or hw in such processes, and end the session with `probe_close`/Ctrl+C.
 - **The debugger is not hidden** (✗ Codex workaround audit C6; Controller static review).
   See [visibility](#visibility-to-the-target-anti-debug).
 
@@ -126,15 +134,19 @@ data) prints on all backends.
 
 - **`call_func` on breakpoint/hw is a debugger-driven call** (✗ Controller static review,
   "call_func under contention"; Evaluator round 3 #6). Other threads' code-probe hits wait
-  during the call; if one of them holds a lock the callee needs, the call times out after
-  5 s and the callee is abandoned mid-wait. A first-chance exception inside the callee also
-  abandons it. Owner decision: no further hardening.
-  *Workaround:* call only lock-free, non-throwing callees; cache results; prefer
+  during the call (callbacks never overlap, so a callback may hold its own lock across
+  `call_func`); if one of them holds a lock the callee needs, the call times out after 5 s
+  and the callee is abandoned mid-wait (inline: both run). A first-chance exception inside
+  the callee also abandons it. Owner decision: no further hardening.
+  *Workaround:* call only non-blocking, non-throwing callees; cache results; prefer
   `call_original` for the probed function.
-- **`call_func` calls do not nest on breakpoint/hw** (⬜ Detours D3, Frida F5, Hunter A2).
-  Code-probe hits of other threads are parked during a call, but a data-watchpoint hit
-  cannot be parked: its callback runs during the call, and a `call_func` from it returns 0.
-  *Workaround:* treat 0 as "try later"; avoid `call_func` in watch callbacks.
+- **Concurrent `call_func` on breakpoint/hw** (✅ Detours D3, Frida F5, Hunter A2): calls from
+  several threads' callbacks all succeed, one after the other: other threads' hits wait while
+  a call is in flight -- code probes are rewound and hit again, a data watch's thread is held
+  right after its access and its callback runs once the call is over (it used to run during
+  the call, where its own `call_func` returned 0). `call_original` likewise runs one at a time.
+  One corner: a hardware hit on a thread that is at that moment single-stepping over a
+  breakpoint probe is handled at once.
 - **Inline `call_original` is a real call from the agent** (📄 Transparency findings). The
   original sees the agent's return address (`_ReturnAddress()`), a new frame for its stack
   arguments, and only the hit's argument registers (x64 RCX RDX R8 R9 XMM0-5; x86 EAX ECX
@@ -247,7 +259,7 @@ data) prints on all backends.
 
 - **Hits = logs + `log_dropped` + `callbacks_interrupted`** exactly for a callback that logs
   once per hit, also when the process dies at any instant: a callback's first log carries its
-  hit, so a thread killed after publishing it is a delivered log, not interrupted (agent v21;
+  hit, so a thread killed after publishing it is a delivered log, not interrupted (agent v23;
   runfix1). One inherent edge (Log delivery findings): a producer that claims a slot in the
   few instructions after the final drain at detach/close loses that record uncounted.
 - **Per-thread order** is kept across backends, except that a record behind two unfinished

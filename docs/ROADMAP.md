@@ -243,8 +243,8 @@ breakpoint/hw/inline on x64+x86, compared with the uninstrumented run (`regress.
 - ✅ (F1) HW: a hardware probe armed at RUNTIME (from a callback, or at a later DLL load) was lost for whole threads still in loader initialisation: thread start ends in NtContinue with the creation-time context, debug registers included (the initial-thread entry fixup's mechanism, for every other thread). Found by `famous-retval-hw` (return-site probes added while workers start: whole workers 0/25 overridden). Fix: library-owned INT3 at `ntdll!RtlUserThreadStart` (armed the first time a hw probe is armed after entry/attach) re-applies the active DRs to each arriving thread. Test: `famous-retval-hw` x3 (+ 8/8 manual)
 - ✅ (F2) HW: target killed by STATUS_SINGLE_STEP. Arming a hw probe writes every thread's debug registers -- DR6 included -- and on a thread whose #DB is still waiting to be reported that zeroes the B-bit, so the hit looked foreign and was passed to the target. Fix: a #DB with no B-bit exactly at an active, enabled hw EXECUTE probe is that probe's hit (`hw-dr6-lost` under PROBE_TRACE). Test: `famous-retval-hw`. The same lost bit on a data WATCHPOINT: fixed by H2 (status kept across our DR writes)
 - ✅ (F3) Inline: target died (STATUS_STACK_OVERFLOW, "probe_agent_init failed 0xC000041D") in ~half of short runs of an inline `RtlAllocateHeap` probe whose callback calls `call_func`: (a) the agent's thread_local region cache was touched before a starting thread had TLS (LdrpInitializeThread allocates it through the probed allocator) -> AV; (b) allocations inside call_func's own resolution/callee hit the probe again -> unbounded recursion. Fix: TLS presence checked (no cache until then); inline call_func now suppresses callbacks on its own thread for its duration -- the documented contract the breakpoint/hw path already kept. Test: `famous-heap-inline-reentry` (12 runs)
-- ⬜ (F4) Same NtContinue/RtlRestoreContext wipe class, not covered: a thread inside exception dispatch when a hw probe is armed resumes with the old DRs
-- ⬜ (F5) `call_func` from a breakpoint/hw callback returns 0 while another thread's callback is inside one (no nesting: the other thread's event is dispatched inside the first call). A Process.mainModule lookup via call_func silently skips that racing call; famous_common.h falls back to walking to the PE header. Library options: document in probe_api.h, or defer (replay) other threads' probe hits during a call
+- ✅ (F4) Same NtContinue/RtlRestoreContext wipe class: a thread inside exception dispatch (an exception filter, a vectored handler) or inside a user APC when a hw probe is armed resumed through NtContinue with the context the kernel captured BEFORE the arm -- debug registers included -- and missed that probe (reproduced: `hw-dr-restore` exception 9/10, APC 9/10 before the fix, x64). Fix (builds on hwonce's thread-start mechanism): library-owned INT3s at `ntdll!NtContinue` / `NtContinueEx` (armed with the thread-start fixup: once a hw probe is armed or released at runtime) bring the DR image of the context about to be restored up to date: our ACTIVE probes' slots re-asserted, nothing else touched (an exception handler may arm the program's own DR in that record, even at an address we watched once and released: `cdx-owndrx` caught a first version that cleared released images there; a stale image of a released probe is recognised at the thread's next #DB by hwonce's per-thread logic). x86: a WOW64 user APC's 32-bit record carries no debug registers (flags 0x10003) and the 64-bit layer restores its own copy, out of a 32-bit debugger's reach -- there the fixup points the record's EIP at the library's private INT3 (`call_trap`), re-applies the DRs there and resumes the thread at its real EIP, so even its first instruction sees them (Codex review 2: a first version re-applied them by trap flag AFTER that instruction; `hw-dr-restore-first` arms a hw probe exactly at the APC thread's resume site). A breakpoint/hw call_original that borrowed its hw probe's own slot for the return catch keeps it on its thread through such a restore (Codex review: an exception continued inside the original lost the return; `enforce_owned_drs` skips it). Cost while armed: one INT3 + step per NtContinue (exceptions, APCs, thread starts). Tests: `hw-dr-restore` (exception 0/10, APC 0/10 before; 30/30 after), `hw-co-borrow-restore`
+- ✅ (F5) `call_func` from a breakpoint/hw callback returned 0 while another thread's callback was inside one. Fixed with D3 (callback fibers; see there). famous_common.h's PE-header fallback is no longer needed for this but kept (harmless)
 - ✗ (F6) HW budget: a recipe needing one return probe per call site exceeds the 4 debug registers when unfiltered (NtCreateFile is called from several KernelBase sites, CreateDirectory among them) -> clean `too many hardware probes` refusal. By design; the recipe's Procmon-style `--filter` keeps it to one site. Documented in the recipe README
 - ✗ (F7) Observer effect: with inline probes, writing a hook makes the patched bytes PAGE_EXECUTE_READWRITE through the target's own NtProtectVirtualMemory (seen by an RWX watcher installed earlier: `rwx-protect size=0x8` in KernelBase); breakpoint/hw patch from the controller and are invisible. Documented (loader_rwx README)
 - ✅ (F8, fixed with D2: a launched target writing to a pipe/file gets its own pipe, forwarded line-wise; regress `stdout-*`) The live log tail shares the target's inherited stdout: a target writing partial lines (cmd `type`) interleaves with tail lines mid-line, corrupting both for a line-based reader. The session JSONL file is unaffected (the famous checks read logs from it). Options: document; or tail to stderr/another handle when the target inherits stdout
@@ -278,8 +278,36 @@ binaries (cmd, reg, sort), multi-threaded targets, launch vs attach, attach mid-
   target's output too). Workaround in the suite: `dt_split` cuts records back out of the line they
   landed in. Options: a separate tail handle/stream, or giving the child its own stdout pipe that
   the controller forwards line-wise.
-- ⬜ (D3) **call_func from a breakpoint/hw callback fails while another thread's call_func is in
-  flight.** The "no nesting" guard (`in_call_tid`) is session-wide: during thread A's call the
+- ✅ (D3) **call_func from a breakpoint/hw callback fails while another thread's call_func is in
+  flight.** FIXED (cfnest). Two parts: (1) Hunter A's policy (other threads' code-probe hits are
+  rewound + held during a call and replayed after it) already serialised most calls; kept as
+  the documented contract -- breakpoint/hw callbacks never overlap, so a callback may hold its own
+  lock across call_func (B3). (2) Hits that cannot be held back (a data watch, a thread mid-step)
+  still ran their callback during the call, and its call_func returned 0 ("no nesting"). Now
+  every exception event is handled on a fiber of the debug thread: a callback waiting in
+  call_func parks its fiber (its event continued), the loop that resumed it dispatches on, and
+  the callee's trap / fault / 5 s timeout / thread or process end resumes it (`service_event`,
+  `poll_calls`); those calls overlap and finish in any order. Also: a timed-out callee's thread
+  stays suspended until its callback's handling ends (its register changes used to be written
+  into an already-resumed thread). Considered and REJECTED (Codex review): letting held hits run
+  once a callee is seen blocked (it fixed "the callee needs a lock a held thread owns", but a
+  callback holding a lock across that call_func and a second callback taking it deadlock the
+  debug thread -- it broke the documented never-overlap contract). That case stays the
+  documented 5 s timeout (limitations.md; owner: no hardening). Codex review 2 of the branch:
+  (a) a data-watch hit, which cannot be rewound, still ran its callback while another one was
+  parked in call_func -- a lock held across that call_func and taken by the watch callback hung
+  the debug thread; now the watch's thread is held right after its access (status bits kept via
+  hwonce's dr6_lost carry) and its callback replayed, call_func included, once no call is in
+  flight (`hold_watch_hit`, `replay_held_watches`): callbacks are strictly serialised (one corner
+  documented: a hit on a thread mid single-step); (b) a call that timed out while its return
+  trap (or a callee fault) was already queued passed that late event to the target as an
+  unknown breakpoint -- now recognised and swallowed (`call_late`; forced deterministically
+  by the UHH_TEST_LATE_TRAP test hook); (c) WOW64-form trap codes are normalised before the
+  call_func checks (not reachable in this setup: same-bitness only, native codes seen).
+  Tests: `callfunc-watch-lock-{bp,hw}`, `callfunc-late-trap-{bp,hw}` (ar_driver_th), and `callfunc-many-{bp,hw}`
+  (100 threads, every call ok), `callfunc-watch-{bp,hw,inline}` (a watch callback's call_func
+  during another thread's call: returned 0 before), `callfunc-lock-inline` (the inline
+  reference), `sessions-repeat`. Original finding: The "no nesting" guard (`in_call_tid`) is session-wide: during thread A's call the
   debug loop dispatches thread B's events, B's callback calls call_func -> returns 0. With
   return-value probes on 4 threads (GetLastError via call_func at every CreateFileW return) this
   happens in practice. Inline is unaffected. Clean failure (returns 0), but surprising: the doc
@@ -300,7 +328,12 @@ binaries (cmd, reg, sort), multi-threaded targets, launch vs attach, attach mid-
   `detours-retval-hw` 36/36 since. (Still open in principle for a thread whose queued event is
   not a hw hit, e.g. a software breakpoint in a mixed session: those paths write CONTEXT_FULL
   and do not re-assert DRs.)
-- ⬜ (D5) (code reading, not reproduced) absolute-address inline probes (`probe_add_address(...,
+- ✅ (D5) REPRODUCED and fixed: an inline probe added by address at a return site followed by a
+  loop head (ar_target absret, hand-assembled in .text) was hooked and the target died
+  (0xC000001D). The site check now analyses the image mapped around the address
+  (`image_base_of`), and the no-bounds block walk runs for any site (also non-image code).
+  Tests: `inline-absolute-refused` (refused, result unchanged), `inline-absolute-fallback`
+  (PROBE_FALLBACK_HW -> hw). Original note: absolute-address inline probes (`probe_add_address(...,
   PROBE_INLINE)`, e.g. a return site) are vetted with `base == 0`, which skips the function-bounds /
   branch-target part of the inline site check (`analyse_site` and the block walk both need a base):
   only the exit and call-inside-patch rules apply. A return site followed within 5 bytes by a jump
@@ -363,7 +396,7 @@ PowerShell + detach) under every backend, against an uninstrumented baseline.
 - ✅ A relocated INT3 whose adoption failed was passed to the target as unhandled: now rewound
 - ✅ (call_original hunter) breakpoint/hw counted the call_original pass-through as a second hit;
   inline call_original swallowed the original's exceptions -- see "call_original findings"
-- ✅ Accounting edge (closed 2026-11-06, runfix1, agent v21): a callback killed by process exit AFTER
+- ✅ Accounting edge (closed 2026-11-06, runfix1, agent v23): a callback killed by process exit AFTER
   publishing its log but BEFORE returning was reported both as a delivered log and in
   callbacks_interrupted (seen on CI runners: 3 of 36 crash-logs-inline-4t runs). Now the callback's
   first record carries the hit's unaccounted unit (one store: the ring's seq) and the controller retires
@@ -477,6 +510,68 @@ and a .NET P/Invoke script (`ps-truth`) that prints the real handle -> pid of ev
   `Get-Process | % Modules` then (under 1 GB of controller/target memory, x86) alongside
   other agents' builds/tests; free RAM was not sampled at the time, so the cause is unknown.
   The rerun with free RAM logged every 15 s never went below 13.9 GB free (16 GB VM).
+
+## Real large apps findings (2026-11-06, regress `realbig-*`, `scripts/target_state.py`)
+Beyond `bigapps-*` (PowerShell + the Edge BROWSER, launch/attach/detach): a sandboxed Edge 156
+RENDERER (V8, CIG, win32k lockdown) and the browser while a page ticks (`examples/bigapps/
+ticks.html`: a new `Function` + hot loop + 512 KB typed array per tick, every value re-computed
+by the suite, ticks must stay contiguous), PowerShell 5.1 (`workload.ps1`, JIT) and heavily
+multi-threaded native programs (`robocopy /MT:16` of a 10000-file tree, `findstr /s` over 800
+files), x64 and x86 (SysWOW64 hosts), every backend, launched or attached and detached
+mid-run. Every run: the program's own result (exact copy / byte-identical output / workload
+`bad=0` / page values), hits == logs_written == delivered (after a detach: the final totals
+hits == logs + in_flight, every probe logs), log_dropped 0, no second-chance exception, the
+controller's private bytes/handles sampled every 0.5 s, and after every detach **no residue**:
+the target compared with ITSELF before the attach (every executable byte of ntdll / KernelBase /
+kernel32 and the probed modules, both bitnesses in WoW64; every thread's DR0-3/DR7/TF in its
+64- and 32-bit contexts; the debug port). (A comparison with the file on disk or with another
+process would differ anyway: Chromium's sandbox patches ntdll stubs in its renderers.)
+- ✅ (RB1) **Attach to a sandboxed process: every DLL but ntdll unnamed.** The synthesized
+  LOAD_DLL events of an attach open each module's file in the TARGET's security context; an Edge
+  renderer's restricted token cannot, so they arrive with `hFile == NULL` (dumped with a plain
+  debugger: only ntdll and the exe have a handle). UHH named modules only from that handle:
+  probes on KernelBase/kernel32/ws2_32/... stayed `pending` for the whole session (silently, 0
+  hits), symbols for them were never registered, and the agent load failed with the misleading
+  `target module owning LoadLibraryW was not observed` (repeated per event). The name and the
+  dbghelp path now come from `GetMappedFileNameW` (device path mapped to a drive letter) when the
+  event has no handle. Test: `realbig-edge-renderer-{breakpoint,hw}` (`KernelBase!VirtualAlloc`
+  must hit; 1400-1600 hits per run).
+- ✅ (RB2) **Inline into a CIG process is refused cleanly.** The renderer admits only
+  Microsoft-signed DLLs (`ProcessSignaturePolicy.MicrosoftSignedOnly`), so `LoadLibraryW` of the
+  agent fails; the session already failed cleanly (L7: detached, no residue, page unaffected),
+  the error now says why (`... (the target admits only Microsoft-signed DLLs -- ProcessSignature
+  Policy, e.g. a Chromium/Edge renderer -- ...)`). Breakpoint/hw there run without the
+  controller-death guard (warned; limitations.md). Test: `realbig-edge-renderer-inline`.
+  Renderer mitigations seen: CIG, DisableWin32kSystemCalls, StrictHandle, CFG, no-remote/low-label
+  images, no child processes; **no ACG** (BlockDynamicCode off, V8 JIT on), so no dynamic-code
+  refusal to test there.
+- ✅ No other library issue: 18 x64 + 12 x86 rows (`--bigapps`), every residue check clean (0
+  code bytes, 0 dirty threads of 16-83 per process), 0 drops, exact totals, every program right;
+  controller peak 1-7 MB private, growth <= 3 MB over a run.
+- (test-side) `realbig-robocopy-detach-inline` once finished the copy before its detach (a warm
+  copy is ~4 s under inline; the plain first copy of fresh files 15-55 s): it now attaches as the
+  copy starts and detaches 1.5 s later.
+- (test-side, realapps) `realapps-ps-fileversion-*` failed twice on x64 with one `powershell.exe`
+  / `conhost.exe` row "missing": a bare image path stands for every process of that image, and
+  another agent's instance that ended between the plain runs and the instrumented one was counted
+  as lost output. Such rows now count only as many instances as were alive for the whole run.
+- (flake, not reproduced) x86 `blog-pwsh-attach-detach-breakpoint` once detached (2.5 s) before
+  its probe went active on a loaded VM; 3/3 x 3 backends green on the rerun (the mapped-name
+  fallback never triggers for a WoW64 attach: traced).
+- (note) What is hot is not what one expects: robocopy and findstr move file data through
+  sections, not NtReadFile/NtWriteFile (0 hits on both: probe NtCreateFile/NtMapViewOfSection/
+  NtClose); Edge's renderer calls NtProtectVirtualMemory 0 times in 20 s of fresh `Function`s
+  and PowerShell 5.1 0-2 times (neither flips JIT page protection per compile on this build);
+  the renderer's hot exports are NtAllocateVirtualMemory/VirtualAlloc and NtWaitForSingleObject.
+- (measure, x64 VM, shared) Cost while attached: PowerShell workload ticks (plain 1.0/s, 4
+  probes): breakpoint 0.4-0.9/s, hw 0.6-0.75/s, inline 1.0/s at 5-10x the hits; one probe on
+  CreateFileW: bp/hw 0.70/s at ~85 hits/s (the 4 runspace threads serialize on the debugger),
+  inline 0.84/s at ~630 hits/s; attached with no hit: 0.85/s (bp) / 0.95/s (inline) -- the
+  workload's 6 first-chance .NET exceptions per iteration are debug events. Edge renderer:
+  15/s while attached (bp/hw, ~300 hits/s) vs 21/s after the detach; the browser shows none.
+  robocopy/findstr launch: bp 2-5x, hw 1-3x, inline ~1-3x (seconds-long runs, noisy).
+- Not covered: pwsh 7 (not installed on the test VM: rows SKIP), 7-Zip / node (absent),
+  msbuild (not run: spawns long-lived nodes on a shared VM).
 
 ## Calling-convention findings (2026-11-06, `examples/callconv`, regress `callconv-*`)
 `ccfix.dll` exports one function per x86/x64 convention and argument/return shape: cdecl,
@@ -1290,6 +1385,57 @@ The drivers gained per-role backends: `gated_config --close-backend`, and
   both attach timings, on both arches (C7's mixed-backend test item is closed by this).
 - Open: these are functional sizes. A long mixed-backend churn soak (`scripts/soak.py` has no
   churn phase) and the UHH_SHARED per-hit benchmark (C7) are not done.
+## Codex review 2 findings (2026-11-06, code merged that day, regress `cx2-*`)
+A second read-only Codex review (merge-frida 6f0c533) reported 3 high-confidence bugs. Each was
+reproduced by a check that FAILED on the unfixed library (commit 85fd858 + the fixtures only),
+then fixed. Fixtures: `ctrl_target faultmix`, `co_target susp / many / manydead`. `--only cx2`.
+- ✅ (X1) **Real.** breakpoint (647130f): after a faulting probed instruction was passed to the program,
+  the thread's next INT3 at the site was always taken for the handler's RETRY -- also when the handler
+  had SKIPPED the instruction or UNWOUND out of it (SEH `__except`) and the next call executed the site
+  afresh: no callback, no hit (gospel: hits == logs, identical across backends). Reproduced:
+  `cx2-faultfresh-breakpoint` hits=101 logs=101 of 300 calls (retry / skip / unwind in turn), x64 and
+  x86; hw and inline 300/300. Fix (`fault_retried`): the exception's dispatcher frame, still on the
+  thread's stack below the faulting SP, decides. A retry is the first instruction after the handler's
+  CONTEXT was restored: that CONTEXT names the site and holds exactly the thread's registers (whatever
+  the handler repaired); after a skip it names another address, after an unwind it no longer matches
+  (x86: RtlUnwind marks the paired EXCEPTION_RECORD unwinding). The program never sees a trap flag
+  (ctrl-fault-*, cdx-faultreg-* unchanged). After: 300/300 on every backend, x64 and x86.
+  Residual: a hand-rolled x86 unwind (no RtlUnwind) whose next execution of the site has every
+  register identical and the stack below untouched is still taken for a retry.
+- ✅ (X2) **Real.** x86 controller (d7140db): GuardTouch listed a thread touched by a WOW64
+  Get/SetThreadContext (an implicit suspend inside the call) as an unconditional guard hold. A
+  controller killed while the entry was published but the implicit suspension was not in place
+  (before the call, or after it returned) made the guard resume a suspension the PROGRAM held.
+  Reproduced (test-hook build, `UHH_TEST_DIE_IN_TOUCH_MODE=before`): `cx2-touchprog-hw` the program's
+  ResumeThread returned 0 (want 1), its suspended worker ran 20-21 iterations. Fix: guard entries carry
+  a floor (`probe_agent_guard::held_floor`, protocol v21): GuardTouch records the thread's suspend
+  count before the call and the guard resumes it only while the count is above that (conditional
+  entries first, then our own holds once each). The count is NtQueryInformationThread
+  ThreadSuspendCount, which INCLUDES the debug freeze (+1 on every thread while the target is stopped
+  at an event; measured: a program-suspended thread read 2 inside an event, a running one 1 -- the
+  first version of this fix therefore left `cxlib-touchkill-hw` hung); the freeze is read off the
+  agent's service thread, which nobody suspends (`guard.service_tid`), and subtracted. Unknown
+  (no agent service thread, Windows < 8.1): an unconditional entry, as before. The check runs both
+  deaths -- before the implicit suspension and with it in place (on a program-suspended thread):
+  the guard must leave exactly the program's one suspension. After: PASS; `cxlib-touchkill-hw` PASS.
+  Open (same class, not changed): guard_sync's unconditional entries for the event threads and the
+  call_func/call_original thread (`handling`, `in_call_tid`) stay listed until the next sync, i.e.
+  past ContinueDebugEvent; a program that suspends such a thread right then and a controller death
+  before the next event would release it.
+- ✅ (X3) **Real.** inline agent: the thread table held 4096 thread ids and never freed a slot, so
+  after 4096 distinct probe-hitting threads over the process's life every further thread ran its
+  callbacks untracked (no active record): the detach drain counted 0 live callbacks, gave up after
+  three answers and the callback's log was lost (in_flight=1); such threads also had no recursion
+  guard (call_func refused). Reproduced: `cx2-manythreads-inline` / `cx2-manydead-inline` (4200 threads
+  alive at once, one hit each, then a callback outliving a detach, while they live / after they
+  exited): late log delivered=0, in_flight=1, x64 and x86. Fix: a full table takes over a dead
+  thread's slot (marked moving while the owner is re-checked, one sweeper at a time, its own hits
+  pass through); with more than 4096 such threads alive an overflow table (256) holds the rest; a
+  thread with no slot at all is counted live by the drain (`g_untracked_running`). After: PASS both.
+- Verification (e4efa5d): `--only cx2` 2 x 5/5 + 1 SKIP on x64, 2 x 6/6 on x86; `--only ctrl,cdx,cxlib,
+  lifecycle,detach,callorig` 138/138 on x86, 136/137 + 1 SKIP on x64 -- `cxlib-killarm-hw` once:
+  "controller-death guard unavailable (agent not ready within 5 s)" under VM load, so the hw probe was
+  armed without the guard; `--only cxlib` 3 x 9/9 on reruns.
 
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`
@@ -1329,12 +1475,12 @@ The drivers gained per-role backends: `gated_config --close-backend`, and
     - ✅ Breakpoint emulation of CALL/RET (`emulate_site`): moves RSP/RIP but not SSP, so the target would #CP at its NEXT real `ret` inside its own CETCOMPAT code (fatal even in compatibility mode). Since 226f131 the emulation is skipped when `ProcessUserShadowStackPolicy.EnableUserShadowStack` is set and the CPU steps CALL/RET in place (JMP/Jcc/LOOP/PUSHF/POPF emulation is unaffected). Regress `cet-ret-breakpoint` (probe on NtOpenProcess's `ret` in probe_app_cet). That in-place CALL/RET step now runs in the in-place window (Evaluator round 3 #2: the other threads are held while the byte is lifted), so it is exact under threads too; the CPU still does the push/pop, so SSP stays consistent. The x64 SYSCALL trampoline has no call/ret (a `jmp [rip]` back), so it does not touch the shadow stack either.
     - ✅ `call_func` on breakpoint/hw (`call_in_target`): the callee is entered by SetThreadContext, so its `ret` to `call_trap` does not match the shadow stack -> #CP inside the callee (a CETCOMPAT system DLL: fatal). Now REFUSED (returns 0, one stderr warning) when the target has shadow stacks; inline `call_func` is a real call and unaffected. A working design for CET (return to the real shadow-stack top under a per-thread DR trap, then restore SSP through `CONTEXT_XSTATE`/`XSTATE_MASK_CET_U`) needs CET hardware to develop.
     - ⬜ SetThreadContext RIP changes (displaced stepping into scratch memory, moving frozen threads onto the trampoline, `call_func` restore, `set_reg`): no `ret` is involved and SSP is never touched (the controller never sets `CONTEXT_XSTATE`), so the CPU check does not apply. Open: Windows' optional `SetContextIpValidation` policy validates a new RIP against the shadow stack / EH-continuation table; whether it applies to a DEBUGGER's cross-process SetThreadContext is unverified. If it does, displaced stepping and the freeze move would be refused under that policy (in-place stepping would still work).
-    - ⬜ `BlockNonCetBinaries` policy: the injected `probe_api_agent.dll` is not /CETCOMPAT and would be refused -> no inline backend in such a process. Linking the agent /CETCOMPAT is now plausible (its hook path has no ret-to-pushed-address) but untested.
+    - ✅ `BlockNonCetBinaries` policy: the injected `probe_api_agent.dll` was not /CETCOMPAT and would be refused -> no inline backend in such a process. Now linked /CETCOMPAT (cfnest). The bit only declares that the image's OWN `ret`s are shadow-stack clean (in compatibility mode a violation inside a CETCOMPAT image becomes fatal). Audit of every agent path: agent C++ and callbacks built into it are plain call/ret (no `_AddressOfReturnAddress`, no setjmp/longjmp of its own, x86 `__asm` blocks are x86-only: WOW64 has no user shadow stacks); `uhh_orig_thunk` (agent_x64.asm) is a real call/ret (its fake machine frame only steers the unwinder's frame walk, not a `ret`); the hook stub (SafetyHook mid-hook, in allocated memory) `call`s the agent and ends `pop rsp; jmp [trampoline]`; return_from's thunk (`pop rsp; ret`, allocated memory) returns to the hit's own return address = the shadow-stack top at a function entry (entry-only, enforced); a relocated CALL stays a call when a shadow stack is active (c7755cf); the trampoline-fault VEH re-raises with NtRaiseException (no `ret`). Open, as before and unchanged by the bit (needs CET hardware): SSP after an exception unwinds out of an inline call_original through the fake machine frame, and the VEH re-raise's SSP. Tests: `cet-agent-image` (agent CETCOMPAT, FAILED before), `cet-agent-block-noncet` (SKIP on this VM: `SetProcessMitigationPolicy(ProcessUserShadowStackPolicy, BlockNonCetBinaries)` at runtime is refused with ERROR_ACCESS_DENIED here -- no CET hardware; on CET hardware it maps a non-CET DLL vs the agent under the policy). Under Intel SDE with the CETCOMPAT agent (`--only cet`, x64): every `cet-sde-*` inline row passes unchanged (e.g. `cet-sde-relcall-inline` 3 reports = uninstrumented 3; `cet-sde-gated-inline` checksum same, target SSP live); bp/hw rows stay SKIP (not measurable under SDE)
   - Not exercised anywhere yet: the CET-only branches (CALL/RET in-place stepping and the `call_func` refusal) are keyed on `EnableUserShadowStack`, which the VM reports as 0 even for a /CETCOMPAT image -- correct (it reflects enforcement, not the image bit), but it means those branches never ran here, and SDE cannot run them either (policy 0 there too, and the breakpoint backend leaves SDE at the first INT3). The policy is queried once per session and a failed query is cached as "no shadow stack" (the agent's own relocation switch also reads RDSSP; the controller cannot run RDSSP in the target).
   - **Test plan on CET hardware** (Intel Tiger Lake+ / AMD Zen 3+, Windows 10 21H1+/11 x64, bare metal or a hypervisor that passes CET through; `cet_probe` must print `enforced=true`): run `regress.py --only check_cet,check_conformance` and expect all PASS with `cet_enforced=True target_ssp=True`; then repeat with the process forced into strict mode (Exploit protection -> Program settings -> probe_app_cet.exe -> Hardware-enforced Stack Protection: on, strict) and with `SetContextIpValidation` on, to settle the two open items; then a `call_func` breakpoint/hw run to confirm the refusal is clean (returns 0, target unaffected). Hardware positive control first: `cet_smash smash` must die with 0xC0000409 (#CP), `cet_smash clean` exit 0. What only hardware can settle: the breakpoint/hw paths under a real shadow stack (in-place CALL/RET, displaced stepping, `call_func` refusal, call_original), strict mode, `SetContextIpValidation` for a debugger's SetThreadContext, `BlockNonCetBinaries` vs the non-CETCOMPAT agent, and the CET_U XSTATE the controller never sets.
   - Tests: `cet-image` (probe_app_cet/cet_probe carry the CETCOMPAT bit, probe_app does not), `cet-probe` (what the machine enforces), `cet-gated-{breakpoint,inline,hw}` (gated_config with all probes on one backend against `probe_app_cet`, exact hits/logs, checksum equal to an uninstrumented CET run, target's own RDSSP == cet_probe), `cet-ret-breakpoint`; `conformance-inline` sp_moved 10; under SDE: `cet-sde-{probe,control-clean,control-smash,calls-base,calls-inline,relcall-inline,gated-inline,sp-inline}`, `cet-sde-co-<case>-inline` (11 cases), SKIP rows `cet-sde-breakpoint` / `cet-sde-hw` saying why.
 - ⬜ [fan-out] Windows 11 VM on the Proxmox server, run the suite there too (later)
-- ⬜ [fan-out] Stability on real large apps (important): browsers / heavily multi-threaded / JIT processes under all backends
+- ✅ [fan-out] Stability on real large apps (important): browsers / heavily multi-threaded / JIT processes under all backends -- Edge renderer + browser, PowerShell 5.1, robocopy /MT:16, findstr /s, x64 + x86, launch and attach/detach with a no-residue check; 1 library bug fixed (RB1, attach to sandboxed processes), CIG refusal clarified (RB2). See "Real large apps findings"; regress `realbig-*` (default subset; all rows with `--bigapps`)
 - ⬜ [fan-out, Codex] Docs: quickstart, API reference, per-backend limitations table, troubleshooting
 - 🔧 Inline cap raised to 128 per session (user: 128 is enough; error beyond) -- compile-time thunk table, per-request FREEZE flag; refusal test uses the 129th -- VM verify pending
 - ⏸ Follow child processes: design written -- [docs/child-processes.md](child-processes.md) (strategies with VM measurements from `bench/child_follow`, API options A-D, recommendation: ProcessDebugFlags inheritance + `probe_follow_children` + `get_pid`); **deferred by the owner (2026-11-06)**: a session follows one process; a child it starts runs unprobed -- attach to it with its own session. Processes the target did not create are unaffected either way (attach separately)
@@ -1368,16 +1514,25 @@ Platinum 8573C under Hyper-V (no CET in the guest), Defender real-time protectio
   `check_realworld`, `check_symbols`, `check_callorig`). `ci_shards.py units` lists them; the units are re-parsed from
   regress.py main() on every run and must partition it exactly, so a new check is picked up automatically (60 s
   estimate + a warning annotation until `EST` is refreshed). Opt-in tiers (`--volume-reads`, `--bigapps`,
-  `--soak-minutes`) are not run. Critical path: x86 `check_realapps` (~15 min, one unit).
+  `--soak-minutes`) are not run. A long unit is SPLIT into parts run as units of their own (`SPLIT` in
+  ci_shards.py: `check_realapps:<part>` = regress `--only check_realapps` with `UHH_REALAPPS_ONLY` /
+  `UHH_REALAPPS_BACKENDS`; parts tasklist-m, ps-modules-<backend>, ps-fileversion-<backend>, rest = every other
+  scenario, parsed from `_realapps_scenarios()` so a new one is never lost). Critical path now: x86 `check_hunt`
+  (~7 min; longest shard 443 s) instead of x86 `check_realapps` (~15 min as one unit).
 - **External deps:** every check runs explicitly selected, so `skip_external()` is a FAIL in CI where a full
   unselected run would SKIP. The shards that need them install Frida 16.5.9 into `C:\work\fv16` (regress
-  `FRIDA_PY`) and Intel SDE 9.48 into `C:\tools\sde` (Intel's mirror, sha256-pinned, cached). A system program missing
-  on the image therefore shows as a FAIL.
+  `FRIDA_PY`) and Intel SDE 9.48 into `C:\tools\sde` (Intel's mirror, sha256-pinned, cached). `check_oldcrt` needs a
+  pre-14.40 msvcp140.dll: windows-2022 has one (VS 2022's bundled LLVM, the check's own lookup); on other images the
+  shard fetches the 14.29.30133 DLL from the PyPI wheel `msvc-runtime` (sha256-pinned) into `UHH_OLD_MSVCP`. An OS
+  component an image does not ship at all is listed per image in `ABSENT` (ci_shards.py; windows-2025:
+  `realapps-wmic`): its `skip_external()` row is posted as a warning like `KNOWN`, only on that image and only with
+  skip_external's "optional external dependency absent" text. Any other absent system program is a FAIL.
 - **Reading results without a token** (public REST, 60 requests/h unauthenticated): runs
   `GET /repos/talivision/uhh/actions/runs?branch=<b>`, jobs `GET .../actions/runs/<id>/jobs` (with per-step
   conclusions), annotations `GET .../check-runs/<job id>/annotations`. Every test job posts a notice
-  (`<shard> PASS|FAIL N/M ok ... <secs>s` + per-unit times), an error annotation with all its `] FAIL` lines, a
-  warning with its known failures; `summary` posts the whole table (chunked, ~3.5 KB per annotation); `build` posts
+  (`<shard> PASS|FAIL N/M ok ... <secs>s` + per-unit times), error annotations with every `] FAIL` line IN FULL
+  (chunked at 3.4 KB, a longer line split across parts, max 10 per step; the step summary and the `summary` job's
+  "Failures (full detail)" section always have every line whole), a warning with its known / absent failures; `summary` posts the whole table (chunked, ~3.5 KB per annotation); `build` posts
   runner facts, toolchain and the `cet_probe` JSON. Orchestrator helper:
   `~/work/uhh-tools/fan/work/ci/gh.py runs <branch> | jobs <run> | notes <run> [job-name regex]` (2-12 calls per run).
   Logs, artifacts and dispatch need auth: `~/work/tools/gh/bin/gh auth login` once, then
@@ -1422,7 +1577,7 @@ Real-bug candidates (reproduce on runners, not on the VM so far):
   (runfix1-diag run 42191637133, 72 runs, 6 jobs) showed `hits == logs + interrupted` exactly in 69 -- the check
   compared logs with hits. The other 3 (x64) exposed a real accounting bug: `logs + interrupted = hits + 1`, a thread
   killed after publishing its log but before its callback returned was counted as a log AND as interrupted (the
-  documented v20 edge). Fix (agent protocol v21): the callback's FIRST record carries its hit's unaccounted unit
+  documented v20 edge). Fix (agent protocol v23): the callback's FIRST record carries its hit's unaccounted unit
   (`probe_agent_log::carry`, published by the ring's single seq store) and the controller retires it when it takes
   the record (ring or PROBE_IPC_LOG); a callback that returns without logging drops it itself; unhook / detach drain
   wait on a separate `running` count. So a kill at any instant leaves hits == logs + dropped + interrupted exactly.
@@ -1494,31 +1649,83 @@ Real-bug candidates (reproduce on runners, not on the VM so far):
   pslog's.)
 - Seen once, undetermined: x64 `detach-inline` (`1 thread(s) frozen; all clean` yet FAIL, detail cut); x86
   `hw-once-slots-breakpoint` (run 42194952645: `HwSite[once,all]=[1, 75]`, the run ended after 75 of 4000 calls).
-- v21 follow-ups found by the full suite (42194952645): `cxlib-cfgfree-inline` wanted `in_flight=1` for a callback the
+- v23 (runfix1) follow-ups found by the full suite (42194952645): `cxlib-cfgfree-inline` wanted `in_flight=1` for a callback the
   program suspends across the detach AFTER it logged -- now accounted by its log (`in_flight=0`); the detach line
   gained `running=` (callbacks still executing, not accounting) and the check wants `running=1 in_flight=0`.
   `logs-controller-killed` reads the orphaned ring itself: first records left in it carry their hits, so the target
   counts with `probe_agent_unlogged` (unaccounted minus carried records still in the ring).
 
-Environment (runner) effects, not UHH bugs:
+Environment (runner) effects, and how the checks were made robust without proving less (branch `citune`; full
+run 42203177441 at df3bddc, windows-2022 + cet-hw: 1830/1843 ok; every check below PASS on both arches; longest
+shard 443 s, was ~900 s; the 13 FAILs are the KNOWN hunt rows and findings owned elsewhere: crash-logs-inline-4t
+x64+x86, ret-probe-breakpoint x86, ntdll-churn-breakpoint x86, gated-e2e-attach-post-fbp-oin-cbp-rbp x64 (new check,
+another branch), logs-wedge-{exit x64, kill + suspend x86} (`wedged=0`: the wedge never formed on the runner)):
 - **patch-race-frozen (x64 + x86, deterministic)**: hook_cycles=[1,1,1,1], need >= 4 in the target's 12 s. Measured
   (diag): one attach -> install -> 400 ms -> detach cycle against 8 spinning threads takes 6-8.5 s on the 2-core
-  runner (13 threads frozen, all clean, 20-78 M hits per cycle), so only one cycle fits; never crashed or torn. The
-  check's time budget assumes 4 real cores. (Also a perf note: attach/detach under full CPU saturation is slow.)
-- **stream-latency-{inline,hw} (x64, 3 of 15 diag rows)**: p99 192-387 ms > the 100 ms ceiling on a noisy
-  4-vCPU runner; and once stream-latency-breakpoint failed with p99=3.3 ms on the per-line ordering condition (a log
-  line read before its tick line). Timing ceilings; flaky on runners.
+  runner (13 threads frozen, all clean, 20-78 M hits per cycle), so only one cycle fits; never crashed or torn.
+  **Fix:** cycle-count based. patchrace_target `--until-stdin` runs until the check closes its stdin; each trial
+  runs >= 4 cycles AND >= 12 s (whichever is later; <= 25 cycles; 300 s budget, else FAIL), so the VM keeps at
+  least its old exposure (VM x64: 6 cycles/trial in 12-17 s) and a runner gets 4 (28-31 s/trial). A second runner
+  effect surfaced then: the report taken 400 ms after the attach can still show `hits=0` (the install against 8
+  spinning threads is not finished yet), although the same cycle's detach summary counts 20-78 M hits; "this cycle's
+  hook ran" now uses the detach-time count (stderr `probe: detached: hits=N`). patch-race-unsafe unchanged (still
+  KNOWN: fails when the race is not seen; with more cycles it now sees it more often: crashed=3/4 on a runner).
+- **stream-latency-* (x64 + x86)**: NOT scheduler noise. Rewritten to measure the real latency: logstream_target
+  stamps each LogSite call and each of its own lines with QueryPerformanceCounter, the reader stamps arrivals with
+  the same counter, and an uninstrumented writer (the same target, a line every ~5 ms) runs alongside as a
+  scheduler-noise sampler (cyclictest-style: late writes and late arrivals). Bar: p99 < 100 ms when the sampler saw
+  < 50 ms of stall in the run (quiet: the original absolute bar), else p99 of (latency - the stall the sampler saw in
+  that record's own window) < 100 ms; plus all 50 records once and in call order, never before their event. Diag
+  runs (CI 42192197211, 42195891554, 42198334462: 10-24 runs per arch x {0,2,4 CPU burners} x {TEMP on C:, D:}):
+  the sampler showed a QUIET machine (stalls 1-5 ms) while records were held 50 ms - 2.5 s, consecutive records
+  released together while the target kept running on schedule (x64 hw: #24-#46 all at once, 2.5 s late). Watching
+  the session log file located the hold BEFORE the file (event -> in file == event -> stdout; file -> stdout ~0):
+  UHH writes each batch to `%TEMP%\uhh\logs\*.jsonl` first, and appends on the runner's C: (network-backed managed
+  disk) block when the lazy writer flushes (worst near ~1 s after the first write: sample #8-#10 is the slowest in
+  almost every run). Same job, same commit (run 42198334462, 10 runs per arch each): TEMP on the runner's D: (local
+  temp disk) -> 60/60 PASS, breakpoint/hw p99 ~0.5 ms (one 10 ms), the #8-#10 bump gone, sampler appends <= 10 ms;
+  TEMP on C: -> 1 FAIL (breakpoint 221 ms, #25+#26 released together), several 50-63 ms holds, sampler appends
+  stalling up to 364 ms. Earlier C: runs: 2.5 s (x64 hw), 205 ms (x86 inline), 164 / 136 ms (hw).
+  The VM shows the same holds, from Defender: A/B on the VM, same C: disk, x64, 3 runs each: TEMP =
+  `C:\Users\admin\AppData\Local\Temp` (real-time scan on) -> 2/3 FAIL (inline 427 / 180 ms holds at #8-#10, near
+  misses 91 / 79 ms); TEMP in the Defender-excluded `C:\work\...` -> 9/9 PASS (worst 30 ms).
+  **Fix (check):** the controller's TEMP/TMP is `<build dir>/uhh-latency-tmp` (next to the binaries: the VM's
+  `C:\work`, the CI workspace on D:, both local and AV-excluded), so the check measures UHH's pipeline, not the
+  user profile's AV or the runner's OS disk. VM after the fix: 17/18 PASS over 3 runs x 2 arches x 3 backends; the
+  one FAIL (x64 hw, #8-#10 held 366 ms before the file) came with the sampler's own appends stalling 243 ms in that
+  run (the VM's disk is shared with the other agents' builds). **Finding for the owners (UHH design):** live stdout
+  latency is bounded by the session file's write latency -- the writer thread writes each batch to the file, then
+  to stdout, so an AV scan of the new file or a slow disk (the first lazy-writer flush, ~1 s after the first write,
+  is the usual culprit) holds live records 0.1-2.5 s. Candidates: write stdout before / independently of the file
+  (the file stays the complete record), or give the file its own thread. The check deliberately does NOT discount
+  disk stalls (the sampler's file is not UHH's file; discounting would hide exactly this).
+  The 3.3 ms breakpoint failure was the old per-line ordering condition: the target's own lines are FORWARDED by
+  UHH (pipe + forwarder thread, since 2f2f8c1), so a record can reach stdout before the tick line the target wrote
+  just before the event; measured `log_before_tick` = 4-12 of 50 per run with 4 CPU burners, 0 otherwise. No such
+  cross-stream promise exists (docs/api.md promises whole lines only): now reported, not required. (Possible UHH
+  improvement: the writer drains the forward pipe's pending bytes before a batch.) Perf note: inline p50 ~15.6 ms
+  everywhere = one timer quantum of the drainer's idle `Sleep(1)`.
 - **realapps-ps-fileversion-* x86 (deterministic)**: the plain 32-bit `Get-Process -FileVersionInfo` lists only
   itself and exits 1 on a runner -- no other WoW64 process exists there (the VM has some), so `stable_rows=0` fails.
-  The scenario's assumption, not UHH (all reads mapped, nothing dropped).
-- windows-2025 only: `realapps-wmic` (WMIC removed from Server 2025), `oldcrt` (VS 2026's LLVM ships no pre-14.40
-  msvcp140) -- absent deps, FAIL because explicitly selected; `realapps-ps-modules-breakpoint` once: an svchost loaded
-  fwpuclnt.dll between the plain and the instrumented run (a live process list).
+  **Fix:** the check starts 3 helpers of its own bitness (`<sysdir>\findstr.exe` waiting on a pipe) for the whole
+  scenario and REQUIRES each in both plain runs and the instrumented one, and each read by the instrumented program
+  through a handle mapped to its pid and name (`helpers=3xfindstr.exe: stable=3 instrumented=3 read=3/3`) -- on
+  every machine, both arches.
+- **windows-2025 only**: `realapps-wmic` (WMIC is a Feature on Demand Server 2025 no longer installs) -> new scenario
+  `realapps-ps-cim` (the same WMI process query through PowerShell `Get-CimInstance`, every image, all backends)
+  and `realapps-wmic` absent = `skip_external()` with that reason, posted by CI as ABSENT on windows-2025 only.
+  `oldcrt` (VS 2026's LLVM ships no pre-14.40 msvcp140) -> CI provides msvcp140 14.29.30133 via `UHH_OLD_MSVCP`
+  (PyPI `msvc-runtime` wheel, sha256-pinned). Verified on windows-2025 (diag jobs of run 42192197211): x64 and x86
+  `realapps-ps-cim-*`, `realapps-ps-fileversion-*`, `oldcrt-{inline,breakpoint}` (app_local=True, 2000/2000) PASS,
+  wmic ABSENT. `realapps-ps-modules-breakpoint` once: an svchost loaded fwpuclnt.dll between the plain and the
+  instrumented run (a live process list).
+- New on runners with ps-cim: x86 `realapps-ps-cim-inline` `intr=1` once (a callback interrupted when PowerShell
+  exited: the crash-logs-inline-4t class -- an inline hit whose callback never completed because the process ended).
 - Passing on runners where the VM was suspect: x86 `hunt-ctx-breakpoint` (no 600 s timeout), x86
   `edgehunt-*-fmtptr` (B10), x64 `blog-pwsh-attach-detach-inline`, x86 `hunt-exit-*`.
 
 ## Later
-- ⬜ x86 cumulative-session flakiness (possibly the same handle double-close; recheck)
+- ✅ x86 cumulative-session flakiness (possibly the same handle double-close; recheck) -- CLOSED with evidence (cfnest). The note dates from the first checkpoint (c617de4); its suspected cause, review finding I6 (handles closed twice on the launch failure path), was fixed long since. Rechecked with `ar_driver --repeat`: 60 sessions in ONE controller process, backends in turn (breakpoint, hw, inline), each a call_func + runtime data watch whose callback call_funcs during another thread's call: every session exact, nothing dropped, the controller's handle count flat (x64 73 -> 73, x86 89 -> 89). Regress `sessions-repeat` keeps it covered (also exercises the per-run callback-fiber host). (Separately: `callfunc-kill-reuse` -- inline, needs the OS to hand a killed thread's id to a new thread of the same process within 3000 creations -- failed on the shared VM in Nov-06 evening runs on the cfnest build AND on an unmodified baseline build (2/2): system-wide thread-id reuse under other agents' load, not a UHH regression.)
 - ✅ PDB-only symbols (`module!InternalFunc`), Microsoft symbol server via dbghelp+symsrv and `_NT_SYMBOL_PATH`, export/function enumeration (`uhh_trace --list`) — engine by Codex, wired into the library; suite checks added
 - ⬜ Split `src/probe/session.cpp` (debug loop, backends, symbols, attach/call)
 - 🔧 [fan-out] Faster builds (user, 2026-11-05): parallel MSBuild (/MP, MultiToolTask, Directory.Build.rsp -maxCpuCount; `-DUHH_PARALLEL_MSBUILD=OFF` to disable) and `scripts\build.ps1` (Ninja Multi-Config). VM (4 cores), same tree: clean x64 221 s -> 83 s (VS) / 73 s (Ninja), x86 220 s -> 85 s / 66 s; touch session.cpp x64 49 s -> 24 s / 23 s. Still open: PCH / unity for session.cpp, not relinking every example when the library changes

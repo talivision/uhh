@@ -21,7 +21,12 @@ EST gets DEFAULT_EST.
 Note the --only semantics this implies: skip_external() is a FAIL for an explicitly selected
 check, so an optional external dependency absent on the runner (Frida, Intel SDE, a system
 program) FAILS here where the unselected full suite would SKIP it. The workflow installs
-Frida (check_frida_coexist) and Intel SDE 9.48 (check_cet_sde) for the shards that need them.
+Frida (check_frida_coexist), Intel SDE 9.48 (check_cet_sde) and, on images without one, a
+pre-14.40 msvcp140.dll (check_oldcrt) for the shards that need them. An OS component an image
+does not ship at all (ABSENT, per image) is reported like a KNOWN failure: a warning.
+
+A long unit can be SPLIT into parts (`check_realapps:ps-modules`), each its own unit: the
+check is run with an environment variable narrowing it to the part's items (SPLIT).
 """
 import argparse
 import json
@@ -50,7 +55,7 @@ EST = {
     "check_emulated_sites": (73, 138), "check_entry_hold_threads": (1, 3), "check_famous_files": (14, 14),
     "check_famous_heap": (11, 20), "check_famous_loader": (1, 1), "check_famous_retval": (5, 5),
     "check_famous_tls": (2, 2), "check_forwarded_probe": (1, 1), "check_frida_coexist": (4, 9),
-    "check_frida_parity": (1, 1), "check_gated_filter": (5, 6), "check_gated_map": (3, 3),
+    "check_frida_parity": (1, 1), "check_gated_e2e": (343, 364), "check_gated_filter": (5, 6), "check_gated_map": (3, 3),
     "check_gated_mem": (8, 7), "check_gated_off": (1, 1), "check_handle_map": (20, 21),
     "check_hotpatch_prologue": (1, 1), "check_hunt": (85, 420), "check_hw_once_slots": (6, 6),
     "check_inplace_shapes": (30, 27), "check_interrupt": (2, 2), "check_late_dll_worker": (1, 1),
@@ -59,9 +64,12 @@ EST = {
     "check_logs_stdout_closed": (1, 1), "check_logs_wedge": (4, 5), "check_memstress": (50, 71),
     "check_mix_matrix": (23, 32), "check_multithread_exact": (10, 11), "check_newapp_files": (1, 2),
     "check_newapp_flag": (5, 4), "check_newapp_reg": (2, 2), "check_ntdll_churn": (75, 111),
-    "check_oldcrt": (2, 2), "check_patch_race": (88, 88), "check_portability": (8, 8),
+    "check_oldcrt": (2, 3), "check_patch_race": (166, 204), "check_portability": (8, 8),
     "check_prehook_attach": (3, 3), "check_prehook_chain": (1, 1), "check_quickstart": (1, 1),
-    "check_realapps": (413, 933), "check_realworld": (14, 14), "check_realworld_targets": (0, 0),
+    "check_realapps:tasklist-m": (14, 360), "check_realapps:ps-modules-breakpoint": (230, 8),
+    "check_realapps:ps-modules-hw": (140, 7), "check_realapps:ps-modules-inline": (35, 6),
+    "check_realapps:ps-fileversion-breakpoint": (25, 200), "check_realapps:ps-fileversion-hw": (20, 190),
+    "check_realapps:ps-fileversion-inline": (15, 190), "check_realapps:rest": (30, 33), "check_realworld": (14, 14), "check_realworld_targets": (0, 0),
     "check_refusals": (1, 1), "check_ret_probe": (5, 6), "check_shared_mix": (13, 14), "check_sidefx": (3, 10),
     "check_sites": (1, 1), "check_stacks": (1, 1), "check_stdout_forward": (18, 20),
     "check_stream_latency": (17, 17), "check_stream_live": (21, 44), "check_stream_order": (1, 1),
@@ -82,8 +90,29 @@ KNOWN = {
     "hunt-owndr-hw": "A7: by design",
     "patch-race-unsafe": "the unsafe-patch race is probabilistic (proves the test can see it)",
 }
+# OS components a runner image does not ship (by image, from the workflow's CI_IMAGE): the check's skip_external()
+# row (a FAIL, every CI unit being explicitly selected) is reported as a warning like KNOWN -- only that record, only
+# on that image, and only when its detail is skip_external's "optional external dependency absent".
+ABSENT = {
+    "windows-2025": {
+        "realapps-wmic": "WMIC is not installed on Server 2025 (realapps-ps-cim runs the same WMI process query)",
+    },
+}
+ABSENT_TEXT = "optional external dependency absent"
 # Units that need an external dependency the workflow installs on demand.
-NEEDS = {"frida": {"check_frida_coexist"}, "sde": {"check_cet_sde"}}
+NEEDS = {"frida": {"check_frida_coexist"}, "sde": {"check_cet_sde"}, "oldmsvcp": {"check_oldcrt"}}
+# Units run as several parts (`<selector>:<part>`), each a unit of its own: ENV narrows the check to the part's items
+# (comma list), BENV (if the part names one) to one backend; the items None = "every item no other part names". The
+# items are parsed from regress.py (FROM: the function listing them, one `("<item>", ...` tuple per line), so a new
+# item lands in that part automatically.
+_BK = ("breakpoint", "hw", "inline")
+SPLIT = {
+    "check_realapps": {"env": "UHH_REALAPPS_ONLY", "benv": "UHH_REALAPPS_BACKENDS", "from": "_realapps_scenarios",
+                       "parts": {"tasklist-m": (["tasklist-m"], None),
+                                 **{f"ps-modules-{b}": (["ps-modules"], b) for b in _BK},
+                                 **{f"ps-fileversion-{b}": (["ps-fileversion"], b) for b in _BK},
+                                 "rest": (None, None)}},
+}
 ARCH_IDX = {"x64": 0, "x86": 1}
 
 
@@ -99,15 +128,38 @@ def checks():
     return out
 
 
+def split_items(sel):
+    """{part: (items, backend or None)} of a SPLIT selector; every item of regress.py's list is covered."""
+    sp = SPLIT[sel]
+    src = REGRESS.read_text(encoding="utf-8")
+    body = src[src.index(f"\ndef {sp['from']}("):]
+    body = body[:body.index("\ndef ", 1)]
+    items = re.findall(r'^\s+\("([\w-]+)",', body, re.M)
+    named = {i for part, _ in sp["parts"].values() if part for i in part}
+    if not items or any(i not in items for i in named):
+        sys.exit(f"ci_shards: SPLIT {sel}: parts {sorted(named)} not all in {sp['from']}() items {items}")
+    for i in named:   # an item split by backend must have every backend
+        bks = {b for part, b in sp["parts"].values() if part and i in part}
+        if None not in bks and bks != set(_BK):
+            sys.exit(f"ci_shards: SPLIT {sel}: {i} split into backends {sorted(bks)}, not all of {_BK}")
+    return {p: (v or [i for i in items if i not in named], b) for p, (v, b) in sp["parts"].items()}
+
+
 def units():
-    """[(selector, [members])] in suite order; opt-in tiers excluded."""
+    """[(selector, [members])] in suite order; opt-in tiers excluded; SPLIT units as their parts."""
     names = [n for n, opt in checks() if not opt]
     sel = [n for n in names if not any(o != n and o in n for o in names)]
     res = [(s, [n for n in names if s in n]) for s in sel]
     seen = [m for _, ms in res for m in ms]
     if sorted(seen) != sorted(names) or len(seen) != len(set(seen)):
         sys.exit(f"ci_shards: units do not partition the suite: {res}")
-    return res
+    out = []
+    for s, ms in res:
+        if s in SPLIT and ms == [s]:
+            out += [(f"{s}:{p}", [f"{s}:{p}"]) for p in split_items(s)]
+        else:
+            out.append((s, ms))
+    return out
 
 
 def est(members, arch):
@@ -151,7 +203,8 @@ def cmd_matrix(a):
                             "units": ",".join(sels), "est": t,
                             "frida": bool(ms & NEEDS["frida"]),
                             # x86 too: check_cet_sde looks for SDE before its x86 SKIP
-                            "sde": bool(ms & NEEDS["sde"])})
+                            "sde": bool(ms & NEEDS["sde"]),
+                            "oldmsvcp": bool(ms & NEEDS["oldmsvcp"])})
     matrix = {"include": include}
     for e in include:
         print(f"{e['name']}: ~{e['est']}s  {e['units']}", file=sys.stderr)
@@ -199,6 +252,8 @@ def cmd_run(a):
            "cpu": os.environ.get("RUNNER_CPU", ""),
            "sha": os.environ.get("GITHUB_SHA", "")}
     fail_re = re.compile(r"^\[\d\d:\d\d:\d\d\] FAIL ")
+    absent = ABSENT.get(os.environ.get("CI_IMAGE", ""), {})
+    expected = {}                                   # record -> why it may fail here (KNOWN, ABSENT)
     # CI_NOTICE_RE: result lines to publish as a notice annotation too (e.g. the cet-* rows of cet-hw)
     notice_re = re.compile(os.environ["CI_NOTICE_RE"]) if os.environ.get("CI_NOTICE_RE") else None
     noticed = []
@@ -210,9 +265,18 @@ def cmd_run(a):
             print(hdr, flush=True); lf.write(hdr + "\n"); lf.flush()
             t0 = time.time()
             u = {"unit": sel, "fails": [], "known": [], "ok_line": "", "rc": None, "timeout": False}
-            p = subprocess.Popen([sys.executable, "-u", str(REGRESS), "--bin", a.bin, "--only", sel],
+            only, uenv = sel, env
+            if ":" in sel:                              # a SPLIT part: the check, narrowed by its env variable
+                only, part = sel.split(":", 1)
+                its, bk = split_items(only)[part]
+                uenv = dict(env, **{SPLIT[only]["env"]: ",".join(its)})
+                if bk:
+                    uenv[SPLIT[only]["benv"]] = bk
+                hdr2 = f"===== {SPLIT[only]['env']}={uenv[SPLIT[only]['env']]}" + (f" {SPLIT[only]['benv']}={bk}" if bk else "")
+                print(hdr2, flush=True); lf.write(hdr2 + "\n")
+            p = subprocess.Popen([sys.executable, "-u", str(REGRESS), "--bin", a.bin, "--only", only],
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                 encoding="utf-8", errors="replace", bufsize=1, cwd=ROOT, env=env)
+                                 encoding="utf-8", errors="replace", bufsize=1, cwd=ROOT, env=uenv)
             timer = threading.Timer(a.unit_timeout, lambda: (u.update(timeout=True), kill_tree(p)))
             timer.daemon = True
             timer.start()
@@ -223,7 +287,10 @@ def cmd_run(a):
                     noticed.append(s[11:].strip())
                 if fail_re.match(s):
                     rec = s[11:].split()[1] if len(s[11:].split()) > 1 else ""
-                    (u["known"] if rec in KNOWN else u["fails"]).append(s[11:].strip())
+                    why = KNOWN.get(rec) or (absent.get(rec) if ABSENT_TEXT in s else None)
+                    if why:
+                        expected[rec] = why
+                    (u["known"] if why else u["fails"]).append(s[11:].strip())
                 elif ok_re.match(s):
                     u["ok_line"] = s
             u["rc"] = p.wait()
@@ -250,12 +317,13 @@ def cmd_run(a):
     for u in res["units"]:
         why = "timeout" if u["timeout"] else ("" if u["ok"] else f"rc={u['rc']}")
         lines.append(f"| {u['unit']} | {'ok' if u['ok'] else 'FAIL'} | {u['secs']:.0f} | {u['ok_line'] or why} |")
-    if bad:
-        lines += ["", "```"] + [f for u in bad for f in (u["fails"] or [f"{u['unit']}: rc={u['rc']}"
-                                                                        f"{' timeout' if u['timeout'] else ''}"])] + ["```"]
+    fl = [f for u in bad for f in (u["fails"] or [f"{u['unit']}: rc={u['rc']}{' timeout' if u['timeout'] else ''}"])]
+    if bad:   # every FAIL line in full (the regress.py detail is the diagnosis)
+        lines += ["", "Failures (full detail):", "```"] + fl + ["```"]
     known = [f for u in res["units"] for f in u["known"]]
     if known:
-        lines += ["", "Known (by design, not failing the job):", "```"] + known + ["```"]
+        lines += ["", "Known / absent on this image (not failing the job):", "```"] + \
+                 [f"{x}  [{expected.get(x.split()[1], '')}]" for x in known] + ["```"]
     md = "\n".join(lines) + "\n"
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
@@ -266,12 +334,17 @@ def cmd_run(a):
           + esc(f"cpu: {res['cpu']}\ntimes: {timing}"))
     if known:
         print(f"::warning title={a.name} known failures ({len(known)})::"
-              + esc("\n".join(f"{x[:300]}  [{KNOWN[x.split()[1]]}]" for x in known)))
+              + esc("\n".join(f"{x[:300]}  [{expected.get(x.split()[1], '')}]" for x in known)))
     for k, chunk in enumerate(chunks([x[:600] for x in noticed])):
         print(f"::notice title={a.name} selected rows ({k + 1})::" + esc(chunk))
     if bad:
-        fl = [f for u in bad for f in (u["fails"] or [f"{u['unit']}: rc={u['rc']}{' timeout' if u['timeout'] else ''}"])]
-        print(f"::error title={a.name} FAIL ({len(fl)})::" + esc("\n".join(x[:400] for x in fl)[:30000]))
+        # Every FAIL line in full: one annotation per <= 3.5 KB chunk (GitHub cuts a message at ~4 KB), a longer line
+        # split across consecutive chunks; at most 10 error annotations per step (the step summary and the log artifact
+        # always have everything).
+        parts = [x[i:i + 3400] for x in fl for i in range(0, max(len(x), 1), 3400)]
+        cs = chunks(parts)
+        for k, chunk in enumerate(cs[:10]):
+            print(f"::error title={a.name} FAIL ({len(fl)}) part {k + 1}/{len(cs)}::" + esc(chunk))
     sys.exit(0 if res["ok"] else 1)
 
 
@@ -303,6 +376,10 @@ def cmd_summarize(a):
             rows.append(f"| | known: `{f[:200].replace('|', '/')}` | | |")
     md = [f"## UHH regress on {os.environ.get('IMAGE', 'windows')}", "", "| shard | result | secs | counts | cpu |",
           "|---|---|---|---|---|"] + rows
+    details = [(n, f) for n in expected if n in results for u in results[n]["units"] if not u["ok"]
+               for f in (u["fails"] or [f"{u['unit']}: rc={u['rc']}{' timeout' if u['timeout'] else ''}"])]
+    if details:
+        md += ["", "### Failures (full detail)", "", "```"] + [f"[{n}] {f}" for n, f in details] + ["```"]
     md += ["", "### Measured unit times (s)", "", "| unit | x64 | x86 |", "|---|---|---|"]
     for unit in sorted(measured, key=lambda k: -max(measured[k].values())):
         md.append(f"| {unit} | {measured[unit].get('x64', '')} | {measured[unit].get('x86', '')} |")

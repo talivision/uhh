@@ -1,0 +1,28 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>uhh realbig ticks</title></head>
+<body>
+<!-- Served by scripts/regress.py (realbig-edge-*) to headless Edge, which then stays up (no
+     --dump-dom) until the suite kills it. The renderer runs a JIT-heavy loop for as long as it
+     lives: every tick k it compiles a NEW function (new Function -> fresh code in V8's code
+     space, i.e. NtAllocateVirtualMemory / NtProtectVirtualMemory in the renderer), runs a hot
+     loop, allocates a 512 KB typed array, and reports /tick?i=k&v=<result> to the local server,
+     which recomputes the value independently (Python, int32 arithmetic) and checks the ticks
+     are contiguous. A renderer that crashed, hung or computed a wrong value shows there. -->
+<div id="state">running</div>
+<script>
+function work(n) { let h = 0; for (let i = 0; i < n; i++) h = (Math.imul(h, 31) + (i ^ (i >> 3))) | 0; return h; }
+let k = 0;
+async function loop() {
+  for (;;) {
+    const i = k++;
+    const f = new Function('x', 'let s = 0; for (let j = 0; j < 1000; j++) s = (s + x * ' + (i % 97 + 3) + ' + j) | 0; return s;');
+    const big = new Float64Array(1 << 16);
+    big[i % big.length] = i;
+    const v = (work(100000 + i % 50) ^ f(i) ^ (big[i % big.length] | 0)) | 0;
+    try { await fetch('/tick?i=' + i + '&v=' + v, {cache: 'no-store'}); } catch (e) {}
+    await new Promise(r => setTimeout(r, 40));
+  }
+}
+loop();
+</script>
+</body></html>

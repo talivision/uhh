@@ -11,7 +11,7 @@
 #include <intrin.h>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 21;
+constexpr uint32_t PROBE_AGENT_VERSION = 23;   /* 23: runfix1 log carry + running count (on top of 21: held_floor; 22 is huntaudit's) */
 constexpr uint32_t PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH = 1u << 9;   /* agent side only needs this one */   /* == PROBE_UNSAFE_FAST_PATCH (asserted in session.cpp) */
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 128;   /* inline probes per session; the 129th is refused */
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
@@ -85,7 +85,7 @@ struct probe_agent_log {
     volatile LONG owner;           /* tid of the producer that claimed the slot; 0 = free/unknown */
     uint32_t carry;                /* 1: the FIRST record of a running callback -- it carries that hit's
                                       unaccounted unit (hit_stripes[probe][stripe of tid]); the controller
-                                      retires the unit when it takes the record (v21, see hit_stripes) */
+                                      retires the unit when it takes the record (v23, see hit_stripes) */
     uint32_t reserved;
     uint64_t frames[32];           /* == PROBE_STACK_MAX_FRAMES */
 };
@@ -142,7 +142,17 @@ struct probe_agent_guard {
                                                           per suspension: install holds, hook-write freezes,
                                                           call_func/call_original deferrals, in-place windows */
     uint64_t blocks[PROBE_AGENT_GUARD_BLOCKS];         /* 64 KiB out-of-line step blocks */
+    uint32_t held_floor[PROBE_AGENT_GUARD_TIDS];       /* per held_tids entry: PROBE_AGENT_HOLD_OURS (a hold
+                                                          of ours: resume once), or a CONDITIONAL entry --
+                                                          the thread's suspend count before a call that may
+                                                          suspend it implicitly (x86 controller, GuardTouch):
+                                                          resumed once only if its count is above that */
+    volatile LONG service_tid;                         /* the agent's service thread (no one suspends it): its
+                                                          suspend count as read by NtQueryInformationThread is
+                                                          the debug freeze alone (0 / 1), which that count
+                                                          includes -- subtracted from a held_floor reading */
 };
+constexpr uint32_t PROBE_AGENT_HOLD_OURS = 0xFFFFFFFFu;
 
 /* Hit counting and in-flight tracking are striped over cache-line-separated counters
    (indexed by thread id: (tid >> 2) % PROBE_AGENT_STRIPES) so threads hitting the same probe
