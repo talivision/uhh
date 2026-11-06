@@ -1538,6 +1538,26 @@ static __declspec(noinline) bool mid_entry_saved(safetyhook::Context &native, ui
     return x87;
 }
 
+// No usable XSAVE (no OSXSAVE, or a save area past the buffer): FXSAVE keeps the x87 state
+// (ST0-7, control/status/tag words) and MXCSR around the callback, as XSAVE's x87 component
+// does on the gated path. MXCSR alone let a callback's (or the CRT's) float code change a live
+// x87 stack / status word at a mid-function site (x86 returns floats in ST0, so any float call
+// pushes and pops it). The XMM registers the image also holds are put back by the hook stub
+// afterwards anyway; without OSXSAVE there is no AVX state to keep.
+static __declspec(noinline) bool mid_entry_fx(safetyhook::Context &native, uint32_t index, unsigned char *x87_post) {
+    alignas(16) unsigned char fx[512];
+#if defined(_WIN64)
+    _fxsave64(fx);
+    const bool x87 = call_mid(native, index, x87_post);
+    _fxrstor64(fx);
+#else
+    _fxsave(fx);
+    const bool x87 = call_mid(native, index, x87_post);
+    _fxrstor(fx);
+#endif
+    return x87;
+}
+
 static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
     __writeeflags(__readeflags() & ~(uintptr_t)0x400);    // DF=0 before ANY C code
 #if defined(_WIN64)
@@ -1557,8 +1577,9 @@ static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
     }
     if (xmode == 1) x87 = call_mid(native, index, x87_post);
     else if (mask) x87 = mid_entry_saved(native, index, mask, x87_post);
+    else if (!xs_ok) x87 = mid_entry_fx(native, index, x87_post);   // no XSAVE: x87 + MXCSR by FXSAVE
     else {
-        unsigned int mxcsr = _mm_getcsr();                 // the common case (and no XSAVE): just MXCSR
+        unsigned int mxcsr = _mm_getcsr();                 // the common case: nothing live but MXCSR
         x87 = call_mid(native, index, x87_post);
         _mm_setcsr(mxcsr);
     }
