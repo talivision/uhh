@@ -196,6 +196,7 @@ def cmd_run(a):
     log = out / f"{a.name}.log"
     sels = [x for x in a.units.split(",") if x]
     res = {"name": a.name, "arch": a.arch, "units": [], "runner": os.environ.get("RUNNER_NAME", ""),
+           "cpu": os.environ.get("RUNNER_CPU", ""),
            "sha": os.environ.get("GITHUB_SHA", "")}
     fail_re = re.compile(r"^\[\d\d:\d\d:\d\d\] FAIL ")
     # CI_NOTICE_RE: result lines to publish as a notice annotation too (e.g. the cet-* rows of cet-hw)
@@ -244,7 +245,7 @@ def cmd_run(a):
     (out / f"{a.name}.json").write_text(json.dumps(res, indent=1), encoding="utf-8")
 
     bad = [u for u in res["units"] if not u["ok"]]
-    lines = [f"### {a.name}: {'PASS' if res['ok'] else 'FAIL'} -- {res['ok_line']} in {res['secs']:.0f}s", "",
+    lines = [f"### {a.name}: {'PASS' if res['ok'] else 'FAIL'} -- {res['ok_line']} in {res['secs']:.0f}s ({res['cpu']})", "",
              "| unit | result | secs | |", "|---|---|---|---|"]
     for u in res["units"]:
         why = "timeout" if u["timeout"] else ("" if u["ok"] else f"rc={u['rc']}")
@@ -262,7 +263,7 @@ def cmd_run(a):
     # Annotations are readable through the public REST API without auth (check-run annotations).
     timing = " ".join(f"{u['unit'][6:]}={u['secs']:.0f}" for u in res["units"])
     print(f"::notice title={a.name} {'PASS' if res['ok'] else 'FAIL'} {res['ok_line']} {res['secs']:.0f}s::"
-          + esc(f"times: {timing}"))
+          + esc(f"cpu: {res['cpu']}\ntimes: {timing}"))
     if known:
         print(f"::warning title={a.name} known failures ({len(known)})::"
               + esc("\n".join(f"{x[:300]}  [{KNOWN[x.split()[1]]}]" for x in known)))
@@ -293,14 +294,15 @@ def cmd_summarize(a):
             continue
         fails = [f for u in r["units"] if not u["ok"]
                  for f in (u["fails"] or [f"{u['unit']}: rc={u['rc']}{' timeout' if u['timeout'] else ''}"])]
-        rows.append(f"| {n} | {'PASS' if r['ok'] else 'FAIL'} | {r['secs']:.0f} | {r['ok_line']} |")
+        rows.append(f"| {n} | {'PASS' if r['ok'] else 'FAIL'} | {r['secs']:.0f} | {r['ok_line']} | {r.get('cpu', '')} |")
         for u in r["units"]:
             measured.setdefault(u["unit"], {})[r["arch"]] = u["secs"]
         for f in fails:
             rows.append(f"| | `{f[:300].replace('|', '/')}` | | |")
         for f in (f for u in r["units"] for f in u.get("known", [])):
             rows.append(f"| | known: `{f[:200].replace('|', '/')}` | | |")
-    md = [f"## UHH regress on {os.environ.get('IMAGE', 'windows')}", "", "| shard | result | secs | counts |", "|---|---|---|---|"] + rows
+    md = [f"## UHH regress on {os.environ.get('IMAGE', 'windows')}", "", "| shard | result | secs | counts | cpu |",
+          "|---|---|---|---|---|"] + rows
     md += ["", "### Measured unit times (s)", "", "| unit | x64 | x86 |", "|---|---|---|"]
     for unit in sorted(measured, key=lambda k: -max(measured[k].values())):
         md.append(f"| {unit} | {measured[unit].get('x64', '')} | {measured[unit].get('x86', '')} |")

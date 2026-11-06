@@ -179,6 +179,11 @@ jobs:
         with:
           name: bin-${{ matrix.arch }}
           path: build-${{ matrix.arch }}/Release
+      - name: Runner CPU (failures can depend on the host model; recorded per shard)
+        shell: pwsh
+        run: |
+          $cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name.Trim() -replace '\s+', ' '
+          "RUNNER_CPU=$cpu" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
       - name: Defender exclusion for the workspace (as on the test VM, which excludes C:\work)
         shell: pwsh
         run: |
