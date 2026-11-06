@@ -5877,6 +5877,9 @@ def check_cdx_review():
             if hits != N: bad.append(f"hits={hits}")
             if len(logs) != N: bad.append(f"logs={len(logs)}")
             if res.get("fix") != N: bad.append(f"veh_fixes={res.get('fix')} (want {N})")
+            # The program's own result: every repaired load reads g_good (42), n loads.
+            if res.get("sum") != N * 42 or res.get("n") != N:
+                bad.append(f"target sum={res.get('sum')} n={res.get('n')} (want {N * 42}, {N})")
             if res.get("tf") != 0 and bk != "breakpoint": bad.append(f"tf_in_handler={res.get('tf')}")
             if res.get("stray") != 0: bad.append(f"stray_single_steps={res.get('stray')}")
             record(name, not bad, " ".join(bad) or f"hits={hits} logs={len(logs)} fixes={res.get('fix')}")
