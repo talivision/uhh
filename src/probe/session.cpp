@@ -1608,6 +1608,17 @@ static bool emu_cond(ZydisMnemonic m, DWORD f) {
 // Hardware-enforced shadow stacks (Intel CET, /CETCOMPAT): an emulated CALL/RET would move
 // the normal stack but not the shadow stack, so the target would fault at its next real ret.
 // Such targets get CALL/RET stepped by the CPU (in-place path) instead.
+// The thread is exiting (or gone): Get/SetThreadContext on it fail with ERROR_ACCESS_DENIED
+// (STATUS_THREAD_IS_TERMINATING) while GetExitCodeThread can still say STILL_ACTIVE.
+static bool thread_terminating(HANDLE thread) {
+    using QueryFn = LONG(NTAPI *)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    static auto query = reinterpret_cast<QueryFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+    ULONG terminated = 0;
+    DWORD code = 0;
+    if (GetExitCodeThread(thread, &code) && code != STILL_ACTIVE) return true;
+    return query && query(thread, 20 /* ThreadIsTerminated */, &terminated, sizeof(terminated), nullptr) >= 0 && terminated;
+}
+
 static bool target_has_shadow_stack(probe_session *s) {
     if (s->shadow_stack < 0) {
         s->shadow_stack = 0;
@@ -4099,8 +4110,7 @@ static void detach(probe_session *s) {
             Sleep(1);                                                           // transient: retry
         }
         if (!got) {
-            DWORD code = 0;
-            bool gone = GetExitCodeThread(t, &code) && code != STILL_ACTIVE;
+            bool gone = thread_terminating(t);
             if (!gone) report_tids += " " + std::to_string(GetThreadId(t)) + ":getfail=" + std::to_string(why);
             continue;
         }
@@ -4116,6 +4126,7 @@ static void detach(probe_session *s) {
         w.EFlags &= ~0x100u;
         BOOL set_ok = SetThreadContext(t, &w);
         const DWORD set_err = set_ok ? 0 : GetLastError();
+        if (!set_ok && thread_terminating(t)) continue;      // exiting (ERROR_ACCESS_DENIED): never runs user code again
         CONTEXT v{}; v.ContextFlags = CONTEXT_DEBUG_REGISTERS;
         GetThreadContext(t, &v);
         if (!set_ok || (v.Dr7 & 0xFF))
@@ -6692,7 +6703,12 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
     ok = remote_write(s->pi.hProcess, sp, frame, sizeof(frame), &wrote) && wrote == sizeof(frame);
     w.Esp = sp + 4; w.Eip = (DWORD)s->call_trap; w.Eax = (DWORD)fn;   // the stub's CALL pushes ret at sp
 #endif
-    w.EFlags &= ~0x100u;
+    // The callee gets what the ABI promises at a call: TF and DF clear. A hit can stop the
+    // thread anywhere (a mid-function site may sit inside a `std` ... `cld` span): entered with
+    // DF set, string instructions run backwards -- on Server 2025 / Win11 24H2 the WoW64
+    // syscall thunk of GetThreadPriority then smashed its own stack (x86 target died executing
+    // 0x0, transparency-*-callfn at TpMidHit). The thread's own flags come back with the restore.
+    w.EFlags &= ~0x500u;
     w.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
     if (!ok || !SetThreadContext(thread, &w)) {
         if (trace_enabled()) std::fprintf(stderr, "  call_func: frame write ok=%d / SetThreadContext(%lu) failed %lu\n", (int)ok,

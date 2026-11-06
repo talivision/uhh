@@ -2016,13 +2016,19 @@ def check_detach():
                 line = target.stdout.readline().decode(errors="replace")
                 if not line or '"waiting"' in line:
                     break
-            tracer = subprocess.Popen([str(t), "--backend", bk, "--attach", str(target.pid), "--detach-after-ms", "2500",
+            # Detach once a twentieth of the reads is logged (was: a fixed 2.5 s after the attach,
+            # which a fast host -- windows-2025's EPYC, inline -- outran: the target had finished
+            # every read, so the detach was not mid-run, and met its main thread exiting).
+            tracer = subprocess.Popen([str(t), "--backend", bk, "--attach", str(target.pid), "--detach-on-stdin",
                                        "-p", "ntdll.dll!NtReadVirtualMemory:xxxx"],
-                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             tout, terr = Lines(tracer.stdout), Lines(tracer.stderr)   # release the gate once the probe is LIVE
             if not terr.wait_for(lambda l: l.startswith("probe: active ntdll.dll!NtReadVirtualMemory"), 60):
                 raise RuntimeError("probe never became active")
             target.stdin.write(b"\n"); target.stdin.flush()
+            with tout.cv:
+                tout.cv.wait_for(lambda: len(tout.lines) >= total // 20, 120)
+            tracer.stdin.write("\n"); tracer.stdin.flush()
             tracer.wait(timeout=120)
             tout.t.join(timeout=30); terr.t.join(timeout=30)
             out, err = "\n".join(tout.lines), "\n".join(terr.lines)
