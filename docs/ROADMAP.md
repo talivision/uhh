@@ -1190,7 +1190,8 @@ by itself, nothing dropped), detach while callbacks run / block in call_original
   and the write: an unmap racing them fails that one hook (abandoned, never touched again).
   Pinning the module was tried and rejected: GetModuleHandleEx/FreeLibrary wait on the loader,
   which a thread held mid-load (no DR free for gates) blocks -- the install then stalled past the
-  detach's 5 s wait. `lifecycle-detach-early-*-{inline,mixed}`
+  detach's 5 s wait. `lifecycle-detach-early-*-{inline,mixed}` (The same race on the REMOVE side -- the final unhook
+  of a site its DLL had just left -- was fixed later: "CI residuals" R3, `lifecycle-unload-unseen-*`.)
 - ✅ (L6) Stale UNLOAD_DLL (reported after the same DLL was mapped again at the same base and its
   LOAD handled) retired the probe just armed in the NEW instance: its INT3 was never removed at
   detach. An image mapped at that base when the unload is processed now means the event is stale
@@ -2010,7 +2011,7 @@ full logs to a `diaglogs/<run>-<job>` branch -- readable with git, no API token)
   absent, known hunt rows), plus single occurrences: attach-new-inline (load flake, above) and
   `lifecycle-detach-early-120-inline` (target 0xC0000005 in an agent thread while hunt_dll unloads; PRE-EXISTING:
   the same signature in 1 of 128 rows on merge-frida's agent, 0 of 128 on runfix2, diag run 42224315607 -- L5
-  family, open). `prehook-attach` failed once on windows-2025 (OSError: the target was gone 3 s into the attach);
+  family; root-caused and fixed: "CI residuals" R3). `prehook-attach` failed once on windows-2025 (OSError: the target was gone 3 s into the attach);
   14/14 PASS in reruns on both arches.
 - VM (Windows 10, both arches): `--only transparency,check_detach,conformance,callfunc,check_cet_policy,callorig`
   x64 88/89, x86 84/85 (the one FAIL both times: `callfunc-kill-reuse` "no thread reused the dead id in 3000
