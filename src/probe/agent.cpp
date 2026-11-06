@@ -1538,6 +1538,46 @@ static __declspec(noinline) bool mid_entry_saved(safetyhook::Context &native, ui
     return x87;
 }
 
+// No usable XSAVE (no OSXSAVE, or a save area past the buffer): FXSAVE keeps the x87 state
+// (ST0-7, control/status/tag words) and MXCSR around the callback, as XSAVE's x87 component
+// does on the gated path. MXCSR alone let a callback's (or the CRT's) float code change a live
+// x87 stack / status word at a mid-function site (x86 returns floats in ST0, so any float call
+// pushes and pops it). The XMM registers the image also holds are put back by the hook stub
+// afterwards anyway; without OSXSAVE there is no AVX state to keep.
+static __declspec(noinline) bool mid_entry_fx(safetyhook::Context &native, uint32_t index, unsigned char *x87_post) {
+    alignas(16) unsigned char fx[512];
+#if defined(_WIN64)
+    _fxsave64(fx);
+    const bool x87 = call_mid(native, index, x87_post);
+    _fxrstor64(fx);
+#else
+    _fxsave(fx);
+    const bool x87 = call_mid(native, index, x87_post);
+    _fxrstor(fx);
+#endif
+    return x87;
+}
+
+// Regress knob (xstate_mode 3, UHH_BENCH_XSTATE=noxsave): the no-XSAVE fallback on a CPU that
+// HAS AVX. A CPU without OSXSAVE has no AVX state at all; this one does, so the AVX components
+// alone are kept by XSAVE around the fallback, which is then tested for what it is responsible
+// for -- x87, MXCSR -- exactly as without OSXSAVE.
+static __declspec(noinline) bool mid_entry_noxsave_sim(safetyhook::Context &native, uint32_t index, uint64_t avx,
+                                                       unsigned char *x87_post) {
+    alignas(64) unsigned char area[4096];
+    __stosb(area + 512, 0, 64);
+#if defined(_WIN64)
+    if (g_xs.compact) _xsavec64(area, avx); else _xsave64(area, avx);
+    const bool x87 = mid_entry_fx(native, index, x87_post);
+    _xrstor64(area, avx);
+#else
+    if (g_xs.compact) _xsavec(area, avx); else _xsave(area, avx);
+    const bool x87 = mid_entry_fx(native, index, x87_post);
+    _xrstor(area, avx);
+#endif
+    return x87;
+}
+
 static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
     __writeeflags(__readeflags() & ~(uintptr_t)0x400);    // DF=0 before ANY C code
 #if defined(_WIN64)
@@ -1546,17 +1586,22 @@ static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
     unsigned char x87_buf[108], *x87_post = x87_buf;       // call_original's x87 state (ST0 result)
 #endif
     bool x87 = false;
-    LONG xmode = shared->xstate_mode;                      // 0 gated (default), 1 none, 2 full (bench knob)
+    // 0 gated (default), 1 none, 2 full (bench knobs), 3 as on a CPU without OSXSAVE (regress)
+    LONG xmode = shared->xstate_mode;
+    const bool xs_ok = g_xs.ok && xmode != 3;
     uint64_t mask = 0;
-    if (xmode != 1 && g_xs.ok) {
+    if (xmode != 1 && xs_ok) {
         if (xmode == 2) mask = g_xs.mask;
         else if (g_xs.xinuse) mask = _xgetbv(1) & g_xs.avx_mask;  // only components actually live
         else mask = g_xs.avx_mask;                         // liveness unknown: keep AVX state
     }
     if (xmode == 1) x87 = call_mid(native, index, x87_post);
+    else if (xmode == 3 && g_xs.ok && (g_xs.mask & 0xE4ull))
+        x87 = mid_entry_noxsave_sim(native, index, g_xs.mask & 0xE4ull, x87_post);
     else if (mask) x87 = mid_entry_saved(native, index, mask, x87_post);
+    else if (!xs_ok) x87 = mid_entry_fx(native, index, x87_post);   // no XSAVE: x87 + MXCSR by FXSAVE
     else {
-        unsigned int mxcsr = _mm_getcsr();                 // the common case (and no XSAVE): just MXCSR
+        unsigned int mxcsr = _mm_getcsr();                 // the common case: nothing live but MXCSR
         x87 = call_mid(native, index, x87_post);
         _mm_setcsr(mxcsr);
     }
@@ -1996,7 +2041,18 @@ static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
     const uint64_t at = (uint64_t)(uintptr_t)ep->ExceptionRecord->ExceptionAddress;
     if (code == EXCEPTION_BREAKPOINT) {
         unsigned char original = 0;
-        if (!int3_original(at, original)) return EXCEPTION_CONTINUE_SEARCH;
+        if (!int3_original(at, original)) {
+            // The other INT3 of ours a thread can execute: the end of a displaced REP string
+            // copy in one of our scratch blocks (session.cpp: the copy, an INT3 instead of a
+            // trap flag, then a jump back to the code after the site). Skip to the jump back.
+            LONG n = g.block_count; if (n > (LONG)PROBE_AGENT_GUARD_BLOCKS) n = PROBE_AGENT_GUARD_BLOCKS;
+            bool in_block = false;
+            for (LONG i = 0; i < n && !in_block; ++i) in_block = g.blocks[i] && at - g.blocks[i] < 0x10000;
+            if (!in_block) return EXCEPTION_CONTINUE_SEARCH;
+            set_ip(cx, at + 1);
+            if (g_guard_wake) SetEvent(g_guard_wake);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         restore_byte(at, original);
         set_ip(cx, at);                                           // run the original instruction
         if (g_guard_wake) SetEvent(g_guard_wake);
@@ -2088,6 +2144,52 @@ static void guard_cleanup() {
     probe_agent_stop(nullptr);                                  // inline hooks out (no-op without any)
     InterlockedExchange(&g_self_freeze, 0);
 }
+// Detach drain (probe_agent_shared::live_query): the in-flight callbacks that can still finish
+// and send a log -- on a thread that exists, is not suspended and is still inside the callback
+// its slot records (the record's frame is on the thread's stack, above its SP, canary intact).
+// Dead / suspended threads and records a non-unwinding longjmp left behind are not counted.
+static LONG count_live_callbacks() {
+    LONG n = 0;
+    const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    for (ThreadSlot &ts : g_threads) {
+        const DWORD tid = (DWORD)ts.tid;
+        const HitScope *h = ts.active;
+        if (!tid || !h || tid == self) continue;
+        HANDLE t = OpenThread(THREAD_QUERY_LIMITED_INFORMATION | THREAD_GET_CONTEXT | SYNCHRONIZE, FALSE, tid);
+        if (!t) continue;                                          // gone
+        bool live = WaitForSingleObject(t, 0) == WAIT_TIMEOUT && GetProcessIdOfThread(t) == pid;
+        if (live && g_nt_qit) {                                    // suspended (by the program): cannot finish now
+            ULONG suspended = 0;
+            if (g_nt_qit(t, 35 /* ThreadSuspendCount */, &suspended, sizeof(suspended), nullptr) >= 0 && suspended)
+                live = false;
+        }
+        if (live) {
+            CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
+            if (GetThreadContext(t, &c)) {
+#if defined(_WIN64)
+                const uintptr_t sp = (uintptr_t)c.Rsp;
+#else
+                const uintptr_t sp = (uintptr_t)c.Esp;
+#endif
+                const uintptr_t a = (uintptr_t)h;
+                live = a > sp && (!ts.stack || a + sizeof(HitScope) <= ts.stack);
+                if (live) {
+                    __try { live = h->canary == (a ^ HIT_CANARY); }
+                    __except (EXCEPTION_EXECUTE_HANDLER) { live = false; }
+                }
+            }
+        }
+        CloseHandle(t);
+        n += live;
+    }
+    return n;
+}
+static void answer_live_query() {
+    shared->live_callbacks = count_live_callbacks();
+    MemoryBarrier();
+    InterlockedIncrement(&shared->live_seq);
+}
+
 static HANDLE service_event;
 static volatile LONG service_running;   // service_main has started (past its loader init)
 static HANDLE service_up;               // set by service_main once it runs (init waits for it)
@@ -2121,7 +2223,12 @@ static DWORD WINAPI service_main(void *) {
                              GetTickCount64() - ctl_gone_at < 30000;
         HANDLE waits[3] = {service_event, g_guard_wake, g_ctl};
         DWORD w = WaitForMultipleObjects(g_ctl ? 3 : 2, waits, FALSE, polling ? 10 : INFINITE);
-        if (w == WAIT_OBJECT_0) { install_pending(); notify_installed(); continue; }
+        if (w == WAIT_OBJECT_0) {
+            // A detach drain asking how many callbacks can still finish: answer only -- the
+            // session is over, so no install round (and no INSTALL_DONE raised to nobody).
+            if (InterlockedExchange(&shared->live_query, 0)) { answer_live_query(); continue; }
+            install_pending(); notify_installed(); continue;
+        }
         if (w == WAIT_OBJECT_0 + 2) { CloseHandle(g_ctl); g_ctl = nullptr; ctl_gone_at = GetTickCount64(); }
         else if (w == WAIT_FAILED) {
             if (!g_ctl) return 1;
@@ -2209,7 +2316,10 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_stop(void *) {
     if (!shared) return 0;                               // loaded but never initialised: nothing to undo
     AcquireSRWLockExclusive(&g_install_lock);            // after any install round in progress
     InterlockedExchange(&g_stopping, 1);
-    for (int i = 0; i < 2000 && any_inflight(); ++i) Sleep(1);
+    // 2 s of wall time: 2000 x Sleep(1) was up to ~31 s at the default 15.6 ms timer, past the
+    // controller's 5 s wait for this thread -- the detach then skipped its log drain (dropped
+    // the late logs of a callback still running) and reported the hooks as not removed.
+    for (const ULONGLONG t0 = GetTickCount64(); any_inflight() && GetTickCount64() - t0 < 2000; ) Sleep(1);
     for (auto &sh : g_shadow) if (sh.lo) { sh.lo = 0; InterlockedDecrement(&g_shadow_count); }
     frozen(slot_set{}, [] {
         for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i)

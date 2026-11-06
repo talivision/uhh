@@ -3,7 +3,7 @@
 .model flat, C
 OPTION CASEMAP:NONE
 
-PUBLIC CoMidPush, CoPrologue, CoCallPrologue, CoThis
+PUBLIC CoMidPush, CoPrologue, CoCallPrologue, CoThis, CoRepFill, CoRepSite
 
 .code
 ; int CoMidPush(int a) = a + 1; a probe at CoMidPush+1 is mid-function ([esp] = saved ebx).
@@ -71,4 +71,16 @@ CoThis PROC
     imul eax, [esp+8]
     ret 8
 CoThis ENDP
+
+; void CoRepFill(void *dst, size_t n, int v): memset by `rep stosb` at CoRepSite (cxlib-reptail).
+CoRepFill PROC
+    push edi
+    mov edi, [esp+8]
+    mov ecx, [esp+12]
+    mov eax, [esp+16]
+CoRepSite::
+    rep stosb
+    pop edi
+    ret
+CoRepFill ENDP
 END

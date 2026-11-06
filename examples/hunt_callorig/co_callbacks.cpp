@@ -1,6 +1,8 @@
 // call_original / return_from edge-case hunt: ONE callback source for every backend (built
 // into co_driver for breakpoint/hw and into the agent for inline). Every callback logs lines
 // starting "co "; the regress check counts them against the probe hits.
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include "probe_api.h"
 #include <stdint.h>
 #include <atomic>
@@ -72,3 +74,42 @@ CO_CB void co_on_ret(probe_context *c) {
     }
     wrap(c, "ret", 1, 0, 0);
 }
+
+// ---- Codex library review (regress `cxlib-*`) ---------------------------------------------
+// cbfault: the callback FAULTS after call_original / return_from. By co_cbf's first argument:
+// 0 mod 3 -- after call_original: the original must not run again, the caller gets its result;
+// 1 mod 3 -- after call_original + return_from(r + 1000): the caller gets r + 1000;
+// 2 mod 3 -- after a return_from without call_original: dropped (a faulting callback is a
+// no-op), the original runs once. One body run per call on every backend.
+CO_CB void co_on_cbf(probe_context *c) {
+    const uint64_t a = get_func_arg(c, 0);
+    send_log(c, "co cbfault");
+    uint64_t r = 0;
+    if (a % 3 == 0) call_original(c, 2, &r);
+    else if (a % 3 == 1) { if (call_original(c, 2, &r)) return_from(c, r + 1000, 0); }
+    else return_from(c, 5000, 0);
+    *(volatile int *)(uintptr_t)0x10 = 1;                // the fault
+}
+
+// late / cfgfree: a config larger than the agent's inline buffer (it lives in a block in the
+// target), read only after the callback has waited for the target's go (state 2).
+struct co_bigcfg { uint32_t backend, n; unsigned char pat[1000]; };
+CO_CB void co_on_late(probe_context *c) {
+    const uint64_t st = get_func_arg(c, 0);
+    send_log(c, "co late start");
+    LONG one = 1;
+    set_mem(c, st, &one, sizeof(one));
+    for (;;) {
+        LONG v = 0;
+        if (!get_mem(c, st, &v, sizeof(v)) || v >= 2) break;
+        Sleep(20);
+    }
+    const co_bigcfg *k = (const co_bigcfg *)get_config(c);
+    uint32_t sum = 0;
+    for (uint32_t i = 0; k && i < k->n && i < sizeof(k->pat); ++i) sum += (uint32_t)k->pat[i] * (i + 1);
+    send_log(c, "co late-done sum=%u", sum);
+    return_from(c, sum & 0x7fffffffu, 0);
+}
+
+// spin (cxlib-killarm): an ordinary logging probe.
+CO_CB void co_on_spin(probe_context *c) { send_log(c, "co spin"); }

@@ -10,7 +10,7 @@
 #include <cstdio>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 19;
+constexpr uint32_t PROBE_AGENT_VERSION = 20;
 constexpr uint32_t PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH = 1u << 9;   /* agent side only needs this one */   /* == PROBE_UNSAFE_FAST_PATCH (asserted in session.cpp) */
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 128;   /* inline probes per session; the 129th is refused */
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
@@ -156,7 +156,7 @@ struct probe_agent_shared {
     volatile LONG service_ready;   /* agent's persistent install thread is waiting on the svc event */
     volatile LONG64 overrides;     /* set_reg calls that changed a register, inline side */
     volatile LONG64 drain_beat;    /* bumped by the controller's drainer every loop: liveness */
-    volatile LONG xstate_mode;     /* benchmark knob: 0 = default (gated), 1 = none, 2 = full */
+    volatile LONG xstate_mode;     /* bench/test knob: 0 = default (gated), 1 = none, 2 = full, 3 = as without OSXSAVE */
     volatile LONG controller_gone; /* set when the controller stops consuming (detach/close): log calls return at once */
     volatile LONG ring_stalled;    /* controller: the ring is stuck behind a live producer's slot -- use PROBE_IPC_LOG */
     volatile LONG log_ipc;         /* controller: 1 while it is the debugger and services PROBE_IPC_LOG */
@@ -172,6 +172,16 @@ struct probe_agent_shared {
     volatile LONG int3_count;
     probe_agent_int3 int3[PROBE_AGENT_INT3_CAP];
     probe_agent_guard guard;
+    /* Detach drain (v20). Logs are never dropped while a callback can still send one: after a
+       detach the controller keeps delivering until no in-flight callback can still finish. It
+       sets live_query and signals the service event; the agent's service thread answers in
+       live_callbacks -- callbacks in flight on a thread that exists, is not suspended and is
+       still inside that callback (its record's frame is on the stack, canary intact) -- and
+       then bumps live_seq. A callback whose thread is dead, suspended (by the program) or left
+       through a non-unwinding longjmp cannot finish now: it stays counted in flight. */
+    volatile LONG live_query;
+    volatile LONG live_seq;
+    volatile LONG live_callbacks;
 };
 
 constexpr LONG64 PROBE_AGENT_INFLIGHT_ONE = 1LL << 48;   /* one running callback in a hit_stripes cell */

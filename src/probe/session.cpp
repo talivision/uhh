@@ -86,12 +86,20 @@ struct CallbackState {
     bool have_post = false;
     CONTEXT post{};
     probe_regs post_seen{};
+    // The callback faulted after call_original ran the original: the hit returns to its caller
+    // with everything the original left (run_callback), as inline does.
+    bool faulted = false;
 };
 // The floating-point parts of a CONTEXT (x86: the x87 save area and the FXSAVE image with XMM).
 #if defined(_WIN64)
 #define UHH_CONTEXT_FP CONTEXT_FLOATING_POINT
 #else
 #define UHH_CONTEXT_FP (CONTEXT_FLOATING_POINT | CONTEXT_EXTENDED_REGISTERS)
+#endif
+#if defined(_WIN64)
+#define UHH_POST_AX Rax
+#else
+#define UHH_POST_AX Eax
 #endif
 
 // A thread mid-single-step over a software breakpoint. displaced == true means the
@@ -112,6 +120,7 @@ struct StepState {
     bool pushf_insn = false;   // PUSHF stepped in place: the pushed image carries OUR trap flag
     bool prog_tf = false;      // ... unless the program had TF set itself
     bool windowed = false;     // in place under the in-place window (other threads held, see inplace_begin)
+    bool refire = false;       // the in-place step faulted: re-running the instruction WITHOUT our trap flag
 };
 
 // One log line, optionally with a raw stack snapshot (return addresses only). Frames
@@ -203,6 +212,10 @@ struct probe_session {
     std::map<std::pair<DWORD, uint64_t>, uint64_t> scratch;
     std::map<uint64_t, std::vector<uint64_t>> scratch_free;   // region -> free slots
     std::vector<uint64_t> scratch_blocks;
+    // Blocks holding inline configs larger than the request's buffer (fill_request): an inline
+    // callback reads its config from there, so after a detach they are freed only if no
+    // callback is still in flight (probe_close).
+    std::vector<uint64_t> config_blocks;
     // Live target threads + hardware-breakpoint state. HW probes set a debug
     // register on EVERY thread (and each new one), so there is no code to modify
     // and no re-arm race: exact under threads for any instruction, up to 4 slots.
@@ -307,6 +320,54 @@ struct probe_session {
 };
 
 static bool register_runtime_inline(probe_session *s, Probe &p);
+// A 32-bit (WOW64) controller's Get/SetThreadContext on a thread other than the one whose
+// event it is handling is an implicit suspend + resume INSIDE the call (ROADMAP L13): killed in
+// the middle of one, the controller leaves that thread suspended once with nothing of ours
+// recording it (the guard resumes the event threads, call threads and explicit holds only).
+// While such a call runs, the thread is listed among the guard's held threads -- after a
+// controller death it gets one resume, a no-op unless the call was in progress -- and it is
+// taken off again right after. x64 controllers have no implicit suspend: nothing to do.
+struct GuardTouch {
+#if !defined(_WIN64)
+    probe_agent_guard *g = nullptr;
+    LONG n = 0;
+    GuardTouch(const probe_session *s, DWORD tid);
+    ~GuardTouch() { if (g && g->held_count == n + 1) { MemoryBarrier(); g->held_count = n; } }
+#else
+    GuardTouch(const probe_session *, DWORD) {}
+#endif
+    GuardTouch(const GuardTouch &) = delete;
+    GuardTouch &operator=(const GuardTouch &) = delete;
+};
+#if !defined(_WIN64)
+GuardTouch::GuardTouch(const probe_session *s, DWORD tid) {
+    if (!s->attached || !s->shared || s->detached || !tid) return;
+    auto &gg = s->shared->guard;
+    const LONG count = gg.held_count;
+#if defined(UHH_TEST_HOOKS)
+    // Test-only (probe_api_testhooks): UHH_TEST_NO_TOUCH_GUARD=1 leaves the touch unrecorded
+    // (the control run of regress cxlib-touchkill-hw).
+    static const bool off = std::getenv("UHH_TEST_NO_TOUCH_GUARD") != nullptr;
+    if (off) {} else
+#endif
+    if (count >= 0 && count < (LONG)PROBE_AGENT_GUARD_TIDS) {
+        gg.held_tids[count] = tid;
+        MemoryBarrier();
+        gg.held_count = count + 1;
+        g = &gg; n = count;
+    }
+#if defined(UHH_TEST_HOOKS)
+    // UHH_TEST_DIE_IN_TOUCH=<tid>: at the first such call on that thread, do what the kernel
+    // does inside it (suspend the thread) and die there -- the WOW64 implicit-suspend window.
+    static const DWORD die_tid = [] { const char *v = std::getenv("UHH_TEST_DIE_IN_TOUCH"); return v ? (DWORD)std::strtoul(v, nullptr, 10) : 0u; }();
+    if (die_tid && tid == die_tid) {
+        if (HANDLE t = OpenThread(THREAD_SUSPEND_RESUME, FALSE, tid)) SuspendThread(t);
+        std::fflush(nullptr);
+        TerminateProcess(GetCurrentProcess(), 98);
+    }
+#endif
+}
+#endif
 static bool kick_agent(probe_session *s);
 static bool resolve_inline(probe_session *s, Probe &p, uint64_t base);
 static Probe *probe_at(probe_session *s, uint64_t address);
@@ -1785,6 +1846,7 @@ static uint8_t target_slots_any(const probe_session *s) {
     for (DWORD tid : s->threads) {
         HANDLE t = OpenThread(THREAD_GET_CONTEXT, FALSE, tid);
         CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        GuardTouch touch(s, tid);
         if (t && GetThreadContext(t, &c)) m |= target_slots(s, tid, c);
         if (t) CloseHandle(t);
     }
@@ -1824,7 +1886,8 @@ static void retire_hw_address(probe_session *s, uint64_t address) {
         auto &u = s->hw_unsettled[tid];
         CONTEXT now{}; now.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
         HANDLE t = OpenThread(THREAD_GET_CONTEXT, FALSE, tid);
-        const bool got = t && GetThreadContext(t, &now);
+        bool got;
+        { GuardTouch touch(s, tid); got = t && GetThreadContext(t, &now); }
         if (t) CloseHandle(t);
         if (got && u.have_regs && !same_thread_regs(u.regs, now)) u.addrs.clear();
         if (got && (!u.have_regs || u.addrs.empty())) { u.regs = now; u.have_regs = true; }
@@ -1880,6 +1943,25 @@ static void settle_hw_thread(probe_session *s, DWORD tid) {
 }
 
 static void arm_thread_start_fixup(probe_session *s);
+static void guard_sync(probe_session *s);
+#if defined(UHH_TEST_HOOKS)
+// Test-only build (probe_api_testhooks, never shipped): UHH_TEST_DIE_AFTER_ARM=n kills the
+// controller right after it writes its n-th user INT3 or arms its n-th hardware probe on the
+// target's threads -- a controller death at the worst instant for the agent's guard
+// (regress cxlib-killarm-*).
+// UHH_TEST_DIE_IN_REPCOPY=1: die right after continuing a thread into a displaced REP string
+// copy (it ends at an INT3 in our scratch; regress cxlib-reptail).
+static bool g_test_die_on_continue = false;
+static void test_note_repcopy() {
+    static const bool on = std::getenv("UHH_TEST_DIE_IN_REPCOPY") != nullptr;
+    if (on) g_test_die_on_continue = true;
+}
+static void test_die_after_arm() {
+    static const long n = [] { const char *v = std::getenv("UHH_TEST_DIE_AFTER_ARM"); return v ? std::atol(v) : 0L; }();
+    static long seen = 0;
+    if (n > 0 && ++seen == n) { std::fflush(nullptr); TerminateProcess(GetCurrentProcess(), 99); }
+}
+#endif
 static bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
     if (p.rva > UINT64_MAX - base) { set_error(s, "probe address overflow"); return false; }
     uint64_t address = base + p.rva;
@@ -1895,16 +1977,27 @@ static bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
     if (slot >= 0) s->dr_next = (uint8_t)((slot + 1) & 3);
     if (slot < 0) { set_error(s, "no free hardware breakpoint slot (max 4)"); return false; }
     uint32_t rw = 0, len = 0; hw_rw_len(p.flags, rw, len);
+    // The guard's DR mask gets the slot BEFORE any thread has it armed (as for an INT3, see
+    // arm_breakpoint): a controller killed in between left an enabled DR the guard took for
+    // the target's own -- never cleared, its #DB unhandled (0x80000004) at the next hit.
+    const uint8_t ever_before = s->dr_ever;
+    s->dr_ever |= (uint8_t)(1u << slot);
+    guard_sync(s);
     size_t tried = 0, set_ok = 0;
     for (DWORD tid : s->threads) {
         HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
         if (!t) continue;
         ++tried;
+        GuardTouch touch(s, tid);
         keep_queued_dr6(s, tid, t);
         if (set_dr_on_thread(t, slot, address, true, rw, len)) ++set_ok;
         CloseHandle(t);
     }
+#if defined(UHH_TEST_HOOKS)
+    if (set_ok && !p.internal) test_die_after_arm();
+#endif
     if (tried && !set_ok) {   // could not arm the DR on any thread -> the probe would never fire
+        s->dr_ever = ever_before; guard_sync(s);
         set_error(s, win_error("set hardware breakpoint on target threads")); return false;
     }
     s->dr_used |= (uint8_t)(1u << slot); s->dr_ever |= (uint8_t)(1u << slot); ++s->hw_active;
@@ -1970,12 +2063,25 @@ static bool arm_breakpoint(probe_session *s, Probe &p, uint64_t base) {
     p.orig_insn.assign(buf, buf + len);
     p.follow.assign(buf + 1, buf + sizeof(buf));
     p.insn_len = len; p.displaced_ok = disp_ok; p.riprel_disp_off = riprel; p.rep_string = rep_str;
+    // Published to the agent's INT3 table (the controller-death guard) BEFORE the byte is
+    // written: a controller killed right after the write left an INT3 neither the guard's VEH
+    // nor its cleanup knew -- the target died at its next execution (unhandled breakpoint).
+    // An entry whose byte is not (yet) 0xCC is harmless: the cleanup writes back the byte that
+    // is already there, an inline get_mem overlays only a 0xCC.
+    const uint64_t old_base = p.base, old_address = p.address;
+    const bool old_active = p.active;
+    p.base = base; p.address = address; p.active = true;
+    sync_int3_table(s);
+    guard_sync(s);
     if (!patch(s->pi.hProcess, address, 0xcc)) {
+        p.base = old_base; p.address = old_address; p.active = old_active;
+        sync_int3_table(s);
         set_error(s, win_error("arm software breakpoint")); return false;
     }
-    p.base = base; p.address = address; p.active = true;
+#if defined(UHH_TEST_HOOKS)
+    if (!p.internal) test_die_after_arm();
+#endif
     s->retired_bps.erase(address);
-    sync_int3_table(s);
     if (!p.internal || trace_enabled())       // library-owned probes are not the user's to see
         std::fprintf(stderr, "%s %s -> base=0x%llx addr=0x%llx (was 0x%02x, len=%u, %s)\n",
                      p.internal ? "  internal" : "probe: active", p.location.c_str(), (unsigned long long)base,
@@ -3000,7 +3106,16 @@ static void inplace_watchdog(probe_session *s) {
                              "(a call through that site meanwhile may be missed). Further cases are not reported.\n",
                      (unsigned long)s->inplace_owner);
     }
-    if (auto it = s->stepping.find(s->inplace_owner); it != s->stepping.end()) it->second.windowed = false;
+    if (auto it = s->stepping.find(s->inplace_owner); it != s->stepping.end()) {
+        if (it->second.refire) {
+            // A faulted instruction re-run without our trap flag did not fault again (the memory
+            // changed meanwhile): it ran on with the byte lifted. Arm the site again.
+            end_inplace_step(s, it->first, it->second.site);
+            s->stepping.erase(it);
+        } else {
+            it->second.windowed = false;
+        }
+    }
     inplace_release_all(s);
 }
 // After every debug event: the window lasts exactly as long as its owner's in-place step.
@@ -3083,6 +3198,7 @@ static void reapply_all_hw(probe_session *s) {
         uint32_t rw = 0, len = 0; hw_rw_len(p->flags, rw, len);
         for (DWORD tid : s->threads) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+            GuardTouch touch(s, tid);
             if (t) { keep_queued_dr6(s, tid, t); set_dr_on_thread(t, p->dr_slot, p->address, true, rw, len); CloseHandle(t); }
         }
     }
@@ -3357,7 +3473,8 @@ static bool open_agent_section(probe_session *s, uint32_t count) {
     s->shared->log_ipc = 1;                     // this debugger services PROBE_IPC_LOG (cleared before it leaves)
     // Benchmark-only knob (not API): compare inline extended-state handling strategies.
     if (const char *m = std::getenv("UHH_BENCH_XSTATE"))
-        s->shared->xstate_mode = !std::strcmp(m, "none") ? 1 : !std::strcmp(m, "full") ? 2 : 0;
+        s->shared->xstate_mode = !std::strcmp(m, "none") ? 1 : !std::strcmp(m, "full") ? 2 :
+                                 !std::strcmp(m, "noxsave") ? 3 : 0;   // 3: regress, a CPU without OSXSAVE
     if (s->attached) {          // the agent's guard waits on this handle (closes it itself)
         HANDLE dup = nullptr;
         if (DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), s->pi.hProcess, &dup, SYNCHRONIZE, FALSE, 0))
@@ -3371,7 +3488,7 @@ static bool open_agent_section(probe_session *s, uint32_t count) {
 }
 
 // A config larger than the request's inline buffer goes to a block allocated in the target
-// (freed at close), so an inline probe takes the same configs as a breakpoint/hw probe. If
+// (freed at close unless a callback may still read it), so an inline probe takes the same configs as a breakpoint/hw probe. If
 // that block cannot be made, config_remote stays 0 and the agent refuses the request.
 static void fill_request(probe_session *s, const Probe &p) {
     auto &request = s->shared->requests[p.agent_index]; request.flags = p.flags;
@@ -3386,7 +3503,7 @@ static void fill_request(probe_session *s, const Probe &p) {
     if (!mem) return;
     if (!remote_write(s->pi.hProcess, (uint64_t)(uintptr_t)mem, p.config.data(), p.config.size(), &wrote) ||
         wrote != p.config.size()) { VirtualFreeEx(s->pi.hProcess, mem, 0, MEM_RELEASE); return; }
-    s->scratch_blocks.push_back((uint64_t)(uintptr_t)mem);
+    s->config_blocks.push_back((uint64_t)(uintptr_t)mem);
     request.config_remote = (uint64_t)(uintptr_t)mem;
 }
 
@@ -3527,6 +3644,7 @@ static bool arm_gates_for_pending(probe_session *s) {
         const int slot = slots[i];
         for (DWORD tid : s->threads) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+            GuardTouch touch(s, tid);
             if (t) { keep_queued_dr6(s, tid, t); set_dr_on_thread(t, slot, sites[i], true); CloseHandle(t); }
         }
         s->dr_used |= (uint8_t)(1u << slot); s->dr_ever |= (uint8_t)(1u << slot);
@@ -3540,6 +3658,7 @@ static void clear_gates(probe_session *s) {
     for (auto &g : s->gates) {
         for (DWORD tid : s->threads) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+            GuardTouch touch(s, tid);
             if (t) { keep_queued_dr6(s, tid, t); set_dr_on_thread(t, g.second, 0, false); CloseHandle(t); }
         }
         s->dr_used &= (uint8_t)~(1u << g.second);
@@ -3900,6 +4019,7 @@ static void detach(probe_session *s) {
     for (auto &kv : s->stepping) {
         HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, kv.first);
         CONTEXT w{}; w.ContextFlags = CONTEXT_CONTROL;
+        GuardTouch touch(s, kv.first);
         if (t && GetThreadContext(t, &w)) {
 #if defined(_WIN64)
             uint64_t ip = w.Rip;
@@ -3927,6 +4047,7 @@ static void detach(probe_session *s) {
     std::string report_tids;
     for (HANDLE t : frozen) {
         CONTEXT w{}; w.ContextFlags = CONTEXT_DEBUG_REGISTERS | CONTEXT_CONTROL;
+        GuardTouch touch(s, GetThreadId(t));                 // (frozen handles carry query rights)
         BOOL got = FALSE; DWORD why = 0;
         for (int attempt = 0; attempt < 200 && !(got = GetThreadContext(t, &w)); ++attempt) {
             why = GetLastError();
@@ -4064,6 +4185,7 @@ static void release_hw(probe_session *s, Probe &p) {
     if (p.dr_slot < 0) return;
     for (DWORD tid : s->threads) {
         HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+        GuardTouch touch(s, tid);
         if (t) { keep_queued_dr6(s, tid, t); set_dr_on_thread(t, p.dr_slot, 0, false); CloseHandle(t); }
     }
     if (p.address) retire_hw_address(s, p.address);
@@ -4098,6 +4220,7 @@ static void ipc_freeze_thread(probe_session *s, DWORD tid) {
 // jumps back to site + patch_len.
 static void move_into_trampoline(probe_session *s, HANDLE t) {
     CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
+    GuardTouch touch(s, GetThreadId(t));
     if (!GetThreadContext(t, &c)) return;
 #if defined(_WIN64)
     uint64_t ip = c.Rip;
@@ -4432,8 +4555,34 @@ static void run_callback(probe_session *s, Probe *probe, probe_context *c) {
     const probe_regs before = c->regs;
     DWORD code = 0;
     if (seh_callback(probe->callback, c, &code)) return;
-    c->regs = before;                                   // no write-back, as inline
-    if (code == UHH_CALL_RELEASED) return;              // call_original ended the callback (see there)
+    if (code == UHH_CALL_RELEASED) { c->regs = before; return; }   // call_original ended the callback (see there)
+    // A faulting callback is a no-op: its register changes are discarded and a return_from it
+    // asked for is dropped (the hit falls through into the original) -- exactly as inline
+    // (agent.cpp call_mid). Unless call_original already RAN the original: falling through
+    // would run it a second time (a double free / double close), so the hooked function
+    // returns to its caller as with return_from -- return_from's value if one was set, else
+    // the original's own result (x86: EDX:EAX and the bytes its `ret N` popped) -- with
+    // everything else the original left (apply_return_from, CallbackState::faulted).
+    auto *st = static_cast<CallbackState *>(c->controller);
+    const bool ran = c->called_original && st && st->have_post;
+    const bool was_returned = c->returned != 0;
+    const uint64_t ax = was_returned ? c->regs.rax : ran ? (uint64_t)st->post.UHH_POST_AX : 0;
+    const uint64_t dx = was_returned ? c->regs.rdx : c->orig_edx;
+    c->regs = before;
+    c->returned = 0;
+    if (ran) {
+        bool ok = true;
+#if !defined(_WIN64)
+        if (!was_returned) {
+            if (c->orig_pop < 0 || c->orig_pop > 1020 || (c->orig_pop & 3)) ok = false;   // not measured: as inline
+            else c->ret_pop = (uint32_t)c->orig_pop;
+        }
+        if (ok) c->regs.rdx = dx;
+#else
+        (void)dx;
+#endif
+        if (ok) { c->regs.rax = ax; c->returned = 1; st->faulted = true; }
+    }
     if (!s->warned_cb_fault) {
         s->warned_cb_fault = true;
         std::fprintf(stderr, "probe: warning: callback for %s raised 0x%08lx; abandoned (hit counted, no register "
@@ -4493,7 +4642,7 @@ static bool apply_return_from(probe_session *s, Probe *probe, const probe_contex
         // ABI) and the volatile GPRs the callback did not set_reg after the call. x86 EDX is
         // already the original's unless return_from set a high half (probe_x86_return_regs).
         const CONTEXT &a = st->post;
-#define UHH_KEEP(f, r) if (c.regs.r == st->post_seen.r) native.f = a.f;
+#define UHH_KEEP(f, r) if (st->faulted || c.regs.r == st->post_seen.r) native.f = a.f;
 #if defined(_WIN64)
         UHH_KEEP(Rcx, rcx) UHH_KEEP(Rdx, rdx) UHH_KEEP(R8, r8) UHH_KEEP(R9, r9) UHH_KEEP(R10, r10) UHH_KEEP(R11, r11)
         native.FltSave = a.FltSave; native.MxCsr = a.MxCsr;
@@ -4872,6 +5021,14 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     if (code == PROBE_IPC_CODE && handle_ipc(s, event)) { disposition = DBG_CONTINUE; return true; }
     auto step = stepping.find(event.dwThreadId);
     uint64_t address = (uint64_t)(uintptr_t)ex.ExceptionAddress;
+    if (step != stepping.end() && step->second.refire &&
+        (address != step->second.site || code == EXCEPTION_BREAKPOINT || code == EXCEPTION_SINGLE_STEP)) {
+        // A faulted instruction re-run without our trap flag (see refire) that did NOT fault
+        // again: the thread ran on with the byte lifted. Arm the site again; this event is new.
+        end_inplace_step(s, event.dwThreadId, step->second.site);
+        stepping.erase(step);
+        step = stepping.end();
+    }
     bool restart = false;            // this INT3 is a faulted in-place step restarting (see refault)
     if (auto rf = s->refault.find(event.dwThreadId); rf != s->refault.end() && step == stepping.end()) {
         const uint64_t site = rf->second.site;
@@ -4881,15 +5038,12 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             CONTEXT w{}; w.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
             const bool got = t && GetThreadContext(t, &w);
             const bool tf = got && (w.EFlags & 0x100u);
-#if defined(_WIN64)
-            const bool same = false;       // x64: our trap flag in the restored context marks the restart
-#else
-            // WOW64 (x86): the handler's context comes back WITHOUT our trap flag. The fault was
-            // dispatched to the program, and this is the thread's next event: an INT3 at the
-            // site is its handler retrying the same execution, whatever registers it changed to
-            // repair the fault (comparing them took a repaired retry for a new hit: 2 callbacks).
+            // The fault reached the program WITHOUT our trap flag (the in-place step re-runs a
+            // faulting instruction without it; WOW64 drops it anyway), and this is the thread's
+            // next event: an INT3 at the site is its handler retrying the same execution,
+            // whatever registers it changed to repair the fault (comparing them took a repaired
+            // retry for a new hit: 2 callbacks).
             const bool same = true;
-#endif
             if ((tf || same) && code == EXCEPTION_BREAKPOINT && address == site) {
                 restart = true;                            // same execution: no new hit
             } else if (tf && code == EXCEPTION_SINGLE_STEP) {
@@ -5046,13 +5200,40 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         // later stray single-step can't teleport it to site+insn_len; re-arm the byte
         // if the step was in-place. Pass the exception through unchanged.
         if (step != stepping.end()) {
+            if (!step->second.displaced && event.u.Exception.dwFirstChance && address == step->second.site &&
+                code != EXCEPTION_BREAKPOINT && step->second.windowed && !step->second.refire && !step->second.prog_tf) {
+                // The instruction faulted during its in-place step: the kernel hands the program's
+                // handler the context AS IT FAULTED -- with OUR trap flag (x64; WOW64 drops it),
+                // which the program must never see. Swallow this one and run the instruction once
+                // more without the flag (byte still lifted, window still held): it faults again,
+                // and THAT fault, with the program's own flags, is the one passed on (below). A
+                // guard page the faulting access consumed is put back first. Should the re-run
+                // not fault after all, the window's watchdog re-arms the site (inplace_watchdog).
+                HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
+                CONTEXT w{}; w.ContextFlags = CONTEXT_CONTROL;
+                if (t && GetThreadContext(t, &w) && (w.EFlags & 0x100u) && (uint64_t)EMU_IP(w) == address) {
+                    if (code == STATUS_GUARD_PAGE_VIOLATION && ex.NumberParameters >= 2) {
+                        MEMORY_BASIC_INFORMATION m{};
+                        void *page = (void *)(uintptr_t)ex.ExceptionInformation[1];
+                        DWORD old = 0;
+                        if (VirtualQueryEx(s->pi.hProcess, page, &m, sizeof(m)) && m.State == MEM_COMMIT && !(m.Protect & PAGE_GUARD))
+                            VirtualProtectEx(s->pi.hProcess, page, 1, m.Protect | PAGE_GUARD, &old);
+                    }
+                    w.EFlags &= ~0x100u;
+                    if (SetThreadContext(t, &w)) {
+                        CloseHandle(t);
+                        step->second.refire = true;
+                        disposition = DBG_CONTINUE; return true;
+                    }
+                }
+                if (t) CloseHandle(t);
+            }
             if (!step->second.displaced) {
                 end_inplace_step(s, event.dwThreadId, step->second.site);
                 // The instruction itself raised during its in-place step (e.g. the re-run of a
-                // faulting displaced copy): the program's handler gets it with our trap flag set
-                // in its context. Remember it, to tell a restart of this same execution (the
-                // handler continues at the site: the INT3 again, TF set) from a new hit, and to
-                // absorb the single stray step if the handler continues elsewhere.
+                // faulting displaced copy; re-run once more without our trap flag, above).
+                // Remember it, to tell a restart of this same execution (the handler continues
+                // at the site: the INT3 again) from a new hit.
                 if (event.u.Exception.dwFirstChance && address == step->second.site) {
                     probe_session::Refault rf; rf.site = step->second.site;
                     s->refault[event.dwThreadId] = rf;
@@ -5340,10 +5521,14 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     const bool is_syscall = probe->orig_insn.size() == 2 && probe->orig_insn[0] == 0x0F && probe->orig_insn[1] == 0x05;
     StepState st{probe, displaced, probe->address, probe->insn_len, displaced ? scratch_addr : 0,
                  tail, probe->rep_string, is_syscall};
+    st.prog_tf = prog_tf;          // (also kept for a displaced copy that faults and re-runs in place)
+#if defined(UHH_TEST_HOOKS)
+    if (tail && !probe->internal) test_note_repcopy();
+#endif
     if (!displaced) {
         bool pushf = false, may_block = false;
         site_traits(*probe, pushf, may_block);
-        st.pushf_insn = pushf; st.prog_tf = prog_tf;
+        st.pushf_insn = pushf;
         st.windowed = !may_block;
         if (st.windowed) inplace_begin(s, event.dwThreadId);    // the byte is lifted: hold every other thread
     }
@@ -5671,11 +5856,32 @@ static void drain_final(probe_session *s) {
     sh->log_tail = head;
 }
 
+// How many in-flight inline callbacks can still finish (probe_agent_shared::live_query),
+// answered by the agent's service thread. False: no answer (no service thread, or it cannot
+// run) -- the caller falls back to a bounded wait.
+static bool query_live_callbacks(probe_session *s, LONG &live) {
+    if (!s->svc_event || !s->shared) return false;
+    auto *sh = s->shared;
+    const LONG seq = sh->live_seq;
+    InterlockedExchange(&sh->live_query, 1);
+    SetEvent(s->svc_event);
+    for (ULONGLONG until = GetTickCount64() + 1000; GetTickCount64() < until; Sleep(1)) {
+        MemoryBarrier();
+        if (sh->live_seq != seq) { MemoryBarrier(); live = sh->live_callbacks; return true; }
+    }
+    return false;
+}
+
 static void stop_drainer(probe_session *s) {
     // Detached from a live target: its hooks are gone, but a callback that was already running
     // (e.g. blocked in call_original longer than the agent's 2 s unhook wait) may still log.
-    // Keep draining until none is in flight (bounded) BEFORE telling producers nobody listens,
-    // so its logs are delivered rather than dropped.
+    // Keep draining BEFORE telling producers nobody listens, so its logs are delivered rather
+    // than dropped -- for as long as any in-flight callback can still finish (no time bound: a
+    // slow detach is reported, never cut short). Callbacks that cannot finish now -- their
+    // thread is gone, or suspended by the program, or left through a non-unwinding longjmp --
+    // are not waited for: they stay counted in flight (the detach summary's in_flight), and a
+    // log one sends if the program resumes it later is counted dropped in the target. Without
+    // an answer from the agent (no service thread) the wait is bounded (15 s), as before.
     if (s->shared && !s->exited && s->drainer.joinable()) {
         MemoryBarrier();
         if (const uint64_t running = probe_agent_inflight(s->shared))
@@ -5683,9 +5889,39 @@ static void stop_drainer(probe_session *s) {
                          s->detached_hooks ? "detach" : "close", (unsigned long long)running);
     }
     if (s->shared && s->detached_hooks && !s->exited && s->drainer.joinable()) {
-        for (ULONGLONG until = GetTickCount64() + 15000; GetTickCount64() < until; Sleep(5)) {
+        const ULONGLONG start = GetTickCount64();
+        ULONGLONG next_note = start + 15000;
+        int idle_answers = 0;
+        ULONGLONG last_answer = start;
+        for (;;) {
             MemoryBarrier();
-            if (!probe_agent_inflight(s->shared) && s->shared->log_head == s->shared->log_tail) break;
+            const uint64_t inflight = probe_agent_inflight(s->shared);
+            if (!inflight && s->shared->log_head == s->shared->log_tail) break;
+            const ULONGLONG now = GetTickCount64();
+            if (inflight) {
+                LONG live = 0;
+                if (query_live_callbacks(s, live)) {
+                    last_answer = GetTickCount64();
+                    // Three answers in a row (~50 ms apart): a callback between its in-flight
+                    // count and its record (nanoseconds) is not missed.
+                    if (live > 0) idle_answers = 0;
+                    else if (++idle_answers >= 3) {
+                        std::fprintf(stderr, "probe: detach: %llu callback(s) cannot finish now (thread gone or suspended); "
+                                             "not waiting for them\n", (unsigned long long)inflight);
+                        break;
+                    }
+                } else if (now - last_answer >= 15000) {
+                    break;                                      // nobody answers (any more): the old bound
+                }
+            } else if (now - start >= 15000) {
+                break;                                          // ring not empty with nothing in flight
+            }
+            if (now >= next_note) {
+                next_note += 15000;
+                std::fprintf(stderr, "probe: detach: still waiting for %llu running callback(s) to finish (%llus)\n",
+                             (unsigned long long)inflight, (unsigned long long)((now - start) / 1000));
+            }
+            Sleep(inflight ? 50 : 5);
         }
     }
     if (s->shared) {
@@ -5989,6 +6225,9 @@ extern "C" int probe_run(probe_session *s) {
         if (!ContinueDebugEvent(event.dwProcessId, event.dwThreadId, disposition)) {
             set_error(s, win_error("continue debug event")); ok = false;
         }
+#if defined(UHH_TEST_HOOKS)
+        if (g_test_die_on_continue) { std::fflush(nullptr); TerminateProcess(GetCurrentProcess(), 97); }
+#endif
         if (!ok) break;
     }
     // An attached target is still running and the loop is leaving for some other reason
@@ -6142,8 +6381,18 @@ extern "C" void probe_close(probe_session *s) {
                      (unsigned long long)(s->shared ? probe_agent_inflight(s->shared) : 0));
     }
     inplace_release_all(s);
-    if (s->pi.hProcess)
+    if (s->pi.hProcess) {
         for (uint64_t b : s->scratch_blocks) VirtualFreeEx(s->pi.hProcess, (void *)(uintptr_t)b, 0, MEM_RELEASE);
+        // A config block stays in a detached target while any inline callback is still in flight
+        // there (its thread suspended by the program, or past the drain): that callback's
+        // get_config points into it. Freed, it read freed (or reused) memory.
+        const uint64_t left = s->detached && !s->exited && s->shared ? probe_agent_inflight(s->shared) : 0;
+        if (left && !s->config_blocks.empty())
+            std::fprintf(stderr, "probe: detach: %zu config block(s) left in the target for %llu callback(s) still in flight\n",
+                         s->config_blocks.size(), (unsigned long long)left);
+        else
+            for (uint64_t b : s->config_blocks) VirtualFreeEx(s->pi.hProcess, (void *)(uintptr_t)b, 0, MEM_RELEASE);
+    }
     if (s->sym_ready) uhh_sym::cleanup(s->pi.hProcess);
     if (s->remote_thread) CloseHandle(s->remote_thread);
     if (s->svc_event) CloseHandle(s->svc_event);

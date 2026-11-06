@@ -19,6 +19,7 @@ static volatile long g_sink;
 
 extern "C" intptr_t CoMidPush(intptr_t a);
 extern "C" intptr_t CoCallPrologue(intptr_t a, intptr_t *out);
+extern "C" void CoRepFill(void *dst, size_t n, int v);
 #if !defined(_WIN64)
 extern "C" int CoThis(void);             // __thiscall, called from inline asm only
 #endif
@@ -56,6 +57,15 @@ CO_EXPORT intptr_t co_inner(intptr_t x) { g_body++; return x * 2; }
 CO_EXPORT intptr_t co_outer(intptr_t x) { g_body++; return co_inner(x) + 1; }
 CO_EXPORT intptr_t co_slow(intptr_t x) { g_body++; Sleep(250); return x * 13; }
 CO_EXPORT intptr_t co_vslow(intptr_t x) { g_body++; Sleep(5600); return x * 17; }   // past the 5 s call limit
+// Codex library review (regress `cxlib-*`): a callback that faults after call_original /
+// return_from (cbfault), and one still running long after a detach started (late, cfgfree).
+static volatile long g_cbf_runs[9];      // cbfault: body runs per call (by its first argument)
+CO_EXPORT intptr_t co_cbf(intptr_t a, intptr_t b) {
+    g_body++;
+    if (a >= 0 && a < 9) g_cbf_runs[a]++;
+    return a * 3 + b;
+}
+CO_EXPORT intptr_t co_late(volatile LONG *state, intptr_t x) { g_body++; (void)state; return x + 1; }
 
 static void after3(intptr_t &after) { for (int i = 0; i < 3; ++i) after += co_after(i); }
 
@@ -72,9 +82,43 @@ static intptr_t jump_call(intptr_t x, int *jumped) {
 }
 
 static int wait_gate() {
-    printf("{\"kind\":\"waiting\",\"pid\":%lu}\n", GetCurrentProcessId()); fflush(stdout);
+    printf("{\"kind\":\"waiting\",\"pid\":%lu,\"tid\":%lu}\n", GetCurrentProcessId(), GetCurrentThreadId()); fflush(stdout);
     char b; DWORD n = 0;
     return ReadFile(GetStdHandle(STD_INPUT_HANDLE), &b, 1, &n, nullptr) && n == 1;
+}
+
+// late / cfgfree: a thread calls co_late; its callback marks state 1 and waits until the
+// target sets state 2. late: state 2 comes 19 s later (longer than the 2 s agent wait + the
+// 15 s drain a detach used to allow). cfgfree: the thread is SUSPENDED by the program while in
+// the callback, the test detaches, then sends one more byte: state 2, the thread resumed.
+struct LateArg { volatile LONG state; intptr_t ret; };
+static DWORD WINAPI late_thread(void *p) {
+    auto *a = static_cast<LateArg *>(p);
+    a->ret = co_late(&a->state, 7);
+    return 0;
+}
+static int run_late(const char *k) {
+    const bool suspend = !strcmp(k, "cfgfree");
+    LateArg arg{0, 0};
+    HANDLE th = CreateThread(nullptr, 0, late_thread, &arg, 0, nullptr);
+    if (!th) return 4;
+    for (int i = 0; i < 12000 && arg.state == 0; ++i) Sleep(5);          // the callback has started
+    const LONG seen = arg.state;
+    if (suspend && seen) SuspendThread(th);
+    printf("{\"kind\":\"incb\",\"state\":%ld}\n", (long)seen); fflush(stdout);
+    if (suspend) {
+        char b; DWORD n = 0;
+        ReadFile(GetStdHandle(STD_INPUT_HANDLE), &b, 1, &n, nullptr);    // after the detach
+    } else if (seen) {
+        Sleep(19000);
+    }
+    InterlockedExchange(&arg.state, 2);
+    if (suspend && seen) ResumeThread(th);
+    const DWORD w = WaitForSingleObject(th, 60000);
+    printf("{\"kind\":\"co\",\"case\":\"%s\",\"ret\":%lld,\"body\":%ld,\"done\":%d}\n", k,
+           (long long)arg.ret, g_body.load(), w == WAIT_OBJECT_0);
+    fflush(stdout);
+    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -169,6 +213,31 @@ int main(int argc, char **argv) {
         after3(after);
         printf("{\"kind\":\"co\",\"case\":\"vslow\",\"sum\":%lld,\"body\":%ld,\"after\":%lld}\n",
                (long long)sum, g_body.load(), (long long)after);
+    } else if (!strcmp(k, "cbfault")) {
+        char rets[256] = "", runs[16] = "";
+        for (int i = 0; i < 9; ++i) {
+            const intptr_t r = co_cbf(i, 5);
+            sum += r;
+            snprintf(rets + strlen(rets), sizeof(rets) - strlen(rets), "%s%lld", i ? "," : "", (long long)r);
+        }
+        for (int i = 0; i < 9; ++i) runs[i] = (char)('0' + (g_cbf_runs[i] > 9 ? 9 : g_cbf_runs[i]));
+        printf("{\"kind\":\"co\",\"case\":\"cbfault\",\"sum\":%lld,\"body\":%ld,\"rets\":[%s],\"runs\":\"%s\"}\n",
+               (long long)sum, g_body.load(), rets, runs);
+    } else if (!strcmp(k, "late") || !strcmp(k, "cfgfree")) {
+        return run_late(k);
+    } else if (!strcmp(k, "rep")) {                  // cxlib-reptail: big rep stosb fills, verified
+        const size_t n = 64u << 20;
+        unsigned char *b = (unsigned char *)VirtualAlloc(nullptr, n, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!b) return 4;
+        long good = 0;
+        for (int i = 0; i < 8; ++i) {
+            CoRepFill(b, n, 0x30 + i);
+            good += b[0] == 0x30 + i && b[n / 2] == 0x30 + i && b[n - 1] == 0x30 + i;
+        }
+        printf("{\"kind\":\"co\",\"case\":\"rep\",\"good\":%ld}\n", good);
+    } else if (!strcmp(k, "spin")) {                 // attached after its gate (cxlib-killarm)
+        for (int i = 0; i < 200; ++i) { sum += co_add(i, 5); Sleep(1); }
+        printf("{\"kind\":\"co\",\"case\":\"spin\",\"sum\":%lld,\"body\":%ld}\n", (long long)sum, g_body.load());
     } else if (!strcmp(k, "slow")) {
         for (int i = 0; i < 12; ++i) sum += co_slow(i);
         printf("{\"kind\":\"co\",\"case\":\"slow\",\"sum\":%lld,\"body\":%ld}\n", (long long)sum, g_body.load());

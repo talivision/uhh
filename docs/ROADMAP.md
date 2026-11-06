@@ -661,7 +661,8 @@ Fixture `examples/ctrlreview` (ctrl_target + ctrl_dll + ONE callback source), re
   continues elsewhere the one stray trap of our TF is absorbed. A WOW64 (x86) handler's context comes back
   WITHOUT our TF (x86 had 400 hits for 200 with the TF test alone): there the restart is the next INT3 at
   the site with every integer register, SP and the arithmetic flags unchanged since the fault.
-  📄 x64: the handler's ContextRecord shows our TF (the restart marker; it was visible before too).
+  ~~📄 x64: the handler's ContextRecord shows our TF (the restart marker; it was visible before too).~~
+  Fixed 2026-11-06 (Codex library review, below): the handler never sees our TF on any backend.
   📄 x86: a NEW call that reaches the site with exactly the faulting registers right after the handler
   unwound would be taken for the restart (not seen; needs identical registers incl. SP). hw and inline were
   already exact. Test: `ctrl-fault-{breakpoint,hw,inline}`
@@ -1054,7 +1055,8 @@ by itself, nothing dropped), detach while callbacks run / block in call_original
   `lifecycle-install-stuck-{inline,mixed}`
 - ✅ (L9) Logs of inline callbacks still running at detach (longer than the agent's 2 s unhook
   wait) were dropped (controller_gone set at once). The controller now keeps draining until no
-  callback is in flight (bounded 15 s) before telling producers nobody listens.
+  callback is in flight (bounded 15 s) before telling producers nobody listens. (Since the Codex
+  library review: unbounded while a callback can still finish -- see there, finding 4.)
   `lifecycle-detach-longcb-*`
 - ✅ (L10) The debug register a breakpoint/hw call_original borrows to catch the return was not
   counted as ours: the detach's final pass and the guard did not clear it (x86: its address stayed
@@ -1110,8 +1112,8 @@ by itself, nothing dropped), detach while callbacks run / block in call_original
   is published to the guard BEFORE the suspension (guard_note_hold), incl. detach's own freeze.
   Defensive, same commit: after the controller process ends, the agent polls (10 ms, <= 30 s) for
   its debug port to go instead of waiting for a trap to wake it. x86 bp+hw 10/10 (was 8 of 16
-  failing). Residual: a WOW64 implicit suspend of a thread that is neither the event's nor the
-  call's (e.g. arming a hardware probe on every thread) is not covered; the guard's extra
+  failing). Residual (closed by the Codex library review, see there): a WOW64 implicit suspend of a
+  thread that is neither the event's nor the call's (e.g. arming a hardware probe on every thread) was not covered; the guard's extra
   resume can undo a suspension the PROGRAM made of one of those threads at that instant.
 - Merge verification (2026-11-06, VM, after L12/L13): `--only lifecycle,interrupt,attach,gated,detach,
   transparency,callorig,callfunc` 151/151 on x64 and 151/151 on x86; L11
@@ -1126,6 +1128,85 @@ by itself, nothing dropped), detach while callbacks run / block in call_original
   longer raises the FREEZE IPC with no debugger attached (it went to the program's own VEHs as a
   stray 0xE0554848): it freezes in-process directly. The 65536-INT3 limit applies, as
   documented, only alongside inline probes (an attach's channel no longer implies it).
+
+## Codex library review findings (2026-11-06, merge-frida vs main, regress `cxlib-*`)
+A read-only Codex review of every library change since the last release reported 5 bugs (static
+reading only, all "high confidence"). Each was checked against the code and reproduced by a check
+that FAILED on the unfixed code (commit 6e06b7b: the checks + test hooks only) before the fix.
+Fixtures: new `examples/hunt_callorig` cases (`cbfault`, `late`, `cfgfree`, `spin`, `rep`) and
+`co_driver_th` = co_driver linked with `probe_api_testhooks`, a TEST-ONLY build of the controller
+(`UHH_TEST_HOOKS`: fault-injection points such as "the controller dies right after writing an
+INT3"); nothing shipped links it. `--only cxlib`.
+- ✅ (1) **Real.** A breakpoint/hw callback that faulted after `call_original` was recovered by restoring
+  the registers only: the hit fell through and ran the original a SECOND time (fault after call_original
+  without return_from), or returned the hit's entry AX (fault after return_from); a faulting callback that
+  had called return_from without call_original returned entry AX instead of being a no-op. Reproduced:
+  `cxlib-cbfault-{breakpoint,hw}` rets=[5, 1, 2, 14, 3, 2, ...] body runs per call `210210210` (want every
+  call's own result, +1000 after return_from, `111111111`); inline was already exact. Now identical to
+  inline (run_callback): after call_original the hit returns to its caller with return_from's value if one
+  was set, else the original's result (x86: EDX:EAX and its measured `ret N`), plus every volatile register
+  and the FP state the original left; otherwise the fault drops the return_from and the original runs once.
+  `cxlib-cbfault-*` 3/3 on x64 and x86.
+- ✅ (2) **Real.** probe_close freed the target block of an oversized (> 256 B) inline config even with a
+  callback still in flight (thread suspended by the program across the detach, or running past the drain):
+  its get_config then read freed memory (the callback faulted and was abandoned; the hit fell through).
+  Reproduced: `cxlib-cfgfree-inline` / `cxlib-late-inline` target ret=8 (the original's) instead of the
+  config checksum. Config blocks now have their own list and stay in a detached target while any callback
+  is in flight (stderr says so: a deliberate, bounded leak, one block per oversized inline config).
+- ✅ (3) **Real.** arm_breakpoint wrote the INT3 and only then published it to the guard's INT3 table; arm_hw
+  set the DR on every thread before the slot joined the guard's DR mask. Reproduced with the test-hook build
+  killing the controller right after the write (`UHH_TEST_DIE_AFTER_ARM=1`): the target died at its next
+  call, 0x80000003 (`cxlib-killarm-breakpoint`) / 0x80000004 (`cxlib-killarm-hw`), x64 and x86. Now both are
+  published (and the guard enabled) BEFORE the write; a failed write is unpublished. Also found: the end of a
+  displaced REP string copy is an INT3 in our scratch (no trap flag) the guard did not know -- a controller
+  death with a thread inside such a copy killed the target; the guard's VEH now steps over an INT3 in our
+  scratch blocks to the copy's jump back (`cxlib-reptail-breakpoint`, test hook `UHH_TEST_DIE_IN_REPCOPY`).
+- ✅ (4) **Real**, and worse than reported. The drain after a live-controller detach gave up after 15 s
+  with callbacks still running (their later logs dropped), and in practice even sooner: the agent's stop
+  waited `2000 x Sleep(1)` -- ~31 s at the default timer, not 2 s -- so a callback running past the
+  controller's 5 s wait for the stop thread made the detach skip the drain altogether. Reproduced:
+  `cxlib-late-inline` (a callback logging 19 s into the detach): late log delivered=0, summary in_flight=1.
+  Design that does not drop: the drain asks the agent (protocol v20: `live_query` / `live_callbacks`,
+  answered by its service thread) how many in-flight callbacks can still finish -- thread alive, not
+  suspended, still inside its callback (its record's frame on the stack, canary intact) -- and keeps
+  delivering for as long as any can, with no time bound (progress on stderr every 15 s; a slow detach is
+  reported, never cut short). The agent's stop waits 2 s of wall time. 📄 Not waited for, by design: a
+  callback whose thread is dead, suspended by the program (`cxlib-cfgfree-inline`: the detach takes ~2 s,
+  in_flight=1) or left through a non-unwinding longjmp; it stays counted in flight (detach summary
+  `in_flight`), and a log it sends if the program resumes it after the detach is counted dropped in the
+  target (nobody can receive it). Without an answer from the agent (no service thread) the old 15 s bound
+  applies. A callback that never returns (deadlocked) now keeps the detach waiting.
+- ✅ (5) **Real** (x86 only: x64 callbacks use no x87). Without OSXSAVE the inline hit saved MXCSR only; a
+  callback's float work (x86 returns floats in ST0) changed a live x87 stack / status word at a
+  mid-function site. Reproduced on the VM's OSXSAVE CPU with the knob `UHH_BENCH_XSTATE=noxsave` (xstate_mode
+  3: the no-XSAVE fallback; the AVX state this CPU has is still kept by XSAVE, since a CPU without OSXSAVE has
+  none): x86 `cxlib-noxsave-inline` bad=30 `first='mid iter 0: x87 ...'` (transparency `mid` with a full x87
+  stack, callbacks doing float math). The fallback now FXSAVEs/FXRSTORs (x87 + MXCSR) around the callback.
+  The knob is an env var like the existing `none`/`full`/`amx` bench knobs (inert unless set).
+- ✅ (TF, from the Codex test review) The breakpoint backend let the program's own handler see UHH's trap
+  flag: an instruction faulting during its in-place step reached the program with the context as it
+  faulted (x64; WOW64 drops TF). `ctrl-fault-*` / `cdx-faultreg-*` now require tf == 0 on every backend;
+  x64 breakpoint failed (tf_in_handler=200 of 200). Now that fault is swallowed once and the instruction
+  re-run without our flag (byte still lifted, window held, a consumed guard page re-armed): its second
+  fault, with the program's own flags, is passed on. A re-run that does not fault again re-arms the site at
+  the thread's next event or by the window watchdog. The restart is recognised as on x86 (the thread's next
+  event is the INT3 at the site). 📄 x64 now shares x86's residual: a handler that continues ELSEWHERE and
+  whose thread's very next event is a new call at the same site is taken for the restart (no callback).
+- ✅ (L13 residual) x86 controller: a WOW64 Get/SetThreadContext on a thread that is neither the event's nor
+  the call's (arming/releasing a hw probe on every thread, gates, the detach fix-ups, moving a frozen thread
+  into a trampoline) is an implicit suspend; killed inside it, the controller left that thread suspended.
+  Each such call now lists the thread in the guard's held list for its duration (GuardTouch).
+  `cxlib-touchkill-hw` (x86; SKIP on x64) simulates it in the test-hook build (the controller suspends the
+  target's main thread at its first touch and dies); a control run without the record leaves the target
+  hung.
+- Verification (2026-11-06, VM). Before (6e06b7b, checks only), x64 and x86: cbfault-{breakpoint,hw}, late,
+  cfgfree, killarm-{breakpoint,hw}, noxsave FAIL (x64 noxsave failed on YMM: the knob's first version broke
+  the AVX state itself; fixed in 4c0e61c, the x86 run failed on x87 as intended); ctrl-fault-breakpoint /
+  cdx-faultreg-breakpoint FAIL on x64 only (tf_in_handler=200; WOW64 drops TF). A second snapshot with only
+  the REP-tail rule and the FXSAVE fallback reverted: reptail FAIL (0x80000003) on both, x86 noxsave FAIL
+  (x87 SW/TW 0041/c000 vs 0000/0000). After (9aef7c1): `--only cxlib,ctrl-review,cdx-review` 38/38 + 1 SKIP
+  (touchkill: x86 only) on x64 (cxlib 9/9 on the final build), 39/39 on x86; `--only callorig,lifecycle,
+  detach,interrupt,conformance,transparency,agent_review,gated` 146/146 on x64 and 146/146 on x86.
 
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`
