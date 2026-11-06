@@ -1,6 +1,7 @@
 // probe_app: the target the gated_config and attach examples instrument.
 //
 //   probe_app [--helpers N] [--threads W] [--reads R] [--pace P] [--prehook] [--config k=v;...] [--no-wait]
+//             [--until-key]
 //
 // 1. Spawn N helper processes (probe_app --helper). Each holds the same known 256-byte
 //    buffer (byte j == j) at the same address and prints nothing; probe_app prints one
@@ -20,6 +21,11 @@
 // --pace P caps each read thread at about P reads per second (it sleeps when ahead of
 // schedule), so a long soak (scripts/soak.py) runs at a steady, sustainable rate for as long
 // as R / P seconds. Pacing changes only the timing: the reads, and the checksum, are the same.
+//
+// --until-key repeats the read phase (W x R reads, the same pattern each round) until a second
+// byte/keystroke arrives on stdin after the gate, so a test can keep the threads reading for
+// as long as it needs regardless of machine speed. The app line reports "rounds"; the reads
+// and the checksum are exactly rounds x one round's.
 //
 // Read pattern (deterministic, so a filter on one pid + one address range selects an
 // exactly predictable count): global read i = t*R + k (thread t, its k-th read) reads
@@ -260,7 +266,7 @@ int main(int argc, char **argv) try {
     size_t helper_count = 4, threads = std::thread::hardware_concurrency();
     uint64_t reads = 1000;
     uint64_t decoy_opens = 0;
-    bool existing_hook = false, wait = true;
+    bool existing_hook = false, wait = true, until_key = false;
     std::string config = "reads_enabled=0\n";   // shipped config: the feature is OFF
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -272,10 +278,11 @@ int main(int argc, char **argv) try {
         else if (a == "--prehook") existing_hook = true;
         else if (a == "--config") { config = next(); for (auto &c : config) if (c == ';') c = '\n'; }
         else if (a == "--no-wait") wait = false;
+        else if (a == "--until-key") until_key = true;
         else if (a == "--decoy-opens") decoy_opens = _strtoui64(next(), nullptr, 10);
         else if (a == "--open-via") g_open_kernel32 = std::string(next()) == "kernel32";
         else throw std::runtime_error("usage: probe_app [--helpers N] [--threads W] [--reads R] [--pace P] [--prehook] "
-                                      "[--config k=v;...] [--no-wait] [--decoy-opens N]");
+                                      "[--config k=v;...] [--no-wait] [--until-key] [--decoy-opens N]");
     }
     require(helper_count >= 1 && helper_count <= 64 && threads >= 1 && threads <= 256 &&
             reads >= 1 && reads <= 1000000000ULL, "helper/thread/read counts");
@@ -315,6 +322,7 @@ int main(int argc, char **argv) try {
     // 4. The gated feature: open the helpers by PID and read them.
     std::vector<ThreadResult> results;
     double elapsed_ns = 0;
+    uint64_t success = 0, checksum = 0, rounds = 0;
     if (parsed.reads_enabled) {
         // --decoy-opens: open (and close) ourselves N times first through the same stub, so
         // an open-tracking map sees many opens -- and reused handle values -- before the
@@ -330,10 +338,14 @@ int main(int argc, char **argv) try {
             std::printf("{\"kind\":\"opened\",\"pid\":%lu,\"handle\":%llu}\n", h.hello.pid,
                         (unsigned long long)(uintptr_t)h.read_handle);
         std::fflush(stdout);
-        elapsed_ns = run_reads(helpers, threads, reads, results);
+        static std::atomic<bool> key_pressed{false};
+        if (until_key) std::thread([] { wait_for_key(); key_pressed.store(true); }).detach();   // EOF stops too
+        do {
+            elapsed_ns += run_reads(helpers, threads, reads, results);
+            ++rounds;
+            for (auto &r : results) { require(r.error.empty(), r.error); success += r.success; checksum += r.checksum; }
+        } while (until_key && !key_pressed.load());
     }
-    uint64_t success = 0, checksum = 0;
-    for (auto &r : results) { require(r.error.empty(), r.error); success += r.success; checksum += r.checksum; }
     uint64_t hook_calls = prehook_calls.load();
     prehook.reset();
     // CET: RDSSP reads the shadow-stack pointer, and is a NOP (leaves 0) when this thread
@@ -346,12 +358,12 @@ int main(int argc, char **argv) try {
 #endif
     std::printf("{\"kind\":\"app\",\"reads_enabled\":%u,\"helpers\":%llu,\"opened\":%llu,\"threads\":%llu,"
                 "\"reads_per_thread\":%llu,\"successful_reads\":%llu,\"checksum\":%llu,\"elapsed_ns\":%.0f,"
-                "\"prehook\":%s,\"prehook_calls\":%llu,\"configparse_base\":%llu,\"shadow_stack\":%s}\n",
+                "\"prehook\":%s,\"prehook_calls\":%llu,\"configparse_base\":%llu,\"shadow_stack\":%s,\"rounds\":%llu}\n",
                 parsed.reads_enabled, (unsigned long long)helper_count,
                 (unsigned long long)(parsed.reads_enabled ? helper_count : 0), (unsigned long long)threads,
                 (unsigned long long)reads, (unsigned long long)success, (unsigned long long)checksum, elapsed_ns,
                 existing_hook ? "true" : "false", (unsigned long long)hook_calls,
-                (unsigned long long)(uintptr_t)dll, ssp ? "true" : "false");
+                (unsigned long long)(uintptr_t)dll, ssp ? "true" : "false", (unsigned long long)rounds);
     std::fflush(stdout);
     return 0;
 } catch (const std::exception &e) { std::fprintf(stderr, "probe_app: %s\n", e.what()); return 1; }
