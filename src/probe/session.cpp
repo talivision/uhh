@@ -6315,7 +6315,11 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             if (t) CloseHandle(t);
             if (ours) { disposition = DBG_CONTINUE; return true; }
         }
-        if (hw_released_on(s, event.dwThreadId, address) && !probe_any_at(s, address)) {
+        // (An INLINE probe at that address does not count: a cleared install gate's #DB is ours.)
+        bool hw_live_here = false;
+        for (const auto &p : s->probes)
+            if (p->active && (p->flags & PROBE_HW) && p->address == address) { hw_live_here = true; break; }
+        if (hw_released_on(s, event.dwThreadId, address) && !hw_live_here) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
             CONTEXT w{}; w.ContextFlags = CONTEXT_DEBUG_REGISTERS | CONTEXT_CONTROL;
             if (t && GetThreadContext(t, &w)) {
