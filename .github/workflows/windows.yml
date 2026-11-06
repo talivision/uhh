@@ -71,7 +71,12 @@ jobs:
         shell: pwsh
         run: |
           $platform = @{ x64 = 'x64'; x86 = 'Win32' }['${{ matrix.arch }}']
-          cmake -S . -B build-${{ matrix.arch }} -G "Visual Studio 17 2022" -A $platform
+          # The VM's generator; windows-2025 images ship a newer Visual Studio only -> its default VS generator.
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -version '[17.0,18.0)' -property installationPath
+          if ($vs) { cmake -S . -B build-${{ matrix.arch }} -G "Visual Studio 17 2022" -A $platform }
+          else { cmake -S . -B build-${{ matrix.arch }} -A $platform }
+          $cl = Get-Content build-${{ matrix.arch }}\CMakeCache.txt | Select-String 'CMAKE_GENERATOR:|CMAKE_CXX_COMPILER:' | % { "$_" }
+          Write-Output "::notice title=toolchain ${{ matrix.arch }}::$($cl -join ' ')"
       - name: Build (Release)
         run: cmake --build build-${{ matrix.arch }} --config Release --parallel
       - name: Runner facts + CET probe
