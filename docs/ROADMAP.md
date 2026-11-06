@@ -1444,7 +1444,17 @@ Real-bug candidates (reproduce on runners, not on the VM so far):
   requests end HOOK_FAILED); a removal freezes in-process. Deterministic regress `lifecycle-killed-in-freeze-{inline,
   mixed}` (test hook `UHH_TEST_FREEZE_STALL_MS` parks the controller with the FREEZE pending, the test kills it):
   old agent 40/40 cases DEAD 0xC0000005 on windows-2022 x64 and x86 (diag run 42197120854), fixed agent 40/40 PASS.
-  Kill loop after the fix: see "runfix2 results" below.
+  **Second layer, exposed by that fix: the target HUNG** instead (kill loop: 0 deaths but 4 hangs in ~3100 kills; a
+  thread dump of the hung target -- `lckill.py` H lines -- showed EVERY program thread suspended once and no agent
+  thread). The controller froze all threads for the install round and died before answering; nobody resumed them:
+  the agent's service thread did not exist yet (its named event is the controller's and went with it), and the
+  init's own orphan check keyed on the controller process being signaled -- an agent-side probe (diag build) showed
+  `enabled=1 dead=0 port_gone=1 held=11`: the debug port goes during the dying controller's handle rundown, BEFORE
+  its process object is signaled. Fix (agent init/service): the init ends with the guard's orphan check on the debug
+  port (waiting up to 5 s for it when no service thread could start), and the service thread polls the port while
+  it has no controller handle. The regress check now stalls the controller AFTER the freeze (`UHH_TEST_FREEZE_STALL_MS`,
+  every other thread suspended): x64 freeze-stall loop 14-24 hangs / 120 before, 0 / 120 after (diag runs
+  42212013348 / 42214215294 vs 42217463236); `lifecycle-killed-in-freeze-*` x64 + x86 all PASS.
 - **ret-probe-breakpoint (x64 + x86, 1 of 9 each)**: hits=5 for 4 NtOpenProcess calls (hw: never). Either the
   breakpoint backend double-reports a `ret` (the hunt-ctx A4 class) or a sporadic 5th NtOpenProcess by a system
   component in that run; needs the per-hit log (caller/tid) to decide.
