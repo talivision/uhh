@@ -507,6 +507,9 @@ target_link_options(tp_target_cet PRIVATE ${TP_EXPORTS} /INCREMENTAL:NO /OPT:NOI
 add_executable(tp_driver examples/transparency/tp_driver.cpp examples/transparency/tp_callbacks.cpp)
 target_include_directories(tp_driver PRIVATE include)
 target_link_libraries(tp_driver PRIVATE probe_api)
+# /CETCOMPAT: under BlockNonCetBinaries the inline backend loads this module (the callbacks)
+# into the target, and only CET-compatible images may load there (regress cet-block-*).
+target_link_options(tp_driver PRIVATE /CETCOMPAT)
 add_dependencies(tp_driver tp_target tp_target_cet probe_api_agent)
 
 # --- blog replicas: API-monitor scenarios from well-known write-ups (examples/blogs) ----

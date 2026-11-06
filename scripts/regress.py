@@ -2842,6 +2842,11 @@ def check_cet_policy(threads=4, reads=200):
     made = []
     try:
         for policy in CET_POLICIES:
+            if policy == "block" and pe_is_x86(BIN / "cet_probe.exe"):
+                # WoW64 refuses to create a process with this policy (0xC0000022, measured on
+                # windows-2025); moot: Windows enforces no shadow stack for WoW64 processes.
+                skip("cet-block", "x86: Windows does not start a WoW64 process under BlockNonCetBinaries (no CET on WoW64)")
+                continue
             try:
                 copies = {n: cet_policy_copy(n, policy) for n in ("cet_probe", "tp_target_cet", "probe_app_cet")}
                 made += copies.values()
@@ -2866,7 +2871,8 @@ def check_cet_policy(threads=4, reads=200):
                             r2, o2 = run([tpd, "--backend", bk, "--mode", mode, "--probes", "add", "--",
                                           copies["tp_target_cet"], "--iters", 2], timeout=120)
                             err = (report(o2).get("error") or "")
-                            if bad and "probe_api_agent" in err:
+                            # until the agent AND the callback module are /CETCOMPAT
+                            if bad and "LoadLibrary" in err:
                                 record(name, True, f"policy IN EFFECT: inline refused cleanly: {err[:100]}")
                                 continue
                         record(name, not bad, f"policy {'IN EFFECT' if on else 'not in effect'} " +
