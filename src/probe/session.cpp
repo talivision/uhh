@@ -4116,11 +4116,12 @@ static void detach(probe_session *s) {
         if (!(w.Dr7 & 0xFF)) w.Dr7 &= ~(decltype(w.Dr7))0x300;
         w.EFlags &= ~0x100u;
         BOOL set_ok = SetThreadContext(t, &w);
+        const DWORD set_err = set_ok ? 0 : GetLastError();
         CONTEXT v{}; v.ContextFlags = CONTEXT_DEBUG_REGISTERS;
         GetThreadContext(t, &v);
         if (!set_ok || (v.Dr7 & 0xFF))
             report_tids += " " + std::to_string(GetThreadId(t)) + ":dr7=" + std::to_string((unsigned long long)v.Dr7) +
-                           (set_ok ? "" : ":setfail");
+                           (set_ok ? "" : ":setfail=" + std::to_string(set_err));
     }
     {   // threads the debugger knows about but could not freeze
         std::unordered_set<DWORD> fz;
@@ -6623,7 +6624,10 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
 #if !defined(_WIN64)
     saved.ContextFlags |= CONTEXT_EXTENDED_REGISTERS;                  // x86: XMM0-7 live here, not in FloatSave
 #endif
-    if (!GetThreadContext(thread, &saved)) { CloseHandle(thread); return 0; }
+    if (!GetThreadContext(thread, &saved)) {
+        if (trace_enabled()) std::fprintf(stderr, "  call_func: GetThreadContext(%lu) failed %lu\n", (unsigned long)st->tid, GetLastError());
+        CloseHandle(thread); return 0;
+    }
     TebErrors teb_errors; teb_errors.save(s->pi.hProcess, thread, saved);
     CONTEXT w = saved; size_t wrote = 0; bool ok = true;
     if (seed) to_context(*seed, w);                                    // call_original: the callback's registers
@@ -6644,7 +6648,27 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
 #endif
     w.EFlags &= ~0x100u;
     w.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
-    if (!ok || !SetThreadContext(thread, &w)) { CloseHandle(thread); return 0; }
+    if (!ok || !SetThreadContext(thread, &w)) {
+        if (trace_enabled()) std::fprintf(stderr, "  call_func: frame write ok=%d / SetThreadContext(%lu) failed %lu\n", (int)ok,
+                                          (unsigned long)st->tid, GetLastError());
+        CloseHandle(thread); return 0;
+    }
+    if (trace_enabled()) {
+        CONTEXT v{}; v.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS;
+        BOOL got = GetThreadContext(thread, &v);
+#if defined(_WIN64)
+        std::fprintf(stderr, "  call_func: tid %lu fn=0x%llx ip 0x%llx->0x%llx sp 0x%llx->0x%llx (reread %d: ip 0x%llx sp 0x%llx) teb=0x%llx\n",
+                     (unsigned long)st->tid, (unsigned long long)fn, (unsigned long long)saved.Rip, (unsigned long long)w.Rip,
+                     (unsigned long long)saved.Rsp, (unsigned long long)w.Rsp, (int)got, (unsigned long long)v.Rip,
+                     (unsigned long long)v.Rsp, (unsigned long long)teb_errors.teb);
+#else
+        std::fprintf(stderr, "  call_func: tid %lu fn=0x%llx ip 0x%lx->0x%lx sp 0x%lx->0x%lx (reread %d: ip 0x%lx sp 0x%lx cs=%lx fs=%lx) "
+                     "teb=0x%llx flags=0x%lx\n", (unsigned long)st->tid, (unsigned long long)fn, (unsigned long)saved.Eip,
+                     (unsigned long)w.Eip, (unsigned long)saved.Esp, (unsigned long)w.Esp, (int)got, (unsigned long)v.Eip,
+                     (unsigned long)v.Esp, (unsigned long)v.SegCs, (unsigned long)v.SegFs, (unsigned long long)teb_errors.teb,
+                     (unsigned long)saved.ContextFlags);
+#endif
+    }
     s->in_call_tid = st->tid;
     if (!ContinueDebugEvent(st->pid, st->tid, DBG_CONTINUE)) { s->in_call_tid = 0; SetThreadContext(thread, &saved); CloseHandle(thread); return 0; }
     int result = 0; bool trapped = false;
@@ -6672,8 +6696,11 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
             }
             if (!(er.ExceptionCode == EXCEPTION_BREAKPOINT || er.ExceptionCode == EXCEPTION_SINGLE_STEP)) {
                 if (trace_enabled())
-                    std::fprintf(stderr, "  call_func: callee raised 0x%08lx at 0x%llx; abandoned\n", (unsigned long)er.ExceptionCode,
-                                 (unsigned long long)(uintptr_t)er.ExceptionAddress);
+                    std::fprintf(stderr, "  call_func: callee raised 0x%08lx at 0x%llx (first=%lu info 0x%llx 0x%llx); abandoned\n",
+                                 (unsigned long)er.ExceptionCode, (unsigned long long)(uintptr_t)er.ExceptionAddress,
+                                 (unsigned long)ev.u.Exception.dwFirstChance,
+                                 (unsigned long long)(er.NumberParameters > 0 ? er.ExceptionInformation[0] : 0),
+                                 (unsigned long long)(er.NumberParameters > 1 ? er.ExceptionInformation[1] : 0));
                 trapped = true; break;                             // the callee faulted: abandon the call
             }
             if (trace_enabled())
@@ -6688,7 +6715,8 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
     s->in_call_tid = 0;
     resume_deferred_hits(s);                                       // they hit their probes again now
     if (trapped) {
-        SetThreadContext(thread, &saved);                          // exactly as it was at the hit
+        if (!SetThreadContext(thread, &saved) && trace_enabled())  // exactly as it was at the hit
+            std::fprintf(stderr, "  call_func: restore SetThreadContext(%lu) failed %lu\n", (unsigned long)st->tid, GetLastError());
         teb_errors.restore(s->pi.hProcess);                        // and its last error / status
         // The pending trap/fault event on this thread now stands in for the original one.
     } else if (!s->exited) {

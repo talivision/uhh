@@ -6565,7 +6565,7 @@ class LcTarget:
         return a
 
     def unhandled(self):
-        return [l for l in self.out.lines if '"unhandled"' in l][:2]
+        return [l for l in self.out.lines if '"unhandled' in l][:4]     # + "unhandled_where" lines
 
     def kill(self):
         if self.p.poll() is None:

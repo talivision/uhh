@@ -350,6 +350,48 @@ static LONG WINAPI report_unhandled(EXCEPTION_POINTERS *ep) {
                         (unsigned long long)dr.Dr7, cx_dr ? (unsigned long long)cx->Dr6 : 0ull,
                         cx_dr ? (unsigned long long)cx->Dr7 : 0ull);
     if (n > 0) WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), buf, (DWORD)n, &w, NULL);
+    {   /* Where: the faulting module+offset, the access (AV: kind + address) and every stack slot
+           near SP that points into a module (a cheap backtrace; no symbol engine in a dying
+           process). One extra line: {"kind":"unhandled_where",...}. */
+        char where[1400]; int m = 0;
+        const EXCEPTION_RECORD *er = ep->ExceptionRecord;
+#if defined(_WIN64)
+        const ULONG_PTR *sp = (const ULONG_PTR *)cx->Rsp;
+#else
+        const ULONG_PTR *sp = (const ULONG_PTR *)cx->Esp;
+#endif
+        {   /* the ip as module+offset (or its region when no module holds it) */
+            HMODULE mod = NULL; char path[MAX_PATH] = "?";
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCSTR)(ULONG_PTR)ip, &mod) && mod) {
+                char full[MAX_PATH]; const char *base;
+                GetModuleFileNameA(mod, full, MAX_PATH); base = strrchr(full, '\\');
+                _snprintf_s(path, sizeof(path), _TRUNCATE, "%s+0x%llx", base ? base + 1 : full, ip - (unsigned long long)(ULONG_PTR)mod);
+            } else {
+                MEMORY_BASIC_INFORMATION mbi;
+                if (VirtualQuery((LPCVOID)(ULONG_PTR)ip, &mbi, sizeof(mbi)))
+                    _snprintf_s(path, sizeof(path), _TRUNCATE, "nomod 0x%llx state=0x%lx prot=0x%lx type=0x%lx", ip,
+                                (unsigned long)mbi.State, (unsigned long)mbi.Protect, (unsigned long)mbi.Type);
+            }
+            m = _snprintf_s(where, sizeof(where), _TRUNCATE, "{\"kind\":\"unhandled_where\",\"ip\":\"%s\",\"info\":[\"0x%llx\",\"0x%llx\"],\"stack\":[",
+                            path, (unsigned long long)(er->NumberParameters > 0 ? er->ExceptionInformation[0] : 0),
+                            (unsigned long long)(er->NumberParameters > 1 ? er->ExceptionInformation[1] : 0));
+        }
+        for (int i = 0, found = 0; i < 256 && found < 12 && m > 0 && m < (int)sizeof(where) - 120; ++i) {
+            ULONG_PTR v = 0; HMODULE mod = NULL; char full[MAX_PATH]; const char *base;
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQuery(sp + i, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) break;
+            v = sp[i];
+            if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                    (LPCSTR)v, &mod) || !mod) continue;
+            GetModuleFileNameA(mod, full, MAX_PATH); base = strrchr(full, '\\');
+            m += _snprintf_s(where + m, sizeof(where) - m, _TRUNCATE, "%s\"sp+0x%x %s+0x%llx\"", found ? "," : "", i * (int)sizeof(ULONG_PTR),
+                             base ? base + 1 : full, (unsigned long long)(v - (ULONG_PTR)mod));
+            ++found;
+        }
+        if (m > 0) m += _snprintf_s(where + m, sizeof(where) - m, _TRUNCATE, "]}\n");
+        if (m > 0) WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), where, (DWORD)strlen(where), &w, NULL);
+    }
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
