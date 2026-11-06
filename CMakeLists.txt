@@ -440,6 +440,19 @@ add_executable(co_driver examples/hunt_callorig/co_driver.cpp examples/hunt_call
 target_include_directories(co_driver PRIVATE include)
 target_link_libraries(co_driver PRIVATE probe_api)
 add_dependencies(co_driver co_target probe_api_agent)
+# Test-only build of the controller library: UHH_TEST_HOOKS compiles in fault-injection points
+# (session.cpp, e.g. the controller dying right after it writes an INT3). Linked only into
+# co_driver_th (regress `cxlib-*`); nothing shipped uses it.
+add_library(probe_api_testhooks STATIC src/probe/session.cpp src/probe/symbols.cpp)
+target_include_directories(probe_api_testhooks PUBLIC include)
+target_link_libraries(probe_api_testhooks PRIVATE Zydis)
+target_compile_definitions(probe_api_testhooks PRIVATE UHH_TEST_HOOKS _CRT_SECURE_NO_WARNINGS)
+target_compile_options(probe_api_testhooks PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
+add_executable(co_driver_th examples/hunt_callorig/co_driver.cpp examples/hunt_callorig/co_callbacks.cpp)
+target_include_directories(co_driver_th PRIVATE include)
+target_link_libraries(co_driver_th PRIVATE probe_api_testhooks)
+target_compile_definitions(co_driver_th PRIVATE _CRT_SECURE_NO_WARNINGS)
+add_dependencies(co_driver_th co_target probe_api_agent)
 
 # --- calling conventions: get_func_arg / call_original / return_from per convention (regress `callconv`) --
 # ccfix.dll exports one function per x86/x64 convention and argument/return shape (plus an

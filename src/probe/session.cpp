@@ -1837,6 +1837,17 @@ static void settle_hw_thread(probe_session *s, DWORD tid) {
 }
 
 static void arm_thread_start_fixup(probe_session *s);
+#if defined(UHH_TEST_HOOKS)
+// Test-only build (probe_api_testhooks, never shipped): UHH_TEST_DIE_AFTER_ARM=n kills the
+// controller right after it writes its n-th user INT3 or arms its n-th hardware probe on the
+// target's threads -- a controller death at the worst instant for the agent's guard
+// (regress cxlib-killarm-*).
+static void test_die_after_arm() {
+    static const long n = [] { const char *v = std::getenv("UHH_TEST_DIE_AFTER_ARM"); return v ? std::atol(v) : 0L; }();
+    static long seen = 0;
+    if (n > 0 && ++seen == n) { std::fflush(nullptr); TerminateProcess(GetCurrentProcess(), 99); }
+}
+#endif
 static bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
     if (p.rva > UINT64_MAX - base) { set_error(s, "probe address overflow"); return false; }
     uint64_t address = base + p.rva;
@@ -1860,6 +1871,9 @@ static bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
         if (set_dr_on_thread(t, slot, address, true, rw, len)) ++set_ok;
         CloseHandle(t);
     }
+#if defined(UHH_TEST_HOOKS)
+    if (set_ok && !p.internal) test_die_after_arm();
+#endif
     if (tried && !set_ok) {   // could not arm the DR on any thread -> the probe would never fire
         set_error(s, win_error("set hardware breakpoint on target threads")); return false;
     }
@@ -1929,6 +1943,9 @@ static bool arm_breakpoint(probe_session *s, Probe &p, uint64_t base) {
     if (!patch(s->pi.hProcess, address, 0xcc)) {
         set_error(s, win_error("arm software breakpoint")); return false;
     }
+#if defined(UHH_TEST_HOOKS)
+    if (!p.internal) test_die_after_arm();
+#endif
     p.base = base; p.address = address; p.active = true;
     s->retired_bps.erase(address);
     sync_int3_table(s);
@@ -3297,7 +3314,8 @@ static bool open_agent_section(probe_session *s, uint32_t count) {
     s->shared->log_ipc = 1;                     // this debugger services PROBE_IPC_LOG (cleared before it leaves)
     // Benchmark-only knob (not API): compare inline extended-state handling strategies.
     if (const char *m = std::getenv("UHH_BENCH_XSTATE"))
-        s->shared->xstate_mode = !std::strcmp(m, "none") ? 1 : !std::strcmp(m, "full") ? 2 : 0;
+        s->shared->xstate_mode = !std::strcmp(m, "none") ? 1 : !std::strcmp(m, "full") ? 2 :
+                                 !std::strcmp(m, "noxsave") ? 3 : 0;   // 3: regress, a CPU without OSXSAVE
     if (s->attached) {          // the agent's guard waits on this handle (closes it itself)
         HANDLE dup = nullptr;
         if (DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), s->pi.hProcess, &dup, SYNCHRONIZE, FALSE, 0))

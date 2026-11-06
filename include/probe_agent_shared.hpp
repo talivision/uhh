@@ -156,7 +156,7 @@ struct probe_agent_shared {
     volatile LONG service_ready;   /* agent's persistent install thread is waiting on the svc event */
     volatile LONG64 overrides;     /* set_reg calls that changed a register, inline side */
     volatile LONG64 drain_beat;    /* bumped by the controller's drainer every loop: liveness */
-    volatile LONG xstate_mode;     /* benchmark knob: 0 = default (gated), 1 = none, 2 = full */
+    volatile LONG xstate_mode;     /* bench/test knob: 0 = default (gated), 1 = none, 2 = full, 3 = as without OSXSAVE */
     volatile LONG controller_gone; /* set when the controller stops consuming (detach/close): log calls return at once */
     volatile LONG ring_stalled;    /* controller: the ring is stuck behind a live producer's slot -- use PROBE_IPC_LOG */
     volatile LONG log_ipc;         /* controller: 1 while it is the debugger and services PROBE_IPC_LOG */

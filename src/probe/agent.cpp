@@ -1546,9 +1546,11 @@ static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
     unsigned char x87_buf[108], *x87_post = x87_buf;       // call_original's x87 state (ST0 result)
 #endif
     bool x87 = false;
-    LONG xmode = shared->xstate_mode;                      // 0 gated (default), 1 none, 2 full (bench knob)
+    // 0 gated (default), 1 none, 2 full (bench knobs), 3 as on a CPU without OSXSAVE (regress)
+    LONG xmode = shared->xstate_mode;
+    const bool xs_ok = g_xs.ok && xmode != 3;
     uint64_t mask = 0;
-    if (xmode != 1 && g_xs.ok) {
+    if (xmode != 1 && xs_ok) {
         if (xmode == 2) mask = g_xs.mask;
         else if (g_xs.xinuse) mask = _xgetbv(1) & g_xs.avx_mask;  // only components actually live
         else mask = g_xs.avx_mask;                         // liveness unknown: keep AVX state

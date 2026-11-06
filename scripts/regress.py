@@ -5612,9 +5612,8 @@ def check_ctrl_review():
             if len(logs) != N: bad.append(f"logs={len(logs)}")
             if res.get("av") != N // 2 or res.get("guard") != N // 2:
                 bad.append(f"veh av={res.get('av')} guard={res.get('guard')} (want {N // 2} each)")
-            # breakpoint: the handler's context carries our trap flag (the marker that tells a
-            # restart of the same execution from a new hit; documented) -- reported, not failed
-            if res.get("tf") != 0 and bk != "breakpoint": bad.append(f"tf_in_handler={res.get('tf')}")
+            # The program's handler must never see UHH's trap flag, on any backend (the gospel).
+            if res.get("tf") != 0: bad.append(f"tf_in_handler={res.get('tf')}")
             if res.get("stray") != 0: bad.append(f"stray_single_steps={res.get('stray')}")
             # The program's own result: even loads read a freshly committed (zero) page, odd
             # ones the guard page holding 7 -> N/2 * 7. A probe that changed the load fails it.
@@ -5786,7 +5785,7 @@ def check_cdx_review():
             if hits != N: bad.append(f"hits={hits}")
             if len(logs) != N: bad.append(f"logs={len(logs)}")
             if res.get("fix") != N: bad.append(f"veh_fixes={res.get('fix')} (want {N})")
-            if res.get("tf") != 0 and bk != "breakpoint": bad.append(f"tf_in_handler={res.get('tf')}")
+            if res.get("tf") != 0: bad.append(f"tf_in_handler={res.get('tf')}")   # never UHH's trap flag
             if res.get("stray") != 0: bad.append(f"stray_single_steps={res.get('stray')}")
             record(name, not bad, " ".join(bad) or f"hits={hits} logs={len(logs)} fixes={res.get('fix')}")
         except Exception as e:
@@ -7065,6 +7064,195 @@ def check_cet_sde(n=20, threads=2, reads=50):
     skip("cet-sde-hw", "not measurable under SDE: execute debug registers never match code run from SDE's code cache "
                        "(0 hits on cet_smash/co_target/conformance; the program is unaffected)")
 
+CX_LATE_SUM = sum(((j * 7 + 3) & 0xFF) * (j + 1) for j in range(1000)) & 0x7FFFFFFF   # co_on_late's config sum
+
+
+def cx_detach_summary(lines):
+    """The 'probe: detached: hits=.. logs_written=.. log_dropped=.. in_flight=..' line as a dict."""
+    for l in lines:
+        if l.startswith("probe: detached:"):
+            return {k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", l)}
+    return {}
+
+
+def cx_attached_run(case, bk, driver, t, detach_step, timeout=150, env=None):
+    """co_target <case> --wait, attached by <driver> --detach-on-stdin. detach_step(tgt, att, tout)
+    runs once the callback is in flight; returns (target row, driver stdout/stderr Lines, rcs)."""
+    procs = []
+    try:
+        tgt = subprocess.Popen([str(t), case, "--wait"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, text=True)
+        procs.append(tgt)
+        tout = Lines(tgt.stdout)
+        w = tout.wait_for(lambda l: '"kind":"waiting"' in l, 30)
+        if not w:
+            raise RuntimeError("target never reached its gate")
+        att = subprocess.Popen([str(driver), "--backend", bk, "--case", case, "--attach", str(json.loads(w)["pid"]),
+                                "--detach-on-stdin"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True, env=env)
+        procs.append(att)
+        aout, aerr = Lines(att.stdout), Lines(att.stderr)
+        if not aerr.wait_for(lambda l: l.startswith("probe: active co_target.exe!co_late"), 60):
+            raise RuntimeError("co_late never became active: " + " | ".join(aerr.lines[-4:])[:300])
+        tgt.stdin.write("x"); tgt.stdin.flush()
+        incb = tout.wait_for(lambda l: '"kind":"incb"' in l, 90)
+        if not incb or json.loads(incb).get("state") != 1:
+            raise RuntimeError(f"the callback never started: {incb}")
+        took = detach_step(tgt, att, tout)
+        att.wait(timeout=timeout); tgt.wait(timeout=timeout)
+        row = next((x for x in tout.objs() if x.get("kind") == "co"), {})
+        aout.objs(); aerr.t.join(timeout=30)
+        return row, aout, aerr, att.returncode, tgt.returncode, took
+    finally:
+        for q in procs:
+            if q.poll() is None:
+                q.kill()
+
+
+def check_cxlib():
+    """Codex library review of merge-frida vs main (docs/ROADMAP.md "Codex library review
+    findings"), one check per finding, each reproduced on the unfixed code first:
+      cbfault-*   a breakpoint/hw/inline callback that FAULTS after call_original (the original
+                  must not run twice; the caller gets its result), after call_original +
+                  return_from (the caller gets return_from's value) and after a return_from
+                  without call_original (dropped, the original runs once) -- every backend alike;
+      late-inline an inline callback still running 19 s into a detach (past the agent's 2 s wait
+                  and the drain's old 15 s allowance): its log after that is delivered, nothing
+                  dropped, and its >256-byte config (a block in the target) is still readable;
+      cfgfree-inline the program suspends a thread inside an inline callback across the whole
+                  detach and resumes it afterwards: the detach does not wait for it (accounted as
+                  in_flight=1), and the callback's config block is NOT freed under it;
+      killarm-*   the controller dies right after writing an INT3 / arming a hw probe (test-hook
+                  build, co_driver_th): the agent's guard must undo it -- the target finishes;
+      noxsave-inline the x86 inline fallback without OSXSAVE (forced: UHH_BENCH_XSTATE=noxsave)
+                  keeps the x87 state at a mid-function site with a full x87 stack (transparency
+                  `mid`, a callback doing x87 float work)."""
+    d, t, dth = exe("co_driver.exe"), exe("co_target.exe"), exe("co_driver_th.exe")
+    if not d or not t or not dth:
+        return skip("cxlib", "co_driver/co_target/co_driver_th missing")
+
+    # -- (1) a callback faulting after call_original / return_from -------------------------
+    want_rets = [i * 3 + 5 + (1000 if i % 3 == 1 else 0) for i in range(9)]
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"cxlib-cbfault-{bk}"
+        try:
+            r, o = run([d, "--backend", bk, "--case", "cbfault", "--", t, "cbfault"], timeout=120)
+            row, rep = next((x for x in o if x.get("kind") == "co"), {}), report(o)
+            hits = sum(p.get("hits", 0) for p in probes(o))
+            logs = sum(1 for x in o if x.get("kind") == "probe_log" and x.get("message") == "co cbfault")
+            bad = []
+            if row.get("rets") != want_rets: bad.append(f"rets={row.get('rets')} want {want_rets}")
+            if row.get("runs") != "1" * 9: bad.append(f"body runs per call={row.get('runs')!r} (want 111111111)")
+            if hits != 9 or logs != 9: bad.append(f"hits={hits} logs={logs} (want 9)")
+            if r.returncode != 0 or rep.get("error") is not None or rep.get("app_exit") != 0 or rep.get("log_dropped") != 0:
+                bad.append(f"rc={r.returncode} err={rep.get('error')} exit={rep.get('app_exit')} dropped={rep.get('log_dropped')}")
+            record(name, not bad, " ".join(bad) or f"rets={row.get('rets')} runs={row.get('runs')} hits={hits}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    # -- (4)+(2) an inline callback outliving the detach's old allowances ------------------
+    name = "cxlib-late-inline"
+    try:
+        def detach_now(tgt, att, tout):
+            t0 = time.time(); att.stdin.write("\n"); att.stdin.flush()
+            att.wait(timeout=150)
+            return time.time() - t0
+        row, aout, aerr, arc, trc, took = cx_attached_run("late", "inline", d, t, detach_now)
+        sm = cx_detach_summary(aerr.lines)
+        done = [l for l in aout.lines if '"message":"co late-done' in l]
+        bad = []
+        if row.get("ret") != CX_LATE_SUM or row.get("body") != 0 or row.get("done") != 1:
+            bad.append(f"target ret={row.get('ret')} want {CX_LATE_SUM} body={row.get('body')} done={row.get('done')}")
+        if len(done) != 1 or f"sum={CX_LATE_SUM}" not in done[0]:
+            bad.append(f"late log delivered={len(done)}")
+        if sm.get("log_dropped") != 0 or sm.get("in_flight") != 0 or sm.get("hits") != 1 or sm.get("logs_written") != 2:
+            bad.append(f"summary={sm}")
+        if arc != 0 or trc != 0: bad.append(f"driver_rc={arc} target_rc={trc}")
+        record(name, not bad, " ".join(bad) or f"detach_took={took:.1f}s summary={sm} ret={row.get('ret')}")
+    except Exception as e:
+        record(name, False, repr(e))
+
+    # -- (2) config block under a callback the program holds suspended across the detach ----
+    name = "cxlib-cfgfree-inline"
+    try:
+        def detach_then_resume(tgt, att, tout):
+            t0 = time.time(); att.stdin.write("\n"); att.stdin.flush()
+            att.wait(timeout=150)
+            took = time.time() - t0
+            tgt.stdin.write("g"); tgt.stdin.flush()
+            return took
+        row, aout, aerr, arc, trc, took = cx_attached_run("cfgfree", "inline", d, t, detach_then_resume)
+        sm = cx_detach_summary(aerr.lines)
+        bad = []
+        if row.get("ret") != CX_LATE_SUM or row.get("body") != 0 or row.get("done") != 1:
+            bad.append(f"target ret={row.get('ret')} want {CX_LATE_SUM} body={row.get('body')} done={row.get('done')} "
+                       "(config freed under the callback?)")
+        if sm.get("in_flight") != 1 or sm.get("log_dropped") != 0: bad.append(f"summary={sm} (want in_flight=1 dropped=0)")
+        if took > 12: bad.append(f"detach waited {took:.1f}s for a callback the program holds suspended")
+        if arc != 0 or trc != 0: bad.append(f"driver_rc={arc} target_rc={trc}")
+        record(name, not bad, " ".join(bad) or f"detach_took={took:.1f}s summary={sm} ret={row.get('ret')}")
+    except Exception as e:
+        record(name, False, repr(e))
+
+    # -- (3) the controller dies right after arming: the guard must cover it ---------------
+    r0, o0 = run([t, "spin"], timeout=60)
+    base = next((x for x in o0 if x.get("kind") == "co"), {})
+    for bk in ("breakpoint", "hw"):
+        name = f"cxlib-killarm-{bk}"
+        procs = []
+        try:
+            tgt = subprocess.Popen([str(t), "spin", "--wait"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, text=True)
+            procs.append(tgt)
+            tout = Lines(tgt.stdout)
+            w = tout.wait_for(lambda l: '"kind":"waiting"' in l, 30)
+            if not w:
+                raise RuntimeError("target never reached its gate")
+            env = dict(os.environ, UHH_TEST_DIE_AFTER_ARM="1")
+            att = subprocess.Popen([str(dth), "--backend", bk, "--case", "spin", "--attach", str(json.loads(w)["pid"])],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+            procs.append(att)
+            aout, aerr = Lines(att.stdout), Lines(att.stderr)
+            att.wait(timeout=90)
+            time.sleep(2.0)                                   # the guard notices the controller is gone
+            tgt.stdin.write("x"); tgt.stdin.flush()
+            try:
+                tgt.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                raise RuntimeError("target hung after the controller died")
+            row = next((x for x in tout.objs() if x.get("kind") == "co"), {})
+            row.pop("kind", None); want = dict(base); want.pop("kind", None)
+            rc = tgt.returncode & 0xFFFFFFFF
+            ok = att.returncode == 99 and rc == 0 and row == want and bool(want)
+            record(name, ok, f"controller_rc={att.returncode} (99: killed by the hook) target_rc=0x{rc:x} row={row} "
+                             f"want={want}" + ("" if ok else f" ctl_err={[l[:160] for l in aerr.lines[-4:]]}"))
+        except Exception as e:
+            record(name, False, repr(e))
+        finally:
+            for q in procs:
+                if q.poll() is None:
+                    q.kill()
+
+    # -- (5) x86 inline without OSXSAVE: the x87 state around ordinary callbacks -----------
+    name = "cxlib-noxsave-inline"
+    tpd, tpt = exe("tp_driver.exe"), exe("tp_target.exe")
+    if not tpd or not tpt:
+        return skip(name, "tp_driver/tp_target missing")
+    try:
+        env = dict(os.environ, UHH_BENCH_XSTATE="noxsave")
+        bad = []
+        for mode in ("log", "sys"):
+            r = subprocess.run([str(a) for a in [tpd, "--backend", "inline", "--mode", mode, "--probes", "mid,dbl,add", "--",
+                                                 tpt, "--iters", 30]], capture_output=True, text=True, timeout=300, env=env)
+            o = [json.loads(l) for l in r.stdout.splitlines() if l.strip().startswith("{")]
+            tg, rep = next((x for x in o if x.get("kind") == "target"), {}), report(o)
+            if r.returncode != 0 or tg.get("bad") != 0 or rep.get("error") is not None or rep.get("log_dropped") != 0:
+                bad.append(f"[{mode}] rc={r.returncode} bad={tg.get('bad')} first={tg.get('first')!r} err={rep.get('error')}")
+        record(name, not bad, " ".join(bad) or "mid/dbl/add (log, sys) identical to the twin without XSAVE")
+    except Exception as e:
+        record(name, False, repr(e))
+
+
 def main():
     global BIN
     ap = argparse.ArgumentParser()
@@ -7199,6 +7387,7 @@ def main():
     if want(check_inplace_shapes): check_inplace_shapes()
     if want(check_lifecycle): check_lifecycle()
     if want(check_cet_sde): check_cet_sde()
+    if want(check_cxlib): check_cxlib()
     print("-" * 72)
     failed = 0
     for name, status, detail in RESULTS:

@@ -1,5 +1,7 @@
-// co_driver --backend b [--inner-backend b2] --case name [--attach pid [--detach-after ms]]
+// co_driver --backend b [--inner-backend b2] --case name [--attach pid [--detach-after ms | --detach-on-stdin]]
 //           [-- co_target.exe name]
+// --detach-on-stdin: detach when a line arrives on stdin. co_driver_th is the same driver
+// linked with the test-hook build of the library (probe_api_testhooks, regress cxlib-killarm).
 // call_original / return_from edge-case hunt (regress `callorig-hunt`): probes co_target's
 // functions for one case with one backend (nested: the inner probe may use another), runs
 // it, prints the report. --attach: attach to a running co_target; --detach-after: close the
@@ -18,8 +20,9 @@
 #define CB(n) extern "C" void n(probe_context *);
 CB(co_on_fact) CB(co_on_throw) CB(co_on_seh) CB(co_on_jump) CB(co_on_add) CB(co_on_outer) CB(co_on_slow)
 CB(co_on_after) CB(co_on_inner) CB(co_on_nargs) CB(co_on_fast) CB(co_on_this) CB(co_on_args8) CB(co_on_mid)
-CB(co_on_prologue) CB(co_on_ret) CB(co_on_vslow)
+CB(co_on_prologue) CB(co_on_ret) CB(co_on_vslow) CB(co_on_cbf) CB(co_on_late) CB(co_on_spin)
 struct co_cfg { uint32_t backend; };
+struct co_bigcfg { uint32_t backend, n; unsigned char pat[1000]; };   // see co_callbacks.cpp
 
 static uint32_t parse_backend(const char *b) {
     return !std::strcmp(b, "hw") ? PROBE_HW : !std::strcmp(b, "inline") ? PROBE_INLINE
@@ -28,6 +31,7 @@ static uint32_t parse_backend(const char *b) {
 
 int main(int argc, char **argv) {
     uint32_t bk = 0, inner = 0, pid = 0, detach_ms = 0;
+    bool detach_stdin = false;
     std::string kase;
     int i = 1;
     for (; i < argc && std::strcmp(argv[i], "--"); ++i) {
@@ -36,6 +40,7 @@ int main(int argc, char **argv) {
         else if (!std::strcmp(argv[i], "--case") && i + 1 < argc) kase = argv[++i];
         else if (!std::strcmp(argv[i], "--attach") && i + 1 < argc) pid = (uint32_t)std::strtoul(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--detach-after") && i + 1 < argc) detach_ms = (uint32_t)std::strtoul(argv[++i], nullptr, 10);
+        else if (!std::strcmp(argv[i], "--detach-on-stdin")) detach_stdin = true;
     }
     if (!bk || kase.empty() || (!pid && i + 1 >= argc)) { std::fprintf(stderr, "usage: see co_driver.cpp\n"); return 2; }
     if (!inner) inner = bk;
@@ -66,9 +71,17 @@ int main(int argc, char **argv) {
     else if (k == "nested") ok = add("co_outer", co_on_outer, bk) && add("co_inner", co_on_inner, inner);
     else if (k == "slow") ok = add("co_slow", co_on_slow, bk);
     else if (k == "vslow") ok = add("co_vslow", co_on_vslow, bk) && add("co_after", co_on_after, bk);
+    else if (k == "cbfault") ok = add("co_cbf", co_on_cbf, bk);
+    else if (k == "spin") ok = add("co_add", co_on_spin, bk);
+    else if (k == "late" || k == "cfgfree") {
+        static co_bigcfg big{};                  // larger than PROBE_AGENT_CONFIG_CAP (256)
+        big.backend = bk; big.n = (uint32_t)sizeof(big.pat);
+        for (uint32_t j = 0; j < big.n; ++j) big.pat[j] = (unsigned char)((j * 7 + 3) & 0xFF);
+        ok = probe_add_symbol_cfg(s, "co_target.exe!co_late", co_on_late, bk, &big, sizeof(big)) != 0;
+    }
     else { std::fprintf(stderr, "co_driver: unknown case %s\n", k.c_str()); return 2; }
     if (!ok) { std::fprintf(stderr, "co_driver: add failed\n"); probe_close(s); return 1; }
-    if (pid && detach_ms) {
+    if (pid && (detach_ms || detach_stdin)) {
         // Detach from another thread while probe_run runs (and a call_original is in flight).
         // The debug object belongs to the attaching thread, so it attaches AND runs there.
         HANDLE attached = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -81,7 +94,8 @@ int main(int argc, char **argv) {
         WaitForSingleObject(attached, INFINITE);
         if (att_ok) {
             std::printf("{\"kind\":\"attached\",\"pid\":%u}\n", pid); std::fflush(stdout);
-            Sleep(detach_ms);
+            if (detach_stdin) { char line[16]; if (!std::fgets(line, sizeof(line), stdin)) {} }
+            else Sleep(detach_ms);
             std::fprintf(stderr, "co_driver: detaching\n");
         }
         probe_close(s);                         // waits for probe_run, then it has detached
