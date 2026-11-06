@@ -543,19 +543,22 @@ about a second, UHH prints a one-time warning suggesting a redirect to a file or
 Records reach the file within about 10 ms or when the writer is idle.
 
 ```json
-{"kind":"probe_log","probe":3,"tid":5124,"message":"read handle=0xa4 pid=7516 name=probe_app.exe addr=0x7ff7fb509690 size=16"}
-{"kind":"probe_log","probe":0,"tid":5124,"message":"write to watched block","stack":["module!function+0x12 (file.c:87) [0x7ff6...]", "..."]}
+{"kind":"probe_log","probe":3,"tid":5124,"message":"read handle=0xa4 pid=7516 name=probe_app.exe addr=0x7ff7fb509690 size=16","seq":0}
+{"kind":"probe_log","probe":0,"tid":5124,"message":"write to watched block","stack":["module!function+0x12 (file.c:87) [0x7ff6...]", "..."],"seq":1}
 ```
 
 `probe` is the probe's index in the order the probes were added (0-based); `tid` is the
-target thread that hit it.
+target thread that hit it; `seq` numbers the session's records 0, 1, 2, ... in file order
+(the same in the file and on stdout), so a gap or a missing tail in a capture is visible
+from the capture itself. Every record is exactly one line: newlines and other control
+characters in the text or a stack frame are escaped.
 
 ### Report (`probe_report`)
 
 ```json
 {"kind":"prehook","location":"...","address":"0x...","patched_bytes":5,"pattern":"...","destination":"0x...","via":"","live":"...","original":"...","live_disasm":[...],"original_disasm":[...],"suggest":[...]}
 {"kind":"probe","location":"ntdll.dll!NtReadVirtualMemory","backend":"inline","active":true,"hits":8000}
-{"kind":"probe_report","probes":4,"active":4,"hits":8012,"overrides":1,"log_dropped":0,"callbacks_interrupted":0,"logs_written":8010,"controller_peak_ws_mb":12,"app_exit":0,"live_output_closed":false,"error":null}
+{"kind":"probe_report","probes":4,"active":4,"hits":8012,"overrides":1,"log_dropped":0,"callbacks_interrupted":0,"logs_written":8010,"controller_peak_ws_mb":12,"app_exit":0,"live_output_closed":false,"stdout_logs":8010,"live_output_error":null,"error":null}
 ```
 
 | Field | Meaning |
@@ -571,7 +574,16 @@ target thread that hit it.
 | `controller_peak_ws_mb` | the controller's peak working set |
 | `app_exit` | the target's exit code (1 if it did not exit, e.g. after a detach) |
 | `live_output_closed` | stdout's reader went away; the file still has every record |
+| `stdout_logs` | `probe_log` records the live tail wrote to stdout before this report (null when stdout is `NUL`: no tail). Equal to `logs_written` unless the tail stopped (`live_output_closed` / `live_output_error`) |
+| `live_output_error` | a stdout write failed for another reason (also on stderr and in `error`); the file still has every record |
 | `error` | the session's first error, or null |
+
+A capture of stdout is complete when it ends with the `probe_report`, holds exactly
+`stdout_logs` `probe_log` lines and their `seq` runs 0..`stdout_logs`-1 without a gap (recipe:
+[troubleshooting.md](troubleshooting.md#is-my-captured-output-complete)). When records follow
+the report -- an attach detached by `probe_close` after `probe_report`, as in
+`uhh_trace --detach-after-ms` -- `probe_close` ends stdout with
+`{"kind":"probe_final","hits":..,"logs_written":..,"log_dropped":..,"in_flight":..,"stdout_logs":..}`.
 
 Accounting: hits = logs + `log_dropped` + `callbacks_interrupted` for a callback that logs
 once per hit (see [limitations.md](limitations.md#logs-and-accounting) for the edge cases).

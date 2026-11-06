@@ -1437,6 +1437,122 @@ then fixed. Fixtures: `ctrl_target faultmix`, `co_target susp / many / manydead`
   "controller-death guard unavailable (agent not ready within 5 s)" under VM load, so the hw probe was
   armed without the guard; `--only cxlib` 3 x 9/9 on reruns.
 
+## PowerShell capture findings (2026-11-06, owner: "high volume drops lines logged -- powershell logging"; the session file was complete, the PowerShell console showed fewer lines; regress `stdout-powershell-*`, `stdout-console-*`)
+
+Reproduced on Windows PowerShell 5.1.19041 (no `pwsh` on the VM) with `uhh_trace` on
+`logstream_target` (4 threads, delay 0) under every backend, with and without `--stack`, and on
+a launched `powershell.exe` target. Every capture was compared with the session JSONL file and
+the report (count, valid JSON per line, CRC multiset of the lines, `seq` coverage).
+
+**The live tail itself loses nothing -- into pipes, files or a console:**
+- Console handle at volume: `uhh_trace` attached to a pseudo console (ConPTY, the console
+  Windows Terminal / OpenSSH / VS Code use; GetConsoleMode succeeds on its stdout, the
+  WriteFile-to-console path), inside `powershell -Command`, the rendered VT stream decoded:
+  inline `--stack` 2,000,000/2,000,000 `seq` rendered (371 s; 602 MB of VT), inline without
+  stacks 2,000,000/2,000,000 (82 s); 100k inline and 10k breakpoint/hw, with and without
+  stacks, all complete; every report `stdout_logs == logs_written == hits`, no live error.
+  A classic console window (screen buffer read back with ReadConsoleOutputCharacter, 400
+  columns x 32766 rows): 8000/8000 records + report, inline and breakpoint.
+- Pipes/files through PowerShell: `| Out-File` (UTF-16 and `-Encoding utf8`), `>` (UTF-16),
+  `| Set-Content`, `| Tee-Object`, `| ForEach-Object`, `2>&1 | Out-File`, `| Measure-Object -Line`,
+  `| Select-String`, `Start-Process -RedirectStandardOutput`, `cmd /c ... >` (control), from a
+  redirected host and from a console window: every capture held exactly logs_written == hits
+  records, byte-identical to the file (inline 200k and 1.2M stack records; breakpoint/hw 20k with
+  and without stacks; 40k with the target's own stdout forwarded in between; a launched
+  PowerShell target). Records never contain raw newlines (the JSON writer escapes every control
+  character), so a stack stays on its line. PowerShell is slow (1.2M stack records: `cmd /c >`
+  19 s, `>` 46 s, `Tee-Object` 56 s, `Out-File` 110 s); UHH back-pressures, it does not drop.
+
+**Where the console loses lines (outside UHH):**
+- A pseudo console is a screen renderer, not a byte pipe: fed faster than it renders, it
+  emits only the frames it draws. Non-UHH control (`control2.py`, 2M UHH-shaped 330-byte
+  records) through ConPTY: written with WriteConsoleW (Python's console stream) only
+  360,005/2,000,000 records were ever rendered (first missing: seq 37); the SAME bytes with
+  WriteFile (`os.write`, like UHH) 2,000,000/2,000,000 (579 s). UHH writes with WriteFile,
+  which conhost processes in step with rendering: no loss above, at any volume measured.
+- PowerShell displaying the records itself (its host writes the console): `& uhh_trace ... |
+  Tee-Object x.txt`, `| ForEach-Object { $_ }` and `2>&1` in a pseudo console, inline `--stack` 1M records:
+  1,000,000/1,000,000 rendered each (Tee 1077 s, ForEach 889 s, merged 171 s; plain 158 s). PowerShell is slower than the
+  renderer, so it does not hit the WriteConsoleW loss above.
+- The one reproduced "console short, session file more complete": **Ctrl+C in a PowerShell
+  pipeline** (below): the capture/console stops a few hundred records before the session file
+  and has no report. With Ctrl+C at the end of a long run, that is "lines missing near the end".
+- Every console keeps a finite history (conhost: the screen buffer, e.g. 9001 rows; Windows
+  Terminal: 9001 lines by default). A `--stack` record wraps into several rows at 120 columns,
+  so a million-record run leaves only the last few thousand records on screen while every
+  write succeeded (`stdout_logs == logs_written`). The session file is the archive.
+- **Ctrl+C inside a PowerShell pipeline** terminates the native command: PowerShell stops
+  reading and kills it, so UHH's Ctrl+C path (end the session, flush, report) never runs.
+  inline, 4x300k stack records, Ctrl+C at 6 s: `| Out-File` captured 55,560 records (file
+  55,824), `>` 112,947 (file 113,165), `2> err | Out-File` 131,073 (file 131,275; stderr has no
+  `probe: interrupted`), none with a report; `cmd /c ... >` 152,649 == file == logs_written,
+  hits 152,653 (= + 4 callbacks_interrupted), report present. Non-UHH control (`control.py`: on
+  Ctrl+C writes 1000 more lines, waits 1 s, writes a final line and a side-file "finished"):
+  `| Out-File` and `>` never reach "finished" (killed); `cmd /c >` and the plain console do.
+
+**What changed in UHH (each with its reproduction on the old code):**
+- ✅ **A capture could not prove it was complete** (owner: "interpreting the END of the log
+  wrong"; owner-requested): every `probe_log` record carries `"seq"` (0, 1, 2, ... in file
+  order; the last field, so prefix matchers keep working); `probe_report` adds `stdout_logs`
+  (records the live tail wrote to stdout) and `live_output_error` (a stdout failure other than
+  a closed reader; also on stderr and in `error`); when records follow the report
+  (`--detach-after-ms`), `probe_close` ends stdout with a `probe_final` line. Recipe:
+  troubleshooting.md "Is my captured output complete?". Old code: all 14 `stdout-*` checks FAIL
+  (no seq / stdout_logs) although delivery was complete.
+- ✅ **A report on a still-running target contradicted itself** (hwonce: final `probe` hits
+  97,694 vs `logs_written` 5.4M). Reproduced on 6f0c533 (`hwonce.py`: attach inline `--stack`,
+  `--detach-after-ms 4000`, `| Out-File`, target ended after 60 s): probe hits 102,972 /
+  123,116 vs logs_written 997,389 / 1,256,316 in the same report, and the report only after the
+  target ended. Cause: `probe_report` read the inline hit counters, then `flush_log_writer`
+  waited for an EMPTY queue, which never happens while the target logs faster than stdout
+  drains. Fix: on a live target the report flushes the records queued when it started
+  (`logs_enqueued` mark; the writer notifies per batch), then reads stdout_logs, logs_written
+  and the hits in that causal order under the stdout lock, one hits snapshot per probe for its
+  record and the total. After: consistent in every run (e.g. hits 163,364 >= logs_written
+  157,215 == stdout_logs, then `probe_final` 540,542 == 540,542 == 540,542).
+- ✅ **probe_close never finished while the attached target kept logging** (the debug loop
+  starved). `drain_agent_logs` looped "until the ring is empty" under `drain_mu`; producers
+  saturating a full ring refill every freed slot at once, so the debug loop (which drains on
+  every iteration) never reached the stop request. Reproduced with the bounded drain reverted
+  (`stdout-powershell-detach-inline`, 4 runs): 1 of 4 hung (`probe: close: still waiting for
+  probe_run to stop (180s)`, 6,462,473 records streamed, ended only when the test killed the
+  target); with the fix 0 of 4 runs. Fix: every drain is one bounded pass up to `log_head` at
+  entry (the drainer thread loops).
+- ✅ **A held-up session-file write held live stdout** (reproduced by the citune agent: CI with
+  TEMP on C: holds up to 221 ms, on D: 0.5 ms p99; VM default TEMP 2 of 3 runs with 427/180 ms
+  holds from real-time AV scanning of the growing file, a Defender-excluded dir 9/9 clean).
+  The writer wrote each batch to the file, then to stdout. Fix: stdout first, then the file,
+  `stdout_mu` held across both (a report sees a batch counted in both or in neither). The file
+  is still written by the same thread right after (no second writer, no reordering); a target
+  whose stdout is forwarded keeps file-then-replay (deferred records are replayed from the
+  file). Before/after on the shared VM (3 interleaved rounds each, 6f0c533 vs pslog, x64; other agents kept
+  the VM at 37-100% CPU, so run-to-run spread is wide): `stream-live` p99 breakpoint 14.4 -> 3.2 ms,
+  hw 25.2 -> 2.0 ms, inline 15.7 -> 12.9 ms (medians); `stream-latency` p99 medians within the
+  noise (both builds had runs over 30 ms). The `stream-latency-*` ordering flake (a record
+  printed before the target's own tick line: the forwarder has not read the tick from the
+  target's pipe yet) failed on both builds under that load (6f0c533: 1 of 9 records,
+  pslog: 3 of 9, plus one more breakpoint p99 of 341 ms); `stream-latency` launches with the
+  target's stdout forwarded, a path this change does not touch (file, then replay).
+- Throughput (6f0c533 vs pslog, 3 interleaved rounds per arch on the shared VM, medians; full
+  table in the pslog report): no regression beyond the run-to-run spread, which was large (other
+  agents kept the VM at 10-100% CPU): x64 `uhh_trace --stack` 1M to a file 69.8k -> 81.7k rec/s,
+  through `| Out-File` 12.1k -> 25.8k; x86 20.6k -> 40.1k and 6.5k -> 12.0k; log-throughput and
+  stream-volume peaks unchanged. stream-latency ordering flake: 5/36 (6f0c533) vs 9/36 (pslog)
+  in a 6x interleaved A/B, p99 medians equal; the forwarded path it measures is unchanged.
+- Considered and NOT changed: the drainer's idle `Sleep(1)` (inline median latency ~15.6 ms =
+  one timer tick, a latency, not a loss); and, with no failure reproduced: splitting/looping console writes or
+  WriteConsoleW (2M records through a console handle were complete), a retry after a short
+  WriteFile, code-page conversion (records are ASCII unless the logged text is not), the
+  inherited console of a launched target (its own output can interleave with records on a
+  console; the records still all reach it).
+- Regress: `stdout-powershell-{outfile,redirect,setcontent,tee,merged}-inline`,
+  `-{outfile,merged}-{breakpoint,hw}` (100k / 10k stack records through `powershell -Command`):
+  captured == stdout_logs == logs_written == hits == logs + dropped + interrupted, every line
+  valid JSON, seq contiguous, nothing after the report, session file equally complete;
+  `stdout-powershell-detach-{inline,breakpoint}` (live report consistent, `probe_final` last,
+  target alive); `stdout-console-{inline,breakpoint,hw}` (into a pseudo console: every seq
+  rendered, report complete; `--console-records 2000000` adds the 2M tier).
+
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`
 - ✅ Per-log overhead ceilings in the suite (`log-throughput-*`)
