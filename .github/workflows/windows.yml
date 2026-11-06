@@ -22,12 +22,16 @@ on:
         default: 'x64,x86'
         required: false
       shards:
-        description: 'shards per arch (0 = default: x64 9, x86 10)'
+        description: 'shards per arch (0 = default: x64 7, x86 9)'
         default: '0'
+        required: false
+      image:
+        description: 'runner image: windows-2022 (no CET in the guest) | windows-2025 (CET shadow stacks ENFORCED, AMD EPYC)'
+        default: 'windows-2022'
         required: false
 
 concurrency:
-  group: regress-${{ github.event_name }}-${{ github.ref }}-${{ inputs.only }}-${{ inputs.arches }}
+  group: regress-${{ github.event_name }}-${{ github.ref }}-${{ inputs.only }}-${{ inputs.arches }}-${{ inputs.image }}
   cancel-in-progress: true
 
 permissions:
@@ -39,6 +43,7 @@ jobs:
     outputs:
       matrix: ${{ steps.m.outputs.matrix }}
       arches: ${{ steps.m.outputs.arches }}
+      image: ${{ steps.m.outputs.image }}
     steps:
       - uses: actions/checkout@v6
       - id: m
@@ -46,11 +51,15 @@ jobs:
           ONLY: ${{ inputs.only }}
           ARCHES: ${{ inputs.arches || 'x64,x86' }}
           SHARDS: ${{ inputs.shards || '0' }}
-        run: python3 scripts/ci_shards.py matrix --only "$ONLY" --arches "$ARCHES" --shards "$SHARDS" --github-output "$GITHUB_OUTPUT"
+          IMAGE: ${{ inputs.image || 'windows-2022' }}   # pushes and pull requests: windows-2022
+        run: |
+          case "$IMAGE" in windows-20[0-9][0-9]) ;; *) echo "bad image $IMAGE"; exit 1;; esac
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          python3 scripts/ci_shards.py matrix --only "$ONLY" --arches "$ARCHES" --shards "$SHARDS" --github-output "$GITHUB_OUTPUT"
 
   build:
     needs: plan
-    runs-on: windows-2022
+    runs-on: ${{ needs.plan.outputs.image }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -116,12 +125,12 @@ jobs:
 
   test:
     needs: [plan, build]
-    runs-on: windows-2022
+    runs-on: ${{ needs.plan.outputs.image }}
     timeout-minutes: 100
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
-    name: test ${{ matrix.name }}
+    name: test ${{ matrix.name }} (${{ needs.plan.outputs.image }})
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -185,6 +194,7 @@ jobs:
       - name: Table (shard x arch) and measured unit times
         env:
           MATRIX: ${{ needs.plan.outputs.matrix }}
+          IMAGE: ${{ needs.plan.outputs.image }}
         run: python3 scripts/ci_shards.py summarize --dir all-logs --matrix "$MATRIX" --est-out unit-times.json
       - uses: actions/upload-artifact@v6
         with:

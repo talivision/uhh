@@ -1294,10 +1294,46 @@ INT3"); nothing shipped links it. `--only cxlib`.
 - ⬜ [fan-out, Codex] Docs: quickstart, API reference, per-backend limitations table, troubleshooting
 - 🔧 Inline cap raised to 128 per session (user: 128 is enough; error beyond) -- compile-time thunk table, per-request FREEZE flag; refusal test uses the 129th -- VM verify pending
 - ⏸ Follow child processes: design written -- [docs/child-processes.md](child-processes.md) (strategies with VM measurements from `bench/child_follow`, API options A-D, recommendation: ProcessDebugFlags inheritance + `probe_follow_children` + `get_pid`); **deferred by the owner (2026-11-06)**: a session follows one process; a child it starts runs unprobed -- attach to it with its own session. Processes the target did not create are unaffected either way (attach separately)
-- ⬜ (maybe) CI on GitHub Actions; (maybe) CMake package + versioned release zip
+- 🔧 CI on GitHub Actions: the full suite sharded on hosted windows-2022 runners, x64 + x86 (`.github/workflows/windows.yml`, `scripts/ci_shards.py`) -- see "CI on GitHub Actions" below; ⬜ (maybe) CMake package + versioned release zip
 - 🔧 (very last) Soak test: hours under load; handles/memory/threads flat -- `scripts/soak.py` (phases mixed / hw / breakpoint / attach-detach cycles, per-minute samples to CSV, exactness + checksum + growth verdict), opt-in `regress.py --soak-minutes N`; probe_app `--pace`. x64 mixed 30 min PASS (57.6M reads, all logged, controller/target flat); 1-min calibration of every phase PASS. **The VM froze twice during the 30-min all-hw phase** (at ~18 and ~22 min, ~12k hw hits/s; guest RAM exhausted while UHH's own processes stayed at ~2.5 MB private) -- suspected kernel-side memory growth per debug event / DR context switch (host logs a burst of `Unhandled WRMSR(0x1d9)` DEBUGCTL from the guest during hw runs). soak.py now samples available RAM, kernel paged/nonpaged pool and system handles and aborts below 1.5 GB. Next: a 3-minute hw run with 15 s samples to measure pool growth per hit before any long hw soak
 - ✅ Controller-crash self-unhook -- originally ✗ (user: the analyst sees the controller died and restarts the target; not worth the cost); superseded for ATTACHED targets by Lifecycle L1 (the agent's controller-death guard undoes INT3s/DRs/holds and removes inline hooks, so the target survives). A launched target still ends with its controller
 - ✗ Named-object hardening (user: unlikely; a clash fails loudly)
+
+## CI on GitHub Actions (2026-11-06, `.github/workflows/windows.yml`, `scripts/ci_shards.py`)
+More Windows test capacity than the one VM: the repo is public, so GitHub-hosted `windows-2022` runners are free
+(~20 concurrent jobs). They are NOT the VM: Windows Server 2022 (build 20348), 4 vCPU (2 cores) / 16 GB, Intel Xeon
+Platinum 8573C under Hyper-V, Defender real-time protection off.
+- **Triggers:** every push to any branch (docs-only / `*.md` pushes are skipped, except `docs/quickstart.md`), every
+  pull request, and `workflow_dispatch` (Actions tab -> windows-regress -> Run workflow, or the API) with inputs
+  `only` (regress.py `--only` selectors, comma-separated; empty = full suite), `arches` (`x64,x86` / `x64` / `x86`)
+  and `shards` (per arch; 0 = 9 x64 / 10 x86). A newer push to the same branch cancels the older run.
+- **Jobs:** `plan` (ubuntu) packs the suite's check units into balanced shards from measured runtimes;
+  `build (x64|x86)` configures + builds Release (~2 min), prints runner facts and `cet_probe`, uploads `bin-<arch>`;
+  `test <arch>-<NN>` downloads it and runs `ci_shards.py run`: ONE `regress.py --only <unit>` per unit, timed, the
+  whole output teed to `ci-logs/<arch>-<NN>.log` (+ `.json`), uploaded as artifact `logs-<arch>-<NN>`; the job fails on
+  any FAIL / non-zero exit / unit timeout (45 min). `summary` tabulates shard x arch and the measured unit times
+  (artifact `unit-times`). `cet-probe` builds `cet_probe` on `windows-2025` (does a newer image expose CET?).
+- **Units:** `--only` matches substrings of check function names, so a unit is a check name that contains no other
+  one, plus every check containing it (`check_attach` = attach + attach_new, `check_cet` = cet + cet_sde,
+  `check_realworld`, `check_symbols`, `check_callorig`). `ci_shards.py units` lists them; the units are re-parsed from
+  regress.py main() on every run and must partition it exactly, so a new check is picked up automatically (with a
+  60 s estimate and a warning annotation until EST in ci_shards.py is refreshed from `summary`'s measured table).
+  Opt-in tiers (`--volume-reads`, `--bigapps`, `--soak-minutes`) are not run.
+- **External deps:** because every check runs explicitly selected, `skip_external()` is a FAIL in CI (in a full
+  unselected run it would SKIP). The shards that need them install Frida 16.5.9 into `C:\work\fv16` (regress
+  `FRIDA_PY`) and Intel SDE 9.48 into `C:\tools\sde` (from Intel's mirror, sha256-pinned, cached). A system program
+  missing on Server 2022 therefore shows as a FAIL: a runner finding, not hidden.
+- **Reading results without a token** (public REST, 60 requests/h unauthenticated): the run list
+  `GET /repos/talivision/uhh/actions/runs?branch=<b>`, its jobs `GET .../actions/runs/<id>/jobs` (per-step
+  conclusions too), and the check-run annotations `GET .../check-runs/<job id>/annotations`: every test job posts one
+  notice (`<shard> PASS|FAIL N/M ok ... <secs>s` + per-unit times) and, on failure, one error annotation with all its
+  `] FAIL` lines; `summary` posts the whole shard table; `build` posts the runner facts and the `cet_probe` JSON.
+  Helper on the orchestrator: `~/work/uhh-tools/fan/work/ci/gh.py runs <branch> | jobs <run> | notes <run> [job regex]`.
+  The full logs and artifacts need auth: `~/work/tools/gh/bin/gh auth login` once, then
+  `gh run list -R talivision/uhh -b <branch>`, `gh run view <id> -R talivision/uhh --log-failed`,
+  `gh run download <id> -R talivision/uhh -p 'logs-*'`, and to start a run on any branch
+  `gh workflow run windows.yml -R talivision/uhh --ref <branch> -f only=lifecycle,hunt -f arches=x64`
+  (or just push the branch: every push runs the full suite).
 
 ## Later
 - ⬜ x86 cumulative-session flakiness (possibly the same handle double-close; recheck)
