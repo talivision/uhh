@@ -2016,9 +2016,10 @@ def check_detach():
                 line = target.stdout.readline().decode(errors="replace")
                 if not line or '"waiting"' in line:
                     break
-            # Detach once a twentieth of the reads is logged (was: a fixed 2.5 s after the attach,
+            # Detach as soon as the first 1000 logs arrive (was: a fixed 2.5 s after the attach,
             # which a fast host -- windows-2025's EPYC, inline -- outran: the target had finished
-            # every read, so the detach was not mid-run, and met its main thread exiting).
+            # every read, so the detach was not mid-run, and met its main thread exiting; a
+            # twentieth of the reads was still too late there: inline hits outrun the log pipe).
             tracer = subprocess.Popen([str(t), "--backend", bk, "--attach", str(target.pid), "--detach-on-stdin",
                                        "-p", "ntdll.dll!NtReadVirtualMemory:xxxx"],
                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -2027,7 +2028,7 @@ def check_detach():
                 raise RuntimeError("probe never became active")
             target.stdin.write(b"\n"); target.stdin.flush()
             with tout.cv:
-                tout.cv.wait_for(lambda: len(tout.lines) >= total // 20, 120)
+                tout.cv.wait_for(lambda: len(tout.lines) >= 1000, 120)
             tracer.stdin.write("\n"); tracer.stdin.flush()
             tracer.wait(timeout=120)
             tout.t.join(timeout=30); terr.t.join(timeout=30)

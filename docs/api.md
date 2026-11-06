@@ -381,7 +381,8 @@ ran; `*ret` receives the return register.
   that does not return within 5 s is abandoned (`probe: call_func timed out after 5 s;
   thread restored`). A callee that raises an exception, even one it handles itself, is
   abandoned at that exception (returns 0, `*ret` untouched, the target never sees it).
-  Refused when the target has CET shadow stacks.
+  The callee is entered through a real `call` (a 3-byte stub in the target), so it works
+  under CET shadow stacks too (measured on enforced-CET hardware, CI windows-2025).
 - **Inline:** a direct call. An exception in the callee is dispatched in the target as usual
   (handled inside: returns 1; unhandled: 0), and the target's vectored handlers see it.
 - Prefer `call_original` for the probed function itself, and keep `call_func` to callees
