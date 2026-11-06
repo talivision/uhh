@@ -287,22 +287,18 @@ data) prints on all backends.
 
 ## CET shadow stacks
 
-🔧 Production readiness, "Intel CET shadow stacks". The test machine's CPU has no CET, so
-**no UHH path has run under a hardware-enforced shadow stack**.
+✅ Measured on real CET hardware (CI `windows-2025` runners: AMD EPYC, Windows Server 2025, user
+shadow stacks enforced for /CETCOMPAT images; regress `cet-*`). The test VM's CPU has no CET.
 
 | Path | Status |
 |---|---|
-| Static audit | every path that broke the shadow stack was fixed or is refused |
-| Inline, x64 | measured clean under Intel SDE 9.48's CET emulation: gated_config all-inline on `probe_app_cet`, `call_original` + `return_from`, `set_reg(SP)`, 11 call_original edge cases; UHH added no shadow-stack violation |
-| Breakpoint, hw | not measurable under SDE (the INT3 takes the thread out of SDE; execute DRs never match SDE's code cache) |
-| x86 | not measurable under SDE; moot, Windows does not enforce user shadow stacks for WoW64 |
-| breakpoint/hw `call_func` | refused (returns 0, one stderr warning) when the target has shadow stacks |
-| breakpoint CALL/RET | stepped in place (not emulated) under shadow stacks; never exercised |
-| `SetContextIpValidation` policy | ⬜ unknown whether it applies to a debugger's SetThreadContext (displaced stepping would be refused) |
-| `BlockNonCetBinaries` policy | ⬜ `probe_api_agent.dll` is not /CETCOMPAT, so inline would be unavailable |
-
-*Workaround:* on CET targets prefer inline (x64); expect `call_func` to return 0 on
-breakpoint/hw. The planned hardware test is in the ROADMAP.
+| Every backend, x64 | gated_config and the transparency fixture (`call_func`, `call_original` + `return_from`) on /CETCOMPAT targets: exact, target's shadow stack live |
+| Strict mode (Exploit protection) | same rows pass: no shadow-stack violation is left for the kernel to fix up |
+| breakpoint/hw `call_func` | works: the callee is entered through a real `call` from a 3-byte stub; an abandoned callee's shadow frames are dropped (SSP restored) |
+| breakpoint/hw `call_original` without `return_from` | under shadow stacks the original cannot run a second time (its shadow entry is gone): the hooked function returns the original's result, with one warning |
+| `SetContextIpValidation` policy | does not refuse a debugger's thread-context changes (displaced stepping, freeze moves, call stub), strict mode included |
+| `BlockNonCetBinaries` policy | breakpoint/hw work; inline needs the agent and the callback module linked /CETCOMPAT, otherwise the session fails cleanly (`LoadLibraryW failed for probe_api_agent.dll`) |
+| x86 | Windows enforces no shadow stack for WoW64; a WoW64 process does not even start under `BlockNonCetBinaries` |
 
 ## Visibility to the target (anti-debug)
 
