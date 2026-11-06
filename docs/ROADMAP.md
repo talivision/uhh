@@ -2107,6 +2107,66 @@ another branch), logs-wedge-{exit x64, kill + suspend x86} (`wedged=0`: the wedg
   addressing, erase/insert/delete, scroll regions). Rows are read as they leave the screen and the report is parsed
   whole. The assertions are unchanged.
 
+## CI residuals (2026-11-07, branch `ciresid`, regress `cx2-cosample-*`, `lifecycle-unload-unseen-*`, `transparency-*`)
+Three residuals of merge-frida's CI run 42256070700 (e186402). Diagnostics ran on a scratch branch `ciresid-diag`
+(never merged; deleted after) whose jobs pushed their full logs plus linker maps of the agent and targets to
+`diaglogs/cr-<run>-<job>` branches (git-readable, no API token), so crash stacks could be symbolized.
+- ✅ (R3, L5 family) **lifecycle-detach-early-*-inline: the target died 0xC0000005 on an agent thread while
+  hunt_dll unloads.** Reproduced on CI (diag run 42262469609, 16 x64 jobs x ~214 iterations of every
+  `lifecycle-detach-early-*` row, merge-frida's code): 51 failures in ~13,700 inline/mixed rows (35 x
+  early-120-inline, 14 x early-30-inline, 1 x early-120-mixed, 0 breakpoint/hw), on every CPU type, all with ONE
+  signature: `exception 0xc0000005 at probe_api_agent.dll+0x371f7 (write of 0x7ff...1040 (unmapped))`, stack
+  (symbolized with the job's linker map) `MoveSmall6` <- `safetyhook::trap_threads` <- `InlineHook::disable` <-
+  `MidHook::disable` <- `frozen<probe_agent_stop lambda>` (+0x21ca) <- `probe_agent_stop` (+0x9e25, the thread's
+  start) -- the frames of merge-frida's CI failure. The agent's STOP thread (the remote thread a detach starts at
+  probe_agent_stop) restored HuntWork's original bytes into hunt_dll after the program had unloaded it (refcount 0:
+  unmapped): the UNLOAD_DLL event (reported AFTER the view is gone) was still queued behind the detach's own
+  events, so the request was not yet UNLOADED. L5 had guarded the install side only. Fix (agent.cpp
+  `disable_hook`): the final unhook skips a site that is not mapped executable code (nothing to restore) or that
+  already holds the original bytes (the DLL mapped again at the same base: a fresh copy), and the write is
+  SEH-guarded (an unmap completing meanwhile -- a thread suspended inside its unmap system call still finishes
+  it); a hook whose write faulted is abandoned in place, never touched again. Deterministic check
+  `lifecycle-unload-unseen-<cfg>` (every config): the test-hook controller (`UHH_TEST_DEFER_UNLOAD=hunt_dll.dll`,
+  probe_api_testhooks) leaves that unload unprocessed, as if still queued; lifecycle_target's new `dllonce`
+  command loads hunt_dll, calls HuntWork (its probe goes active and hits) and unloads it; then the detach. Before
+  (VM x64, the fix reverted): inline and mixed DEAD 0xC0000005 with the same frames (`#4 +0x21ca`, `#5` the stop
+  thread's start); breakpoint/hw PASS (removing an INT3/DR at an unmapped address fails harmlessly in the
+  controller). After: 4/4 on both arches. CI_R3_AFTER
+- ✅ (R2) **cx2-cosusp-breakpoint (x64)**: the failing condition was the one the message did not print -- `first`,
+  the program's own SuspendThread of its worker returned 1, not 0: a suspension of the CONTROLLER's was in place at
+  that instant; prev/ran/ret were right (the guard left exactly the program's suspension). Cause: call_original's
+  20 ms "left the original?" poll suspended the thread around its GetThreadContext (window ~tens of us per 20 ms);
+  a program suspending that thread then sees it -- a side effect (gospel), not a guard bug. Fix: the poll reads
+  the context without a suspension. On x64 GetThreadContext of a running thread is a consistent snapshot (taken
+  in an APC on that thread) and leaves the suspend count alone. x86 residual: a 32-bit (WOW64) controller's
+  GetThreadContext suspends the thread INSIDE the call -- measured with a standalone 32-bit program on the VM
+  (another thread reads the worker's context once per ms while a sampler loops SuspendThread/ResumeThread on it:
+  3,639 of 3.3 M samples saw prev=1; `none` 0); NtQueryInformationThread(ThreadWow64Context) is refused to 32-bit
+  callers (STATUS_INVALID_INFO_CLASS) and Wow64GetThreadContext suspends the same way (5,240) -- inherent to a
+  32-bit debugger short of switching to 64-bit code; the call stays GuardTouch'd. New check `cx2-cosample-<b>`
+  (susp_target `cosample`): the program samples its worker's suspend count for up to 1 s while the worker is
+  inside a call_original (co_hold(2), under the 5 s limit; the wrap must complete, ret 38): x64 wants 0 foreign
+  suspensions, x86 <= 1% (the WOW64 residual, reported). Before (VM x64, the poll reverted): foreign=43,193 of
+  1.25 M samples (breakpoint), 389 of 436 k (hw). After: 0 of 1.26 M / 277 k; x86 987 of 493 k / 138 of 190 k
+  (0.2% / 0.07%: the residual). The cosusp/evsusp failure message now prints `first`. CI_R2_AFTER
+- ✅ (R1) **transparency-* on the Xeon 6973P-C (AMX) runner: the target's own stack overflow died on every
+  backend** (merge-frida: 14 of 18 rows; inline's single run includes `ovf`, so all its modes failed with "no
+  target row"). Environmental, not UHH: the overflow's exception frame is a CONTEXT plus the XSAVE area of every
+  XCR0 feature in the STANDARD layout, whatever is in use -- measured with tp_target's diagnostics (the overflow
+  filter records the frame, the dispatch's position and the stack's committed range): XSTATE length 328-376
+  bytes / frame ~1.8 KB on AVX2 hosts (EPYC 7763, 9V74), 1,920-1,976 / ~3.4 KB with AVX-512 (Xeon 8370C, EPYC
+  9V45), ~1.95 KB on the VM (Skylake, AVX), the same for control (no debugger), a bare ctypes debugger (with and without a
+  Get/SetThreadContext per exception) and every UHH backend with the probe on tp_ovf or elsewhere. Windows leaves
+  the faulting frame 16.4-20.4 KB above the never-committed bottom page (random: where in a page the overflow
+  strikes), so with AMX's 11,008-byte area (frame ~12 KB) the dispatch, the filter and RtlUnwindEx land within
+  0-4 KB of reserved memory -- the "AV in the unwind, read of ... reserved, not committed" seen before -- with or
+  without a tool. Model on the VM (tp_target's diagnostic knob `TP_OVF_PAD=N`: the overflow filter touches N more bytes, standing in for a bigger frame; Windows' default guarantee; 12 runs per cell): every mode survives at N <= 10 KB and dies at N >= 12 KB; in the transition (10.5-11.5 KB -- about what AMX adds to the frame) control (no debugger) survived 19/36, a bare debugger 19/36, UHH breakpoint/hw/inline 54/108: the same margin. AMX_EVIDENCE Fix (test): tp_target's ovf thread reserves the stack its own overflow's dispatch
+  needs on this CPU (SetThreadStackGuarantee(CONTEXT + CPUID(0xD,0).EBX + 16 KB), as a program relying on catching
+  its overflow must; `TP_OVF_NO_GUARANTEE=1` keeps Windows' default). The check still proves TR9 (a callback's
+  overflow must not cost the thread its guard page: without the restore the program's next overflow has no guard
+  page and dies) on every host. UHH needs no change; inline's callback-time lift (g_cb_guarantee) is a no-op
+  under the program's equal guarantee.
+
 ## Later
 - ✅ x86 cumulative-session flakiness (possibly the same handle double-close; recheck) -- CLOSED with evidence (cfnest). The note dates from the first checkpoint (c617de4); its suspected cause, review finding I6 (handles closed twice on the launch failure path), was fixed long since. Rechecked with `ar_driver --repeat`: 60 sessions in ONE controller process, backends in turn (breakpoint, hw, inline), each a call_func + runtime data watch whose callback call_funcs during another thread's call: every session exact, nothing dropped, the controller's handle count flat (x64 73 -> 73, x86 89 -> 89). Regress `sessions-repeat` keeps it covered (also exercises the per-run callback-fiber host). (Separately: `callfunc-kill-reuse` -- inline, needs the OS to hand a killed thread's id to a new thread of the same process within 3000 creations -- failed on the shared VM in Nov-06 evening runs on the cfnest build AND on an unmodified baseline build (2/2): system-wide thread-id reuse under other agents' load, not a UHH regression.)
 - ✅ PDB-only symbols (`module!InternalFunc`), Microsoft symbol server via dbghelp+symsrv and `_NT_SYMBOL_PATH`, export/function enumeration (`uhh_trace --list`) — engine by Codex, wired into the library; suite checks added
