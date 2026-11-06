@@ -6953,6 +6953,32 @@ static void ctrl_leave(probe_session *s) {
     if (g_ctrl_sessions.fetch_sub(1) == 1) g_ctrl_hit = false;   // the next session starts clean
 }
 
+#if defined(UHH_TEST_HOOKS)
+// UHH_TEST_DIE_AFTER_HIT_MS=ms (test-only build): once a user probe has been hit, after the
+// first exception event that was continued with its thread not mid-step (the hit's thread
+// runs on), wait ms -- no event, no guard sync meanwhile -- and die (rc 96). The program
+// suspends that thread meanwhile; the guard must leave that suspension alone (regress
+// cx2-evsusp-*: the event thread used to stay on the guard's list until the next sync).
+static void test_die_after_hit(probe_session *s, const DEBUG_EVENT &ev) {
+    static const long ms = [] { const char *v = std::getenv("UHH_TEST_DIE_AFTER_HIT_MS"); return v ? std::atol(v) : 0L; }();
+    if (ms <= 0 || ev.dwDebugEventCode != EXCEPTION_DEBUG_EVENT || s->stepping.count(ev.dwThreadId) ||
+        s->cur_fiber || !s->calls.empty() || s->exited)
+        return;
+    uint64_t hits = 0;
+    for (auto &p : s->probes) if (!p->internal) hits += p->hits;
+    if (!hits) return;
+    Sleep((DWORD)ms);
+    const probe_agent_guard *g = s->shared ? &s->shared->guard : nullptr;
+    std::string listed;
+    for (LONG i = 0; g && i < g->held_count && i < (LONG)PROBE_AGENT_GUARD_TIDS; ++i)
+        listed += (listed.empty() ? "" : ",") + std::to_string((unsigned long)g->held_tids[i]);
+    std::fprintf(stderr, "probe: test: dying %ld ms after continuing thread %lu (guard enabled=%ld held=[%s])\n",
+                 ms, (unsigned long)ev.dwThreadId, g ? (long)g->enabled : -1L, listed.c_str());
+    std::fflush(nullptr);
+    TerminateProcess(GetCurrentProcess(), 96);
+}
+#endif
+
 extern "C" int probe_run(probe_session *s) {
     if (!s || !s->launched) { if (s) set_error(s, "session is not launched"); return 0; }
     if (s->ran) { set_error(s, "session already ran"); return 0; }
@@ -7003,6 +7029,7 @@ extern "C" int probe_run(probe_session *s) {
         bool ok = service_event(s, event);
 #if defined(UHH_TEST_HOOKS)
         if (g_test_die_on_continue) { std::fflush(nullptr); TerminateProcess(GetCurrentProcess(), 97); }
+        test_die_after_hit(s, event);
 #endif
         if (!ok) break;
     }

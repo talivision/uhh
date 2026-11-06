@@ -20,7 +20,7 @@
 #define CB(n) extern "C" void n(probe_context *);
 CB(co_on_fact) CB(co_on_throw) CB(co_on_seh) CB(co_on_jump) CB(co_on_add) CB(co_on_outer) CB(co_on_slow)
 CB(co_on_after) CB(co_on_inner) CB(co_on_nargs) CB(co_on_fast) CB(co_on_this) CB(co_on_args8) CB(co_on_mid)
-CB(co_on_prologue) CB(co_on_ret) CB(co_on_vslow) CB(co_on_cbf) CB(co_on_late) CB(co_on_spin)
+CB(co_on_prologue) CB(co_on_ret) CB(co_on_vslow) CB(co_on_cbf) CB(co_on_late) CB(co_on_spin) CB(co_on_hold)
 struct co_cfg { uint32_t backend; };
 struct co_bigcfg { uint32_t backend, n; unsigned char pat[1000]; };   // see co_callbacks.cpp
 
@@ -74,7 +74,8 @@ int main(int argc, char **argv) {
     else if (k == "cbfault") ok = add("co_cbf", co_on_cbf, bk);
     else if (k == "spin") ok = add("co_add", co_on_spin, bk);
     else if (k == "rep") ok = add("CoRepSite", co_on_spin, bk);
-    else if (k == "susp") ok = add("co_add", co_on_spin, bk);
+    else if (k == "susp" || k == "evsusp") ok = add("co_add", co_on_spin, bk);
+    else if (k == "cosusp") ok = add("co_hold", co_on_hold, bk);
     else if (k == "late" || k == "cfgfree" || k == "many" || k == "manydead") {
         static co_bigcfg big{};                  // larger than PROBE_AGENT_CONFIG_CAP (256)
         big.backend = bk; big.n = (uint32_t)sizeof(big.pat);
