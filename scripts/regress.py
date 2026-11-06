@@ -9109,8 +9109,9 @@ def check_cx2_review():
                 bad.append("controller ended before it was killed (the call_original was not in flight)")
             if rc != 0: bad.append(f"target_rc=0x{rc:x}")
             if row.get("first") != 0 or row.get("prev") != 1 or row.get("ran_while_suspended") != 0:
-                bad.append(f"ResumeThread prev={row.get('prev')} (want 1: the program's own suspension) "
-                           f"ran_while_suspended={row.get('ran_while_suspended')} (want 0)")
+                bad.append(f"SuspendThread first={row.get('first')} (want 0: no suspension of the controller's in place "
+                           f"when the program suspends) ResumeThread prev={row.get('prev')} (want 1: the program's own "
+                           f"suspension) ran_while_suspended={row.get('ran_while_suspended')} (want 0)")
             want = 76 if case == "cosusp" else 5
             if row.get("done") != 1 or row.get("ret") != want: bad.append(f"target row={row} (ret want {want})")
             listed = re.search(r"held=\[([^\]]*)\]", died)
