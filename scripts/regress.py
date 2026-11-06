@@ -9132,7 +9132,7 @@ def check_cx2_review():
             except Exception as e:
                 record(name, False, repr(e))
 
-    # cx2-cosample-<b>: the same call_original (co_hold, ~3 s inside the original) with the controller
+    # cx2-cosample-<b>: the same call_original (co_hold, ~1.5 s inside the original) with the controller
     # staying; the program samples its worker's suspend count for 1 s. Any suspension of the
     # controller's in place at a sample is visible to the program (SuspendThread returns 1, not 0):
     # call_original's 20 ms "left the original?" poll suspended the thread for its context read,
@@ -9168,9 +9168,9 @@ def check_cx2_review():
             if row.get("foreign") != 0: bad.append(f"foreign={row.get('foreign')} of {row.get('samples')} samples (want 0)")
             if (row.get("samples") or 0) < 100 or row.get("in_original") != 1:
                 bad.append(f"samples={row.get('samples')} in_original={row.get('in_original')} (want >= 100, 1)")
-            if row.get("done") != 1 or row.get("ret") != 76 or wraps != 1:
+            if row.get("done") != 1 or row.get("ret") != 38 or wraps != 1:
                 bad.append(f"target row={row} hold_logs={wraps}")
-            record(name, not bad, " ".join(bad) or f"samples={row.get('samples')} foreign=0 ret=76 call_original completed")
+            record(name, not bad, " ".join(bad) or f"samples={row.get('samples')} foreign=0 ret=38 call_original completed")
         except Exception as e:
             record(name, False, repr(e))
         finally:

@@ -3,7 +3,7 @@
 //   susp_target evsusp: the worker's probe hit (co_add) was handled and continued; it counts on.
 //   susp_target cosusp: the worker is inside co_hold, run by its callback's call_original.
 //   susp_target cosample: the worker is inside co_hold, run by call_original, and the controller
-//     stays; the main thread samples the worker's suspend count for 1 s (SuspendThread +
+//     stays; the main thread samples the worker's suspend count for <= 1 s (SuspendThread +
 //     ResumeThread in a loop): a suspension of the CONTROLLER in place at a sample shows as a
 //     previous count of 1 ("foreign"), a side effect the program can see. No gate 2.
 // Gate 1 (stdin): the controller is attached and its probe active -> the worker goes. The main
@@ -21,8 +21,8 @@
 
 static volatile LONG g_spun = 0, g_spin_stop = 0;
 CO_EXPORT intptr_t co_add(intptr_t a, intptr_t b) { return a * 3 + b; }
-CO_EXPORT intptr_t co_hold(intptr_t x) {                   // an original that runs ~3 s, counting
-    for (int i = 0; i < 300; ++i) { InterlockedIncrement(&g_spun); Sleep(10); }
+CO_EXPORT intptr_t co_hold(intptr_t x) {                   // an original that runs ~x * 0.75 s, counting
+    for (int i = 0; i < x * 75; ++i) { InterlockedIncrement(&g_spun); Sleep(10); }
     return x * 19;
 }
 
@@ -30,7 +30,7 @@ static HANDLE g_go;
 static intptr_t g_worker_ret;
 static DWORD WINAPI worker(void *p) {
     WaitForSingleObject(g_go, INFINITE);
-    if (p) { g_worker_ret = co_hold(4); return 0; }
+    if (p) { g_worker_ret = co_hold((intptr_t)p); return 0; }   // cosusp: 4 (~3 s); cosample: 2
     g_worker_ret = co_add(1, 2);
     while (!g_spin_stop) { InterlockedIncrement(&g_spun); Sleep(1); }
     return 0;
@@ -46,7 +46,8 @@ int main(int argc, char **argv) {
     const bool co = sample || !strcmp(k, "cosusp");
     if (!co && strcmp(k, "evsusp")) { fprintf(stderr, "susp_target: unknown case '%s'\n", k); return 2; }
     g_go = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    HANDLE w = CreateThread(nullptr, 0, worker, co ? (void *)1 : nullptr, 0, nullptr);
+    // cosample: an original shorter than call_original's 5 s limit even at a 15.6 ms timer (150 x Sleep(10))
+    HANDLE w = CreateThread(nullptr, 0, worker, co ? (void *)(intptr_t)(sample ? 2 : 4) : nullptr, 0, nullptr);
     if (!g_go || !w) return 4;
     printf("{\"kind\":\"waiting\",\"pid\":%lu,\"tid\":%lu}\n", GetCurrentProcessId(), GetCurrentThreadId()); fflush(stdout);
     if (!read_gate()) return 3;                                  // gate 1: the probe is active
@@ -55,13 +56,13 @@ int main(int argc, char **argv) {
     if (sample) {
         long n = 0, foreign = 0, in_original = 0;
         const ULONGLONG t0 = GetTickCount64();
-        while (GetTickCount64() - t0 < 1000 && g_spun < 250) {      // well inside co_hold (300 x 10 ms)
+        while (GetTickCount64() - t0 < 1000 && g_spun < 120) {      // well inside co_hold (150 x 10 ms)
             const DWORD prev = SuspendThread(w);
             if (prev == (DWORD)-1) break;
             ResumeThread(w);
             ++n; if (prev != 0) ++foreign;
         }
-        in_original = g_spun < 300;
+        in_original = g_spun < 150;
         const DWORD done = WaitForSingleObject(w, 30000);
         printf("{\"kind\":\"co\",\"case\":\"%s\",\"samples\":%ld,\"foreign\":%ld,\"in_original\":%ld,\"done\":%d,\"ret\":%lld}\n",
                k, n, foreign, in_original, done == WAIT_OBJECT_0, (long long)g_worker_ret);
