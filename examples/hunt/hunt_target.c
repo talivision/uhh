@@ -28,7 +28,7 @@
  *   guard   N times: a fresh PAGE_GUARD page touched through guard_touch (its first instruction
  *           is the access): the program's __except must see exactly one guard violation each
  *           time, the second touch reads the value (probe guard_touch, e.g. with uhh_trace)
- *   twin    N times: twin_a\twin.dll (TwinWork returns 1), unload, twin_b\twin.dll (returns 2)
+ *   twin    N times: twin_a\twin.dll (TwinWork returns 0x101), unload, twin_b\twin.dll (0x202)
  *           -- the same base, different code at the same RVA (probe twin.dll!TwinWork)
  *   early   the handle is opened and one read made in a TLS callback at process attach
  *           (before the entry point); then N reads from main
@@ -230,7 +230,12 @@ static DWORD WINAPI owndr_worker(void *p) {
 }
 
 /* ---- guard: an instruction displaced by a probe touches a guard page ---- */
+/* __fastcall: on x86 too the pointer arrives in a register, so the access IS the first
+   instruction (the probe site). Exported undecorated on x86 as well. */
 __declspec(dllexport) __declspec(noinline) int __fastcall guard_touch(volatile char *p) { return *p; }
+#ifndef _WIN64
+#pragma comment(linker, "/EXPORT:guard_touch=@guard_touch@4")
+#endif
 static int guard_filter(DWORD code) {
     return code == STATUS_GUARD_PAGE_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
 }
@@ -361,8 +366,8 @@ int main(int argc, char **argv) {
         while (n && dir[n - 1] != '\\') --n;
         dir[n ? n - 1 : 0] = 0;
         for (DWORD i = 0; i < g_n; ++i) {
-            if (twin_call(dir, "twin_a") != 1) InterlockedIncrement(&g_bad); else InterlockedIncrement(&g_twin);
-            if (twin_call(dir, "twin_b") != 2) InterlockedIncrement(&g_bad); else InterlockedIncrement(&g_twin);
+            if (twin_call(dir, "twin_a") != 0x101) InterlockedIncrement(&g_bad); else InterlockedIncrement(&g_twin);
+            if (twin_call(dir, "twin_b") != 0x202) InterlockedIncrement(&g_bad); else InterlockedIncrement(&g_twin);
         }
     } else if (!strcmp(sc, "early")) {
         for (DWORD i = 0; i < g_n; ++i) hunt_read();

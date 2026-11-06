@@ -70,6 +70,7 @@ struct Probe {
     // address + insn_len), shared by every thread (see displaced_trampoline). 0 = none yet;
     // dtramp_site is the address it was built for (a module reloaded elsewhere gets a new one).
     uint64_t dtramp = 0, dtramp_site = 0;
+    std::vector<unsigned char> dtramp_insn;   // the instruction bytes that copy holds
     probe_callback callback = nullptr;
     uint32_t flags = 0;
     std::vector<unsigned char> config;
@@ -4384,7 +4385,9 @@ static uint64_t thread_scratch(probe_session *s, DWORD tid, uint64_t site) {
 // as are a watch hit in it (handle_hw) and a thread inside it at a detach. 0 = cannot build one
 // (the caller takes the stepping path).
 static uint64_t displaced_trampoline(probe_session *s, Probe &p) {
-    if (p.dtramp && p.dtramp_site == p.address) return p.dtramp;
+    // Reused only for the same instruction at the same address: a module reloaded at the same
+    // base may hold different code there (another build of the DLL), re-read by arm_breakpoint.
+    if (p.dtramp && p.dtramp_site == p.address && p.dtramp_insn == p.orig_insn) return p.dtramp;
     if (!p.displaced_ok || p.orig_insn.empty() || !p.address || p.insn_len != p.orig_insn.size()) return 0;
     auto &pool = s->dtramp_pool[p.address >> 30];
     if (pool.first + 64 > pool.second) {
@@ -4416,7 +4419,7 @@ static uint64_t displaced_trampoline(probe_session *s, Probe &p) {
     if (!remote_write(s->pi.hProcess, at, code.data(), code.size(), &wrote) || wrote != code.size()) return 0;
     FlushInstructionCache(s->pi.hProcess, (void *)(uintptr_t)at, code.size());
     pool.first += 64;
-    p.dtramp = at; p.dtramp_site = p.address;
+    p.dtramp = at; p.dtramp_site = p.address; p.dtramp_insn = p.orig_insn;
     probe_session::DTramp d; d.site = p.address; d.len = p.insn_len; d.probe = &p;
     s->dtramps[at] = d;
     return at;
@@ -5636,7 +5639,9 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             bool armed = still_armed(s, step->second.site);
             Probe *owner = armed ? probe_at(s, step->second.site) : nullptr;
             if (ok && owner) restore_original(s->pi.hProcess, step->second.site, owner->original);
-            if (ok && owner && code == STATUS_GUARD_PAGE_VIOLATION && ex.NumberParameters >= 2) {
+            // (Whoever owns the copy -- a breakpoint, a hardware probe's trampoline, a probe gone
+            //  since: the re-run at the real instruction must raise the guard fault itself.)
+            if (ok && code == STATUS_GUARD_PAGE_VIOLATION && ex.NumberParameters >= 2) {
                 // The copy's access consumed the page's one-shot guard: put it back, so the
                 // re-run raises the guard violation the program expects at the real instruction.
                 MEMORY_BASIC_INFORMATION m{};

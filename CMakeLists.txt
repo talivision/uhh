@@ -417,16 +417,16 @@ add_library(hunt_dll SHARED examples/hunt/hunt_dll.c)
 foreach(v a b)
     add_library(twin_${v} SHARED examples/hunt/twin_dll.c)
     if(v STREQUAL "a")
-        target_compile_definitions(twin_${v} PRIVATE TWIN_VALUE=1)
+        target_compile_definitions(twin_${v} PRIVATE TWIN_VALUE=0x101)
     else()
-        target_compile_definitions(twin_${v} PRIVATE TWIN_VALUE=2)
+        target_compile_definitions(twin_${v} PRIVATE TWIN_VALUE=0x202)
     endif()
     set_target_properties(twin_${v} PROPERTIES OUTPUT_NAME twin
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/$<CONFIG>/twin_${v}
         LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/$<CONFIG>/twin_${v}
         ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/twin_${v}_lib/$<CONFIG>
         PDB_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/$<CONFIG>/twin_${v})
-    target_link_options(twin_${v} PRIVATE /DYNAMICBASE:NO /BASE:0x5E000000 /INCREMENTAL:NO)
+    target_link_options(twin_${v} PRIVATE /DYNAMICBASE:NO /BASE:0x5E000000 /INCREMENTAL:NO /OPT:NOICF)
     set_property(TARGET twin_${v} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 endforeach()
 add_executable(hunt_driver examples/hunt/hunt_driver.cpp examples/hunt/hunt_callbacks.cpp examples/gated_config/callbacks.cpp)
