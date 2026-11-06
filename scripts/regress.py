@@ -5941,29 +5941,46 @@ def check_logs_order(threads=4, count=2000):
     """Per-thread order across MIXED backends: each thread alternates an inline-probed call
     and a breakpoint/hw-probed call (seq 0,1,2,...; the second logs with a stack). Inline
     logs cross the shared ring, breakpoint/hw logs are queued by the debugger -- every
-    thread's records must still arrive in its own order, all of them, nothing dropped."""
+    thread's records must still arrive in its own order, all of them, nothing dropped: each
+    thread's sequence is EXACTLY 0, 1, ..., 2*count-1, no other record, and the report accounts
+    for every call (hits == logs_written == delivered, nothing dropped or interrupted)."""
     if not exe("logs_driver.exe") or not exe("logs_target.exe"):
         return missing("logs-order", "logs_driver/logs_target")
+    want_seq = list(range(2 * count))
     for a, b in (("inline", "breakpoint"), ("inline", "hw")):
         name = f"logs-order-{a}+{b}"
         try:
             r, o, bad = logs_run(a, b, ["--mode", "order", "--threads", threads, "--count", count], timeout=600)
-            by, nostack = {}, 0
+            by, nostack, foreign, delivered = {}, 0, [], 0
             for x in o:
                 if x.get("kind") != "probe_log":
                     continue
+                delivered += 1
                 m = re.fullmatch(r"o (\d+)", str(x.get("message", "")))
-                if m:
-                    v = int(m.group(1))
-                    by.setdefault(x.get("tid"), []).append(v)
-                    nostack += bool(v % 2) and not x.get("stack")
-            inversions = sum(sum(1 for p, q in zip(s, s[1:]) if q <= p) for s in by.values())
+                if not m or not isinstance(x.get("tid"), int):
+                    foreign.append(f"{x.get('tid')}:{str(x.get('message', ''))[:60]!r}")
+                    continue
+                v = int(m.group(1))
+                by.setdefault(x.get("tid"), []).append(v)
+                nostack += bool(v % 2) and not x.get("stack")
+            wrong = {tid: seq for tid, seq in by.items() if seq != want_seq}
+            first_wrong = ""
+            for tid, seq in list(wrong.items())[:1]:
+                i = next((j for j, (p, q) in enumerate(zip(seq, want_seq)) if p != q), min(len(seq), len(want_seq)))
+                first_wrong = f" tid {tid}: len={len(seq)} first diff @{i}: got {seq[i:i + 3]} want {want_seq[i:i + 3]}"
             total = sum(map(len, by.values()))
+            calls = 2 * threads * count
             rep = report(o)
-            ok = (r.returncode == 0 and not bad and len(by) == threads and total == 2 * threads * count and
-                  inversions == 0 and nostack == 0 and rep.get("log_dropped") == 0)
-            record(name, ok, f"threads={len(by)}/{threads} logs={total}/{2 * threads * count} "
-                             f"out_of_order={inversions} stack_missing={nostack} dropped={rep.get('log_dropped')}")
+            acct = {k: rep.get(k) for k in ("hits", "logs_written", "log_dropped", "callbacks_interrupted", "app_exit", "error")}
+            acct_ok = (rep.get("hits") == calls and rep.get("logs_written") == calls == delivered and
+                       rep.get("log_dropped") == 0 and rep.get("callbacks_interrupted") == 0 and
+                       rep.get("app_exit") == 0 and rep.get("error") is None)
+            ok = (r.returncode == 0 and not bad and len(by) == threads and total == calls and not wrong and
+                  not foreign and nostack == 0 and acct_ok)
+            record(name, ok, f"threads={len(by)}/{threads} logs={total}/{calls} wrong_seq_threads={len(wrong)} "
+                             f"foreign={len(foreign)} stack_missing={nostack} report={acct}"
+                             + (first_wrong if wrong else "") + (f" foreign_e.g.={foreign[:2]}" if foreign else "")
+                             + (f" bad_json={bad[:1]}" if bad else ""))
         except Exception as e:
             record(name, False, repr(e))
 
