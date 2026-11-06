@@ -73,8 +73,9 @@ int main(int argc, char **argv) {
     // probe_close from here.
     // A session that ends on its own (the target exited / died) before the detach cue gets
     // its final accounting from probe_report on the runner (probe_close prints none then);
-    // a detach reports through probe_close's "probe: detached:" line. phase: 0 running,
-    // 1 runner reporting, 2 reported, 3 main closing -- never both, never concurrently.
+    // a detach reports through probe_close's "probe: detached:" line, and a target that dies
+    // after the cue but before the detach landed through its "probe: ended:" line. phase:
+    // 0 running, 1 runner reporting, 2 reported, 3 main closing -- never both, never concurrently.
     HANDLE attached = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     bool attach_ok = false; int run_ok = 0;
     std::atomic<int> phase{0};

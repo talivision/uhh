@@ -638,7 +638,7 @@ process would differ anyway: Chromium's sandbox patches ntdll stubs in its rende
   controller peak 1-7 MB private, growth <= 3 MB over a run.
 - (test-side) `realbig-robocopy-detach-inline` once finished the copy before its detach (a warm
   copy is ~4 s under inline; the plain first copy of fresh files 15-55 s): it now attaches as the
-  copy starts and detaches 1.5 s later.
+  copy starts and detaches 1.5 s later. (Still too fast for a runner once: now gated, see Follow-ups F2.)
 - (test-side, realapps) `realapps-ps-fileversion-*` failed twice on x64 with one `powershell.exe`
   / `conhost.exe` row "missing": a bare image path stands for every process of that image, and
   another agent's instance that ended between the plain runs and the instrumented one was counted
@@ -1252,6 +1252,10 @@ by itself, nothing dropped), detach while callbacks run / block in call_original
   x64: every lifecycle-* check PASSED on the final code in some run, `--only interrupt` 3/3,
   `--only gated` 17/17, `--only attach` 11/11 (attach-new-inline failed once "probe never became
   active", then passed 3 runs in a row -- looks like a load flake, not re-investigated).
+- ✅ (L11, runner signature, runfix2) controller killed early in an inline/mixed attach -> target 0xC0000005 with no
+  unhandled report: the agent wrote an install round UNFROZEN when its FREEZE raise came back unserviced (SafetyHook's
+  trap path made the ntdll stub page non-executable). Fixed in the agent; `lifecycle-killed-in-freeze-*` (CI section,
+  "Runner findings").
 - 🔧 (L11, likely fixed) x64 `lifecycle-controller-killed-breakpoint` was intermittent (1 of 4 kill timings fails
   in ~1 of 3 runs): the target still dies after the controller is killed, 0x80000004 at
   lifecycle_target+0x194d (a return address -- call_original's in-place run / its return-catch
@@ -1506,10 +1510,10 @@ then fixed. Fixtures: `ctrl_target faultmix`, `co_target susp / many / manydead`
   (no agent service thread, Windows < 8.1): an unconditional entry, as before. The check runs both
   deaths -- before the implicit suspension and with it in place (on a program-suspended thread):
   the guard must leave exactly the program's one suspension. After: PASS; `cxlib-touchkill-hw` PASS.
-  Open (same class, not changed): guard_sync's unconditional entries for the event threads and the
-  call_func/call_original thread (`handling`, `in_call_tid`) stay listed until the next sync, i.e.
-  past ContinueDebugEvent; a program that suspends such a thread right then and a controller death
-  before the next event would release it.
+  Open note (same class) -- ✅ closed by the follow-ups (F4 below): guard_sync's unconditional
+  entries for the event threads and the call_func/call_original thread (`handling`, `in_call_tid`)
+  stayed listed until the next sync, i.e. past ContinueDebugEvent; a program that suspended such a
+  thread right then and a controller death before the next event released it.
 - ✅ (X3) **Real.** inline agent: the thread table held 4096 thread ids and never freed a slot, so
   after 4096 distinct probe-hitting threads over the process's life every further thread ran its
   callbacks untracked (no active record): the detach drain counted 0 live callbacks, gave up after
@@ -1524,6 +1528,125 @@ then fixed. Fixtures: `ctrl_target faultmix`, `co_target susp / many / manydead`
   lifecycle,detach,callorig` 138/138 on x86, 136/137 + 1 SKIP on x64 -- `cxlib-killarm-hw` once:
   "controller-death guard unavailable (agent not ready within 5 s)" under VM load, so the hw probe was
   armed without the guard; `--only cxlib` 3 x 9/9 on reruns.
+
+## Follow-ups (2026-11-07, branch `followups`, regress `stream-live-*`, `realbig-robocopy-detach-*`, `lifecycle-target-dies-*`, `cx2-evsusp-*` / `cx2-cosusp-*`)
+- ✅ (F1, test-side) **`stream-live-*` absolute p99 bound vs a loaded machine.** Same build, VM under load:
+  p99 0.7-253 ms over 18 runs with every log delivered; one FAIL at 253 ms (x86 breakpoint), earlier 1102 ms
+  (x64 hw). Fix: the stream-latency calibration (citune) applied -- an uninstrumented writer (logstream_target,
+  a QPC-stamped line every ~5 ms) runs alongside as the noise sampler; arrivals are stamped with
+  QueryPerformanceCounter (the target's own clock, us). Quiet run (the sampler saw < 50 ms of stall): p99 < 250 ms
+  absolute, as before; noisy: p99 of (lag - the stall the sampler saw in that log's own window [event, arrival])
+  < 250 ms, so a real UHH latency regression on top of the machine's stalls still fails. TEMP = the build dir's
+  `uhh-latency-tmp` (as stream-latency: the profile's AV scan of the session file is not UHH's pipeline). Also
+  required as before: every log delivered, >= 90% before the target's final line. `_NoiseSampler.noise` is indexed
+  (bisect; equal to the old scan on random data) for ~31k samples per inline run. Evidence: VM (shared, other
+  agents' builds running) 3 runs x 3 backends per arch, 18/18 PASS: inline p99 11.6-74 ms, hw/breakpoint 0.9-144
+  ms; one x86 hw run was noisy (sampler stall 114.7 ms: judged on p99 net of it, 2.0 ms). CI: 10 runs per arch
+  (2 full-suite pushes + 2 x 4 repetitions, branch `followups-reps`), all PASS. Not discounted, reported:
+  `disk_run_max` (the sampler's own 120-byte appends) -- one quiet x86 inline run had a 622 ms disk stall and a
+  724 ms lag_max (p99 74 ms): a stall of the session file's disk still delays the writer's next batch (as in
+  stream-latency, by design not discounted); it would fail only if it held > 1% of the samples. The earlier
+  253 / 1102 ms failures could not be reproduced on demand (no before/after pair): they were single runs under load.
+- ✅ (F2, test-side) **`realbig-robocopy-detach-*` "robocopy ended during the attach"** (CI 42213960508, x86
+  breakpoint: a fast runner finished the whole copy during the attach; accounting exact). Fix: a gate -- the last
+  file of the tree in robocopy's order is held open with no sharing until the detach and the residue check are
+  done; robocopy (`/R:600 /W:1` in this scenario) retries it and finishes after the gate opens, exit 1, the copy
+  exact. On any machine the detach now lands while robocopy runs; `files_at_detach` reports how far the copy had
+  got. Before: merge-frida 921820c's CI (42225208495) failed this row on x64 AND x86. After: VM 2 runs per arch PASS
+  (files_at_detach 347-4266 of 10000, exit 1, copy exact, residue clean); CI 10 runs per arch PASS.
+- ✅ (F3) **No final accounting when the target dies right after a detach request** (x86
+  `lifecycle-target-dies-breakpoint`, ~1 in 20). Cause: probe_close from another thread asks probe_run to detach;
+  a target killed 0-5 ms later can end the session on its EXIT_PROCESS before probe_run acts on the request. Then
+  probe_run returns with the target exited and NOT detached, so probe_close printed no `probe: detached:` line --
+  and the caller had no way left to take the totals (lifecycle_driver's runner had yielded the report to the
+  closing thread; the session is gone after probe_close). Fix: probe_close prints `probe: ended: the target exited
+  before the detach (exit code N): hits= logs_written= log_dropped= in_flight=` (in_flight: callbacks the end
+  interrupted, as probe_report's callbacks_interrupted) whenever it asked a live session to stop and the target
+  ended first. Checks: `lifecycle-target-dies-*` gains `detach0` (killed at once after the request) and `late`
+  (test-hook `lifecycle_driver_th`, `UHH_TEST_STOP_LATE_MS=400`: probe_run acts on the request 400 ms late while
+  dispatching, the target dies 50 ms after it -- the race forced; must report via `probe: ended:`). Before (VM,
+  test hooks on 921820c's library): `late` FAILED 16/16 (4 configs x 2 runs x 2 arches, "no final accounting"),
+  and the natural race once more (x86 mixed `detach0`); 48 runs of `detach`/`detach0` without the hook passed
+  otherwise. After: VM 6 runs x 4 configs per arch PASS; `late` reported via `probe: ended:` 48/48, the natural race
+  hit once more (x86 `detach0`) and also reported `ended`; CI 10 runs per arch PASS (`late` in 5 of them).
+- ✅ (F4) **Guard event/call-thread window (X2 open note).** The controller-death guard listed, unconditionally,
+  each thread whose event was being handled until the NEXT guard sync (past its ContinueDebugEvent), the
+  call_original thread and every call_func callee thread for the whole call, and call_original's 20 ms poll
+  appended one entry per poll until the next event. A program that suspended such a thread after it ran on, then
+  a controller death: the guard resumed it, releasing the PROGRAM's suspension (side effect). Reproduced (new
+  `susp_target`, driven by `co_driver_th --module susp_target.exe`): `cx2-evsusp-<b>` -- the test-hook build
+  (`UHH_TEST_DIE_AFTER_HIT_MS=1500`) dies 1.5 s after continuing a probe hit's last event while the program has
+  suspended that thread (no event, no sync in between); `cx2-cosusp-<b>` -- the controller is killed while
+  call_original runs the original on a thread the program suspended. Before (unfixed library, VM): all four FAIL
+  on x64 and on x86, 2 of 2 runs per arch (the program's ResumeThread returned 0, want 1; the worker ran 17-21
+  iterations while "suspended"; the dying controller's guard list held the worker). Fix (a list of exactly the
+  suspensions in place, no new protocol): the handling of an event records whether its thread runs again
+  (call_func / call_original continued it, or call_original released it); guard_sync lists only stopped ones (at
+  the event, or suspended by us for the rest of the handling) plus call_func threads held by us (`call_held`);
+  the list is rewritten right before every continue of a handled event and right after each of our own
+  suspensions ends (call_original's poll and clear_slot, resume_after, release_held, ipc_thaw, the in-place
+  window, deferred hits); call_original's return catch is listed while its context is touched; the two context
+  calls on undispatched events (restore-resume, a late callee fault) are GuardTouch'd. Residual (microseconds):
+  between our ResumeThread of an explicit suspension and the re-sync right after it; and an event thread the
+  program suspended in the instant before its exception was reported (listed unconditionally while stopped).
+  After: VM `--only cx2` x86 10/10, x64 9/9 + touchprog SKIP (x64 has no implicit suspend); the dying
+  controller's guard list no longer held the worker; CI 10 runs per arch PASS; `--only cxlib` (the guard's
+  controller-death checks) PASS on both arches, VM and CI. Agent protocol unchanged (controller-side only).
+- ✅ (F5) **breakpoint/hw call_original left by an exception: later hits deeper on the stack got no callback.**
+  (Found when two cases added to co_target changed its x86 layout: `callorig-hunt-cppthrow-{breakpoint,hw}` x86
+  then failed deterministically, `co after` hits=3 logs=0 -- after3 no longer inlined.) Cause: the release of a
+  call_original whose original was left (C++ throw, SEH raise, longjmp) needed the thread to be seen AT OR ABOVE
+  the hit's frame (a probe hit there, or the 20 ms poll); a hit from a DEEPER frame was taken for a hit inside the
+  original -- counted, no callback (hits without logs) -- until the next hit at that level or the 5 s release
+  (other threads' hits held back meanwhile). Reproduced deterministically in `susp_target` (co_target untouched):
+  `deepthrow` / `deepseh` / `deepjmp` -- the original is left and caught above it, then the program calls a probed
+  function from a frame deeper than the left call's; `catchhit` -- the probed call is made inside the C++ catch
+  block itself (runs on the dispatch's stack, below the raise point, with the original's frame physically intact
+  -- its return address still in place). Fix (controller only, no protocol change), at a deeper hit of the call's
+  thread and in the 20 ms poll: (1) `co_slot_gone` -- the original's return address slot at the hit's SP no longer
+  holds the return address (the catching frame's later calls reused the stack; a copy within the 64 bytes just
+  below -- a thunk that moved its own return address -- counts as inside); (2) `co_unwound` -- when an exception was
+  raised on the call's thread during the call and the thread is below the raise point: a virtual unwind (dbghelp,
+  new `uhh_sym::unwind_frames`) that reaches the frame above the hit's straight from below the raise point -- not
+  through a frame between the raise point and the hit's frame (the original's, or a live callee's) -- means the
+  exception was already unwound past the original (x64: the catch funclet's consolidation frame unwinds into the
+  catching frame; x86: the catch block runs on the catching frame's EBP); on x86 the SEH chain must also hold no
+  registration between the raise point and the hit's frame. Either way the hit is rewound and the call released
+  (as for a hit above): the callback's call_original ends as before ("the original left without returning",
+  UHH_CALL_RELEASED, `-done` not logged, nothing interrupted), and the hit replays with its callback. Control case
+  `catchinside`: the exception is caught INSIDE the original (a probed call in that catch block, then a deeper
+  one): those hits stay inside the call (counted, no callback -- as inline) and the call returns normally.
+  Regress `callorig-deep-{deepthrow,deepseh,deepjmp,catchhit,catchinside}-{breakpoint,hw,inline}`: exact hits and
+  `co` logs, the target's row as uninstrumented, nothing dropped/interrupted, no 5 s release. Before (VM, the
+  unfixed library of 53490ed): x64 AND x86 4/12 -- every breakpoint/hw row of deepthrow/deepseh/deepjmp FAIL with
+  `co after` 5 of 10 logs, catchhit 0 of 5; inline PASS. With (1) only: 10/12 on both (catchhit still 0 of 5).
+  After: 15/15 on both arches; VM `--only callorig,callfunc,cx2,cxlib,hunt` (f08b9ff) x64 192/192 (+2 SKIP), x86
+  188/189 (`hunt-starve-breakpoint` timeout, a documented known row); 3 more VM runs per arch 17/17
+  (`callorig-deep,callfunc-registry`). CI: full suite on f08b9ff (run 42259248723) and cf25988 (run 42263598556) --
+  the only FAILs `stdout-console-*` on both arches (runner console, failing on merge-frida too); `callorig`
+  (callorig-hunt + callorig-deep) and `callfunc-registry` 5 repetitions per arch (temporary branch `f5-reps`, run
+  42263590965, deleted since): all PASS. Residuals: a left original whose slot still holds the return address and no
+  exception seen (longjmp, then a deeper call that leaves that slot alone) -- as before until the thread is seen
+  above / the slot changes; x86 only: during a phase-1 filter of a frame ABOVE the original (an original with no
+  SEH registration of its own) a hit in the filter releases the call early -- harmless unless the filter then
+  resumes execution in the original (EXCEPTION_CONTINUE_EXECUTION), when the callback's tail after call_original
+  does not run; x86 walks without FPO data (no PDB) are guarded by the SEH-chain condition only.
+- ✅ **`callfunc-kill-reuse` proved nothing on the VM** ("no thread reused the dead id in 3000 threads", every
+  run). Windows hands a freed thread id out again only once the id table's free list it went to has run dry (freed
+  ids queue behind it; per-CPU lists, the creating thread's CPU picks one) -- on a long-running machine that takes
+  more thread creations than 3000. The check now creates its precondition: after the kill, ar_target takes ids
+  fast -- threads created suspended and ended before they ever run (no callback, no hit), the creator moving across
+  the CPUs -- until one is given the dead id (budget 150 s / 4M ids); that thread and 19 more run cf_short. It
+  fails unless the dead id came back (reused=1, 20 threads). VM: x64 PASS after 4745 ids (500 ms), x86 after 4751
+  ids (563 ms); 3 more runs per arch 8256-8310 ids, <= 1.6 s; CI (fresh runners) PASS in both full-suite runs and
+  all 5 x 2 repetitions above.
+- Open, not caused here: x86 `lifecycle-controller-killed-inline` kill@early-0.05 target DEAD (0xC0000005 /
+  0xC00000FD) on windows-2022 runners, 2 of 8 reps (the known runner finding in the CI section, 2 of ~7 before).
+  Also failing on merge-frida 921820c's CI and unchanged here: `stdout-console-*` on both arches (runner console).
+- Verification (VM, c19bbd9 = the final code): `--only stream,realbig,lifecycle,cxlib,cx2` x64 81/81 + 2 SKIP
+  (x86-only touch checks), x86 81/81 + 2 SKIP (x64-only Edge rows); `--only callorig_hunt` 45/45 on both arches.
+  CI: full suite on 79d71e7 and c19bbd9 plus 2 x 4 repetitions of stream-live/realbig/lifecycle/cx2
+  (`followups-reps`): every row of the four items PASS on both arches.
 
 ## PowerShell capture findings (2026-11-06, owner: "high volume drops lines logged -- powershell logging"; the session file was complete, the PowerShell console showed fewer lines; regress `stdout-powershell-*`, `stdout-console-*`)
 
@@ -1660,9 +1783,15 @@ the report (count, valid JSON per line, CRC multiset of the lines, `seq` coverag
 - ✅ (9) Hot-patch `mov edi,edi` prologues (x86); 🔧 coexistence with Frida hooking the same function
 
 ## Production readiness (user decisions 2026-11-05)
-- 🔧 [fan-out] Intel CET shadow stacks (user-mode "Hardware-enforced Stack Protection", /CETCOMPAT): static audit done, every path that broke the shadow stack fixed or refused; **inline backend measured clean under Intel SDE's CET emulation (x64, 2026-11-06, below); the breakpoint/hw CET branches and the OS-level policies still need real CET hardware** (the test VM has no CET -- see below)
+- 🔧 [fan-out] Intel CET shadow stacks (user-mode "Hardware-enforced Stack Protection", /CETCOMPAT): static audit done, every path that broke the shadow stack fixed or refused; **measured on REAL CET hardware (CI windows-2025, shadow stacks enforced): every backend, incl. call_func / call_original + return_from, in compatibility AND strict mode; BlockNonCetBinaries works on breakpoint/hw, inline needs the /CETCOMPAT agent (branch cfnest)** -- details in "CET on real hardware (runfix2)" below; inline was also measured under Intel SDE's CET emulation (the test VM has no CET)
   - **The VM cannot test it:** its CPU is an Intel Core i5-6600 (Skylake, 2015 -- CET shipped with Tiger Lake / Zen 3), so `cet_probe` reports CPUID CET_SS=0, IBT=0, no OS CET_U state, RDSSP=0 and `EnableUserShadowStack=0` for a /CETCOMPAT process (Windows 10 19045, x64 and x86, under Proxmox/KVM). A newer host would also need a hypervisor that passes CET to the guest (KVM CET virtualization is recent). So every `cet-*` row on the VM proves only that /CETCOMPAT targets work under all backends, NOT that UHH survives an enforced shadow stack.
-  - **Real CET hardware: GitHub-hosted `windows-2025` runners (2026-11-06, CI job `cet-hw` on every push).** AMD EPYC 7763 / 9V45 under Hyper-V, Windows Server 2025 build 26100: `cet_probe` reports `cpuid_cet_ss=1, os_cet_u=1, ssp!=0, enforced=true`, policy `EnableUserShadowStack=1, SetContextIpValidation=1` (strict mode 0, BlockNonCetBinaries 0) for a /CETCOMPAT process (windows-2022 runners: Xeon 8573C, no CET in the guest). With shadow stacks ENFORCED: `cet-gated-breakpoint`, `cet-gated-inline`, `cet-gated-hw` PASS (`cet_enforced=True target_ssp=True`, hits 4000/4000, logs exact, checksum = uninstrumented; breakpoint sites displaced-stepped), `cet-ret-breakpoint` PASS (4/4, the in-place CALL/RET branch keyed on `EnableUserShadowStack` finally ran), the whole `cet-sde-*` set PASS (SDE 9.48 still hosts targets there), and the rest of the x64 suite on that image shows no CET-related failure (run 42182687993; probe_app_cet/cet_probe are the only /CETCOMPAT targets, so only the `cet-*` rows run under a shadow stack). So: the breakpoint/hw CET branches work on real hardware, and a debugger's cross-process SetThreadContext into displaced-step scratch memory is NOT refused under `SetContextIpValidation=1` in compatibility mode. Still open: strict mode, `BlockNonCetBinaries` vs the non-CETCOMPAT agent, and the breakpoint/hw `call_func` refusal row (no check exercises it yet) -- all runnable on that image (`workflow_dispatch image=windows-2025`).
+  - **Real CET hardware: GitHub-hosted `windows-2025` runners (2026-11-06, CI job `cet-hw` on every push).** AMD EPYC 7763 / 9V45 under Hyper-V, Windows Server 2025 build 26100: `cet_probe` reports `cpuid_cet_ss=1, os_cet_u=1, ssp!=0, enforced=true`, policy `EnableUserShadowStack=1, SetContextIpValidation=1` (strict mode 0, BlockNonCetBinaries 0) for a /CETCOMPAT process (windows-2022 runners: Xeon 8573C, no CET in the guest). With shadow stacks ENFORCED: `cet-gated-breakpoint`, `cet-gated-inline`, `cet-gated-hw` PASS (`cet_enforced=True target_ssp=True`, hits 4000/4000, logs exact, checksum = uninstrumented; breakpoint sites displaced-stepped), `cet-ret-breakpoint` PASS (4/4, the in-place CALL/RET branch keyed on `EnableUserShadowStack` finally ran), the whole `cet-sde-*` set PASS (SDE 9.48 still hosts targets there), and the rest of the x64 suite on that image shows no CET-related failure (run 42182687993; probe_app_cet/cet_probe are the only /CETCOMPAT targets, so only the `cet-*` rows run under a shadow stack). So: the breakpoint/hw CET branches work on real hardware, and a debugger's cross-process SetThreadContext into displaced-step scratch memory is NOT refused under `SetContextIpValidation=1` in compatibility mode. Strict mode, `BlockNonCetBinaries` and breakpoint/hw `call_func` were then settled on that image by runfix2 (next item).
+  - **CET on real hardware (runfix2, 2026-11-06, CI windows-2025: AMD EPYC, Server 2025 build 26100, shadow stacks enforced; rows `cet-tp-*`, `cet-strict-*`, `cet-block-*`):**
+    - ✅ **breakpoint/hw `call_func` now WORKS under shadow stacks** (the refusal is gone): the callee is entered through a real CALL -- the thread is pointed at a 3-byte stub in the target, `call rax`/`call eax` (rax/eax = the function) + `int3` -- so the CPU pushes the return address on both stacks, the callee's `ret` matches and comes back to the stub's INT3, and SSP is where it was at the hit (simpler than the planned DR trap at the shadow-stack top; no debug register needed; the same path on every target). A callee abandoned midway (it faulted, or timed out) leaves its frames on the shadow stack: SSP is put back through `CONTEXT_XSTATE` / `XSTATE_MASK_CET_U` (`thread_ssp`; measured: `0x..fc8 -> 0x..fd0 restored`, also in strict mode -- the kernel accepts moving SSP UP). New fixture `tp_target_cet` (the transparency target linked /CETCOMPAT; `tp_driver` derives the module from the target's name): `cet-tp-{breakpoint,hw,inline}-{callfn,co}` all PASS with `target_ssp=True` (callfn = GetThreadPriority / TlsGetValue / a probed function / a callee faulting at its first instruction, "0x1"; co = call_original + return_from, int/int64/double/stdcall/alignment/recursion).
+    - ✅ **Found + fixed: call_original + return_from on breakpoint/hw #CP'd under STRICT mode** (0xC0000409 at the ret gadget). The original runs in place and its own `ret` pops the frame's shadow entry; return_from then resumed at the `ret` gadget with SP at the hit, which popped the CALLER's shadow entry -- tolerated by the kernel in compatibility mode only because the gadget is non-image code. Windows REFUSES to move SSP back down (measured: `NOT restored (the kernel refused)`), so under shadow stacks return_from now resumes directly at the return address with the stack popped past it (no `ret` executed); call_original WITHOUT return_from under CET returns the original's result (warned once: it cannot run twice -- its shadow entry is gone; without shadow stacks the fall-through re-run is unchanged).
+    - ✅ **Strict mode** (Exploit protection "Hardware-enforced Stack Protection: strict", set per image through IFEO `MitigationOptions` on renamed copies -- `check_cet_policy`; byte 15 = 0x30, as `Set-ProcessMitigation -Enable UserShadowStack,UserShadowStackStrictMode` writes it; `cet_probe` confirms `EnableUserShadowStackStrictMode=1`): `cet-strict-tp-{breakpoint,hw,inline}-{callfn,co}` and `cet-strict-gated-{breakpoint,hw,inline}` (800/800 hits+logs, target_ssp=True) all PASS. Displaced stepping into private scratch memory, the call stub, the freeze moves and every SetThreadContext RIP change are NOT refused by `SetContextIpValidation` (on by default for /CETCOMPAT images, not relaxed) for a debugger, in strict mode either.
+    - ✅ **BlockNonCetBinaries** (IFEO byte 16 = 0x10 -- Set-ProcessMitigation has no switch for it; `cet_probe` confirms `BlockNonCetBinaries=1`): breakpoint/hw work (`cet-block-tp-{breakpoint,hw}-log`); inline with today's non-CETCOMPAT agent is refused CLEANLY (`LoadLibraryW failed for probe_api_agent.dll`, session error, target unaffected) and works fully once the agent AND the callback module are /CETCOMPAT (measured with a diag build: the cfnest agent line + `tp_driver` /CETCOMPAT, which runfix2 now links). x86: Windows does not even start a WoW64 process under this policy (0xC0000022) -- skipped, moot (no CET for WoW64).
+    - x86 under Server 2025: `cet_probe` reports `EnableUserShadowStack=0` for WoW64 even for a /CETCOMPAT image (no enforcement); the x86-only runner failures there were not CET (see "Runner findings").
   - **Measured under Intel SDE's CET emulation (`check_cet_sde`, rows `cet-sde-*`; SDE in `C:\tools\sde`, skipped when absent):**
     - Kit: **SDE 9.48.0 (2024-11-25) is the last Windows kit with the CET checker**: 9.53+ (9.58.0, 10.13.1 tried) print `SDE ERROR: CET is not supported on Windows` and the checker strings are gone from their `sde-mix-mt.dll`. Knobs: `-tgl -cet -cet_stderr -cet_call_stack -no-follow-child` (`-cet_abort` stops at the first report, `-cet_raise` kills the target with 0xC000008C). SDE prints one `Control flow error: IP: <ret> expected (shadow stack): A got (actual return address): B` per mismatching `ret`; the labels are swapped in 9.48 (A is the ordinary-stack address, B the shadow-stack entry -- proven by cet_smash's known addresses).
     - Positive control (`examples/cet/cet_smash.c`, /CETCOMPAT): `cet_smash smash` overwrites a return address with another valid one -- natively it just "lands" (exit 3); under SDE the first report is exactly that `ret` with the two addresses (`cet-sde-control-smash`), a clean run gives none (`cet-sde-control-clean`). `cet_smash calls N --wait --smash` is the witness workload: RDSSP after every iteration (`ssp_live`: non-zero only while the thread runs inside SDE) and the deliberate smash again at the end, so a run proves the checker was on to the last instruction.
@@ -1677,10 +1806,10 @@ the report (count, valid JSON per line, CRC multiset of the lines, `seq` coverag
     - ✅ Inline, every hit: SafetyHook's mid-hook stub ended `lea rsp,[rsp+8]; pop rsp; ret`, returning to the trampoline through an address it had PUSHED -- a #CP on every inline hit (fatal in strict mode; in compatibility mode at best a kernel fix-up per hit, since stub and trampoline are non-image memory). Fixed: the stub now ends `pop rsp; jmp [trampoline]` (`cmake/patch_safetyhook.cmake` step 3, applied to `third_party/safetyhook`; x64 the same 7 bytes, x86 one byte longer with a relocated `jmp [abs32]`). No `ret` remains on the hook path (the stub's own `call [destination]` is a real call/ret pair).
     - ✅ Inline `set_reg(SP)` (#8): the same patch makes the context's rsp/esp the stack pointer the hooked code resumes with -- nothing is written below the new SP (the old `trampoline_rsp` slot clobbered the saved registers when SP moved down). Re-enabled in `src/probe/agent.cpp`; conformance `sp_moved` now 10/10 on every backend.
     - ✅ Breakpoint emulation of CALL/RET (`emulate_site`): moves RSP/RIP but not SSP, so the target would #CP at its NEXT real `ret` inside its own CETCOMPAT code (fatal even in compatibility mode). Since 226f131 the emulation is skipped when `ProcessUserShadowStackPolicy.EnableUserShadowStack` is set and the CPU steps CALL/RET in place (JMP/Jcc/LOOP/PUSHF/POPF emulation is unaffected). Regress `cet-ret-breakpoint` (probe on NtOpenProcess's `ret` in probe_app_cet). That in-place CALL/RET step now runs in the in-place window (Evaluator round 3 #2: the other threads are held while the byte is lifted), so it is exact under threads too; the CPU still does the push/pop, so SSP stays consistent. The x64 SYSCALL trampoline has no call/ret (a `jmp [rip]` back), so it does not touch the shadow stack either.
-    - ✅ `call_func` on breakpoint/hw (`call_in_target`): the callee is entered by SetThreadContext, so its `ret` to `call_trap` does not match the shadow stack -> #CP inside the callee (a CETCOMPAT system DLL: fatal). Now REFUSED (returns 0, one stderr warning) when the target has shadow stacks; inline `call_func` is a real call and unaffected. A working design for CET (return to the real shadow-stack top under a per-thread DR trap, then restore SSP through `CONTEXT_XSTATE`/`XSTATE_MASK_CET_U`) needs CET hardware to develop.
-    - ⬜ SetThreadContext RIP changes (displaced stepping into scratch memory, moving frozen threads onto the trampoline, `call_func` restore, `set_reg`): no `ret` is involved and SSP is never touched (the controller never sets `CONTEXT_XSTATE`), so the CPU check does not apply. Open: Windows' optional `SetContextIpValidation` policy validates a new RIP against the shadow stack / EH-continuation table; whether it applies to a DEBUGGER's cross-process SetThreadContext is unverified. If it does, displaced stepping and the freeze move would be refused under that policy (in-place stepping would still work).
-    - ✅ `BlockNonCetBinaries` policy: the injected `probe_api_agent.dll` was not /CETCOMPAT and would be refused -> no inline backend in such a process. Now linked /CETCOMPAT (cfnest). The bit only declares that the image's OWN `ret`s are shadow-stack clean (in compatibility mode a violation inside a CETCOMPAT image becomes fatal). Audit of every agent path: agent C++ and callbacks built into it are plain call/ret (no `_AddressOfReturnAddress`, no setjmp/longjmp of its own, x86 `__asm` blocks are x86-only: WOW64 has no user shadow stacks); `uhh_orig_thunk` (agent_x64.asm) is a real call/ret (its fake machine frame only steers the unwinder's frame walk, not a `ret`); the hook stub (SafetyHook mid-hook, in allocated memory) `call`s the agent and ends `pop rsp; jmp [trampoline]`; return_from's thunk (`pop rsp; ret`, allocated memory) returns to the hit's own return address = the shadow-stack top at a function entry (entry-only, enforced); a relocated CALL stays a call when a shadow stack is active (c7755cf); the trampoline-fault VEH re-raises with NtRaiseException (no `ret`). Open, as before and unchanged by the bit (needs CET hardware): SSP after an exception unwinds out of an inline call_original through the fake machine frame, and the VEH re-raise's SSP. Tests: `cet-agent-image` (agent CETCOMPAT, FAILED before), `cet-agent-block-noncet` (SKIP on this VM: `SetProcessMitigationPolicy(ProcessUserShadowStackPolicy, BlockNonCetBinaries)` at runtime is refused with ERROR_ACCESS_DENIED here -- no CET hardware; on CET hardware it maps a non-CET DLL vs the agent under the policy). Under Intel SDE with the CETCOMPAT agent (`--only cet`, x64): every `cet-sde-*` inline row passes unchanged (e.g. `cet-sde-relcall-inline` 3 reports = uninstrumented 3; `cet-sde-gated-inline` checksum same, target SSP live); bp/hw rows stay SKIP (not measurable under SDE)
-  - Not exercised anywhere yet: the CET-only branches (CALL/RET in-place stepping and the `call_func` refusal) are keyed on `EnableUserShadowStack`, which the VM reports as 0 even for a /CETCOMPAT image -- correct (it reflects enforcement, not the image bit), but it means those branches never ran here, and SDE cannot run them either (policy 0 there too, and the breakpoint backend leaves SDE at the first INT3). The policy is queried once per session and a failed query is cached as "no shadow stack" (the agent's own relocation switch also reads RDSSP; the controller cannot run RDSSP in the target).
+    - ✅ `call_func` on breakpoint/hw (`call_in_target`): the callee was entered by SetThreadContext, so its `ret` to `call_trap` did not match the shadow stack -> #CP inside the callee. Was refused under shadow stacks; since runfix2 entered through a real CALL from a stub and works (above).
+    - ✅ SetThreadContext RIP changes (displaced stepping into scratch memory, moving frozen threads onto the trampoline, `call_func` entry/restore, `set_reg`): not refused by `SetContextIpValidation` for a debugger, compatibility and strict mode (measured, above). The controller sets `CONTEXT_XSTATE` (CET_U) only to drop an abandoned call_func callee's shadow frames.
+    - ✅ `BlockNonCetBinaries` policy: the injected `probe_api_agent.dll` was not /CETCOMPAT and would be refused -> no inline backend in such a process. Now linked /CETCOMPAT (cfnest). The bit only declares that the image's OWN `ret`s are shadow-stack clean (in compatibility mode a violation inside a CETCOMPAT image becomes fatal). Audit of every agent path: agent C++ and callbacks built into it are plain call/ret (no `_AddressOfReturnAddress`, no setjmp/longjmp of its own, x86 `__asm` blocks are x86-only: WOW64 has no user shadow stacks); `uhh_orig_thunk` (agent_x64.asm) is a real call/ret (its fake machine frame only steers the unwinder's frame walk, not a `ret`); the hook stub (SafetyHook mid-hook, in allocated memory) `call`s the agent and ends `pop rsp; jmp [trampoline]`; return_from's thunk (`pop rsp; ret`, allocated memory) returns to the hit's own return address = the shadow-stack top at a function entry (entry-only, enforced); a relocated CALL stays a call when a shadow stack is active (c7755cf); the trampoline-fault VEH re-raises with NtRaiseException (no `ret`). Open, as before and unchanged by the bit (needs CET hardware): SSP after an exception unwinds out of an inline call_original through the fake machine frame, and the VEH re-raise's SSP. Tests: `cet-agent-image` (agent CETCOMPAT, FAILED before), `cet-agent-block-noncet` (SKIP on this VM: `SetProcessMitigationPolicy(ProcessUserShadowStackPolicy, BlockNonCetBinaries)` at runtime is refused with ERROR_ACCESS_DENIED here -- no CET hardware; on CET hardware it maps a non-CET DLL vs the agent under the policy). Under Intel SDE with the CETCOMPAT agent (`--only cet`, x64): every `cet-sde-*` inline row passes unchanged (e.g. `cet-sde-relcall-inline` 3 reports = uninstrumented 3; `cet-sde-gated-inline` checksum same, target SSP live); bp/hw rows stay SKIP (not measurable under SDE). **Measured end to end on CET hardware (runfix2, windows-2025):** with this agent and a /CETCOMPAT callback module, inline works under BlockNonCetBinaries (`cet-block-tp-inline-log`).
+  - (Before the windows-2025 runners) Not exercised anywhere: the CET-only branches (CALL/RET in-place stepping and the `call_func` refusal) are keyed on `EnableUserShadowStack`, which the VM reports as 0 even for a /CETCOMPAT image -- correct (it reflects enforcement, not the image bit), but it means those branches never ran here, and SDE cannot run them either (policy 0 there too, and the breakpoint backend leaves SDE at the first INT3). The policy is queried once per session and a failed query is cached as "no shadow stack" (the agent's own relocation switch also reads RDSSP; the controller cannot run RDSSP in the target).
   - **Test plan on CET hardware** (Intel Tiger Lake+ / AMD Zen 3+, Windows 10 21H1+/11 x64, bare metal or a hypervisor that passes CET through; `cet_probe` must print `enforced=true`): run `regress.py --only check_cet,check_conformance` and expect all PASS with `cet_enforced=True target_ssp=True`; then repeat with the process forced into strict mode (Exploit protection -> Program settings -> probe_app_cet.exe -> Hardware-enforced Stack Protection: on, strict) and with `SetContextIpValidation` on, to settle the two open items; then a `call_func` breakpoint/hw run to confirm the refusal is clean (returns 0, target unaffected). Hardware positive control first: `cet_smash smash` must die with 0xC0000409 (#CP), `cet_smash clean` exit 0. What only hardware can settle: the breakpoint/hw paths under a real shadow stack (in-place CALL/RET, displaced stepping, `call_func` refusal, call_original), strict mode, `SetContextIpValidation` for a debugger's SetThreadContext, `BlockNonCetBinaries` vs the non-CETCOMPAT agent, and the CET_U XSTATE the controller never sets.
   - Tests: `cet-image` (probe_app_cet/cet_probe carry the CETCOMPAT bit, probe_app does not), `cet-probe` (what the machine enforces), `cet-gated-{breakpoint,inline,hw}` (gated_config with all probes on one backend against `probe_app_cet`, exact hits/logs, checksum equal to an uninstrumented CET run, target's own RDSSP == cet_probe), `cet-ret-breakpoint`; `conformance-inline` sp_moved 10; under SDE: `cet-sde-{probe,control-clean,control-smash,calls-base,calls-inline,relcall-inline,gated-inline,sp-inline}`, `cet-sde-co-<case>-inline` (11 cases), SKIP rows `cet-sde-breakpoint` / `cet-sde-hw` saying why.
 - ⬜ [fan-out] Windows 11 VM on the Proxmox server, run the suite there too (later)
@@ -1790,9 +1919,28 @@ Real-bug candidates (reproduce on runners, not on the VM so far):
   runs PASS, VM x64+x86 PASS. The same v20 edge made `hunt-exit-process-inline` report `logs + interrupted == hits +
   1` in ~1 of 8 runner runs (huntaudit): 42212077320 ran every `hunt-exit-*` 12 times on 5 jobs (x64+x86): 540/540
   PASS, 180 inline runs exact with interrupted 0-8.
-- **lifecycle-controller-killed-{mixed x64 (full run), inline x86 (diag 1 of 4)}**: kill@early-0.05 -> target DEAD
-  0xC0000005, not progressing. The L11 race (controller killed during install) with a new signature (access violation,
-  inline/mixed configs). 2 of ~7 runs on windows-2022; 0 on windows-2025.
+- ✅ **lifecycle-controller-killed-{mixed x64 (full run), inline x86 (diag 1 of 4)}** (runfix2): kill@early-0.05 ->
+  target DEAD 0xC0000005 with NO unhandled report. Reproduced with a kill loop on runners (`lckill`: 3 of ~1130 kills
+  at 0.05/0.08 s into an inline/mixed attach; 0 of ~1130 with 3 CPU burners -- contention does not help). Cause: the
+  controller died while the agent's install round was raising its FREEZE request; the raise came back unserviced
+  (no debugger any more) BEFORE the guard's cleanup had set `controller_gone`, and the agent then enabled the hooks
+  UNFROZEN -- SafetyHook's own trap path makes the site page non-executable, and on an ntdll syscall-stub page every
+  system call faults, the installer's and the program's alike (also the program's own unhandled-exception filter,
+  hence no report). Fix (agent `frozen()`): an install whose FREEZE no controller serviced is not written (the
+  requests end HOOK_FAILED); a removal freezes in-process. Deterministic regress `lifecycle-killed-in-freeze-{inline,
+  mixed}` (test hook `UHH_TEST_FREEZE_STALL_MS` parks the controller with the FREEZE pending, the test kills it):
+  old agent 40/40 cases DEAD 0xC0000005 on windows-2022 x64 and x86 (diag run 42197120854), fixed agent 40/40 PASS.
+  **Second layer, exposed by that fix: the target HUNG** instead (kill loop: 0 deaths but 4 hangs in ~3100 kills; a
+  thread dump of the hung target -- `lckill.py` H lines -- showed EVERY program thread suspended once and no agent
+  thread). The controller froze all threads for the install round and died before answering; nobody resumed them:
+  the agent's service thread did not exist yet (its named event is the controller's and went with it), and the
+  init's own orphan check keyed on the controller process being signaled -- an agent-side probe (diag build) showed
+  `enabled=1 dead=0 port_gone=1 held=11`: the debug port goes during the dying controller's handle rundown, BEFORE
+  its process object is signaled. Fix (agent init/service): the init ends with the guard's orphan check on the debug
+  port (waiting up to 5 s for it when no service thread could start), and the service thread polls the port while
+  it has no controller handle. The regress check now stalls the controller AFTER the freeze (`UHH_TEST_FREEZE_STALL_MS`,
+  every other thread suspended): x64 freeze-stall loop 14-24 hangs / 120 before, 0 / 120 after (diag runs
+  42212013348 / 42214215294 vs 42217463236); `lifecycle-killed-in-freeze-*` x64 + x86 all PASS.
 - ✅ **ret-probe-breakpoint (x64 + x86, 1 of 9 each)** -- not a double count: a real 5th NtOpenProcess by the
   target. Per-hit stacks (runner diag 42192716058): on the FIRST launch of probe_app on a fresh runner (7 of 7 jobs,
   x64 and x86; never on a later run, so hw -- which runs second -- never saw it) the shim engine opens a process
@@ -1801,12 +1949,19 @@ Real-bug candidates (reproduce on runners, not on the VM so far):
   stack (`--stack`): hits with a probe_app frame must equal the target's `opened` count, every hit is logged, other
   hits must be system-only (reported as `system_opens`). Evidence: 42194976034 12/12 jobs `check_ret_probe` first on
   a fresh runner PASS (4/4) and 36/36 later runs PASS.
-- **x86 transparency-{breakpoint,hw}-callfn on windows-2025 (build 26100)**: `call_func GetThreadPriority` /
-  `TlsGetValue` fail in the callback, the hw run's target dies 0xC0000005. Not CET (WoW64 is not enforced); a
-  breakpoint/hw `call_func` problem on WoW64 of the newer Windows build. Needs a Windows 11 24H2 / Server 2025 VM.
-- **x86 detach-inline on windows-2025**: detach reports `1 thread(s) frozen; <tid>:dr7=0:setfail` (clearing DR7 on
-  one thread failed) although every count is exact; the check fails on the setfail. WoW64 SetThreadContext on build
-  26100 (or a thread exiting at that instant).
+- ✅ **x86 transparency-{breakpoint,hw}-callfn on windows-2025 (build 26100)** (runfix2): not CET (x86
+  `cet_probe` there: `EnableUserShadowStack=0`, so the old refusal never fired). The target died at the MID-function
+  site (TpMidHit sits inside a `std` ... `cld` span): call_func entered the callee with the hit's EFLAGS, DF=1, and
+  on build 26100 the WoW64 syscall thunk under GetThreadPriority uses string instructions, which ran backwards and
+  smashed its stack (execute of 0x0, return address = the call trap). Fix: the callee gets the ABI's flags (DF and
+  TF clear); the thread's own flags come back with the restore. x86 windows-2025 `--only transparency` 19/19.
+- ✅ **x86 detach-inline on windows-2025** (runfix2): two causes. (1) The check's fixed 2.5 s detach came after
+  the target had finished every read on the fast EPYC hosts (`hits=6000000/6000000`, x64 too), so the detach met the
+  main thread EXITING: SetThreadContext fails ERROR_ACCESS_DENIED (STATUS_THREAD_IS_TERMINATING) -- `setfail=5`
+  (the error code is now reported). (2) The final DR pass counted that as a failure. Fixes: a terminating thread is
+  clean (ThreadIsTerminated); the check detaches on stdin (`uhh_trace --detach-on-stdin`) after the first 1000
+  logs, with the inline target paced (200k reads/s per thread) so the detach is mid-run on any host. windows-2025
+  `--only check_detach` 6/6 on x86 and x64.
 - **attach-new-inline x64 windows-2025 (1 run)**: "probe never became active" -- the load flake also seen once on
   the VM (Lifecycle section).
 
@@ -1858,6 +2013,37 @@ Real-bug candidates (reproduce on runners, not on the VM so far):
   gained `running=` (callbacks still executing, not accounting) and the check wants `running=1 in_flight=0`.
   `logs-controller-killed` reads the orphaned ring itself: first records left in it carry their hits, so the target
   counts with `probe_agent_unlogged` (unaccounted minus carried records still in the ring).
+
+runfix2 results (2026-11-06/07; diagnostics through a scratch branch `runfix2-diag` whose workflow pushes each job's
+full logs to a `diaglogs/<run>-<job>` branch -- readable with git, no API token):
+- Kill loop (`ci-diag/lckill.py`: lifecycle_target + lifecycle_driver, the driver killed 0.02-0.2 s into the attach):
+  before 3 deaths / ~1130 kills (inline+mixed, windows-2022); with the install fix 0 deaths but 11 hangs / ~2900
+  (inline, 0.04-0.06 s); with both fixes **0 failures / 2557** (x64+x86, windows-2022+2025, run 42217463236).
+- After merging merge-frida b1888e3 (cfnest fibers, runfix1, codex2, pslog, realbig, gatede2e, citune, huntaudit)
+  into runfix2 (91e766b): ONE call_func path -- cfnest's fiber parking / late-trap tombstones / serialization,
+  entered through runfix2's CALL stub (`call rax|eax` at call_trap-2, returning into call_trap, the INT3 that
+  restore_fixup also uses), DF/TF clear, SSP restored on FAULTED/TIMEOUT; the early agent load (A6) now also runs
+  under CET. CI windows-2022 run 42235426997 1992/2001, windows-2025 run 42235435967 1987/1997, cet-hw 49/49 on
+  windows-2025 (the windows-2022 run's cet-hw: 48/49, `cet-sde-sp-inline` a PowerShell process-query timeout);
+  remaining failures are on merge-frida too (stdout-console-*, stacks-identical) or timing flakes of other checks
+  (realbig-robocopy-detach-breakpoint: 2 of 3 FAIL on merge-frida itself, 3 of 3 PASS on runfix2, diag
+  42240423313; attach-new-inline). VM clean build, `--only callfunc,transparency,cet,lifecycle,detach,cxlib,cx2,co`:
+  x64 169/170, x86 148/149 (only `callfunc-kill-reuse`, the VM precondition above).
+- Final CI on runfix2 before the merge (eb4d54d): windows-2022 run 42225278011 1885/1897, windows-2025 run 42225285343 (branch
+  `runfix2-w25` = runfix2 + a default `image=windows-2025`, never to be merged) 1876/1891, cet-hw 48/48 (+2 SKIP) on
+  both; none of the failures is a runfix2 row (crash-logs-inline-4t, realapps-ps-fileversion x86, patch-race-frozen,
+  stream-latency, wmic/oldcrt absent, known hunt rows).
+- Earlier windows-2025 full suite (run 42218924878): x86 transparency/detach rows PASS, cet-hw 48/48
+  (+2 SKIP); remaining failures are other findings (crash-logs-inline-4t, realapps-ps-fileversion x86, wmic/oldcrt
+  absent, known hunt rows), plus single occurrences: attach-new-inline (load flake, above) and
+  `lifecycle-detach-early-120-inline` (target 0xC0000005 in an agent thread while hunt_dll unloads; PRE-EXISTING:
+  the same signature in 1 of 128 rows on merge-frida's agent, 0 of 128 on runfix2, diag run 42224315607 -- L5
+  family, open). `prehook-attach` failed once on windows-2025 (OSError: the target was gone 3 s into the attach);
+  14/14 PASS in reruns on both arches.
+- VM (Windows 10, both arches): `--only transparency,check_detach,conformance,callfunc,check_cet_policy,callorig`
+  x64 88/89, x86 84/85 (the one FAIL both times: `callfunc-kill-reuse` "no thread reused the dead id in 3000
+  threads" -- the check's precondition on that host, unrelated); `UHH_LC=controller-killed,killed-in-freeze
+  --only lifecycle` 3 x 6/6 on each arch.
 
 Environment (runner) effects, and how the checks were made robust without proving less (branch `citune`; full
 run 42203177441 at df3bddc, windows-2022 + cet-hw: 1830/1843 ok; every check below PASS on both arches; longest
@@ -1927,6 +2113,27 @@ another branch), logs-wedge-{exit x64, kill + suspend x86} (`wedged=0`: the wedg
   exited: the crash-logs-inline-4t class -- an inline hit whose callback never completed because the process ended).
 - Passing on runners where the VM was suspect: x86 `hunt-ctx-breakpoint` (no 600 s timeout), x86
   `edgehunt-*-fmtptr` (B10), x64 `blog-pwsh-attach-detach-inline`, x86 `hunt-exit-*`.
+- ✅ **stacks-identical (both arches, about 1 run in 5 on windows-2022; never on the VM)**: a real bug, fixed
+  (cisym). One inline frame was named `kernel32+0x14f80` while breakpoint and hw named it
+  `kernel32!BaseThreadInitThunk+0x10`. Same address, same DbgHelp (SDK, export-only kernel32). The run-time
+  diagnostics (60 repetitions per arch, 12-14 failures) showed kernel32 loaded with `SymType` none and no exports.
+  DbgHelp keyed by the target's process handle reads a deferred module's image from the target's MEMORY on first
+  use. An experiment registered kernel32's file at the base where the live target maps ntdll. Windows 10's DbgHelp
+  then named the frame with ntdll's exports (`kernel32!RtlDosPathNameToNtPathName_U+0x60`) and the SDK's DbgHelp
+  gave none. Names therefore depended on when a module was first used: breakpoint/hw walks load kernel32 at the
+  hit, while inline stacks are named later on the writer, as the short target exited. **Fix:**
+  `src/probe/symbols.cpp` keeps names in a DbgHelp session keyed by an opaque value, so every module loads from its
+  file and PDB on disk. `StackWalk64` runs in a second session keyed by the real handle and only returns
+  addresses. The rule is in docs/symbols.md. Regress `symbols-file-backed` (`symfile_test`) covers it. CI: stacks
+  repeated 60 times per arch, 0 failures.
+- ✅ **stdout-console-* (both arches, every run on windows-2022)**: a check bug, not a UHH bug. Every record and the
+  report reached the pseudo console. Server 2022's conhost renders a line that wraps at the console width as the
+  row, CRLF, CUP to the previous row's last column, and that column's character again, which the terminal's
+  autowrap then continues. The check stripped VT sequences and line breaks, so it saw one character twice per
+  wrapped row: `"logs__written"` and `"live_output_error"":null`. As a result the report was unparsable or lacked
+  `logs_written`. **Fix:** regress `VtScreen`, a small VT screen emulator (autowrap with deferred wrap, cursor
+  addressing, erase/insert/delete, scroll regions). Rows are read as they leave the screen and the report is parsed
+  whole. The assertions are unchanged.
 
 ## Later
 - ✅ x86 cumulative-session flakiness (possibly the same handle double-close; recheck) -- CLOSED with evidence (cfnest). The note dates from the first checkpoint (c617de4); its suspected cause, review finding I6 (handles closed twice on the launch failure path), was fixed long since. Rechecked with `ar_driver --repeat`: 60 sessions in ONE controller process, backends in turn (breakpoint, hw, inline), each a call_func + runtime data watch whose callback call_funcs during another thread's call: every session exact, nothing dropped, the controller's handle count flat (x64 73 -> 73, x86 89 -> 89). Regress `sessions-repeat` keeps it covered (also exercises the per-run callback-fiber host). (Separately: `callfunc-kill-reuse` -- inline, needs the OS to hand a killed thread's id to a new thread of the same process within 3000 creations -- failed on the shared VM in Nov-06 evening runs on the cfnest build AND on an unmodified baseline build (2/2): system-wide thread-id reuse under other agents' load, not a UHH regression.)

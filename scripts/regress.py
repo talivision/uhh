@@ -580,33 +580,54 @@ def check_stream_volume():
 
 def check_stream_live(calls=2_000_000):
     """Logs arrive LIVE under full load, not in a burst at the end. hitcost_target passes a
-    QueryPerformanceCounter timestamp (ns) as the probed function's argument; send_log logs
-    it; this reader timestamps each chunk of stdout as it arrives with the SAME clock
-    (time.perf_counter_ns) and computes the lag of every 64th log, plus the gaps between
-    arrivals and how many logs arrived before the target printed its final line."""
-    driver, target = exe("hitcost_driver.exe"), exe("hitcost_target.exe")
-    if not driver or not target:
-        return missing_bin("stream-live", "hitcost driver/target")
+    QueryPerformanceCounter timestamp (us, low 31 bits) as the probed function's argument;
+    send_log logs it; this reader stamps each chunk of stdout as it arrives with the SAME
+    counter and computes the lag of every 64th log, plus the gaps between arrivals and how
+    many logs arrived before the target printed its final line. Bar (as stream-latency, whose
+    calibration this reuses): every log delivered, >= 90% of them before the target's final
+    line, and the lag
+      - quiet machine (the concurrent noise sampler -- an uninstrumented writer, a line every
+        ~5 ms -- saw < 50 ms of stall in the whole run): p99 < 250 ms, absolute (the original bar);
+      - noisy machine (a shared VM, a 2-core runner): p99 of (lag - the stall the sampler saw in
+        that log's own window [event, arrival]) < 250 ms -- the machine's stalls are not UHH's
+        (same build, VM under load: p99 0.7-253 ms over 18 runs, one 1102 ms), but latency UHH
+        adds on top of them still fails.
+    The controller's %TEMP% (its session file) is <build dir>/uhh-latency-tmp, as stream-latency's
+    (a local, AV-excluded dir on the test machines: the check measures UHH, not the profile's AV)."""
+    driver, target, sampler_exe = exe("hitcost_driver.exe"), exe("hitcost_target.exe"), exe("logstream_target.exe")
+    if not driver or not target or not sampler_exe:
+        return missing_bin("stream-live", "hitcost driver/target, logstream_target")
     import re as _re
+    freq = _qpc_freq()
+    tms = lambda ticks: ticks * 1000.0 / freq
+    tmp = Path(BIN).resolve().parent / "uhh-latency-tmp"
+    tmp.mkdir(exist_ok=True)
+    env = dict(os.environ, TEMP=str(tmp), TMP=str(tmp))
+    quiet_ms, bar_ms = 50.0, 250.0
+    pct = lambda vals, q: sorted(vals)[max(0, math.ceil(q * len(vals)) - 1)] if vals else float("inf")
     for backend, n in (("inline", calls), ("hw", 50_000), ("breakpoint", 50_000)):
         name = f"stream-live-{backend}"
+        sampler = None
         try:
+            sampler = _NoiseSampler(sampler_exe, tmp)
+            time.sleep(0.2)
             p = subprocess.Popen([str(driver), "--backend", backend, "--method", "send_log", "--",
                                   str(target), "--calls", str(n), "--threads", "1", "--no-wait", "--qpc-arg"],
-                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            lags, gaps, logs, before_exit, exited, last, buf = [], [], 0, 0, False, None, b""
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
+            samples, gaps, logs, before_exit, exited, last, buf = [], [], 0, 0, False, None, b""
             rx = _re.compile(rb'"message":"hit (-?\d+)"')
             while True:
                 chunk = p.stdout.read1(1 << 20)
                 if not chunk:
                     break
-                now = time.perf_counter_ns()
+                now = _qpc_now()
+                now_us = (now // freq) * 1_000_000 + (now % freq) * 1_000_000 // freq   # the target's formula
                 if last is not None:
                     gaps.append(now - last)
                 last = now
                 buf += chunk
                 lines = buf.split(b"\n"); buf = lines.pop()
-                for k, line in enumerate(lines):
+                for line in lines:
                     if b'"kind":"probe_log"' in line:
                         logs += 1
                         if not exited:
@@ -614,19 +635,30 @@ def check_stream_live(calls=2_000_000):
                         if logs % 64 == 0:
                             m = rx.search(line)
                             if m:
-                                lags.append((((now // 1000) - int(m.group(1))) & 0x7FFFFFFF) * 1000)   # us, 31-bit wrap
+                                lag = ((now_us - int(m.group(1))) & 0x7FFFFFFF) * freq // 1_000_000   # ticks, 31-bit us wrap
+                                samples.append((lag, now - lag, now))       # (lag, event, arrival)
                     elif b'"kind":"target"' in line:
                         exited = True
             p.wait(timeout=600)
-            lags.sort(); ms = lambda v: round(v / 1e6, 1)
-            p50 = ms(lags[len(lags) // 2]) if lags else None
-            p99 = ms(lags[int(len(lags) * 0.99)]) if lags else None
-            gmax = ms(max(gaps)) if gaps else None
+            sampler.stop()
+            lags = [x[0] for x in samples]
+            excess = [lag - sampler.noise(ev, arr) for lag, ev, arr in samples]
+            run_noise = max([0] + [late for _, _, late in sampler.late] + [arr - w for w, arr in sampler.samples])
+            quiet = tms(run_noise) < quiet_ms and len(sampler.samples) >= 100
+            p50, p99, p99x = pct(lags, .5), pct(lags, .99), pct(excess, .99)
             frac = before_exit / logs if logs else 0
-            ok = (p.returncode == 0 and logs == n and p99 is not None and p99 < 250 and frac >= 0.9)
-            record(name, ok, f"logs={logs:,}/{n:,} lag_p50={p50}ms lag_p99={p99}ms max_gap={gmax}ms "
+            lat_ok = bool(samples) and tms(p99 if quiet else p99x) < bar_ms
+            ok = p.returncode == 0 and logs == n and lat_ok and frac >= 0.9
+            record(name, ok, f"logs={logs:,}/{n:,} {'quiet' if quiet else 'noisy'}: "
+                             f"bar={'p99' if quiet else 'p99(lag-noise)'}<{bar_ms:.0f}ms lag_p50={tms(p50):.1f}ms "
+                             f"lag_p99={tms(p99):.1f}ms p99_excess={tms(p99x):.1f}ms lag_max={tms(max(lags, default=0)):.1f}ms "
+                             f"max_gap={tms(max(gaps, default=0)):.1f}ms noise_run_max={tms(run_noise):.1f}ms "
+                             f"sampler={len(sampler.samples)}@{tms(sampler.period):.1f}ms "
+                             f"disk_run_max={tms(max((e - b for b, e in sampler.disk), default=0)):.1f}ms "
                              f"before_target_exit={frac:.1%} rc={p.returncode}")
         except Exception as e:
+            if sampler and sampler.p.poll() is None:
+                sampler.p.kill()
             record(name, False, repr(e))
 
 
@@ -753,16 +785,29 @@ class _NoiseSampler:
         self.period = gaps[len(gaps) // 2] if gaps else 0         # the writer's normal period (median)
         # per interval between consecutive writes: (start, end, lateness) ; per write: delivery latency
         self.late = [(a[0], b[0], max(0, b[0] - a[0] - self.period)) for a, b in zip(s, s[1:])]
+        # Indexes for noise(): the intervals are consecutive (starts and ends ascending), the
+        # write stamps ascending (one writer); a write delivered at or after a was written at or
+        # after a - the longest delivery.
+        self._starts = [x[0] for x in self.late]
+        self._ends = [x[1] for x in self.late]
+        self._lates = [x[2] for x in self.late]
+        self._ws = [w for w, _ in s]
+        self._maxdel = max((arr - w for w, arr in s), default=0)
         return self
 
     def noise(self, a, b):
         """Worst write lateness / delivery latency (QPC ticks) overlapping [a, b]."""
+        import bisect
         worst = 0
-        for start, end, late in self.late:
-            if start <= b and end >= a:
-                worst = max(worst, late)
-        for w, arr in self.samples:
-            if w <= b and arr >= a:
+        i0, i1 = bisect.bisect_left(self._ends, a), bisect.bisect_right(self._starts, b)
+        if i0 < i1:
+            worst = max(self._lates[i0:i1])
+        j = bisect.bisect_right(self._ws, b)
+        floor = a - self._maxdel
+        while j > 0 and self._ws[j - 1] >= floor:
+            j -= 1
+            w, arr = self.samples[j]
+            if arr >= a:
                 worst = max(worst, arr - w)
         return worst
 
@@ -1513,6 +1558,68 @@ def check_callorig_hunt():
                         q.kill()
 
 
+# F5: case -> (the probed function call_original runs, its callback's log name, how many of its
+# calls are left (no "-done" log), "co after" hits, "co after" logs).
+CO_DEEP = {"deepthrow": ("co_throw", "throw", 5, 10, 10), "deepseh": ("co_seh", "seh", 5, 10, 10),
+           "deepjmp": ("co_jump", "jump", 5, 10, 10), "catchhit": ("co_throw", "throw", 5, 5, 5),
+           "catchinside": ("co_outer", "outer", 0, 15, 0)}
+
+
+def check_callorig_deep():
+    """ROADMAP F5: a breakpoint/hw call_original whose original is LEFT (C++ throw, SEH raise,
+    longjmp) and caught above it; the program then calls a probed function from a DEEPER frame
+    than the left call's (susp_target deep*), or inside the catch block (catchhit). Every later
+    hit must run its callback as on inline -- they used to be taken for hits inside the
+    original (counted, no callback) until the next hit at the left frame's level or the 5 s
+    release. Control (catchinside): the exception is caught INSIDE the original (a probed call
+    in that catch block, then a deeper one): those hits are inside the call -- counted, no
+    callback -- and the call returns normally. Exact hits and "co" logs (hits == logs), the target's row as uninstrumented,
+    nothing dropped or interrupted, and the abandoned call_original never runs into the 5 s
+    limit. Every backend."""
+    d, t = exe("co_driver.exe"), exe("susp_target.exe")
+    if not d or not t:
+        return missing_bin("callorig-deep", "co_driver/susp_target")
+
+    def co_row(objs):
+        return next((x for x in objs if x.get("kind") == "co"), {})
+
+    for case, (fn, nm, nleft, after, after_logs) in CO_DEEP.items():
+        try:
+            r0, o0 = run([t, case], timeout=60)
+            base = co_row(o0)
+        except Exception as e:
+            base = {}
+        for bk in ("breakpoint", "hw", "inline"):
+            name = f"callorig-deep-{case}-{bk}"
+            try:
+                r, o = run([d, "--backend", bk, "--case", case, "--module", "susp_target.exe", "--", t, case],
+                           timeout=180)
+                row, rep = co_row(o), report(o)
+                logs = {}
+                for x in o:
+                    m = str(x.get("message", ""))
+                    if x.get("kind") == "probe_log" and m.startswith("co "):
+                        logs[m] = logs.get(m, 0) + 1
+                hb = {}
+                for p in probes(o):
+                    loc = str(p.get("location", ""))
+                    hb[loc.split("!", 1)[-1]] = p.get("hits")
+                want_logs = {f"co {nm}": 10, f"co {nm}-done": 10 - nleft, "co after": after_logs}
+                want_hits = {fn: 10, "co_after": after}
+                got_logs = {k: logs.get(k, 0) for k in want_logs}
+                extra = sorted(k for k in logs if k not in want_logs)
+                slow = "within 5 s" in (r.stderr or "")
+                ok = (bool(base) and base.get("left") == 5 and row == base and
+                      all(hb.get(k) == v for k, v in want_hits.items()) and got_logs == want_logs and not extra and
+                      rep.get("log_dropped") == 0 and rep.get("callbacks_interrupted", 0) == 0 and
+                      rep.get("error") is None and rep.get("app_exit") == 0 and r.returncode == 0 and not slow)
+                record(name, ok, f"row={row} want={base} hits={hb} logs={got_logs} extra={extra[:3]} "
+                                 f"dropped={rep.get('log_dropped')} intr={rep.get('callbacks_interrupted')} "
+                                 f"err={rep.get('error')} rc={r.returncode} released_at_5s={slow}")
+            except Exception as e:
+                record(name, False, repr(e))
+
+
 CC_NAMES = ["CcCdecl0", "CcCdecl3", "CcStd3", "CcStd10", "CcFast4", "CcThisGet", "CcVec", "CcI64", "CcStdI64",
             "CcS12", "CcS8", "CcDbl", "CcFlt", "CcRetBig", "CcRetBigStd", "CcRet8", "CcHot", "CcIlt",
             "CcImpThunk", "CcJmpDst"]          # = cc_shared.h's CC_FNS, in id order
@@ -1651,6 +1758,26 @@ def check_symbols():
         record("symbols-list", "CreateFileW" in names, f"found={sorted(n for n in names if n)[:5]}")
     except Exception as e:
         record("symbols-list", False, repr(e))
+    # The rule behind identical stacks on every backend: names come from the image file on
+    # disk, never from the target's memory. symfile_test registers kernel32.dll's file at the
+    # base where the live target maps ntdll (DbgHelp keyed by the process handle read the
+    # image there: ntdll's exports under kernel32's name, or none -- one inline frame showed
+    # kernel32+0x14f80 where breakpoint/hw showed BaseThreadInitThunk+0x10), and looks
+    # kernel32 up for the first time after its target exited.
+    sf = exe("symfile_test.exe")
+    if not sf:
+        missing_bin("symbols-file-backed", "symfile_test")
+    else:
+        try:
+            r, o = run([sf], timeout=120)
+            cases = {x.get("case"): x for x in o if x.get("kind") == "symfile"}
+            ok = (r.returncode == 0 and set(cases) == {"foreign-image", "after-exit"} and
+                  all(c.get("ok") for c in cases.values()))
+            record("symbols-file-backed", ok, "; ".join(f"{k}: {c.get('name')} resolved_rva={c.get('resolved_rva')}"
+                                                        f"/{c.get('want_rva')}" for k, c in cases.items())
+                   + f" rc={r.returncode}" + ("" if ok else f" out={r.stdout.strip()[-600:]!r}"))
+        except Exception as e:
+            record("symbols-file-backed", False, repr(e))
 
 
 def trace_run(target, probes_spec, backend, targs=(), timeout=300):
@@ -1885,6 +2012,49 @@ def tp_co_expected(grp, iters):
     return sum(per[p] for p in grp)
 
 
+# The CET rows leave out tp_ovf (a callback overflowing its stack: TR9, a host-dependent runner finding of its
+# own -- one such crash took every later row of the run with it); it has nothing to do with shadow stacks.
+TP_CET_SKIP = ("ovf",)
+TP_GROUPS = {"breakpoint": [TP_PROBES], "inline": [TP_PROBES],
+             "hw": [TP_PROBES[i:i + 3] for i in range(0, len(TP_PROBES), 3)]}
+
+
+def tp_runs(d, t, bk, mode, iters, skip=()):
+    """Runs tp_driver for every probe group of `bk` in `mode` against target `t` (tp_target or
+    its /CETCOMPAT twin); returns (problems, target rows). `skip`: probes left out."""
+    bad, rows = [], []
+    for grp in TP_GROUPS[bk]:
+        grp = [p for p in grp if p not in skip]
+        if not grp:
+            continue
+        targs = [t, "--iters", iters] + [f"--{x}" for x in ("spawn", "peek", "ovf") if x in grp]
+        r, o = run([d, "--backend", bk, "--mode", mode, "--probes", ",".join(grp), "--"] + targs, timeout=300)
+        tg = next((x for x in o if x.get("kind") == "target"), {})
+        rows.append(tg)
+        rep = report(o)
+        fails = sorted({str(x.get("message", "")) for x in o
+                        if x.get("kind") == "probe_log" and str(x.get("message", "")).startswith("tp FAIL")})
+        cold = [p.get("location") for p in probes(o) if not p.get("hits")]
+        why = []
+        if r.returncode != 0: why.append(f"rc={r.returncode}")
+        if not tg: why.append("no target row")
+        elif tg.get("bad") != 0: why.append(f"bad={tg.get('bad')} first={tg.get('first')!r}")
+        for x in ("spawn", "peek", "ovf"):
+            if x in grp and tg.get(x) != 1: why.append(f"{x}={tg.get(x)}")
+        if fails: why.append(f"cb={fails[:4]}")
+        if cold: why.append(f"no hits: {cold}")
+        if mode == "co":
+            wraps = sum(1 for x in o if x.get("kind") == "probe_log" and x.get("message") == "tp co ok")
+            if wraps != tp_co_expected(grp, iters):
+                why.append(f"call_original wraps={wraps} want {tp_co_expected(grp, iters)}")
+        if rep.get("error") is not None or rep.get("app_exit") != 0 or rep.get("log_dropped") != 0:
+            why.append(f"report err={rep.get('error')} exit={rep.get('app_exit')} dropped={rep.get('log_dropped')}")
+        if why:
+            bad.append(f"[{','.join(grp)}] " + " ".join(why) +
+                       ("" if r.returncode == 0 else f" stderr={(r.stderr or '')[-200:]!r}"))
+    return bad, rows
+
+
 def check_transparency(iters=30):
     """A hit is invisible to the program (examples/transparency): every probed function has an
     unprobed twin, both called through one assembly harness, and a probed call must leave
@@ -1901,40 +2071,12 @@ def check_transparency(iters=30):
     d, t = exe("tp_driver.exe"), exe("tp_target.exe")
     if not d or not t:
         return missing_bin("transparency", "tp_driver/tp_target")
-    groups = {"breakpoint": [TP_PROBES], "inline": [TP_PROBES],
-              "hw": [TP_PROBES[i:i + 3] for i in range(0, len(TP_PROBES), 3)]}
     for bk in ("breakpoint", "hw", "inline"):
         for mode in TP_MODES:
             name = f"transparency-{bk}-{mode}"
-            bad = []
             try:
-                for grp in groups[bk]:
-                    spawn = "spawn" in grp
-                    targs = [t, "--iters", iters] + [f"--{x}" for x in ("spawn", "peek", "ovf") if x in grp]
-                    r, o = run([d, "--backend", bk, "--mode", mode, "--probes", ",".join(grp), "--"] + targs, timeout=300)
-                    tg = next((x for x in o if x.get("kind") == "target"), {})
-                    rep = report(o)
-                    fails = sorted({str(x.get("message", "")) for x in o
-                                    if x.get("kind") == "probe_log" and str(x.get("message", "")).startswith("tp FAIL")})
-                    cold = [p.get("location") for p in probes(o) if not p.get("hits")]
-                    why = []
-                    if r.returncode != 0: why.append(f"rc={r.returncode}")
-                    if not tg: why.append("no target row")
-                    elif tg.get("bad") != 0: why.append(f"bad={tg.get('bad')} first={tg.get('first')!r}")
-                    for x in ("spawn", "peek", "ovf"):
-                        if x in grp and tg.get(x) != 1: why.append(f"{x}={tg.get(x)}")
-                    if fails: why.append(f"cb={fails[:2]}")
-                    if cold: why.append(f"no hits: {cold}")
-                    if mode == "co":
-                        wraps = sum(1 for x in o if x.get("kind") == "probe_log" and x.get("message") == "tp co ok")
-                        if wraps != tp_co_expected(grp, iters):
-                            why.append(f"call_original wraps={wraps} want {tp_co_expected(grp, iters)}")
-                    if rep.get("error") is not None or rep.get("app_exit") != 0 or rep.get("log_dropped") != 0:
-                        why.append(f"report err={rep.get('error')} exit={rep.get('app_exit')} dropped={rep.get('log_dropped')}")
-                    if why:
-                        bad.append(f"[{','.join(grp)}] " + " ".join(why) +
-                                   ("" if r.returncode == 0 else f" stderr={(r.stderr or '')[-200:]!r}"))
-                record(name, not bad, "; ".join(bad) if bad else f"{len(groups[bk])} run(s), iters={iters}, all calls identical to the twin")
+                bad, _ = tp_runs(d, t, bk, mode, iters)
+                record(name, not bad, "; ".join(bad) if bad else f"{len(TP_GROUPS[bk])} run(s), iters={iters}, all calls identical to the twin")
             except Exception as e:
                 record(name, False, repr(e))
     # Inline, a CPU whose full XSAVE area (every XCR0 feature, e.g. AMX tiles: ~11 KB) exceeds
@@ -2221,23 +2363,33 @@ def check_detach():
         try:
             threads = 4
             total = threads * reads
-            _, bo = run([a, "--no-wait", "--threads", threads, "--reads", reads, "--config", "reads_enabled=1"],
+            # inline paced (200k reads/s per thread, >= 7.5 s): an unpaced inline target on a fast
+            # host finished every read before the detach completed (not mid-run).
+            pace = ["--pace", "200000"] if bk == "inline" else []
+            _, bo = run([a, "--no-wait", "--threads", threads, "--reads", reads, "--config", "reads_enabled=1"] + pace,
                         timeout=600)
             base = app(bo)
             target = subprocess.Popen([str(a), "--threads", str(threads), "--reads", str(reads),
-                                       "--config", "reads_enabled=1"],
+                                       "--config", "reads_enabled=1"] + pace,
                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             while True:                                          # wait until it is at its gate
                 line = target.stdout.readline().decode(errors="replace")
                 if not line or '"waiting"' in line:
                     break
-            tracer = subprocess.Popen([str(t), "--backend", bk, "--attach", str(target.pid), "--detach-after-ms", "2500",
+            # Detach as soon as the first 1000 logs arrive (was: a fixed 2.5 s after the attach,
+            # which a fast host -- windows-2025's EPYC, inline -- outran: the target had finished
+            # every read, so the detach was not mid-run, and met its main thread exiting; a
+            # twentieth of the reads was still too late there: inline hits outrun the log pipe).
+            tracer = subprocess.Popen([str(t), "--backend", bk, "--attach", str(target.pid), "--detach-on-stdin",
                                        "-p", "ntdll.dll!NtReadVirtualMemory:xxxx"],
-                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             tout, terr = Lines(tracer.stdout), Lines(tracer.stderr)   # release the gate once the probe is LIVE
             if not terr.wait_for(lambda l: l.startswith("probe: active ntdll.dll!NtReadVirtualMemory"), 60):
                 raise RuntimeError("probe never became active")
             target.stdin.write(b"\n"); target.stdin.flush()
+            with tout.cv:
+                tout.cv.wait_for(lambda: len(tout.lines) >= 1000, 120)
+            tracer.stdin.write("\n"); tracer.stdin.flush()
             tracer.wait(timeout=120)
             tout.t.join(timeout=30); terr.t.join(timeout=30)
             out, err = "\n".join(tout.lines), "\n".join(terr.lines)
@@ -2991,6 +3143,28 @@ def check_cet(threads=8, reads=500):
                              f"rc={r.returncode} err={(rep.get('error') or '')[:120]} stderr={r.stderr.strip()[-160:]!r}")
         except Exception as e:
             record(name, False, repr(e))
+    # call_func and call_original under the shadow stack, every backend: the transparency
+    # fixture on its /CETCOMPAT twin (call_func of Win32 APIs, of a probed function, of a callee
+    # faulting at its first instruction / inside a system function; call_original+return_from).
+    # breakpoint/hw call_func enters the callee through a real CALL (a stub in the target), so
+    # its ret matches the shadow stack; an abandoned callee's shadow frames are dropped (SSP
+    # restored through CONTEXT_XSTATE CET_U).
+    tpd, tpc = exe("tp_driver.exe"), exe("tp_target_cet.exe")
+    for bk in ("breakpoint", "hw", "inline"):
+        for mode in ("callfn", "co"):
+            name = f"cet-tp-{bk}-{mode}"
+            if not tpd or not tpc:
+                missing_bin(name, "tp_driver/tp_target_cet")
+                continue
+            try:
+                bad, rows = tp_runs(tpd, tpc, bk, mode, 10, skip=TP_CET_SKIP)
+                ssp = sorted({str(x.get("shadow_stack")) for x in rows})
+                if enforced is not None and ssp != [str(bool(enforced))]:
+                    bad.append(f"target shadow_stack={ssp} but cet_probe enforced={enforced}")
+                record(name, not bad, f"cet_enforced={enforced} target_ssp={ssp} " +
+                       ("; ".join(bad) if bad else f"{len(TP_GROUPS[bk])} run(s), all calls identical to the twin"))
+            except Exception as e:
+                record(name, False, repr(e))
     site, stub = ntopen_ret_site(t)
     if site is None:
         return record("cet-ret-breakpoint", False, f"no ret found in NtOpenProcess stub: {stub.hex()}")
@@ -3004,6 +3178,115 @@ def check_cet(threads=8, reads=500):
                                          f"opened={a.get('opened')} reads={a.get('successful_reads')} rc={r.returncode}")
     except Exception as e:
         record("cet-ret-breakpoint", False, repr(e))
+
+
+# Exploit-protection policies per image name (Image File Execution Options MitigationOptions,
+# 24 bytes, as Set-ProcessMitigation writes them): user shadow stacks byte 15 (0x10 on, 0x30
+# strict mode); byte 16 continues the CET policy2 nibbles: SetContext IP validation 0x01
+# (0x03 relaxed), BlockNonCetBinaries 0x10 (0x30 non-EHCONT). Measured on windows-2025: these
+# bytes make cet_probe report EnableUserShadowStackStrictMode / BlockNonCetBinaries /
+# SetContextIpValidationRelaxedMode = 1 (Set-ProcessMitigation has no BlockNonCetBinaries).
+CET_POLICIES = {"strict": (0x30, 0x00), "block": (0x10, 0x10)}
+
+
+def cet_policy_copy(name, policy):
+    """BIN/<name>.exe copied to BIN/<name>_<policy>.exe with that IFEO policy set (admin);
+    returns the copy's path, or raises. cet_policy_clear removes the IFEO keys again."""
+    import winreg
+    src = BIN / f"{name}.exe"
+    dst = BIN / f"{name}_{policy}.exe"
+    shutil.copyfile(src, dst)
+    b = bytearray(24); b[15], b[16] = CET_POLICIES[policy]
+    k = winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, rf"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\{dst.name}",
+                           0, winreg.KEY_WRITE | winreg.KEY_WOW64_64KEY)
+    winreg.SetValueEx(k, "MitigationOptions", 0, winreg.REG_BINARY, bytes(b))
+    winreg.CloseKey(k)
+    return dst
+
+
+def cet_policy_clear(paths):
+    import winreg
+    for p in paths:
+        try:
+            winreg.DeleteKeyEx(winreg.HKEY_LOCAL_MACHINE, rf"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\{Path(p).name}",
+                               winreg.KEY_WOW64_64KEY, 0)
+        except OSError:
+            pass
+
+
+def check_cet_policy(threads=4, reads=200):
+    """CET under the strictest process policies (Exploit protection, per image; set through
+    IFEO on renamed copies, removed afterwards). STRICT MODE (cet-strict-*): every shadow-stack
+    mismatch is fatal, also in non-image code the kernel would fix up in compatibility mode --
+    the transparency fixture (call_func, call_original + return_from) and gated_config on every
+    backend. BlockNonCetBinaries (cet-block-*): only /CETCOMPAT images may load; breakpoint/hw
+    need nothing in the target; inline needs the agent (and the callback module) loaded.
+    The detail says whether the machine enforced the policy (cet_probe of the same policy);
+    on a machine without CET the rows prove only that the policy copies run."""
+    pr_exe, tpd, gc = exe("cet_probe.exe"), exe("tp_driver.exe"), exe("gated_config.exe")
+    if not pr_exe or not tpd or not gc or not exe("tp_target_cet.exe") or not exe("probe_app_cet.exe"):
+        return missing_bin("cet-policy", "cet_probe/tp_driver/tp_target_cet/probe_app_cet/gated_config")
+    made = []
+    try:
+        for policy in CET_POLICIES:
+            if policy == "block" and pe_is_x86(BIN / "cet_probe.exe"):
+                # WoW64 refuses to create a process with this policy (0xC0000022, measured on
+                # windows-2025); moot: Windows enforces no shadow stack for WoW64 processes.
+                skip("cet-block", "x86: Windows does not start a WoW64 process under BlockNonCetBinaries (no CET on WoW64)")
+                continue
+            try:
+                copies = {n: cet_policy_copy(n, policy) for n in ("cet_probe", "tp_target_cet", "probe_app_cet")}
+                made += copies.values()
+            except Exception as e:
+                record(f"cet-{policy}-setup", False, f"cannot set the IFEO policy (admin needed): {e!r}")
+                continue
+            r, o = run([copies["cet_probe"]], timeout=60)
+            info = next((x for x in o if x.get("kind") == "cet_probe"), {})
+            pol = info.get("policy", {})
+            key = {"strict": "EnableUserShadowStackStrictMode", "block": "BlockNonCetBinaries"}[policy]
+            # BlockNonCetBinaries is enforced by the loader whether or not the CPU has CET (seen on the
+            # VM, Windows 10 on a Skylake); strict mode only matters with an active shadow stack.
+            on = pol.get(key) == 1 and (policy == "block" or bool(info.get("enforced")))
+            record(f"cet-{policy}-probe", r.returncode == 0 and (pol.get(key) == 1 or not info.get("enforced")),
+                   f"enforced={info.get('enforced')} {key}={pol.get(key)} (policy {'IN EFFECT' if on else 'not in effect'})")
+            for bk in ("breakpoint", "hw", "inline"):
+                for mode in (("callfn", "co") if policy == "strict" else ("log",)):
+                    name = f"cet-{policy}-tp-{bk}-{mode}"
+                    try:
+                        bad, rows = tp_runs(tpd, copies["tp_target_cet"], bk, mode, 5, skip=TP_CET_SKIP)
+                        if policy == "block" and bk == "inline" and on:
+                            # The agent / callback module must be /CETCOMPAT to load; until then
+                            # the refusal must be clean (the error names the agent load).
+                            r2, o2 = run([tpd, "--backend", bk, "--mode", mode, "--probes", "add", "--",
+                                          copies["tp_target_cet"], "--iters", 2], timeout=120)
+                            err = (report(o2).get("error") or "")
+                            # until the agent AND the callback module are /CETCOMPAT
+                            if bad and "LoadLibrary" in err:
+                                record(name, True, f"policy IN EFFECT: inline refused cleanly: {err[:100]}")
+                                continue
+                        record(name, not bad, f"policy {'IN EFFECT' if on else 'not in effect'} " +
+                               ("; ".join(bad) if bad else f"{len(TP_GROUPS[bk])} run(s), all calls identical to the twin"))
+                    except Exception as e:
+                        record(name, False, repr(e))
+                if policy == "strict":
+                    name = f"cet-{policy}-gated-{bk}"
+                    try:
+                        total = threads * reads
+                        r, o = run([gc, "--flag-backend", bk, "--read-backend", bk, "--open-backend", bk, FLAG_LOCATION,
+                                    READ_LOCATION, "--", copies["probe_app_cet"], "--no-wait", "--helpers", HELPERS,
+                                    "--threads", threads, "--reads", reads], timeout=300)
+                        rep, rd, a = report(o), read_probe(o), app(o)
+                        logs, dropped = read_logs(o)
+                        ok = (r.returncode == 0 and rep.get("overrides") == 1 and rd.get("hits") == total and logs == total
+                              and dropped == 0 and unmapped(o) == 0 and rep.get("error") is None
+                              and a.get("successful_reads") == total)
+                        record(name, ok, f"policy {'IN EFFECT' if on else 'not in effect'} target_ssp={a.get('shadow_stack')} "
+                                         f"hits={rd.get('hits')}/{total} logs={logs} dropped={dropped} rc={r.returncode} "
+                                         f"exit={rep.get('app_exit')} err={(rep.get('error') or '')[:100]}")
+                    except Exception as e:
+                        record(name, False, repr(e))
+    finally:
+        cet_policy_clear(made)
 
 
 def check_ret_probe(threads=2, reads=50):
@@ -5222,11 +5505,14 @@ def check_stacks():
     except Exception as e:
         return record("stacks", False, f"map: {e!r}")
     specs = [f"{k}=stacks_target.exe+{r[v]:#x}" for k, v in STACK_SITES.items()]
-    per_bk = {}
+    per_bk, raw_bk, sym_bk = {}, {}, {}
     for bk in ("breakpoint", "hw", "inline"):
         name = f"stacks-{bk}"
         try:
-            _, o = run([d, "--backend", bk, *specs, "--", t], timeout=120)
+            rr, o = run([d, "--backend", bk, *specs, "--", t], timeout=120)
+            sym_bk[bk] = [l for l in rr.stderr.splitlines() if "symbols via" in l][:1]
+            raw_bk[bk] = {k: next((x.get("stack") or [] for x in o if x.get("kind") == "probe_log"
+                                   and x.get("message") == f"stack {k}"), []) for k in STACK_SITES}
             tgt = next((x for x in o if x.get("kind") == "target"), {})
             got, bad = {}, []
             for k, site in STACK_SITES.items():
@@ -5248,7 +5534,7 @@ def check_stacks():
         except Exception as e:
             record(name, False, repr(e))
     if len(per_bk) == 3:
-        diffs = []
+        diffs, first = [], None
         for k in STACK_SITES:
             ref = per_bk["breakpoint"].get(k)
             for bk in ("hw", "inline"):
@@ -5257,8 +5543,14 @@ def check_stacks():
                     i = next((j for j in range(max(len(ref or []), len(other or [])))
                               if (ref or [None] * 99)[j:j + 1] != (other or [None] * 99)[j:j + 1]), -1)
                     diffs.append(f"{k}/{bk}@{i}: {(ref or [])[i:i + 1]} vs {(other or [])[i:i + 1]}")
+                    first = first or (k, i)
+        diag = ""
+        if first:   # the first differing frame with its address, per backend, and each run's dbghelp
+            k, i = first
+            diag = (f" raw={ {b: (raw_bk.get(b, {}).get(k) or [])[i:i + 1] for b in per_bk} }"
+                    f" dbghelp={ {b: v[0][len('probe: symbols via '):] if v else None for b, v in sym_bk.items()} }")
         record("stacks-identical", not diffs and all(per_bk[b].get(k) for b in per_bk for k in STACK_SITES),
-               f"diffs={diffs[:4]} frames={ {k: len(per_bk['breakpoint'].get(k) or []) for k in STACK_SITES} }")
+               f"diffs={diffs[:4]} frames={ {k: len(per_bk['breakpoint'].get(k) or []) for k in STACK_SITES} }" + diag)
 
 
 BIGAPPS_DIR = Path(__file__).resolve().parent.parent / "examples" / "bigapps"
@@ -6809,7 +7101,9 @@ def check_agent_review():
 def check_callfunc_registry():
     """Inline call_func's recursion guard (a probe its callee hits is counted, no callback).
     callfunc-kill-reuse: a thread is killed (TerminateThread) while its callback is inside
-    call_func; short threads then run until one gets the dead thread's id. Every hit of every
+    call_func; thread ids are then taken (threads created suspended and ended unrun, the creator
+    moving across the CPUs: Windows reuses a freed id only once its free list has run dry) until
+    a thread gets the dead thread's id; it and 19 more run. Every hit of every
     later thread -- the reused id included -- runs its callback and logs; the killed hit is
     accounted as interrupted: hits == logs + interrupted, nothing dropped. (The guard used to
     be a thread-id table that a killed thread never left: the reused id's callbacks were
@@ -6842,12 +7136,14 @@ def check_callfunc_registry():
         return next((x for x in o if x.get("kind") == "ar"), {})
 
     try:
-        r, o = go("cfkill", ["ar_target.exe!ar_cf_site=ar_on_cf"])
+        r, o = go("cfkill", ["ar_target.exe!ar_cf_site=ar_on_cf"], timeout=300)
         rw, rep, lg, bad = row(o), report(o), logs(o), []
         hits, calls = hits_of(o, "ar_cf_site"), rw.get("calls", -1)
         intr, logged = rep.get("callbacks_interrupted"), lg.get("ar cf", 0)
         if rw.get("killed") != 1: bad.append(f"victim not killed inside call_func: {rw}")
-        if not rw.get("reused"): bad.append(f"no thread reused the dead id in {rw.get('threads')} threads")
+        if rw.get("reused") != 1 or rw.get("threads") != 20:
+            bad.append(f"the dead id was not given out again: reused={rw.get('reused')} threads={rw.get('threads')} "
+                       f"after {rw.get('consumed')} ids in {rw.get('ms')} ms")
         if hits != calls + 1: bad.append(f"hits={hits} want={calls + 1}")
         if logged != calls: bad.append(f"logged={logged} want={calls} (callbacks skipped)")
         if set(lg) - {"ar cf"}: bad.append(f"logs={lg}")
@@ -6856,7 +7152,8 @@ def check_callfunc_registry():
         if rep.get("log_dropped") != 0: bad.append(f"dropped={rep.get('log_dropped')}")
         if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
         record("callfunc-kill-reuse", not bad, "; ".join(bad) or
-               f"threads={rw.get('threads')} reused={rw.get('reused')} hits={hits} logs={logged} interrupted={intr}")
+               f"threads={rw.get('threads')} reused={rw.get('reused')} (after {rw.get('consumed')} ids, {rw.get('ms')} ms) "
+               f"hits={hits} logs={logged} interrupted={intr}")
     except Exception as e:
         record("callfunc-kill-reuse", False, repr(e))
 
@@ -6943,7 +7240,7 @@ class LcTarget:
         return a
 
     def unhandled(self):
-        return [l for l in self.out.lines if '"unhandled"' in l][:2]
+        return [l for l in self.out.lines if '"unhandled' in l][:4]     # + "unhandled_where" lines
 
     def kill(self):
         if self.p.poll() is None:
@@ -6972,14 +7269,15 @@ def lc_brief(c):
 class LcDriver:
     """lifecycle_driver: stdout probe_log lines are only COUNTED (never kept)."""
 
-    def __init__(self, pid, cfg, *extra, group=False):
-        args = [str(exe("lifecycle_driver.exe")), str(pid)]
+    def __init__(self, pid, cfg, *extra, group=False, driver="lifecycle_driver.exe", env=None):
+        args = [str(exe(driver)), str(pid)]
         for k in ("open", "close", "read", "flag", "slow", "work"):
             args += [f"--{k}", cfg.get(k, "none")]
         args += [str(x) for x in extra]
         self.probes = sum(1 for k in ("open", "close", "read", "flag", "slow", "work") if cfg.get(k, "none") != "none")
         self.p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                  creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if group else 0)
+                                  creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if group else 0,
+                                  env=dict(os.environ, **env) if env else None)
         self.logs, self.other, self.cv = 0, [], threading.Condition()
         self.t = threading.Thread(target=self._pump, daemon=True); self.t.start()
         self.err = Lines(self.p.stderr)
@@ -7023,16 +7321,20 @@ class LcDriver:
         return tuple(int(x) for x in m.groups()) if m else None
 
     def accounting(self):
-        """The session's final accounting {hits, logs_written, log_dropped, source}: probe_close's
-        'probe: detached:' line (a detach) or the probe_report record (the session ended on its
-        own -- the target exited/died -- or never attached). None if neither was printed."""
-        f = self.final()
-        if f is not None:
-            return {"hits": f[0], "logs_written": f[1], "log_dropped": f[2], "source": "detached"}
+        """The session's final accounting {hits, logs_written, log_dropped, in_flight, source}:
+        probe_close's 'probe: detached:' line (a detach), its 'probe: ended:' line (the close asked
+        for a detach but the target ended first) or the probe_report record (the session ended on
+        its own -- the target exited/died -- or never attached). in_flight: callbacks still running
+        at the detach / interrupted by the target's end. None if none was printed."""
+        for l in self.err.lines:
+            m = re.search(r"probe: (detached|ended): .*?hits=(\d+) logs_written=(\d+) log_dropped=(\d+) in_flight=(\d+)", l)
+            if m:
+                return {"hits": int(m.group(2)), "logs_written": int(m.group(3)), "log_dropped": int(m.group(4)),
+                        "in_flight": int(m.group(5)), "source": m.group(1)}
         rep = report([json.loads(l) for l in self.other if l.startswith('{"kind":"probe_report"')])
         if rep:
             return {"hits": rep.get("hits"), "logs_written": rep.get("logs_written"), "log_dropped": rep.get("log_dropped"),
-                    "source": "report"}
+                    "in_flight": rep.get("callbacks_interrupted") or 0, "source": "report"}
         return None
 
     def attached(self):
@@ -7141,21 +7443,36 @@ def lc_detach_cases(cfgname, cfg):
 
 def lc_target_dies(cfgname, cfg):
     """The target dies (TerminateProcess) N ms into the attach / agent injection / install, or
-    right after a detach was requested: the controller must notice, end its session and exit on
-    its own (no hang, no crash) with every log it wrote delivered and none dropped. A session
-    that was established ("attached") must report its final accounting, logs_written == the
-    probe_log records delivered on stdout, log_dropped == 0, driver exit 0; an attach that
-    failed before the session existed must exit 1 with a report of zero logs."""
+    right after a detach was requested (5 ms after; "detach0": at once, so the death races the
+    request; "late": the test-hook driver acts on the request 400 ms late, the target dies 50 ms
+    after it -- forced, the session ends on the target's EXIT_PROCESS before probe_run acts on
+    the request, as seen once in ~20 x86 runs: no final accounting was printed): the controller must notice, end its session and exit on its own (no hang, no
+    crash) with every log it wrote delivered and none dropped. A session that was established
+    ("attached") must report its final accounting (hits, logs_written, log_dropped, in_flight:
+    probe_close's detached/ended line or the runner's probe_report), logs_written == the
+    probe_log records delivered on stdout, log_dropped == 0, and exit 0; an attach that failed
+    before the session existed must exit 1 with a report of zero logs. (Not every lifecycle
+    probe logs every hit, so hits are not balanced against logs here; realbig/stdout do that.)"""
     bad, n, seen = [], 0, []
-    for when in (0, 2, 10, 40, 150, 600, "detach"):
+    if not exe("lifecycle_driver_th.exe"):
+        bad.append("missing project-built binary lifecycle_driver_th.exe")
+    for when in (0, 2, 10, 40, 150, 600, "detach", "detach0", "late"):
         n += 1
         tg = d = None
+        if when == "late" and not exe("lifecycle_driver_th.exe"):
+            continue
         try:
             tg = LcTarget("--threads", 4, "--churn")
-            d = LcDriver(tg.pid, cfg, "--detach-on-stdin")
-            if when == "detach":
+            if when == "late":
+                d = LcDriver(tg.pid, cfg, "--detach-on-stdin", driver="lifecycle_driver_th.exe",
+                             env={"UHH_TEST_STOP_LATE_MS": "400"})
+            else:
+                d = LcDriver(tg.pid, cfg, "--detach-on-stdin")
+            if when in ("detach", "detach0", "late"):
                 d.wait_attached(); d.wait_active(timeout=30)
-                d.detach(); time.sleep(0.005)
+                d.detach()
+                if when == "detach": time.sleep(0.005)
+                if when == "late": time.sleep(0.05)
             else:
                 time.sleep(when / 1000.0)
             tg.kill()
@@ -7164,15 +7481,18 @@ def lc_target_dies(cfgname, cfg):
             fin_ok = d.finish(timeout=60)
             rc = d.p.returncode
             acct, session = d.accounting(), d.attached()
-            seen.append(f"{when}:{'S' if session else '-'}{d.logs}")
+            seen.append(f"{when}:{'S' if session else '-'}{d.logs}" + (f"/{acct['source'][0]}" if acct else ""))
             why = []
             if not fin_ok: why.append("driver did not finish")
             if acct is None:
-                why.append("no final accounting (neither 'probe: detached:' nor probe_report)")
+                why.append("no final accounting (neither 'probe: detached:'/'probe: ended:' nor probe_report)")
             elif acct["logs_written"] != d.logs or acct["log_dropped"] != 0:
                 why.append(f"logs_written={acct['logs_written']} delivered={d.logs} dropped={acct['log_dropped']} "
                            f"({acct['source']})")
+
             if session and rc != 0: why.append(f"rc={rc} after the session was established")
+            if when == "late" and session and (acct or {}).get("source") != "ended":
+                why.append(f"forced late stop: accounting from {(acct or {}).get('source')} (want 'probe: ended:')")
             if not session and (rc != 1 or (acct or {}).get("logs_written") not in (0, None) or d.logs):
                 why.append(f"attach failed before the session existed but rc={rc} delivered={d.logs}")
             if why:
@@ -7363,6 +7683,51 @@ def lc_install_stuck(cfgname, cfg):
             if x: x.kill()
 
 
+def lc_killed_in_freeze(cfgname, cfg, repeats=5):
+    """L11, runner signature (controller killed 0.05 s into an attach, target dead 0xC0000005
+    with no unhandled report; then, with that fixed, HUNG): the controller dies while the agent's
+    first install round waits on its FREEZE request, every other thread already suspended
+    (UHH_TEST_FREEZE_STALL_MS parks the controller exactly there). The raise then comes back
+    unserviced; the agent must NOT write the hooks unfrozen (SafetyHook's own trap path made the
+    ntdll stub page non-executable under the installer and every other thread), and must resume
+    the threads the dead controller froze although no service thread watches it yet (its named
+    event died with it). The target must run on, untouched and unhooked."""
+    if "inline" not in cfg.values():
+        return
+    bad, n = [], 0
+    for i in range(repeats):
+        n += 1
+        tg = d = None
+        try:
+            tg = LcTarget("--threads", 4, "--churn", pace=0 if cfgname == "inline" else 1)
+            old = os.environ.get("UHH_TEST_FREEZE_STALL_MS")
+            os.environ["UHH_TEST_FREEZE_STALL_MS"] = "3000"
+            try:
+                d = LcDriver(tg.pid, cfg)
+            finally:
+                if old is None: os.environ.pop("UHH_TEST_FREEZE_STALL_MS", None)
+                else: os.environ["UHH_TEST_FREEZE_STALL_MS"] = old
+            if not d.err.wait_for(lambda l: l.startswith("probe: test: install freeze stalled"), 30):
+                raise RuntimeError(f"no install freeze seen: {d.err.lines[-3:]}")
+            d.kill(); d.finish(timeout=30)
+            time.sleep(3.0)
+            c = tg.check()
+            time.sleep(1.0)
+            c2 = tg.check()
+            progressed = (c2.get("iterations") or 0) > (c.get("iterations") or 0)
+            if not lc_clean(c2) or not progressed:
+                bad.append(f"#{i}: progressed={progressed} {lc_brief(c2)} unhandled={tg.unhandled()}")
+            a = tg.quit()
+            if (a.get("rc") != 0 or a.get("late") or a.get("stuck")) and not any(x.startswith(f"#{i}") for x in bad):
+                bad.append(f"#{i}: exit={a.get('rc')} {lc_brief(a)} unhandled={tg.unhandled()}")
+        except Exception as e:
+            bad.append(f"#{i}: {e!r}")
+        finally:
+            if d: d.kill()
+            if tg: tg.kill()
+    record(f"lifecycle-killed-in-freeze-{cfgname}", not bad, f"cases={n}" + (f" bad={bad[:3]}" if bad else ""))
+
+
 def check_lifecycle():
     """Lifecycle edge cases (examples/lifecycle) under every backend and mixed: repeated
     attach/detach/re-attach, detach at awkward moments, the target dying under the controller,
@@ -7372,7 +7737,7 @@ def check_lifecycle():
         return missing_bin("lifecycle", "lifecycle_driver / lifecycle_target / hunt_dll")
     for cfgname, cfg in LC_CONFIGS.items():
         for fn in (lc_reattach, lc_detach_cases, lc_target_dies, lc_two_controllers, lc_interrupt, lc_controller_killed,
-                   lc_agent_refused, lc_install_stuck):
+                   lc_killed_in_freeze, lc_agent_refused, lc_install_stuck):
             tag = fn.__name__[3:].replace("_", "-")
             if fn is lc_detach_cases or lc_selected(f"lifecycle-{tag}-{cfgname}"):
                 fn(cfgname, cfg)
@@ -8636,7 +9001,13 @@ def check_cx2_review():
         ids, more than the agent's 4096-entry thread table) make one inline hit each; then a
         callback on yet another thread outlives a detach -- while those threads still live, and
         after they have all exited. Its log must be delivered (it ran untracked: the detach
-        drain counted 0 live callbacks and gave up, the log was dropped)."""
+        drain counted 0 live callbacks and gave up, the log was dropped).
+      cx2-evsusp-<b> / cx2-cosusp-<b> (X2 open note; breakpoint, hw): the program suspends a
+        worker the controller has just let run again -- its probe hit continued (evsusp; the
+        test-hook build dies 1.5 s later with no event or guard sync in between) or inside its
+        callback's call_original (cosusp; the controller killed while the original runs). The
+        guard listed that thread as held until the next sync (evsusp) / for the whole call and
+        once per 20 ms poll (cosusp), so it released the PROGRAM's suspension: it must leave it."""
     cd, ct = exe("ctrl_driver.exe"), exe("ctrl_target.exe")
     d, t, dth = exe("co_driver.exe"), exe("co_target.exe"), exe("co_driver_th.exe")
     if not cd or not ct or not d or not t or not dth:
@@ -8719,6 +9090,83 @@ def check_cx2_review():
                                                    "suspension kept (prev=1, worker never ran) both times")
         except Exception as e:
             record(name, False, repr(e))
+
+    st = exe("susp_target.exe")
+
+    def susp_after(case, bk):
+        """susp_target evsusp / cosusp: the program suspends its worker right after the controller let
+        it run again (its hit continued / inside its callback's call_original); the controller then
+        dies (evsusp: the test-hook build dies 1.5 s after continuing the hit, no event or guard sync
+        meanwhile; cosusp: killed while the original runs). The guard must leave exactly the
+        program's suspension: the worker did not run, the program's ResumeThread reports 1."""
+        procs, bad = [], []
+        try:
+            tgt = subprocess.Popen([str(st), case], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, text=True)
+            procs.append(tgt)
+            tout = Lines(tgt.stdout)
+            w = tout.wait_for(lambda l: '"kind":"waiting"' in l, 30)
+            if not w:
+                raise RuntimeError("target never reached its gate")
+            env = dict(os.environ)
+            if case == "evsusp":
+                env["UHH_TEST_DIE_AFTER_HIT_MS"] = "1500"
+            att = subprocess.Popen([str(dth), "--backend", bk, "--case", case, "--module", "susp_target.exe",
+                                    "--attach", str(json.loads(w)["pid"])],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env)
+            procs.append(att)
+            aerr = Lines(att.stderr)
+            if not aerr.wait_for(lambda l: l.startswith("probe: active "), 60):
+                raise RuntimeError(f"probe never active: {aerr.lines[-4:]}")
+            if any("guard unavailable" in l for l in aerr.lines):
+                bad.append("controller-death guard unavailable")
+            tgt.stdin.write("x"); tgt.stdin.flush()                # gate 1: the worker goes
+            sl = tout.wait_for(lambda l: '"kind":"susp"' in l, 60)
+            if not sl:
+                raise RuntimeError("the program never suspended its worker")
+            wtid = json.loads(sl)["tid"]
+            if case == "evsusp":
+                att.wait(timeout=90)                                 # dies 1.5 s after continuing the hit
+            else:
+                time.sleep(0.5)                                      # ~25 of call_original's 20 ms polls
+                if att.poll() is None:
+                    att.kill()
+                att.wait(timeout=60)
+            aerr.t.join(timeout=30)
+            died = next((l for l in aerr.lines if l.startswith("probe: test: dying")), "")
+            tgt.stdin.write("x"); tgt.stdin.flush()                # gate 2: the controller is dead
+            tgt.wait(timeout=90)
+            row = next((x for x in tout.objs() if x.get("kind") == "co"), {})
+            rc = tgt.returncode & 0xFFFFFFFF
+            if case == "evsusp":
+                if att.returncode != 96: bad.append(f"controller_rc={att.returncode} (96: died after the hit)")
+                if "enabled=1" not in died: bad.append(f"guard not enabled at the death: {died!r}")
+            elif att.returncode == 0:
+                bad.append("controller ended before it was killed (the call_original was not in flight)")
+            if rc != 0: bad.append(f"target_rc=0x{rc:x}")
+            if row.get("first") != 0 or row.get("prev") != 1 or row.get("ran_while_suspended") != 0:
+                bad.append(f"ResumeThread prev={row.get('prev')} (want 1: the program's own suspension) "
+                           f"ran_while_suspended={row.get('ran_while_suspended')} (want 0)")
+            want = 76 if case == "cosusp" else 5
+            if row.get("done") != 1 or row.get("ret") != want: bad.append(f"target row={row} (ret want {want})")
+            listed = re.search(r"held=\[([^\]]*)\]", died)
+            return bad, (f"worker={wtid} prev={row.get('prev')} ran={row.get('ran_while_suspended')} ret={row.get('ret')}"
+                         + (f" guard_listed_worker={str(wtid) in listed.group(1).split(',')}" if listed else ""))
+        finally:
+            for q in procs:
+                if q.poll() is None:
+                    q.kill()
+
+    for case in ("evsusp", "cosusp"):
+        for bk in ("breakpoint", "hw"):
+            name = f"cx2-{case}-{bk}"
+            if not st:
+                missing_bin(name, "susp_target"); continue
+            try:
+                bad, detail = susp_after(case, bk)
+                record(name, not bad, " ".join(bad + [detail]))
+            except Exception as e:
+                record(name, False, repr(e))
 
     for case in ("many", "manydead"):
         name = f"cx2-{case}threads-inline" if case == "many" else "cx2-manydead-inline"
@@ -8918,10 +9366,39 @@ def realbig_sysprog(name, arch):
     return (Path(r"C:\Windows\SysWOW64") if arch == "x86" else SYS32) / name
 
 
+def _share_lock(path):
+    """Open `path` with no sharing (a gate): every other open fails with a sharing violation
+    until close_share_lock(handle)."""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    h = k32.CreateFileW(str(path), 0x80000000, 0, None, 3, 0x80, None)   # GENERIC_READ, share 0, OPEN_EXISTING
+    if not h or h == wintypes.HANDLE(-1).value:
+        raise RuntimeError(f"cannot lock {path}: error {ctypes.get_last_error()}")
+    return h
+
+
+def _close_share_lock(h):
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32")
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.CloseHandle(h)
+
+
 def realbig_robocopy(bk, mode, arch, work, base):
     """robocopy /MT:16 (launch: the 800-file tree under UHH; detach: attached while it copies the
-    many-small-files tree, which takes long enough plain; detached a third of the way in). The
-    copy must be exact and exit 1 (copied). (/IPG cannot pace it: with /MT robocopy rejects it, rc 16.)"""
+    many-small-files tree, detached 1.5 s after the attach). The copy must be exact and exit 1
+    (copied). (/IPG cannot pace it: with /MT robocopy rejects it, rc 16.)
+    Detach: the copy cannot end before the detach on any machine -- the last file in robocopy's
+    order is held open with no sharing (a gate) until the detach and the residue check are done;
+    robocopy retries it (/R:600 /W:1: a sharing violation is retried, the file then copied,
+    exit 1) and finishes after the gate opens. (Ungated, a fast runner finished the whole copy
+    during the attach: CI 42213960508 x86, "robocopy ended during the attach".) How far the copy
+    had got at the detach is reported (files_at_detach)."""
     robo = realbig_sysprog("robocopy.exe", arch)
     src = work / ("src" if mode == "launch" else "many")
     dst = work / f"dst-{bk}-{mode}"
@@ -8936,6 +9413,10 @@ def realbig_robocopy(bk, mode, arch, work, base):
         if rep.get("app_exit") != 1: bad.append(f"robocopy exit={rep.get('app_exit')} (want 1: files copied)")
         extra = f"secs={s['secs']:.1f} base={base['robo_secs']:.1f} x{s['secs'] / max(base['robo_secs'], 0.1):.1f}"
     else:
+        gate_file = sorted(src.rglob("*.dat"))[-1]
+        gate = _share_lock(gate_file)
+        argv = [a if a != "/R:0" else "/R:600" for a in argv]
+        argv = [a if a != "/W:0" else "/W:1" for a in argv]
         tgt = subprocess.Popen([str(a) for a in argv], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             t0 = time.time()
@@ -8950,6 +9431,7 @@ def realbig_robocopy(bk, mode, arch, work, base):
             dms = 1500
             s = realbig_session(bk, REALBIG_ROBO_PROBES, ["--attach", tgt.pid, "--detach-after-ms", dms], 900)
             alive = tgt.poll() is None
+            at_detach = sum(1 for _ in dst.rglob("*.dat")) if dst.exists() else 0
             bad, detail = realbig_judge(s, bk, REALBIG_ROBO_PROBES, [REALBIG_ROBO_PROBES[i].rsplit(":", 1)[0] for i in (0, 2, 3)], False)
             if not alive:
                 bad.append(f"robocopy ended during the attach (rc={tgt.returncode}): detach not mid-run")
@@ -8958,10 +9440,14 @@ def realbig_robocopy(bk, mode, arch, work, base):
                 bad += rbad
                 detail += " " + rdet
             if '"kind":"detached"' not in s["out"]: bad.append("not detached")
+            _close_share_lock(gate); gate = None                  # the gate opens: robocopy finishes
             rc = tgt.wait(timeout=900)
             if rc != 1: bad.append(f"robocopy exit={rc} (want 1)")
-            extra = f"plain_first_copy={base['robo_many_secs']:.1f}s total={time.time() - t0:.1f}s"
+            extra = (f"files_at_detach={at_detach}/{nfiles} plain_first_copy={base['robo_many_secs']:.1f}s "
+                     f"total={time.time() - t0:.1f}s")
         finally:
+            if gate is not None:
+                _close_share_lock(gate)
             if tgt.poll() is None:
                 tgt.kill()
     got, n = realbig_tree_digest(dst) if dst.exists() else (None, 0)
@@ -9457,16 +9943,203 @@ def run_in_conpty(cmdline, out_path, timeout, cols=120, rows=30):
     return code, elapsed
 
 
-def count_vt_seq(path):
-    """Stream a ConPTY capture: VT sequences and line breaks removed, the unique probe_log seq
-    values (bit set), the highest one, and the last probe_report seen."""
-    vt = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]")
+class VtScreen:
+    """A minimal VT terminal (what a ConPTY capture needs): a rows x cols grid with autowrap,
+    cursor addressing, erase/insert/delete and scrolling. ConPTY renders the console as a
+    screen, not as the bytes the program wrote: it repaints only cells that changed, moves the
+    cursor over cells the screen already shows, and may repaint rows out of order -- so text
+    is only reconstructible by emulating the screen. Every row that leaves the screen (scrolled
+    off the top or erased) and, at the end, every row still on it is passed to emit(text) --
+    a row that autowrapped keeps its full width and no line break; any other row is
+    right-stripped and ends in '\\n'."""
+    SEQ = re.compile(r"\x1b\[([0-?]*)([ -/]*)([@-~])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[P^_][^\x1b]*\x1b\\"
+                     r"|\x1b[ -/]*[0-~]|[\x00-\x1f\x7f]")
+    MOVES = set("HfABeCaDEFG`dKJX@PLMSTbr")
+    PARTIAL = re.compile(r"\x1b(?:\[[0-?]*[ -/]*|\][^\x07\x1b]*|[P^_][^\x1b]*|[ -/]*)?\Z")
+
+    def __init__(self, cols, rows, emit):
+        self.cols, self.rows, self.emit = cols, rows, emit
+        self.grid = [[" "] * cols for _ in range(rows)]
+        self.wrapped = [False] * rows
+        self.dirty = [False] * rows          # anything written since the row was last blank
+        self.x = self.y = 0
+        self.pending = False                 # deferred autowrap: the last column was written
+        self.top, self.bottom = 0, rows - 1
+        self.last = " "
+        self.carry = ""
+
+    def _row_text(self, y):
+        t = "".join(self.grid[y])
+        return t if self.wrapped[y] else t.rstrip(" ") + "\n"
+
+    def _blank(self, y):
+        self.grid[y] = [" "] * self.cols
+        self.wrapped[y] = self.dirty[y] = False
+
+    def _flush_row(self, y):
+        if self.dirty[y]:
+            self.emit(self._row_text(y))
+        self._blank(y)
+
+    def _scroll_up(self, n=1):
+        for _ in range(n):
+            if self.top == 0:
+                self._flush_row(self.top)
+            del self.grid[self.top]; del self.wrapped[self.top]; del self.dirty[self.top]
+            self.grid.insert(self.bottom, [" "] * self.cols)
+            self.wrapped.insert(self.bottom, False); self.dirty.insert(self.bottom, False)
+
+    def _scroll_down(self, n=1):
+        for _ in range(n):
+            del self.grid[self.bottom]; del self.wrapped[self.bottom]; del self.dirty[self.bottom]
+            self.grid.insert(self.top, [" "] * self.cols)
+            self.wrapped.insert(self.top, False); self.dirty.insert(self.top, False)
+
+    def _linefeed(self):
+        self.pending = False
+        if self.y == self.bottom:
+            self._scroll_up()
+        elif self.y < self.rows - 1:
+            self.y += 1
+
+    def _text(self, s):
+        i, n = 0, len(s)
+        while i < n:
+            if self.pending:
+                self.wrapped[self.y] = True
+                self.x = 0
+                self._linefeed()
+            take = min(n - i, self.cols - self.x)
+            self.grid[self.y][self.x:self.x + take] = s[i:i + take]
+            self.dirty[self.y] = True
+            self.x += take
+            i += take
+            if self.x >= self.cols:
+                self.x, self.pending = self.cols - 1, True
+        self.last = s[-1]
+
+    def _erase(self, y, a, b):
+        self.grid[y][a:b] = [" "] * (b - a)
+        if b >= self.cols:
+            self.wrapped[y] = False
+
+    def _csi(self, params, inter, final):
+        private = params[:1] in ("?", ">", "<", "=")
+        nums = [int(p) if p.isdigit() else 0 for p in (params[1:] if private else params).split(";")] if params else []
+        def arg(i=0, d=1):
+            return nums[i] if len(nums) > i and nums[i] else d
+        if private or inter or final not in self.MOVES:
+            return                 # SGR, modes (?25l cursor, ?1049h ...): no text, no cursor motion
+        c, r = self.cols, self.rows
+        if final in "Hf":
+            self.y, self.x = min(arg(0) - 1, r - 1), min(arg(1) - 1, c - 1)
+        elif final == "A":
+            self.y = max(self.y - arg(), 0)
+        elif final in "Be":
+            self.y = min(self.y + arg(), r - 1)
+        elif final in "Ca":
+            self.x = min(self.x + arg(), c - 1)
+        elif final == "D":
+            self.x = max(self.x - arg(), 0)
+        elif final == "E":
+            self.y, self.x = min(self.y + arg(), r - 1), 0
+        elif final == "F":
+            self.y, self.x = max(self.y - arg(), 0), 0
+        elif final in "G`":
+            self.x = min(arg() - 1, c - 1)
+        elif final == "d":
+            self.y = min(arg() - 1, r - 1)
+        elif final == "K":
+            m = arg(0, 0)
+            self._erase(self.y, *((self.x, c) if m == 0 else (0, self.x + 1) if m == 1 else (0, c)))
+        elif final == "J":
+            m = arg(0, 0)
+            if m == 0:
+                self._erase(self.y, self.x, c)
+                for y in range(self.y + 1, r): self._blank(y)
+            elif m == 1:
+                self._erase(self.y, 0, self.x + 1)
+                for y in range(0, self.y): self._blank(y)
+            elif m == 2:                             # clear: what it held was shown -- pass it on
+                for y in range(r): self._flush_row(y)
+        elif final == "X":
+            self._erase(self.y, self.x, min(self.x + arg(), c))
+        elif final == "@":
+            row = self.grid[self.y]; k = min(arg(), c - self.x)
+            row[self.x:] = [" "] * k + row[self.x:c - k]
+        elif final == "P":
+            row = self.grid[self.y]; k = min(arg(), c - self.x)
+            row[self.x:] = row[self.x + k:] + [" "] * k
+        elif final in "LM" and self.top <= self.y <= self.bottom:
+            top, self.top = self.top, self.y
+            (self._scroll_down if final == "L" else self._scroll_up)(min(arg(), self.bottom - self.y + 1))
+            self.top = top
+        elif final == "S":
+            self._scroll_up(arg())
+        elif final == "T":
+            self._scroll_down(arg())
+        elif final == "b":
+            self._text(self.last * arg())
+            return
+        elif final == "r":
+            t, b = arg(0, 1) - 1, arg(1, r) - 1
+            if 0 <= t < b < r:
+                self.top, self.bottom = t, b
+            self.x = self.y = 0
+        self.pending = False
+
+    def feed(self, data):
+        data = self.carry + data
+        m = self.PARTIAL.search(data)
+        cut = m.start() if m else len(data)
+        self.carry = data[cut:]
+        pos = 0
+        for m in self.SEQ.finditer(data, 0, cut):
+            if m.start() > pos:
+                self._text(data[pos:m.start()])
+            pos = m.end()
+            t = m.group(0)
+            if m.group(3):
+                self._csi(m.group(1), m.group(2), m.group(3))
+            elif t == "\r":
+                self.x, self.pending = 0, False
+            elif t in "\n\x0b\x0c":
+                self._linefeed()
+            elif t == "\x08":
+                self.x, self.pending = max(self.x - 1, 0), False
+            elif t == "\t":
+                self.x = min((self.x // 8 + 1) * 8, self.cols - 1)
+            elif t == "\x1bM":                       # reverse index
+                if self.y == self.top: self._scroll_down()
+                else: self.y = max(self.y - 1, 0)
+            elif t == "\x1bD":
+                self._linefeed()
+            elif t == "\x1bE":
+                self.x = 0; self._linefeed()
+            elif t == "\x1bc":
+                for y in range(self.rows): self._flush_row(y)
+                self.x = self.y = 0
+        if cut > pos:
+            self._text(data[pos:cut])
+
+    def close(self):
+        for y in range(self.rows):
+            self._flush_row(y)
+
+
+def count_vt_seq(path, cols=120, rows=30):
+    """Stream a ConPTY capture (cols x rows, as run_in_conpty created it) through VtScreen and
+    read the reconstructed text, line breaks removed: the unique probe_log seq values (bit
+    set), the highest one, and the last probe_report seen (parsed whole, however the renderer
+    wrapped or repainted it)."""
+    import codecs
     token = re.compile(r'"seq":(\d+)\}')
     seen, count, top, report_text, carry = bytearray(1 << 16), 0, -1, None, ""
+    pieces = []
+    screen = VtScreen(cols, rows, pieces.append)
 
-    def scan(text):
+    def scan(flat):
         nonlocal seen, count, top, report_text
-        flat = vt.sub("", text).replace("\r", "").replace("\n", "").replace("\x08", "")   # BS: ConPTY wrap artefact
         for m in token.finditer(flat):
             v = int(m.group(1))
             if v >= len(seen):
@@ -9477,26 +10150,32 @@ def count_vt_seq(path):
             top = max(top, v)
         at = flat.rfind('{"kind":"probe_report"')
         if at >= 0:
-            report_text = flat[at:at + 600]
+            report_text = flat[at:at + 16384]
+
+    def drain(final):
+        nonlocal carry
+        text = carry + "".join(pieces).replace("\n", "")
+        pieces.clear()
+        cut = len(text) if final else max(text.rfind('{"kind"', 0, max(0, len(text) - 16384)), 0)
+        scan(text[:cut])
+        carry = text[cut:]
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
     with open(path, "rb") as f:
         while True:
             chunk = f.read(1 << 22)
             if not chunk:
                 break
-            text = carry + chunk.decode("utf-8", "replace")
-            cut = text.rfind('{"kind"', 0, max(0, len(text) - 4096))
-            cut = max(cut, 0)
-            scan(text[:cut])
-            carry = text[cut:]
-    scan(carry)
+            screen.feed(decoder.decode(chunk))
+            drain(False)
+    screen.feed(decoder.decode(b"", final=True))
+    screen.close()
+    drain(True)
     report_obj = None
     if report_text:
-        m = re.match(r'\{"kind":"probe_report".*?"error":(?:null|"(?:[^"\\]|\\.)*")\}', report_text)
-        if m:
-            try:
-                report_obj = json.loads(m.group(0))
-            except json.JSONDecodeError:
-                report_obj = None
+        try:
+            report_obj, _ = json.JSONDecoder().raw_decode(report_text)
+        except json.JSONDecodeError:
+            report_obj = None
     return {"unique": count, "max": top, "missing": (top + 1 - count) if top >= 0 else 0, "report": report_obj}
 
 
@@ -9655,6 +10334,9 @@ def check_stdout_console(big=0):
                    f'--delay 0 --no-ticks"')
             code, secs = run_in_conpty(cmd, work / "vt.bin", timeout=600 + want / 500)
             seen = count_vt_seq(work / "vt.bin")
+            with open(work / "vt.bin", "rb") as f:          # the capture's end: the report's rendering
+                f.seek(max(0, (work / "vt.bin").stat().st_size - 2600))
+                vt_tail = f.read()
             (work / "vt.bin").unlink()
             rep = seen["report"] or {}
             sessions = list((work / "uhh" / "logs").glob("*.jsonl"))
@@ -9666,7 +10348,8 @@ def check_stdout_console(big=0):
                   sess.get("logs") == want and sess.get("gaps") == 0)
             record(name, ok, f"console_seq={seen['unique']}/{want} missing={seen['missing']} report={'yes' if rep else 'no'} "
                              f"hits={rep.get('hits')} written={rep.get('logs_written')} stdout_logs={rep.get('stdout_logs')} "
-                             f"live_error={rep.get('live_output_error')} file={sess.get('logs')} rc={code} {secs:.0f}s")
+                             f"live_error={rep.get('live_output_error')} file={sess.get('logs')} rc={code} {secs:.0f}s"
+                             + ("" if ok else f" vt_tail={vt_tail!r}"))
         except Exception as e:
             record(name, False, repr(e))
         finally:
@@ -9773,6 +10456,7 @@ def main():
     if want(check_callorig): check_callorig()
     if want(check_portability): check_portability()
     if want(check_callorig_hunt): check_callorig_hunt()
+    if want(check_callorig_deep): check_callorig_deep()
     if want(check_callconv): check_callconv()
     if want(check_agent_review): check_agent_review()
     if want(check_callfunc_registry): check_callfunc_registry()
@@ -9781,6 +10465,7 @@ def main():
     if want(check_agent_crt): check_agent_crt()
     if want(check_oldcrt): check_oldcrt()
     if want(check_cet): check_cet()
+    if want(check_cet_policy): check_cet_policy()
     if want(check_shared_mix): check_shared_mix()
     if want(check_handle_map): check_handle_map()
     if want(check_gated_mem): check_gated_mem()

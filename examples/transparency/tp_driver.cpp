@@ -15,7 +15,7 @@
 extern "C" void tp_on_hit(probe_context *);
 extern "C" void tp_on_spawn(probe_context *);
 extern "C" void tp_on_ovf(probe_context *);
-struct tp_cfg { uint32_t mode, nargs, pop, backend, entry; };   // see tp_callbacks.cpp
+struct tp_cfg { uint32_t mode, nargs, pop, backend, entry; char module[48]; };   // see tp_callbacks.cpp
 
 struct Site { const char *name, *symbol; uint32_t nargs, pop; int special; };   // 1 spawn, 2 ovf
 #if defined(_WIN64)
@@ -50,10 +50,16 @@ int main(int argc, char **argv) {
     if (!bk || mode == UINT32_MAX || i + 1 >= argc) { std::fprintf(stderr, "usage: see tp_driver.cpp\n"); return 2; }
     probe_session *s = probe_session_create();
     if (!s) return 1;
+    // The target's image name (tp_target.exe, or its /CETCOMPAT twin tp_target_cet.exe).
+    std::string module = argv[i + 1];
+    if (size_t slash = module.find_last_of("\\/"); slash != std::string::npos) module.erase(0, slash + 1);
+    if (module.size() < 4 || _stricmp(module.c_str() + module.size() - 4, ".exe")) module += ".exe";
+    if (module.size() >= sizeof(tp_cfg::module)) { std::fprintf(stderr, "tp_driver: target name too long\n"); return 2; }
     for (const Site &site : kSites) {
         if (!only.empty() && only.find(std::string(",") + site.name + ",") == std::string::npos) continue;
-        tp_cfg cfg{mode, site.nargs, site.pop, bk, std::strcmp(site.name, "mid") ? 1u : 0u};
-        std::string loc = std::string("tp_target.exe!") + site.symbol;
+        tp_cfg cfg{mode, site.nargs, site.pop, bk, std::strcmp(site.name, "mid") ? 1u : 0u, {}};
+        std::memcpy(cfg.module, module.c_str(), module.size() + 1);
+        std::string loc = module + "!" + site.symbol;
         if (!probe_add_symbol_cfg(s, loc.c_str(), site.special == 1 ? tp_on_spawn : site.special == 2 ? tp_on_ovf : tp_on_hit, bk, &cfg, sizeof(cfg))) {
             std::fprintf(stderr, "tp_driver: add %s failed\n", loc.c_str());
             probe_close(s);

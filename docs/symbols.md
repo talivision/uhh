@@ -105,6 +105,38 @@ myapp+0x1052 [0x7ff612341052]
 `SymGetModuleBase64`. Its first returned frame is always the supplied program counter;
 later frames are callers recovered by DbgHelp.
 
+## Names come from files, never from the target's memory
+
+Each controller symbol session is two DbgHelp sessions:
+
+- **Names** (`resolve`, `symbolize`, `containing_function`, `enumerate`): keyed by an
+  opaque value that is not a process handle, so DbgHelp cannot read the target's address
+  space. Every module is loaded, on first use, from its image file and its PDB on disk:
+  PDB names when a PDB matches, otherwise the file's export table.
+- **Walk** (`walk_stack` only): keyed by the real process handle, created on the first
+  stack walk, holding the same modules and search path. `StackWalk64` unwinds the live,
+  stopped target from its memory (on x64 it needs the `.pdata` there). It produces raw
+  frame addresses only; they are named by the names session.
+
+The rule exists because DbgHelp keyed by a process handle reads a deferred module's image
+from the target's memory when the module is first used. If the memory there does not
+match the file, the module ends up with the memory's exports under the file's name or with
+no symbols at all (`SymNone`). Which happened depended on when a module was first used.
+The `stacks` check, run on GitHub's Server 2022 runners, failed about one run in five
+(x64 and x86): breakpoint and hw walks had loaded kernel32 at the hit and named a frame
+`kernel32!BaseThreadInitThunk+0x10`. Inline stacks are named later, on the writer
+thread, and the check's target exits right after its last hit. In those runs the same
+frame came out as `kernel32+0x14f80`. DbgHelp reported the module loaded from
+`C:\Windows\System32\kernel32.dll` with `SymType` none and no exports.
+
+The rule is the same for every backend and does not depend on timing: a frame names
+through the image file whenever it is symbolized. A module whose file is gone, for
+example a DLL deleted after it loaded, gets no names and is shown as `module+offset`.
+`regress.py symbols-file-backed` registers kernel32's file at the base where the target
+maps ntdll and requires kernel32's names and `resolve` results. A memory-keyed session
+gave ntdll's exports (Windows 10's DbgHelp) or none (the SDK's). The check also requires
+kernel32's names on a first lookup after the target has exited.
+
 ## Stacks per backend (`send_log_stack`)
 
 Every backend captures raw return addresses at the hit and symbolizes them at report

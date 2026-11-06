@@ -3,6 +3,7 @@
 //   uhh_trace [--backend inline|breakpoint|hw] [--fallback-hw] [--allow-unsafe-site] [--allow-prehooked] [--stack] [--unsafe-fast-patch]
 //             -p "KernelBase.dll!CreateFileW:Wxx" [-p ...] -- program.exe [args...]
 //   uhh_trace ... --attach <pid>          (instrument an already-running process)
+//                 [--detach-after-ms N | --detach-on-stdin]   (then detach, the target runs on)
 //   uhh_trace ... --attach-new <image> [--timeout ms]   (attach to the next NEW instance)
 //
 // After the ':' one format character per argument (see trace_callback.h); ':-' counts
@@ -175,7 +176,7 @@ static int list_symbols(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     if (argc > 1 && !std::strcmp(argv[1], "--list")) return list_symbols(argc, argv);
-    uint32_t backend = PROBE_BREAKPOINT; bool stack = false, unsafe_fast_patch = false, fallback_hw = false, allow_unsafe_site = false, allow_prehooked = false; unsigned long attach_pid = 0, detach_ms = 0;
+    uint32_t backend = PROBE_BREAKPOINT; bool stack = false, unsafe_fast_patch = false, fallback_hw = false, allow_unsafe_site = false, allow_prehooked = false; unsigned long attach_pid = 0, detach_ms = 0; bool detach_stdin = false;
     const char *attach_new = nullptr; unsigned long attach_timeout = 0;
     std::vector<trace_config> cfgs; std::vector<std::string> locs;
     int i = 1;
@@ -188,6 +189,7 @@ int main(int argc, char **argv) {
         if (!std::strcmp(argv[i], "--allow-prehooked")) { allow_prehooked = true; continue; }
         if (!std::strcmp(argv[i], "--attach") && i + 1 < argc) { attach_pid = std::strtoul(argv[++i], nullptr, 0); continue; }
         if (!std::strcmp(argv[i], "--detach-after-ms") && i + 1 < argc) { detach_ms = std::strtoul(argv[++i], nullptr, 0); continue; }
+        if (!std::strcmp(argv[i], "--detach-on-stdin")) { detach_stdin = true; continue; }   // a line (or EOF) on stdin
         if (!std::strcmp(argv[i], "--attach-new") && i + 1 < argc) { attach_new = argv[++i]; continue; }
         if (!std::strcmp(argv[i], "--timeout") && i + 1 < argc) { attach_timeout = std::strtoul(argv[++i], nullptr, 0); continue; }
         if (!std::strcmp(argv[i], "--backend") && i + 1 < argc) {
@@ -233,7 +235,7 @@ int main(int argc, char **argv) {
         ok = ok && probe_attach_new(s, attach_new, (uint32_t)attach_timeout);
         if (ok) { std::printf("{\"kind\":\"attached\"}\n"); std::fflush(stdout); }
         ok = ok && probe_run(s);
-    } else if (attach_pid && detach_ms) {
+    } else if (attach_pid && (detach_ms || detach_stdin)) {
         // Detach while the target keeps running: attach AND run on a worker thread (the debug
         // object belongs to the thread that attached), probe_close from this one after the
         // delay. The target must carry on exactly as before.
@@ -252,7 +254,8 @@ int main(int argc, char **argv) {
         WaitForSingleObject(attached, INFINITE);
         CloseHandle(attached);
         if (!attach_ok) { runner.join(); probe_report(s, stdout); probe_close(s); return 1; }
-        Sleep(detach_ms);
+        if (detach_stdin) { char line[64]; if (!std::fgets(line, sizeof(line), stdin)) {} }
+        else Sleep(detach_ms);
         probe_report(s, stdout);              // what was observed before letting go
         probe_close(s);                       // detach: hooks removed, INT3s restored, DRs cleared
         runner.join();

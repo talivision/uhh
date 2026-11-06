@@ -1926,7 +1926,8 @@ struct SelfFreeze {
         if (active) HeapUnlock(GetProcessHeap());
     }
 };
-template <class F> static void frozen(const slot_set &enabling, F &&fn) {
+// Returns false (fn not run) for an install no controller froze the target for.
+template <class F> static bool frozen(const slot_set &enabling, F &&fn) {
     for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i)          // tell the controller which ranges change
         InterlockedExchange(&shared->requests[i].enabling, enabling[i] ? 1 : 0);
     probe_ipc_request req{};
@@ -1934,8 +1935,15 @@ template <class F> static void frozen(const slot_set &enabling, F &&fn) {
     // The guard's cleanup runs with no debugger attached: the raise would only reach the
     // program's own handlers, so it goes straight to the in-process freeze.
     const bool held = !g_self_freeze && raise_ipc(&req) && req.result == 1;
+    // Not held = no debugger serviced the raise: the controller died (or let go) during this
+    // round, before the guard's cleanup has run (it sets controller_gone). An INSTALL is then
+    // not written at all: unfrozen, SafetyHook's own trap path makes the site page
+    // non-executable, and on an ntdll stub page the installer's own system calls fault on it
+    // (the target died 0xC0000005 when the controller was killed early in an attach, L11's
+    // runner signature). A removal freezes in-process instead (the cleanup's path).
+    if (!held && enabling.any()) return false;
     SelfFreeze self;
-    if (!held && enabling.none() && (g_self_freeze || shared->controller_gone)) self.freeze();   // removal with no controller
+    if (!held) self.freeze();
     if (held || self.active) InterlockedExchange(&uhh_safetyhook_frozen, 1);
     fn();
     if (self.active) InterlockedExchange(&uhh_safetyhook_frozen, 0);
@@ -1945,6 +1953,7 @@ template <class F> static void frozen(const slot_set &enabling, F &&fn) {
         thaw.op = PROBE_IPC_THAW; thaw.origin_site = UINT32_MAX;
         raise_ipc(&thaw);
     }
+    return true;
 }
 
 // Install rounds and the final unhook never overlap: a round that started before a detach
@@ -2084,7 +2093,9 @@ static void install_pending_locked() {
         InterlockedExchange(&uhh_safetyhook_frozen, 0);
     }
     const slot_set safe = enabling & ~unsafe;
-    if (safe.any()) frozen(safe, [&] { enable(safe); });
+    if (safe.any() && !frozen(safe, [&] { enable(safe); }))
+        for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i)      // built, never written: nobody to install for
+            if (safe[i]) InterlockedExchange(&shared->requests[i].status, PROBE_AGENT_HOOK_FAILED);
 }
 
 // Tell the controller an install round finished (synchronous: the controller services
@@ -2410,8 +2421,11 @@ static DWORD WINAPI service_main(void *) {
         }
         const bool polling = ctl_gone_at && !g_orphan_cleaned && shared->guard.enabled &&
                              GetTickCount64() - ctl_gone_at < 30000;
+        // A guarded session whose controller never handed over its process handle (it died
+        // first): poll for the debug port to go instead (the check below).
+        const bool watch_port = !g_ctl && !ctl_gone_at && !g_orphan_cleaned && shared->guard.enabled;
         HANDLE waits[3] = {service_event, g_guard_wake, g_ctl};
-        DWORD w = WaitForMultipleObjects(g_ctl ? 3 : 2, waits, FALSE, polling ? 10 : INFINITE);
+        DWORD w = WaitForMultipleObjects(g_ctl ? 3 : 2, waits, FALSE, polling ? 10 : watch_port ? 100 : INFINITE);
         if (w == WAIT_OBJECT_0) {
             // A detach drain asking how many callbacks can still finish: answer only -- the
             // session is over, so no install round (and no INSTALL_DONE raised to nobody).
@@ -2499,6 +2513,18 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
             }
         }
     }
+    // The controller died DURING this init (killed early in an attach), before anything could
+    // watch it: its named service event went with it (no service thread) or it never handed
+    // over its process handle. Nobody else would then undo what it left -- the threads it had
+    // frozen for this install round stayed suspended and the target hung (runner kill loop).
+    // The debug port is the signal: it goes as the dying controller's handles are closed,
+    // BEFORE its process object is signaled (measured: port gone, process not yet "dead").
+    // No service thread could start (its named event is the controller's: gone means the
+    // controller is dying), so wait here for the port to go -- the handle rundown order is not
+    // ours to rely on.
+    if (!service_event && shared->guard.enabled)
+        for (const ULONGLONG t0 = GetTickCount64(); !no_debug_port() && GetTickCount64() - t0 < 5000; ) Sleep(10);
+    if (!g_orphan_cleaned && guard_orphaned()) guard_cleanup();
     return 0;
 }
 

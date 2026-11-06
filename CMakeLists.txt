@@ -291,6 +291,10 @@ target_include_directories(uhh_trace PRIVATE include examples/trace)
 target_link_libraries(uhh_trace PRIVATE probe_api)
 add_dependencies(uhh_trace probe_api_agent)
 
+# symfile_test: symbol names come from image files, never the target's memory (regress symbols-file-backed)
+add_executable(symfile_test examples/symbols/symfile_test.cpp)
+target_link_libraries(symfile_test PRIVATE probe_api)
+
 # --- forwarded target stdout/stderr (ROADMAP D2/F8): partial lines vs live log records --
 add_executable(stdout_target examples/targets/stdout/stdout_target.c)
 target_compile_definitions(stdout_target PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -478,11 +482,22 @@ target_include_directories(co_driver_th PRIVATE include)
 target_link_libraries(co_driver_th PRIVATE probe_api_testhooks)
 target_compile_definitions(co_driver_th PRIVATE _CRT_SECURE_NO_WARNINGS)
 add_dependencies(co_driver_th co_target probe_api_agent)
+add_executable(susp_target examples/hunt_callorig/susp_target.cpp)   # regress cx2-evsusp-* / cx2-cosusp-* / callorig-deep-*
+target_compile_definitions(susp_target PRIVATE _CRT_SECURE_NO_WARNINGS)
+target_compile_options(susp_target PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/EHc->)   # its extern "C" functions throw
+add_dependencies(co_driver_th susp_target)
+add_dependencies(co_driver susp_target)
 add_executable(ar_driver_th examples/agent_review/ar_driver.cpp examples/agent_review/ar_callbacks.cpp)   # regress callfunc-late-trap-*
 target_include_directories(ar_driver_th PRIVATE include)
 target_link_libraries(ar_driver_th PRIVATE probe_api_testhooks)
 target_compile_definitions(ar_driver_th PRIVATE _CRT_SECURE_NO_WARNINGS)
 add_dependencies(ar_driver_th ar_target probe_api_agent)
+add_executable(lifecycle_driver_th examples/lifecycle/lifecycle_driver.cpp examples/lifecycle/lifecycle_callbacks.cpp
+               examples/hunt/hunt_callbacks.cpp examples/gated_config/callbacks.cpp)   # regress lifecycle-target-dies-* ("late")
+target_include_directories(lifecycle_driver_th PRIVATE include examples/gated_config)
+target_link_libraries(lifecycle_driver_th PRIVATE probe_api_testhooks)
+target_compile_definitions(lifecycle_driver_th PRIVATE _CRT_SECURE_NO_WARNINGS)
+add_dependencies(lifecycle_driver_th lifecycle_target hunt_dll configparse probe_api_agent)
 
 # --- calling conventions: get_func_arg / call_original / return_from per convention (regress `callconv`) --
 # ccfix.dll exports one function per x86/x64 convention and argument/return shape (plus an
@@ -528,10 +543,17 @@ endif()
 add_executable(tp_target examples/transparency/tp_target.cpp ${TP_ASM})
 # NOICF: every probed function has an identical unprobed twin that must stay separate.
 target_link_options(tp_target PRIVATE ${TP_EXPORTS} /INCREMENTAL:NO /OPT:NOICF)
+# The same target linked /CETCOMPAT: on CET hardware (CI windows-2025) it runs with a user
+# shadow stack, so the transparency modes (call_func, call_original) run under it (regress `cet-tp-*`).
+add_executable(tp_target_cet examples/transparency/tp_target.cpp ${TP_ASM})
+target_link_options(tp_target_cet PRIVATE ${TP_EXPORTS} /INCREMENTAL:NO /OPT:NOICF /CETCOMPAT)
 add_executable(tp_driver examples/transparency/tp_driver.cpp examples/transparency/tp_callbacks.cpp)
 target_include_directories(tp_driver PRIVATE include)
 target_link_libraries(tp_driver PRIVATE probe_api)
-add_dependencies(tp_driver tp_target probe_api_agent)
+# /CETCOMPAT: under BlockNonCetBinaries the inline backend loads this module (the callbacks)
+# into the target, and only CET-compatible images may load there (regress cet-block-*).
+target_link_options(tp_driver PRIVATE /CETCOMPAT)
+add_dependencies(tp_driver tp_target tp_target_cet probe_api_agent)
 
 # --- blog replicas: API-monitor scenarios from well-known write-ups (examples/blogs) ----
 add_executable(blog_target examples/blogs/blog_target.c)
@@ -651,7 +673,7 @@ foreach(d detours_simple detours_traceapi detours_retval)
     add_dependencies(${d} detours_target probe_api_agent)
 endforeach()
 
-foreach(t tp_target tp_driver latedll_target latedll_fix latedll_heavy latedll_driver stacks_target stacks_driver p2edge_early p2edge_late p2edge_target p2edge_driver blog_target blog_driver gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver hunt_target hunt_dll hunt_driver lifecycle_target lifecycle_driver detours_target detours_simple detours_traceapi detours_retval edge_target edge_driver co_target co_driver famous_driver famous_heap_target famous_file_target famous_loader_target famous_tick_target probe_app_cet cet_probe
+foreach(t tp_target tp_target_cet tp_driver latedll_target latedll_fix latedll_heavy latedll_driver stacks_target stacks_driver p2edge_early p2edge_late p2edge_target p2edge_driver blog_target blog_driver gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver hunt_target hunt_dll hunt_driver lifecycle_target lifecycle_driver detours_target detours_simple detours_traceapi detours_retval edge_target edge_driver co_target co_driver famous_driver famous_heap_target famous_file_target famous_loader_target famous_tick_target probe_app_cet cet_probe
           filetrace filetrace_target flagflip flagfeature flagflip_target regtrace regtrace_target)
     target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
@@ -667,7 +689,7 @@ foreach(t configparse cet_probe hook_edge parity_target watch_target dynwatch_ta
           famous_heap_target famous_file_target famous_loader_target famous_tick_target edge_target detours_target co_target
           hunt_target hunt_dll lifecycle_target blog_target p2edge_target p2edge_early p2edge_late
           latedll_target latedll_fix latedll_heavy
-          stacks_target filetrace_target flagfeature flagflip_target regtrace_target stdout_target tp_target)
+          stacks_target filetrace_target flagfeature flagflip_target regtrace_target stdout_target tp_target tp_target_cet)
     set_property(TARGET ${t} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 endforeach()
 

@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <memory>
 #include <mutex>
 #include <utility>
 
@@ -36,7 +37,22 @@ struct session_state {
         std::uint64_t base = 0;
         std::uint32_t size = 0;
     };
-    HANDLE process = nullptr;
+    HANDLE process = nullptr;   // the caller's handle: the target, or an opaque key (uhh_trace --list)
+    // The NAMES session (resolve, symbolize, containing_function, enumerate) is keyed by a
+    // unique non-handle value, never the target's process handle. With a real process handle
+    // DbgHelp reads a module's image from the target's MEMORY when it first loads the module
+    // (deferred), and memory there that does not match the file leaves the module with that
+    // memory's exports or with no symbols at all (SymNone): an inline frame (named late, on
+    // the writer, as the target exited) showed kernel32+0x14f80 where breakpoint/hw (whose
+    // walk loaded kernel32 at the hit) showed BaseThreadInitThunk+0x10 (docs/symbols.md). Keyed
+    // by a value DbgHelp cannot read memory through, every module loads from its image file
+    // (and PDB) on disk: the same names whenever, and on whichever backend, a frame is named.
+    HANDLE key = nullptr;
+    std::unique_ptr<char> key_storage;
+    // The WALK session: StackWalk64 unwinds the live, stopped target from its memory (x64 needs
+    // its .pdata there), keyed by the real process handle. Created on the first walk_stack;
+    // it holds the same modules and search path. It only produces raw frame addresses.
+    bool walker = false;
     std::vector<std::wstring> image_directories;
     std::vector<module_state> modules;
 };
@@ -445,13 +461,15 @@ void append_image_directory(session_state &session, const std::wstring &image_pa
     if (already_present != session.image_directories.end()) return;
 
     std::vector<wchar_t> current(32768, L'\0');
-    if (!g_api.get_search_path(session.process, current.data(), static_cast<DWORD>(current.size())))
+    if (!g_api.get_search_path(session.key, current.data(), static_cast<DWORD>(current.size())))
         return;
     std::wstring updated(current.data());
     if (!updated.empty() && updated.back() != L';') updated.push_back(L';');
     updated += directory;
-    if (g_api.set_search_path(session.process, updated.c_str()))
+    if (g_api.set_search_path(session.key, updated.c_str())) {
         session.image_directories.push_back(directory);
+        if (session.walker) g_api.set_search_path(session.process, updated.c_str());
+    }
 }
 
 std::string hex_address(std::uint64_t address) {
@@ -501,18 +519,21 @@ bool init(HANDLE process, std::string &which_dbghelp_or_error) {
         }
         g_api.set_options(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_FAIL_CRITICAL_ERRORS |
                           SYMOPT_NO_PROMPTS | SYMOPT_LOAD_LINES);
+        session_state state;
+        state.process = process;
+        state.key_storage.reset(new char(0));     // a heap address: unique, and never a handle value
+        state.key = reinterpret_cast<HANDLE>(state.key_storage.get());
         // A null search path asks DbgHelp to construct WinDbg's normal environment-based
         // path, including _NT_SYMBOL_PATH and _NT_ALT_SYMBOL_PATH.
-        if (!g_api.initialize(process, nullptr, FALSE)) {
+        if (!g_api.initialize(state.key, nullptr, FALSE)) {
             which_dbghelp_or_error = win32_error("SymInitializeW");
             return false;
         }
+        const HANDLE key = state.key;
         try {
-            session_state state;
-            state.process = process;
             g_sessions.push_back(std::move(state));
         } catch (...) {
-            g_api.cleanup(process);
+            g_api.cleanup(key);
             throw;
         }
         try { which_dbghelp_or_error = narrow(g_dbghelp_path); } catch (...) {}
@@ -543,8 +564,11 @@ void register_module(HANDLE process, const std::wstring &image_path,
             existing->image_path = image_path;
             existing->size = size_of_image;
         }
-        g_api.load_module(process, nullptr, image_path.c_str(), nullptr,
+        g_api.load_module(session->key, nullptr, image_path.c_str(), nullptr,
                           static_cast<DWORD64>(base), static_cast<DWORD>(size_of_image), nullptr, 0);
+        if (session->walker)
+            g_api.load_module(session->process, nullptr, image_path.c_str(), nullptr,
+                              static_cast<DWORD64>(base), static_cast<DWORD>(size_of_image), nullptr, 0);
     } catch (...) {
     }
 }
@@ -561,7 +585,8 @@ void unregister_module(HANDLE process, std::uint64_t base) {
         for (auto it = mods.begin(); it != mods.end(); ) {
             if (it->base == base) it = mods.erase(it); else ++it;
         }
-        g_api.unload_module(process, static_cast<DWORD64>(base));
+        g_api.unload_module(session->key, static_cast<DWORD64>(base));
+        if (session->walker) g_api.unload_module(session->process, static_cast<DWORD64>(base));
     } catch (...) {
     }
 }
@@ -570,7 +595,8 @@ bool resolve(HANDLE process, const std::string &module, const std::string &name,
              std::uint64_t &address) {
     try {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (!g_dbghelp || find_session(process) == g_sessions.end() || module.empty() || name.empty())
+        const auto session = find_session(process);
+        if (!g_dbghelp || session == g_sessions.end() || module.empty() || name.empty())
             return false;
         constexpr ULONG max_name = 2048;
         std::vector<unsigned char> storage(sizeof(SYMBOL_INFOW) +
@@ -580,7 +606,7 @@ bool resolve(HANDLE process, const std::string &module, const std::string &name,
             std::memset(storage.data(), 0, storage.size());
             symbol->SizeOfStruct = sizeof(SYMBOL_INFOW);
             symbol->MaxNameLen = max_name;
-            if (g_api.from_name(process, query.c_str(), symbol)) {
+            if (g_api.from_name(session->key, query.c_str(), symbol)) {
                 address = static_cast<std::uint64_t>(symbol->Address);
                 return true;
             }
@@ -603,7 +629,7 @@ bool containing_function(HANDLE process, std::uint64_t address, std::uint64_t &s
         symbol->SizeOfStruct = sizeof(SYMBOL_INFOW);
         symbol->MaxNameLen = max_name;
         DWORD64 displacement = 0;
-        if (!g_api.from_addr(process, static_cast<DWORD64>(address), &displacement, symbol)) return false;
+        if (!g_api.from_addr(session->key, static_cast<DWORD64>(address), &displacement, symbol)) return false;
         if (symbol->Size == 0 || displacement >= symbol->Size) return false;
         start = static_cast<std::uint64_t>(symbol->Address);
         size = symbol->Size;
@@ -622,7 +648,8 @@ std::string symbolize(HANDLE process, std::uint64_t address) {
 
         IMAGEHLP_MODULEW64 module{};
         module.SizeOfStruct = sizeof(module);
-        const bool have_module = g_api.get_module_info(process, static_cast<DWORD64>(address), &module) != FALSE;
+        const HANDLE key = session->key;
+        const bool have_module = g_api.get_module_info(key, static_cast<DWORD64>(address), &module) != FALSE;
         std::wstring module_name;
         if (have_module) {
             module_name = module.ModuleName;
@@ -648,7 +675,7 @@ std::string symbolize(HANDLE process, std::uint64_t address) {
         symbol->SizeOfStruct = sizeof(SYMBOL_INFOW);
         symbol->MaxNameLen = max_name;
         DWORD64 displacement = 0;
-        if (g_api.from_addr(process, static_cast<DWORD64>(address), &displacement, symbol)) {
+        if (g_api.from_addr(key, static_cast<DWORD64>(address), &displacement, symbol)) {
             std::string output = narrow(module_name);
             if (!output.empty()) output.push_back('!');
             output += narrow(std::wstring(symbol->Name, symbol->NameLen < symbol->MaxNameLen ? symbol->NameLen
@@ -658,7 +685,7 @@ std::string symbolize(HANDLE process, std::uint64_t address) {
             IMAGEHLP_LINEW64 line{};
             line.SizeOfStruct = sizeof(line);
             DWORD line_displacement = 0;
-            if (g_api.get_line(process, static_cast<DWORD64>(address), &line_displacement, &line) &&
+            if (g_api.get_line(key, static_cast<DWORD64>(address), &line_displacement, &line) &&
                 line.FileName) {
                 output += " (" + narrow(line.FileName) + ":" + std::to_string(line.LineNumber) + ")";
             }
@@ -674,14 +701,33 @@ std::string symbolize(HANDLE process, std::uint64_t address) {
     }
 }
 
+// The stack-walk session (keyed by the real process handle: StackWalk64 needs the target's
+// memory, e.g. x64 .pdata), created on first use with the same modules as the names session.
+// Every walker (walk_stack, unwind_frames) goes through here. Caller holds g_mutex.
+template <class SessionIt>
+static bool ensure_walker(SessionIt session) {
+    if (session->walker) return true;
+    std::vector<wchar_t> path(32768, L'\0');
+    if (!g_api.get_search_path(session->key, path.data(), static_cast<DWORD>(path.size())) ||
+        !g_api.initialize(session->process, path.data(), FALSE))
+        return false;
+    session->walker = true;
+    for (const auto &m : session->modules)
+        g_api.load_module(session->process, nullptr, m.image_path.c_str(), nullptr,
+                          static_cast<DWORD64>(m.base), static_cast<DWORD>(m.size), nullptr, 0);
+    return true;
+}
+
 bool walk_stack(HANDLE process, HANDLE thread, CONTEXT ctx,
                 std::uint64_t pc, std::uint64_t sp, std::uint64_t fp,
                 std::vector<std::uint64_t> &frames, std::size_t max_frames) {
     try {
         std::lock_guard<std::mutex> lock(g_mutex);
         frames.clear();
-        if (!g_dbghelp || find_session(process) == g_sessions.end() || !thread || max_frames == 0)
+        const auto session = find_session(process);
+        if (!g_dbghelp || session == g_sessions.end() || !thread || max_frames == 0)
             return false;
+        if (!ensure_walker(session)) return false;  // the walk session, on first use
         frames.push_back(pc);
 
         STACKFRAME64 frame{};
@@ -729,18 +775,56 @@ bool walk_stack(HANDLE process, HANDLE thread, CONTEXT ctx,
     }
 }
 
+bool unwind_frames(HANDLE process, HANDLE thread, CONTEXT ctx,
+                   std::vector<std::pair<std::uint64_t, std::uint64_t>> &pc_sp, std::size_t max_frames) {
+    try {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        pc_sp.clear();
+        const auto session = find_session(process);
+        if (!g_dbghelp || session == g_sessions.end() || !thread || !ensure_walker(session)) return false;
+        STACKFRAME64 frame{};
+        ctx.ContextFlags |= CONTEXT_FULL;
+#if defined(_WIN64)
+        const DWORD machine = IMAGE_FILE_MACHINE_AMD64;
+        frame.AddrPC.Offset = ctx.Rip; frame.AddrStack.Offset = ctx.Rsp; frame.AddrFrame.Offset = ctx.Rbp;
+#else
+        const DWORD machine = IMAGE_FILE_MACHINE_I386;
+        frame.AddrPC.Offset = ctx.Eip; frame.AddrStack.Offset = ctx.Esp; frame.AddrFrame.Offset = ctx.Ebp;
+#endif
+        frame.AddrPC.Mode = frame.AddrStack.Mode = frame.AddrFrame.Mode = AddrModeFlat;
+        for (std::size_t i = 0; i < max_frames + 1; ++i) {
+            if (!g_api.stack_walk(machine, process, thread, &frame, &ctx, nullptr,
+                                  g_api.function_table_access, g_api.get_module_base, nullptr))
+                break;
+            if (i == 0) continue;                  // the first call reports frame 0 itself
+#if defined(_WIN64)
+            const std::uint64_t pc = ctx.Rip, sp = ctx.Rsp;
+#else
+            const std::uint64_t pc = ctx.Eip, sp = ctx.Esp;
+#endif
+            if (!pc || (!pc_sp.empty() && sp <= pc_sp.back().second && pc == pc_sp.back().first)) break;
+            pc_sp.emplace_back(pc, sp);
+        }
+        return true;
+    } catch (...) {
+        pc_sp.clear();
+        return false;
+    }
+}
+
 bool enumerate(HANDLE process, const std::string &module, const std::string &mask,
                std::vector<symbol_entry> &out) {
     try {
         std::lock_guard<std::mutex> lock(g_mutex);
         out.clear();
-        if (!g_dbghelp || find_session(process) == g_sessions.end() || module.empty()) return false;
+        const auto session = find_session(process);
+        if (!g_dbghelp || session == g_sessions.end() || module.empty()) return false;
         const std::vector<std::wstring> queries = module_queries(module, mask.empty() ? "*" : mask);
         bool succeeded = false;
         for (const std::wstring &query : queries) {
             out.clear();
             enum_context context{&out, false};
-            const BOOL ok = g_api.enum_symbols(process, 0, query.c_str(), collect_symbol, &context);
+            const BOOL ok = g_api.enum_symbols(session->key, 0, query.c_str(), collect_symbol, &context);
             if (context.allocation_failed) {
                 out.clear();
                 return false;
@@ -761,7 +845,8 @@ void cleanup(HANDLE process) {
         std::lock_guard<std::mutex> lock(g_mutex);
         const auto session = find_session(process);
         if (!g_dbghelp || session == g_sessions.end()) return;
-        g_api.cleanup(process);
+        g_api.cleanup(session->key);
+        if (session->walker) g_api.cleanup(session->process);
         g_sessions.erase(session);
     } catch (...) {
     }
