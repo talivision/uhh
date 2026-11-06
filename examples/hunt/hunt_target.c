@@ -25,9 +25,12 @@
  *   owndr-live  the same, but DR0 is armed on the worker while it RUNS (it waits on an event;
  *           main suspends it, GetThreadContext, sets DR0, SetThreadContext, resumes) -- over
  *           whatever DR0 held then (a debugger's hardware probe, if any)
- *   guard   N times: a fresh PAGE_GUARD page touched through guard_touch (its first instruction
- *           is the access): the program's __except must see exactly one guard violation each
- *           time, the second touch reads the value (probe guard_touch, e.g. with uhh_trace)
+ *   guard   N times, on a page touched through guard_touch (its first instruction is the
+ *           access): twice from ONE call site, each a guard violation caught by __except (the
+ *           second is a new call, not a retry); then once more with a filter that RETRIES
+ *           (EXCEPTION_CONTINUE_EXECUTION: the guard is gone, the same execution completes);
+ *           then a plain read. 4 calls (hits) and 3 guard violations per iteration (probe
+ *           guard_touch, e.g. with uhh_trace)
  *   twin    N times: twin_a\twin.dll (TwinWork returns 0x101), unload, twin_b\twin.dll (0x202)
  *           -- the same base, different code at the same RVA (probe twin.dll!TwinWork)
  *   early   the handle is opened and one read made in a TLS callback at process attach
@@ -239,6 +242,11 @@ __declspec(dllexport) __declspec(noinline) int __fastcall guard_touch(volatile c
 static int guard_filter(DWORD code) {
     return code == STATUS_GUARD_PAGE_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
 }
+static int guard_retry(DWORD code) {
+    if (code != STATUS_GUARD_PAGE_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
+    InterlockedIncrement(&g_guards);
+    return EXCEPTION_CONTINUE_EXECUTION;                     /* the guard is consumed: retry */
+}
 
 /* ---- twin: two builds of one DLL at the same base ---- */
 typedef int (*TwinFn)(void);
@@ -353,14 +361,22 @@ int main(int argc, char **argv) {
             DWORD old = 0; int v = -1;
             if (!page) { InterlockedIncrement(&g_bad); continue; }
             page[0] = (char)(i & 0x7F);
+            for (int k = 0; k < 2; ++k) {                        /* one call site, twice */
+                v = -1;
+                if (!VirtualProtect(page, 4096, PAGE_READWRITE | PAGE_GUARD, &old)) InterlockedIncrement(&g_bad);
+                __try { v = guard_touch(page); }
+                __except (guard_filter(GetExceptionCode())) { InterlockedIncrement(&g_guards); }
+                if (v != -1) InterlockedIncrement(&g_bad);        /* the guard did not fire */
+            }
             if (!VirtualProtect(page, 4096, PAGE_READWRITE | PAGE_GUARD, &old)) InterlockedIncrement(&g_bad);
+            v = -1;
             __try { v = guard_touch(page); }
-            __except (guard_filter(GetExceptionCode())) { InterlockedIncrement(&g_guards); }
-            if (v != -1) InterlockedIncrement(&g_bad);            /* the guard did not fire */
+            __except (guard_retry(GetExceptionCode())) { InterlockedIncrement(&g_bad); }
+            if (v != (int)(i & 0x7F)) InterlockedIncrement(&g_bad); /* the retry completed the read */
             if (guard_touch(page) != (int)(i & 0x7F)) InterlockedIncrement(&g_bad);
             VirtualFree(page, 0, MEM_RELEASE);
         }
-        if ((DWORD)g_guards != g_n) InterlockedIncrement(&g_bad);
+        if ((DWORD)g_guards != 3 * g_n) InterlockedIncrement(&g_bad);
     } else if (!strcmp(sc, "twin")) {
         char dir[MAX_PATH]; DWORD n = GetModuleFileNameA(NULL, dir, MAX_PATH);
         while (n && dir[n - 1] != '\\') --n;

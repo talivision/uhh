@@ -321,7 +321,18 @@ struct probe_session {
     // continues elsewhere, the trap flag raises one stray step. thread -> probe site.
     // A WOW64 (x86) handler's context comes back WITHOUT our trap flag: there the restart is
     // the thread's next event being the INT3 at the site (whatever registers it repaired).
-    struct Refault { uint64_t site = 0; };
+    // Telling a retry from a NEW call (ROADMAP A9): the program resumes a faulted execution
+    // through ntdll's context restore (x64 RtlRestoreContext / NtContinue[Ex]; x86 NtContinue)
+    // with a CONTEXT whose pc is the site; an unwind to a handler restores a different pc, and
+    // a new call reaches the site without either. Watched with debug registers on THAT thread
+    // only (watch: slots + addresses, armed until its next arrival at the site decides).
+    struct Refault {
+        uint64_t site = 0;
+        bool watched = false, retry = false;
+        int restores = 0;
+        int slot[3] = {-1, -1, -1};
+        uint64_t at[3] = {0, 0, 0};
+    };
     std::unordered_map<DWORD, Refault> refault;
     // In-place window (see inplace_begin): while a thread steps an instruction at its real
     // address with our INT3 lifted, every other thread of the target is suspended by us, so
@@ -5434,6 +5445,91 @@ static void trace_thread_stacks(probe_session *s, const char *why) {
     }
 }
 
+// ---- Retry watch (ROADMAP A9) -------------------------------------------------------------
+static uint64_t resolve_symbol(probe_session *s, const char *symbol);
+static void retry_watch_end(probe_session *s, DWORD tid, probe_session::Refault &rf) {
+    if (!rf.watched) return;
+    HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+    for (int k = 0; k < 3; ++k) {
+        if (rf.slot[k] < 0) continue;
+        if (t) { GuardTouch touch(s, tid); set_dr_on_thread(t, rf.slot[k], 0, false); }
+        s->dr_used &= (uint8_t)~(1u << rf.slot[k]);
+        rf.slot[k] = -1;
+    }
+    if (t) CloseHandle(t);
+    rf.watched = false;
+}
+static void retry_watch_begin(probe_session *s, DWORD tid, probe_session::Refault &rf) {
+#if defined(_WIN64)
+    const char *names[3] = {"ntdll.dll!RtlRestoreContext", "ntdll.dll!NtContinue", "ntdll.dll!NtContinueEx"};
+#else
+    const char *names[3] = {"ntdll.dll!NtContinue", "ntdll.dll!NtContinueEx", nullptr};
+#endif
+    HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+    if (!t) return;
+    CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    uint8_t busy = s->dr_used;
+    { GuardTouch touch(s, tid); if (GetThreadContext(t, &c)) busy |= target_slots(s, tid, c); else busy = 0xF; }
+    int n = 0;
+    for (int k = 0; k < 3 && names[k]; ++k) {
+        const uint64_t a = resolve_symbol(s, names[k]);
+        if (!a) continue;
+        int slot = -1;
+        for (int i = 0; i < 4 && slot < 0; ++i) if (!(busy & (1u << i))) slot = i;
+        if (slot < 0) break;
+        busy |= (uint8_t)(1u << slot);
+        s->dr_used |= (uint8_t)(1u << slot); s->dr_ever |= (uint8_t)(1u << slot);
+        s->hw_armed_ever.insert(a);
+        guard_sync(s);
+        { GuardTouch touch(s, tid); set_dr_on_thread(t, slot, a, true); }
+        rf.slot[n] = slot; rf.at[n] = a; ++n;
+        rf.watched = true;
+    }
+    CloseHandle(t);
+    // Both ways back must be watched (x64: the dispatcher's user-mode restore AND NtContinue),
+    // else the decision is not exact: drop it, the old rule (every arrival is the retry) holds.
+    if (n < (int)(sizeof(names) / sizeof(names[0])) - 1) retry_watch_end(s, tid, rf);
+}
+// A #DB of a retry watch on this thread: note whether the context being restored resumes the
+// faulted site. Returns true if the event was one (continued, with RF).
+static bool retry_watch_hit(probe_session *s, const DEBUG_EVENT &event) {
+    auto it = s->refault.find(event.dwThreadId);
+    if (it == s->refault.end() || !it->second.watched) return false;
+    auto &rf = it->second;
+    const uint64_t pc = (uint64_t)(uintptr_t)event.u.Exception.ExceptionRecord.ExceptionAddress;
+    bool ours = false;
+    for (int k = 0; k < 3; ++k) ours = ours || (rf.slot[k] >= 0 && rf.at[k] == pc);
+    if (!ours) return false;
+    HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
+    if (!t) return false;
+    CONTEXT w{}; w.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS;
+    if (!GetThreadContext(t, &w)) { CloseHandle(t); return false; }
+#if defined(_WIN64)
+    const uint64_t ctx = w.Rcx;
+    uint64_t ip = 0; size_t n = 0;
+    remote_read(s->pi.hProcess, ctx + offsetof(CONTEXT, Rip), &ip, sizeof(ip), &n);
+#else
+    uint32_t ctx = 0, ip32 = 0; size_t n = 0;
+    remote_read(s->pi.hProcess, (uint64_t)w.Esp + 4, &ctx, 4, &n);
+    if (n == 4) remote_read(s->pi.hProcess, (uint64_t)ctx + offsetof(CONTEXT, Eip), &ip32, 4, &n);
+    const uint64_t ip = ip32;
+#endif
+    if (trace_enabled())
+        std::fprintf(stderr, "  retry-watch tid=%lu restore pc=0x%llx site=0x%llx\n", (unsigned long)event.dwThreadId,
+                     (unsigned long long)ip, (unsigned long long)rf.site);
+    if (n && ip == rf.site) rf.retry = true;           // resuming the faulted execution
+    else if (++rf.restores >= 16 && !rf.retry) {        // long gone elsewhere: free the registers
+        retry_watch_end(s, event.dwThreadId, rf);
+        s->refault.erase(it);
+    }
+    w.Dr6 = 0;
+    w.EFlags |= 0x10000u;                               // RF: run the function once
+    w.ContextFlags = CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS;
+    SetThreadContext(t, &w);
+    CloseHandle(t);
+    return true;
+}
+
 static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
                              std::unordered_map<DWORD, StepState> &stepping,
                              bool &initial_break, DWORD &disposition) {
@@ -5486,6 +5582,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         initial_break = true; disposition = DBG_CONTINUE; return true;
     }
     if (code == PROBE_IPC_CODE && handle_ipc(s, event)) { disposition = DBG_CONTINUE; return true; }
+    if (code == EXCEPTION_SINGLE_STEP && retry_watch_hit(s, event)) { disposition = DBG_CONTINUE; return true; }
     auto step = stepping.find(event.dwThreadId);
     uint64_t address = (uint64_t)(uintptr_t)ex.ExceptionAddress;
     if (step != stepping.end() && step->second.refire &&
@@ -5497,8 +5594,15 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         step = stepping.end();
     }
     bool restart = false;            // this INT3 is a faulted in-place step restarting (see refault)
-    if (auto rf = s->refault.find(event.dwThreadId); rf != s->refault.end() && step == stepping.end()) {
+    auto rfw = s->refault.find(event.dwThreadId);
+    // A watched refault is decided by the thread's next arrival at the site (or a stray step of
+    // our trap flag); its other events in between (other probes, the handler's code) are not it.
+    if (rfw != s->refault.end() && rfw->second.watched && !(code == EXCEPTION_BREAKPOINT && address == rfw->second.site))
+        rfw = s->refault.end();
+    if (auto rf = rfw; rf != s->refault.end() && step == stepping.end()) {
         const uint64_t site = rf->second.site;
+        const bool watched = rf->second.watched, retried = rf->second.retry;
+        retry_watch_end(s, event.dwThreadId, rf->second);
         s->refault.erase(rf);                              // one event decides
         if (code == EXCEPTION_BREAKPOINT || code == EXCEPTION_SINGLE_STEP) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
@@ -5510,7 +5614,9 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             // next event: an INT3 at the site is its handler retrying the same execution,
             // whatever registers it changed to repair the fault (comparing them took a repaired
             // retry for a new hit: 2 callbacks).
-            const bool same = true;
+            // With the retry watch (ROADMAP A9) it is exact: the site again WITHOUT a restore of
+            // the faulted context in between is a NEW call (its hit counts, its callback runs).
+            const bool same = watched ? retried : true;
             if ((tf || same) && code == EXCEPTION_BREAKPOINT && address == site) {
                 restart = true;                            // same execution: no new hit
             } else if (tf && code == EXCEPTION_SINGLE_STEP) {
@@ -5718,6 +5824,9 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
                 // at the site: the INT3 again) from a new hit.
                 if (event.u.Exception.dwFirstChance && address == step->second.site) {
                     probe_session::Refault rf; rf.site = step->second.site;
+                    if (auto old = s->refault.find(event.dwThreadId); old != s->refault.end())
+                        retry_watch_end(s, event.dwThreadId, old->second);
+                    retry_watch_begin(s, event.dwThreadId, rf);
                     s->refault[event.dwThreadId] = rf;
                 }
             }
@@ -6573,7 +6682,10 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
         if (event.dwThreadId == s->remote_tid) ok = complete_remote_thread(s, event.u.ExitThread.dwExitCode);
         if (event.dwThreadId == s->ipc_freezer) ipc_thaw(s);       // agent thread died mid-write: never strand the rest
         s->threads.erase(event.dwThreadId);
-        s->refault.erase(event.dwThreadId);
+        if (auto rf = s->refault.find(event.dwThreadId); rf != s->refault.end()) {
+            for (int k = 0; k < 3; ++k) if (rf->second.slot[k] >= 0) s->dr_used &= (uint8_t)~(1u << rf->second.slot[k]);
+            s->refault.erase(rf);
+        }
         s->hw_unsettled.erase(event.dwThreadId);
         forget_thread_holds(s, event.dwThreadId);
         s->dr6_lost.erase(event.dwThreadId);

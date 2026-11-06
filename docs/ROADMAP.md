@@ -243,6 +243,21 @@ reads, a slow (50 ms) callback under 32 threads.
   breakpoint/inline probe was still marked active at that base although the fresh mapping has
   neither the INT3 nor the hook -- LOAD now re-arms such probes (hw: the DR is per address and
   stays). `hunt-dll-work-backend-{hw,breakpoint,inline}`
+- ✅ (A9, found in this audit) breakpoint: an instruction at a probe site that faults (a guard
+  page, an access violation the program catches) is re-run at the real address so the program
+  sees its own fault there; the thread's next arrival at the site was then ALWAYS taken for the
+  handler retrying that execution (no hit, no callback) -- so a NEW call after an `__except`
+  (IsBadReadPtr-style probing, a second call from the same call site) lost its hit and its log.
+  Fixed (huntaudit): while such a fault is outstanding, debug registers on THAT thread only watch
+  ntdll's context restores (x64 RtlRestoreContext + NtContinue + NtContinueEx, x86 NtContinue +
+  NtContinueEx); the restored CONTEXT's pc decides: the site -> the retry (one execution, as
+  inline: its continue handler resumes in the trampoline); anything else, or no restore before
+  the thread is back at the site -> a new call (counted, callback). Without free slots for that
+  watch the old rule holds. Also found here (Codex review): a displaced trampoline is reused only
+  for the same instruction bytes (a DLL rebuilt at the same base); a faulting trampoline copy of
+  a hardware probe re-arms the consumed guard page before the re-run (the program never saw its
+  guard violation). `hunt-guard-*` (twice from one call site, once retried, once plain: 4 hits,
+  3 guard violations per round), `hunt-twin-*`
 
 ## Codex workaround audit (2026-11-05) — triaged
 - ✗ (C1) handle->pid through kernel32!OpenProcess: example-callback design, not a library issue (user, 2026-11-05); documented in the gated_config README
