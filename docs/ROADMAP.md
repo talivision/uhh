@@ -1329,7 +1329,23 @@ the report (count, valid JSON per line, CRC multiset of the lines, `seq` coverag
   probe_run to stop (180s)`, 6,462,473 records streamed, ended only when the test killed the
   target); with the fix 0 of 4 runs. Fix: every drain is one bounded pass up to `log_head` at
   entry (the drainer thread loops).
-- Considered and NOT changed (no failure reproduced): splitting/looping console writes or
+- ✅ **A held-up session-file write held live stdout** (reproduced by the citune agent: CI with
+  TEMP on C: holds up to 221 ms, on D: 0.5 ms p99; VM default TEMP 2 of 3 runs with 427/180 ms
+  holds from real-time AV scanning of the growing file, a Defender-excluded dir 9/9 clean).
+  The writer wrote each batch to the file, then to stdout. Fix: stdout first, then the file,
+  `stdout_mu` held across both (a report sees a batch counted in both or in neither). The file
+  is still written by the same thread right after (no second writer, no reordering); a target
+  whose stdout is forwarded keeps file-then-replay (deferred records are replayed from the
+  file). Before/after on the shared VM (3 interleaved rounds each, 6f0c533 vs pslog, x64; other agents kept
+  the VM at 37-100% CPU, so run-to-run spread is wide): `stream-live` p99 breakpoint 14.4 -> 3.2 ms,
+  hw 25.2 -> 2.0 ms, inline 15.7 -> 12.9 ms (medians); `stream-latency` p99 medians within the
+  noise (both builds had runs over 30 ms). The `stream-latency-*` ordering flake (a record
+  printed before the target's own tick line: the forwarder has not read the tick from the
+  target's pipe yet) failed on both builds under that load (6f0c533: 1 of 9 records,
+  pslog: 3 of 9, plus one more breakpoint p99 of 341 ms); `stream-latency` launches with the
+  target's stdout forwarded, a path this change does not touch (file, then replay).
+- Considered and NOT changed: the drainer's idle `Sleep(1)` (inline median latency ~15.6 ms =
+  one timer tick, a latency, not a loss); and, with no failure reproduced: splitting/looping console writes or
   WriteConsoleW (2M records through a console handle were complete), a retry after a short
   WriteFile, code-page conversion (records are ASCII unless the logged text is not), the
   inherited console of a launched target (its own output can interleave with records on a
