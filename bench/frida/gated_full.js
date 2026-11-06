@@ -50,11 +50,17 @@ function hookParseConfig() {
 }
 var flagHooked = hookParseConfig();
 if (!flagHooked) {
-    Process.attachModuleObserver({
-        onAdded: function (m) {
-            if (!flagHooked && m.name && m.name.toLowerCase() === 'configparse.dll') flagHooked = hookParseConfig();
-        },
-    });
+    if (typeof Process.attachModuleObserver === 'function') {          // Frida >= 17
+        Process.attachModuleObserver({
+            onAdded: function (m) {
+                if (!flagHooked && m.name && m.name.toLowerCase() === 'configparse.dll') flagHooked = hookParseConfig();
+            },
+        });
+    } else {                                                            // Frida 16: after each LdrLoadDll
+        Interceptor.attach(exp('ntdll.dll', 'LdrLoadDll'), {
+            onLeave: function () { if (!flagHooked) flagHooked = hookParseConfig(); },
+        });
+    }
 }
 
 // 2. the handle -> pid map
