@@ -1721,8 +1721,27 @@ def check_transparency(iters=30):
                                              "--iters", iters]], capture_output=True, text=True, timeout=300, env=env)
         o = [json.loads(l) for l in r.stdout.splitlines() if l.strip().startswith("{")]
         tg = next((x for x in o if x.get("kind") == "target"), {})
-        record(name, r.returncode == 0 and tg.get("bad") == 0 and report(o).get("error") is None,
-               f"bad={tg.get('bad')} first={tg.get('first')!r} rc={r.returncode}")
+        rep = report(o)
+        rows = probes(o)
+        logs = [str(x.get("message", "")) for x in o if x.get("kind") == "probe_log"]
+        n = int(iters)                                   # TpMid runs once per iteration
+        n_log = sum(1 for m in logs if m.startswith("tp log ax="))
+        n_stack = logs.count("tp stack")
+        fails = [m for m in logs if m.startswith("tp FAIL")]
+        bad = []
+        if r.returncode != 0: bad.append(f"rc={r.returncode}")
+        if not tg or tg.get("bad") != 0: bad.append(f"target bad={tg.get('bad')} first={tg.get('first')!r}")
+        if (len(rows) != 1 or rows[0].get("location") != "tp_target.exe!TpMidHit" or rows[0].get("backend") != "inline"
+                or not rows[0].get("active") or rows[0].get("hits") != n):
+            bad.append(f"probe_rows={rows} (want one active inline TpMidHit row with {n} hits)")
+        if n_log != n or n_stack != n or len(logs) != 2 * n or fails:
+            bad.append(f"callback logs: log={n_log} stack={n_stack} total={len(logs)} want {n}/{n}/{2 * n} fails={fails[:2]}")
+        if (rep.get("error") is not None or rep.get("app_exit") != 0 or rep.get("log_dropped") != 0
+                or rep.get("callbacks_interrupted") != 0 or rep.get("logs_written") != 2 * n):
+            bad.append(f"report err={rep.get('error')} exit={rep.get('app_exit')} dropped={rep.get('log_dropped')} "
+                       f"interrupted={rep.get('callbacks_interrupted')} written={rep.get('logs_written')}")
+        record(name, not bad, " ".join(bad) if bad else
+               f"hits={rows[0].get('hits')} logs={len(logs)} bad=0 first={tg.get('first')!r} rc=0")
     except Exception as e:
         record(name, False, repr(e))
 
