@@ -194,7 +194,9 @@ reads, a slow (50 ms) callback under 32 threads.
   the context of the event (before) and the one it resumes with (after), holds the thread with
   one suspension of its own until the target has resumed it, and then re-applies its changes to
   whatever the target wrote back, per register: a field still at its trap value gets UHH's, a
-  field the target set itself keeps the target's (exact for a plain write-back). Re-checked after
+  field the target set itself keeps the target's (exact for a plain write-back); debug registers
+  are not merged but rewritten from the CURRENT probe state by enforce_owned_drs -- the one place
+  that re-applies DRs, as at NtContinue (cfnest's restore_fixup). Re-checked after
   the repair: a thread the target suspended again meanwhile stays held. (2) hw execute hits no
   longer resume at the site with RF (RF only lives until the instruction ran, and a round-trip in
   that window comes back without it): they resume in the site's displaced trampoline (A5), whose
