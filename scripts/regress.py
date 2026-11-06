@@ -4952,11 +4952,20 @@ def bigapps_judge(objs, out_text, err_text, bk, specs, required, exact):
     if not written: bad.append("no logs")
     if exact and written != want_logs: bad.append(f"logs_written={written} != logged hits={want_logs}")
     if logs_raw != logs_out: bad.append(f"malformed/unparsable probe_log lines={logs_raw - logs_out}")
-    if written is None or logs_out != written:
-        bad.append(f"stdout probe_log records={logs_out} != logs_written={written}")
+    # A detach mid-run: the report is a live snapshot taken BEFORE probe_close; the session's
+    # final count is probe_close's "probe: detached: ... logs_written=N" (stderr), and every
+    # record up to it must be on stdout -- exactly.
+    fin = re.findall(r"probe: detached: hits=\d+ logs_written=(\d+) log_dropped=(\d+)", err_text)
+    final_written = int(fin[-1][0]) if fin else written
+    if fin and int(fin[-1][1]) != 0: bad.append(f"final log_dropped={fin[-1][1]}")
+    if '"kind":"detached"' in out_text and not fin: bad.append("detached but no final 'probe: detached:' accounting")
+    if final_written is None or logs_out != final_written:
+        bad.append(f"stdout probe_log records={logs_out} != logs_written={final_written}"
+                   + (" (final, after the detach)" if fin else ""))
     if unhandled: bad.append(f"unhandled={unhandled}")
     short = {k.split("!")[-1]: v for k, v in hits.items()}
-    detail = f"hits={short} logs={written} delivered={logs_out} dropped={rep.get('log_dropped')}"
+    detail = (f"hits={short} logs={written}" + (f" final_logs={final_written}" if fin else "")
+              + f" delivered={logs_out} dropped={rep.get('log_dropped')}")
     return not bad, detail, bad
 
 
