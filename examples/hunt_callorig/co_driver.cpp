@@ -77,7 +77,7 @@ int main(int argc, char **argv) {
     else if (k == "spin") ok = add("co_add", co_on_spin, bk);
     else if (k == "rep") ok = add("CoRepSite", co_on_spin, bk);
     else if (k == "susp" || k == "evsusp") ok = add("co_add", co_on_spin, bk);
-    else if (k == "cosusp") ok = add("co_hold", co_on_hold, bk);
+    else if (k == "cosusp" || k == "cosample") ok = add("co_hold", co_on_hold, bk);
     else if (k == "late" || k == "cfgfree" || k == "many" || k == "manydead") {
         static co_bigcfg big{};                  // larger than PROBE_AGENT_CONFIG_CAP (256)
         big.backend = bk; big.n = (uint32_t)sizeof(big.pat);

@@ -7489,6 +7489,17 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
     }
     case UNLOAD_DLL_DEBUG_EVENT: {
         uint64_t base = (uint64_t)(uintptr_t)event.u.UnloadDll.lpBaseOfDll;
+#if defined(UHH_TEST_HOOKS)
+        // Test-only (probe_api_testhooks): UHH_TEST_DEFER_UNLOAD=<module name> leaves that
+        // module's unload unprocessed, as if its event were still queued behind the detach
+        // (regress lifecycle-unload-unseen-*: the agent's final unhook meets an unmapped site
+        // whose request is not UNLOADED -- the early-detach race of lifecycle-detach-early-*).
+        if (const char *defer = std::getenv("UHH_TEST_DEFER_UNLOAD")) {
+            bool match = false;
+            for (const auto &m : s->module_bases) match = match || (m.second == base && !_stricmp(m.first.c_str(), defer));
+            if (match) { std::fprintf(stderr, "probe: test: unload of %s left unprocessed\n", defer); break; }
+        }
+#endif
         // The unmapping thread reports AFTER the view is gone, so another thread can map the
         // same DLL again at the same base and report ITS load first. Seen under load/unload
         // churn: the late unload then retired probes just armed in the NEW instance -- its
@@ -8476,21 +8487,25 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
         if (now >= next_poll && !s->co_left && !thread_gone && !s->exited) {
             // Left without a probe hit to show it (e.g. an exception caught by the caller):
             // the thread is above the hit's frame and not at the return address.
+            // The context is read WITHOUT suspending the thread: a suspension of ours, however
+            // short, is visible to the program -- its own SuspendThread of that thread returns 1
+            // instead of 0 if it lands inside (regress cx2-cosusp-*, seen on CI). An x64
+            // controller's GetThreadContext on a running thread is a consistent snapshot (the
+            // kernel takes it in an APC on that thread) and leaves the suspend count alone. A
+            // 32-bit (WOW64) controller's call suspends the thread implicitly inside the call
+            // (GuardTouch; a residual window of the call's own length, as for any WOW64 debugger).
             next_poll = now + 20;
-            guard_note_hold(s, st->tid);
-            if (SuspendThread(thread) != (DWORD)-1) {
-                CONTEXT r{}; r.ContextFlags = CONTEXT_CONTROL;
-                if (GetThreadContext(thread, &r)) {
+            CONTEXT r{}; r.ContextFlags = CONTEXT_CONTROL;
+            bool got;
+            { GuardTouch touch(s, st->tid); got = !!GetThreadContext(thread, &r); }
+            if (got) {
 #if defined(_WIN64)
-                    const uint64_t sp = r.Rsp, pc = r.Rip;
+                const uint64_t sp = r.Rsp, pc = r.Rip;
 #else
-                    const uint64_t sp = r.Esp, pc = r.Eip;
+                const uint64_t sp = r.Esp, pc = r.Eip;
 #endif
-                    if (sp >= s->co_sp + ptr && pc != ret_addr) s->co_left = true;
-                }
-                ResumeThread(thread);
+                if (sp >= s->co_sp + ptr && pc != ret_addr) s->co_left = true;
             }
-            guard_resync(s);                                               // our suspension is over: off the list
         }
         if (!done && now > until && !s->co_left) {
             s->co_left = true; why = "the original did not return within 5 s (released, it runs on)";

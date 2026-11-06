@@ -7562,6 +7562,56 @@ def lc_agent_refused(cfgname, cfg):
         if tg: tg.kill()
 
 
+def lc_unload_unseen(cfgname, cfg):
+    """A detach while a hooked DLL's unload has not been processed yet (ROADMAP L5 / ciresid: the
+    early-detach race of lifecycle-detach-early-*-inline, ~1 in 128 rows on CI): the program
+    unloaded hunt_dll (unmapped) and the controller has not handled its UNLOAD_DLL event when
+    the agent's final unhook runs, so the request is still INSTALLED at an unmapped site. The
+    restore wrote there -- an access violation on the agent's stop thread killed the target.
+    Forced deterministically: the test-hook driver (UHH_TEST_DEFER_UNLOAD=hunt_dll.dll) leaves
+    that unload unprocessed. The probe on hunt_dll!HuntWork must have gone active and hit
+    (work logs), then after the detach the target must be alive and clean, every log
+    delivered. Every config (breakpoint/hw: the INT3 / DR of an unmapped site at detach)."""
+    name = f"lifecycle-unload-unseen-{cfgname}"
+    if not exe("lifecycle_driver_th.exe"):
+        return missing_bin(name, "lifecycle_driver_th")
+    tg = d = None
+    try:
+        tg = LcTarget("--threads", 2)
+        dcfg = dict(cfg, work="breakpoint" if cfg["read"] == "hw" else cfg["read"])   # hw: keep a DR free
+        d = LcDriver(tg.pid, dcfg, "--detach-on-stdin", driver="lifecycle_driver_th.exe",
+                     env={"UHH_TEST_DEFER_UNLOAD": "hunt_dll.dll"})
+        if not d.wait_attached() or not d.wait_active(n=d.probes - 1):        # HuntWork: pending (not loaded)
+            raise RuntimeError(f"not active: {d.errors()}")
+        once = tg._cmd("dllonce", "dllonce")
+        active = d.err.wait_for(lambda l: l.startswith("probe: active hunt_dll.dll!HuntWork"), 10)
+        deferred = d.err.wait_for(lambda l: l.startswith("probe: test: unload of hunt_dll.dll left unprocessed"), 10)
+        time.sleep(0.3)
+        d.detach()
+        fin_ok = d.finish(timeout=120)
+        ok_logs, fin = lc_logs_ok(d)
+        c = tg.check()
+        a = tg.quit()
+        work_logs = fin is not None and fin[0] > 0
+        bad = []
+        if once.get("mapped") != 0 or not once.get("work"): bad.append(f"dllonce={once}")
+        if not active: bad.append("HuntWork never went active")
+        if not deferred: bad.append("the unload was not deferred (test hook)")
+        if not fin_ok or d.p.returncode != 0: bad.append(f"driver rc={d.p.returncode} finished={fin_ok}")
+        if not ok_logs or not work_logs: bad.append(f"logs={d.logs} final={fin}")
+        if not lc_clean(c): bad.append(lc_brief(c))
+        if not lc_clean(a) or a.get("rc") != 0: bad.append(f"quit rc={a.get('rc')} {lc_brief(a)}")
+        record(name, not bad, " ".join(bad) + ("" if not bad else f" unhandled={tg.unhandled()} stderr_tail="
+                                               f"{[l[:200] for l in d.err.lines if not l.startswith('probe: active')][-10:]}")
+               or f"HuntWork hooked, hit (work={once.get('work')}), unloaded unseen; detach clean: logs={d.logs} "
+                  f"final={fin} target alive, exit 0")
+    except Exception as e:
+        record(name, False, repr(e))
+    finally:
+        if d: d.kill()
+        if tg: tg.kill()
+
+
 def lc_install_stuck(cfgname, cfg):
     """Detach while the agent's remote work cannot run: the target holds its loader lock, so the
     agent init thread a re-attach starts cannot even begin before the detach gives up waiting
@@ -7651,7 +7701,7 @@ def check_lifecycle():
         return missing_bin("lifecycle", "lifecycle_driver / lifecycle_target / hunt_dll")
     for cfgname, cfg in LC_CONFIGS.items():
         for fn in (lc_reattach, lc_detach_cases, lc_target_dies, lc_two_controllers, lc_interrupt, lc_controller_killed,
-                   lc_killed_in_freeze, lc_agent_refused, lc_install_stuck):
+                   lc_killed_in_freeze, lc_agent_refused, lc_install_stuck, lc_unload_unseen):
             tag = fn.__name__[3:].replace("_", "-")
             if fn is lc_detach_cases or lc_selected(f"lifecycle-{tag}-{cfgname}"):
                 fn(cfgname, cfg)
@@ -9081,6 +9131,52 @@ def check_cx2_review():
                 record(name, not bad, " ".join(bad + [detail]))
             except Exception as e:
                 record(name, False, repr(e))
+
+    # cx2-cosample-<b>: the same call_original (co_hold, ~3 s inside the original) with the controller
+    # staying; the program samples its worker's suspend count for 1 s. Any suspension of the
+    # controller's in place at a sample is visible to the program (SuspendThread returns 1, not 0):
+    # call_original's 20 ms "left the original?" poll suspended the thread for its context read,
+    # and a program suspending that thread at that moment got prev=1 (cx2-cosusp-breakpoint on CI,
+    # run 42256070700). The poll now reads the context without a suspension.
+    for bk in ("breakpoint", "hw"):
+        name = f"cx2-cosample-{bk}"
+        if not st:
+            missing_bin(name, "susp_target"); continue
+        procs = []
+        try:
+            tgt = subprocess.Popen([str(st), "cosample"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, text=True)
+            procs.append(tgt)
+            tout = Lines(tgt.stdout)
+            w = tout.wait_for(lambda l: '"kind":"waiting"' in l, 30)
+            if not w:
+                raise RuntimeError("target never reached its gate")
+            att = subprocess.Popen([str(d), "--backend", bk, "--case", "cosample", "--module", "susp_target.exe",
+                                    "--attach", str(json.loads(w)["pid"])],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            procs.append(att)
+            aout, aerr = Lines(att.stdout), Lines(att.stderr)
+            if not aerr.wait_for(lambda l: l.startswith("probe: active "), 60):
+                raise RuntimeError(f"probe never active: {aerr.lines[-4:]}")
+            tgt.stdin.write("x"); tgt.stdin.flush()
+            tgt.wait(timeout=90); att.wait(timeout=90)
+            row = next((x for x in tout.objs() if x.get("kind") == "co"), {})
+            wraps = sum(1 for x in aout.objs() if x.get("kind") == "probe_log" and x.get("message") == "co hold-done")
+            bad = []
+            if tgt.returncode != 0: bad.append(f"target_rc={tgt.returncode}")
+            if att.returncode != 0: bad.append(f"controller_rc={att.returncode}")
+            if row.get("foreign") != 0: bad.append(f"foreign={row.get('foreign')} of {row.get('samples')} samples (want 0)")
+            if (row.get("samples") or 0) < 100 or row.get("in_original") != 1:
+                bad.append(f"samples={row.get('samples')} in_original={row.get('in_original')} (want >= 100, 1)")
+            if row.get("done") != 1 or row.get("ret") != 76 or wraps != 1:
+                bad.append(f"target row={row} hold_logs={wraps}")
+            record(name, not bad, " ".join(bad) or f"samples={row.get('samples')} foreign=0 ret=76 call_original completed")
+        except Exception as e:
+            record(name, False, repr(e))
+        finally:
+            for q in procs:
+                if q.poll() is None:
+                    q.kill()
 
     for case in ("many", "manydead"):
         name = f"cx2-{case}threads-inline" if case == "many" else "cx2-manydead-inline"

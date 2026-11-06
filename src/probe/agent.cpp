@@ -1884,6 +1884,28 @@ static void enable_hook(void *p) {
     auto *op = static_cast<HookOp *>(p);
     op->ok = hooks[op->index].enable().has_value();
 }
+// The final unhook (probe_agent_stop) of a site whose DLL another thread unloaded before the
+// controller processed that unload (its status is not UNLOADED yet -- e.g. during an early
+// detach while the program churns the DLL): the restore wrote to the unmapped site, an
+// access violation on the agent's stop thread killed the target (regress
+// lifecycle-detach-early-*-inline, ~1 in 128 on CI; ROADMAP L5). Not mapped executable code:
+// nothing to restore. The bytes already the original ones (the DLL was mapped again, a fresh
+// copy, at the same base): nothing to restore either. The write itself is SEH-guarded
+// (seh_run) against an unmap completing meanwhile (a thread suspended inside its unmap
+// system call still finishes it).
+static bool site_mapped(uint64_t site);
+static bool bytes_equal(const void *a, const uint8_t *b, size_t n) {
+    __try { return std::memcmp(a, b, n) == 0; }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) { return false; }
+}
+static void disable_hook(void *p) {
+    auto *op = static_cast<HookOp *>(p);
+    auto &h = hooks[op->index];
+    const auto &orig = h.original_bytes();
+    if (!site_mapped(h.target_address())) return;
+    if (!orig.empty() && bytes_equal((const void *)h.target_address(), orig.data(), orig.size())) return;
+    op->ok = h.disable().has_value();
+}
 
 // Run fn with every other thread of the target suspended by the controller (FREEZE/THAW
 // IPC; the controller is a debugger, so the raise is serviced synchronously). While frozen,
@@ -2543,8 +2565,12 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_stop(void *) {
     frozen(slot_set{}, [] {
         for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i)
             // Restore the original bytes -- unless the controller saw the module unload
-            // (the address is unmapped or holds another image now).
-            if (hooks[i] && shared->requests[i].status != PROBE_AGENT_UNLOADED) (void)hooks[i].disable();
+            // (the address is unmapped or holds another image now), or the module went away
+            // before the controller has processed its unload (see disable_hook).
+            if (hooks[i] && shared->requests[i].status != PROBE_AGENT_UNLOADED) {
+                HookOp op{i, 0, false};
+                if (!seh_run(disable_hook, &op)) new (&hooks[i]) SafetyHookMid();   // unmapped mid-write: abandoned in place
+            }
     });
     // Keep the trampolines and stubs: a thread may still be on its way back through one
     // (it then jumps to the original code, which is intact). Deliberate leak, once.

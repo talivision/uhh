@@ -22,6 +22,8 @@
  *   reset  -> zero the flip counter (after a detach, nothing may flip any more)
  *   lock N -> a thread holds the LOADER LOCK for N ms ({"kind":"locked"} once held): a tool's
  *             remote thread (agent load / init) cannot even start meanwhile
+ *   dllonce -> load hunt_dll.dll, call HuntWork once, unload it (refcount 0: unmapped);
+ *             {"kind":"dllonce","work":<HuntWork's count after>,"mapped":<still loaded: 0/1>}
  *   quit   -> stop, join, final check, {"kind":"app",...}, exit 0 (1 on any error)
  * --pace-ms P: every worker (and the churner) sleeps P ms per iteration -- a bounded hit rate
  * (the shared test VM must not run hardware breakpoints flat out for long).
@@ -445,6 +447,18 @@ int main(int argc, char **argv) {
         else if (!strncmp(line, "lock ", 5)) {
             HANDLE t = CreateThread(NULL, 0, hold_loader_lock, (void *)(ULONG_PTR)atol(line + 5), 0, NULL);
             if (t) CloseHandle(t);
+        }
+        else if (!strncmp(line, "dllonce", 7)) {
+            char hp[MAX_PATH]; int mapped = -1;
+            _snprintf_s(hp, sizeof(hp), _TRUNCATE, "%shunt_dll.dll", g_dir);
+            HMODULE m = LoadLibraryA(hp);
+            if (m) {
+                HuntWorkFn work = (HuntWorkFn)GetProcAddress(m, "HuntWork");
+                if (work) work(hunt_read, &g_work); else error("HuntWork missing");
+                FreeLibrary(m);
+                mapped = GetModuleHandleA("hunt_dll.dll") != NULL;
+            } else error("load hunt_dll failed");
+            printf("{\"kind\":\"dllonce\",\"work\":%ld,\"mapped\":%d}\n", g_work, mapped); fflush(stdout);
         }
         else if (!strncmp(line, "quit", 4)) break;
     }
