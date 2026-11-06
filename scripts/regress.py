@@ -7794,8 +7794,18 @@ def check_stdout_powershell():
             script = (f"$ErrorActionPreference='Continue'; $tr='{tracer}'; $o='{out}'; $a=@({lit}); "
                       "& $tr @a | Out-File -FilePath $o -Encoding utf8")
             env = dict(os.environ, TEMP=str(work), TMP=str(work))
-            r = subprocess.run([str(ps), "-NoProfile", "-NonInteractive", "-Command", script],
-                               capture_output=True, text=True, errors="replace", timeout=240, env=env)
+            p = subprocess.Popen([str(ps), "-NoProfile", "-NonInteractive", "-Command", script],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", env=env)
+            try:
+                _, err = p.communicate(timeout=240)
+            except subprocess.TimeoutExpired:
+                tgt.kill()                                   # ends the attached session too
+                _, err = p.communicate(timeout=120)
+                partial = verify_capture(out)
+                record(name, False, f"no end within 240 s: captured so far={partial['logs']} "
+                                    f"report={'yes' if partial['report'] else 'no'} stderr={err.strip().splitlines()[-4:]}")
+                continue
+            r = subprocess.CompletedProcess(p.args, p.returncode, "", err)
             alive = tgt.poll() is None
             cap = verify_capture(out)
             rep = cap["report"] or {}

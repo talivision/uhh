@@ -5788,13 +5788,19 @@ static void enqueue_agent_record(probe_session *s, const probe_agent_log &rec) {
 // Move published inline-log records out of the shared ring (single consumer). Called
 // every debug-loop turn, on idle timeouts, and at report, so the ring never fills
 // just because the run is long.
+// One pass: up to the records claimed when the call started. On a target that keeps logging
+// into a full ring (stdout slower than the producers) every freed slot is refilled at once,
+// so "until the ring is empty" never ended -- holding drain_mu all the while (a report before
+// a detach never came). Callers that need more call again (the drainer loops).
 static size_t drain_agent_logs(probe_session *s) {
     if (!s->shared) return 0;
     auto *sh = s->shared;
     size_t moved = 0;
     std::lock_guard<std::mutex> consume(s->drain_mu);
+    const LONG64 stop = sh->log_head;
     for (;;) {
         LONG64 tail = sh->log_tail;
+        if (tail >= stop) break;
         auto &rec = sh->logs[(uint64_t)tail % PROBE_AGENT_LOG_CAP];
         LONG64 seq = rec.seq;
         if (seq != tail + 1 && seq != -(tail + 1)) break;
@@ -6350,12 +6356,7 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
     std::unique_lock<std::mutex> out_lock(s->stdout_mu, std::defer_lock);
     if (out == stdout) out_lock.lock();
     // The forwarded target left its last line unfinished: report records start on their own line.
-    // Records that waited behind that line go out now, BEFORE the report: the report is the
-    // last word on what stdout carries.
-    if (out == stdout && s->fwd_out_active && s->out_midline) {
-        std::fputc('\n', out); s->out_midline = false;
-        tail_catch_up_locked(s, nullptr, 0, 0);
-    }
+    if (out == stdout && s->fwd_out_active && s->out_midline) { std::fputc('\n', out); s->out_midline = false; }
     // The counts, in causal order: stdout_logs (frozen while stdout_mu is held), then
     // logs_written (a record reaches the file before stdout), then the hits (a hit is counted
     // before its log exists). So stdout_logs <= logs_written <= hits even on a target that is

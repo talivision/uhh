@@ -1295,10 +1295,17 @@ the session JSONL file and the report (count, valid JSON per line, CRC multiset 
   target still logging faster than stdout drained (a PowerShell pipeline), the report waited
   until the target stopped logging and printed hits from before the wait. Baseline
   (`stdout-powershell-detach-inline`, attach + `--detach-after-ms 4000` into `| Out-File`): no
-  report within 240 s. Fix: on a live target the report flushes only the records queued when
-  it started, and reads its counts in causal order under the stdout lock: stdout_logs, then
-  logs_written, then hits (stdout_logs <= logs_written <= hits always; exact once the target
-  exited or was detached).
+  report within 240 s. Second unbounded wait under it: `drain_agent_logs` looped "until the
+  ring is empty" while holding `drain_mu`; with producers saturating a full ring every freed
+  slot is refilled at once, so a pass never ended (the report, the debug loop and the
+  controller-side IPC log path all call it; after the first fix the check still hung in one of
+  two runs). Fix: on a live target the report flushes only the records queued when it
+  started; every ring drain is one bounded pass (up to `log_head` at entry; the drainer
+  thread loops); the report reads its counts in causal order under the stdout lock:
+  stdout_logs, then logs_written, then hits, one hits snapshot per probe for its record and
+  the total (breakpoint hits keep counting between the two reads: one `detach-breakpoint` run
+  failed its consistency test this way). stdout_logs <= logs_written <= hits always; exact
+  once the target exited or was detached.
 - Regress `stdout-powershell-{outfile,redirect,setcontent,tee,merged}-inline`,
   `-{outfile,merged}-{breakpoint,hw}` (100k / 10k stack records through `powershell -Command`):
   captured == stdout_logs == logs_written == hits == logs + dropped + interrupted, every line
