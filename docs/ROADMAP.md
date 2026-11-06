@@ -1593,7 +1593,11 @@ then fixed. Fixtures: `ctrl_target faultmix`, `co_target susp / many / manydead`
   unfixed library of 53490ed): x64 AND x86 4/12 -- every breakpoint/hw row of deepthrow/deepseh/deepjmp FAIL with
   `co after` 5 of 10 logs, catchhit 0 of 5; inline PASS. With (1) only: 10/12 on both (catchhit still 0 of 5).
   After: 15/15 on both arches; VM `--only callorig,callfunc,cx2,cxlib,hunt` (f08b9ff) x64 192/192 (+2 SKIP), x86
-  188/189 (`hunt-starve-breakpoint` timeout, a documented known row). Residuals: a left original whose slot still holds the return address and no
+  188/189 (`hunt-starve-breakpoint` timeout, a documented known row); 3 more VM runs per arch 17/17
+  (`callorig-deep,callfunc-registry`). CI: full suite on f08b9ff (run 42259248723) and cf25988 (run 42263598556) --
+  the only FAILs `stdout-console-*` on both arches (runner console, failing on merge-frida too); `callorig`
+  (callorig-hunt + callorig-deep) and `callfunc-registry` 5 repetitions per arch (temporary branch `f5-reps`, run
+  42263590965, deleted since): all PASS. Residuals: a left original whose slot still holds the return address and no
   exception seen (longjmp, then a deeper call that leaves that slot alone) -- as before until the thread is seen
   above / the slot changes; x86 only: during a phase-1 filter of a frame ABOVE the original (an original with no
   SEH registration of its own) a hit in the filter releases the call early -- harmless unless the filter then
@@ -1606,7 +1610,8 @@ then fixed. Fixtures: `ctrl_target faultmix`, `co_target susp / many / manydead`
   fast -- threads created suspended and ended before they ever run (no callback, no hit), the creator moving across
   the CPUs -- until one is given the dead id (budget 150 s / 4M ids); that thread and 19 more run cf_short. It
   fails unless the dead id came back (reused=1, 20 threads). VM: x64 PASS after 4745 ids (500 ms), x86 after 4751
-  ids (563 ms).
+  ids (563 ms); 3 more runs per arch 8256-8310 ids, <= 1.6 s; CI (fresh runners) PASS in both full-suite runs and
+  all 5 x 2 repetitions above.
 - Open, not caused here: x86 `lifecycle-controller-killed-inline` kill@early-0.05 target DEAD (0xC0000005 /
   0xC00000FD) on windows-2022 runners, 2 of 8 reps (the known runner finding in the CI section, 2 of ~7 before).
   Also failing on merge-frida 921820c's CI and unchanged here: `stdout-console-*` on both arches (runner console).
