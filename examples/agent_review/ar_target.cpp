@@ -139,6 +139,16 @@ AR_EXPORT intptr_t ar_cf_gate(intptr_t x) {
     if (g_cf_arrived.load() >= g_cf_need) g_cf_together++;
     return ar_cf_inner(x);
 }
+// cflock: a callee that needs a lock another thread holds AT ITS OWN probe hit. It only
+// completes if that thread's callback runs (and returns) while this call is in flight.
+static CRITICAL_SECTION g_cf_cs;
+static HANDLE g_cf_waiting;
+AR_EXPORT intptr_t ar_cf_needlock() {
+    SetEvent(g_cf_waiting);
+    EnterCriticalSection(&g_cf_cs); LeaveCriticalSection(&g_cf_cs);
+    return 7 + (intptr_t)g_zero;
+}
+static DWORD WINAPI cf_waiter(void *) { return (DWORD)ar_cf_site(4); }
 struct CfReuse { DWORD victim; std::atomic<long> calls{0}, reused{0}; };
 static DWORD WINAPI cf_short(void *p) {
     auto *r = (CfReuse *)p;
@@ -230,6 +240,18 @@ int main(int argc, char **argv) {
         }
         printf("{\"kind\":\"ar\",\"case\":\"cfkill\",\"killed\":%d,\"reused\":%ld,\"threads\":%d,\"calls\":%ld}\n",
                killed, r.reused.load(), threads, r.calls.load());
+    } else if (!strcmp(k, "cflock")) {
+        InitializeCriticalSection(&g_cf_cs);
+        g_cf_waiting = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        EnterCriticalSection(&g_cf_cs);
+        HANDLE w = CreateThread(nullptr, 0, cf_waiter, nullptr, 0, nullptr);   // its callee waits for the lock
+        const int inside = WaitForSingleObject(g_cf_waiting, 10000) == WAIT_OBJECT_0;
+        const intptr_t held = ar_cf_site(2);              // a probe hit while holding it
+        LeaveCriticalSection(&g_cf_cs);
+        const int joined = WaitForSingleObject(w, 15000) == WAIT_OBJECT_0;
+        DWORD e = 0; GetExitCodeThread(w, &e); CloseHandle(w);
+        printf("{\"kind\":\"ar\",\"case\":\"cflock\",\"inside\":%d,\"joined\":%d,\"held\":%lld,\"waiter\":%lu}\n",
+               inside, joined, (long long)held, e);
     } else if (!strcmp(k, "cfmany")) {
         const int n = 100;
         g_cf_need = n;

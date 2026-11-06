@@ -7634,6 +7634,79 @@ def check_quickstart():
         record(name, False, repr(e))
 
 
+def check_callfunc_concurrent():
+    """call_func from several threads' breakpoint/hw callbacks at once (ROADMAP F5/D3): each
+    callback parks on its own fiber while its callee runs, so the calls overlap and finish in
+    any order, as on inline.
+    callfunc-lock-<backend>: thread W's callback call_funcs a callee that needs a lock the main
+    thread holds AT ITS OWN probe hit; the main thread's callback (a call_func of its own) has
+    to run while W's call is in flight. (Holding other threads' hits back during a call --
+    the former behaviour -- deadlocked the callee until the 5 s timeout: ok=0.)
+    callfunc-many-<backend>: 100 threads' callbacks inside call_func together (the callee waits
+    for all of them), the callee hitting another probe on its own thread (counted, no
+    callback); every call returns its value, exact hits and logs."""
+    d, t = exe("ar_driver.exe"), exe("ar_target.exe")
+    if not d or not t:
+        return missing_bin("callfunc-concurrent", "ar_driver/ar_target")
+
+    def go(bk, case, specs, timeout):
+        args = [d, "--backend", bk]
+        for sp in specs:
+            args += ["--probe", sp]
+        return run(args + ["--", t, case], timeout=timeout)
+
+    def logs(o):
+        cnt = {}
+        for x in o:
+            m = str(x.get("message", ""))
+            if x.get("kind") == "probe_log" and m.startswith(("ar ", "uhh warning")):
+                cnt[m] = cnt.get(m, 0) + 1
+        return cnt
+
+    def hits_of(o, sym):
+        return next((p.get("hits") for p in probes(o) if sym in str(p.get("location", ""))), None)
+
+    def row(o):
+        return next((x for x in o if x.get("kind") == "ar"), {})
+
+    def common(r, rep, bad):
+        if rep.get("log_dropped") != 0: bad.append(f"dropped={rep.get('log_dropped')}")
+        if rep.get("callbacks_interrupted", 0) != 0: bad.append(f"intr={rep.get('callbacks_interrupted')}")
+        if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
+        if "timed out" in (r.stderr or ""): bad.append("call_func timed out")
+
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"callfunc-lock-{bk}"
+        try:
+            r, o = go(bk, "cflock", ["ar_target.exe!ar_cf_site=ar_on_cf"], 90)
+            rw, rep, lg, bad = row(o), report(o), logs(o), []
+            if (rw.get("inside"), rw.get("joined"), rw.get("held"), rw.get("waiter")) != (1, 1, 2, 4): bad.append(f"row={rw}")
+            want_logs = {"ar cf-lock holder ok=1 r=6": 1, "ar cf-lock waiter ok=1 r=7": 1}
+            if lg != want_logs: bad.append(f"logs={lg}")
+            if hits_of(o, "ar_cf_site") != 2: bad.append(f"hits={hits_of(o, 'ar_cf_site')} want=2")
+            common(r, rep, bad)
+            record(name, not bad, "; ".join(bad) + ("" if not bad else f" stderr={(r.stderr or '')[-300:]!r}")
+                   or f"row={rw} logs={lg}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    n = 100
+    for bk in ("breakpoint", "hw"):
+        name = f"callfunc-many-{bk}"
+        try:
+            r, o = go(bk, "cfmany", ["ar_target.exe!ar_cf_site=ar_on_cf", "ar_target.exe!ar_cf_inner=ar_on_cf_inner"], 120)
+            rw, rep, lg, bad = row(o), report(o), logs(o), []
+            hs, hi = hits_of(o, "ar_cf_site"), hits_of(o, "ar_cf_inner")
+            if rw.get("sum") != sum(range(1000, 1000 + n)): bad.append(f"row={rw}")
+            if rw.get("together") != n: bad.append(f"only {rw.get('together')}/{n} threads were inside call_func together")
+            if hs != n or hi != n: bad.append(f"hits site={hs} inner={hi} want={n}")
+            if lg != {"ar cf-many ok=1 good=1": n}: bad.append(f"logs={lg}")
+            common(r, rep, bad)
+            record(name, not bad, "; ".join(bad) or f"row={rw} hits={hs}/{hi} logs={lg}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
 def main():
     global BIN
     ap = argparse.ArgumentParser()
@@ -7784,6 +7857,7 @@ def main():
     if want(check_cxlib): check_cxlib()
     if want(check_symbols_grammar): check_symbols_grammar()
     if want(check_quickstart): check_quickstart()
+    if want(check_callfunc_concurrent): check_callfunc_concurrent()
     if only and not RESULTS:
         print(f"regress.py: --only {','.join(only)} selected only opt-in tiers that were not enabled "
               f"(--bigapps / --soak-minutes / --volume-reads): no check ran.", file=sys.stderr)
