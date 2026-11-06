@@ -709,7 +709,37 @@ class _NoiseSampler:
             if m and int(m.group(1)) > 0:
                 self.samples.append((int(m.group(1)), arrival))
 
+        # The disk side, as UHH writes its session log (GetTempPath()\uhh\logs, cached appends):
+        # each ~5 ms a 120-byte append to a file there, timed. A write that blocks (the lazy
+        # writer flushing to a slow disk) is the machine's stall, not UHH's.
+        self.disk, self._stop = [], threading.Event()
+        self.dt = threading.Thread(target=self._disk, daemon=True)
+        self.dt.start()
+
+    def _disk(self):
+        d = Path(tempfile.gettempdir()) / "uhh" / "logs"
+        d.mkdir(parents=True, exist_ok=True)
+        f = open(d / f"latency-sampler-{os.getpid()}-{threading.get_ident()}.tmp", "wb", buffering=0)
+        try:
+            line = b"x" * 119 + b"\n"
+            while not self._stop.wait(0.005):
+                a = _qpc_now()
+                f.write(line)
+                self.disk.append((a, _qpc_now()))
+        finally:
+            f.close()
+            try:
+                os.unlink(f.name)
+            except OSError:
+                pass
+
+    def disk_noise(self, a, b):
+        """Longest sampler append (QPC ticks) overlapping [a, b]."""
+        return max((e - s for s, e in self.disk if s <= b and e >= a), default=0)
+
     def stop(self):
+        self._stop.set()
+        self.dt.join(timeout=10)
         try:
             self.p.kill()
         except OSError:
@@ -879,6 +909,9 @@ def check_stream_latency():
                    f"worst(#,ms,noise,in_file)={[(i, round(ms(lat[i]), 1), round(ms(noise[i]), 1), round(ms(in_file[i] - events[i]), 1) if i in in_file else None) for i in worst]} "
                    f"p99_to_file={ms(pct([in_file[i] - events[i] for i in lat if i in in_file], .99)):.1f}ms "
                    f"p99_file_to_out={ms(pct([logs[i] - in_file[i] for i in lat if i in in_file], .99)):.1f}ms "
+                   f"disk(worst)={[round(ms(sampler.disk_noise(events[i], logs[i])), 1) for i in worst]} "
+                   f"disk_run_max={ms(max((e - b for b, e in sampler.disk), default=0)):.1f}ms "
+                   f"tmp={tempfile.gettempdir()[:3]} "
                    f"noise_run_max={ms(run_noise):.1f}ms sampler={len(sampler.samples)}@{ms(sampler.period):.1f}ms "
                    f"fwd_p99={ms(pct(fwd, .99)):.1f}ms log_before_tick={before_tick} "
                    f"written={rep.get('logs_written')} dropped={rep.get('log_dropped')} rc={rc}"

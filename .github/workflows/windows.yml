@@ -277,8 +277,9 @@ jobs:
       fail-fast: false
       matrix:
         arch: [x64, x86]
-        burn: [0, 2, 4]
-    name: diag latency ${{ matrix.arch }} burn${{ matrix.burn }}
+        burn: [0]
+        tmp: [C, D]
+    name: diag latency ${{ matrix.arch }} burn${{ matrix.burn }} tmp${{ matrix.tmp }}
     env:
       CI_NOTICE_RE: 'stream-latency|patch-race'
     steps:
@@ -293,17 +294,18 @@ jobs:
       - name: stream-latency x8 with N CPU burners
         shell: pwsh
         run: |
+          if ('${{ matrix.tmp }}' -eq 'D') { New-Item -ItemType Directory -Force D:\uhhtmp | Out-Null; $env:TEMP = 'D:\uhhtmp'; $env:TMP = 'D:\uhhtmp' }
+          Write-Output "TEMP=$env:TEMP"; Get-PSDrive C, D | Format-Table -AutoSize | Out-String | Write-Output
           $b = @(); for ($i = 0; $i -lt ${{ matrix.burn }}; $i++) { $b += Start-Process -PassThru -WindowStyle Hidden python -ArgumentList '-c', 'while True: pass' }
-          $u = (1..8 | % { 'check_stream_latency' }) -join ','
-          if (${{ matrix.burn }} -eq 0) { $u += ',check_patch_race' }
-          python -u scripts/ci_shards.py run --arch ${{ matrix.arch }} --units $u --bin build-${{ matrix.arch }}/Release --out ci-logs --name lat-${{ matrix.arch }}-b${{ matrix.burn }}
+          $u = (1..10 | % { 'check_stream_latency' }) -join ','
+          python -u scripts/ci_shards.py run --arch ${{ matrix.arch }} --units $u --bin build-${{ matrix.arch }}/Release --out ci-logs --name lat-${{ matrix.arch }}-b${{ matrix.burn }}-${{ matrix.tmp }}
           $rc = $LASTEXITCODE
           $b | % { Stop-Process -Id $_.Id -Force -EA SilentlyContinue }
           exit 0
       - uses: actions/upload-artifact@v6
         if: always()
         with:
-          name: diag-lat-${{ matrix.arch }}-b${{ matrix.burn }}
+          name: diag-lat-${{ matrix.arch }}-b${{ matrix.burn }}-${{ matrix.tmp }}
           path: ci-logs/
           retention-days: 5
 
