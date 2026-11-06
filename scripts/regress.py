@@ -7201,6 +7201,12 @@ class LcTarget:
             if len(got) > n:
                 return json.loads(got[n])
             if self.p.poll() is not None:
+                # It exited: its last lines may still be in the pipe (the reader thread lags the exit;
+                # seen once: quit's "app" line missed, rc=0) -- read them all before calling it dead.
+                self.out.t.join(timeout=10)
+                got = [l for l in self.out.lines if f'"kind":"{kind}"' in l]
+                if len(got) > n:
+                    return json.loads(got[n])
                 return {"dead": self.p.returncode, "unhandled": self.unhandled()}
             time.sleep(0.05)
         return {"hung": True}

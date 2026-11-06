@@ -1937,7 +1937,7 @@ Real-bug candidates (reproduce on runners, not on the VM so far):
 - **attach-new-inline x64 windows-2025 (1 run)**: "probe never became active" -- the load flake also seen once on
   the VM (Lifecycle section).
 
-- 🔧 **transparency-* (x64, all 18 rows, once in 5 runs)** -- host found: it is the **Intel Xeon 6973P-C** runner
+- ✅ (explained and fixed in the test: see "CI residuals" R1 below) **transparency-* (x64, all 18 rows, once in 5 runs)** -- host found: it is the **Intel Xeon 6973P-C** runner
   (Granite Rapids; AMX enabled in XCR0 = 0x600e7, XSAVE area 11008 bytes; GetEnabledXStateFeatures 0x608e7),
   1 in ~15 x64 windows-2022 jobs (runfix1-diag 42192716058 x64-a, 42194976034 x64-g: every `ovf` row fails there,
   every other CPU passes: EPYC 7763 / 9V74 / 9V45, Xeon 8370C / 8573C -- AVX-512, no AMX). The `ovf` case (TR9) has
@@ -2112,10 +2112,10 @@ Three residuals of merge-frida's CI run 42256070700 (e186402). Diagnostics ran o
 (never merged; deleted after) whose jobs pushed their full logs plus linker maps of the agent and targets to
 `diaglogs/cr-<run>-<job>` branches (git-readable, no API token), so crash stacks could be symbolized.
 - ✅ (R3, L5 family) **lifecycle-detach-early-*-inline: the target died 0xC0000005 on an agent thread while
-  hunt_dll unloads.** Reproduced on CI (diag run 42262469609, 16 x64 jobs x ~214 iterations of every
-  `lifecycle-detach-early-*` row, merge-frida's code): 51 failures in ~13,700 inline/mixed rows (35 x
-  early-120-inline, 14 x early-30-inline, 1 x early-120-mixed, 0 breakpoint/hw), on every CPU type, all with ONE
-  signature: `exception 0xc0000005 at probe_api_agent.dll+0x371f7 (write of 0x7ff...1040 (unmapped))`, stack
+  hunt_dll unloads.** Reproduced on CI (diag run 42262469609, 17 x64 jobs -- 16 windows-2022, 1 windows-2025 -- x ~214
+  iterations of every `lifecycle-detach-early-*` row, merge-frida's code): 65 failures in 58,240 rows, all in the
+  29,120 inline/mixed ones (44 x early-120-inline, 19 x early-30-inline, 2 x early-120-mixed; 0 breakpoint/hw), on
+  every CPU type, all with ONE signature (the windows-2025 job's own build at its own offsets): `exception 0xc0000005 at probe_api_agent.dll+0x371f7 (write of 0x7ff...1040 (unmapped))`, stack
   (symbolized with the job's linker map) `MoveSmall6` <- `safetyhook::trap_threads` <- `InlineHook::disable` <-
   `MidHook::disable` <- `frozen<probe_agent_stop lambda>` (+0x21ca) <- `probe_agent_stop` (+0x9e25, the thread's
   start) -- the frames of merge-frida's CI failure. The agent's STOP thread (the remote thread a detach starts at
@@ -2131,7 +2131,7 @@ Three residuals of merge-frida's CI run 42256070700 (e186402). Diagnostics ran o
   command loads hunt_dll, calls HuntWork (its probe goes active and hits) and unloads it; then the detach. Before
   (VM x64, the fix reverted): inline and mixed DEAD 0xC0000005 with the same frames (`#4 +0x21ca`, `#5` the stop
   thread's start); breakpoint/hw PASS (removing an INT3/DR at an unmapped address fails harmlessly in the
-  controller). After: 4/4 on both arches. CI_R3_AFTER
+  controller). After: 4/4 on both arches (VM; CI diag 42264739119 3 x 4 per arch). Repetitions after the fix (diag 42264739119, every `lifecycle-detach-early-*` row in a loop, 17 jobs, both arches, windows-2022 + one windows-2025, on EPYC 7763 / 9V74, Xeon 8573C and one Xeon 6973P-C): x64 0 failures in 31,184 rows (7,796 inline + 7,796 mixed; before the fix 65 in 29,120 inline+mixed); x86 1 failure in 21,792 rows (5,448 inline + 5,448 mixed) -- a DIFFERENT signature, still open: x86 `lifecycle-detach-early-30-inline` on an EPYC 9V74 (x86-04), `target crashed: exception 0xc0000005 ... (execute of 0x16dfc38 (private memory, PAGE_READWRITE))`, a worker thread executing a non-executable private page, `in_flight=1 running=1` (a callback still running at the detach), x86 frames not walkable (`#2-#4 probe_api_agent.dll+0x1489` = local_read's tail, frame-pointer garbage). Not the stop thread's write; not reproduced elsewhere (first x86 loop run of these rows: no x86 baseline exists to compare).
 - ✅ (R2) **cx2-cosusp-breakpoint (x64)**: the failing condition was the one the message did not print -- `first`,
   the program's own SuspendThread of its worker returned 1, not 0: a suspension of the CONTROLLER's was in place at
   that instant; prev/ran/ret were right (the guard left exactly the program's suspension). Cause: call_original's
@@ -2148,7 +2148,7 @@ Three residuals of merge-frida's CI run 42256070700 (e186402). Diagnostics ran o
   inside a call_original (co_hold(2), under the 5 s limit; the wrap must complete, ret 38): x64 wants 0 foreign
   suspensions, x86 <= 1% (the WOW64 residual, reported). Before (VM x64, the poll reverted): foreign=43,193 of
   1.25 M samples (breakpoint), 389 of 436 k (hw). After: 0 of 1.26 M / 277 k; x86 987 of 493 k / 138 of 190 k
-  (0.2% / 0.07%: the residual). The cosusp/evsusp failure message now prints `first`. CI_R2_AFTER
+  (0.2% / 0.07%: the residual). The cosusp/evsusp failure message now prints `first`. CI (diag 42264739119, 3 runs each): before (the poll reverted) x64 cosample foreign 2,137-2,549 of ~2.4 M (breakpoint) / 680-803 of ~0.73 M (hw), x86 4,194-4,824 of ~1.47 M / 1,090-1,179 of ~0.43 M, and once the original symptom itself (x86 `cx2-cosusp-hw` FAIL); after: x64 0 of ~2.06 M / 0 of ~0.41 M, x86 1,953-2,362 of ~2.27 M (0.09%, the WOW64 residual, 3.5x below before). Full CI on the merged branch (30c1b48, run 42278813404): x64 1017/1017, x86 987/987, cet-hw 49/49.
 - ✅ (R1) **transparency-* on the Xeon 6973P-C (AMX) runner: the target's own stack overflow died on every
   backend** (merge-frida: 14 of 18 rows; inline's single run includes `ovf`, so all its modes failed with "no
   target row"). Environmental, not UHH: the overflow's exception frame is a CONTEXT plus the XSAVE area of every
