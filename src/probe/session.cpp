@@ -7165,7 +7165,8 @@ extern "C" void probe_close(probe_session *s) {
     // for it to finish before tearing the session down.
     const bool owner_elsewhere = s->launched && !s->exited && s->debug_tid &&
                                  s->debug_tid != GetCurrentThreadId();
-    if (s->running || (owner_elsewhere && !s->ran)) {
+    const bool asked = s->running || (owner_elsewhere && !s->ran);   // this close stops a live session
+    if (asked) {
         s->stop_requested = true;
         // Wait until probe_run has really returned: tearing the session down (or detaching
         // from this thread, which does not own the debug object) while it still runs would
@@ -7200,7 +7201,12 @@ extern "C" void probe_close(probe_session *s) {
     }
     stop_drainer(s);
     stop_log_output(s);                         // symbolization needs dbghelp and the process handle
-    if (s->detached) {
+    // The close asked probe_run to detach, but the target ended first (killed or exited between
+    // the request and the detach: probe_run left on its EXIT_PROCESS): the caller still gets
+    // the final accounting, which it cannot take itself any more -- the session ended inside
+    // this call (regress lifecycle-target-dies: once in ~20 runs no total was printed).
+    const bool ended_first = asked && !s->detached && s->exited && s->attached;
+    if (s->detached || ended_first) {
         // The final counts AFTER the detach (a report taken before probe_close races the
         // still-running target): every hit, and every log already written out.
         uint64_t hits = 0;
@@ -7216,9 +7222,16 @@ extern "C" void probe_close(probe_session *s) {
         const uint64_t dropped = (uint64_t)(s->shared ? s->shared->log_dropped : 0) +
                                  s->controller_dropped.load(std::memory_order_relaxed);
         const uint64_t in_flight = s->shared ? probe_agent_inflight(s->shared) : 0;
-        std::fprintf(stderr, "probe: detached: hits=%llu logs_written=%llu log_dropped=%llu in_flight=%llu running=%llu\n",
-                     (unsigned long long)hits, (unsigned long long)written, (unsigned long long)dropped,
-                     (unsigned long long)in_flight, (unsigned long long)(s->shared ? probe_agent_running(s->shared) : 0));
+        if (ended_first) {      // in_flight here: callbacks the target's end interrupted (probe_report's callbacks_interrupted)
+            std::fprintf(stderr, "probe: ended: the target exited before the detach (exit code %lu): hits=%llu "
+                                 "logs_written=%llu log_dropped=%llu in_flight=%llu\n", (unsigned long)s->exit_code,
+                         (unsigned long long)hits, (unsigned long long)written, (unsigned long long)dropped,
+                         (unsigned long long)in_flight);
+        } else {
+            std::fprintf(stderr, "probe: detached: hits=%llu logs_written=%llu log_dropped=%llu in_flight=%llu running=%llu\n",
+                         (unsigned long long)hits, (unsigned long long)written, (unsigned long long)dropped,
+                         (unsigned long long)in_flight, (unsigned long long)(s->shared ? probe_agent_running(s->shared) : 0));
+        }
         // The probe_report on stdout was taken before this detach (uhh_trace --detach-after-ms)
         // and records followed it: give stdout a last word too, so a capture that ends with
         // them still states its own total.
