@@ -1564,17 +1564,54 @@ then fixed. Fixtures: `ctrl_target faultmix`, `co_target susp / many / manydead`
   After: VM `--only cx2` x86 10/10, x64 9/9 + touchprog SKIP (x64 has no implicit suspend); the dying
   controller's guard list no longer held the worker; CI 10 runs per arch PASS; `--only cxlib` (the guard's
   controller-death checks) PASS on both arches, VM and CI. Agent protocol unchanged (controller-side only).
-- (F5, finding, open) **breakpoint/hw call_original left by an exception: later hits deeper on the stack get no
-  callback.** Adding two cases to co_target first (since moved to susp_target) changed its x86 code layout, and
-  `callorig-hunt-cppthrow-{breakpoint,hw}` x86 then failed deterministically on the VM -- with AND without the F4
-  fix -- `co after` hits=3 logs=0 (CI 42227764189 likewise); co_target as in 921820c: 45/45. The release of a
-  call_original whose original was left by an exception relies on the thread being seen at or above the hit's
-  frame (a probe hit there, or the 20 ms poll). Probably `after3` was no longer inlined, so co_after's hits came
-  from a deeper frame: each was taken for a hit inside the original (counted, no callback) until the 5 s
-  release. A gospel gap (hits without logs) for programs that catch an exception thrown through a probed
-  function and then call probed code from a deeper frame. Not fixed here (no reliable "the original's frame is
-  gone" signal yet: the stale return address can stay on the stack; x86 could check the SEH chain / x64 the
-  unwind); recorded for the owners.
+- ✅ (F5) **breakpoint/hw call_original left by an exception: later hits deeper on the stack got no callback.**
+  (Found when two cases added to co_target changed its x86 layout: `callorig-hunt-cppthrow-{breakpoint,hw}` x86
+  then failed deterministically, `co after` hits=3 logs=0 -- after3 no longer inlined.) Cause: the release of a
+  call_original whose original was left (C++ throw, SEH raise, longjmp) needed the thread to be seen AT OR ABOVE
+  the hit's frame (a probe hit there, or the 20 ms poll); a hit from a DEEPER frame was taken for a hit inside the
+  original -- counted, no callback (hits without logs) -- until the next hit at that level or the 5 s release
+  (other threads' hits held back meanwhile). Reproduced deterministically in `susp_target` (co_target untouched):
+  `deepthrow` / `deepseh` / `deepjmp` -- the original is left and caught above it, then the program calls a probed
+  function from a frame deeper than the left call's; `catchhit` -- the probed call is made inside the C++ catch
+  block itself (runs on the dispatch's stack, below the raise point, with the original's frame physically intact
+  -- its return address still in place). Fix (controller only, no protocol change), at a deeper hit of the call's
+  thread and in the 20 ms poll: (1) `co_slot_gone` -- the original's return address slot at the hit's SP no longer
+  holds the return address (the catching frame's later calls reused the stack; a copy within the 64 bytes just
+  below -- a thunk that moved its own return address -- counts as inside); (2) `co_unwound` -- when an exception was
+  raised on the call's thread during the call and the thread is below the raise point: a virtual unwind (dbghelp,
+  new `uhh_sym::unwind_frames`) that reaches the frame above the hit's straight from below the raise point -- not
+  through a frame between the raise point and the hit's frame (the original's, or a live callee's) -- means the
+  exception was already unwound past the original (x64: the catch funclet's consolidation frame unwinds into the
+  catching frame; x86: the catch block runs on the catching frame's EBP); on x86 the SEH chain must also hold no
+  registration between the raise point and the hit's frame. Either way the hit is rewound and the call released
+  (as for a hit above): the callback's call_original ends as before ("the original left without returning",
+  UHH_CALL_RELEASED, `-done` not logged, nothing interrupted), and the hit replays with its callback. Control case
+  `catchinside`: the exception is caught INSIDE the original (a probed call in that catch block, then a deeper
+  one): those hits stay inside the call (counted, no callback -- as inline) and the call returns normally.
+  Regress `callorig-deep-{deepthrow,deepseh,deepjmp,catchhit,catchinside}-{breakpoint,hw,inline}`: exact hits and
+  `co` logs, the target's row as uninstrumented, nothing dropped/interrupted, no 5 s release. Before (VM, the
+  unfixed library of 53490ed): x64 AND x86 4/12 -- every breakpoint/hw row of deepthrow/deepseh/deepjmp FAIL with
+  `co after` 5 of 10 logs, catchhit 0 of 5; inline PASS. With (1) only: 10/12 on both (catchhit still 0 of 5).
+  After: 15/15 on both arches; VM `--only callorig,callfunc,cx2,cxlib,hunt` (f08b9ff) x64 192/192 (+2 SKIP), x86
+  188/189 (`hunt-starve-breakpoint` timeout, a documented known row); 3 more VM runs per arch 17/17
+  (`callorig-deep,callfunc-registry`). CI: full suite on f08b9ff (run 42259248723) and cf25988 (run 42263598556) --
+  the only FAILs `stdout-console-*` on both arches (runner console, failing on merge-frida too); `callorig`
+  (callorig-hunt + callorig-deep) and `callfunc-registry` 5 repetitions per arch (temporary branch `f5-reps`, run
+  42263590965, deleted since): all PASS. Residuals: a left original whose slot still holds the return address and no
+  exception seen (longjmp, then a deeper call that leaves that slot alone) -- as before until the thread is seen
+  above / the slot changes; x86 only: during a phase-1 filter of a frame ABOVE the original (an original with no
+  SEH registration of its own) a hit in the filter releases the call early -- harmless unless the filter then
+  resumes execution in the original (EXCEPTION_CONTINUE_EXECUTION), when the callback's tail after call_original
+  does not run; x86 walks without FPO data (no PDB) are guarded by the SEH-chain condition only.
+- ✅ **`callfunc-kill-reuse` proved nothing on the VM** ("no thread reused the dead id in 3000 threads", every
+  run). Windows hands a freed thread id out again only once the id table's free list it went to has run dry (freed
+  ids queue behind it; per-CPU lists, the creating thread's CPU picks one) -- on a long-running machine that takes
+  more thread creations than 3000. The check now creates its precondition: after the kill, ar_target takes ids
+  fast -- threads created suspended and ended before they ever run (no callback, no hit), the creator moving across
+  the CPUs -- until one is given the dead id (budget 150 s / 4M ids); that thread and 19 more run cf_short. It
+  fails unless the dead id came back (reused=1, 20 threads). VM: x64 PASS after 4745 ids (500 ms), x86 after 4751
+  ids (563 ms); 3 more runs per arch 8256-8310 ids, <= 1.6 s; CI (fresh runners) PASS in both full-suite runs and
+  all 5 x 2 repetitions above.
 - Open, not caused here: x86 `lifecycle-controller-killed-inline` kill@early-0.05 target DEAD (0xC0000005 /
   0xC00000FD) on windows-2022 runners, 2 of 8 reps (the known runner finding in the CI section, 2 of ~7 before).
   Also failing on merge-frida 921820c's CI and unchanged here: `stdout-console-*` on both arches (runner console).
