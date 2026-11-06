@@ -7966,6 +7966,133 @@ def check_gated_e2e(threads=8, rounds=16):
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def check_cx2_review():
+    """Second Codex review of the code merged on 2026-11-06 (docs/ROADMAP.md "Codex review 2
+    findings"), each reproduced on the unfixed code first:
+      cx2-faultfresh-<b>: a probed load faults and the program's handler, in turn, retries it
+        (commits the page), SKIPS it (emulates the load) or UNWINDS out of it (SEH __except).
+        The next call is a fresh execution of the site on the same thread with no other event
+        in between: one hit, one log per call on every backend (breakpoint took it for a retry
+        of the faulted execution: no callback, no hit), the handler never sees a trap flag.
+      cx2-touchprog-hw (x86 controller): the PROGRAM holds a thread suspended; the controller
+        arms a hw probe at attach (a context call on every thread) and dies inside the call on
+        that thread, before the implicit WOW64 suspension and (second run) with it in place
+        (test-hook build). The guard must leave exactly the program's suspension (it resumed
+        every thread the call had listed, once: the program's suspension was released).
+      cx2-manythreads-inline / cx2-manydead-inline: 4200 threads (all alive at once: distinct
+        ids, more than the agent's 4096-entry thread table) make one inline hit each; then a
+        callback on yet another thread outlives a detach -- while those threads still live, and
+        after they have all exited. Its log must be delivered (it ran untracked: the detach
+        drain counted 0 live callbacks and gave up, the log was dropped)."""
+    cd, ct = exe("ctrl_driver.exe"), exe("ctrl_target.exe")
+    d, t, dth = exe("co_driver.exe"), exe("co_target.exe"), exe("co_driver_th.exe")
+    if not cd or not ct or not d or not t or not dth:
+        return missing_bin("cx2-review", "ctrl_driver/ctrl_target/co_driver/co_target/co_driver_th")
+
+    N = 300
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"cx2-faultfresh-{bk}"
+        try:
+            r, o = run([cd, "--scenario", "faultmix", "--backend", bk, "--", ct, "faultmix", "--n", N], timeout=180)
+            res = next((x for x in o if x.get("kind") == "ctrl_result"), {})
+            logs = [x for x in o if x.get("kind") == "probe_log"]
+            hits = sum(x.get("hits", 0) for x in o if x.get("kind") == "probe")
+            rep = report(o)
+            bad = []
+            if r.returncode != 0: bad.append(f"exit={r.returncode}")
+            if rep.get("error") is not None: bad.append(f"error={rep.get('error')}")
+            if rep.get("log_dropped", 0) != 0: bad.append(f"log_dropped={rep.get('log_dropped')}")
+            if hits != N or len(logs) != N: bad.append(f"hits={hits} logs={len(logs)} (want {N} each)")
+            third = N // 3
+            if (res.get("retry"), res.get("skip"), res.get("unwind")) != (third, third, third):
+                bad.append(f"handler retry={res.get('retry')} skip={res.get('skip')} unwind={res.get('unwind')} (want {third} each)")
+            if res.get("sum") is None or res.get("sum") != res.get("want"):
+                bad.append(f"target sum={res.get('sum')} want={res.get('want')}")
+            if res.get("tf") != 0: bad.append(f"tf_in_handler={res.get('tf')}")
+            if res.get("stray") != 0: bad.append(f"stray_single_steps={res.get('stray')}")
+            record(name, not bad, " ".join(bad) or f"hits={hits} logs={len(logs)} retry/skip/unwind="
+                                                   f"{res.get('retry')}/{res.get('skip')}/{res.get('unwind')}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    name = "cx2-touchprog-hw"
+    if not pe_is_x86(t):
+        skip(name, "x86 only (an x64 controller has no implicit suspend)")
+    else:
+        def touchprog(mode):
+            """co_target susp: the controller dies in its context call on the program-suspended
+            worker, before (mode "before") or inside (default: suspended) the implicit suspension."""
+            procs = []
+            try:
+                tgt = subprocess.Popen([str(t), "susp", "--wait"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, text=True)
+                procs.append(tgt)
+                tout = Lines(tgt.stdout)
+                sl = tout.wait_for(lambda l: '"kind":"susp"' in l, 30)
+                w = tout.wait_for(lambda l: '"kind":"waiting"' in l, 30)
+                if not sl or not w:
+                    raise RuntimeError("target never reached its gate")
+                env = dict(os.environ, UHH_TEST_DIE_IN_TOUCH=str(json.loads(sl)["tid"]))
+                if mode:
+                    env["UHH_TEST_DIE_IN_TOUCH_MODE"] = mode
+                att = subprocess.Popen([str(dth), "--backend", "hw", "--case", "susp", "--attach", str(json.loads(w)["pid"])],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env)
+                procs.append(att)
+                aerr = Lines(att.stderr)
+                att.wait(timeout=90)                       # dies arming the hw probe on every thread
+                aerr.t.join(timeout=30)
+                tgt.stdin.write("x"); tgt.stdin.flush()
+                tgt.wait(timeout=90)
+                row = next((x for x in tout.objs() if x.get("kind") == "co"), {})
+                rc = tgt.returncode & 0xFFFFFFFF
+                bad = []
+                if att.returncode != 98: bad.append(f"controller_rc={att.returncode} (98: died in the touch)")
+                died = next((l for l in aerr.lines if l.startswith("probe: test: dying")), "")
+                if "enabled=1" not in died: bad.append(f"not killed in a guarded touch: {died!r}")
+                if rc != 0: bad.append(f"target_rc=0x{rc:x}")
+                if row.get("first") != 0 or row.get("prev") != 1 or row.get("ran_while_suspended") != 0:
+                    bad.append(f"ResumeThread prev={row.get('prev')} (want 1: the program's own suspension) "
+                               f"ran_while_suspended={row.get('ran_while_suspended')} (want 0)")
+                if row.get("done") != 1 or row.get("sum") != sum(i * 3 + 5 for i in range(20)):
+                    bad.append(f"target row={row}")
+                return bad
+            finally:
+                for q in procs:
+                    if q.poll() is None:
+                        q.kill()
+        try:
+            bad = [f"[{m or 'suspended'}] {x}" for m in ("before", None) for x in touchprog(m)]
+            record(name, not bad, " ".join(bad) or "died before / inside the implicit suspension: the program's "
+                                                   "suspension kept (prev=1, worker never ran) both times")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    for case in ("many", "manydead"):
+        name = f"cx2-{case}threads-inline" if case == "many" else "cx2-manydead-inline"
+        try:
+            def detach_now(tgt, att, tout):
+                t0 = time.time(); att.stdin.write("\n"); att.stdin.flush()
+                att.wait(timeout=200)
+                return time.time() - t0
+            row, aout, aerr, arc, trc, took = cx_attached_run(case, "inline", d, t, detach_now, timeout=200)
+            sm = cx_detach_summary(aerr.lines)
+            done = [l for l in aout.lines if '"message":"co late-done' in l]
+            n = row.get("threads", 0)
+            bad = []
+            if n != 4200 or row.get("called") != n or row.get("distinct") != n:
+                bad.append(f"threads={n} called={row.get('called')} distinct={row.get('distinct')} (want 4200 each)")
+            if row.get("ret") != CX_LATE_SUM or row.get("done") != 1:
+                bad.append(f"target ret={row.get('ret')} want {CX_LATE_SUM} done={row.get('done')}")
+            if len(done) != 1 or f"sum={CX_LATE_SUM}" not in done[0]:
+                bad.append(f"late log delivered={len(done)}")
+            if sm.get("log_dropped") != 0 or sm.get("in_flight") != 0 or sm.get("hits") != n + 1 or sm.get("logs_written") != n + 2:
+                bad.append(f"summary={sm} (want hits={n + 1} logs_written={n + 2} dropped=0 in_flight=0)")
+            if arc != 0 or trc != 0: bad.append(f"driver_rc={arc} target_rc={trc}")
+            record(name, not bad, " ".join(bad) or f"threads={n} detach_took={took:.1f}s summary={sm}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
 def main():
     global BIN
     ap = argparse.ArgumentParser()
@@ -8114,6 +8241,7 @@ def main():
     if want(check_lifecycle): check_lifecycle()
     if want(check_cet_sde): check_cet_sde()
     if want(check_cxlib): check_cxlib()
+    if want(check_cx2_review): check_cx2_review()
     if want(check_symbols_grammar): check_symbols_grammar()
     if want(check_quickstart): check_quickstart()
     if want(check_gated_e2e): check_gated_e2e()

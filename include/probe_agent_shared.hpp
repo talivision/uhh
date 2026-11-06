@@ -10,7 +10,7 @@
 #include <cstdio>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 21;
+constexpr uint32_t PROBE_AGENT_VERSION = 22;
 constexpr uint32_t PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH = 1u << 9;   /* agent side only needs this one */   /* == PROBE_UNSAFE_FAST_PATCH (asserted in session.cpp) */
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 128;   /* inline probes per session; the 129th is refused */
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
@@ -137,7 +137,17 @@ struct probe_agent_guard {
                                                           per suspension: install holds, hook-write freezes,
                                                           call_func/call_original deferrals, in-place windows */
     uint64_t blocks[PROBE_AGENT_GUARD_BLOCKS];         /* 64 KiB out-of-line step blocks */
+    uint32_t held_floor[PROBE_AGENT_GUARD_TIDS];       /* per held_tids entry: PROBE_AGENT_HOLD_OURS (a hold
+                                                          of ours: resume once), or a CONDITIONAL entry --
+                                                          the thread's suspend count before a call that may
+                                                          suspend it implicitly (x86 controller, GuardTouch):
+                                                          resumed once only if its count is above that */
+    volatile LONG service_tid;                         /* the agent's service thread (no one suspends it): its
+                                                          suspend count as read by NtQueryInformationThread is
+                                                          the debug freeze alone (0 / 1), which that count
+                                                          includes -- subtracted from a held_floor reading */
 };
+constexpr uint32_t PROBE_AGENT_HOLD_OURS = 0xFFFFFFFFu;
 
 /* Hit counting and in-flight tracking are striped over cache-line-separated counters
    (indexed by thread id) so threads hitting the same probe do not contend on one line.
@@ -182,7 +192,7 @@ struct probe_agent_shared {
     volatile LONG live_query;
     volatile LONG live_seq;
     volatile LONG live_callbacks;
-    /* Early init (v21): the controller runs probe_agent_init on the launched target's MAIN
+    /* Early init (v22): the controller runs probe_agent_init on the launched target's MAIN
        thread at the loader breakpoint (before TLS callbacks and static DllMains, ROADMAP A6).
        No new thread can start before process initialisation ends, so init must not wait for
        its service thread (it reports itself ready once it runs). */
