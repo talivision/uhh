@@ -1381,11 +1381,14 @@ static inline volatile ULONG *teb_stack_guarantee() { return (volatile ULONG *)(
 #endif
 static ULONG g_cb_guarantee;             // 0: unknown offset / not needed -- left alone
 static void probe_stack_guarantee_offset() {   // on an agent thread (its guarantee is ours to change)
+    // (A request below the system's effective default is a no-op that leaves the field alone:
+    // probe with the real value, which is above it.)
+    const ULONG need = probe_callback_stack_guarantee();
     ULONG prev = 0;
     if (!SetThreadStackGuarantee(&prev) || *teb_stack_guarantee() != prev) return;
-    ULONG want = prev + 4096;
-    if (!SetThreadStackGuarantee(&want) || *teb_stack_guarantee() != prev + 4096) return;
-    g_cb_guarantee = probe_callback_stack_guarantee();
+    ULONG want = need > prev ? need : prev + 4096;
+    if (!SetThreadStackGuarantee(&want) || *teb_stack_guarantee() != (need > prev ? need : prev + 4096)) return;
+    g_cb_guarantee = need;
 }
 
 // The callback runs on the target's own thread: any Win32 call it (or the library) makes

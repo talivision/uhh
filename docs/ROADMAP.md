@@ -363,11 +363,11 @@ PowerShell + detach) under every backend, against an uninstrumented baseline.
 - ✅ A relocated INT3 whose adoption failed was passed to the target as unhandled: now rewound
 - ✅ (call_original hunter) breakpoint/hw counted the call_original pass-through as a second hit;
   inline call_original swallowed the original's exceptions -- see "call_original findings"
-- 📄 Accounting edge: a callback killed by process exit AFTER publishing its log but BEFORE returning
-  is reported both as a delivered log and in callbacks_interrupted (logs + dropped + interrupted can
-  exceed hits by the number of such threads). No log is lost; closing it exactly needs a per-callback
-  serial carried in the log record and matched by the controller. (The reverse window -- a hit counted
-  with no log and not interrupted -- is closed: hit and in-flight are one atomic add.)
+- ✅ Accounting edge (closed 2026-11-06, runfix1, agent v21): a callback killed by process exit AFTER
+  publishing its log but BEFORE returning was reported both as a delivered log and in
+  callbacks_interrupted (seen on CI runners: 3 of 36 crash-logs-inline-4t runs). Now the callback's
+  first record carries the hit's unaccounted unit (one store: the ring's seq) and the controller retires
+  it when it takes the record, so hits == logs + dropped + interrupted exactly (see "Runner findings").
 ## call_original findings (2026-11-05, `examples/hunt_callorig`, regress `callorig-hunt-*`)
 Edge-case hunt on `call_original` / `return_from`, every backend x x64/x86, each run compared
 with the uninstrumented target and with exact hits / "co" logs / `log_dropped == 0`.
