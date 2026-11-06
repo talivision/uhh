@@ -1165,10 +1165,14 @@ Two decisions that reverse earlier work:
   "controller-crash self-unhook: not worth the cost; the analyst sees the controller died and restarts the
   target". Now (as on main f9f3436): the agent goes in at launch/attach if inline probes are registered, or
   lazily when a callback/runtime add requests the first inline probe. bp/hw-only sessions inject nothing,
-  arm at the attach's break-in (no 5 s agent wait), and do not need the agent DLL. (Arming them during the
-  kernel's synthetic attach events instead, as main did, crashed hw targets with a stray single step on CI --
-  lifecycle-*-hw, detach-early/reattach/interrupt -- a bug L1 had masked: arming waited for the agent, whose
-  guard VEH also swallowed stray traps of ours.) Inline sessions keep the guard (it covers their bp/hw probes
+  arm at the attach's break-in (no 5 s agent wait), and do not need the agent DLL.
+  Found on the way (CI + VM PROBE_TRACE, `lifecycle-{reattach,detach-early,interrupt}-hw`): hw-only targets
+  died of an unhandled single step at a probed address during the detach drain. A thread created by one of
+  ours starts with its CREATE THREAD-time copy of its creator's debug registers; created around the release,
+  it carried our released DR images (`dr7=0x415`, all three slots) without being in any release bookkeeping,
+  so its #DB was taken for the program's own breakpoint and passed on. Masked since L1: the agent's guard VEH
+  swallowed such traps. Now CREATE_THREAD clears, before the thread runs, every enabled slot of a register
+  we have used that holds an address we armed (active probes and gates are set again right after). Inline sessions keep the guard (it covers their bp/hw probes
   too; one that acquires the agent later is guarded from then on). Controller death in a bp/hw-only attached
   session is main's behaviour: kill-on-exit is off, so the target is not killed, but it keeps our INT3s/DRs
   and dies at its next hit (0x80000003 / 0x80000004) -- documented in limitations.md.
