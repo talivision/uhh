@@ -1344,6 +1344,12 @@ the report (count, valid JSON per line, CRC multiset of the lines, `seq` coverag
   target's pipe yet) failed on both builds under that load (6f0c533: 1 of 9 records,
   pslog: 3 of 9, plus one more breakpoint p99 of 341 ms); `stream-latency` launches with the
   target's stdout forwarded, a path this change does not touch (file, then replay).
+- Throughput (6f0c533 vs pslog, 3 interleaved rounds per arch on the shared VM, medians; full
+  table in the pslog report): no regression beyond the run-to-run spread, which was large (other
+  agents kept the VM at 10-100% CPU): x64 `uhh_trace --stack` 1M to a file 69.8k -> 81.7k rec/s,
+  through `| Out-File` 12.1k -> 25.8k; x86 20.6k -> 40.1k and 6.5k -> 12.0k; log-throughput and
+  stream-volume peaks unchanged. stream-latency ordering flake: 5/36 (6f0c533) vs 9/36 (pslog)
+  in a 6x interleaved A/B, p99 medians equal; the forwarded path it measures is unchanged.
 - Considered and NOT changed: the drainer's idle `Sleep(1)` (inline median latency ~15.6 ms =
   one timer tick, a latency, not a loss); and, with no failure reproduced: splitting/looping console writes or
   WriteConsoleW (2M records through a console handle were complete), a retry after a short
