@@ -16,8 +16,9 @@
  * stdin commands (one per line):
  *   check  -> {"kind":"check",...}: the code bytes of every probe-able site against the
  *             snapshot taken at start-up (before any tool attached), the debug registers and
- *             trap flag of EVERY thread, IsDebuggerPresent, whether probe_api_agent.dll is
- *             loaded, iteration/error/flip counts.
+ *             trap flag of EVERY thread (a thread that could not be inspected and did not
+ *             exit is counted in dr_unknown, never as clean), IsDebuggerPresent, whether
+ *             probe_api_agent.dll is loaded, iteration/error/flip counts.
  *   reset  -> zero the flip counter (after a detach, nothing may flip any more)
  *   lock N -> a thread holds the LOADER LOCK for N ms ({"kind":"locked"} once held): a tool's
  *             remote thread (agent load / init) cannot even start meanwhile
@@ -135,10 +136,11 @@ static void snapshot(void) {
     for (int i = 0; i < NSITES; ++i) if (g_site[i]) memcpy(g_snap[i], g_site[i], sizeof(g_snap[i]));
 }
 
+/* 1 dirty, 0 clean, -1 the context could not be read (NOT clean: not inspected). */
 static int thread_dirty(HANDLE t, char *why, size_t cap) {
     CONTEXT c; memset(&c, 0, sizeof(c));
     c.ContextFlags = CONTEXT_DEBUG_REGISTERS | CONTEXT_CONTROL;
-    if (!GetThreadContext(t, &c)) return 0;
+    if (!GetThreadContext(t, &c)) { _snprintf_s(why, cap, _TRUNCATE, "GetThreadContext err=%lu", GetLastError()); return -1; }
     /* A breakpoint is an ENABLED slot (DR7 L0-3/G0-3) or the trap flag. An address left in a
        disabled slot never fires (WOW64 does not propagate a zeroed address of a disabled slot):
        counted separately as "stale", for information. */
@@ -234,9 +236,11 @@ static void find_agent_threads(void) {
     CloseHandle(snap);
 }
 
+static int thread_exited(HANDLE t) { return t && WaitForSingleObject(t, 0) == WAIT_OBJECT_0; }
+
 static void check(const char *kind) {
-    char code_bad[256] = "", dr_bad[256] = "", why[96];
-    int code_diff = 0, dr_dirty = 0, threads = 0;
+    char code_bad[256] = "", dr_bad[256] = "", dr_unknown_info[256] = "", why[96];
+    int code_diff = 0, dr_dirty = 0, dr_unknown = 0, threads = 0;
     InterlockedExchange(&g_dr_stale, 0);
     for (int i = 0; i < NSITES; ++i)
         if (g_site[i] && memcmp(g_snap[i], g_site[i], sizeof(g_snap[i]))) {
@@ -246,37 +250,59 @@ static void check(const char *kind) {
             _snprintf_s(code_bad + n, sizeof(code_bad) - n, _TRUNCATE, "%s%s+%d:%02x->%02x", n ? "," : "",
                         g_site_name[i], at, g_snap[i][at], g_site[i][at]);
         }
+    /* Every thread must be INSPECTED to count as clean: one whose handle, suspension or context
+       failed is "dr_unknown" (not clean) unless it is confirmed to have exited meanwhile (its
+       id gone at OpenThread, or its handle signalled). */
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     THREADENTRY32 te; te.dwSize = sizeof(te);
     DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
-    for (BOOL more = Thread32First(snap, &te); more; more = Thread32Next(snap, &te)) {
+    if (snap == INVALID_HANDLE_VALUE || !Thread32First(snap, &te)) {
+        ++dr_unknown;
+        _snprintf_s(dr_unknown_info, sizeof(dr_unknown_info), _TRUNCATE, "thread snapshot failed err=%lu", GetLastError());
+    } else for (BOOL more = TRUE; more; more = Thread32Next(snap, &te)) {
+        int d;
         if (te.th32OwnerProcessID != pid) continue;
         ++threads;
         if (te.th32ThreadID == self) {
-            if (thread_dirty(GetCurrentThread(), why, sizeof(why))) goto dirty;
-            continue;
+            d = thread_dirty(GetCurrentThread(), why, sizeof(why));
+        } else {
+            HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION | SYNCHRONIZE,
+                                  FALSE, te.th32ThreadID);
+            if (!t) {
+                const DWORD e = GetLastError();
+                if (e == ERROR_INVALID_PARAMETER) continue;        /* no such thread any more: it exited */
+                _snprintf_s(why, sizeof(why), _TRUNCATE, "OpenThread err=%lu", e);
+                d = -1;
+            } else if (SuspendThread(t) == (DWORD)-1) {
+                const DWORD e = GetLastError();
+                d = thread_exited(t) ? 0 : -1;
+                if (d) _snprintf_s(why, sizeof(why), _TRUNCATE, "SuspendThread err=%lu", e);
+                CloseHandle(t);
+            } else {
+                d = thread_dirty(t, why, sizeof(why));
+                ResumeThread(t);
+                if (d < 0 && thread_exited(t)) d = 0;           /* exiting when inspected: gone now */
+                CloseHandle(t);
+            }
         }
-        HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
-        if (!t) continue;
-        if (SuspendThread(t) != (DWORD)-1) {
-            int d = thread_dirty(t, why, sizeof(why));
-            ResumeThread(t);
-            CloseHandle(t);
-            if (d) goto dirty;
-        } else CloseHandle(t);
-        continue;
-    dirty:
-        ++dr_dirty;
-        { size_t n = strlen(dr_bad);
-          _snprintf_s(dr_bad + n, sizeof(dr_bad) - n, _TRUNCATE, "%s%lu:%s", n ? "," : "", te.th32ThreadID, why); }
+        if (d > 0) {
+            ++dr_dirty;
+            size_t n = strlen(dr_bad);
+            _snprintf_s(dr_bad + n, sizeof(dr_bad) - n, _TRUNCATE, "%s%lu:%s", n ? "," : "", te.th32ThreadID, why);
+        } else if (d < 0) {
+            ++dr_unknown;
+            size_t n = strlen(dr_unknown_info);
+            _snprintf_s(dr_unknown_info + n, sizeof(dr_unknown_info) - n, _TRUNCATE, "%s%lu:%s", n ? "," : "", te.th32ThreadID, why);
+        }
     }
-    CloseHandle(snap);
+    if (snap != INVALID_HANDLE_VALUE) CloseHandle(snap);
     LONG susp = 0; char susp_info[256] = "";
     find_suspended(&susp, susp_info, sizeof(susp_info));
-    printf("{\"kind\":\"%s\",\"susp\":%ld,\"susp_info\":\"%s\",\"code_diff\":%d,\"code_bad\":\"%s\",\"dr_dirty\":%d,\"dr_bad\":\"%s\",\"dr_stale\":%ld,\"threads\":%d,"
+    printf("{\"kind\":\"%s\",\"susp\":%ld,\"susp_info\":\"%s\",\"code_diff\":%d,\"code_bad\":\"%s\",\"dr_dirty\":%d,\"dr_bad\":\"%s\","
+           "\"dr_unknown\":%d,\"dr_unknown_info\":\"%s\",\"dr_stale\":%ld,\"threads\":%d,"
            "\"debugger\":%d,\"agent_loaded\":%d,\"iterations\":%lld,\"errors\":%ld,\"first_error\":\"%s\","
            "\"flips\":%ld,\"slow_calls\":%ld,\"churned\":%ld,\"dll_cycles\":%ld,\"late\":%ld,\"stuck\":%ld,\"stuck_info\":\"%s\",\"agent_thr\":\"%s\"}\n",
-           kind, susp, susp_info, code_diff, code_bad, dr_dirty, dr_bad, g_dr_stale, threads, IsDebuggerPresent() ? 1 : 0,
+           kind, susp, susp_info, code_diff, code_bad, dr_dirty, dr_bad, dr_unknown, dr_unknown_info, g_dr_stale, threads, IsDebuggerPresent() ? 1 : 0,
            GetModuleHandleA("probe_api_agent.dll") != NULL, (long long)g_iters, g_errors, g_first_error,
            g_flips, g_slow_calls, g_churned, g_dll_cycles, g_late, g_stuck, g_stuck_info, g_agent_thr);
     fflush(stdout);

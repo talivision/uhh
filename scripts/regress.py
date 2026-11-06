@@ -6488,6 +6488,7 @@ def lc_clean(c, attached_ok=False):
     """A check line that says the target is exactly as before any tool came."""
     # (late / stuck: the quit report -- worker threads that did not end, threads left suspended)
     return (not c.get("dead") and not c.get("hung") and c.get("code_diff") == 0 and c.get("dr_dirty") == 0 and
+            c.get("dr_unknown") == 0 and
             c.get("errors") == 0 and not c.get("late") and not c.get("stuck") and (attached_ok or c.get("debugger") == 0))
 
 
@@ -6495,6 +6496,7 @@ def lc_brief(c):
     if c.get("dead") is not None or c.get("hung"):
         return f"DEAD/HUNG {c}"
     return (f"code_diff={c.get('code_diff')} {c.get('code_bad') or ''} dr_dirty={c.get('dr_dirty')} {c.get('dr_bad') or ''} "
+            f"dr_unknown={c.get('dr_unknown')} {c.get('dr_unknown_info') or ''} "
             f"dr_stale={c.get('dr_stale')} dbg={c.get('debugger')} errors={c.get('errors')} {c.get('first_error') or ''} flips={c.get('flips')} "
             f"agent={c.get('agent_loaded')}" + (f" late={c.get('late')} stuck={c.get('stuck_info')} agent_thr={c.get('agent_thr')}" if c.get("late") or c.get("stuck") else "")
             + (f" susp={c.get('susp_info')}" if c.get("susp") else "")
