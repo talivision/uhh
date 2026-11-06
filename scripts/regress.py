@@ -2040,61 +2040,92 @@ def check_detach():
                 target.kill()
 
 
-def check_ntdll_churn():
+def check_ntdll_churn(cycles=8, round_reads=1000000):
     """Hooks on ntdll's own syscall stub, installed and removed again and again while
     threads hammer it: probe_app reads in a tight loop on 4 threads through
     ntdll!NtReadVirtualMemory (which shares its page with NtProtectVirtualMemory & co.);
-    uhh_trace attaches, hooks the stub, detaches -- repeatedly -- for every backend.
-    Inline hooks are written with the target frozen and threads caught inside the
-    overwritten bytes moved to the trampoline: the target must finish every read, exit 0
-    and match the uninstrumented checksum, and every cycle must have seen hits."""
+    uhh_trace attaches, hooks the stub, logs every call, detaches -- `cycles` times -- for
+    every backend. Inline hooks are written with the target frozen and threads caught inside
+    the overwritten bytes moved to the trampoline. The target reads until told to stop
+    (probe_app --until-key: rounds of 4 x round_reads, the same pattern each round), so every
+    cycle runs while it reads, whatever the machine's speed. Every cycle must detach cleanly
+    with hits (all but the first: it may load the agent) and deliver every hit as a log
+    (stdout logs == the detach line's hits == logs_written, none dropped); the target must
+    exit 0 with every read done and the checksum exactly rounds x an uninstrumented round's.
+
+    Why the target no longer runs a fixed count (it used to: 4 x 4,000,000 reads, >= 5
+    cycles required; inline fitted only 2-4). Measured on the x64 VM (2026-11-06, merge-frida
+    2715fab): attach (uhh_trace start + debug attach + agent) 0.4-3.0 s on every backend, the
+    hook active ~0.05-0.1 s later. Then the inline cycle is dominated by its own logs: inline
+    callbacks run at full speed (~2.4 M reads/s uninstrumented), every call is logged and none
+    may be dropped, and the hook stays in while uhh_trace's report drains them -- 0.3-5.4 M
+    log lines per cycle through the stdout pipe, cycles of 2.9-16.8 s (hw/breakpoint: ~2-3 k
+    hits, 1.2-2.6 s). The uninstrumented run takes ~6.8 s, so a fixed count fits too few
+    inline cycles. Inherent to logging every call, not a wait: the check now sets the run
+    length instead of the machine. Log lines are counted as they stream (never held); with that,
+    inline cycles took 1.0-2.9 s on x64 and 1.2-8.0 s on x86."""
     t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
     if not t or not a:
         return missing_bin("ntdll-churn", "uhh_trace/probe_app")
-    import time
-    for bk, reads in (("inline", 4000000), ("hw", 4000000), ("breakpoint", 4000000)):
+    threads = 4
+    for bk in ("inline", "hw", "breakpoint"):
         name = f"ntdll-churn-{bk}"
         target = None
         try:
-            threads = 4
-            total = threads * reads
-            _, bo = run([a, "--no-wait", "--threads", threads, "--reads", reads, "--config", "reads_enabled=1"],
-                        timeout=600)
+            args = ["--threads", str(threads), "--reads", str(round_reads), "--config", "reads_enabled=1"]
+            _, bo = run([a, "--no-wait", *args], timeout=600)
             base = app(bo)
-            target = subprocess.Popen([str(a), "--threads", str(threads), "--reads", str(reads),
-                                       "--config", "reads_enabled=1"],
+            target = subprocess.Popen([str(a), "--until-key", *args],
                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             while True:
                 line = target.stdout.readline().decode(errors="replace")
                 if not line or '"waiting"' in line:
                     break
             target.stdin.write(b"\n"); target.stdin.flush()
-            cycles, bad = [], []
-            while target.poll() is None and len(cycles) < 12:
+            done, bad, secs = [], [], []
+            for c in range(1, cycles + 1):
+                if target.poll() is not None:
+                    bad.append(f"target ended before cycle {c}")
+                    break
+                t0 = time.time()
                 tr = subprocess.Popen([str(t), "--backend", bk, "--attach", str(target.pid), "--detach-after-ms", "300",
                                        "-p", "ntdll.dll!NtReadVirtualMemory:xxxx"],
                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                out, err = tr.communicate(timeout=120)
-                objs = [json.loads(l) for l in out.splitlines() if l.startswith("{")]
+                terr = Lines(tr.stderr)
+                logs, objs = 0, []
+                for l in tr.stdout:                          # millions of log lines: count, never keep
+                    if l.startswith('{"kind":"probe_log"'):
+                        logs += 1
+                    elif l.startswith("{"):
+                        objs.append(json.loads(l))
+                tr.wait(timeout=120); terr.t.join(timeout=30)
+                secs.append(time.time() - t0)
                 pr = next((o for o in objs if o.get("kind") == "probe"), {})
                 det = any(o.get("kind") == "detached" for o in objs)
-                if target.poll() is not None and not det:
-                    break                                    # target finished mid-cycle: not a failure
-                cycles.append(pr.get("hits") or 0)
-                # The first cycle includes loading the agent (inline) and may not finish installing
-                # inside the 300 ms window; every later cycle must see hits.
-                if not det or (not pr.get("hits") and len(cycles) > 1) or pr.get("backend") != bk:
-                    bad.append(f"cycle{len(cycles)}: detached={det} hits={pr.get('hits')} backend={pr.get('backend')} "
-                               f"err={' | '.join(err.strip().splitlines()[-3:])[:400]}")
+                fin = next((re.search(r"probe: detached: hits=(\d+) logs_written=(\d+) log_dropped=(\d+)", l)
+                            for l in terr.lines if "probe: detached: hits=" in l), None)
+                hits, written, dropped = (int(x) for x in fin.groups()) if fin else (None, None, None)
+                done.append(hits)
+                if (not det or tr.returncode != 0 or pr.get("backend") != bk or (not hits and c > 1) or
+                        not (logs == hits == written) or dropped != 0):
+                    bad.append(f"cycle{c}: rc={tr.returncode} detached={det} backend={pr.get('backend')} hits={hits} "
+                               f"logs={logs} written={written} dropped={dropped} "
+                               f"err={' | '.join(terr.lines[-3:])[:400]}")
+            if target.poll() is None:
+                target.stdin.write(b"\n"); target.stdin.flush()   # stop reading
             rest = lines_until(target, '"kind":"app"', 600)
             target.wait(timeout=120)
             terr = target.stderr.read().decode(errors="replace") if target.returncode != 0 else ""
             unhandled = [l for l in terr.splitlines() if '"unhandled"' in l][:2]
             res = next((json.loads(l) for l in rest if l.strip().startswith("{") and '"kind":"app"' in l), {})
-            ok = (len(cycles) >= 5 and not bad and target.returncode == 0 and res.get("successful_reads") == total
-                  and res.get("checksum") == base.get("checksum"))
-            record(name, ok, f"cycles={len(cycles)} hits/cycle={cycles} exit={target.returncode} "
-                             f"reads={res.get('successful_reads')}/{total} checksum_same={res.get('checksum') == base.get('checksum')}"
+            rounds = res.get("rounds") or 0
+            total = threads * round_reads
+            ok = (len(done) == cycles and not bad and target.returncode == 0 and rounds >= 1 and
+                  res.get("successful_reads") == rounds * total and base.get("checksum") is not None and
+                  res.get("checksum") == rounds * base.get("checksum"))
+            record(name, ok, f"cycles={len(done)} hits/cycle={done} secs/cycle={[round(x, 1) for x in secs]} "
+                             f"exit={target.returncode} rounds={rounds} reads={res.get('successful_reads')}/{rounds * total} "
+                             f"checksum_exact={res.get('checksum') == rounds * (base.get('checksum') or 0)}"
                              + ("" if ok else f" bad={bad[:3]} target_unhandled={unhandled}"))
         except Exception as e:
             record(name, False, repr(e))
