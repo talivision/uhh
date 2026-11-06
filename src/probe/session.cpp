@@ -4712,9 +4712,8 @@ static void enforce_owned_drs(const probe_session *s, DWORD tid, CONTEXT &c, boo
 // released resumes through NtContinue with the context the kernel captured BEFORE that --
 // debug registers included -- so the new probe never fires on it (or a released one comes
 // back). Library-owned breakpoints at ntdll!NtContinue / NtContinueEx bring the debug-register
-// image of the context about to be restored up to date first: our slots only, exactly as at
-// a hardware hit, minus the generic stale-slot clear: a handler may have just armed its own
-// DR in that record (regress cdx-owndrx). Armed
+// image of the context about to be restored up to date first: our ACTIVE probes' slots only
+// (a handler may have just armed the program's own DR in that record: regress cdx-owndrx). Armed
 // with the thread-start fixup: once a hardware probe is armed or released at runtime.
 static void restore_fixup(probe_context *c) {
     probe_session *s = get_session(c);
@@ -4751,8 +4750,11 @@ static void restore_fixup(probe_context *c) {
         return;                                              // DRs not restored from this record
     }
     const CONTEXT before = img;
-    clear_released_images(s, img);                           // a released probe captured in the image
-    enforce_owned_drs(s, c->tid, img, false);                // our active probes; the rest as the program left it
+    // Our ACTIVE probes only. Everything else stays as the record has it: a handler may have
+    // armed the program's own DR there -- even at an address we watched once and released
+    // (cdx-owndrx) -- and a stale image of a released probe of ours is recognised at the
+    // thread's next #DB anyway (hw_unsettled).
+    enforce_owned_drs(s, c->tid, img, false);
     if (img.Dr0 == before.Dr0 && img.Dr1 == before.Dr1 && img.Dr2 == before.Dr2 && img.Dr3 == before.Dr3 &&
         img.Dr7 == before.Dr7) return;
     if (trace_enabled())
