@@ -8742,15 +8742,17 @@ def check_cx2_review():
         except Exception as e:
             record(name, False, repr(e))
 
+    st = exe("susp_target.exe")
+
     def susp_after(case, bk):
-        """co_target evsusp / cosusp: the program suspends its worker right after the controller let
+        """susp_target evsusp / cosusp: the program suspends its worker right after the controller let
         it run again (its hit continued / inside its callback's call_original); the controller then
         dies (evsusp: the test-hook build dies 1.5 s after continuing the hit, no event or guard sync
         meanwhile; cosusp: killed while the original runs). The guard must leave exactly the
         program's suspension: the worker did not run, the program's ResumeThread reports 1."""
         procs, bad = [], []
         try:
-            tgt = subprocess.Popen([str(t), case], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            tgt = subprocess.Popen([str(st), case], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.DEVNULL, text=True)
             procs.append(tgt)
             tout = Lines(tgt.stdout)
@@ -8760,7 +8762,8 @@ def check_cx2_review():
             env = dict(os.environ)
             if case == "evsusp":
                 env["UHH_TEST_DIE_AFTER_HIT_MS"] = "1500"
-            att = subprocess.Popen([str(dth), "--backend", bk, "--case", case, "--attach", str(json.loads(w)["pid"])],
+            att = subprocess.Popen([str(dth), "--backend", bk, "--case", case, "--module", "susp_target.exe",
+                                    "--attach", str(json.loads(w)["pid"])],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env)
             procs.append(att)
             aerr = Lines(att.stderr)
@@ -8808,6 +8811,8 @@ def check_cx2_review():
     for case in ("evsusp", "cosusp"):
         for bk in ("breakpoint", "hw"):
             name = f"cx2-{case}-{bk}"
+            if not st:
+                missing_bin(name, "susp_target"); continue
             try:
                 bad, detail = susp_after(case, bk)
                 record(name, not bad, " ".join(bad + [detail]))

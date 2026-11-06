@@ -1,5 +1,6 @@
-// co_driver --backend b [--inner-backend b2] --case name [--attach pid [--detach-after ms | --detach-on-stdin]]
+// co_driver --backend b [--inner-backend b2] --case name [--module m.exe] [--attach pid [--detach-after ms | --detach-on-stdin]]
 //           [-- co_target.exe name]
+// --module: the probed functions' module (default co_target.exe; susp_target.exe for evsusp/cosusp).
 // --detach-on-stdin: detach when a line arrives on stdin. co_driver_th is the same driver
 // linked with the test-hook build of the library (probe_api_testhooks, regress cxlib-killarm).
 // call_original / return_from edge-case hunt (regress `callorig-hunt`): probes co_target's
@@ -32,12 +33,13 @@ static uint32_t parse_backend(const char *b) {
 int main(int argc, char **argv) {
     uint32_t bk = 0, inner = 0, pid = 0, detach_ms = 0;
     bool detach_stdin = false;
-    std::string kase;
+    std::string kase, module = "co_target.exe";
     int i = 1;
     for (; i < argc && std::strcmp(argv[i], "--"); ++i) {
         if (!std::strcmp(argv[i], "--backend") && i + 1 < argc) bk = parse_backend(argv[++i]);
         else if (!std::strcmp(argv[i], "--inner-backend") && i + 1 < argc) inner = parse_backend(argv[++i]);
         else if (!std::strcmp(argv[i], "--case") && i + 1 < argc) kase = argv[++i];
+        else if (!std::strcmp(argv[i], "--module") && i + 1 < argc) module = argv[++i];
         else if (!std::strcmp(argv[i], "--attach") && i + 1 < argc) pid = (uint32_t)std::strtoul(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--detach-after") && i + 1 < argc) detach_ms = (uint32_t)std::strtoul(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--detach-on-stdin")) detach_stdin = true;
@@ -48,7 +50,7 @@ int main(int argc, char **argv) {
     if (!s) return 1;
     co_cfg cfg{bk};
     auto add = [&](const char *fn, probe_callback cb, uint32_t flags) {
-        std::string loc = std::string("co_target.exe!") + fn;
+        std::string loc = module + "!" + fn;
         return probe_add_symbol_cfg(s, loc.c_str(), cb, flags, &cfg, sizeof(cfg)) != 0;
     };
     bool ok = true;

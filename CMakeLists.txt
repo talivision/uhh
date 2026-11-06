@@ -461,6 +461,9 @@ target_include_directories(co_driver_th PRIVATE include)
 target_link_libraries(co_driver_th PRIVATE probe_api_testhooks)
 target_compile_definitions(co_driver_th PRIVATE _CRT_SECURE_NO_WARNINGS)
 add_dependencies(co_driver_th co_target probe_api_agent)
+add_executable(susp_target examples/hunt_callorig/susp_target.cpp)   # regress cx2-evsusp-* / cx2-cosusp-*
+target_compile_definitions(susp_target PRIVATE _CRT_SECURE_NO_WARNINGS)
+add_dependencies(co_driver_th susp_target)
 add_executable(ar_driver_th examples/agent_review/ar_driver.cpp examples/agent_review/ar_callbacks.cpp)   # regress callfunc-late-trap-*
 target_include_directories(ar_driver_th PRIVATE include)
 target_link_libraries(ar_driver_th PRIVATE probe_api_testhooks)
