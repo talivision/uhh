@@ -7233,6 +7233,56 @@ def check_cxlib():
                 if q.poll() is None:
                     q.kill()
 
+    # -- ROADMAP L13 residual (x86 controller): the WOW64 implicit suspend of a thread the
+    # controller touches outside an event (arming a hw probe on every thread). Simulated in the
+    # test-hook build: at its first touch of the target's main thread the controller suspends
+    # it (what the kernel does inside the call) and dies. The guard must resume it. The control
+    # run (UHH_TEST_NO_TOUCH_GUARD: the touch left unrecorded) shows the gap: the target hangs.
+    name = "cxlib-touchkill-hw"
+    if not pe_is_x86(t):
+        skip(name, "x86 only (an x64 controller has no implicit suspend)")
+    else:
+        def touchkill(control):
+            procs = []
+            try:
+                tgt = subprocess.Popen([str(t), "spin", "--wait"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, text=True)
+                procs.append(tgt)
+                tout = Lines(tgt.stdout)
+                w = tout.wait_for(lambda l: '"kind":"waiting"' in l, 30)
+                if not w:
+                    raise RuntimeError("target never reached its gate")
+                g = json.loads(w)
+                env = dict(os.environ, UHH_TEST_DIE_IN_TOUCH=str(g["tid"]))
+                if control:
+                    env["UHH_TEST_NO_TOUCH_GUARD"] = "1"
+                att = subprocess.Popen([str(dth), "--backend", "hw", "--case", "spin", "--attach", str(g["pid"])],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, env=env)
+                procs.append(att)
+                att.wait(timeout=90)
+                time.sleep(2.0)
+                tgt.stdin.write("x"); tgt.stdin.flush()
+                try:
+                    tgt.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    return att.returncode, None, "hung"
+                row = next((x for x in tout.objs() if x.get("kind") == "co"), {})
+                return att.returncode, tgt.returncode & 0xFFFFFFFF, row
+            finally:
+                for q in procs:
+                    if q.poll() is None:
+                        q.kill()
+        try:
+            want = dict(base); want.pop("kind", None)
+            crc, trc, row = touchkill(False)
+            if isinstance(row, dict): row.pop("kind", None)
+            ccrc, ctrc, crow = touchkill(True)
+            ok = crc == 98 and trc == 0 and row == want and bool(want)
+            record(name, ok, f"controller_rc={crc} (98: died in the touch) target_rc={trc} row={row} want={want}; "
+                             f"control without the touch record: controller_rc={ccrc} target={crow if crow == 'hung' else ctrc}")
+        except Exception as e:
+            record(name, False, repr(e))
+
     # -- (5) x86 inline without OSXSAVE: the x87 state around ordinary callbacks -----------
     name = "cxlib-noxsave-inline"
     tpd, tpt = exe("tp_driver.exe"), exe("tp_target.exe")

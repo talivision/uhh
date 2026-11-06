@@ -304,6 +304,54 @@ struct probe_session {
 };
 
 static bool register_runtime_inline(probe_session *s, Probe &p);
+// A 32-bit (WOW64) controller's Get/SetThreadContext on a thread other than the one whose
+// event it is handling is an implicit suspend + resume INSIDE the call (ROADMAP L13): killed in
+// the middle of one, the controller leaves that thread suspended once with nothing of ours
+// recording it (the guard resumes the event threads, call threads and explicit holds only).
+// While such a call runs, the thread is listed among the guard's held threads -- after a
+// controller death it gets one resume, a no-op unless the call was in progress -- and it is
+// taken off again right after. x64 controllers have no implicit suspend: nothing to do.
+struct GuardTouch {
+#if !defined(_WIN64)
+    probe_agent_guard *g = nullptr;
+    LONG n = 0;
+    GuardTouch(const probe_session *s, DWORD tid);
+    ~GuardTouch() { if (g && g->held_count == n + 1) { MemoryBarrier(); g->held_count = n; } }
+#else
+    GuardTouch(const probe_session *, DWORD) {}
+#endif
+    GuardTouch(const GuardTouch &) = delete;
+    GuardTouch &operator=(const GuardTouch &) = delete;
+};
+#if !defined(_WIN64)
+GuardTouch::GuardTouch(const probe_session *s, DWORD tid) {
+    if (!s->attached || !s->shared || s->detached || !tid) return;
+    auto &gg = s->shared->guard;
+    const LONG count = gg.held_count;
+#if defined(UHH_TEST_HOOKS)
+    // Test-only (probe_api_testhooks): UHH_TEST_NO_TOUCH_GUARD=1 leaves the touch unrecorded
+    // (the control run of regress cxlib-touchkill-hw).
+    static const bool off = std::getenv("UHH_TEST_NO_TOUCH_GUARD") != nullptr;
+    if (off) {} else
+#endif
+    if (count >= 0 && count < (LONG)PROBE_AGENT_GUARD_TIDS) {
+        gg.held_tids[count] = tid;
+        MemoryBarrier();
+        gg.held_count = count + 1;
+        g = &gg; n = count;
+    }
+#if defined(UHH_TEST_HOOKS)
+    // UHH_TEST_DIE_IN_TOUCH=<tid>: at the first such call on that thread, do what the kernel
+    // does inside it (suspend the thread) and die there -- the WOW64 implicit-suspend window.
+    static const DWORD die_tid = [] { const char *v = std::getenv("UHH_TEST_DIE_IN_TOUCH"); return v ? (DWORD)std::strtoul(v, nullptr, 10) : 0u; }();
+    if (die_tid && tid == die_tid) {
+        if (HANDLE t = OpenThread(THREAD_SUSPEND_RESUME, FALSE, tid)) SuspendThread(t);
+        std::fflush(nullptr);
+        TerminateProcess(GetCurrentProcess(), 98);
+    }
+#endif
+}
+#endif
 static bool kick_agent(probe_session *s);
 static bool resolve_inline(probe_session *s, Probe &p, uint64_t base);
 static Probe *probe_at(probe_session *s, uint64_t address);
@@ -1782,6 +1830,7 @@ static uint8_t target_slots_any(const probe_session *s) {
     for (DWORD tid : s->threads) {
         HANDLE t = OpenThread(THREAD_GET_CONTEXT, FALSE, tid);
         CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        GuardTouch touch(s, tid);
         if (t && GetThreadContext(t, &c)) m |= target_slots(s, tid, c);
         if (t) CloseHandle(t);
     }
@@ -1807,7 +1856,8 @@ static void retire_hw_address(probe_session *s, uint64_t address) {
         auto &u = s->hw_unsettled[tid];
         CONTEXT now{}; now.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
         HANDLE t = OpenThread(THREAD_GET_CONTEXT, FALSE, tid);
-        const bool got = t && GetThreadContext(t, &now);
+        bool got;
+        { GuardTouch touch(s, tid); got = t && GetThreadContext(t, &now); }
         if (t) CloseHandle(t);
         if (got && u.have_regs && !same_thread_regs(u.regs, now)) u.addrs.clear();
         if (got && (!u.have_regs || u.addrs.empty())) { u.regs = now; u.have_regs = true; }
@@ -1888,6 +1938,7 @@ static bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
         HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
         if (!t) continue;
         ++tried;
+        GuardTouch touch(s, tid);
         if (set_dr_on_thread(t, slot, address, true, rw, len)) ++set_ok;
         CloseHandle(t);
     }
@@ -3096,6 +3147,7 @@ static void reapply_all_hw(probe_session *s) {
         uint32_t rw = 0, len = 0; hw_rw_len(p->flags, rw, len);
         for (DWORD tid : s->threads) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+            GuardTouch touch(s, tid);
             if (t) { set_dr_on_thread(t, p->dr_slot, p->address, true, rw, len); CloseHandle(t); }
         }
     }
@@ -3525,6 +3577,7 @@ static bool arm_gates_for_pending(probe_session *s) {
         const int slot = slots[i];
         for (DWORD tid : s->threads) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+            GuardTouch touch(s, tid);
             if (t) { set_dr_on_thread(t, slot, sites[i], true); CloseHandle(t); }
         }
         s->dr_used |= (uint8_t)(1u << slot); s->dr_ever |= (uint8_t)(1u << slot);
@@ -3538,6 +3591,7 @@ static void clear_gates(probe_session *s) {
     for (auto &g : s->gates) {
         for (DWORD tid : s->threads) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+            GuardTouch touch(s, tid);
             if (t) { set_dr_on_thread(t, g.second, 0, false); CloseHandle(t); }
         }
         s->dr_used &= (uint8_t)~(1u << g.second);
@@ -3897,6 +3951,7 @@ static void detach(probe_session *s) {
     for (auto &kv : s->stepping) {
         HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, kv.first);
         CONTEXT w{}; w.ContextFlags = CONTEXT_CONTROL;
+        GuardTouch touch(s, kv.first);
         if (t && GetThreadContext(t, &w)) {
 #if defined(_WIN64)
             uint64_t ip = w.Rip;
@@ -3924,6 +3979,7 @@ static void detach(probe_session *s) {
     std::string report_tids;
     for (HANDLE t : frozen) {
         CONTEXT w{}; w.ContextFlags = CONTEXT_DEBUG_REGISTERS | CONTEXT_CONTROL;
+        GuardTouch touch(s, GetThreadId(t));                 // (frozen handles carry query rights)
         BOOL got = FALSE; DWORD why = 0;
         for (int attempt = 0; attempt < 200 && !(got = GetThreadContext(t, &w)); ++attempt) {
             why = GetLastError();
@@ -4061,6 +4117,7 @@ static void release_hw(probe_session *s, Probe &p) {
     if (p.dr_slot < 0) return;
     for (DWORD tid : s->threads) {
         HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+        GuardTouch touch(s, tid);
         if (t) { set_dr_on_thread(t, p.dr_slot, 0, false); CloseHandle(t); }
     }
     if (p.address) retire_hw_address(s, p.address);
@@ -4095,6 +4152,7 @@ static void ipc_freeze_thread(probe_session *s, DWORD tid) {
 // jumps back to site + patch_len.
 static void move_into_trampoline(probe_session *s, HANDLE t) {
     CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
+    GuardTouch touch(s, GetThreadId(t));
     if (!GetThreadContext(t, &c)) return;
 #if defined(_WIN64)
     uint64_t ip = c.Rip;

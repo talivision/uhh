@@ -81,7 +81,7 @@ static intptr_t jump_call(intptr_t x, int *jumped) {
 }
 
 static int wait_gate() {
-    printf("{\"kind\":\"waiting\",\"pid\":%lu}\n", GetCurrentProcessId()); fflush(stdout);
+    printf("{\"kind\":\"waiting\",\"pid\":%lu,\"tid\":%lu}\n", GetCurrentProcessId(), GetCurrentThreadId()); fflush(stdout);
     char b; DWORD n = 0;
     return ReadFile(GetStdHandle(STD_INPUT_HANDLE), &b, 1, &n, nullptr) && n == 1;
 }
