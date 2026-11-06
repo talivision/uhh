@@ -73,6 +73,7 @@ int main(int argc, char **argv) {
     else if (k == "vslow") ok = add("co_vslow", co_on_vslow, bk) && add("co_after", co_on_after, bk);
     else if (k == "cbfault") ok = add("co_cbf", co_on_cbf, bk);
     else if (k == "spin") ok = add("co_add", co_on_spin, bk);
+    else if (k == "rep") ok = add("CoRepSite", co_on_spin, bk);
     else if (k == "late" || k == "cfgfree") {
         static co_bigcfg big{};                  // larger than PROBE_AGENT_CONFIG_CAP (256)
         big.backend = bk; big.n = (uint32_t)sizeof(big.pat);

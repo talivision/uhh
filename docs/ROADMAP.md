@@ -661,7 +661,8 @@ Fixture `examples/ctrlreview` (ctrl_target + ctrl_dll + ONE callback source), re
   continues elsewhere the one stray trap of our TF is absorbed. A WOW64 (x86) handler's context comes back
   WITHOUT our TF (x86 had 400 hits for 200 with the TF test alone): there the restart is the next INT3 at
   the site with every integer register, SP and the arithmetic flags unchanged since the fault.
-  📄 x64: the handler's ContextRecord shows our TF (the restart marker; it was visible before too).
+  ~~📄 x64: the handler's ContextRecord shows our TF (the restart marker; it was visible before too).~~
+  Fixed 2026-11-06 (Codex library review, below): the handler never sees our TF on any backend.
   📄 x86: a NEW call that reaches the site with exactly the faulting registers right after the handler
   unwound would be taken for the restart (not seen; needs identical registers incl. SP). hw and inline were
   already exact. Test: `ctrl-fault-{breakpoint,hw,inline}`
@@ -1054,7 +1055,8 @@ by itself, nothing dropped), detach while callbacks run / block in call_original
   `lifecycle-install-stuck-{inline,mixed}`
 - ✅ (L9) Logs of inline callbacks still running at detach (longer than the agent's 2 s unhook
   wait) were dropped (controller_gone set at once). The controller now keeps draining until no
-  callback is in flight (bounded 15 s) before telling producers nobody listens.
+  callback is in flight (bounded 15 s) before telling producers nobody listens. (Since the Codex
+  library review: unbounded while a callback can still finish -- see there, finding 4.)
   `lifecycle-detach-longcb-*`
 - ✅ (L10) The debug register a breakpoint/hw call_original borrows to catch the return was not
   counted as ours: the detach's final pass and the guard did not clear it (x86: its address stayed

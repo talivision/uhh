@@ -7233,6 +7233,44 @@ def check_cxlib():
                 if q.poll() is None:
                     q.kill()
 
+    # -- (3, extra) the other INT3 of ours a thread can execute: the end of a displaced REP
+    # string copy (in UHH's scratch, no trap flag). The controller dies right after sending a
+    # thread into one (test-hook build): the guard must take that INT3 too.
+    name = "cxlib-reptail-breakpoint"
+    procs = []
+    try:
+        tgt = subprocess.Popen([str(t), "rep", "--wait"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, text=True)
+        procs.append(tgt)
+        tout = Lines(tgt.stdout)
+        w = tout.wait_for(lambda l: '"kind":"waiting"' in l, 30)
+        if not w:
+            raise RuntimeError("target never reached its gate")
+        env = dict(os.environ, UHH_TEST_DIE_IN_REPCOPY="1")
+        att = subprocess.Popen([str(dth), "--backend", "breakpoint", "--case", "rep", "--attach", str(json.loads(w)["pid"])],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        procs.append(att)
+        aout, aerr = Lines(att.stdout), Lines(att.stderr)
+        if not aerr.wait_for(lambda l: l.startswith("probe: active co_target.exe!CoRepSite"), 60):
+            raise RuntimeError("CoRepSite never became active: " + " | ".join(aerr.lines[-4:])[:300])
+        tgt.stdin.write("x"); tgt.stdin.flush()
+        att.wait(timeout=90)
+        try:
+            tgt.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("target hung after the controller died")
+        row = next((x for x in tout.objs() if x.get("kind") == "co"), {})
+        rc = tgt.returncode & 0xFFFFFFFF
+        ok = att.returncode == 97 and rc == 0 and row.get("good") == 8
+        record(name, ok, f"controller_rc={att.returncode} (97: died with a thread in the copy) target_rc=0x{rc:x} "
+                         f"fills_ok={row.get('good')}/8")
+    except Exception as e:
+        record(name, False, repr(e))
+    finally:
+        for q in procs:
+            if q.poll() is None:
+                q.kill()
+
     # -- ROADMAP L13 residual (x86 controller): the WOW64 implicit suspend of a thread the
     # controller touches outside an event (arming a hw probe on every thread). Simulated in the
     # test-hook build: at its first touch of the target's main thread the controller suspends

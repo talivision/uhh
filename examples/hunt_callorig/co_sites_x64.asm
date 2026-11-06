@@ -1,5 +1,5 @@
 ; call_original / return_from hunt: exact code shapes the C compiler would not guarantee.
-PUBLIC CoMidPush, CoPrologue, CoCallPrologue
+PUBLIC CoMidPush, CoPrologue, CoCallPrologue, CoRepFill, CoRepSite
 
 .code
 ; intptr_t CoMidPush(intptr_t a) = a + 1. A probe at CoMidPush+1 is MID-function: [rsp] is
@@ -64,4 +64,17 @@ bad:
     pop rbx
     ret
 CoCallPrologue ENDP
+
+; void CoRepFill(void *dst, size_t n, int v): memset by `rep stosb` at CoRepSite (cxlib-reptail:
+; a breakpoint runs it out-of-line, ending at an INT3 in UHH's scratch instead of a trap flag).
+CoRepFill PROC
+    push rdi
+    mov rdi, rcx
+    mov rcx, rdx
+    mov eax, r8d
+CoRepSite::
+    rep stosb
+    pop rdi
+    ret
+CoRepFill ENDP
 END

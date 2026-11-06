@@ -1906,6 +1906,13 @@ static void guard_sync(probe_session *s);
 // controller right after it writes its n-th user INT3 or arms its n-th hardware probe on the
 // target's threads -- a controller death at the worst instant for the agent's guard
 // (regress cxlib-killarm-*).
+// UHH_TEST_DIE_IN_REPCOPY=1: die right after continuing a thread into a displaced REP string
+// copy (it ends at an INT3 in our scratch; regress cxlib-reptail).
+static bool g_test_die_on_continue = false;
+static void test_note_repcopy() {
+    static const bool on = std::getenv("UHH_TEST_DIE_IN_REPCOPY") != nullptr;
+    if (on) g_test_die_on_continue = true;
+}
 static void test_die_after_arm() {
     static const long n = [] { const char *v = std::getenv("UHH_TEST_DIE_AFTER_ARM"); return v ? std::atol(v) : 0L; }();
     static long seen = 0;
@@ -5453,6 +5460,9 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     StepState st{probe, displaced, probe->address, probe->insn_len, displaced ? scratch_addr : 0,
                  tail, probe->rep_string, is_syscall};
     st.prog_tf = prog_tf;          // (also kept for a displaced copy that faults and re-runs in place)
+#if defined(UHH_TEST_HOOKS)
+    if (tail && !probe->internal) test_note_repcopy();
+#endif
     if (!displaced) {
         bool pushf = false, may_block = false;
         site_traits(*probe, pushf, may_block);
@@ -6145,6 +6155,9 @@ extern "C" int probe_run(probe_session *s) {
         if (!ContinueDebugEvent(event.dwProcessId, event.dwThreadId, disposition)) {
             set_error(s, win_error("continue debug event")); ok = false;
         }
+#if defined(UHH_TEST_HOOKS)
+        if (g_test_die_on_continue) { std::fflush(nullptr); TerminateProcess(GetCurrentProcess(), 97); }
+#endif
         if (!ok) break;
     }
     // An attached target is still running and the loop is leaving for some other reason

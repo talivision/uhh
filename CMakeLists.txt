@@ -448,6 +448,7 @@ target_include_directories(probe_api_testhooks PUBLIC include)
 target_link_libraries(probe_api_testhooks PRIVATE Zydis)
 target_compile_definitions(probe_api_testhooks PRIVATE UHH_TEST_HOOKS _CRT_SECURE_NO_WARNINGS)
 target_compile_options(probe_api_testhooks PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
+target_link_options(co_target PRIVATE /EXPORT:CoRepFill /EXPORT:CoRepSite)   # cxlib-reptail
 add_executable(co_driver_th examples/hunt_callorig/co_driver.cpp examples/hunt_callorig/co_callbacks.cpp)
 target_include_directories(co_driver_th PRIVATE include)
 target_link_libraries(co_driver_th PRIVATE probe_api_testhooks)

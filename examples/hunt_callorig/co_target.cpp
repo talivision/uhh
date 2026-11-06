@@ -19,6 +19,7 @@ static volatile long g_sink;
 
 extern "C" intptr_t CoMidPush(intptr_t a);
 extern "C" intptr_t CoCallPrologue(intptr_t a, intptr_t *out);
+extern "C" void CoRepFill(void *dst, size_t n, int v);
 #if !defined(_WIN64)
 extern "C" int CoThis(void);             // __thiscall, called from inline asm only
 #endif
@@ -224,6 +225,16 @@ int main(int argc, char **argv) {
                (long long)sum, g_body.load(), rets, runs);
     } else if (!strcmp(k, "late") || !strcmp(k, "cfgfree")) {
         return run_late(k);
+    } else if (!strcmp(k, "rep")) {                  // cxlib-reptail: big rep stosb fills, verified
+        const size_t n = 64u << 20;
+        unsigned char *b = (unsigned char *)VirtualAlloc(nullptr, n, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!b) return 4;
+        long good = 0;
+        for (int i = 0; i < 8; ++i) {
+            CoRepFill(b, n, 0x30 + i);
+            good += b[0] == 0x30 + i && b[n / 2] == 0x30 + i && b[n - 1] == 0x30 + i;
+        }
+        printf("{\"kind\":\"co\",\"case\":\"rep\",\"good\":%ld}\n", good);
     } else if (!strcmp(k, "spin")) {                 // attached after its gate (cxlib-killarm)
         for (int i = 0; i < 200; ++i) { sum += co_add(i, 5); Sleep(1); }
         printf("{\"kind\":\"co\",\"case\":\"spin\",\"sum\":%lld,\"body\":%ld}\n", (long long)sum, g_body.load());
