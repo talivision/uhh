@@ -2857,7 +2857,9 @@ def check_cet_policy(threads=4, reads=200):
             info = next((x for x in o if x.get("kind") == "cet_probe"), {})
             pol = info.get("policy", {})
             key = {"strict": "EnableUserShadowStackStrictMode", "block": "BlockNonCetBinaries"}[policy]
-            on = bool(info.get("enforced")) and pol.get(key) == 1
+            # BlockNonCetBinaries is enforced by the loader whether or not the CPU has CET (seen on the
+            # VM, Windows 10 on a Skylake); strict mode only matters with an active shadow stack.
+            on = pol.get(key) == 1 and (policy == "block" or bool(info.get("enforced")))
             record(f"cet-{policy}-probe", r.returncode == 0 and (pol.get(key) == 1 or not info.get("enforced")),
                    f"enforced={info.get('enforced')} {key}={pol.get(key)} (policy {'IN EFFECT' if on else 'not in effect'})")
             for bk in ("breakpoint", "hw", "inline"):
