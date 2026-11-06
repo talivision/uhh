@@ -695,7 +695,7 @@ class _NoiseSampler:
     by a Python thread. A stall of the machine (or of a thread's CPU) shows as a late write
     (a gap between consecutive stamps beyond the writer's normal period) or a late arrival
     (arrival - stamp). noise(a, b) = the worst of both overlapping the window [a, b]."""
-    def __init__(self, target):
+    def __init__(self, target, tmp):
         self.samples = []                     # (w, arrival) in QPC ticks
         self.p = subprocess.Popen([str(target), "--count", "1000000", "--delay", "5"],
                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
@@ -706,7 +706,7 @@ class _NoiseSampler:
         # discounted -- a stall of UHH's own file is not coincident with this one's, and UHH
         # writing the file before stdout is its design (docs/ROADMAP.md, CI section).
         self.disk, self._stop = [], threading.Event()
-        self.dt = threading.Thread(target=self._disk, daemon=True)
+        self.dt = threading.Thread(target=self._disk, args=(tmp,), daemon=True)
         self.dt.start()
 
     def _read(self):
@@ -716,8 +716,8 @@ class _NoiseSampler:
             if m and int(m.group(1)) > 0:
                 self.samples.append((int(m.group(1)), arrival))
 
-    def _disk(self):
-        d = Path(tempfile.gettempdir()) / "uhh" / "logs"
+    def _disk(self, tmp):
+        d = Path(tmp) / "uhh" / "logs"
         d.mkdir(parents=True, exist_ok=True)
         f = open(d / f"latency-sampler-{os.getpid()}-{threading.get_ident()}.tmp", "wb", buffering=0)
         try:
@@ -761,13 +761,14 @@ class _NoiseSampler:
         return worst
 
 
-def _trace_logstream_staged(backend, consume, file_seen, timeout=120):
+def _trace_logstream_staged(backend, consume, file_seen, env=None, timeout=120):
     """trace_logstream, plus the session log file watched as it grows: file_seen[i] = QPC when
     LogSite(i)'s record was in the FILE (UHH writes each batch to the file, then to stdout), so a
     late record shows which stage held it: before the file (queue / writer) or after (stdout)."""
     tracer, target = exe("uhh_trace.exe"), exe("logstream_target.exe")
     proc = subprocess.Popen([str(tracer), "--backend", backend, "-p", "logstream_target.exe!LogSite:d", "--",
-                             str(target)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+                             str(target)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+                            env=env)
     path, have_path, done, timed_out = [], threading.Event(), threading.Event(), threading.Event()
 
     def drain_stderr():
@@ -842,14 +843,21 @@ def check_stream_latency():
     its event: reported (log_before_tick), not required (no such cross-stream promise).
     Diagnosis of a late record: the session log file is watched too (UHH writes each batch to
     it, then to stdout): in_file / p99_to_file = event -> in the file, p99_file_to_out = file
-    -> stdout; disk_run_max = the longest 120-byte append the sampler saw in that temp dir. A
-    stalling %TEMP% disk holds records before the file (UHH writes the file first): on GitHub
-    runners' C: disk 50 ms - 2.5 s, so CI puts %TEMP% on the runner's local disk (as the VM)."""
+    -> stdout; disk_run_max = the longest 120-byte append the sampler saw in that temp dir.
+    The controller's %TEMP% (where UHH puts its session file) is <build dir>/uhh-latency-tmp,
+    next to the binaries: a local, AV-excluded directory on the test machines (the VM's
+    C:/work, the CI workspace). UHH writes every batch to that file BEFORE stdout, so a
+    stalling file write holds live records: in the user's %TEMP% a real-time AV scan of the
+    new file (VM: 180-430 ms at records #8-#10) or a slow disk (CI runners' C:: 50 ms-2.5 s)
+    -- a UHH design finding (docs/ROADMAP.md, CI section), not this check's subject."""
     tracer, target = exe("uhh_trace.exe"), exe("logstream_target.exe")
     if not tracer or not target:
         return missing_bin("stream-latency", "uhh_trace/logstream_target")
     freq = _qpc_freq()
     ms = lambda ticks: ticks * 1000.0 / freq
+    tmp = Path(BIN).resolve().parent / "uhh-latency-tmp"          # the controller's %TEMP%: see the docstring
+    tmp.mkdir(exist_ok=True)
+    env = dict(os.environ, TEMP=str(tmp), TMP=str(tmp))
     quiet_ms, bar_ms, n = 50.0, 100.0, 50      # quiet: < ~3 timer quanta (15.6 ms) of stall
     for backend in ("inline", "hw", "breakpoint"):
         name = f"stream-latency-{backend}"
@@ -875,9 +883,9 @@ def check_stream_latency():
                 else:
                     objects.append(obj)
 
-            sampler = _NoiseSampler(target)
+            sampler = _NoiseSampler(target, tmp)
             time.sleep(0.2)
-            rc, timed_out = _trace_logstream_staged(backend, consume, in_file)
+            rc, timed_out = _trace_logstream_staged(backend, consume, in_file, env)
             sampler.stop()
             # event i's stamp travels in tick i+1 ("t"); a tick's own write stamp is "w"
             events = {i: ticks[i + 1][2] for i in range(n) if i + 1 in ticks and (ticks[i + 1][2] or 0) > 0}
@@ -908,7 +916,7 @@ def check_stream_latency():
                    f"p99_to_file={ms(pct([in_file[i] - events[i] for i in lat if i in in_file], .99)):.1f}ms "
                    f"p99_file_to_out={ms(pct([logs[i] - in_file[i] for i in lat if i in in_file], .99)):.1f}ms "
                    f"disk_run_max={ms(max((e - b for b, e in sampler.disk), default=0)):.1f}ms "
-                   f"tmp={tempfile.gettempdir()[:3]} "
+                   f"tmp={tmp} "
                    f"noise_run_max={ms(run_noise):.1f}ms sampler={len(sampler.samples)}@{ms(sampler.period):.1f}ms "
                    f"fwd_p99={ms(pct(fwd, .99)):.1f}ms log_before_tick={before_tick} "
                    f"written={rep.get('logs_written')} dropped={rep.get('log_dropped')} rc={rc}"

@@ -186,23 +186,10 @@ jobs:
         run: |
           $cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name.Trim() -replace '\s+', ' '
           "RUNNER_CPU=$cpu" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-      # %TEMP% on the runner's local temp disk (D:, RUNNER_TEMP), not the C: OS disk: UHH writes every log batch to its
-      # session file under %TEMP%\uhh\logs BEFORE stdout, and cached appends on C: (a network-backed managed disk)
-      # stall 50 ms - 2.5 s when the lazy writer flushes -- measured (stream-latency, docs/ROADMAP.md "CI on GitHub
-      # Actions"): records held that long on C:, p99 ~0.5 ms on D:. The test VM's temp is a local disk too.
-      - name: TEMP on the local temp disk (as the VM; UHH's session log file lives there)
-        shell: pwsh
-        run: |
-          $t = Join-Path $env:RUNNER_TEMP 'tmp'
-          New-Item -ItemType Directory -Force $t | Out-Null
-          "TEMP=$t" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          "TMP=$t" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          Write-Output "TEMP=$t"
       - name: Defender exclusion for the workspace (as on the test VM, which excludes C:\work)
         shell: pwsh
         run: |
           try { Add-MpPreference -ExclusionPath $env:GITHUB_WORKSPACE } catch { Write-Output "no Defender: $_" }
-          try { Add-MpPreference -ExclusionPath (Join-Path $env:RUNNER_TEMP 'tmp') } catch { }
       - name: Frida 16.5.9 venv at C:\work\fv16 (regress FRIDA_PY)
         if: matrix.frida
         shell: pwsh
