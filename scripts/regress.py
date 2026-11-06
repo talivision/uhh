@@ -45,6 +45,12 @@ Checks:
     under every backend, launched / attached to exit / detached mid-run, busy system
     exports probed; program result + exit 0, no unhandled exception, hits > 0,
     log_dropped == 0, logs == hits, still working after detach.
+  - realbig-<app>-<mode>-<backend>: robocopy /MT:16 and findstr /s on a generated tree,
+    PowerShell 5.1 / pwsh 7 (JIT), and a sandboxed Edge renderer / the browser while a page
+    ticks, attached and detached mid-run: the program's own result, hits == logs ==
+    delivered, a flat controller, and NO residue after the detach (the target's code
+    compared with itself before the attach, every thread's DRs/TF, the debug port). A
+    default subset; every row with --bigapps.
   - newapp-file/flag/reg-<backends>: the new-app examples (filetrace, flagflip, regtrace),
     every backend and mixes, each compared with the ground truth its fixture prints.
   - logs-*: adversarial log delivery (examples/logs_eval): exact text for hostile formats on
@@ -5570,6 +5576,7 @@ def _realapps_one(name, drv, argv, kind, cols, bk, base, stem, x86, after=None):
         seen = poll.finish()
         alive_pids = {p for p, _ in poll.always}
         alive_names = {n for _, n in poll.always}
+        alive_always = list(poll.always)
         if target and target.poll() is None:
             target.kill()
     secs = time.perf_counter() - t0
@@ -5597,6 +5604,13 @@ def _realapps_one(name, drv, argv, kind, cols, bk, base, stem, x86, after=None):
         stable = Counter({r: n for r, n in (Counter(_realapps_rows(base[0][1], kind, cols)) &
                                             Counter(_realapps_rows(base[1][1], kind, cols))).items()
                           if _row_alive(r, cols, alive_pids, alive_names)})
+        if cols and cols[1] == "path":
+            # A bare image path stands for every process of that image: only as many as were
+            # alive for the WHOLE run must be listed (another agent's conhost/powershell that
+            # ended between the plain runs and this one is not lost output).
+            per_name = Counter(n for _, n in alive_always)
+            stable = Counter({r: min(n, per_name[r.rsplit("\\", 1)[-1].lower()]) for r, n in stable.items()})
+            stable = +stable
         mine = Counter(_realapps_rows(prog_out, kind, cols))
         missing = sorted((stable - mine).elements())
         # A 32-bit Get-Process -FileVersionInfo lists only the few 32-bit processes: >= 1 row.
@@ -8061,6 +8075,581 @@ def check_cx2_review():
             record(name, False, repr(e))
 
 
+# ---- realbig: real large apps -- detach residue, controller memory, overhead ----------------
+# The bigapps tier (above) proves PowerShell and the Edge BROWSER process survive launch/attach/
+# detach. realbig goes further on the same machine: a sandboxed Edge RENDERER (V8 JIT, CIG:
+# Microsoft-signed DLLs only, so the inline agent cannot load) and the browser while a page
+# ticks, PowerShell 5.1 / pwsh 7 with the JIT's NtProtectVirtualMemory probed, and heavily
+# multi-threaded native programs (robocopy /MT:16, findstr /s) on both arches -- and after
+# every detach it compares the target with ITSELF before the attach: every executable byte of
+# the probed modules, every thread's DR0-3/DR7/TF, the debug port (scripts/target_state.py).
+# Each run also samples the controller's private bytes (flat) and times the backend.
+REALBIG_FILES = 800
+REALBIG_MANY = 10000
+# Every probe LOGS (one short field where the arguments do not matter): after a detach the
+# session's final accounting is a total over all probes, so hits == logs_written + in_flight
+# is exact only when every probe logs.
+# (robocopy and findstr never call NtReadFile/NtWriteFile on these files: findstr maps them,
+# and robocopy's copy engine moves the data with sections too -- 0 hits on both, measured.)
+REALBIG_ROBO_PROBES = ["ntdll.dll!NtCreateFile:xxO", "ntdll.dll!NtMapViewOfSection:xx", "ntdll.dll!NtClose:x",
+                       "KernelBase.dll!WaitForSingleObjectEx:xx"]
+REALBIG_FIND_PROBES = ["ntdll.dll!NtCreateFile:xxO", "ntdll.dll!NtMapViewOfSection:xx",
+                       "ntdll.dll!NtUnmapViewOfSection:xx", "ntdll.dll!NtClose:x"]
+REALBIG_JIT_PROBES = ["ntdll.dll!NtProtectVirtualMemory:xxxx", "ntdll.dll!NtAllocateVirtualMemory:x",
+                      "KernelBase.dll!CreateFileW:Wxx", "ntdll.dll!NtWaitForSingleObject:x"]
+# KernelBase!VirtualAlloc (PartitionAlloc / V8 pages): a probe OUTSIDE ntdll, which in a
+# sandboxed renderer only resolves with the mapped-name fallback (hFile-less LOAD_DLL events).
+# (Edge's renderer barely calls NtProtectVirtualMemory: logged, not required.)
+REALBIG_EDGE_PROBES = ["ntdll.dll!NtProtectVirtualMemory:xxxx", "ntdll.dll!NtAllocateVirtualMemory:x",
+                       "ntdll.dll!NtWaitForSingleObject:x", "KernelBase.dll!VirtualAlloc:xxxx"]
+PWSH_EXE = Path(r"C:\Program Files\PowerShell\7\pwsh.exe")
+# The default suite runs these (~3 min x64); --bigapps runs every realbig row (~10 min x64).
+REALBIG_DEFAULT = ("realbig-robocopy-detach-breakpoint,realbig-findstr-launch-inline,"
+                   "realbig-edge-renderer-breakpoint,realbig-edge-renderer-inline")
+
+
+def _target_state():
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import target_state
+    return target_state
+
+
+def realbig_session(bk, specs, tail, timeout, cwd=None, on_attached=None):
+    """uhh_trace (backend bk, probes specs, then tail) with its private bytes / handles sampled
+    every 0.5 s. stdout goes to a file (no pipe backpressure); the UHH records are split from
+    the target's own bytes (stdout_split's rule). on_attached() runs once the "attached" record
+    is out (the attach, agent and probe installs are done). Returns a dict."""
+    ts = _target_state()
+    d = Path(tempfile.mkdtemp(prefix="uhh-realbig-s-", dir=Path.cwd()))
+    t0 = time.time()
+    timed_out, samples = False, []
+    with open(d / "out", "wb") as fo, open(d / "err", "wb") as fe:
+        p = subprocess.Popen([str(a) for a in bigapps_tracer(bk, specs, tail)], stdout=fo, stderr=fe,
+                             stdin=subprocess.DEVNULL, cwd=cwd)
+        while p.poll() is None:
+            m = ts.mem(p.pid)
+            if m:
+                samples.append((time.time() - t0, m[0], m[2]))
+            if on_attached:
+                try:
+                    if b'"kind":"attached"' in (d / "out").read_bytes()[:1 << 20]:
+                        on_attached()
+                        on_attached = None
+                except OSError:
+                    pass
+            if time.time() - t0 > timeout:
+                timed_out = True
+                p.kill()
+                break
+            time.sleep(0.5)
+        p.wait()
+    secs = time.time() - t0
+    out = (d / "out").read_bytes()
+    err = (d / "err").read_bytes().decode(errors="replace")
+    shutil.rmtree(d, ignore_errors=True)
+    recs, keep = [], []
+    for line in stdout_lines(out):
+        if line.startswith(b'{"kind":') and line.endswith(b"\n"):
+            try:
+                recs.append(json.loads(line))
+                continue
+            except ValueError:
+                pass
+        keep.append(line)
+    return {"rc": p.returncode, "out": out.decode(errors="replace"), "err": err, "recs": recs,
+            "text": b"".join(keep), "samples": samples, "secs": secs, "timed_out": timed_out}
+
+
+def realbig_mem(samples):
+    """Controller growth: the peak of the last quarter of the run vs the peak of the second
+    (the first quarter is attach + symbol loading). Flat = under 32 MB / 300 handles."""
+    priv = [s[1] for s in samples]
+    hnd = [s[2] for s in samples]
+    if len(priv) < 8:
+        return [], f"ctl_samples={len(priv)}" + (f" ctl_peak={max(priv) >> 20}MB" if priv else "")
+    q = len(priv) // 4
+    growth = max(priv[3 * q:]) - max(priv[q:2 * q])
+    hgrowth = max(hnd[3 * q:]) - max(hnd[q:2 * q])
+    bad = []
+    if growth > 32 << 20: bad.append(f"controller private bytes grew {growth >> 20} MB")
+    if hgrowth > 300: bad.append(f"controller handles grew by {hgrowth}")
+    return bad, f"ctl_peak={max(priv) >> 20}MB growth={growth / 2 ** 20:+.1f}MB handles={max(hnd)}({hgrowth:+d})"
+
+
+def realbig_snapshot(pid, specs):
+    names = {"ntdll.dll", "kernelbase.dll", "kernel32.dll"} | {s.split("!")[0].lower() for s in specs}
+    return _target_state().snapshot(pid, names)
+
+
+def realbig_residue(pid, snap):
+    """After a detach: the probed modules' code identical to before the attach, no DR/TF left
+    on any thread, no debug port."""
+    ts = _target_state()
+    bad = []
+    diff = ts.code_diff(pid, snap)
+    if diff: bad.append(f"code changed after detach: {diff[:4]}")
+    dirty, unread, n = ts.debug_regs(pid)
+    if dirty: bad.append(f"debug registers/TF left: {dirty[:4]}")
+    if ts.debugger_present(pid): bad.append("debug port still set after detach")
+    agent = ts.module_loaded(pid, "probe_api_agent.dll")
+    return bad, (f"residue[code={len(diff)} dr={len(dirty)}/{n} unreadable={unread} "
+                 f"mods={len(snap)} agent_loaded={agent}]")
+
+
+def realbig_judge(s, bk, specs, required, exact):
+    """bigapps_judge on a realbig_session result, plus the controller-memory verdict."""
+    ok, detail, bad = bigapps_judge(s["recs"], s["out"], s["err"], bk, specs, required, exact)
+    # Run to exit: hits == logs + log_dropped + callbacks_interrupted (a callback still running
+    # when ExitProcess killed its thread is counted, its log never written -- documented edge).
+    rep = report(s["recs"])
+    intr = rep.get("callbacks_interrupted") or 0
+    if exact and intr:
+        want = sum(p.get("hits") or 0 for p in probes(s["recs"]))
+        bad = [b for b in bad if not (b.startswith("logs_written=") and rep.get("logs_written", 0) + intr == want)]
+        detail += f" interrupted={intr}"
+    mbad, mdetail = realbig_mem(s["samples"])
+    if s["timed_out"]: bad.append("controller timed out (killed)")
+    # After a detach: the final totals over every probe (all of them log) must balance.
+    fin = re.findall(r"probe: detached: hits=(\d+) logs_written=(\d+) log_dropped=(\d+) in_flight=(\d+)", s["err"])
+    if fin:
+        h, w, d, f = (int(x) for x in fin[-1])
+        if h != w + d + f: bad.append(f"detach totals: hits={h} != logs_written={w} + dropped={d} + in_flight={f}")
+        detail += f" final_hits={h} in_flight={f}"
+    return bad + mbad, f"{detail} {mdetail}"
+
+
+def realbig_tree(root, files=REALBIG_FILES):
+    """A deterministic tree: files spread over 16x3 directories, 2-120 KB of text each, every
+    7th one with a UHHNEEDLE<i> line in the middle."""
+    for i in range(files):
+        d = root / f"d{i % 16:02d}" / f"s{i % 3}"
+        d.mkdir(parents=True, exist_ok=True)
+        n = 2048 + (i * 7919) % 120000
+        line = f"{i:05d} the quick brown fox {i * 31 % 1000:03d}\r\n".encode()
+        body = (line * (n // len(line) + 1))[:n]
+        if i % 7 == 0:
+            body = body[:n // 2] + f"\r\nUHHNEEDLE{i}\r\n".encode() + body[n // 2:]
+        (d / f"f{i:05d}.txt").write_bytes(body)
+
+
+def realbig_tree_digest(root):
+    import hashlib
+    h = hashlib.sha256()
+    n = 0
+    for p in sorted(root.rglob("*")):
+        if p.is_file():
+            h.update(str(p.relative_to(root)).lower().encode() + b"\0" + hashlib.sha256(p.read_bytes()).digest())
+            n += 1
+    return h.hexdigest(), n
+
+
+def realbig_sysprog(name, arch):
+    return (Path(r"C:\Windows\SysWOW64") if arch == "x86" else SYS32) / name
+
+
+def realbig_robocopy(bk, mode, arch, work, base):
+    """robocopy /MT:16 (launch: the 800-file tree under UHH; detach: attached while it copies the
+    many-small-files tree, which takes long enough plain; detached a third of the way in). The
+    copy must be exact and exit 1 (copied). (/IPG cannot pace it: with /MT robocopy rejects it, rc 16.)"""
+    robo = realbig_sysprog("robocopy.exe", arch)
+    src = work / ("src" if mode == "launch" else "many")
+    dst = work / f"dst-{bk}-{mode}"
+    shutil.rmtree(dst, ignore_errors=True)
+    want, nfiles = base["src_digest" if mode == "launch" else "many_digest"]
+    argv = [robo, src, dst, "/E", "/MT:16", "/R:0", "/W:0", "/NP", "/NFL", "/NDL", "/NJH", "/NJS"]
+    bad, extra = [], ""
+    if mode == "launch":
+        s = realbig_session(bk, REALBIG_ROBO_PROBES, ["--", *argv], 900)
+        bad, detail = realbig_judge(s, bk, REALBIG_ROBO_PROBES, [REALBIG_ROBO_PROBES[i].rsplit(":", 1)[0] for i in (0, 2, 3)], True)
+        rep = report(s["recs"])
+        if rep.get("app_exit") != 1: bad.append(f"robocopy exit={rep.get('app_exit')} (want 1: files copied)")
+        extra = f"secs={s['secs']:.1f} base={base['robo_secs']:.1f} x{s['secs'] / max(base['robo_secs'], 0.1):.1f}"
+    else:
+        tgt = subprocess.Popen([str(a) for a in argv], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            t0 = time.time()
+            while time.time() - t0 < 60 and not dst.exists():
+                time.sleep(0.05)
+            time.sleep(0.2)
+            if tgt.poll() is not None:
+                return False, f"robocopy ended before the attach (rc={tgt.returncode})", ["too fast"], ""
+            snap = realbig_snapshot(tgt.pid, REALBIG_ROBO_PROBES)
+            # Detach soon: a warm copy of many/ takes only ~4 s under inline (the plain base copy,
+            # of freshly written files, 15-55 s: the first read of a new file is the slow one).
+            dms = 1500
+            s = realbig_session(bk, REALBIG_ROBO_PROBES, ["--attach", tgt.pid, "--detach-after-ms", dms], 900)
+            alive = tgt.poll() is None
+            bad, detail = realbig_judge(s, bk, REALBIG_ROBO_PROBES, [REALBIG_ROBO_PROBES[i].rsplit(":", 1)[0] for i in (0, 2, 3)], False)
+            if not alive:
+                bad.append(f"robocopy ended during the attach (rc={tgt.returncode}): detach not mid-run")
+            else:
+                rbad, rdet = realbig_residue(tgt.pid, snap)
+                bad += rbad
+                detail += " " + rdet
+            if '"kind":"detached"' not in s["out"]: bad.append("not detached")
+            rc = tgt.wait(timeout=900)
+            if rc != 1: bad.append(f"robocopy exit={rc} (want 1)")
+            extra = f"plain_first_copy={base['robo_many_secs']:.1f}s total={time.time() - t0:.1f}s"
+        finally:
+            if tgt.poll() is None:
+                tgt.kill()
+    got, n = realbig_tree_digest(dst) if dst.exists() else (None, 0)
+    if got != want: bad.append(f"copy differs: files={n}/{nfiles}")
+    shutil.rmtree(dst, ignore_errors=True)
+    return not bad, f"{detail} files={n}/{nfiles} {extra}", bad, s["err"]
+
+
+def realbig_findstr(bk, arch, work, base):
+    """findstr /s /n over the tree, launched under UHH: output byte-identical to the plain run."""
+    fs = realbig_sysprog("findstr.exe", arch)
+    s = realbig_session(bk, REALBIG_FIND_PROBES, ["--", fs, "/s", "/n", "/c:UHHNEEDLE", "*.txt"], 900, cwd=work / "src")
+    bad, detail = realbig_judge(s, bk, REALBIG_FIND_PROBES, [p.rsplit(":", 1)[0] for p in REALBIG_FIND_PROBES[:2]], True)
+    rep = report(s["recs"])
+    if rep.get("app_exit") != 0: bad.append(f"findstr exit={rep.get('app_exit')}")
+    if s["text"] != base["find_out"]:
+        bad.append(f"output differs: {stdout_first_diff(s['text'], base['find_out'])}")
+    opened = {str(r.get("message", "")).lower() for r in s["recs"] if r.get("kind") == "probe_log"}
+    nopen = sum(1 for m in opened if ".txt" in m)
+    nlines = s["text"].count(b"\n")
+    return not bad, (f"{detail} out={len(s['text'])}B lines={nlines} txt_opens={nopen} "
+                     f"secs={s['secs']:.1f} base={base['find_secs']:.1f} x{s['secs'] / max(base['find_secs'], 0.1):.1f}"), bad, s["err"]
+
+
+def realbig_native_base(arch, work):
+    """Uninstrumented reference runs (best of 2) and the robocopy pacing: /IPG chosen so a paced
+    copy lasts long enough to attach, run and detach in the middle."""
+    robo, fs = realbig_sysprog("robocopy.exe", arch), realbig_sysprog("findstr.exe", arch)
+    src = work / "src"
+    base = {"src_digest": realbig_tree_digest(src)}
+    times = []
+    for k in range(2):
+        dst = work / "dst-base"
+        shutil.rmtree(dst, ignore_errors=True)
+        t0 = time.time()
+        r = subprocess.run([str(robo), str(src), str(dst), "/E", "/MT:16", "/R:0", "/W:0", "/NP", "/NFL", "/NDL",
+                            "/NJH", "/NJS"], capture_output=True, timeout=600)
+        times.append(time.time() - t0)
+        if r.returncode != 1 or realbig_tree_digest(dst) != base["src_digest"]:
+            raise RuntimeError(f"uninstrumented robocopy failed: rc={r.returncode}")
+    base["robo_secs"] = min(times)
+    times, outs = [], set()
+    for k in range(2):
+        t0 = time.time()
+        r = subprocess.run([str(fs), "/s", "/n", "/c:UHHNEEDLE", "*.txt"], capture_output=True, timeout=600, cwd=src)
+        times.append(time.time() - t0)
+        outs.add(r.stdout)
+        if r.returncode != 0:
+            raise RuntimeError(f"uninstrumented findstr failed: rc={r.returncode}")
+    if len(outs) != 1:
+        raise RuntimeError("uninstrumented findstr output not deterministic")
+    base["find_secs"], base["find_out"] = min(times), outs.pop()
+    # The attach target: many small files (file creation dominates, so the plain copy lasts).
+    many = work / "many"
+    if not many.exists():
+        for i in range(REALBIG_MANY):
+            d = many / f"m{i % 32:02d}"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / f"x{i:05d}.dat").write_bytes((bytes(range(256)) * 9)[i % 256:i % 256 + 512 + i % 1536])
+    base["many_digest"] = realbig_tree_digest(many)
+    dst = work / "dst-base"
+    shutil.rmtree(dst, ignore_errors=True)
+    t0 = time.time()
+    r = subprocess.run([str(robo), str(many), str(dst), "/E", "/MT:16", "/R:0", "/W:0", "/NP", "/NFL", "/NDL", "/NJH",
+                        "/NJS"], capture_output=True, timeout=900)
+    base["robo_many_secs"] = time.time() - t0
+    if r.returncode != 1 or realbig_tree_digest(dst) != base["many_digest"]:
+        raise RuntimeError(f"uninstrumented robocopy (many) failed: rc={r.returncode}")
+    shutil.rmtree(dst, ignore_errors=True)
+    return base
+
+
+def realbig_ps(bk, ps, secs, label):
+    """PowerShell (5.1 or pwsh 7) running bigapps' workload.ps1; attached after READY with the
+    JIT's NtProtectVirtualMemory logged, detached halfway; the workload must keep ticking and
+    finish with bad=0, exit 0; the residue check runs right after the detach."""
+    work = Path(tempfile.mkdtemp(prefix=f"uhh-realbig-{label}-", dir=Path.cwd()))
+    wl = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", BIGAPPS_DIR / "workload.ps1",
+          "-Seconds", secs, "-Work", work, "-ExpectedHash", bigapps_ps_expected_hash()]
+    done_re = re.compile(r"BIGAPPS_DONE iters=(\d+) bad=(\d+) jobs=(\d+) exc=(\d+)")
+    target = None
+    try:
+        target = subprocess.Popen([str(ps), *[str(x) for x in wl]], stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True, errors="replace")
+        tl, te = Lines(target.stdout), Lines(target.stderr)
+        if not tl.wait_for(lambda l: l.startswith("BIGAPPS_READY"), 180):
+            return False, "workload never READY", ["no READY"], "\n".join(te.lines[-5:])
+
+        def ticks():
+            return sum(1 for l in list(tl.lines) if l.startswith("BIGAPPS_TICK"))
+        p0 = ticks()
+        time.sleep(4.0)
+        plain = ticks() - p0                      # uninstrumented tick rate, for the overhead
+        snap = realbig_snapshot(target.pid, REALBIG_JIT_PROBES)
+        mark = {}
+        n0, t_att = ticks(), time.time()
+        s = realbig_session(bk, REALBIG_JIT_PROBES, ["--attach", target.pid, "--detach-after-ms", secs * 1000 // 2],
+                            secs + 600, on_attached=lambda: mark.update(n=ticks(), t=time.time()))
+        n_det, t_det = ticks(), time.time()
+        # Ticks while attaching (attach + agent + installs) and while attached (probes live).
+        attach_secs = mark.get("t", t_det) - t_att
+        attached_ticks = f"attaching={mark.get('n', n_det) - n0}/{attach_secs:.1f}s " \
+                         f"attached={n_det - mark.get('n', n_det)}/{t_det - mark.get('t', t_det):.1f}s"
+        bad, detail = realbig_judge(s, bk, REALBIG_JIT_PROBES, [p.rsplit(":", 1)[0] for p in REALBIG_JIT_PROBES[2:]], False)
+        if target.poll() is None:
+            rbad, rdet = realbig_residue(target.pid, snap)
+            bad += rbad
+            detail += " " + rdet
+        else:
+            bad.append(f"workload ended during the attach (rc={target.returncode})")
+        at_detach = len(tl.lines)
+        target.wait(timeout=secs + 600)
+        tl.t.join(timeout=30)
+        after = sum(1 for l in tl.lines[at_detach:] if l.startswith("BIGAPPS_TICK"))
+        m = done_re.search("\n".join(tl.lines))
+        if not m:
+            bad.append("no BIGAPPS_DONE")
+        else:
+            it, bd, jobs, exc = (int(x) for x in m.groups())
+            if bd != 0 or it == 0 or jobs == 0 or exc != 6 * it: bad.append(f"workload {m.group(0)}")
+        if target.returncode != 0: bad.append(f"rc={target.returncode}")
+        if '"kind":"detached"' not in s["out"]: bad.append("not detached")
+        if after < 2: bad.append(f"ticks after detach={after}")
+        return not bad, (f"{detail} ticks plain={plain}/4s {attached_ticks} after={after} "
+                         f"{m.group(0) if m else 'no DONE'}"), bad, s["err"]
+    finally:
+        if target and target.poll() is None:
+            target.kill()
+        kill_matching(work.name)
+        shutil.rmtree(work, ignore_errors=True)
+
+
+_REALBIG_WORK = {}
+
+
+def realbig_tick_expected(i):
+    """ticks.html's value for tick i (int32 arithmetic, Math.imul semantics)."""
+    def i32(v):
+        return (v + 2 ** 31) % 2 ** 32 - 2 ** 31
+    n = 100000 + i % 50
+    if n not in _REALBIG_WORK:
+        h = 0
+        for j in range(n):
+            h = i32(h * 31 + (j ^ (j >> 3)))
+        _REALBIG_WORK[n] = h
+    c, s = i % 97 + 3, 0
+    for j in range(1000):
+        s = i32(s + i * c + j)
+    return i32(_REALBIG_WORK[n] ^ s ^ i)
+
+
+def realbig_tick_server():
+    """Serves ticks.html and checks every /tick?i=&v= against realbig_tick_expected."""
+    import http.server
+    page = (BIGAPPS_DIR / "ticks.html").read_bytes()
+    st = {"ticks": [], "lock": threading.Lock()}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            try:
+                if self.path == "/":
+                    body = page
+                elif self.path.startswith("/tick?"):
+                    q = dict(x.split("=", 1) for x in self.path.split("?", 1)[1].split("&"))
+                    i, v = int(q["i"]), int(q["v"])
+                    with st["lock"]:
+                        st["ticks"].append((time.time(), i, v == realbig_tick_expected(i)))
+                    body = b"ok"
+                else:
+                    self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers(); return
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+            except (OSError, ValueError, KeyError):
+                pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, st
+
+
+def realbig_edge_children(udd):
+    """{pid: command line} of the Edge processes using this run's user-data-dir."""
+    ps = (f"Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | ?{{ $_.CommandLine -like '*{udd}*' }}"
+          " | %{ \"$($_.ProcessId)`t$($_.CommandLine)\" }")
+    r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True,
+                       text=True, timeout=120)
+    out = {}
+    for line in r.stdout.splitlines():
+        if "\t" in line:
+            pid, cmd = line.split("\t", 1)
+            out[int(pid)] = cmd
+    return out
+
+
+def realbig_edge(bk, which, secs):
+    """Headless Edge on ticks.html; attach to the browser or to the (sandboxed, JIT) renderer,
+    detach halfway; the page must keep ticking with right values before, during and after,
+    and the target must carry no residue."""
+    ts = _target_state()
+    udd = Path(tempfile.mkdtemp(prefix="uhh-realbig-edge-", dir=Path.cwd()))
+    srv, st = realbig_tick_server()
+    url = f"http://127.0.0.1:{srv.server_address[1]}/"
+    argv = [EDGE_EXE, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+            "--disable-extensions", "--disable-component-update", "--disable-background-networking",
+            "--disable-sync", "--no-proxy-server", "--renderer-process-limit=1",
+            "--disable-features=SpareRendererForSitePerProcess", f"--user-data-dir={udd}", url]
+    browser = None
+    try:
+        realbig_tick_expected(0)
+        browser = subprocess.Popen([str(a) for a in argv], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        t0 = time.time()
+        while time.time() - t0 < 120 and len(st["ticks"]) < 20:
+            time.sleep(0.2)
+        if len(st["ticks"]) < 20:
+            return False, f"page never ticked ({len(st['ticks'])})", ["no ticks"], ""
+        kids = realbig_edge_children(udd.name)
+        rends = [p for p, c in kids.items() if "--type=renderer" in c and "--extension-process" not in c]
+        if which == "renderer":
+            if not rends:
+                return False, f"no renderer among {len(kids)} processes", ["no renderer"], ""
+            # The busiest renderer is the page's (a spare/extension renderer idles).
+            pid = max(rends, key=lambda p: ts.cpu_time(p) or 0)
+        else:
+            pid = browser.pid
+        snap = realbig_snapshot(pid, REALBIG_EDGE_PROBES)
+        with st["lock"]:
+            n0 = len(st["ticks"])
+        t_att = time.time()
+        rate0 = sum(1 for t, _, _ in st["ticks"] if t > t_att - 5) / 5.0
+        s = realbig_session(bk, REALBIG_EDGE_PROBES, ["--attach", pid, "--detach-after-ms", secs * 1000 // 2], secs + 600)
+        t_det = time.time()
+        with st["lock"]:
+            during = [x for x in st["ticks"][n0:] if x[0] <= t_det]
+        att = [o for o in s["recs"] if o.get("kind") == "attached"]
+        attached = bool(att)
+        required = [p.rsplit(":", 1)[0] for p in REALBIG_EDGE_PROBES[1:]] if which == "renderer" else \
+                   [REALBIG_EDGE_PROBES[2].rsplit(":", 1)[0]]
+        refused = which == "renderer" and bk == "inline"
+        if refused:
+            # The renderer admits only Microsoft-signed DLLs (CIG): the agent cannot load, so an
+            # inline session must fail CLEANLY -- a clear error, nothing hit, the debugger gone,
+            # no residue, and the page never notices (checked below like every other run).
+            rep = report(s["recs"])
+            err = str(rep.get("error") or "")
+            bad, detail = [], f"error={err[:160]!r} rc={s['rc']}"
+            if "Microsoft-signed" not in err: bad.append(f"no clear refusal: error={err[:200]!r}")
+            if any(p.get("hits") for p in probes(s["recs"])): bad.append("hits in a refused session")
+            if s["timed_out"]: bad.append("controller timed out (killed)")
+        else:
+            bad, detail = realbig_judge(s, bk, REALBIG_EDGE_PROBES, required, False)
+        alive = ts.mem(pid) is not None
+        if alive:
+            rbad, rdet = realbig_residue(pid, snap)
+            bad += rbad
+            detail += " " + rdet
+        else:
+            bad.append(f"{which} process gone after the session")
+        time.sleep(6.0)
+        with st["lock"]:
+            ticks = list(st["ticks"])
+        after = [x for x in ticks if x[0] > t_det]
+        wrong = [i for _, i, ok in ticks if not ok]
+        idx = sorted(i for _, i, _ in ticks)
+        gaps = idx != list(range(len(idx)))
+        if wrong: bad.append(f"wrong tick values at {wrong[:5]}")
+        if gaps: bad.append(f"ticks not contiguous ({len(idx)} ticks, max {idx[-1] if idx else None})")
+        if len(after) < 10: bad.append(f"ticks after detach={len(after)}")
+        if '"kind":"detached"' not in s["out"] and not refused: bad.append("not detached")
+        if browser.poll() is not None: bad.append(f"browser exited rc={browser.returncode}")
+        dur = max(t_det - t_att, 0.1)
+        return not bad, (f"{which} pid={pid} attached={attached} {detail} ticks: before={rate0:.1f}/s "
+                         f"during={len(during) / dur:.1f}/s after={len(after) / 6:.1f}/s total={len(ticks)} "
+                         f"procs={len(kids)} renderers={len(rends)}"), bad, s["err"]
+    finally:
+        srv.shutdown()
+        if browser and browser.poll() is None:
+            browser.kill()
+        kill_matching(udd.name)
+        shutil.rmtree(udd, ignore_errors=True)
+
+
+def check_realbig(select="", secs=30):
+    """realbig-<app>-<mode>-<backend>: real large programs under every backend, launch and
+    attach + detach mid-run, asserting the program's own result, exact accounting
+    (hits == logs == delivered, log_dropped 0), no crash, a flat controller, and after every
+    detach no residue (code bytes / DRs / TF / debug port). See the section comment."""
+    if not exe("uhh_trace.exe"):
+        return missing_bin("realbig", "uhh_trace.exe")
+    arch = bin_machine()
+    sel = [x for x in (os.environ.get("UHH_REALBIG") or select).split(",") if x]
+
+    def wanted(name):
+        return not sel or any(x in name for x in sel)
+
+    def one(name, fn, *a):
+        if not wanted(name):
+            return
+        print(f"  .. {name}", file=sys.stderr, flush=True)
+        t0 = time.time()
+        try:
+            ok, detail, bad, err = fn(*a)
+            tail = " | ".join(l for l in (err or "").splitlines() if l.strip() and "probe: active" not in l)[-700:]
+            record(name, ok, f"{detail} wall={time.time() - t0:.0f}s" + ("" if ok else f" BAD={bad} stderr_tail={tail}"))
+        except Exception as e:
+            import traceback
+            record(name, False, repr(e) + " " + traceback.format_exc().splitlines()[-3][:200])
+    native = [n for n in (f"realbig-{a}-{m}-{b}" for a, m in (("robocopy", "launch"), ("robocopy", "detach"),
+                                                               ("findstr", "launch"))
+                          for b in ("breakpoint", "hw", "inline")) if wanted(n)]
+    if native:
+        work = Path(tempfile.mkdtemp(prefix="uhh-realbig-tree-", dir=Path.cwd()))
+        try:
+            realbig_tree(work / "src")
+            base = realbig_native_base(arch, work)
+            print(f"  .. realbig base: robocopy {base['robo_secs']:.1f}s many {base['robo_many_secs']:.1f}s "
+                  f"findstr {base['find_secs']:.1f}s ({len(base['find_out'])}B)", file=sys.stderr, flush=True)
+            for bk in ("breakpoint", "hw", "inline"):
+                one(f"realbig-robocopy-launch-{bk}", realbig_robocopy, bk, "launch", arch, work, base)
+                one(f"realbig-robocopy-detach-{bk}", realbig_robocopy, bk, "detach", arch, work, base)
+                one(f"realbig-findstr-launch-{bk}", realbig_findstr, bk, arch, work, base)
+        except Exception as e:
+            record("realbig-native-base", False, repr(e))
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+    ps = realbig_sysprog(r"WindowsPowerShell\v1.0\powershell.exe", arch)
+    for bk in ("breakpoint", "hw", "inline"):
+        one(f"realbig-ps-detach-{bk}", realbig_ps, bk, ps, secs, "ps")
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"realbig-pwsh-detach-{bk}"
+        if not wanted(name):
+            continue
+        if arch == "x86":
+            skip(name, "pwsh 7 is installed 64-bit only (x64 build)")
+        elif not PWSH_EXE.exists():
+            # Windows ships only PowerShell 5.1; pwsh 7 is a separate install (not on the test VM).
+            skip(name, f"pwsh 7 is not installed ({PWSH_EXE}); the 5.1 rows cover the .NET JIT host")
+        else:
+            one(name, realbig_ps, bk, PWSH_EXE, secs, "pwsh")
+    for which in ("renderer", "browser"):
+        for bk in ("breakpoint", "hw", "inline"):
+            name = f"realbig-edge-{which}-{bk}"
+            if not wanted(name):
+                continue
+            if arch == "x86":
+                skip(name, "msedge.exe is a 64-bit program (x64 build only)")
+            elif not EDGE_EXE.exists():
+                skip_external(name, f"Edge ({EDGE_EXE})")
+            else:
+                one(name, realbig_edge, bk, which, secs)
+
+
+
 def main():
     global BIN
     ap = argparse.ArgumentParser()
@@ -8213,6 +8802,7 @@ def main():
     if want(check_symbols_grammar): check_symbols_grammar()
     if want(check_quickstart): check_quickstart()
     if want(check_gated_e2e): check_gated_e2e()
+    if want(check_realbig): check_realbig("" if args.bigapps else REALBIG_DEFAULT)
     if only and not RESULTS:
         print(f"regress.py: --only {','.join(only)} selected only opt-in tiers that were not enabled "
               f"(--bigapps / --soak-minutes / --volume-reads): no check ran.", file=sys.stderr)

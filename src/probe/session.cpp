@@ -1200,6 +1200,49 @@ static std::string module_name_from_handle(HANDLE file) {
     return n && n < MAX_PATH ? basename_of(path) : std::string{};
 }
 
+// The image mapped at base, from the mapping itself: for a LOAD_DLL / CREATE_PROCESS event
+// that came without a file handle. An ATTACH's synthesized events open each module's file
+// in the TARGET's security context, and a sandboxed process (a Chromium/Edge renderer: a
+// restricted token at untrusted integrity) cannot open them -- every DLL but ntdll then
+// arrives with hFile == NULL, and probes on kernel32/KernelBase/... stayed pending forever
+// (the inline agent: "target module owning LoadLibraryW was not observed"). DOS path when a
+// drive letter maps the device, else the \Device\... path (its basename is still right).
+static std::wstring mapped_image_path(HANDLE process, uint64_t base) {
+    wchar_t dev[1024];
+    DWORD n = GetMappedFileNameW(process, reinterpret_cast<LPVOID>(static_cast<uintptr_t>(base)), dev, 1024);
+    if (!n || n >= 1024) return {};
+    std::wstring path(dev, n);
+    wchar_t drives[512];
+    DWORD dn = GetLogicalDriveStringsW(512, drives);
+    for (const wchar_t *d = drives; dn && dn < 512 && *d; d += std::wcslen(d) + 1) {
+        wchar_t letter[3] = {d[0], L':', 0}, target[MAX_PATH];
+        if (!QueryDosDeviceW(letter, target, MAX_PATH)) continue;
+        size_t tl = std::wcslen(target);
+        if (path.size() > tl && !_wcsnicmp(path.c_str(), target, tl) && path[tl] == L'\\')
+            return std::wstring(letter) + path.substr(tl);
+    }
+    return path;
+}
+
+static std::string narrow_path(const std::wstring &w) {
+    if (w.empty()) return {};
+    int n = WideCharToMultiByte(CP_ACP, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string r(n > 0 ? (size_t)n : 0, '\0');
+    if (n > 0) WideCharToMultiByte(CP_ACP, 0, w.c_str(), (int)w.size(), r.data(), n, nullptr, nullptr);
+    return r;
+}
+
+// An event's module name: from its file handle, else from the mapping (see mapped_image_path).
+static std::string event_module_name(HANDLE process, HANDLE file, uint64_t base) {
+    std::string name = module_name_from_handle(file);
+    if (name.empty() && process) {
+        name = basename_of(narrow_path(mapped_image_path(process, base)));
+        if (trace_enabled()) std::fprintf(stderr, "  module without a file handle @0x%llx: name from the mapping '%s'\n",
+                                          (unsigned long long)base, name.c_str());
+    }
+    return name;
+}
+
 static std::string module_path_from_handle(HANDLE file) {
     if (!file) return {};
     char path[MAX_PATH];
@@ -1228,6 +1271,12 @@ static void sym_register(probe_session *s, HANDLE file, uint64_t base) {
     const uint32_t size = remote_image_size(s->pi.hProcess, base);
     if (size) s->module_sizes[base] = size;
     std::string path = module_path_from_handle(file);
+    std::wstring mapped;
+    if (path.empty()) {                       // no file handle (sandboxed attach): the mapping's path
+        mapped = mapped_image_path(s->pi.hProcess, base);
+        if (mapped.size() < 3 || mapped[1] != L':') return;
+        path = narrow_path(mapped);
+    }
     if (path.empty()) return;
     s->module_paths[basename_of(path)] = path;
     if (!s->sym_ready) return;
@@ -1237,8 +1286,8 @@ static void sym_register(probe_session *s, HANDLE file, uint64_t base) {
     // captured before its unload (see sym_unload): those are written first.
     wait_sym_unloads(s, base, size ? size : 1);
     // dbghelp gets the exact (wide) path, so non-ASCII directories work.
-    std::wstring wpath;
-    {
+    std::wstring wpath = mapped;
+    if (wpath.empty()) {
         wchar_t w[1024];
         DWORD n = GetFinalPathNameByHandleW(file, w, 1024, FILE_NAME_NORMALIZED);
         if (n && n < 1024) {
@@ -5713,6 +5762,19 @@ static bool start_remote(probe_session *s, LPTHREAD_START_ROUTINE entry,
     s->remote_work = work; return true;
 }
 
+// Why a remote LoadLibraryW of the agent fails by design: the process admits only
+// Microsoft-signed images (Code Integrity Guard -- every Chromium/Edge renderer and most of its
+// utility processes). Empty when no such policy is set.
+static std::string agent_load_policy_hint(HANDLE process) {
+    using GetPolicyFn = BOOL(WINAPI *)(HANDLE, PROCESS_MITIGATION_POLICY, PVOID, SIZE_T);
+    auto get = reinterpret_cast<GetPolicyFn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetProcessMitigationPolicy"));
+    PROCESS_MITIGATION_BINARY_SIGNATURE_POLICY sig{};
+    if (get && get(process, ProcessSignaturePolicy, &sig, sizeof(sig)) && (sig.MicrosoftSignedOnly || sig.StoreSignedOnly))
+        return " (the target admits only Microsoft-signed DLLs -- ProcessSignaturePolicy, e.g. a Chromium/Edge "
+               "renderer -- so the agent cannot load there: no inline probes; breakpoint and hw probes work)";
+    return {};
+}
+
 static bool start_agent_load(probe_session *s) {
     if (s->detaching) return true;                 // never inject into a target we are leaving
     if (s->remote_work != probe_session::REMOTE_NONE || s->remote_agent) return true;
@@ -5829,7 +5891,8 @@ static bool complete_remote_thread(probe_session *s, DWORD result) {
             VirtualFreeEx(s->pi.hProcess, s->remote_path, 0, MEM_RELEASE); s->remote_path = nullptr;
         }
         if (result == 0 || !s->remote_agent) {
-            const std::string why = "LoadLibraryW failed for probe_api_agent.dll" + (s->remote_fault.empty() ? std::string() : ": " + s->remote_fault);
+            const std::string why = "LoadLibraryW failed for probe_api_agent.dll" + (s->remote_fault.empty() ? std::string() : ": " + s->remote_fault) +
+                                    agent_load_policy_hint(s->pi.hProcess);
             if (!has_inline(s)) return guard_set_ready(s, why.c_str());
             set_error(s, why);
             return false;
@@ -6131,8 +6194,8 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
     switch (event.dwDebugEventCode) {
     case CREATE_PROCESS_DEBUG_EVENT: {
         s->threads.insert(event.dwThreadId);                 // initial thread (for HW DRs)
-        std::string name = module_name_from_handle(event.u.CreateProcessInfo.hFile);
         uint64_t base = (uint64_t)(uintptr_t)event.u.CreateProcessInfo.lpBaseOfImage;
+        std::string name = event_module_name(s->pi.hProcess, event.u.CreateProcessInfo.hFile, base);
         if (!name.empty()) s->module_bases[name] = base;
         sym_register(s, event.u.CreateProcessInfo.hFile, base);
         ok = arm_module(s, name, base);
@@ -6189,8 +6252,8 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
         break;
     }
     case LOAD_DLL_DEBUG_EVENT: {
-        std::string name = module_name_from_handle(event.u.LoadDll.hFile);
         uint64_t base = (uint64_t)(uintptr_t)event.u.LoadDll.lpBaseOfDll;
+        std::string name = event_module_name(s->pi.hProcess, event.u.LoadDll.hFile, base);
         if (!name.empty()) s->module_bases[name] = base;
         sym_register(s, event.u.LoadDll.hFile, base);
         ok = arm_module(s, name, base);

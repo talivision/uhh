@@ -478,6 +478,68 @@ and a .NET P/Invoke script (`ps-truth`) that prints the real handle -> pid of ev
   other agents' builds/tests; free RAM was not sampled at the time, so the cause is unknown.
   The rerun with free RAM logged every 15 s never went below 13.9 GB free (16 GB VM).
 
+## Real large apps findings (2026-11-06, regress `realbig-*`, `scripts/target_state.py`)
+Beyond `bigapps-*` (PowerShell + the Edge BROWSER, launch/attach/detach): a sandboxed Edge 156
+RENDERER (V8, CIG, win32k lockdown) and the browser while a page ticks (`examples/bigapps/
+ticks.html`: a new `Function` + hot loop + 512 KB typed array per tick, every value re-computed
+by the suite, ticks must stay contiguous), PowerShell 5.1 (`workload.ps1`, JIT) and heavily
+multi-threaded native programs (`robocopy /MT:16` of a 10000-file tree, `findstr /s` over 800
+files), x64 and x86 (SysWOW64 hosts), every backend, launched or attached and detached
+mid-run. Every run: the program's own result (exact copy / byte-identical output / workload
+`bad=0` / page values), hits == logs_written == delivered (after a detach: the final totals
+hits == logs + in_flight, every probe logs), log_dropped 0, no second-chance exception, the
+controller's private bytes/handles sampled every 0.5 s, and after every detach **no residue**:
+the target compared with ITSELF before the attach (every executable byte of ntdll / KernelBase /
+kernel32 and the probed modules, both bitnesses in WoW64; every thread's DR0-3/DR7/TF in its
+64- and 32-bit contexts; the debug port). (A comparison with the file on disk or with another
+process would differ anyway: Chromium's sandbox patches ntdll stubs in its renderers.)
+- ✅ (RB1) **Attach to a sandboxed process: every DLL but ntdll unnamed.** The synthesized
+  LOAD_DLL events of an attach open each module's file in the TARGET's security context; an Edge
+  renderer's restricted token cannot, so they arrive with `hFile == NULL` (dumped with a plain
+  debugger: only ntdll and the exe have a handle). UHH named modules only from that handle:
+  probes on KernelBase/kernel32/ws2_32/... stayed `pending` for the whole session (silently, 0
+  hits), symbols for them were never registered, and the agent load failed with the misleading
+  `target module owning LoadLibraryW was not observed` (repeated per event). The name and the
+  dbghelp path now come from `GetMappedFileNameW` (device path mapped to a drive letter) when the
+  event has no handle. Test: `realbig-edge-renderer-{breakpoint,hw}` (`KernelBase!VirtualAlloc`
+  must hit; 1400-1600 hits per run).
+- ✅ (RB2) **Inline into a CIG process is refused cleanly.** The renderer admits only
+  Microsoft-signed DLLs (`ProcessSignaturePolicy.MicrosoftSignedOnly`), so `LoadLibraryW` of the
+  agent fails; the session already failed cleanly (L7: detached, no residue, page unaffected),
+  the error now says why (`... (the target admits only Microsoft-signed DLLs -- ProcessSignature
+  Policy, e.g. a Chromium/Edge renderer -- ...)`). Breakpoint/hw there run without the
+  controller-death guard (warned; limitations.md). Test: `realbig-edge-renderer-inline`.
+  Renderer mitigations seen: CIG, DisableWin32kSystemCalls, StrictHandle, CFG, no-remote/low-label
+  images, no child processes; **no ACG** (BlockDynamicCode off, V8 JIT on), so no dynamic-code
+  refusal to test there.
+- ✅ No other library issue: 18 x64 + 12 x86 rows (`--bigapps`), every residue check clean (0
+  code bytes, 0 dirty threads of 16-83 per process), 0 drops, exact totals, every program right;
+  controller peak 1-7 MB private, growth <= 3 MB over a run.
+- (test-side) `realbig-robocopy-detach-inline` once finished the copy before its detach (a warm
+  copy is ~4 s under inline; the plain first copy of fresh files 15-55 s): it now attaches as the
+  copy starts and detaches 1.5 s later.
+- (test-side, realapps) `realapps-ps-fileversion-*` failed twice on x64 with one `powershell.exe`
+  / `conhost.exe` row "missing": a bare image path stands for every process of that image, and
+  another agent's instance that ended between the plain runs and the instrumented one was counted
+  as lost output. Such rows now count only as many instances as were alive for the whole run.
+- (flake, not reproduced) x86 `blog-pwsh-attach-detach-breakpoint` once detached (2.5 s) before
+  its probe went active on a loaded VM; 3/3 x 3 backends green on the rerun (the mapped-name
+  fallback never triggers for a WoW64 attach: traced).
+- (note) What is hot is not what one expects: robocopy and findstr move file data through
+  sections, not NtReadFile/NtWriteFile (0 hits on both: probe NtCreateFile/NtMapViewOfSection/
+  NtClose); Edge's renderer calls NtProtectVirtualMemory 0 times in 20 s of fresh `Function`s
+  and PowerShell 5.1 0-2 times (neither flips JIT page protection per compile on this build);
+  the renderer's hot exports are NtAllocateVirtualMemory/VirtualAlloc and NtWaitForSingleObject.
+- (measure, x64 VM, shared) Cost while attached: PowerShell workload ticks (plain 1.0/s, 4
+  probes): breakpoint 0.4-0.9/s, hw 0.6-0.75/s, inline 1.0/s at 5-10x the hits; one probe on
+  CreateFileW: bp/hw 0.70/s at ~85 hits/s (the 4 runspace threads serialize on the debugger),
+  inline 0.84/s at ~630 hits/s; attached with no hit: 0.85/s (bp) / 0.95/s (inline) -- the
+  workload's 6 first-chance .NET exceptions per iteration are debug events. Edge renderer:
+  15/s while attached (bp/hw, ~300 hits/s) vs 21/s after the detach; the browser shows none.
+  robocopy/findstr launch: bp 2-5x, hw 1-3x, inline ~1-3x (seconds-long runs, noisy).
+- Not covered: pwsh 7 (not installed on the test VM: rows SKIP), 7-Zip / node (absent),
+  msbuild (not run: spawns long-lived nodes on a shared VM).
+
 ## Calling-convention findings (2026-11-06, `examples/callconv`, regress `callconv-*`)
 `ccfix.dll` exports one function per x86/x64 convention and argument/return shape: cdecl,
 stdcall, fastcall, thiscall (a real C++ member), vectorcall (int + double + float args), 0 and
@@ -1385,7 +1447,7 @@ then fixed. Fixtures: `ctrl_target faultmix`, `co_target susp / many / manydead`
   - **Test plan on CET hardware** (Intel Tiger Lake+ / AMD Zen 3+, Windows 10 21H1+/11 x64, bare metal or a hypervisor that passes CET through; `cet_probe` must print `enforced=true`): run `regress.py --only check_cet,check_conformance` and expect all PASS with `cet_enforced=True target_ssp=True`; then repeat with the process forced into strict mode (Exploit protection -> Program settings -> probe_app_cet.exe -> Hardware-enforced Stack Protection: on, strict) and with `SetContextIpValidation` on, to settle the two open items; then a `call_func` breakpoint/hw run to confirm the refusal is clean (returns 0, target unaffected). Hardware positive control first: `cet_smash smash` must die with 0xC0000409 (#CP), `cet_smash clean` exit 0. What only hardware can settle: the breakpoint/hw paths under a real shadow stack (in-place CALL/RET, displaced stepping, `call_func` refusal, call_original), strict mode, `SetContextIpValidation` for a debugger's SetThreadContext, `BlockNonCetBinaries` vs the non-CETCOMPAT agent, and the CET_U XSTATE the controller never sets.
   - Tests: `cet-image` (probe_app_cet/cet_probe carry the CETCOMPAT bit, probe_app does not), `cet-probe` (what the machine enforces), `cet-gated-{breakpoint,inline,hw}` (gated_config with all probes on one backend against `probe_app_cet`, exact hits/logs, checksum equal to an uninstrumented CET run, target's own RDSSP == cet_probe), `cet-ret-breakpoint`; `conformance-inline` sp_moved 10; under SDE: `cet-sde-{probe,control-clean,control-smash,calls-base,calls-inline,relcall-inline,gated-inline,sp-inline}`, `cet-sde-co-<case>-inline` (11 cases), SKIP rows `cet-sde-breakpoint` / `cet-sde-hw` saying why.
 - ⬜ [fan-out] Windows 11 VM on the Proxmox server, run the suite there too (later)
-- ⬜ [fan-out] Stability on real large apps (important): browsers / heavily multi-threaded / JIT processes under all backends
+- ✅ [fan-out] Stability on real large apps (important): browsers / heavily multi-threaded / JIT processes under all backends -- Edge renderer + browser, PowerShell 5.1, robocopy /MT:16, findstr /s, x64 + x86, launch and attach/detach with a no-residue check; 1 library bug fixed (RB1, attach to sandboxed processes), CIG refusal clarified (RB2). See "Real large apps findings"; regress `realbig-*` (default subset; all rows with `--bigapps`)
 - ⬜ [fan-out, Codex] Docs: quickstart, API reference, per-backend limitations table, troubleshooting
 - 🔧 Inline cap raised to 128 per session (user: 128 is enough; error beyond) -- compile-time thunk table, per-request FREEZE flag; refusal test uses the 129th -- VM verify pending
 - ⏸ Follow child processes: design written -- [docs/child-processes.md](child-processes.md) (strategies with VM measurements from `bench/child_follow`, API options A-D, recommendation: ProcessDebugFlags inheritance + `probe_follow_children` + `get_pid`); **deferred by the owner (2026-11-06)**: a session follows one process; a child it starts runs unprobed -- attach to it with its own session. Processes the target did not create are unaffected either way (attach separately)
