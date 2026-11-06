@@ -1651,6 +1651,26 @@ def check_symbols():
         record("symbols-list", "CreateFileW" in names, f"found={sorted(n for n in names if n)[:5]}")
     except Exception as e:
         record("symbols-list", False, repr(e))
+    # The rule behind identical stacks on every backend: names come from the image file on
+    # disk, never from the target's memory. symfile_test registers kernel32.dll's file at the
+    # base where the live target maps ntdll (DbgHelp keyed by the process handle read the
+    # image there: ntdll's exports under kernel32's name, or none -- one inline frame showed
+    # kernel32+0x14f80 where breakpoint/hw showed BaseThreadInitThunk+0x10), and looks
+    # kernel32 up for the first time after its target exited.
+    sf = exe("symfile_test.exe")
+    if not sf:
+        missing_bin("symbols-file-backed", "symfile_test")
+    else:
+        try:
+            r, o = run([sf], timeout=120)
+            cases = {x.get("case"): x for x in o if x.get("kind") == "symfile"}
+            ok = (r.returncode == 0 and set(cases) == {"foreign-image", "after-exit"} and
+                  all(c.get("ok") for c in cases.values()))
+            record("symbols-file-backed", ok, "; ".join(f"{k}: {c.get('name')} resolved_rva={c.get('resolved_rva')}"
+                                                        f"/{c.get('want_rva')}" for k, c in cases.items())
+                   + f" rc={r.returncode}" + ("" if ok else f" out={r.stdout.strip()[-600:]!r}"))
+        except Exception as e:
+            record("symbols-file-backed", False, repr(e))
 
 
 def trace_run(target, probes_spec, backend, targs=(), timeout=300):
@@ -5359,11 +5379,14 @@ def check_stacks():
     except Exception as e:
         return record("stacks", False, f"map: {e!r}")
     specs = [f"{k}=stacks_target.exe+{r[v]:#x}" for k, v in STACK_SITES.items()]
-    per_bk = {}
+    per_bk, raw_bk, sym_bk = {}, {}, {}
     for bk in ("breakpoint", "hw", "inline"):
         name = f"stacks-{bk}"
         try:
-            _, o = run([d, "--backend", bk, *specs, "--", t], timeout=120)
+            rr, o = run([d, "--backend", bk, *specs, "--", t], timeout=120)
+            sym_bk[bk] = [l for l in rr.stderr.splitlines() if "symbols via" in l][:1]
+            raw_bk[bk] = {k: next((x.get("stack") or [] for x in o if x.get("kind") == "probe_log"
+                                   and x.get("message") == f"stack {k}"), []) for k in STACK_SITES}
             tgt = next((x for x in o if x.get("kind") == "target"), {})
             got, bad = {}, []
             for k, site in STACK_SITES.items():
@@ -5385,7 +5408,7 @@ def check_stacks():
         except Exception as e:
             record(name, False, repr(e))
     if len(per_bk) == 3:
-        diffs = []
+        diffs, first = [], None
         for k in STACK_SITES:
             ref = per_bk["breakpoint"].get(k)
             for bk in ("hw", "inline"):
@@ -5394,8 +5417,14 @@ def check_stacks():
                     i = next((j for j in range(max(len(ref or []), len(other or [])))
                               if (ref or [None] * 99)[j:j + 1] != (other or [None] * 99)[j:j + 1]), -1)
                     diffs.append(f"{k}/{bk}@{i}: {(ref or [])[i:i + 1]} vs {(other or [])[i:i + 1]}")
+                    first = first or (k, i)
+        diag = ""
+        if first:   # the first differing frame with its address, per backend, and each run's dbghelp
+            k, i = first
+            diag = (f" raw={ {b: (raw_bk.get(b, {}).get(k) or [])[i:i + 1] for b in per_bk} }"
+                    f" dbghelp={ {b: v[0][len('probe: symbols via '):] if v else None for b, v in sym_bk.items()} }")
         record("stacks-identical", not diffs and all(per_bk[b].get(k) for b in per_bk for k in STACK_SITES),
-               f"diffs={diffs[:4]} frames={ {k: len(per_bk['breakpoint'].get(k) or []) for k in STACK_SITES} }")
+               f"diffs={diffs[:4]} frames={ {k: len(per_bk['breakpoint'].get(k) or []) for k in STACK_SITES} }" + diag)
 
 
 BIGAPPS_DIR = Path(__file__).resolve().parent.parent / "examples" / "bigapps"

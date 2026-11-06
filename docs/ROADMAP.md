@@ -1966,6 +1966,27 @@ another branch), logs-wedge-{exit x64, kill + suspend x86} (`wedged=0`: the wedg
   exited: the crash-logs-inline-4t class -- an inline hit whose callback never completed because the process ended).
 - Passing on runners where the VM was suspect: x86 `hunt-ctx-breakpoint` (no 600 s timeout), x86
   `edgehunt-*-fmtptr` (B10), x64 `blog-pwsh-attach-detach-inline`, x86 `hunt-exit-*`.
+- ✅ **stacks-identical (both arches, about 1 run in 5 on windows-2022; never on the VM)**: a real bug, fixed
+  (cisym). One inline frame was named `kernel32+0x14f80` while breakpoint and hw named it
+  `kernel32!BaseThreadInitThunk+0x10`. Same address, same DbgHelp (SDK, export-only kernel32). The run-time
+  diagnostics (60 repetitions per arch, 12-14 failures) showed kernel32 loaded with `SymType` none and no exports.
+  DbgHelp keyed by the target's process handle reads a deferred module's image from the target's MEMORY on first
+  use. An experiment registered kernel32's file at the base where the live target maps ntdll. Windows 10's DbgHelp
+  then named the frame with ntdll's exports (`kernel32!RtlDosPathNameToNtPathName_U+0x60`) and the SDK's DbgHelp
+  gave none. Names therefore depended on when a module was first used: breakpoint/hw walks load kernel32 at the
+  hit, while inline stacks are named later on the writer, as the short target exited. **Fix:**
+  `src/probe/symbols.cpp` keeps names in a DbgHelp session keyed by an opaque value, so every module loads from its
+  file and PDB on disk. `StackWalk64` runs in a second session keyed by the real handle and only returns
+  addresses. The rule is in docs/symbols.md. Regress `symbols-file-backed` (`symfile_test`) covers it. CI: stacks
+  repeated 60 times per arch, 0 failures.
+- ✅ **stdout-console-* (both arches, every run on windows-2022)**: a check bug, not a UHH bug. Every record and the
+  report reached the pseudo console. Server 2022's conhost renders a line that wraps at the console width as the
+  row, CRLF, CUP to the previous row's last column, and that column's character again, which the terminal's
+  autowrap then continues. The check stripped VT sequences and line breaks, so it saw one character twice per
+  wrapped row: `"logs__written"` and `"live_output_error"":null`. As a result the report was unparsable or lacked
+  `logs_written`. **Fix:** regress `VtScreen`, a small VT screen emulator (autowrap with deferred wrap, cursor
+  addressing, erase/insert/delete, scroll regions). Rows are read as they leave the screen and the report is parsed
+  whole. The assertions are unchanged.
 
 ## Later
 - ✅ x86 cumulative-session flakiness (possibly the same handle double-close; recheck) -- CLOSED with evidence (cfnest). The note dates from the first checkpoint (c617de4); its suspected cause, review finding I6 (handles closed twice on the launch failure path), was fixed long since. Rechecked with `ar_driver --repeat`: 60 sessions in ONE controller process, backends in turn (breakpoint, hw, inline), each a call_func + runtime data watch whose callback call_funcs during another thread's call: every session exact, nothing dropped, the controller's handle count flat (x64 73 -> 73, x86 89 -> 89). Regress `sessions-repeat` keeps it covered (also exercises the per-run callback-fiber host). (Separately: `callfunc-kill-reuse` -- inline, needs the OS to hand a killed thread's id to a new thread of the same process within 3000 creations -- failed on the shared VM in Nov-06 evening runs on the cfnest build AND on an unmodified baseline build (2/2): system-wide thread-id reuse under other agents' load, not a UHH regression.)
