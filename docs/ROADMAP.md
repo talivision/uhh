@@ -1372,7 +1372,7 @@ Platinum 8573C under Hyper-V (no CET in the guest), Defender real-time protectio
   ci_shards.py: `check_realapps:<part>` = regress `--only check_realapps` with `UHH_REALAPPS_ONLY` /
   `UHH_REALAPPS_BACKENDS`; parts tasklist-m, ps-modules-<backend>, ps-fileversion-<backend>, rest = every other
   scenario, parsed from `_realapps_scenarios()` so a new one is never lost). Critical path now: x86 `check_hunt`
-  (~8 min) instead of x86 `check_realapps` (~15 min as one unit).
+  (~7 min; longest shard 443 s) instead of x86 `check_realapps` (~15 min as one unit).
 - **External deps:** every check runs explicitly selected, so `skip_external()` is a FAIL in CI where a full
   unselected run would SKIP. The shards that need them install Frida 16.5.9 into `C:\work\fv16` (regress
   `FRIDA_PY`) and Intel SDE 9.48 into `C:\tools\sde` (Intel's mirror, sha256-pinned, cached). `check_oldcrt` needs a
@@ -1459,7 +1459,11 @@ Real-bug candidates (reproduce on runners, not on the VM so far):
 - Seen once each, undetermined: x86 `logs-wedge-suspend` (`wedged=0`), x64 `detach-inline` (`1 thread(s) frozen;
   all clean` yet FAIL, detail cut).
 
-Environment (runner) effects, and how the checks were made robust without proving less (branch `citune`):
+Environment (runner) effects, and how the checks were made robust without proving less (branch `citune`; full
+run 42203177441 at df3bddc, windows-2022 + cet-hw: 1830/1843 ok; every check below PASS on both arches; longest
+shard 443 s, was ~900 s; the 13 FAILs are the KNOWN hunt rows and findings owned elsewhere: crash-logs-inline-4t
+x64+x86, ret-probe-breakpoint x86, ntdll-churn-breakpoint x86, gated-e2e-attach-post-fbp-oin-cbp-rbp x64 (new check,
+another branch), logs-wedge-{exit x64, kill + suspend x86} (`wedged=0`: the wedge never formed on the runner)):
 - **patch-race-frozen (x64 + x86, deterministic)**: hook_cycles=[1,1,1,1], need >= 4 in the target's 12 s. Measured
   (diag): one attach -> install -> 400 ms -> detach cycle against 8 spinning threads takes 6-8.5 s on the 2-core
   runner (13 threads frozen, all clean, 20-78 M hits per cycle), so only one cycle fits; never crashed or torn.
