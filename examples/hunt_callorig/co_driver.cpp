@@ -1,7 +1,10 @@
-// co_driver --backend b [--inner-backend b2] --case name [--module m.exe] [--attach pid [--detach-after ms | --detach-on-stdin]]
+// co_driver --backend b [--inner-backend b2] --case name [--module m.exe] [--guard] [--attach pid [--detach-after ms | --detach-on-stdin]]
 //           [-- co_target.exe name]
 // --module: the probed functions' module (default co_target.exe; susp_target.exe for evsusp/cosusp
 // and deepthrow/deepseh/deepjmp/catchhit/catchinside).
+// --guard: also an inline probe on <module>!co_idle (never called), so a breakpoint/hw session has
+// the agent and its controller-death guard: only sessions with an inline probe inject it
+// (owner decision 2026-11-07).
 // --detach-on-stdin: detach when a line arrives on stdin. co_driver_th is the same driver
 // linked with the test-hook build of the library (probe_api_testhooks, regress cxlib-killarm).
 // call_original / return_from edge-case hunt (regress `callorig-hunt`): probes co_target's
@@ -23,6 +26,7 @@
 CB(co_on_fact) CB(co_on_throw) CB(co_on_seh) CB(co_on_jump) CB(co_on_add) CB(co_on_outer) CB(co_on_slow)
 CB(co_on_after) CB(co_on_inner) CB(co_on_nargs) CB(co_on_fast) CB(co_on_this) CB(co_on_args8) CB(co_on_mid)
 CB(co_on_prologue) CB(co_on_ret) CB(co_on_vslow) CB(co_on_cbf) CB(co_on_late) CB(co_on_spin) CB(co_on_hold)
+CB(co_on_idle) CB(co_on_lazy)
 struct co_cfg { uint32_t backend; };
 struct co_bigcfg { uint32_t backend, n; unsigned char pat[1000]; };   // see co_callbacks.cpp
 
@@ -33,7 +37,7 @@ static uint32_t parse_backend(const char *b) {
 
 int main(int argc, char **argv) {
     uint32_t bk = 0, inner = 0, pid = 0, detach_ms = 0;
-    bool detach_stdin = false;
+    bool detach_stdin = false, guard = false;
     std::string kase, module = "co_target.exe";
     int i = 1;
     for (; i < argc && std::strcmp(argv[i], "--"); ++i) {
@@ -44,6 +48,7 @@ int main(int argc, char **argv) {
         else if (!std::strcmp(argv[i], "--attach") && i + 1 < argc) pid = (uint32_t)std::strtoul(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--detach-after") && i + 1 < argc) detach_ms = (uint32_t)std::strtoul(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--detach-on-stdin")) detach_stdin = true;
+        else if (!std::strcmp(argv[i], "--guard")) guard = true;
     }
     if (!bk || kase.empty() || (!pid && i + 1 >= argc)) { std::fprintf(stderr, "usage: see co_driver.cpp\n"); return 2; }
     if (!inner) inner = bk;
@@ -72,6 +77,7 @@ int main(int argc, char **argv) {
     else if (k == "retaddr") ok = add("co_ret", co_on_ret, bk);
     else if (k == "prologue") ok = add("CoPrologue", co_on_prologue, bk);
     else if (k == "nested") ok = add("co_outer", co_on_outer, bk) && add("co_inner", co_on_inner, inner);
+    else if (k == "lazy") ok = add("co_outer", co_on_lazy, bk);          // target case: nested
     else if (k == "slow") ok = add("co_slow", co_on_slow, bk);
     else if (k == "vslow") ok = add("co_vslow", co_on_vslow, bk) && add("co_after", co_on_after, bk);
     else if (k == "cbfault") ok = add("co_cbf", co_on_cbf, bk);
@@ -91,6 +97,7 @@ int main(int argc, char **argv) {
         if (k == "many" || k == "manydead") ok = ok && add("co_add", co_on_spin, bk);
     }
     else { std::fprintf(stderr, "co_driver: unknown case %s\n", k.c_str()); return 2; }
+    if (ok && guard) ok = add("co_idle", co_on_idle, PROBE_INLINE);
     if (!ok) { std::fprintf(stderr, "co_driver: add failed\n"); probe_close(s); return 1; }
     if (pid && (detach_ms || detach_stdin)) {
         // Detach from another thread while probe_run runs (and a call_original is in flight).

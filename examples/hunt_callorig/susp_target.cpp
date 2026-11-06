@@ -37,6 +37,8 @@ CO_EXPORT intptr_t co_hold(intptr_t x) {                   // an original that r
 
 static volatile intptr_t g_zero = 0;
 CO_EXPORT intptr_t co_after(intptr_t x) { return x * 7 + g_zero; }
+// Never called: co_driver --guard's inline probe (the agent and its guard in the session).
+CO_EXPORT intptr_t co_idle(intptr_t x) { return (x ^ 0x1D1E) + g_zero * 3; }
 CO_EXPORT intptr_t co_throw(intptr_t x) {
     if (x & 1) throw std::runtime_error("odd");
     return x * 3 + g_zero;

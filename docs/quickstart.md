@@ -30,8 +30,8 @@ Rules that follow from how UHH works:
 
 - The controller (your driver) and the target must have the **same bitness**. Use the x64
   build for 64-bit targets and the x86 build for 32-bit (WOW64) targets.
-- `probe_api_agent.dll` must sit **next to the controller executable**. It is needed for
-  inline probes and for every attach.
+- `probe_api_agent.dll` must sit **next to the controller executable**. It is needed (and
+  injected into the target) only for inline probes.
 - Rebuild the agent DLL and the drivers together. A driver and an agent built from
   different versions of the agent protocol fail with `probe_agent_init failed (code=0x2)`.
 

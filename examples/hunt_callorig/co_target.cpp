@@ -67,6 +67,9 @@ CO_EXPORT intptr_t co_cbf(intptr_t a, intptr_t b) {
     return a * 3 + b;
 }
 CO_EXPORT intptr_t co_late(volatile LONG *state, intptr_t x) { g_body++; (void)state; return x + 1; }
+// Never called: co_driver --guard puts an inline probe here so the session has the agent (and
+// its controller-death guard) beside breakpoint/hw probes (regress cxlib-killarm-* & co.).
+CO_EXPORT intptr_t co_idle(intptr_t x) { g_body += 1000; return x ^ 0x1D1E; }
 
 static void after3(intptr_t &after) { for (int i = 0; i < 3; ++i) after += co_after(i); }
 

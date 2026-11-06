@@ -1462,11 +1462,15 @@ static bool has_inline(const probe_session *s) {
     for (const auto &p : s->probes) if (p->flags & PROBE_INLINE) return true;
     return false;
 }
-// The agent goes into every ATTACHED target: besides inline hooks it is the controller-death
-// guard (probe_agent_shared.hpp). Breakpoint/hw probes of an attach arm once it is up, so a
-// controller that dies at any point never leaves an unguarded trap behind.
+// The agent goes into a target only for inline probes: at launch/attach if any are registered,
+// else lazily when a callback or runtime add requests the first one. A breakpoint/hw-only
+// session loads nothing into the target (owner decision 2026-11-07: an injected DLL is itself a
+// side effect; a controller killed while such a session is attached leaves its INT3s/DRs in the
+// target, which may fault at its next hit -- the analyst sees the controller died). Where the
+// agent is loaded it is also the controller-death guard (probe_agent_shared.hpp): an attach
+// with inline probes from the start arms its breakpoint/hw probes once the guard is up, so no
+// unguarded trap exists there; a session that acquires the agent later is guarded from then on.
 static bool guard_pending(const probe_session *s) { return s->attached && s->shared && !s->guard_ready; }
-static bool needs_agent(const probe_session *s) { return has_inline(s) || (s->attached && s->shared); }
 
 // ---- UHH_SHARED: one callbacks DLL file, loaded by controller and target ---------------
 static bool image_has_section(const unsigned char *base, const char *name) {
@@ -2413,8 +2417,7 @@ static bool arm_breakpoint(probe_session *s, Probe &p, uint64_t base) {
         set_error(s, "could not decode probe site instruction"); return false;
     }
     // The agent's copy must hold every one (an inline get_mem masks them). Without inline
-    // probes (an attach's channel carries only the guard) no limit applies: past the cap the
-    // guard covers the first PROBE_AGENT_INT3_CAP only.
+    // probes there is no agent and no limit.
     if (s->shared && has_inline(s) && int3_armed(s) >= PROBE_AGENT_INT3_CAP) {
         set_error(s, "too many software breakpoints armed alongside inline probes (max " +
                      std::to_string(PROBE_AGENT_INT3_CAP) + ")");
@@ -3951,7 +3954,7 @@ static bool create_agent_channel(probe_session *s) {
                 s->probes[i]->agent_index = count++;
             }
     }
-    if (!count && !s->attached) return true;
+    if (!count) return true;          // no inline probe (yet): no agent, no channel (see guard_pending)
     if (count > PROBE_AGENT_MAX_PROBES) { set_error(s, "too many inline probes"); return false; }
     if (!open_agent_section(s, count)) return false;
     for (const auto &p : s->probes) if (p->flags & PROBE_INLINE) fill_request(s, *p);
@@ -4308,6 +4311,7 @@ extern "C" int probe_attach(probe_session *s, uint32_t pid) {
     if (!start_log_output(s)) return fail();
     { std::string which; s->sym_ready = uhh_sym::init(s->pi.hProcess, which); }
     if (!create_agent_channel(s)) return fail();
+    if (!s->shared) s->guard_ready = true;     // breakpoint/hw only: arm at once, no agent to wait for
     return 1;
 }
 
@@ -7187,8 +7191,8 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
 // may keep every CPU busy: a new normal-priority thread then waits behind its threads for a
 // whole scheduling quantum (Windows Server: ~190 ms) at every start and wake-up -- measured on
 // 2-vCPU CI runners with 4 spinning target threads, an attach armed its breakpoint/hw probes
-// (which wait for the agent's controller-death guard) only 0.3-1.5 s after the attach, and a
-// detach took as long. The agent's work is short and never spins, so the boost costs the
+// (which, beside inline probes, wait for the agent's controller-death guard) only 0.3-1.5 s
+// after the attach, and a detach took as long. The agent's work is short and never spins, so the boost costs the
 // program nothing but those milliseconds. (CREATE_SUSPENDED: the priority is in place before
 // the thread's first instruction.)
 static HANDLE create_remote_thread_boosted(HANDLE process, LPTHREAD_START_ROUTINE entry, void *argument, DWORD *tid) {
@@ -7405,7 +7409,6 @@ static bool complete_remote_thread(probe_session *s, DWORD result) {
         if (result == 0 || !s->remote_agent) {
             const std::string why = "LoadLibraryW failed for probe_api_agent.dll" + (s->remote_fault.empty() ? std::string() : ": " + s->remote_fault) +
                                     agent_load_policy_hint(s->pi.hProcess);
-            if (!has_inline(s)) return guard_set_ready(s, why.c_str());
             set_error(s, why);
             return false;
         }
@@ -7416,7 +7419,6 @@ static bool complete_remote_thread(probe_session *s, DWORD result) {
             char code[16]; std::snprintf(code, sizeof(code), "0x%lx", (unsigned long)result);
             const std::string why = std::string("probe_agent_init failed (code=") + code + ")" +
                                     (s->remote_fault.empty() ? std::string() : ": " + s->remote_fault);
-            if (!has_inline(s)) return guard_set_ready(s, why.c_str());
             set_error(s, why);
             return false;
         }
@@ -7609,7 +7611,7 @@ static void drain_final(probe_session *s) {
 
 // How many in-flight inline callbacks can still finish (probe_agent_shared::live_query),
 // answered by the agent's service thread. False: no answer (no service thread, or it cannot
-// run) -- the caller falls back to a bounded wait.
+// run) -- the caller keeps waiting, within its bound.
 static bool query_live_callbacks(probe_session *s, LONG &live) {
     if (!s->svc_event || !s->shared) return false;
     auto *sh = s->shared;
@@ -7627,32 +7629,39 @@ static void stop_drainer(probe_session *s) {
     // Detached from a live target: its hooks are gone, but a callback that was already running
     // (e.g. blocked in call_original longer than the agent's 2 s unhook wait) may still log.
     // Keep draining BEFORE telling producers nobody listens, so its logs are delivered rather
-    // than dropped -- for as long as any in-flight callback can still finish (no time bound: a
-    // slow detach is reported, never cut short). Callbacks that cannot finish now -- their
-    // thread is gone, or suspended by the program, or left through a non-unwinding longjmp --
-    // are not waited for: they stay counted in flight (the detach summary's in_flight), and a
-    // log one sends if the program resumes it later is counted dropped in the target. Without
-    // an answer from the agent (no service thread) the wait is bounded (15 s), as before.
+    // than dropped -- for at most PROBE_DETACH_CALLBACK_WAIT_MS (owner decision 2026-11-07: the
+    // program's correctness does not need the wait, and an unbounded detach is worse). Callbacks
+    // that cannot finish now -- their thread is gone, or suspended by the program, or left
+    // through a non-unwinding longjmp -- are not waited for at all. Past the bound, or for those,
+    // the detach completes and accounts them: `running` in the detach line, and those that had
+    // not logged yet `in_flight` (hits == logs_written + log_dropped + in_flight); any log they
+    // write later is lost (counted dropped only in the target, which nobody reads any more).
+    // Their config blocks stay allocated (probe_close), so the program is unaffected.
+    constexpr ULONGLONG PROBE_DETACH_CALLBACK_WAIT_MS = 15000;
     if (s->shared && !s->exited && s->drainer.joinable()) {
         MemoryBarrier();
         if (const uint64_t running = probe_agent_running(s->shared))
-            std::fprintf(stderr, "probe: %s: %llu callback(s) still running; delivering their logs\n",
-                         s->detached_hooks ? "detach" : "close", (unsigned long long)running);
+            std::fprintf(stderr, "probe: %s: %llu callback(s) still running; delivering their logs (up to %llu s)\n",
+                         s->detached_hooks ? "detach" : "close", (unsigned long long)running,
+                         (unsigned long long)(PROBE_DETACH_CALLBACK_WAIT_MS / 1000));
     }
     if (s->shared && s->detached_hooks && !s->exited && s->drainer.joinable()) {
         const ULONGLONG start = GetTickCount64();
-        ULONGLONG next_note = start + 15000;
         int idle_answers = 0;
-        ULONGLONG last_answer = start;
         for (;;) {
             MemoryBarrier();
             const uint64_t inflight = probe_agent_running(s->shared);     // callbacks that may still log
             if (!inflight && s->shared->log_head == s->shared->log_tail) break;
-            const ULONGLONG now = GetTickCount64();
+            if (GetTickCount64() - start >= PROBE_DETACH_CALLBACK_WAIT_MS) {
+                if (inflight)
+                    std::fprintf(stderr, "probe: detach: %llu callback(s) still running after %llu s; not waiting longer "
+                                         "(any log they write from now on is lost; see running=/in_flight= below)\n",
+                                 (unsigned long long)inflight, (unsigned long long)(PROBE_DETACH_CALLBACK_WAIT_MS / 1000));
+                break;
+            }
             if (inflight) {
                 LONG live = 0;
                 if (query_live_callbacks(s, live)) {
-                    last_answer = GetTickCount64();
                     // Three answers in a row (~50 ms apart): a callback between its in-flight
                     // count and its record (nanoseconds) is not missed.
                     if (live > 0) idle_answers = 0;
@@ -7661,16 +7670,7 @@ static void stop_drainer(probe_session *s) {
                                              "not waiting for them\n", (unsigned long long)inflight);
                         break;
                     }
-                } else if (now - last_answer >= 15000) {
-                    break;                                      // nobody answers (any more): the old bound
                 }
-            } else if (now - start >= 15000) {
-                break;                                          // ring not empty with nothing in flight
-            }
-            if (now >= next_note) {
-                next_note += 15000;
-                std::fprintf(stderr, "probe: detach: still waiting for %llu running callback(s) to finish (%llus)\n",
-                             (unsigned long long)inflight, (unsigned long long)((now - start) / 1000));
             }
             Sleep(inflight ? 50 : 5);
         }
@@ -8035,12 +8035,11 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
         //  while a held thread that owns the loader lock blocked the agent's LoadLibrary and
         //  froze the target until the install timeout (seen attaching to PowerShell). The
         //  hook write itself is safe without it: FREEZE suspends every thread for the patch.)
-        if (ok && s->initial_break && needs_agent(s) && s->remote_work == probe_session::REMOTE_NONE &&
+        if (ok && s->initial_break && has_inline(s) && s->remote_work == probe_session::REMOTE_NONE &&
             (!s->remote_agent || (s->attached && !s->agent_init_started))) {
             // (Re-attach: the agent is still loaded from an earlier session -- just init it.)
             if (!(loader_break && early_agent(s, event, ok)))
                 ok = !s->remote_agent ? start_agent_load(s) : start_agent_init(s);
-            if (!ok && !has_inline(s)) { std::string why = s->error; s->error.clear(); ok = guard_set_ready(s, why.c_str()); }
         }
         break;
     }
@@ -8383,12 +8382,14 @@ extern "C" void probe_close(probe_session *s) {
         }
         // in_flight: inline callbacks still running (or killed/suspended mid-callback by the
         // program) at the detach that had not delivered a log yet -- hits == logs_written +
-        // log_dropped + in_flight. running: inline callbacks still executing, logged or not
-        // (not accounting: a callback that logged is accounted by its log).
+        // log_dropped + in_flight. running: inline callbacks still executing when the detach
+        // stopped waiting (stop_drainer: at most 15 s), logged or not (not accounting: a callback
+        // that logged is accounted by its log); any log they write later is lost.
         const uint64_t written = s->logs_written.load(std::memory_order_relaxed);
         const uint64_t dropped = (uint64_t)(s->shared ? s->shared->log_dropped : 0) +
                                  s->controller_dropped.load(std::memory_order_relaxed);
         const uint64_t in_flight = s->shared ? probe_agent_inflight(s->shared) : 0;
+        const uint64_t running = s->shared && !ended_first ? probe_agent_running(s->shared) : 0;
         if (ended_first) {      // in_flight here: callbacks the target's end interrupted (probe_report's callbacks_interrupted)
             std::fprintf(stderr, "probe: ended: the target exited before the detach (exit code %lu): hits=%llu "
                                  "logs_written=%llu log_dropped=%llu in_flight=%llu\n", (unsigned long)s->exit_code,
@@ -8397,7 +8398,7 @@ extern "C" void probe_close(probe_session *s) {
         } else {
             std::fprintf(stderr, "probe: detached: hits=%llu logs_written=%llu log_dropped=%llu in_flight=%llu running=%llu\n",
                          (unsigned long long)hits, (unsigned long long)written, (unsigned long long)dropped,
-                         (unsigned long long)in_flight, (unsigned long long)(s->shared ? probe_agent_running(s->shared) : 0));
+                         (unsigned long long)in_flight, (unsigned long long)running);
         }
         // The probe_report on stdout was taken before this detach (uhh_trace --detach-after-ms)
         // and records followed it: give stdout a last word too, so a capture that ends with
@@ -8411,9 +8412,9 @@ extern "C" void probe_close(probe_session *s) {
         if (live && s->reported_to_stdout && tailed != s->reported_stdout_logs) {
             std::lock_guard<std::mutex> out_lock(s->stdout_mu);
             std::fprintf(stdout, "{\"kind\":\"probe_final\",\"hits\":%llu,\"logs_written\":%llu,\"log_dropped\":%llu,"
-                                 "\"in_flight\":%llu,\"stdout_logs\":%llu}\n",
+                                 "\"in_flight\":%llu,\"running\":%llu,\"stdout_logs\":%llu}\n",
                          (unsigned long long)hits, (unsigned long long)written, (unsigned long long)dropped,
-                         (unsigned long long)in_flight, (unsigned long long)tailed);
+                         (unsigned long long)in_flight, (unsigned long long)running, (unsigned long long)tailed);
             std::fflush(stdout);
         }
     }

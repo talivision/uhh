@@ -72,8 +72,9 @@ Contents: [concepts](#concepts) · [types and macros](#types-and-macros) ·
   agent confirms the hooks. Loader-time activity (TLS callbacks, static DLL initialisers)
   is therefore seen only by breakpoint/hw probes.
 - **Attach:** the target keeps running while probes arm. Each probe counts from its
-  `probe: active ...` line on stderr. Breakpoint/hw probes arm once the injected agent's
-  controller-death guard is up (or after 5 s without it, with a warning).
+  `probe: active ...` line on stderr. Breakpoint/hw-only sessions arm at once (nothing is
+  injected). In a session with inline probes, breakpoint/hw probes arm once the injected
+  agent's controller-death guard is up (or after 5 s without it, with a warning).
 - A probe added from a callback: breakpoint/hw arm before the target resumes; an inline
   probe holds the calling thread until its hook is in.
 
@@ -209,10 +210,13 @@ Attaches to a running process instead of launching one.
 - Opens the process with `PROCESS_ALL_ACCESS` and attaches as a debugger. A process that
   already has a debugger cannot be attached (the second controller fails with Win32 87).
 - Same-bitness rule as `probe_launch`.
-- The agent DLL is injected into **every** attached target, also for breakpoint/hw-only
-  sessions: it is the controller-death guard (if the controller dies, the agent restores
-  breakpoints, clears debug registers and removes hooks). `probe_api_agent.dll` must
-  therefore be next to the controller executable, or the attach fails.
+- The agent DLL is injected only when the session has an inline probe: at the attach if
+  one is registered, otherwise when a callback or runtime add requests the first one
+  (owner decision 2026-11-07). A breakpoint/hw-only session loads nothing into the target
+  and does not need `probe_api_agent.dll`. Where the agent is loaded it is also the
+  controller-death guard: if the controller dies, the agent restores breakpoints, clears
+  debug registers and removes hooks. A breakpoint/hw-only target has no such guard (see
+  [limitations.md](limitations.md#detach-and-close)).
 - Probes resolve against the modules already loaded and any loaded later.
 - `probe_run` returns when the target exits. `probe_close` on a still-running target
   **detaches**: inline hooks removed, breakpoints restored, debug registers cleared, no
@@ -273,8 +277,10 @@ Ends the session and frees it; `s` is invalid afterwards.
 - An attached target that is still running is detached. stderr then shows
   `probe: detached: hits=.. logs_written=.. log_dropped=.. in_flight=.. running=..`
   (hits = logs_written + log_dropped + in_flight).
-- Detach waits for inline callbacks that are still running and can finish (see
-  [limitations.md](limitations.md#detach-and-close)).
+- Detach waits at most 15 s for inline callbacks that are still running and can finish,
+  delivering their logs meanwhile. After that it completes: `running=` counts the callbacks
+  still running, `in_flight=` those of them that had not logged yet, and any log they write
+  later is lost (see [limitations.md](limitations.md#detach-and-close)).
 - Do not call it while `probe_attach` is still running on another thread.
 
 ## Callback functions
@@ -584,7 +590,7 @@ A capture of stdout is complete when it ends with the `probe_report`, holds exac
 [troubleshooting.md](troubleshooting.md#is-my-captured-output-complete)). When records follow
 the report -- an attach detached by `probe_close` after `probe_report`, as in
 `uhh_trace --detach-after-ms` -- `probe_close` ends stdout with
-`{"kind":"probe_final","hits":..,"logs_written":..,"log_dropped":..,"in_flight":..,"stdout_logs":..}`.
+`{"kind":"probe_final","hits":..,"logs_written":..,"log_dropped":..,"in_flight":..,"running":..,"stdout_logs":..}`.
 
 Accounting: hits = logs + `log_dropped` + `callbacks_interrupted` for a callback that logs
 once per hit (see [limitations.md](limitations.md#logs-and-accounting) for the edge cases).

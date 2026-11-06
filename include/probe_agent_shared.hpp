@@ -121,12 +121,13 @@ struct probe_ipc_request {
     uint64_t config, config_len;          /* probe_add_symbol_cfg */
 };
 
-/* Controller-death guard (ATTACH sessions). A debugger killed while attached (TerminateProcess,
+/* Controller-death guard (ATTACH sessions with an agent, i.e. with inline probes: a breakpoint/
+   hw-only session injects nothing -- owner decision 2026-11-07). A debugger killed while attached (TerminateProcess,
    crash) is detached by the kernel with its INT3s still in the code, its debug registers still
    armed and possibly threads it had suspended: the target would die at its next hit. The
    controller mirrors that state here after every debug event (the armed INT3s and their
    original bytes are the INT3 table, probe_agent_shared::int3, kept for every session with a
-   channel); the agent (loaded into every attached target) owns a vectored handler that takes
+   channel); the agent owns a vectored handler that takes
    each such trap as ours -- restores the byte / clears the DR / ends the step -- and its service
    thread, woken when the controller process ends, cleans everything up: original bytes back,
    our DR slots and steps cleared on every thread, held threads resumed, inline hooks removed. */
