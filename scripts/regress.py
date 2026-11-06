@@ -702,8 +702,9 @@ class _NoiseSampler:
         self.t = threading.Thread(target=self._read, daemon=True)
         self.t.start()
         # The disk side, as UHH writes its session log (GetTempPath()\uhh\logs, cached appends):
-        # each ~5 ms a 120-byte append to a file there, timed. A write that blocks (the lazy
-        # writer flushing to a slow disk) is the machine's stall, not UHH's.
+        # each ~5 ms a 120-byte append to a file there, timed: reported (disk_run_max), never
+        # discounted -- a stall of UHH's own file is not coincident with this one's, and UHH
+        # writing the file before stdout is its design (docs/ROADMAP.md, CI section).
         self.disk, self._stop = [], threading.Event()
         self.dt = threading.Thread(target=self._disk, daemon=True)
         self.dt.start()
@@ -731,10 +732,6 @@ class _NoiseSampler:
                 os.unlink(f.name)
             except OSError:
                 pass
-
-    def disk_noise(self, a, b):
-        """Longest sampler append (QPC ticks) overlapping [a, b]."""
-        return max((e - s for s, e in self.disk if s <= b and e >= a), default=0)
 
     def stop(self):
         self._stop.set()
@@ -845,7 +842,9 @@ def check_stream_latency():
     its event: reported (log_before_tick), not required (no such cross-stream promise).
     Diagnosis of a late record: the session log file is watched too (UHH writes each batch to
     it, then to stdout): in_file / p99_to_file = event -> in the file, p99_file_to_out = file
-    -> stdout."""
+    -> stdout; disk_run_max = the longest 120-byte append the sampler saw in that temp dir. A
+    stalling %TEMP% disk holds records before the file (UHH writes the file first): on GitHub
+    runners' C: disk 50 ms - 2.5 s, so CI puts %TEMP% on the runner's local disk (as the VM)."""
     tracer, target = exe("uhh_trace.exe"), exe("logstream_target.exe")
     if not tracer or not target:
         return missing_bin("stream-latency", "uhh_trace/logstream_target")
@@ -908,7 +907,6 @@ def check_stream_latency():
                    f"worst(#,ms,noise,in_file)={[(i, round(ms(lat[i]), 1), round(ms(noise[i]), 1), round(ms(in_file[i] - events[i]), 1) if i in in_file else None) for i in worst]} "
                    f"p99_to_file={ms(pct([in_file[i] - events[i] for i in lat if i in in_file], .99)):.1f}ms "
                    f"p99_file_to_out={ms(pct([logs[i] - in_file[i] for i in lat if i in in_file], .99)):.1f}ms "
-                   f"disk(worst)={[round(ms(sampler.disk_noise(events[i], logs[i])), 1) for i in worst]} "
                    f"disk_run_max={ms(max((e - b for b, e in sampler.disk), default=0)):.1f}ms "
                    f"tmp={tempfile.gettempdir()[:3]} "
                    f"noise_run_max={ms(run_noise):.1f}ms sampler={len(sampler.samples)}@{ms(sampler.period):.1f}ms "

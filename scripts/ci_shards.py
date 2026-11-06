@@ -55,7 +55,7 @@ EST = {
     "check_emulated_sites": (73, 138), "check_entry_hold_threads": (1, 3), "check_famous_files": (14, 14),
     "check_famous_heap": (11, 20), "check_famous_loader": (1, 1), "check_famous_retval": (5, 5),
     "check_famous_tls": (2, 2), "check_forwarded_probe": (1, 1), "check_frida_coexist": (4, 9),
-    "check_frida_parity": (1, 1), "check_gated_filter": (5, 6), "check_gated_map": (3, 3),
+    "check_frida_parity": (1, 1), "check_gated_e2e": (343, 364), "check_gated_filter": (5, 6), "check_gated_map": (3, 3),
     "check_gated_mem": (8, 7), "check_gated_off": (1, 1), "check_handle_map": (20, 21),
     "check_hotpatch_prologue": (1, 1), "check_hunt": (85, 420), "check_hw_once_slots": (6, 6),
     "check_inplace_shapes": (30, 27), "check_interrupt": (2, 2), "check_late_dll_worker": (1, 1),
@@ -64,10 +64,12 @@ EST = {
     "check_logs_stdout_closed": (1, 1), "check_logs_wedge": (4, 5), "check_memstress": (50, 71),
     "check_mix_matrix": (23, 32), "check_multithread_exact": (10, 11), "check_newapp_files": (1, 2),
     "check_newapp_flag": (5, 4), "check_newapp_reg": (2, 2), "check_ntdll_churn": (75, 111),
-    "check_oldcrt": (2, 2), "check_patch_race": (300, 300), "check_portability": (8, 8),
+    "check_oldcrt": (2, 3), "check_patch_race": (166, 204), "check_portability": (8, 8),
     "check_prehook_attach": (3, 3), "check_prehook_chain": (1, 1), "check_quickstart": (1, 1),
-    "check_realapps:tasklist-m": (30, 600), "check_realapps:ps-modules": (300, 200),
-    "check_realapps:ps-fileversion": (40, 60), "check_realapps:rest": (60, 120), "check_realworld": (14, 14), "check_realworld_targets": (0, 0),
+    "check_realapps:tasklist-m": (14, 360), "check_realapps:ps-modules-breakpoint": (230, 8),
+    "check_realapps:ps-modules-hw": (140, 7), "check_realapps:ps-modules-inline": (35, 6),
+    "check_realapps:ps-fileversion-breakpoint": (25, 200), "check_realapps:ps-fileversion-hw": (20, 190),
+    "check_realapps:ps-fileversion-inline": (15, 190), "check_realapps:rest": (30, 33), "check_realworld": (14, 14), "check_realworld_targets": (0, 0),
     "check_refusals": (1, 1), "check_ret_probe": (5, 6), "check_shared_mix": (13, 14), "check_sidefx": (3, 10),
     "check_sites": (1, 1), "check_stacks": (1, 1), "check_stdout_forward": (18, 20),
     "check_stream_latency": (17, 17), "check_stream_live": (21, 44), "check_stream_order": (1, 1),
@@ -100,12 +102,16 @@ ABSENT_TEXT = "optional external dependency absent"
 # Units that need an external dependency the workflow installs on demand.
 NEEDS = {"frida": {"check_frida_coexist"}, "sde": {"check_cet_sde"}, "oldmsvcp": {"check_oldcrt"}}
 # Units run as several parts (`<selector>:<part>`), each a unit of its own: ENV narrows the check to the part's items
-# (comma list); the part None is "every item no other part names". The items are parsed from regress.py (FROM: the
-# function listing them, one `("<item>", ...` tuple per line), so a new item lands in the None part automatically.
+# (comma list), BENV (if the part names one) to one backend; the items None = "every item no other part names". The
+# items are parsed from regress.py (FROM: the function listing them, one `("<item>", ...` tuple per line), so a new
+# item lands in that part automatically.
+_BK = ("breakpoint", "hw", "inline")
 SPLIT = {
-    "check_realapps": {"env": "UHH_REALAPPS_ONLY", "from": "_realapps_scenarios",
-                       "parts": {"tasklist-m": ["tasklist-m"], "ps-modules": ["ps-modules"],
-                                 "ps-fileversion": ["ps-fileversion"], "rest": None}},
+    "check_realapps": {"env": "UHH_REALAPPS_ONLY", "benv": "UHH_REALAPPS_BACKENDS", "from": "_realapps_scenarios",
+                       "parts": {"tasklist-m": (["tasklist-m"], None),
+                                 **{f"ps-modules-{b}": (["ps-modules"], b) for b in _BK},
+                                 **{f"ps-fileversion-{b}": (["ps-fileversion"], b) for b in _BK},
+                                 "rest": (None, None)}},
 }
 ARCH_IDX = {"x64": 0, "x86": 1}
 
@@ -123,16 +129,20 @@ def checks():
 
 
 def split_items(sel):
-    """{part: [items]} of a SPLIT selector, every item of regress.py's list in exactly one part."""
+    """{part: (items, backend or None)} of a SPLIT selector; every item of regress.py's list is covered."""
     sp = SPLIT[sel]
     src = REGRESS.read_text(encoding="utf-8")
     body = src[src.index(f"\ndef {sp['from']}("):]
     body = body[:body.index("\ndef ", 1)]
     items = re.findall(r'^\s+\("([\w-]+)",', body, re.M)
-    named = [i for part in sp["parts"].values() if part for i in part]
+    named = {i for part, _ in sp["parts"].values() if part for i in part}
     if not items or any(i not in items for i in named):
-        sys.exit(f"ci_shards: SPLIT {sel}: parts {named} not all in {sp['from']}() items {items}")
-    return {p: (v or [i for i in items if i not in named]) for p, v in sp["parts"].items()}
+        sys.exit(f"ci_shards: SPLIT {sel}: parts {sorted(named)} not all in {sp['from']}() items {items}")
+    for i in named:   # an item split by backend must have every backend
+        bks = {b for part, b in sp["parts"].values() if part and i in part}
+        if None not in bks and bks != set(_BK):
+            sys.exit(f"ci_shards: SPLIT {sel}: {i} split into backends {sorted(bks)}, not all of {_BK}")
+    return {p: (v or [i for i in items if i not in named], b) for p, (v, b) in sp["parts"].items()}
 
 
 def units():
@@ -258,8 +268,11 @@ def cmd_run(a):
             only, uenv = sel, env
             if ":" in sel:                              # a SPLIT part: the check, narrowed by its env variable
                 only, part = sel.split(":", 1)
-                uenv = dict(env, **{SPLIT[only]["env"]: ",".join(split_items(only)[part])})
-                hdr2 = f"===== {SPLIT[only]['env']}={uenv[SPLIT[only]['env']]}"
+                its, bk = split_items(only)[part]
+                uenv = dict(env, **{SPLIT[only]["env"]: ",".join(its)})
+                if bk:
+                    uenv[SPLIT[only]["benv"]] = bk
+                hdr2 = f"===== {SPLIT[only]['env']}={uenv[SPLIT[only]['env']]}" + (f" {SPLIT[only]['benv']}={bk}" if bk else "")
                 print(hdr2, flush=True); lf.write(hdr2 + "\n")
             p = subprocess.Popen([sys.executable, "-u", str(REGRESS), "--bin", a.bin, "--only", only],
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
