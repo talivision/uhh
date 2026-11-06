@@ -197,8 +197,10 @@ extern "C" __declspec(dllexport) __declspec(allocate(".text")) const unsigned ch
 #endif
 
 // ---- drrestore (regress `hw-dr-restore`) ---------------------------------------------------
-AR_EXPORT intptr_t ar_dr_arm(intptr_t x) { return x + (intptr_t)g_zero; }    // probed: arms ar_dr_site (hw)
-AR_EXPORT intptr_t ar_dr_site(intptr_t x) { return x + (intptr_t)g_zero; }   // the runtime-armed hw probe
+// (Distinct bodies: identical ones are folded into ONE function by the linker -- /OPT:ICF.)
+static volatile intptr_t g_dr_seen_arm, g_dr_seen_site;
+AR_EXPORT intptr_t ar_dr_arm(intptr_t x) { g_dr_seen_arm = x; return x; }     // probed: arms ar_dr_site (hw)
+AR_EXPORT intptr_t ar_dr_site(intptr_t x) { g_dr_seen_site = x; return x; }   // the runtime-armed hw probe
 static HANDLE g_dr_inside[2], g_dr_go;
 static std::atomic<long> g_dr_calls[3];
 static LONG dr_filter() {

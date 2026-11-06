@@ -7762,6 +7762,9 @@ def check_hw_dr_restore():
                        f"exception={sum(1 for x in miss if 200 <= x < 300)} apc={sum(1 for x in miss if x >= 300)}) "
                        f"extra={sorted((got - want).elements())[:5]}")
         if hits != 30: bad.append(f"hits={hits} want=30")
+        arm = next((p.get("hits") for p in probes(o) if "ar_dr_arm" in str(p.get("location", ""))), None)
+        site_rows = sum(1 for p in probes(o) if "ar_dr_site" in str(p.get("location", "")))
+        if arm != 1 or site_rows != 1: bad.append(f"arm hits={arm} site probes={site_rows} (want 1, 1)")
         if rep.get("log_dropped") != 0: bad.append(f"dropped={rep.get('log_dropped')}")
         if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
         record("hw-dr-restore", not bad, "; ".join(bad) or f"row={rw} hits={hits}")
