@@ -8999,10 +8999,39 @@ def realbig_sysprog(name, arch):
     return (Path(r"C:\Windows\SysWOW64") if arch == "x86" else SYS32) / name
 
 
+def _share_lock(path):
+    """Open `path` with no sharing (a gate): every other open fails with a sharing violation
+    until close_share_lock(handle)."""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    h = k32.CreateFileW(str(path), 0x80000000, 0, None, 3, 0x80, None)   # GENERIC_READ, share 0, OPEN_EXISTING
+    if not h or h == wintypes.HANDLE(-1).value:
+        raise RuntimeError(f"cannot lock {path}: error {ctypes.get_last_error()}")
+    return h
+
+
+def _close_share_lock(h):
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32")
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.CloseHandle(h)
+
+
 def realbig_robocopy(bk, mode, arch, work, base):
     """robocopy /MT:16 (launch: the 800-file tree under UHH; detach: attached while it copies the
-    many-small-files tree, which takes long enough plain; detached a third of the way in). The
-    copy must be exact and exit 1 (copied). (/IPG cannot pace it: with /MT robocopy rejects it, rc 16.)"""
+    many-small-files tree, detached 1.5 s after the attach). The copy must be exact and exit 1
+    (copied). (/IPG cannot pace it: with /MT robocopy rejects it, rc 16.)
+    Detach: the copy cannot end before the detach on any machine -- the last file in robocopy's
+    order is held open with no sharing (a gate) until the detach and the residue check are done;
+    robocopy retries it (/R:600 /W:1: a sharing violation is retried, the file then copied,
+    exit 1) and finishes after the gate opens. (Ungated, a fast runner finished the whole copy
+    during the attach: CI 42213960508 x86, "robocopy ended during the attach".) How far the copy
+    had got at the detach is reported (files_at_detach)."""
     robo = realbig_sysprog("robocopy.exe", arch)
     src = work / ("src" if mode == "launch" else "many")
     dst = work / f"dst-{bk}-{mode}"
@@ -9017,6 +9046,10 @@ def realbig_robocopy(bk, mode, arch, work, base):
         if rep.get("app_exit") != 1: bad.append(f"robocopy exit={rep.get('app_exit')} (want 1: files copied)")
         extra = f"secs={s['secs']:.1f} base={base['robo_secs']:.1f} x{s['secs'] / max(base['robo_secs'], 0.1):.1f}"
     else:
+        gate_file = sorted(src.rglob("*.dat"))[-1]
+        gate = _share_lock(gate_file)
+        argv = [a if a != "/R:0" else "/R:600" for a in argv]
+        argv = [a if a != "/W:0" else "/W:1" for a in argv]
         tgt = subprocess.Popen([str(a) for a in argv], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             t0 = time.time()
@@ -9031,6 +9064,7 @@ def realbig_robocopy(bk, mode, arch, work, base):
             dms = 1500
             s = realbig_session(bk, REALBIG_ROBO_PROBES, ["--attach", tgt.pid, "--detach-after-ms", dms], 900)
             alive = tgt.poll() is None
+            at_detach = sum(1 for _ in dst.rglob("*.dat")) if dst.exists() else 0
             bad, detail = realbig_judge(s, bk, REALBIG_ROBO_PROBES, [REALBIG_ROBO_PROBES[i].rsplit(":", 1)[0] for i in (0, 2, 3)], False)
             if not alive:
                 bad.append(f"robocopy ended during the attach (rc={tgt.returncode}): detach not mid-run")
@@ -9039,10 +9073,14 @@ def realbig_robocopy(bk, mode, arch, work, base):
                 bad += rbad
                 detail += " " + rdet
             if '"kind":"detached"' not in s["out"]: bad.append("not detached")
+            _close_share_lock(gate); gate = None                  # the gate opens: robocopy finishes
             rc = tgt.wait(timeout=900)
             if rc != 1: bad.append(f"robocopy exit={rc} (want 1)")
-            extra = f"plain_first_copy={base['robo_many_secs']:.1f}s total={time.time() - t0:.1f}s"
+            extra = (f"files_at_detach={at_detach}/{nfiles} plain_first_copy={base['robo_many_secs']:.1f}s "
+                     f"total={time.time() - t0:.1f}s")
         finally:
+            if gate is not None:
+                _close_share_lock(gate)
             if tgt.poll() is None:
                 tgt.kill()
     got, n = realbig_tree_digest(dst) if dst.exists() else (None, 0)
