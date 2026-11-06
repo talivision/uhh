@@ -4718,8 +4718,8 @@ static void restore_fixup(probe_context *c) {
 #if defined(_WIN64)
     rec = c->regs.rcx;                                       // NtContinue[Ex](PCONTEXT, ...)
 #else
-    uint32_t r32 = 0; size_t n = 0;                          // stdcall: [esp] = return, [esp+4] = PCONTEXT
-    if (!remote_read(s->pi.hProcess, c->regs.rsp + 4, &r32, 4, &n) || n != 4) return;
+    uint32_t r32 = 0; size_t got = 0;                        // stdcall: [esp] = return, [esp+4] = PCONTEXT
+    if (!remote_read(s->pi.hProcess, c->regs.rsp + 4, &r32, 4, &got) || got != 4) return;
     rec = r32;
 #endif
     CONTEXT img{};
