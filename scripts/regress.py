@@ -6554,6 +6554,22 @@ class LcDriver:
                   if l.startswith("probe: detached:")), None)
         return tuple(int(x) for x in m.groups()) if m else None
 
+    def accounting(self):
+        """The session's final accounting {hits, logs_written, log_dropped, source}: probe_close's
+        'probe: detached:' line (a detach) or the probe_report record (the session ended on its
+        own -- the target exited/died -- or never attached). None if neither was printed."""
+        f = self.final()
+        if f is not None:
+            return {"hits": f[0], "logs_written": f[1], "log_dropped": f[2], "source": "detached"}
+        rep = report([json.loads(l) for l in self.other if l.startswith('{"kind":"probe_report"')])
+        if rep:
+            return {"hits": rep.get("hits"), "logs_written": rep.get("logs_written"), "log_dropped": rep.get("log_dropped"),
+                    "source": "report"}
+        return None
+
+    def attached(self):
+        return any('"kind":"attached"' in l for l in self.other)
+
     def errors(self):
         return [l[:160] for l in self.err.lines if "error" in l.lower() or "warning" in l.lower() or "failed" in l][:4]
 
@@ -6658,8 +6674,11 @@ def lc_detach_cases(cfgname, cfg):
 def lc_target_dies(cfgname, cfg):
     """The target dies (TerminateProcess) N ms into the attach / agent injection / install, or
     right after a detach was requested: the controller must notice, end its session and exit on
-    its own (no hang, no crash) with every log it wrote delivered and none dropped."""
-    bad, n = [], 0
+    its own (no hang, no crash) with every log it wrote delivered and none dropped. A session
+    that was established ("attached") must report its final accounting, logs_written == the
+    probe_log records delivered on stdout, log_dropped == 0, driver exit 0; an attach that
+    failed before the session existed must exit 1 with a report of zero logs."""
+    bad, n, seen = [], 0, []
     for when in (0, 2, 10, 40, 150, 600, "detach"):
         n += 1
         tg = d = None
@@ -6676,16 +6695,27 @@ def lc_target_dies(cfgname, cfg):
                 d.detach()                                  # the session may still wait for its detach cue
             fin_ok = d.finish(timeout=60)
             rc = d.p.returncode
-            dropped = (d.final() or (0, 0, 0))[2]
-            if not fin_ok or rc not in (0, 1) or dropped:
-                bad.append(f"kill@{when}: finished={fin_ok} rc={rc} dropped={dropped} err={d.errors()}")
+            acct, session = d.accounting(), d.attached()
+            seen.append(f"{when}:{'S' if session else '-'}{d.logs}")
+            why = []
+            if not fin_ok: why.append("driver did not finish")
+            if acct is None:
+                why.append("no final accounting (neither 'probe: detached:' nor probe_report)")
+            elif acct["logs_written"] != d.logs or acct["log_dropped"] != 0:
+                why.append(f"logs_written={acct['logs_written']} delivered={d.logs} dropped={acct['log_dropped']} "
+                           f"({acct['source']})")
+            if session and rc != 0: why.append(f"rc={rc} after the session was established")
+            if not session and (rc != 1 or (acct or {}).get("logs_written") not in (0, None) or d.logs):
+                why.append(f"attach failed before the session existed but rc={rc} delivered={d.logs}")
+            if why:
+                bad.append(f"kill@{when}: session={session} " + " ".join(why) + f" err={d.errors()}")
         except Exception as e:
             bad.append(f"kill@{when}: {e!r}")
         finally:
             if d: d.kill()
             if tg: tg.kill()
     name = f"lifecycle-target-dies-{cfgname}"
-    record(name, not bad, f"cases={n}" + (f" bad={bad[:3]}" if bad else ""))
+    record(name, not bad, f"cases={n} [when:session?delivered]={' '.join(seen)}" + (f" bad={bad[:3]}" if bad else ""))
 
 
 def lc_two_controllers(cfgname, cfg):
