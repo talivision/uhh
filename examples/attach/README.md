@@ -36,10 +36,15 @@ base), so the address range alone cannot tell them apart: only the pid filter do
 ## Usage
 
 ```
-uhh_attach <target_pid> --pid P --range BASE:SIZE [--backend breakpoint|hw|inline]
+uhh_attach <target_pid> [--pid P] [--range BASE:SIZE] [--backend breakpoint|hw|inline]
+           [--flag-backend b] [--open-backend b] [--close-backend b] [--read-backend b]
 ```
 
-`BASE` and `SIZE` take decimal or `0x` hex. Default backend: `breakpoint`.
+`BASE` and `SIZE` take decimal or `0x` hex. Both filters are optional: without them every
+read is logged. Default backend: `breakpoint` for every probe; `--backend` sets the open,
+close and read probes (the close probe stays a breakpoint when `--backend` is `hw`, see
+`close_backend_for`), and `--open/close/read-backend` set one probe each. Every assignment
+of the four probes to the three backends works (regress `gated-e2e-attach-*`).
 
 ## Manual run
 

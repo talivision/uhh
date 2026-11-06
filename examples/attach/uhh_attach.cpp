@@ -1,7 +1,12 @@
 // uhh_attach -- attach to a RUNNING probe_app, turn its disabled feature on, and log
 // only the reads it makes of one process (P) inside one address range.
 //
-//   uhh_attach <target_pid> --pid P --range BASE:SIZE [--backend breakpoint|hw|inline] [--flag-backend b]
+//   uhh_attach <target_pid> [--pid P] [--range BASE:SIZE] [--backend breakpoint|hw|inline] [--flag-backend b]
+//              [--open-backend b] [--close-backend b] [--read-backend b]
+//
+// --pid / --range filter the logged reads (each optional: without both, every read is
+// logged). --backend sets the open, close and read probes' backend (close: breakpoint when it
+// is hw, see close_backend_for); --open/close/read-backend override it per probe.
 //
 // Three probes, the callbacks shared with gated_config (examples/gated_config):
 //   configparse.dll!ParseConfig+0x16   <flag-backend>  enable_reads: parsed flag 0 -> 1
@@ -15,31 +20,39 @@
 #include <cstring>
 
 static int usage() {
-    std::fprintf(stderr, "usage: uhh_attach <target_pid> --pid P --range BASE:SIZE "
-                         "[--backend breakpoint|hw|inline] [--flag-backend b]\n");
+    std::fprintf(stderr, "usage: uhh_attach <target_pid> [--pid P] [--range BASE:SIZE] "
+                         "[--backend breakpoint|hw|inline] [--flag-backend b] [--open-backend b] "
+                         "[--close-backend b] [--read-backend b]\n");
     return 2;
 }
 
 int main(int argc, char **argv) {
     if (argc < 2) return usage();
     uint32_t target = (uint32_t)std::strtoul(argv[1], nullptr, 0), backend = PROBE_BREAKPOINT, flag_backend = PROBE_BREAKPOINT;
+    uint32_t open_backend = 0, close_backend = 0, read_backend = 0, bad = 0;
     read_log_config cfg{};
     cfg.cookie = READ_LOG_COOKIE; cfg.log = 1;
     for (int i = 2; i + 1 < argc; i += 2) {
         if (!std::strcmp(argv[i], "--pid")) cfg.pid = std::strtoull(argv[i + 1], nullptr, 0);
         else if (!std::strcmp(argv[i], "--backend")) backend = backend_flag(argv[i + 1]);
         else if (!std::strcmp(argv[i], "--flag-backend")) flag_backend = backend_flag(argv[i + 1]);
+        else if (!std::strcmp(argv[i], "--open-backend")) bad |= !(open_backend = backend_flag(argv[i + 1]));
+        else if (!std::strcmp(argv[i], "--close-backend")) bad |= !(close_backend = backend_flag(argv[i + 1]));
+        else if (!std::strcmp(argv[i], "--read-backend")) bad |= !(read_backend = backend_flag(argv[i + 1]));
         else if (!std::strcmp(argv[i], "--range")) { if (!add_read_range(&cfg, argv[i + 1])) return usage(); }
         else return usage();
     }
-    if (!target || !cfg.pid || !cfg.nranges || !backend || !flag_backend || argc % 2) return usage();
+    if (!target || !backend || !flag_backend || bad || argc % 2) return usage();
+    if (!open_backend) open_backend = backend;
+    if (!read_backend) read_backend = backend;
+    if (!close_backend) close_backend = close_backend_for(open_backend);
 
     probe_session *s = probe_session_create();
     if (!s) return 1;
     int ok = probe_add_symbol(s, "configparse.dll!ParseConfig+0x16", enable_reads, flag_backend) &&
-             probe_add_symbol(s, "ntdll.dll!NtOpenProcess", track_open_process, backend) &&
-             probe_add_symbol(s, "ntdll.dll!NtClose", forget_closed_handle, close_backend_for(backend)) &&
-             probe_add_symbol_cfg(s, "ntdll.dll!NtReadVirtualMemory", log_read, backend, &cfg, sizeof(cfg)) &&
+             probe_add_symbol(s, "ntdll.dll!NtOpenProcess", track_open_process, open_backend) &&
+             probe_add_symbol(s, "ntdll.dll!NtClose", forget_closed_handle, close_backend) &&
+             probe_add_symbol_cfg(s, "ntdll.dll!NtReadVirtualMemory", log_read, read_backend, &cfg, sizeof(cfg)) &&
              probe_attach(s, target);
     if (ok) {
         std::printf("{\"kind\":\"attached\",\"pid\":%lu}\n", (unsigned long)target);
