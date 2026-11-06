@@ -7308,6 +7308,7 @@ static void co_warn(bool &flag, const Probe *probe, const char *text) {
     std::fprintf(stderr, "probe: warning: %s: %s. Further cases are not reported.\n", probe->location.c_str(), text);
 }
 static int call_original_in_place(probe_session *s, CallbackState *st, probe_context *c, uint64_t *out) {
+    park_release(s);                     // the original may need a lock a parked thread owns
     Probe *probe = st->probe;
     const uint64_t ptr = sizeof(void *);
     uint64_t ret_addr = 0;
@@ -7383,7 +7384,8 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
     ULONGLONG until = GetTickCount64() + 5000, next_poll = GetTickCount64() + 20;
     DEBUG_EVENT ev{};
     while (!s->exited && !s->co_left && !thread_gone) {
-        if (WaitForDebugEvent(&ev, 20)) {
+        if (!s->ctx_watch.empty()) ctx_watch_poll(s);
+        if (WaitForDebugEvent(&ev, s->ctx_watch.empty() ? 20 : 1)) {
             if (continue_foreign_event(s, ev)) continue;
             if (ev.dwThreadId == st->tid && ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT &&
                 ev.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP &&
