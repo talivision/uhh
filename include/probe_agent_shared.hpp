@@ -10,7 +10,7 @@
 #include <cstdio>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 20;
+constexpr uint32_t PROBE_AGENT_VERSION = 21;
 constexpr uint32_t PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH = 1u << 9;   /* agent side only needs this one */   /* == PROBE_UNSAFE_FAST_PATCH (asserted in session.cpp) */
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 128;   /* inline probes per session; the 129th is refused */
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
@@ -182,6 +182,11 @@ struct probe_agent_shared {
     volatile LONG live_query;
     volatile LONG live_seq;
     volatile LONG live_callbacks;
+    /* Early init (v21): the controller runs probe_agent_init on the launched target's MAIN
+       thread at the loader breakpoint (before TLS callbacks and static DllMains, ROADMAP A6).
+       No new thread can start before process initialisation ends, so init must not wait for
+       its service thread (it reports itself ready once it runs). */
+    volatile LONG early_init;
 };
 
 constexpr LONG64 PROBE_AGENT_INFLIGHT_ONE = 1LL << 48;   /* one running callback in a hit_stripes cell */

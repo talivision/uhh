@@ -22,6 +22,9 @@
  *   threads 32 threads x N reads (for slow / call_func callbacks)
  *   owndr   a worker runs with the target's OWN DR0 execute breakpoint on own_dr_site,
  *           handled by its VEH (RF set); N calls must give N own single-steps
+ *   owndr-live  the same, but DR0 is armed on the worker while it RUNS (it waits on an event;
+ *           main suspends it, GetThreadContext, sets DR0, SetThreadContext, resumes) -- over
+ *           whatever DR0 held then (a debugger's hardware probe, if any)
  *   early   the handle is opened and one read made in a TLS callback at process attach
  *           (before the entry point); then N reads from main
  * Output: {"kind":"target","scenario":...,"reads":R,"bad":B,"foreign":F,...}
@@ -213,8 +216,10 @@ static DWORD WINAPI dll_user(void *p) {
 /* ---- owndr: the target arms DR0 on one of its own functions and handles it in its VEH ---- */
 __declspec(dllexport) __declspec(noinline) int own_dr_site(int x) { return x * 3 + 1; }
 static volatile int g_own_sink;
+static HANDLE g_owndr_go;
 static DWORD WINAPI owndr_worker(void *p) {
     (void)p;
+    if (g_owndr_go) WaitForSingleObject(g_owndr_go, INFINITE);
     for (DWORD i = 0; i < g_n; ++i) { g_own_sink += own_dr_site((int)i); hunt_read(); }
     return 0;
 }
@@ -297,15 +302,20 @@ int main(int argc, char **argv) {
         if (!strcmp(sc, "exit-process")) ExitProcess(6);
         if (!strcmp(sc, "exit-terminate")) TerminateProcess(GetCurrentProcess(), 7);
         return 5;
-    } else if (!strcmp(sc, "owndr")) {
-        HANDLE t = CreateThread(NULL, 0, owndr_worker, NULL, CREATE_SUSPENDED, NULL);
+    } else if (!strcmp(sc, "owndr") || !strcmp(sc, "owndr-live")) {
+        const int live = !strcmp(sc, "owndr-live");
+        if (live) g_owndr_go = CreateEventA(NULL, TRUE, FALSE, NULL);
+        HANDLE t = CreateThread(NULL, 0, owndr_worker, NULL, live ? 0 : CREATE_SUSPENDED, NULL);
         CONTEXT c; memset(&c, 0, sizeof(c)); c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
         g_owndr_addr = (ULONG_PTR)own_dr_site;
+        if (live && t) { Sleep(50); if (SuspendThread(t) == (DWORD)-1) InterlockedIncrement(&g_bad); }   /* it waits on the event */
         if (!t || !GetThreadContext(t, &c)) { InterlockedIncrement(&g_bad); }
         else {
             c.Dr0 = g_owndr_addr; c.Dr7 = (c.Dr7 & ~(ULONG_PTR)0xF0003) | 1;   /* L0, execute, len 1 */
             if (!SetThreadContext(t, &c)) InterlockedIncrement(&g_bad);
-            ResumeThread(t); WaitForSingleObject(t, INFINITE); CloseHandle(t);
+            ResumeThread(t);
+            if (live) SetEvent(g_owndr_go);
+            WaitForSingleObject(t, INFINITE); CloseHandle(t);
         }
         if ((DWORD)g_owndr != g_n) InterlockedIncrement(&g_bad);
     } else if (!strcmp(sc, "early")) {

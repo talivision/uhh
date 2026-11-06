@@ -4038,7 +4038,7 @@ HUNT_CASES = [  # (scenario, n, extra driver args ("@" = the backend under test)
     ("veh", 150, (), 600), ("dll", 60, ("--work-backend", "@"), 900), ("ctx", 3000, (), 600),
     ("threads", 4, ("--slow-ms", "50"), 600), ("threads", 20, ("--tid",), 600),
     ("threads", 20, ("--recurse",), 600), ("early", 10, (), 300),
-    ("owndr", 200, (), 300),
+    ("owndr", 200, (), 300), ("owndr-live", 200, (), 300),
 ]
 
 
@@ -4091,9 +4091,9 @@ def check_hunt():
             if not hunt_selected(name):
                 continue
             try:
-                # 2 readers on the debug-event backends: 8 starve the exiting thread (below).
-                rc, tmo, tg, rd, wk, rep, st = hunt_run(bk, sc, 300, (), timeout=180,
-                                                        readers=8 if bk == "inline" else 2)
+                # 8 readers on every backend (the debug-event backends park threads that hit
+                # back to back, so the exiting one is not starved: hunt-starve-*).
+                rc, tmo, tg, rd, wk, rep, st = hunt_run(bk, sc, 300, (), timeout=180, readers=8)
                 hits = rd.get("hits") or 0
                 cut = rep.get("callbacks_interrupted")
                 ok = (not tmo and rep.get("app_exit") == code and hits > 0 and tg.get("bad") == 0 and cut is not None and
@@ -4105,17 +4105,23 @@ def check_hunt():
             except Exception as e:
                 record(name, False, repr(e))
         # Starvation: 8 threads hitting the probe back to back while main sleeps 300 ms and
-        # calls ExitProcess. Uninstrumented: ~0.3 s. Every debug event freezes the whole
-        # process, so on breakpoint/hw a thread that hits no probe only runs in the gaps
-        # between events (Hunter A finding; see ROADMAP). Bar: exits within 60 s.
+        # calls ExitProcess. Uninstrumented: ~0.3 s. Every debug event freezes the whole process,
+        # so on breakpoint/hw a thread that hits no probe used to run only in the gaps between
+        # events (ROADMAP A5): now one event per hit and fairness parking. Bar: exits within
+        # 20 s, and every hit is a delivered log or an honestly counted drop / interruption.
         name = f"hunt-starve-{bk}"
         if hunt_selected(name):
             try:
                 t0 = time.perf_counter()
                 rc, tmo, tg, rd, wk, rep, st = hunt_run(bk, "exit-process", 300, (), timeout=60, readers=8)
                 secs = time.perf_counter() - t0
-                ok = not tmo and rep.get("app_exit") == 6
-                record(name, ok, f"exit={rep.get('app_exit')} secs={secs:.1f} hits={(rd or {}).get('hits')} "
+                hits = (rd or {}).get("hits") or 0
+                cut = rep.get("callbacks_interrupted")
+                ok = (not tmo and rep.get("app_exit") == 6 and secs < 20 and hits > 0 and cut is not None and
+                      st["read"] + (rep.get("log_dropped") or 0) + cut == hits and st["unmapped"] == 0 and
+                      tg.get("bad") == 0 and (bk == "inline" or cut == 0))
+                record(name, ok, f"exit={rep.get('app_exit')} secs={secs:.1f} hits={hits} logs={st['read']} "
+                                 f"dropped={rep.get('log_dropped')} interrupted={cut} "
                                  f"reads_at_print={tg.get('reads_at_exit')} timeout={tmo}")
             except Exception as e:
                 record(name, False, repr(e))
