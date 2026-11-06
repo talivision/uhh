@@ -4615,6 +4615,9 @@ def hunt_run(backend, scenario, n, extra=(), timeout=600, readers=None):
     finally:
         os.environ.pop("HUNT_READERS", None)
     tg = next((o for o in keep if o.get("kind") == "target"), {})
+    mx = next((o for o in keep if o.get("kind") == "main_exit"), None)   # exit scenarios: main's print time
+    if mx is not None:
+        tg = dict(tg, print_ms=mx.get("print_ms"))
     rd = next((o for o in keep if o.get("kind") == "probe" and o.get("location") == HUNT_READ), {})
     wk = next((o for o in keep if o.get("kind") == "probe" and "HuntWork" in str(o.get("location"))), {})
     return rc, timed_out, tg, rd, wk, report(keep), st
@@ -4661,6 +4664,10 @@ def check_hunt():
                       tg.get("checksum") == checksum and rd.get("hits") == want_hits and st["read"] == reads and
                       st["unmapped"] == 0 and st["pids"] == {tg.get("pid")} and rep.get("log_dropped") == 0 and
                       rep.get("app_exit") == 0 and st["other"] == 0)
+                if sc == "ctx":
+                    # Exact whatever the machine: N round-trips or 90 s of them (target-side). Not
+                    # starved: at least 100 rounds, no single round over 30 s.
+                    ok = ok and (tg.get("ctx_rounds") or 0) >= min(n, 100) and (tg.get("ctx_max_round_ms") or 0) < 30000
                 if "--work-backend" in extra:
                     ok = ok and wk.get("hits") == tg.get("work") == st["work"] and tg.get("work") == 4 * n
                 if "--tid" in extra:
@@ -4672,6 +4679,8 @@ def check_hunt():
                                  f"dropped={rep.get('log_dropped')} exit={rep.get('app_exit')} rc={rc} timeout={tmo}"
                                  + (f" work={tg.get('work')}/{wk.get('hits')}/{st['work']}" if wk or tg.get("work") else "")
                                  + (f" tid_ok={st['tid_ok']} tid_bad={st['tid_bad']}" if "--tid" in extra else "")
+                                 + (f" rounds={tg.get('ctx_rounds')}/{n} in {tg.get('ctx_ms')}ms max_round={tg.get('ctx_max_round_ms')}ms"
+                                    if sc == "ctx" else "")
                                  + (f" recurse_ok={st['recurse_ok']}" if "--recurse" in extra else "")
                                  + (f" other={st['other']}" if st["other"] else "")
                                  + ("" if ok else f" err={(rep.get('error') or '')[:160]}"))
@@ -4723,12 +4732,18 @@ def check_hunt():
                                  f"hits={pr.get('hits')}/{want} exit={rep.get('app_exit')} err={(rep.get('error') or '')[:120]}")
             except Exception as e:
                 record(name, False, repr(e))
-        # Starvation: 8 threads hitting the probe back to back while main sleeps 300 ms and
-        # calls ExitProcess. Uninstrumented: ~0.3 s. Every debug event freezes the whole process,
-        # so on breakpoint/hw a thread that hits no probe used to run only in the gaps between
-        # events (ROADMAP A5): now one event per hit and fairness parking. Bar: exits within
-        # 30 s (incl. delivering ~100k logs), and every hit is a delivered log or an honestly
-        # counted drop / interruption.
+        # Starvation: 8 threads hitting the probe back to back while main sleeps 300 ms, prints
+        # one line and calls ExitProcess. Every debug event freezes the whole process, so on
+        # breakpoint/hw a thread that hits no probe used to run only in the gaps between events
+        # (ROADMAP A5: main's Sleep+print took 4 s typically, > 180 s at worst): now one event
+        # per hit and fairness (hot threads yield). Measured where starvation shows and in a unit
+        # machine load does not distort: the reads the 8 threads made (= probe hits the session
+        # handled) between main's Sleep falling due and main running again -- counted by the
+        # target. Measured: with yield rounds 1.5k-6.5k hits (main's Sleep(10) steps every ~80 ms);
+        # without them (suspension parking) 45k-234k, and the original starvation was far
+        # worse (> 180 s). Bar: <= 20000 hits (inline: not judged, it freezes nothing); exit within the 60 s
+        # timeout; every hit a delivered log or an honestly counted drop / interruption. (Wall
+        # time is reported, not judged: on a loaded machine the session itself is slowed.)
         name = f"hunt-starve-{bk}"
         if hunt_selected(name):
             try:
@@ -4737,11 +4752,15 @@ def check_hunt():
                 secs = time.perf_counter() - t0
                 hits = (rd or {}).get("hits") or 0
                 cut = rep.get("callbacks_interrupted")
-                ok = (not tmo and rep.get("app_exit") == 6 and secs < 30 and hits > 0 and cut is not None and
-                      st["read"] + (rep.get("log_dropped") or 0) + cut == hits and st["unmapped"] == 0 and
-                      tg.get("bad") == 0 and (bk == "inline" or cut == 0))
-                record(name, ok, f"exit={rep.get('app_exit')} secs={secs:.1f} hits={hits} logs={st['read']} "
-                                 f"dropped={rep.get('log_dropped')} interrupted={cut} "
+                late = (tg.get("sleep_ms") or 10**9) - 300
+                late_reads = tg.get("late_reads") if tg.get("late_reads") is not None else 10**9
+                pms = tg.get("print_ms")
+                ok = (not tmo and rep.get("app_exit") == 6 and (bk == "inline" or late_reads <= 20000) and hits > 0 and
+                      cut is not None and st["read"] + (rep.get("log_dropped") or 0) + cut == hits and
+                      st["unmapped"] == 0 and tg.get("bad") == 0 and (bk == "inline" or cut == 0))
+                record(name, ok, f"exit={rep.get('app_exit')} main: late_reads={late_reads} (max 20000) sleep_late={late}ms "
+                                 f"print={pms}ms secs={secs:.1f} "
+                                 f"hits={hits} logs={st['read']} dropped={rep.get('log_dropped')} interrupted={cut} "
                                  f"reads_at_print={tg.get('reads_at_exit')} timeout={tmo}")
             except Exception as e:
                 record(name, False, repr(e))

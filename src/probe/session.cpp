@@ -405,7 +405,25 @@ struct probe_session {
     // the other threads run then -- and released together. See fair_tick.
     std::vector<std::pair<DWORD, HANDLE>> parked;
     bool parking = false;
-    bool fine_timer = false;                   // timeBeginPeriod(1) held (only while something polls at 1 ms)
+    bool fine_timer = false;
+    uint32_t fair_events = 0;                   // debug events in the current fairness window
+    LONGLONG round_wake = 0;                    // the current yield round ends (system time, 100 ns)
+    std::unordered_set<DWORD> yielded_round;    // threads that yielded in the current round (once each)
+    uint64_t park_rounds = 0, parked_total = 0;   // fairness statistics (PROBE_TRACE: printed at the end)
+    // Yield stubs (see yield_thread): per thread, `resume address; code`, carved from blocks that
+    // are never freed (a thread may sleep inside one across a detach).
+    std::unordered_map<DWORD, uint64_t> yield_stubs;
+    uint64_t yield_next = 0, yield_end = 0, yield_fn = 0;
+    bool yield_unusable = false;
+    ULONGLONG rekick_at = 0;
+    std::unordered_set<uint64_t> early_unloaded;   // instances torn down at a newer LOAD (their late UNLOAD skipped)
+    // Every mapped instance of every module, in LOAD order (module_bases keeps only the latest):
+    // a DLL loaded concurrently can be mapped twice, one mapping discarded. See retarget_pending.
+    std::vector<std::pair<std::string, uint64_t>> module_instances;
+    // Other instances' copies of inline sites (gated too, see LOAD_DLL): a thread hitting one
+    // proves that instance is the live one -- its probe moves there (handle_gate).
+    struct ExtraGate { uint64_t site = 0, base = 0; Probe *probe = nullptr; };
+    std::vector<ExtraGate> extra_gates;                   // ask the agent's service for another install round then (0: no)                   // timeBeginPeriod(1) held (only while something polls at 1 ms)
     std::chrono::steady_clock::time_point fair_window{}, last_event{};
     std::chrono::steady_clock::duration fair_gaps{};
     // Context round-trips (ROADMAP A4): a thread whose debug event we handled while the target
@@ -3652,7 +3670,7 @@ static bool clear_released_images(const probe_session *s, CONTEXT &c) {
     return changed;
 }
 static void reapply_hw_thread(probe_session *s, DWORD tid) {
-    if (!s->hw_active && s->hw_released.empty()) return;
+    if (!s->hw_active && s->hw_released.empty() && s->gates.empty()) return;
     HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
     if (!t) return;
     CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
@@ -3668,6 +3686,7 @@ static void reapply_hw_thread(probe_session *s, DWORD tid) {
         uint32_t rw = 0, len = 0; hw_rw_len(p->flags, rw, len);
         set_dr_on_thread(t, p->dr_slot, p->address, true, rw, len, s);
     }
+    for (auto &g : s->gates) set_dr_on_thread(t, g.second, g.first, true, 0, 0, s);   // inline install gates too
     CloseHandle(t);
 }
 
@@ -4049,6 +4068,12 @@ static bool arm_gates_for_pending(probe_session *s) {
             for (auto &g : s->gates) if (g.first == p->address) gated = true;
             if (!gated) sites.push_back(p->address);
         }
+    for (const auto &e : s->extra_gates) {
+        const uint64_t x = e.site;
+        bool gated = std::find(sites.begin(), sites.end(), x) != sites.end();
+        for (auto &g : s->gates) if (g.first == x) gated = true;
+        if (!gated) sites.push_back(x);
+    }
     std::vector<int> slots;
     const uint8_t foreign = sites.empty() ? 0 : target_slots_any(s);
     for (int slot = 0; slot < 4 && slots.size() < sites.size(); ++slot)
@@ -4064,13 +4089,27 @@ static bool arm_gates_for_pending(probe_session *s) {
         }
         s->dr_used |= (uint8_t)(1u << slot); s->dr_ever |= (uint8_t)(1u << slot);
         s->gates.push_back({sites[i], slot});
+        // A thread still in its loader initialisation, or inside exception dispatch / an APC,
+        // resumes through NtContinue with the debug registers it had before -- without this
+        // gate -- and could run the site uncaught before its hook is in (seen: hunt-dll-work-
+        // backend-inline, x86 under load, 1-5 of 240 calls missed). The thread-start and
+        // context-restore fixups put gates back as they do hardware probes (after this event).
+        s->thread_start_due = true;
         if (trace_enabled()) std::fprintf(stderr, "  gate 0x%llx DR%d\n", (unsigned long long)sites[i], slot);
     }
     return true;
 }
 
 static void clear_gates(probe_session *s) {
+    // A gate on another instance's copy of an ACTIVE probe's site stays until a thread hits it
+    // (the probe moves there) or the probe leaves that instance; the rest go.
+    std::vector<probe_session::ExtraGate> keep;
+    for (const auto &e : s->extra_gates)
+        if (e.probe && e.probe->active && !e.probe->retired && e.probe->address != e.site && !s->detaching) keep.push_back(e);
+    s->extra_gates = keep;
+    std::vector<std::pair<uint64_t, int>> kept;
     for (auto &g : s->gates) {
+        if (std::any_of(keep.begin(), keep.end(), [&](const auto &e) { return e.site == g.first; })) { kept.push_back(g); continue; }
         for (DWORD tid : s->threads) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
             GuardTouch touch(s, tid);
@@ -4079,10 +4118,11 @@ static void clear_gates(probe_session *s) {
         s->dr_used &= (uint8_t)~(1u << g.second);
         retire_hw_address(s, g.first);                       // a #DB already in flight is stale
     }
-    s->gates.clear();
+    s->gates = kept;
 }
 
 // A gate fired: hold this thread at the site until the hook is confirmed.
+static bool arm_quietly(probe_session *s, const std::string &name, uint64_t base);
 static bool handle_gate(probe_session *s, const DEBUG_EVENT &event) {
     if (s->gates.empty()) return false;
     HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
@@ -4096,7 +4136,30 @@ static bool handle_gate(probe_session *s, const DEBUG_EVENT &event) {
         if (hit) { c.EFlags |= 0x10000u; SetThreadContext(thread, &c); }   // RF: run the site once resumed
     }
     CloseHandle(thread);
-    if (hit) hold_thread(s, event.dwThreadId);
+    if (hit) {
+        hold_thread(s, event.dwThreadId);
+#if defined(_WIN64)
+        const uint64_t pc = c.Rip;
+#else
+        const uint64_t pc = c.Eip;
+#endif
+        // Another instance's copy of a probe's site, now running: that instance is the live
+        // one. The probe moves there (the old instance keeps its hook until it is unmapped;
+        // its calls still count), and this thread waits for the new hook like any gated one.
+        for (auto it = s->extra_gates.begin(); it != s->extra_gates.end(); ++it) {
+            if (it->site != pc || !it->probe) continue;
+            Probe &p = *it->probe;
+            const uint64_t base = it->base;
+            s->extra_gates.erase(it);
+            if (p.address == pc || p.retired) break;
+            if (trace_enabled()) std::fprintf(stderr, "  gate: %s moves to the live instance at 0x%llx\n", p.location.c_str(),
+                                              (unsigned long long)base);
+            p.active = false; p.vetted = false; p.base = p.address = 0;
+            arm_quietly(s, p.module, base);
+            if (agent_has_pending(s)) kick_agent(s);
+            break;
+        }
+    }
     return hit;
 }
 
@@ -4762,6 +4825,16 @@ static void detach(probe_session *s) {
             SetThreadContext(t, &w);
         }
     }
+    // A thread asleep in a yield stub resumes at the address in its slot: if that is in a
+    // trampoline (freed at close), the real code instead.
+    for (const auto &kv : s->yield_stubs) {
+        uint64_t resume = 0, tr = 0; size_t n = 0;
+        if (!remote_read(s->pi.hProcess, kv.second, &resume, sizeof(void *), &n) || n != sizeof(void *)) continue;
+        if (const auto *d = dtramp_at(s, resume, &tr)) {
+            const uint64_t real = d->site + (resume - tr);
+            remote_write(s->pi.hProcess, kv.second, &real, sizeof(void *), &n);
+        }
+    }
     inplace_release_all(s);                                 // every INT3 is gone: nothing to hold for
     // Final pass, after every queued event has been continued: continuing an event can
     // restore the debug registers captured when the exception was raised. Clear our DR
@@ -5018,6 +5091,10 @@ static long suspend_count(HANDLE t) {
 }
 
 static void park_release(probe_session *s) {
+    if (!s->parked.empty()) { ++s->park_rounds; s->parked_total += s->parked.size(); }
+    if (trace_enabled() && !s->parked.empty())
+        std::fprintf(stderr, "  park-release n=%zu t=%lld\n", s->parked.size(),
+                     (long long)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
     for (auto &e : s->parked) { ResumeThread(e.second); CloseHandle(e.second); }
     s->parked.clear();
     s->parking = false;
@@ -5026,39 +5103,182 @@ static void park_release(probe_session *s) {
 // Park the thread whose hit is about to be continued (see probe_session::parked). Never a
 // thread we must keep running: one in a step (an in-place window waits on it), a call_func /
 // call_original thread, our agent's threads.
-static void park_thread(probe_session *s, DWORD tid) {
-    if (s->detaching || s->exited || thread_in_call(s, tid) || tid == s->inplace_owner || s->stepping.count(tid) ||
-        inplace_exempt(s, tid))
+// Make the thread whose hit is about to be continued sleep ~2 ms right after it (yield_stub:
+// registers, flags and XMM0-5 (x86 XMM0-7) saved, ntdll!NtDelayExecution, all restored, a jump to
+// where it was going). NOT a suspension: a thread suspended while it is still inside its debug
+// event resumes the frozen process only when it runs again -- suspending hot threads kept the
+// whole target frozen (main's Sleep(10) took 1-2.5 s); a thread asleep in its own code leaves it
+// running, so the threads that hit nothing get the CPU.
+static uint64_t yield_stub(probe_session *s, DWORD tid) {
+    if (auto it = s->yield_stubs.find(tid); it != s->yield_stubs.end()) return it->second;
+    if (s->yield_unusable) return 0;
+    if (!s->yield_fn) {
+        s->yield_fn = resolve_symbol(s, "ntdll.dll!NtDelayExecution");
+        if (!s->yield_fn) { s->yield_unusable = true; return 0; }
+    }
+    if (s->yield_next + 256 > s->yield_end) {
+        void *m = VirtualAllocEx(s->pi.hProcess, nullptr, 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (!m) { s->yield_unusable = true; return 0; }
+        s->yield_next = (uint64_t)(uintptr_t)m; s->yield_end = s->yield_next + 0x10000;
+    }
+    const uint64_t at = s->yield_next;
+    std::vector<unsigned char> c(16, 0);                       // [0]: resume address, [8]: wake-up (absolute)
+    auto put = [&](std::initializer_list<unsigned char> b) { c.insert(c.end(), b); };
+    auto put_u = [&](uint64_t v, int n) { for (int i = 0; i < n; ++i) c.push_back((unsigned char)(v >> (8 * i))); };
+#if defined(_WIN64)
+    put({0x9C, 0x53, 0x50, 0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53});   // pushfq; rbx rax rcx rdx r8-r11
+    put({0x48, 0x89, 0xE3});                                   // mov rbx, rsp
+    put({0x48, 0x83, 0xE4, 0xF0});                             // and rsp, -16
+    put({0x48, 0x81, 0xEC, 0x90, 0, 0, 0});                    // sub rsp, 0x90
+    put({0xF3, 0x0F, 0x7F, 0x44, 0x24, 0x30, 0xF3, 0x0F, 0x7F, 0x4C, 0x24, 0x40, 0xF3, 0x0F, 0x7F, 0x54, 0x24, 0x50,
+         0xF3, 0x0F, 0x7F, 0x5C, 0x24, 0x60, 0xF3, 0x0F, 0x7F, 0x64, 0x24, 0x70,
+         0xF3, 0x0F, 0x7F, 0xAC, 0x24, 0x80, 0, 0, 0});        // movdqu [rsp+0x30..0x80], xmm0..xmm5
+    put({0x31, 0xC9});                                         // xor ecx, ecx (not alertable)
+    put({0x48, 0x8D, 0x15});                                   // lea rdx, [rip+rel32] -> [8]: the wake-up time
+    { const int32_t r = (int32_t)(8 - (int64_t)(c.size() + 4)); put_u((uint32_t)r, 4); }
+    put({0x48, 0xB8}); put_u(s->yield_fn, 8);                  // mov rax, NtDelayExecution
+    put({0xFF, 0xD0});                                         // call rax
+    put({0xF3, 0x0F, 0x6F, 0x44, 0x24, 0x30, 0xF3, 0x0F, 0x6F, 0x4C, 0x24, 0x40, 0xF3, 0x0F, 0x6F, 0x54, 0x24, 0x50,
+         0xF3, 0x0F, 0x6F, 0x5C, 0x24, 0x60, 0xF3, 0x0F, 0x6F, 0x64, 0x24, 0x70,
+         0xF3, 0x0F, 0x6F, 0xAC, 0x24, 0x80, 0, 0, 0});        // movdqu xmm0..xmm5, [...]
+    put({0x48, 0x89, 0xDC});                                   // mov rsp, rbx
+    put({0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58, 0x5A, 0x59, 0x58, 0x5B, 0x9D});   // pops; popfq
+    put({0xFF, 0x25});                                         // jmp [rip+rel32] -> [0]
+    const int32_t rel = (int32_t)(0 - (int64_t)(c.size() + 4)); put_u((uint32_t)rel, 4);
+#else
+    put({0x9C, 0x60});                                         // pushfd; pushad
+    put({0x89, 0xE3});                                         // mov ebx, esp
+    put({0x83, 0xE4, 0xF0});                                   // and esp, -16
+    put({0x81, 0xEC, 0x90, 0, 0, 0});                          // sub esp, 0x90
+    put({0xF3, 0x0F, 0x7F, 0x44, 0x24, 0x10, 0xF3, 0x0F, 0x7F, 0x4C, 0x24, 0x20, 0xF3, 0x0F, 0x7F, 0x54, 0x24, 0x30,
+         0xF3, 0x0F, 0x7F, 0x5C, 0x24, 0x40, 0xF3, 0x0F, 0x7F, 0x64, 0x24, 0x50, 0xF3, 0x0F, 0x7F, 0x6C, 0x24, 0x60,
+         0xF3, 0x0F, 0x7F, 0x74, 0x24, 0x70, 0xF3, 0x0F, 0x7F, 0xBC, 0x24, 0x80, 0, 0, 0});   // movdqu [esp+0x10..0x80], xmm0..7
+    put({0xB8}); put_u(at + 8, 4);                             // mov eax, &[8]: the wake-up time
+    put({0x50, 0x6A, 0x00});                                   // push eax; push FALSE
+    put({0xB8}); put_u(s->yield_fn, 4);                        // mov eax, NtDelayExecution
+    put({0xFF, 0xD0});                                         // call eax (stdcall: pops its 2 args)
+    put({0xF3, 0x0F, 0x6F, 0x44, 0x24, 0x10, 0xF3, 0x0F, 0x6F, 0x4C, 0x24, 0x20, 0xF3, 0x0F, 0x6F, 0x54, 0x24, 0x30,
+         0xF3, 0x0F, 0x6F, 0x5C, 0x24, 0x40, 0xF3, 0x0F, 0x6F, 0x64, 0x24, 0x50, 0xF3, 0x0F, 0x6F, 0x6C, 0x24, 0x60,
+         0xF3, 0x0F, 0x6F, 0x74, 0x24, 0x70, 0xF3, 0x0F, 0x6F, 0xBC, 0x24, 0x80, 0, 0, 0});
+    put({0x89, 0xDC, 0x61, 0x9D});                             // mov esp, ebx; popad; popfd
+    put({0xFF, 0x25}); put_u(at, 4);                           // jmp [at] -> [0]
+#endif
+    if (c.size() > 256) { s->yield_unusable = true; return 0; }
+    size_t wrote = 0;
+    if (!remote_write(s->pi.hProcess, at, c.data(), c.size(), &wrote) || wrote != c.size()) { s->yield_unusable = true; return 0; }
+    FlushInstructionCache(s->pi.hProcess, (void *)(uintptr_t)at, c.size());
+    s->yield_next += 256;
+    try { s->yield_stubs[tid] = at; } catch (...) { return 0; }
+    return at;
+}
+static bool in_yield_stub(const probe_session *s, uint64_t ip) {
+    for (const auto &kv : s->yield_stubs) if (ip >= kv.second && ip < kv.second + 256) return true;
+    return false;
+}
+static void park_thread(probe_session *s, DWORD tid, DWORD disposition) {
+    if (disposition != DBG_CONTINUE || s->detaching || s->exited || thread_in_call(s, tid) || tid == s->inplace_owner ||
+        s->stepping.count(tid) || inplace_exempt(s, tid) || target_has_shadow_stack(s))
         return;
-    for (auto &e : s->parked) if (e.first == tid) return;
-    HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+    // Not when the program probes NtDelayExecution itself (the stub's call would be its hit).
+    if (s->yield_fn) for (const auto &p : s->probes) if (p->active && p->address == s->yield_fn) return;
+    if (!s->yielded_round.insert(tid).second) return;          // once per round
+    HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
     if (!t) return;
-    guard_note_hold(s, tid);
-    if (SuspendThread(t) == (DWORD)-1) { CloseHandle(t); return; }
-    try { s->parked.emplace_back(tid, t); } catch (...) { ResumeThread(t); CloseHandle(t); }
+    CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
+    // Not a thread resuming with RF or TF (a hw hit re-run at its site, a step): the stub's
+    // first instruction would consume the flag, and the site would trap again at the jump back.
+    const uint64_t stub = GetThreadContext(t, &c) && !(c.EFlags & 0x10100u) && !in_yield_stub(s, (uint64_t)EMU_IP(c))
+                          ? yield_stub(s, tid) : 0;
+    if (stub) {
+        const uint64_t resume = (uint64_t)EMU_IP(c);
+        size_t w = 0, w2 = 0;
+        // Every thread of a round sleeps until the SAME moment (absolute system time): they
+        // are off the CPU together from the last one's yield to then -- staggered 2 ms sleeps
+        // barely overlapped (the yields come one event apart).
+        const LONGLONG wake = s->round_wake;
+        if (remote_write(s->pi.hProcess, stub, &resume, sizeof(void *), &w) && w == sizeof(void *) &&
+            remote_write(s->pi.hProcess, stub + 8, &wake, sizeof(wake), &w2) && w2 == sizeof(wake)) {
+            EMU_IP(c) = (decltype(EMU_IP(c)))(stub + 16);
+            c.ContextFlags = CONTEXT_CONTROL;
+            if (SetThreadContext(t, &c)) ++s->parked_total;
+        }
+    }
+    CloseHandle(t);
 }
 // Called by the event loop around every wait. `blocked`: how long the last wait for a debug
 // event blocked (the target ran unfrozen meanwhile, give or take), `got`: an event came.
 // Returns the next wait's timeout.
+static bool arm_module(probe_session *s, const std::string &module, uint64_t base);
+static bool arm_gates_for_pending(probe_session *s);
+static bool arm_quietly(probe_session *s, const std::string &name, uint64_t base);
+static bool site_executable(HANDLE h, uint64_t a) {
+    MEMORY_BASIC_INFORMATION m{};
+    return a && VirtualQueryEx(h, (void *)(uintptr_t)a, &m, sizeof(m)) && m.State == MEM_COMMIT && !(m.Protect & PAGE_GUARD) &&
+           (m.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+}
+// An install round made no progress: a pending inline probe whose site is not installable (not
+// executable code -- an instance still relocating, or a mapping the loader discards) while
+// another instance of its module has that site as code: move the probe there (newest first).
+static void retarget_pending(probe_session *s) {
+    bool moved = false;
+    std::vector<std::pair<std::string, uint64_t>> arm;           // armed after the scan (arming may add probes)
+    for (auto &p : s->probes) {
+        if (!(p->flags & PROBE_INLINE) || !p->address || !p->base || p->active || p->retired) continue;
+        if (site_executable(s->pi.hProcess, p->address)) continue;
+        const uint64_t off = p->address - p->base;
+        for (auto it = s->module_instances.rbegin(); it != s->module_instances.rend(); ++it) {
+            if (it->second == p->base || !iequals(it->first, p->module)) continue;
+            if (!site_executable(s->pi.hProcess, it->second + off)) continue;
+            if (trace_enabled()) std::fprintf(stderr, "  retarget %s 0x%llx -> 0x%llx\n", p->location.c_str(),
+                                              (unsigned long long)p->address, (unsigned long long)(it->second + off));
+            p->base = p->address = 0; p->vetted = false;
+            arm.emplace_back(it->first, it->second);
+            moved = true;
+            break;
+        }
+    }
+    for (const auto &a : arm) arm_quietly(s, a.first, a.second);
+    if (moved) arm_gates_for_pending(s);
+}
 static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blocked, bool got) {
     using namespace std::chrono;
     const auto now = steady_clock::now();
     if (s->fair_window == steady_clock::time_point{}) s->fair_window = now;
     s->fair_gaps += blocked;
     if (got) s->last_event = now;
-    if (!got && now - s->last_event >= milliseconds(2)) {
-        if (!s->parked.empty()) park_release(s);                  // the others ran: the parked go on
-        s->parking = false;
-    }
+    if (got) ++s->fair_events;
     if (now - s->fair_window >= milliseconds(20)) {
-        if (!s->parking && got && s->fair_gaps * 10 < now - s->fair_window) s->parking = true;
+        const bool was = s->parking;
+        // Dense debug events (>= 2000/s: the target is mostly frozen) -- or little unfrozen
+        // time -- start a yield round: every thread whose hit is continued in the next window
+        // sleeps ~2 ms once (park_thread), so all of them are off the CPU together for a moment
+        // and a thread that hits nothing runs. (Measured: with the unfrozen-time rule alone, a
+        // fast session kept >10% unfrozen yet main's Sleep(300) returned 3-20 s late: whenever
+        // unfrozen, the hot threads had the CPU and trapped again before main was scheduled.)
+        s->parking = got && (s->fair_events >= 40 || s->fair_gaps * 10 < now - s->fair_window);
+        s->fair_events = 0;
+        if (s->parking) {
+            ++s->park_rounds; s->yielded_round.clear();
+            FILETIME ft; GetSystemTimeAsFileTime(&ft);
+            s->round_wake = (LONGLONG)(((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime) + 40000;   // now + 4 ms
+        }
+        if (s->parking && !was) {
+            if (trace_enabled())
+                std::fprintf(stderr, "  park-start t=%lld\n",
+                             (long long)duration_cast<microseconds>(now.time_since_epoch()).count());
+        }
         s->fair_window = now; s->fair_gaps = {};
     }
     // 1 ms timer resolution only while a parked thread or a context watch waits on this loop:
     // process-wide, it also makes every Sleep(1) of the controller's own threads (the log
     // drainer) wake 15x as often -- a writer that never sees its queue empty kept a mid-run
     // probe_report (flush) waiting for the target to finish.
-    const bool fine = !s->parked.empty() || !s->ctx_watch.empty();
+    if (s->rekick_at && GetTickCount64() >= s->rekick_at) {
+        s->rekick_at = 0;
+        if (agent_has_pending(s)) retarget_pending(s);
+        if (agent_has_pending(s) && !kick_agent(s)) std::fprintf(stderr, "probe: %s\n", s->error.c_str());
+    }
+    const bool fine = s->parking || !s->ctx_watch.empty() || s->rekick_at;   // (yields sleep 2 ms, not a tick)
     if (fine != s->fine_timer) { if (fine) timeBeginPeriod(1); else timeEndPeriod(1); s->fine_timer = fine; }
     return fine ? 1 : 20;
 }
@@ -5282,7 +5502,12 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
         if (n == offsetof(probe_ipc_request, address) && head.op == PROBE_IPC_INSTALL_DONE) {
             // Harmless if forged: acceptance re-checks every request status itself.
             if (!accept_agent_install(s)) { std::fprintf(stderr, "probe: %s\n", s->error.c_str()); }
-            if (agent_has_pending(s)) kick_agent(s);
+            // Still pending after a round: its site is not installable YET (a relocated DLL's
+            // code is not executable until the loader has finished relocating it). Asking again
+            // at once made the agent spin round after round, each an event that freezes the
+            // target -- the loading thread starved and the install timed out after 5 s (calls
+            // missed: hunt-dll-work-backend-inline under load). Ask again in 5 ms instead.
+            if (agent_has_pending(s)) s->rekick_at = GetTickCount64() + 5;
             else if (!inline_hold_needed(s)) release_held(s, "inline installs confirmed");
             return true;
         }
@@ -5367,16 +5592,20 @@ static void enforce_owned_drs(const probe_session *s, DWORD tid, CONTEXT &c, boo
         const Probe *owner = nullptr;
         for (const auto &p : s->probes)
             if (p->active && (p->flags & PROBE_HW) && p->dr_slot == slot) { owner = p.get(); break; }
+        // An inline install gate (arm_gates_for_pending) owns its slot like a probe: execute.
+        uint64_t want = owner ? owner->address : 0;
+        if (!owner) for (const auto &g : s->gates) if (g.second == slot) { want = g.first; break; }
         const DWORD64 ln = (DWORD64)1 << (slot * 2), fieldmask = (DWORD64)0xF << (16 + slot * 4);
         DWORD64 dr7 = c.Dr7;
-        if (owner && hw_yielded(s, c, slot)) continue;           // the program's own breakpoint: left alone
-        if (owner) {
-            uint32_t rw = 0, len = 0; hw_rw_len(owner->flags, rw, len);
+        if (want && hw_yielded(s, c, slot)) continue;            // the program's own breakpoint: left alone
+        if (want) {
+            uint32_t rw = 0, len = 0;
+            if (owner) hw_rw_len(owner->flags, rw, len);
             switch (slot) {
-            case 0: c.Dr0 = (decltype(c.Dr0))owner->address; break;
-            case 1: c.Dr1 = (decltype(c.Dr1))owner->address; break;
-            case 2: c.Dr2 = (decltype(c.Dr2))owner->address; break;
-            default: c.Dr3 = (decltype(c.Dr3))owner->address; break;
+            case 0: c.Dr0 = (decltype(c.Dr0))want; break;
+            case 1: c.Dr1 = (decltype(c.Dr1))want; break;
+            case 2: c.Dr2 = (decltype(c.Dr2))want; break;
+            default: c.Dr3 = (decltype(c.Dr3))want; break;
             }
             dr7 = (dr7 & ~fieldmask) | ln | ((DWORD64)(((len & 3u) << 2) | (rw & 3u)) << (16 + slot * 4));
         } else if (clear_stale && !(s->dr_used & (1u << slot)) && !target_owns_slot(s, tid, c, slot)) {
@@ -5420,7 +5649,7 @@ static void restore_fixup(probe_context *c) {
         // before the arm, out of a 32-bit debugger's reach. Re-apply after the restore and
         // BEFORE the first instruction runs: the record resumes at our private INT3
         // (call_trap), where restore_resume_hit puts the DRs back and the thread at its real EIP.
-        if (!s->hw_active || !(img.ContextFlags & CONTEXT_CONTROL & ~CONTEXT_i386) || !ensure_call_trap(s)) return;
+        if ((!s->hw_active && s->gates.empty()) || !(img.ContextFlags & CONTEXT_CONTROL & ~CONTEXT_i386) || !ensure_call_trap(s)) return;
         DWORD eip = 0; size_t got = 0;
         const uint64_t at_eip = rec + offsetof(CONTEXT, Eip);
         if (!remote_read(s->pi.hProcess, at_eip, &eip, 4, &got) || got != 4 || eip == (DWORD)s->call_trap) return;
@@ -6439,7 +6668,41 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         // A trap at the address of a hardware probe we have RELEASED, raised before the
         // release reached this thread (its debug status no longer names the slot): ours,
         // stale. Clear our slots on the thread, step over with RF, and swallow it.
-        if (hw_released_on(s, event.dwThreadId, address) && !probe_any_at(s, address)) {
+        // A stale image of an inline install GATE (the gate is cleared once the hook is in, but
+        // a context record written while it was live -- the restore fixup -- can bring it back
+        // on a thread that has run since): a #DB exactly at one of our inline sites from a slot
+        // we no longer use is ours. Off on this thread; the site runs (its hook) with RF.
+        bool stale_gate = false;
+        for (const auto &p : s->probes)
+            if ((p->flags & PROBE_INLINE) && p->address == address) { stale_gate = true; break; }
+        for (const auto &g : s->gates) if (g.first == address) stale_gate = false;
+        if (stale_gate) {
+            HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
+            CONTEXT w{}; w.ContextFlags = CONTEXT_DEBUG_REGISTERS | CONTEXT_CONTROL;
+            bool ours = false;
+            if (t && GetThreadContext(t, &w)) {
+                for (int slot = 0; slot < 4; ++slot) {
+                    if (!(s->dr_ever & (1u << slot)) || (s->dr_used & (1u << slot)) || !((w.Dr7 >> (slot * 2)) & 3) ||
+                        dr_address(w, slot) != address) continue;
+                    w.Dr7 &= ~((DWORD64)3 << (slot * 2)) & ~((DWORD64)0xF << (16 + slot * 4));
+                    ours = true;
+                }
+                if (ours) {
+                    w.Dr6 = 0;
+                    w.EFlags |= 0x10000u;
+                    SetThreadContext(t, &w);
+                    if (trace_enabled()) std::fprintf(stderr, "  stale gate tid=%lu at 0x%llx\n", (unsigned long)event.dwThreadId,
+                                                      (unsigned long long)address);
+                }
+            }
+            if (t) CloseHandle(t);
+            if (ours) { disposition = DBG_CONTINUE; return true; }
+        }
+        // (An INLINE probe at that address does not count: a cleared install gate's #DB is ours.)
+        bool hw_live_here = false;
+        for (const auto &p : s->probes)
+            if (p->active && (p->flags & PROBE_HW) && p->address == address) { hw_live_here = true; break; }
+        if (hw_released_on(s, event.dwThreadId, address) && !hw_live_here) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
             CONTEXT w{}; w.ContextFlags = CONTEXT_DEBUG_REGISTERS | CONTEXT_CONTROL;
             if (t && GetThreadContext(t, &w)) {
@@ -7444,7 +7707,7 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
     // Fairness (see probe_session::parked): the thread of an exception event about to be
     // continued is parked while the target is starved of unfrozen time.
     if (ok && s->parking && event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT && !s->skip_continue)
-        park_thread(s, event.dwThreadId);
+        park_thread(s, event.dwThreadId, disposition);
     // A hardware probe was released while the process runs: threads still starting must meet
     // the thread-start fixup (see probe_session::hw_released). Armed here, outside the loops
     // over the probes that release them, and before any thread runs on.
@@ -7460,6 +7723,107 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
     if (!s->exited) guard_sync(s);
     return ok;
 }
+// A module instance at `base` is gone: its symbols, its recorded base, and its probes (absolute
+// ones retired; module ones back to pending, re-armed when the module loads again).
+static void module_unloaded(probe_session *s, uint64_t base) {
+    // Gates on this instance's copies of other instances' probe sites: gone with it.
+    for (auto it = s->extra_gates.begin(); it != s->extra_gates.end(); ) {
+        if (it->base != base) { ++it; continue; }
+        const uint64_t site = it->site;
+        it = s->extra_gates.erase(it);
+        for (auto g = s->gates.begin(); g != s->gates.end(); ) {
+            if (g->first != site) { ++g; continue; }
+            for (DWORD tid : s->threads) {
+                HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
+                GuardTouch touch(s, tid);
+                if (t) { keep_queued_dr6(s, tid, t); set_dr_on_thread(t, g->second, 0, false); CloseHandle(t); }
+            }
+            s->dr_used &= (uint8_t)~(1u << g->second);
+            retire_hw_address(s, g->first);
+            g = s->gates.erase(g);
+        }
+    }
+    s->module_instances.erase(std::remove_if(s->module_instances.begin(), s->module_instances.end(),
+                                             [base](const auto &m) { return m.second == base; }), s->module_instances.end());
+    sym_unload(s, base);
+    uint64_t size = 0;
+    if (auto sz = s->module_sizes.find(base); sz != s->module_sizes.end()) { size = sz->second; s->module_sizes.erase(sz); }
+    for (auto it = s->module_bases.begin(); it != s->module_bases.end(); )
+        if (it->second == base) it = s->module_bases.erase(it); else ++it;
+    for (auto &p : s->probes) {
+        // Absolute-address probes (probe_add_address / probe_watch: base 0) inside the
+        // module go with it, for good: there is no module to re-resolve them against, and
+        // a stale one would keep its debug register, shadow a new probe at a reused address
+        // (its saved instruction bytes run instead) and mask the new code's bytes.
+        if (!p->active || p->base || !size || p->address < base || p->address - base >= size) continue;
+        std::fprintf(stderr, "probe: %s retired: its module unloaded\n", p->location.c_str());
+        if (p->flags & PROBE_INLINE) {
+            if (s->shared && p->agent_index < PROBE_AGENT_MAX_PROBES)
+                InterlockedExchange(&s->shared->requests[p->agent_index].status, PROBE_AGENT_UNLOADED);
+            p->active = false;
+        } else if (p->flags & PROBE_HW) {
+            release_hw(s, *p);
+        } else {
+            p->active = false;
+            sync_int3_table(s);      // the agent's copy too: a stale entry masks reused memory
+        }
+        p->retired = true;
+    }
+    for (auto &p : s->probes) if (p->active && p->base == base) {
+        if (p->flags & PROBE_INLINE) {
+            // The hooked code went away with its module. The probe goes back to pending,
+            // exactly like breakpoint/hw probes: if the module loads again (anywhere),
+            // the agent installs a fresh hook at the new address.
+            std::fprintf(stderr, "probe: %s unloaded with its module; pending until it loads again\n", p->location.c_str());
+            p->active = false; p->vetted = false; p->base = p->address = 0;
+            // Tell the agent: its hook there now points at unmapped (or reused) memory,
+            // so detach must not write the original bytes back.
+            if (s->shared && p->agent_index < PROBE_AGENT_MAX_PROBES)
+                InterlockedExchange(&s->shared->requests[p->agent_index].status, PROBE_AGENT_UNLOADED);
+        } else if (p->flags & PROBE_HW) {
+            // Fully release the hardware breakpoint: clear its DR on every thread,
+            // free the slot, and drop the active count. A half-disarm (just
+            // clearing active/address) leaks the DR slot and strands the physical
+            // breakpoint on the unloaded address -> later slot exhaustion / crash.
+            release_hw(s, *p);
+            p->base = p->address = 0;
+        } else { p->active = false; p->base = p->address = 0; sync_int3_table(s); }
+    }
+}
+// After an instance went away while a newer one of the same module is already mapped at
+// `base`: arm the module's pending probes there, with the same install path as a LOAD.
+// The other instance may itself be gone already (a mapping the loader discarded): then the probes
+// stay pending for the next LOAD -- never a session error.
+static bool image_at(probe_session *s, uint64_t base) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    return VirtualQueryEx(s->pi.hProcess, (void *)(uintptr_t)base, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
+           mbi.Type == MEM_IMAGE && (uint64_t)(uintptr_t)mbi.AllocationBase == base;
+}
+static bool arm_quietly(probe_session *s, const std::string &name, uint64_t base) {
+    if (!image_at(s, base)) return false;
+    const std::string saved = s->error;
+    std::vector<std::pair<Probe *, bool>> was;                 // the module's probes: retired before?
+    for (auto &p : s->probes) if (iequals(p->module, name)) was.emplace_back(p.get(), p->retired);
+    const bool ok = arm_module(s, name, base);
+    if (!ok) {
+        if (trace_enabled()) std::fprintf(stderr, "  re-arm %s at 0x%llx failed (%s): pending\n", name.c_str(),
+                                          (unsigned long long)base, s->error.c_str());
+        s->error = saved;
+        for (auto &w : was)                                      // not armed there: pending again, not retired
+            if (!w.first->active) { w.first->retired = w.second; w.first->address = w.first->base = 0; w.first->vetted = false; }
+    }
+    return ok;
+}
+static bool arm_after_reload(probe_session *s, const std::string &name, uint64_t base) {
+    bool ok = arm_quietly(s, name, base) || true;
+    if (trace_enabled()) std::fprintf(stderr, "  re-arm %s at 0x%llx after a late unload\n", name.c_str(), (unsigned long long)base);
+    if (ok && agent_has_pending(s)) {
+        if (s->shared->service_ready && s->svc_event) { arm_gates_for_pending(s); ok = kick_agent(s); }
+        else if (s->remote_agent && s->remote_work == probe_session::REMOTE_NONE) ok = start_agent_init(s);
+    }
+    return ok;
+}
+
 static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &disposition) {
     disposition = DBG_CONTINUE; bool ok = true;
     settle_hw_thread(s, event.dwThreadId);           // released hardware probes: still ours on it?
@@ -7538,6 +7902,31 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
         // active at this base belong to the OLD view: the fresh mapping has neither our INT3
         // nor our hook. Re-arm them in it (a hardware probe's debug register is per address:
         // it stays). ROADMAP A8.
+        s->early_unloaded.erase(base);                      // a new instance here
+        if (!s->detaching) {
+            // ... and at ANOTHER base: an older instance of this module whose image is gone but
+            // whose UNLOAD has not been reported yet keeps its probes marked active, so this
+            // instance would not be armed until that late unload (calls to it missed: seen,
+            // hunt-dll-work-backend-inline). Tear the old one down now; its late UNLOAD is then
+            // skipped (early_unloaded).
+            const std::string nm = event_module_name(s->pi.hProcess, event.u.LoadDll.hFile, base);
+            std::vector<uint64_t> gone;
+            for (auto &p : s->probes) {
+                if (!p->active || !p->base || p->base == base || !iequals(p->module, nm)) continue;
+                if (std::find(gone.begin(), gone.end(), p->base) != gone.end()) continue;
+                MEMORY_BASIC_INFORMATION mbi{};
+                const bool mapped = VirtualQueryEx(s->pi.hProcess, (void *)(uintptr_t)p->base, &mbi, sizeof(mbi)) &&
+                                    mbi.State == MEM_COMMIT && mbi.Type == MEM_IMAGE &&
+                                    (uint64_t)(uintptr_t)mbi.AllocationBase == p->base;
+                if (!mapped) gone.push_back(p->base);
+            }
+            for (uint64_t g : gone) {
+                if (trace_enabled()) std::fprintf(stderr, "  load at 0x%llx: older instance at 0x%llx gone, torn down now\n",
+                                                  (unsigned long long)base, (unsigned long long)g);
+                module_unloaded(s, g);
+                s->early_unloaded.insert(g);
+            }
+        }
         if (!s->detaching)
             for (auto &p : s->probes) {
                 if (!p->active || p->base != base || !base || (p->flags & PROBE_HW)) continue;
@@ -7554,8 +7943,25 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
             }
         std::string name = event_module_name(s->pi.hProcess, event.u.LoadDll.hFile, base);
         if (!name.empty()) s->module_bases[name] = base;
+        if (!name.empty()) s->module_instances.emplace_back(name, base);
         sym_register(s, event.u.LoadDll.hFile, base);
         ok = arm_module(s, name, base);
+        // A pending inline probe of this module resolved in ANOTHER instance (two mappings of
+        // one DLL, one of them discarded -- which one is not known yet): gate this copy of the
+        // site as well until the hook is in; retarget_pending moves the probe if its own copy
+        // never becomes installable.
+        // The same for an ACTIVE probe whose instance is still mapped: an older instance that is
+        // being unloaded (its DllMain detach runs) while this one is already in use by another
+        // thread -- calls to this one would go unhooked until the late UNLOAD.
+        bool extra = false;
+        if (!s->detaching && s->shared && s->shared->service_ready && s->svc_event)
+            for (auto &p : s->probes)
+                if ((p->flags & PROBE_INLINE) && p->address && p->base && p->base != base && !p->retired &&
+                    iequals(p->module, name)) {
+                    probe_session::ExtraGate e; e.site = base + (p->address - p->base); e.base = base; e.probe = p.get();
+                    s->extra_gates.push_back(e); extra = true;
+                }
+        if (extra && !agent_has_pending(s)) arm_gates_for_pending(s);   // (with pending ones: below)
         if (iequals(name, "probe_api_agent.dll")) {
             s->remote_agent = base;
         }
@@ -7603,49 +8009,16 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
                 break;
             }
         }
-        sym_unload(s, base);
-        uint64_t size = 0;
-        if (auto sz = s->module_sizes.find(base); sz != s->module_sizes.end()) { size = sz->second; s->module_sizes.erase(sz); }
-        for (auto it = s->module_bases.begin(); it != s->module_bases.end(); )
-            if (it->second == base) it = s->module_bases.erase(it); else ++it;
-        for (auto &p : s->probes) {
-            // Absolute-address probes (probe_add_address / probe_watch: base 0) inside the
-            // module go with it, for good: there is no module to re-resolve them against, and
-            // a stale one would keep its debug register, shadow a new probe at a reused address
-            // (its saved instruction bytes run instead) and mask the new code's bytes.
-            if (!p->active || p->base || !size || p->address < base || p->address - base >= size) continue;
-            std::fprintf(stderr, "probe: %s retired: its module unloaded\n", p->location.c_str());
-            if (p->flags & PROBE_INLINE) {
-                if (s->shared && p->agent_index < PROBE_AGENT_MAX_PROBES)
-                    InterlockedExchange(&s->shared->requests[p->agent_index].status, PROBE_AGENT_UNLOADED);
-                p->active = false;
-            } else if (p->flags & PROBE_HW) {
-                release_hw(s, *p);
-            } else {
-                p->active = false;
-                sync_int3_table(s);      // the agent's copy too: a stale entry masks reused memory
-            }
-            p->retired = true;
-        }
-        for (auto &p : s->probes) if (p->active && p->base == base) {
-            if (p->flags & PROBE_INLINE) {
-                // The hooked code went away with its module. The probe goes back to pending,
-                // exactly like breakpoint/hw probes: if the module loads again (anywhere),
-                // the agent installs a fresh hook at the new address.
-                std::fprintf(stderr, "probe: %s unloaded with its module; pending until it loads again\n", p->location.c_str());
-                p->active = false; p->vetted = false; p->base = p->address = 0;
-                // Tell the agent: its hook there now points at unmapped (or reused) memory,
-                // so detach must not write the original bytes back.
-                if (s->shared && p->agent_index < PROBE_AGENT_MAX_PROBES)
-                    InterlockedExchange(&s->shared->requests[p->agent_index].status, PROBE_AGENT_UNLOADED);
-            } else if (p->flags & PROBE_HW) {
-                // Fully release the hardware breakpoint: clear its DR on every thread,
-                // free the slot, and drop the active count. A half-disarm (just
-                // clearing active/address) leaks the DR slot and strands the physical
-                // breakpoint on the unloaded address -> later slot exhaustion / crash.
-                release_hw(s, *p);
-                p->base = p->address = 0;
-            } else { p->active = false; p->base = p->address = 0; sync_int3_table(s); }
+        if (s->early_unloaded.erase(base)) break;           // torn down already, at a newer instance's LOAD
+        {
+            std::vector<std::string> mods;
+            for (auto &p : s->probes) if (p->active && p->base == base && !p->module.empty()) mods.push_back(p->module);
+            module_unloaded(s, base);
+            // A newer instance of the module mapped ELSEWHERE already reported its load (its
+            // probes were still marked active here, so it was not armed): arm it now.
+            for (const auto &m : mods)
+                for (const auto &kv : s->module_bases)
+                    if (iequals(kv.first, m)) { ok = arm_after_reload(s, kv.first, kv.second) && ok; break; }
         }
         break;
     }
@@ -7835,6 +8208,9 @@ extern "C" int probe_run(probe_session *s) {
         if (!why.empty()) s->error = why;
     }
     park_release(s);
+    if (trace_enabled())
+        std::fprintf(stderr, "  fairness: %llu park rounds, %llu threads parked\n", (unsigned long long)s->park_rounds,
+                     (unsigned long long)s->parked_total);
     ctx_watch_poll(s, true);
     if (s->fine_timer) { timeEndPeriod(1); s->fine_timer = false; }
     release_held(s, "session end");

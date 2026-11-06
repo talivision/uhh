@@ -2566,7 +2566,10 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_stop(void *) {
         for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i)
             // Restore the original bytes -- unless the controller saw the module unload
             // (the address is unmapped or holds another image now), or the module went away
-            // before the controller has processed its unload (see disable_hook).
+            // before the controller has processed its unload (see disable_hook). A module that
+            // went away and is pending again (reloaded, not yet re-hooked when the detach came)
+            // still has its OLD hook object here, for code that may be unmapped: disable_hook
+            // checks the site is mapped and still holds our bytes before writing.
             if (hooks[i] && shared->requests[i].status != PROBE_AGENT_UNLOADED) {
                 HookOp op{i, 0, false};
                 if (!seh_run(disable_hook, &op)) new (&hooks[i]) SafetyHookMid();   // unmapped mid-write: abandoned in place

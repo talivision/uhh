@@ -211,14 +211,21 @@ reads, a slow (50 ms) callback under 32 threads.
   with no trap flag, so there is no single-step completion event; a fault in the copy is mapped
   back to the real instruction (re-run in place, as before), a watch hit in it reports the real
   pc, a thread inside one at a detach is moved to the real code. A program that single-steps
-  itself (TF set at the hit) keeps the stepped copy. (2) fairness parking: when the target ran
-  unfrozen for less than a tenth of the last 20 ms (the debugger's wait for events blocked < 2 ms),
-  the threads whose exception events are continued are parked (suspended) until the event queue
-  has been empty for 2 ms -- the threads that hit nothing run then -- and released together.
-  Never parked: a thread mid-step / owning an in-place window, a call_func/call_original thread,
-  the agent's threads; released before any call_func and at detach; listed for the controller-
-  death guard. `hunt-starve-*` (8 readers: exit within 30 s incl. ~100k logs, logs + dropped +
-  interrupted == hits); the exit checks now use 8 readers on every backend
+  itself (TF set at the hit) keeps the stepped copy. (2) fairness by YIELD rounds: when debug
+  events are dense (>= 2000/s) or the target ran unfrozen for less than a tenth of the last
+  20 ms, each thread whose hit is continued in the next window is sent once through a per-thread
+  yield stub (registers, flags, XMM saved; ntdll!NtDelayExecution until a deadline common to the
+  round, ~4 ms; everything restored; a jump to where it was going), so the hot threads are off
+  the CPU together for a moment and the threads that hit nothing run. Not done: CET shadow
+  stacks, a program that probes NtDelayExecution itself, a thread mid-step / in a call. A first
+  version SUSPENDED the hot threads instead -- a thread suspended inside its debug event keeps
+  the whole target frozen until it runs again, so main's Sleep(300) still returned 3-20 s late
+  (measured once main's own progress was measured, below). Detach rewrites a sleeping thread's
+  resume address out of a trampoline. `hunt-starve-*` (8 readers; judged in a unit machine load
+  does not distort: the probe hits the session handled between main's Sleep(300) falling due and
+  main running again, counted by the target -- yield rounds 1.5k-6.5k, suspension parking
+  45k-234k; bar 20000; wall time reported; logs + dropped + interrupted
+== hits); the exit checks now use 8 readers on every backend
 - ✅ (A6) inline missed calls made BEFORE the image entry point (TLS callbacks at process attach,
   static-import DllMain): the agent was loaded by a new thread, which cannot start before process
   initialisation ends, so hooks went in at the entry hold. Fixed (huntaudit): a launched target's
@@ -260,6 +267,27 @@ reads, a slow (50 ms) callback under 32 threads.
   of the old one at the same base (the case the guard handles; never observed in this audit), a
   breakpoint/inline probe still marked active there is re-armed in the fresh mapping, which has
   neither the INT3 nor the hook (hw: the DR is per address and stays). `hunt-dll-work-backend-*`
+  Follow-up (huntaudit, after the merge): the same loss hit the INLINE probe in the reloaded DLL
+  (hunt-dll-work-backend-inline, x86, once in a suite run; under load with tracing 20 of 180
+  runs, 1-5 of 240 calls): its install GATE (a debug register on the pending site until the hook
+  is in, arm_gates_for_pending) was wiped on a thread still starting (or inside an NtContinue
+  restore), which then ran the site unhooked and uncaught. Gates are now re-applied by the
+  thread-start and context-restore fixups like hardware probes (armed when a gate is), and
+  enforce_owned_drs treats a gate's slot as owned. Reproduced on demand (x86, 6 parallel loops
+  x 30 runs, PROBE_TRACE on, CPU burners: 20/180 runs missed calls) and fixed layer by layer --
+  (1) gates re-applied as above (and a gate image a context record brings back after the gate
+  was cleared, or its #DB still queued, is recognised as ours: it crashed the target with an
+  unhandled single step once gates were re-applied); (2) an install round that made no progress
+  (a relocated DLL's code is not executable until the loader has relocated it) is retried in
+  5 ms instead of at once -- the immediate re-kick spun the agent, each round an event freezing
+  the target, and starved the relocating thread into the 5 s install timeout; (3) a LOAD of a
+  new instance while the old one's UNLOAD is still unreported: an old instance whose image is
+  gone is torn down at that LOAD (its late UNLOAD skipped), and a late UNLOAD re-arms the
+  module's newest instance; (4) two instances mapped at once (the old one still unmapping, the
+  new one already called by another thread; or a mapping the loader discards): every other
+  instance's copy of an inline site is gated, and a thread hitting one moves the probe to that
+  live instance; a probe whose own copy never becomes code moves to an instance where it is.
+  After all four: 180/180 runs exact under the same load.
 - ✅ (A9, found in this audit) breakpoint: an instruction at a probe site that faults (a guard
   page, an access violation the program catches) is re-run at the real address so the program
   sees its own fault there; the thread's next arrival at the site was then ALWAYS taken for the
