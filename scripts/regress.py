@@ -701,6 +701,12 @@ class _NoiseSampler:
                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
         self.t = threading.Thread(target=self._read, daemon=True)
         self.t.start()
+        # The disk side, as UHH writes its session log (GetTempPath()\uhh\logs, cached appends):
+        # each ~5 ms a 120-byte append to a file there, timed. A write that blocks (the lazy
+        # writer flushing to a slow disk) is the machine's stall, not UHH's.
+        self.disk, self._stop = [], threading.Event()
+        self.dt = threading.Thread(target=self._disk, daemon=True)
+        self.dt.start()
 
     def _read(self):
         for line in self.p.stdout:
@@ -708,13 +714,6 @@ class _NoiseSampler:
             m = re.search(r'"w":(-?\d+)', line)
             if m and int(m.group(1)) > 0:
                 self.samples.append((int(m.group(1)), arrival))
-
-        # The disk side, as UHH writes its session log (GetTempPath()\uhh\logs, cached appends):
-        # each ~5 ms a 120-byte append to a file there, timed. A write that blocks (the lazy
-        # writer flushing to a slow disk) is the machine's stall, not UHH's.
-        self.disk, self._stop = [], threading.Event()
-        self.dt = threading.Thread(target=self._disk, daemon=True)
-        self.dt.start()
 
     def _disk(self):
         d = Path(tempfile.gettempdir()) / "uhh" / "logs"
