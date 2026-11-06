@@ -1428,7 +1428,9 @@ Real-bug candidates (reproduce on runners, not on the VM so far):
   wait on a separate `running` count. So a kill at any instant leaves hits == logs + dropped + interrupted exactly.
   `check_crash_logs` now requires exactly that (dropped 0; inline interrupted <= threads-1; bp/hw 0; 1 thread: n
   logs, 0 interrupted). Evidence: runner diag 42192716058 84/84 exact (7 jobs, x64+x86), 42194976034 36 full-check
-  runs PASS, VM x64+x86 PASS.
+  runs PASS, VM x64+x86 PASS. The same v20 edge made `hunt-exit-process-inline` report `logs + interrupted == hits +
+  1` in ~1 of 8 runner runs (huntaudit): 42212077320 ran every `hunt-exit-*` 12 times on 5 jobs (x64+x86): 540/540
+  PASS, 180 inline runs exact with interrupted 0-8.
 - **lifecycle-controller-killed-{mixed x64 (full run), inline x86 (diag 1 of 4)}**: kill@early-0.05 -> target DEAD
   0xC0000005, not progressing. The L11 race (controller killed during install) with a new signature (access violation,
   inline/mixed configs). 2 of ~7 runs on windows-2022; 0 on windows-2025.
