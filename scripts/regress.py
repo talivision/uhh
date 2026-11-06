@@ -1647,6 +1647,17 @@ TP_MODES = ("noop", "log", "mem", "sys", "callfn", "co")
 TP_PROBES = ("add", "i64", "dbl", "dblarg", "seterr", "std", "align", "fact", "mid", "spawn", "thread", "peek", "ovf")
 
 
+def tp_co_expected(grp, iters):
+    """Mode co: the successful call_original wraps ("tp co ok" logs) a run must show, from the
+    calls tp_target makes (tp_target.cpp main): each of the 8 functions once per iteration
+    (tp_fact's recursive calls run INSIDE call_original: counted, no callback), tp_spawn once
+    and the thread it creates runs tp_threadfn once (--spawn), tp_peek 12 times (--peek). The
+    mid-function site refuses call_original (no wrap); tp_ovf's callback does not wrap."""
+    per = {p: int(iters) for p in ("add", "i64", "dbl", "dblarg", "seterr", "std", "align", "fact")}
+    per.update({"spawn": 1, "thread": 1 if "spawn" in grp else 0, "peek": 12, "mid": 0, "ovf": 0})
+    return sum(per[p] for p in grp)
+
+
 def check_transparency(iters=30):
     """A hit is invisible to the program (examples/transparency): every probed function has an
     unprobed twin, both called through one assembly harness, and a probed call must leave
@@ -1687,6 +1698,10 @@ def check_transparency(iters=30):
                         if x in grp and tg.get(x) != 1: why.append(f"{x}={tg.get(x)}")
                     if fails: why.append(f"cb={fails[:2]}")
                     if cold: why.append(f"no hits: {cold}")
+                    if mode == "co":
+                        wraps = sum(1 for x in o if x.get("kind") == "probe_log" and x.get("message") == "tp co ok")
+                        if wraps != tp_co_expected(grp, iters):
+                            why.append(f"call_original wraps={wraps} want {tp_co_expected(grp, iters)}")
                     if rep.get("error") is not None or rep.get("app_exit") != 0 or rep.get("log_dropped") != 0:
                         why.append(f"report err={rep.get('error')} exit={rep.get('app_exit')} dropped={rep.get('log_dropped')}")
                     if why:
