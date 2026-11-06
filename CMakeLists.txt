@@ -500,10 +500,14 @@ endif()
 add_executable(tp_target examples/transparency/tp_target.cpp ${TP_ASM})
 # NOICF: every probed function has an identical unprobed twin that must stay separate.
 target_link_options(tp_target PRIVATE ${TP_EXPORTS} /INCREMENTAL:NO /OPT:NOICF)
+# The same target linked /CETCOMPAT: on CET hardware (CI windows-2025) it runs with a user
+# shadow stack, so the transparency modes (call_func, call_original) run under it (regress `cet-tp-*`).
+add_executable(tp_target_cet examples/transparency/tp_target.cpp ${TP_ASM})
+target_link_options(tp_target_cet PRIVATE ${TP_EXPORTS} /INCREMENTAL:NO /OPT:NOICF /CETCOMPAT)
 add_executable(tp_driver examples/transparency/tp_driver.cpp examples/transparency/tp_callbacks.cpp)
 target_include_directories(tp_driver PRIVATE include)
 target_link_libraries(tp_driver PRIVATE probe_api)
-add_dependencies(tp_driver tp_target probe_api_agent)
+add_dependencies(tp_driver tp_target tp_target_cet probe_api_agent)
 
 # --- blog replicas: API-monitor scenarios from well-known write-ups (examples/blogs) ----
 add_executable(blog_target examples/blogs/blog_target.c)
@@ -623,7 +627,7 @@ foreach(d detours_simple detours_traceapi detours_retval)
     add_dependencies(${d} detours_target probe_api_agent)
 endforeach()
 
-foreach(t tp_target tp_driver latedll_target latedll_fix latedll_heavy latedll_driver stacks_target stacks_driver p2edge_early p2edge_late p2edge_target p2edge_driver blog_target blog_driver gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver hunt_target hunt_dll hunt_driver lifecycle_target lifecycle_driver detours_target detours_simple detours_traceapi detours_retval edge_target edge_driver co_target co_driver famous_driver famous_heap_target famous_file_target famous_loader_target famous_tick_target probe_app_cet cet_probe
+foreach(t tp_target tp_target_cet tp_driver latedll_target latedll_fix latedll_heavy latedll_driver stacks_target stacks_driver p2edge_early p2edge_late p2edge_target p2edge_driver blog_target blog_driver gated_config_mem patchrace_target refusal_driver sidefx_target sidefx_driver reentrancy_target thread_stress_target antitamper_target antidebug_target exceptions_target memstress_target memstress_driver hitcost_target hitcost_driver logstream_target conformance_target conformance_driver uhh_trace uhh_attach probe_app configparse hook_edge parity_target probe_api probe_api_agent gated_config breakage_driver frida_parity watch_target watch_driver dynwatch_target dynwatch_driver hunt_target hunt_dll hunt_driver lifecycle_target lifecycle_driver detours_target detours_simple detours_traceapi detours_retval edge_target edge_driver co_target co_driver famous_driver famous_heap_target famous_file_target famous_loader_target famous_tick_target probe_app_cet cet_probe
           filetrace filetrace_target flagflip flagfeature flagflip_target regtrace regtrace_target)
     target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
@@ -639,7 +643,7 @@ foreach(t configparse cet_probe hook_edge parity_target watch_target dynwatch_ta
           famous_heap_target famous_file_target famous_loader_target famous_tick_target edge_target detours_target co_target
           hunt_target hunt_dll lifecycle_target blog_target p2edge_target p2edge_early p2edge_late
           latedll_target latedll_fix latedll_heavy
-          stacks_target filetrace_target flagfeature flagflip_target regtrace_target stdout_target tp_target)
+          stacks_target filetrace_target flagfeature flagflip_target regtrace_target stdout_target tp_target tp_target_cet)
     set_property(TARGET ${t} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 endforeach()
 

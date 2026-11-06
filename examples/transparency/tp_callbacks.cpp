@@ -3,6 +3,7 @@
 // does; none of it may be visible to the target (regress `transparency`). Problems the
 // callback itself can see are logged as "tp FAIL ...".
 #define WIN32_LEAN_AND_MEAN
+#include <cstdio>
 #include <windows.h>
 #include "probe_api.h"
 #include <stdint.h>
@@ -11,7 +12,7 @@
 
 // entry: 1 = the probe is at a function entry (call_original must work), 0 = the mid-function
 // site (call_original must be refused there: the one deliberately unsupported place).
-struct tp_cfg { uint32_t mode, nargs, pop, backend, entry; };
+struct tp_cfg { uint32_t mode, nargs, pop, backend, entry; char module[48]; };   // module: the target's image (tp_target.exe / tp_target_cet.exe)
 enum { TP_NOOP, TP_LOG, TP_MEM, TP_SYS, TP_CALLFN, TP_CO };
 
 // x86: a double comes back in ST0 -- the callback's own x87 traffic.
@@ -60,8 +61,17 @@ TP_CB void tp_on_hit(probe_context *c) {
         uint64_t r = 0;
         if (!call_func(c, "kernel32!GetThreadPriority", &r, 1, (uint64_t)0)) send_log(c, "tp FAIL call_func GetThreadPriority");
         if (!call_func(c, "kernel32!TlsGetValue", &r, 1, (uint64_t)1000)) send_log(c, "tp FAIL call_func TlsGetValue");
-        if (!call_func(c, "tp_target.exe!tp_add", &r, 2, (uint64_t)5, (uint64_t)6) || r != 21)
+        char add[96];
+        std::snprintf(add, sizeof(add), "%s!tp_add", k->module);
+        if (!call_func(c, add, &r, 2, (uint64_t)5, (uint64_t)6) || r != 21)
             send_log(c, "tp FAIL call_func tp_add -> %llu", (unsigned long long)r);
+        // A callee that faults: at its first instruction (0x1: refused inline, abandoned on
+        // breakpoint/hw -- 0 everywhere) and inside a system function (lstrlenA of a bad
+        // pointer: its own handler catches it inline; abandoned at the fault on breakpoint/hw,
+        // so only "the program is unaffected" is asserted). Under CET the abandoned callee's
+        // shadow-stack frames must be dropped with it.
+        if (call_func(c, "0x1", &r, 0)) send_log(c, "tp FAIL call_func 0x1 accepted");
+        (void)call_func(c, "kernel32.dll!lstrlenA", &r, 1, (uint64_t)1);
         send_log(c, "tp callfn");
         return;
     }

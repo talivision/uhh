@@ -269,7 +269,6 @@ struct probe_session {
     bool launched = false, exited = false, inline_ready = false;
     bool interrupted = false, ctrl_counted = false;   // Ctrl+C ended this session / counted in g_ctrl_sessions
     std::atomic<bool> ran{false};              // probe_run has started (read by probe_close on any thread)
-    bool call_cet_warned = false;              // call_func refused under CET (warn once)
     int shadow_stack = -1;                     // target has hardware shadow stacks (CET): -1 unknown, 0/1
     uint64_t ret_gadgets = 0;                  // return_from: `ret` / `ret N` gadgets in the target
     bool warned_cb_fault = false;              // one stderr warning for a faulting controller-side callback
@@ -6598,26 +6597,61 @@ struct TebErrors {
     }
 };
 
+// Hardware shadow stacks (CET, x64): the thread's user shadow-stack pointer, read or written
+// through the CET_U XSTATE component ({IA32_U_CET, IA32_PL3_SSP}). false = not available
+// (no CET state on this machine/thread, or the kernel refused the change).
+static bool thread_ssp(HANDLE thread, uint64_t *get, const uint64_t *set) {
+#if defined(_WIN64) && defined(XSTATE_MASK_CET_U)
+    using InitFn = BOOL(WINAPI *)(PVOID, DWORD, PCONTEXT *, PDWORD);
+    using MaskFn = BOOL(WINAPI *)(PCONTEXT, DWORD64);
+    using LocateFn = PVOID(WINAPI *)(PCONTEXT, DWORD, PDWORD);
+    using EnabledFn = DWORD64(WINAPI *)();
+    static HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    static auto init = reinterpret_cast<InitFn>(GetProcAddress(k32, "InitializeContext"));
+    static auto mask = reinterpret_cast<MaskFn>(GetProcAddress(k32, "SetXStateFeaturesMask"));
+    static auto locate = reinterpret_cast<LocateFn>(GetProcAddress(k32, "LocateXStateFeature"));
+    static auto enabled = reinterpret_cast<EnabledFn>(GetProcAddress(k32, "GetEnabledXStateFeatures"));
+    if (!init || !mask || !locate || !enabled || !(enabled() & XSTATE_MASK_CET_U)) return false;
+    DWORD len = 0;
+    init(nullptr, CONTEXT_CONTROL | CONTEXT_XSTATE, nullptr, &len);
+    if (!len) return false;
+    std::vector<unsigned char> buf(len);
+    PCONTEXT ctx = nullptr;
+    if (!init(buf.data(), CONTEXT_CONTROL | CONTEXT_XSTATE, &ctx, &len) || !mask(ctx, XSTATE_MASK_CET_U) ||
+        !GetThreadContext(thread, ctx))
+        return false;
+    DWORD n = 0;
+    auto *cet = static_cast<uint64_t *>(locate(ctx, XSTATE_CET_U, &n));
+    if (!cet || n < 2 * sizeof(uint64_t)) return false;
+    if (get) *get = cet[1];
+    if (!set) return true;
+    cet[1] = *set;
+    ctx->ContextFlags = CONTEXT_XSTATE;                    // only the CET_U component
+    return SetThreadContext(thread, ctx) != FALSE;
+#else
+    (void)thread; (void)get; (void)set;                   // x86: Windows enforces no shadow stack for WoW64
+    return false;
+#endif
+}
+
 static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint64_t *ret, int nargs, const uint64_t *args,
                           const probe_context *seed = nullptr) {
     if (s->in_call_tid || nargs < 0 || nargs > 8) return 0;           // no nesting
-    // Hardware shadow stacks (CET): the callee is entered by SetThreadContext, not a CALL,
-    // so its `ret` to call_trap does not match the shadow stack -> #CP in the target
-    // (fatal in strict mode and when the callee's module is CETCOMPAT). Refuse cleanly
-    // rather than risk the target; inline call_func (a real call) is unaffected.
-    if (target_has_shadow_stack(s)) {
-        if (!s->call_cet_warned) {
-            s->call_cet_warned = true;
-            std::fprintf(stderr, "probe: call_func refused on breakpoint/hw: target has hardware shadow stacks (CET)\n");
-        }
-        return 0;
-    }
+    // The callee is entered through a real CALL: the thread is pointed at a stub in the target,
+    // `call rax/eax` (rax/eax = fn) then INT3, so the return address is pushed by the CPU --
+    // on the shadow stack too when the target has hardware shadow stacks (CET): the callee's
+    // `ret` matches, comes back to the INT3, and SSP is where it was at the hit. (Entering the
+    // callee by SetThreadContext with a hand-written return address made its `ret` a #CP.)
+    static const unsigned char kCallStub[3] = {0xFF, 0xD0, 0xCC};     // call rax|eax; int3
     if (!s->call_trap) {
         void *mem = VirtualAllocEx(s->pi.hProcess, nullptr, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-        unsigned char cc = 0xcc; size_t w = 0;
-        if (!mem || !remote_write(s->pi.hProcess, (uint64_t)(uintptr_t)mem, &cc, 1, &w)) return 0;
+        size_t w = 0;
+        if (!mem || !remote_write(s->pi.hProcess, (uint64_t)(uintptr_t)mem, kCallStub, sizeof(kCallStub), &w) ||
+            w != sizeof(kCallStub))
+            return 0;
         s->call_trap = (uint64_t)(uintptr_t)mem;
     }
+    const uint64_t ret_site = s->call_trap + 2;                        // the stub's INT3 = the callee's return address
     HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, FALSE, st->tid);
     if (!thread) return 0;
     CONTEXT saved{}; saved.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_FLOATING_POINT;
@@ -6629,22 +6663,34 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
         CloseHandle(thread); return 0;
     }
     TebErrors teb_errors; teb_errors.save(s->pi.hProcess, thread, saved);
+    // CET: a callee abandoned midway (it faulted, or timed out) leaves its frames on the
+    // shadow stack; the restore below puts SSP back too (a completed call leaves it as it was).
+    uint64_t ssp0 = 0;
+    const bool have_ssp = target_has_shadow_stack(s) && thread_ssp(thread, &ssp0, nullptr);
+    auto restore_ssp = [&] {
+        uint64_t now = 0;
+        if (!have_ssp || !thread_ssp(thread, &now, nullptr) || now == ssp0) return;
+        const bool set = thread_ssp(thread, nullptr, &ssp0);
+        if (trace_enabled() || !set)
+            std::fprintf(stderr, "probe: call_func: shadow-stack pointer 0x%llx -> 0x%llx %s\n", (unsigned long long)now,
+                         (unsigned long long)ssp0, set ? "restored" : "NOT restored (the kernel refused)");
+    };
     CONTEXT w = saved; size_t wrote = 0; bool ok = true;
     if (seed) to_context(*seed, w);                                    // call_original: the callback's registers
 #if defined(_WIN64)
     uint64_t sp = ((saved.Rsp - 512) & ~(uint64_t)0xF) - 8;           // entry rsp == 8 mod 16
-    uint64_t frame[13] = {s->call_trap};                               // ret, shadow x4, stack args
+    uint64_t frame[13] = {ret_site};                                   // ret (the CALL writes it too), shadow x4, stack args
     for (int i = 4; i < nargs; ++i) frame[5 + (i - 4)] = args[i];
     ok = remote_write(s->pi.hProcess, sp, frame, sizeof(frame), &wrote) && wrote == sizeof(frame);
-    w.Rsp = sp; w.Rip = fn;
+    w.Rsp = sp + 8; w.Rip = s->call_trap; w.Rax = fn;                  // the stub's CALL pushes ret at sp
     w.Rcx = nargs > 0 ? args[0] : 0; w.Rdx = nargs > 1 ? args[1] : 0;
     w.R8 = nargs > 2 ? args[2] : 0;  w.R9 = nargs > 3 ? args[3] : 0;
 #else
     uint32_t sp = ((uint32_t)saved.Esp - 512) & ~0xFu;
-    uint32_t frame[9] = {(uint32_t)s->call_trap};                      // ret, then args (stdcall/cdecl both
+    uint32_t frame[9] = {(uint32_t)ret_site};                          // ret, then args (stdcall/cdecl both
     for (int i = 0; i < nargs; ++i) frame[1 + i] = (uint32_t)args[i];  // fine: esp is restored after)
     ok = remote_write(s->pi.hProcess, sp, frame, sizeof(frame), &wrote) && wrote == sizeof(frame);
-    w.Esp = sp; w.Eip = (DWORD)fn;
+    w.Esp = sp + 4; w.Eip = (DWORD)s->call_trap; w.Eax = (DWORD)fn;   // the stub's CALL pushes ret at sp
 #endif
     w.EFlags &= ~0x100u;
     w.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
@@ -6661,6 +6707,7 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
                      (unsigned long)st->tid, (unsigned long long)fn, (unsigned long long)saved.Rip, (unsigned long long)w.Rip,
                      (unsigned long long)saved.Rsp, (unsigned long long)w.Rsp, (int)got, (unsigned long long)v.Rip,
                      (unsigned long long)v.Rsp, (unsigned long long)teb_errors.teb);
+        if (target_has_shadow_stack(s)) std::fprintf(stderr, "  call_func: shadow stack: ssp=0x%llx (read %d)\n", (unsigned long long)ssp0, (int)have_ssp);
 #else
         std::fprintf(stderr, "  call_func: tid %lu fn=0x%llx ip 0x%lx->0x%lx sp 0x%lx->0x%lx (reread %d: ip 0x%lx sp 0x%lx cs=%lx fs=%lx) "
                      "teb=0x%llx flags=0x%lx\n", (unsigned long)st->tid, (unsigned long long)fn, (unsigned long)saved.Eip,
@@ -6682,7 +6729,7 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
         if (continue_foreign_event(s, ev)) continue;
         if (ev.dwThreadId == st->tid && ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
             auto &er = ev.u.Exception.ExceptionRecord;
-            if (er.ExceptionCode == EXCEPTION_BREAKPOINT && (uint64_t)(uintptr_t)er.ExceptionAddress == s->call_trap) {
+            if (er.ExceptionCode == EXCEPTION_BREAKPOINT && (uint64_t)(uintptr_t)er.ExceptionAddress == ret_site) {
                 CONTEXT r{}; r.ContextFlags = CONTEXT_INTEGER;
                 if (GetThreadContext(thread, &r)) {
 #if defined(_WIN64)
@@ -6717,12 +6764,13 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
     if (trapped) {
         if (!SetThreadContext(thread, &saved) && trace_enabled())  // exactly as it was at the hit
             std::fprintf(stderr, "  call_func: restore SetThreadContext(%lu) failed %lu\n", (unsigned long)st->tid, GetLastError());
+        restore_ssp();
         teb_errors.restore(s->pi.hProcess);                        // and its last error / status
         // The pending trap/fault event on this thread now stands in for the original one.
     } else if (!s->exited) {
         // Timed out with the callee still running: stop it, put the context back, and tell
         // the loop the original event is already continued (there is nothing to continue).
-        SuspendThread(thread); SetThreadContext(thread, &saved); teb_errors.restore(s->pi.hProcess); ResumeThread(thread);
+        SuspendThread(thread); SetThreadContext(thread, &saved); restore_ssp(); teb_errors.restore(s->pi.hProcess); ResumeThread(thread);
         s->skip_continue = true;
         std::fprintf(stderr, "probe: call_func timed out after 5 s; thread restored\n");
     } else {

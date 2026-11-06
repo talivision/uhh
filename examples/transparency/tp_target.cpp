@@ -334,6 +334,14 @@ int main(int argc, char **argv) {
         printf(",\"%s_bad\":%ld", n, res[k].bad);
         moves += res[k].stack_moves; hints += res[k].heap_hint;
     }
+    // CET: RDSSP is a NOP (0) without a shadow stack -- tp_target_cet (/CETCOMPAT) reports
+    // whether this run had one (the main thread; every thread of the process gets one).
+#if defined(_WIN64)
+    const unsigned long long ssp = _rdsspq();
+#else
+    const unsigned long long ssp = _rdsspd();
+#endif
+    printf(",\"shadow_stack\":%s", ssp ? "true" : "false");
     printf(",\"bad\":%ld,\"stack_limit_moves\":%ld,\"heap_hint_changes\":%ld,\"first\":\"", g_bad_total, moves, hints);
     for (const char *p = g_first; *p; ++p) if (*p != '"' && *p != '\\') putchar(*p);
     printf("\"}\n");

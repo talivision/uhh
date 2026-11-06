@@ -1661,6 +1661,43 @@ def tp_co_expected(grp, iters):
     return sum(per[p] for p in grp)
 
 
+TP_GROUPS = {"breakpoint": [TP_PROBES], "inline": [TP_PROBES],
+             "hw": [TP_PROBES[i:i + 3] for i in range(0, len(TP_PROBES), 3)]}
+
+
+def tp_runs(d, t, bk, mode, iters):
+    """Runs tp_driver for every probe group of `bk` in `mode` against target `t` (tp_target or
+    its /CETCOMPAT twin); returns (problems, target rows)."""
+    bad, rows = [], []
+    for grp in TP_GROUPS[bk]:
+        targs = [t, "--iters", iters] + [f"--{x}" for x in ("spawn", "peek", "ovf") if x in grp]
+        r, o = run([d, "--backend", bk, "--mode", mode, "--probes", ",".join(grp), "--"] + targs, timeout=300)
+        tg = next((x for x in o if x.get("kind") == "target"), {})
+        rows.append(tg)
+        rep = report(o)
+        fails = sorted({str(x.get("message", "")) for x in o
+                        if x.get("kind") == "probe_log" and str(x.get("message", "")).startswith("tp FAIL")})
+        cold = [p.get("location") for p in probes(o) if not p.get("hits")]
+        why = []
+        if r.returncode != 0: why.append(f"rc={r.returncode}")
+        if not tg: why.append("no target row")
+        elif tg.get("bad") != 0: why.append(f"bad={tg.get('bad')} first={tg.get('first')!r}")
+        for x in ("spawn", "peek", "ovf"):
+            if x in grp and tg.get(x) != 1: why.append(f"{x}={tg.get(x)}")
+        if fails: why.append(f"cb={fails[:4]}")
+        if cold: why.append(f"no hits: {cold}")
+        if mode == "co":
+            wraps = sum(1 for x in o if x.get("kind") == "probe_log" and x.get("message") == "tp co ok")
+            if wraps != tp_co_expected(grp, iters):
+                why.append(f"call_original wraps={wraps} want {tp_co_expected(grp, iters)}")
+        if rep.get("error") is not None or rep.get("app_exit") != 0 or rep.get("log_dropped") != 0:
+            why.append(f"report err={rep.get('error')} exit={rep.get('app_exit')} dropped={rep.get('log_dropped')}")
+        if why:
+            bad.append(f"[{','.join(grp)}] " + " ".join(why) +
+                       ("" if r.returncode == 0 else f" stderr={(r.stderr or '')[-200:]!r}"))
+    return bad, rows
+
+
 def check_transparency(iters=30):
     """A hit is invisible to the program (examples/transparency): every probed function has an
     unprobed twin, both called through one assembly harness, and a probed call must leave
@@ -1677,40 +1714,12 @@ def check_transparency(iters=30):
     d, t = exe("tp_driver.exe"), exe("tp_target.exe")
     if not d or not t:
         return missing_bin("transparency", "tp_driver/tp_target")
-    groups = {"breakpoint": [TP_PROBES], "inline": [TP_PROBES],
-              "hw": [TP_PROBES[i:i + 3] for i in range(0, len(TP_PROBES), 3)]}
     for bk in ("breakpoint", "hw", "inline"):
         for mode in TP_MODES:
             name = f"transparency-{bk}-{mode}"
-            bad = []
             try:
-                for grp in groups[bk]:
-                    spawn = "spawn" in grp
-                    targs = [t, "--iters", iters] + [f"--{x}" for x in ("spawn", "peek", "ovf") if x in grp]
-                    r, o = run([d, "--backend", bk, "--mode", mode, "--probes", ",".join(grp), "--"] + targs, timeout=300)
-                    tg = next((x for x in o if x.get("kind") == "target"), {})
-                    rep = report(o)
-                    fails = sorted({str(x.get("message", "")) for x in o
-                                    if x.get("kind") == "probe_log" and str(x.get("message", "")).startswith("tp FAIL")})
-                    cold = [p.get("location") for p in probes(o) if not p.get("hits")]
-                    why = []
-                    if r.returncode != 0: why.append(f"rc={r.returncode}")
-                    if not tg: why.append("no target row")
-                    elif tg.get("bad") != 0: why.append(f"bad={tg.get('bad')} first={tg.get('first')!r}")
-                    for x in ("spawn", "peek", "ovf"):
-                        if x in grp and tg.get(x) != 1: why.append(f"{x}={tg.get(x)}")
-                    if fails: why.append(f"cb={fails[:2]}")
-                    if cold: why.append(f"no hits: {cold}")
-                    if mode == "co":
-                        wraps = sum(1 for x in o if x.get("kind") == "probe_log" and x.get("message") == "tp co ok")
-                        if wraps != tp_co_expected(grp, iters):
-                            why.append(f"call_original wraps={wraps} want {tp_co_expected(grp, iters)}")
-                    if rep.get("error") is not None or rep.get("app_exit") != 0 or rep.get("log_dropped") != 0:
-                        why.append(f"report err={rep.get('error')} exit={rep.get('app_exit')} dropped={rep.get('log_dropped')}")
-                    if why:
-                        bad.append(f"[{','.join(grp)}] " + " ".join(why) +
-                                   ("" if r.returncode == 0 else f" stderr={(r.stderr or '')[-200:]!r}"))
-                record(name, not bad, "; ".join(bad) if bad else f"{len(groups[bk])} run(s), iters={iters}, all calls identical to the twin")
+                bad, _ = tp_runs(d, t, bk, mode, iters)
+                record(name, not bad, "; ".join(bad) if bad else f"{len(TP_GROUPS[bk])} run(s), iters={iters}, all calls identical to the twin")
             except Exception as e:
                 record(name, False, repr(e))
     # Inline, a CPU whose full XSAVE area (every XCR0 feature, e.g. AMX tiles: ~11 KB) exceeds
@@ -2737,6 +2746,28 @@ def check_cet(threads=8, reads=500):
                              f"rc={r.returncode} err={(rep.get('error') or '')[:120]} stderr={r.stderr.strip()[-160:]!r}")
         except Exception as e:
             record(name, False, repr(e))
+    # call_func and call_original under the shadow stack, every backend: the transparency
+    # fixture on its /CETCOMPAT twin (call_func of Win32 APIs, of a probed function, of a callee
+    # faulting at its first instruction / inside a system function; call_original+return_from).
+    # breakpoint/hw call_func enters the callee through a real CALL (a stub in the target), so
+    # its ret matches the shadow stack; an abandoned callee's shadow frames are dropped (SSP
+    # restored through CONTEXT_XSTATE CET_U).
+    tpd, tpc = exe("tp_driver.exe"), exe("tp_target_cet.exe")
+    for bk in ("breakpoint", "hw", "inline"):
+        for mode in ("callfn", "co"):
+            name = f"cet-tp-{bk}-{mode}"
+            if not tpd or not tpc:
+                missing_bin(name, "tp_driver/tp_target_cet")
+                continue
+            try:
+                bad, rows = tp_runs(tpd, tpc, bk, mode, 10)
+                ssp = sorted({str(x.get("shadow_stack")) for x in rows})
+                if enforced is not None and ssp != [str(bool(enforced))]:
+                    bad.append(f"target shadow_stack={ssp} but cet_probe enforced={enforced}")
+                record(name, not bad, f"cet_enforced={enforced} target_ssp={ssp} " +
+                       ("; ".join(bad) if bad else f"{len(TP_GROUPS[bk])} run(s), all calls identical to the twin"))
+            except Exception as e:
+                record(name, False, repr(e))
     site, stub = ntopen_ret_site(t)
     if site is None:
         return record("cet-ret-breakpoint", False, f"no ret found in NtOpenProcess stub: {stub.hex()}")
