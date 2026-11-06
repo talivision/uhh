@@ -2328,6 +2328,11 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
     // frozen for this install round stayed suspended and the target hung (runner kill loop).
     // The debug port is the signal: it goes as the dying controller's handles are closed,
     // BEFORE its process object is signaled (measured: port gone, process not yet "dead").
+    // No service thread could start (its named event is the controller's: gone means the
+    // controller is dying), so wait here for the port to go -- the handle rundown order is not
+    // ours to rely on.
+    if (!service_event && shared->guard.enabled)
+        for (const ULONGLONG t0 = GetTickCount64(); !no_debug_port() && GetTickCount64() - t0 < 5000; ) Sleep(10);
     if (!g_orphan_cleaned && guard_orphaned()) guard_cleanup();
     return 0;
 }
