@@ -1284,8 +1284,7 @@ the session JSONL file and the report (count, valid JSON per line, CRC multiset 
   record carries `"seq"` (0, 1, 2, ... in file order; the last field, so prefix matchers keep
   working), `probe_report` states `stdout_logs` (records the live tail wrote to stdout) and
   `live_output_error` (any stdout failure other than a closed reader; also on stderr and in
-  `error`). Records that waited behind an unfinished line of a forwarded target are written
-  BEFORE the report. When records follow the report (`--detach-after-ms`: report, then
+  `error`). When records follow the report (`--detach-after-ms`: report, then
   `probe_close`), `probe_close` ends stdout with a `probe_final` line (hits, logs_written,
   log_dropped, in_flight, stdout_logs). Recipe: docs/troubleshooting.md "Is my captured output
   complete?".

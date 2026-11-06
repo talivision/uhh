@@ -7672,7 +7672,10 @@ def verify_capture(path):
     record) states stdout_logs == the records present. Returns a dict (streamed: never holds
     the records in memory)."""
     import codecs
-    head = Path(path).read_bytes()[:4] if Path(path).exists() else b""
+    head = b""
+    if Path(path).exists():
+        with open(path, "rb") as f:
+            head = f.read(4)
     enc = ("utf-16" if head[:2] in (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE) else
            "utf-8-sig" if head[:3] == codecs.BOM_UTF8 else "utf-8")
     st = {"lines": 0, "logs": 0, "bad": 0, "gaps": 0, "next": 0, "after_report": 0,
@@ -7709,6 +7712,137 @@ def verify_capture(path):
                 elif o.get("kind") == "probe":
                     st["probes"].append(o)
     return st
+
+
+def run_in_conpty(cmdline, out_path, timeout, cols=120, rows=30):
+    """Run cmdline attached to a pseudo console (ConPTY: what Windows Terminal and OpenSSH
+    use; the child's stdout is a real console handle, GetConsoleMode succeeds) and stream the
+    rendered VT byte stream to out_path. Returns (exit code or None on timeout, seconds)."""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    HANDLE = wintypes.HANDLE
+
+    class COORD(ctypes.Structure):
+        _fields_ = [("X", ctypes.c_short), ("Y", ctypes.c_short)]
+
+    class STARTUPINFOW(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("lpReserved", wintypes.LPWSTR), ("lpDesktop", wintypes.LPWSTR),
+                    ("lpTitle", wintypes.LPWSTR), ("dwX", wintypes.DWORD), ("dwY", wintypes.DWORD),
+                    ("dwXSize", wintypes.DWORD), ("dwYSize", wintypes.DWORD), ("dwXCountChars", wintypes.DWORD),
+                    ("dwYCountChars", wintypes.DWORD), ("dwFillAttribute", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                    ("wShowWindow", wintypes.WORD), ("cbReserved2", wintypes.WORD), ("lpReserved2", ctypes.c_void_p),
+                    ("hStdInput", HANDLE), ("hStdOutput", HANDLE), ("hStdError", HANDLE)]
+
+    class STARTUPINFOEXW(ctypes.Structure):
+        _fields_ = [("StartupInfo", STARTUPINFOW), ("lpAttributeList", ctypes.c_void_p)]
+
+    class PROCESS_INFORMATION(ctypes.Structure):
+        _fields_ = [("hProcess", HANDLE), ("hThread", HANDLE), ("dwProcessId", wintypes.DWORD), ("dwThreadId", wintypes.DWORD)]
+
+    k32.CreatePseudoConsole.argtypes = [COORD, HANDLE, HANDLE, wintypes.DWORD, ctypes.POINTER(HANDLE)]
+    k32.CreatePseudoConsole.restype = ctypes.c_long
+    k32.ClosePseudoConsole.argtypes = [HANDLE]
+    k32.CreatePipe.argtypes = [ctypes.POINTER(HANDLE), ctypes.POINTER(HANDLE), ctypes.c_void_p, wintypes.DWORD]
+    k32.InitializeProcThreadAttributeList.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(ctypes.c_size_t)]
+    k32.UpdateProcThreadAttribute.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.c_size_t, ctypes.c_void_p,
+                                              ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p]
+    k32.CreateProcessW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p, ctypes.c_void_p, wintypes.BOOL,
+                                   wintypes.DWORD, ctypes.c_void_p, wintypes.LPCWSTR, ctypes.POINTER(STARTUPINFOEXW),
+                                   ctypes.POINTER(PROCESS_INFORMATION)]
+    k32.ReadFile.argtypes = [HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    k32.WaitForSingleObject.argtypes = [HANDLE, wintypes.DWORD]
+    k32.GetExitCodeProcess.argtypes = [HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    k32.TerminateProcess.argtypes = [HANDLE, wintypes.UINT]
+    k32.CloseHandle.argtypes = [HANDLE]
+    in_r, in_w, out_r, out_w, hpc = HANDLE(), HANDLE(), HANDLE(), HANDLE(), HANDLE()
+    k32.CreatePipe(ctypes.byref(in_r), ctypes.byref(in_w), None, 0)
+    k32.CreatePipe(ctypes.byref(out_r), ctypes.byref(out_w), None, 0)
+    hr = k32.CreatePseudoConsole(COORD(cols, rows), in_r, out_w, 0, ctypes.byref(hpc))
+    if hr != 0:
+        raise OSError(f"CreatePseudoConsole hr={hr:#x}")
+    k32.CloseHandle(in_r); k32.CloseHandle(out_w)
+    sink = open(out_path, "wb")
+
+    def pump():
+        buf = ctypes.create_string_buffer(1 << 16)
+        got = wintypes.DWORD()
+        while k32.ReadFile(out_r, buf, len(buf), ctypes.byref(got), None) and got.value:
+            sink.write(buf.raw[:got.value])
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
+    size = ctypes.c_size_t()
+    k32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(size))
+    attrs = ctypes.create_string_buffer(size.value)
+    k32.InitializeProcThreadAttributeList(attrs, 1, 0, ctypes.byref(size))
+    k32.UpdateProcThreadAttribute(attrs, 0, 0x00020016, hpc, ctypes.sizeof(HANDLE), None, None)   # PSEUDOCONSOLE
+    si = STARTUPINFOEXW()
+    si.StartupInfo.cb = ctypes.sizeof(STARTUPINFOEXW)
+    si.StartupInfo.dwFlags = 0x100           # STARTF_USESTDHANDLES, null: never this process's redirected handles
+    si.lpAttributeList = ctypes.cast(attrs, ctypes.c_void_p)
+    pi = PROCESS_INFORMATION()
+    started = time.perf_counter()
+    if not k32.CreateProcessW(None, ctypes.create_unicode_buffer(cmdline), None, None, False, 0x00080000,
+                              None, None, ctypes.byref(si), ctypes.byref(pi)):
+        raise OSError(f"CreateProcessW error={ctypes.get_last_error()}")
+    code = None
+    if k32.WaitForSingleObject(pi.hProcess, int(timeout * 1000)) == 0:
+        c = wintypes.DWORD()
+        k32.GetExitCodeProcess(pi.hProcess, ctypes.byref(c))
+        code = c.value
+    else:
+        k32.TerminateProcess(pi.hProcess, 1)
+    elapsed = time.perf_counter() - started
+    time.sleep(1.5)                          # the pseudo console renders its last frame
+    k32.ClosePseudoConsole(hpc)
+    reader.join(timeout=30)
+    sink.close()
+    for h in (in_w, out_r, pi.hProcess, pi.hThread):
+        k32.CloseHandle(h)
+    return code, elapsed
+
+
+def count_vt_seq(path):
+    """Stream a ConPTY capture: VT sequences and line breaks removed, the unique probe_log seq
+    values (bit set), the highest one, and the last probe_report seen."""
+    vt = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]")
+    token = re.compile(r'"seq":(\d+)\}')
+    seen, count, top, report_text, carry = bytearray(1 << 16), 0, -1, None, ""
+
+    def scan(text):
+        nonlocal seen, count, top, report_text
+        flat = vt.sub("", text).replace("\r", "").replace("\n", "").replace("\x08", "")   # BS: ConPTY wrap artefact
+        for m in token.finditer(flat):
+            v = int(m.group(1))
+            if v >= len(seen):
+                seen.extend(bytearray(max(v + 1 - len(seen), len(seen))))
+            if not seen[v]:
+                seen[v] = 1
+                count += 1
+            top = max(top, v)
+        at = flat.rfind('{"kind":"probe_report"')
+        if at >= 0:
+            report_text = flat[at:at + 600]
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1 << 22)
+            if not chunk:
+                break
+            text = carry + chunk.decode("utf-8", "replace")
+            cut = text.rfind('{"kind"', 0, max(0, len(text) - 4096))
+            cut = max(cut, 0)
+            scan(text[:cut])
+            carry = text[cut:]
+    scan(carry)
+    report_obj = None
+    if report_text:
+        m = re.match(r'\{"kind":"probe_report".*?"error":(?:null|"(?:[^"\\]|\\.)*")\}', report_text)
+        if m:
+            try:
+                report_obj = json.loads(m.group(0))
+            except json.JSONDecodeError:
+                report_obj = None
+    return {"unique": count, "max": top, "missing": (top + 1 - count) if top >= 0 else 0, "report": report_obj}
 
 
 def check_stdout_powershell():
@@ -7785,7 +7919,7 @@ def check_stdout_powershell():
         tgt = None
         try:
             out = work / "out.txt"
-            tgt = subprocess.Popen([str(target), "--count", "100000000", "--threads", "4", "--delay", "0",
+            tgt = subprocess.Popen([str(target), "--count", "2000000000", "--threads", "4", "--delay", "0",
                                     "--no-ticks"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             time.sleep(1)
             a = ["--backend", backend, "--stack", "-p", "logstream_target.exe!LogSite:d",
@@ -7810,20 +7944,25 @@ def check_stdout_powershell():
             cap = verify_capture(out)
             rep = cap["report"] or {}
             hits = sum(p.get("hits") or 0 for p in cap["probes"])
-            fin = {}
+            # probe_final must be the LAST JSON line, exactly once, after every record.
+            fin, finals, after_final = {}, 0, 0
             with open(out, encoding=cap["encoding"], errors="replace") as f:
                 for line in f:
                     if '"kind":"probe_final"' in line:
                         fin = json.loads(line)
+                        finals += 1
+                    elif line.startswith("{") and finals and '"kind":"detached"' not in line:
+                        after_final += 1              # uhh_trace's own {"kind":"detached"} may follow
             consistent = (rep.get("stdout_logs") is not None and rep.get("logs_written") is not None and
                           rep["stdout_logs"] <= rep["logs_written"] <= hits == rep.get("hits"))
             closed = bool(fin) and fin.get("hits") == (fin.get("logs_written") or 0) + (fin.get("log_dropped") or 0) \
                 + (fin.get("in_flight") or 0) and fin.get("stdout_logs") == fin.get("logs_written") == cap["logs"]
-            ok = (consistent and closed and cap["bad"] == 0 and cap["gaps"] == 0 and
+            ok = (alive and finals == 1 and after_final == 0 and consistent and closed and cap["bad"] == 0 and cap["gaps"] == 0 and
                   fin.get("log_dropped") == 0 and rep.get("error") is None and cap["logs"] > 0)
             record(name, ok, f"report: hits={hits} written={rep.get('logs_written')} stdout_logs={rep.get('stdout_logs')} "
                              f"consistent={consistent} final={ {k: fin.get(k) for k in ('hits', 'logs_written', 'log_dropped', 'in_flight', 'stdout_logs')} } "
-                             f"captured={cap['logs']} bad={cap['bad']} seq_gaps={cap['gaps']} target_alive={alive}"
+                             f"captured={cap['logs']} bad={cap['bad']} seq_gaps={cap['gaps']} target_alive={alive} "
+                             f"finals={finals} json_after_final={after_final}"
                              + ("" if ok else f" stderr={r.stderr.strip().splitlines()[-2:]}"))
         except Exception as e:
             record(name, False, repr(e))
@@ -7831,6 +7970,56 @@ def check_stdout_powershell():
             if tgt and tgt.poll() is None:
                 tgt.kill()
                 tgt.wait()
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def check_stdout_console(big=0):
+    """The live tail into a CONSOLE handle (owner: lines missing in the PowerShell console while
+    the session file was complete). uhh_trace --stack runs attached to a pseudo console
+    (ConPTY: GetConsoleMode succeeds on its stdout, the WriteFile-to-console path; the same
+    conhost renders it to VT as for Windows Terminal), inside powershell.exe as a user runs it.
+    Every probe_log seq 0..N-1 must appear in the rendered stream and the probe_report must say
+    stdout_logs == logs_written == hits, with no live-output error, the session file equally
+    complete. big > 0 (--console-records): one more inline run of that many records."""
+    tracer, target = exe("uhh_trace.exe"), exe("logstream_target.exe")
+    if not tracer or not target:
+        return missing_bin("stdout-console", "uhh_trace/logstream_target")
+    ps = SYS32 / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    runs = [("inline", 4, 25000), ("breakpoint", 4, 2500), ("hw", 4, 2500)]
+    if big:
+        runs.append(("inline", 4, (big + 3) // 4))
+    for backend, threads, count in runs:
+        want = threads * count
+        name = f"stdout-console-{backend}" + (f"-{want}" if want > 100000 else "")
+        work = Path(tempfile.mkdtemp(prefix="uhh-pscon-"))
+        old_temp = os.environ.get("TEMP"), os.environ.get("TMP")
+        try:
+            os.environ["TEMP"] = os.environ["TMP"] = str(work)        # the pseudo console child inherits it
+            cmd = (f'"{ps}" -NoProfile -NonInteractive -Command "& \'{tracer}\' --backend {backend} --stack '
+                   f'-p logstream_target.exe!LogSite:d -- \'{target}\' --count {count} --threads {threads} '
+                   f'--delay 0 --no-ticks"')
+            code, secs = run_in_conpty(cmd, work / "vt.bin", timeout=600 + want / 500)
+            seen = count_vt_seq(work / "vt.bin")
+            (work / "vt.bin").unlink()
+            rep = seen["report"] or {}
+            sessions = list((work / "uhh" / "logs").glob("*.jsonl"))
+            sess = verify_capture(sessions[0]) if len(sessions) == 1 else {}
+            ok = (code is not None and seen["unique"] == want and seen["max"] == want - 1 and
+                  rep.get("logs_written") == want and rep.get("stdout_logs") == want and rep.get("hits") == want and
+                  rep.get("log_dropped") == 0 and rep.get("live_output_error") is None and
+                  not rep.get("live_output_closed") and rep.get("error") is None and
+                  sess.get("logs") == want and sess.get("gaps") == 0)
+            record(name, ok, f"console_seq={seen['unique']}/{want} missing={seen['missing']} report={'yes' if rep else 'no'} "
+                             f"hits={rep.get('hits')} written={rep.get('logs_written')} stdout_logs={rep.get('stdout_logs')} "
+                             f"live_error={rep.get('live_output_error')} file={sess.get('logs')} rc={code} {secs:.0f}s")
+        except Exception as e:
+            record(name, False, repr(e))
+        finally:
+            for k, v in zip(("TEMP", "TMP"), old_temp):
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
             shutil.rmtree(work, ignore_errors=True)
 
 
@@ -7846,6 +8035,9 @@ def main():
                     help="opt-in slow tier: real large apps (powershell, headless Edge) under every backend, "
                          "launch/attach/detach; optional comma list of name substrings (e.g. ps-launch,edge-detach)")
     ap.add_argument("--bigapps-secs", type=int, default=40, help="workload length of each bigapps run")
+    ap.add_argument("--console-records", type=int, default=0,
+                    help="opt-in: stdout-console also runs one inline --stack session of this many records "
+                         "(e.g. 2000000) into a pseudo console")
     ap.add_argument("--soak-minutes", type=float, default=0,
                     help="opt-in soak tier (scripts/soak.py): every phase for this many minutes; 0 skips")
     ap.add_argument("--only", default="",
@@ -7985,6 +8177,7 @@ def main():
     if want(check_symbols_grammar): check_symbols_grammar()
     if want(check_quickstart): check_quickstart()
     if want(check_stdout_powershell): check_stdout_powershell()
+    if want(check_stdout_console): check_stdout_console(args.console_records)
     if only and not RESULTS:
         print(f"regress.py: --only {','.join(only)} selected only opt-in tiers that were not enabled "
               f"(--bigapps / --soak-minutes / --volume-reads): no check ran.", file=sys.stderr)
