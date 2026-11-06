@@ -673,15 +673,96 @@ def trace_logstream(backend, target_args, timeout, consume):
                       timeout, consume)
 
 
+def _qpc_now():
+    """QueryPerformanceCounter ticks: the clock logstream_target stamps its lines with (one
+    system-wide counter, so arrival - stamp is a real cross-process latency)."""
+    import ctypes
+    c = ctypes.c_int64()
+    ctypes.windll.kernel32.QueryPerformanceCounter(ctypes.byref(c))
+    return c.value
+
+
+def _qpc_freq():
+    import ctypes
+    f = ctypes.c_int64()
+    ctypes.windll.kernel32.QueryPerformanceFrequency(ctypes.byref(f))
+    return f.value
+
+
+class _NoiseSampler:
+    """Scheduler noise on THIS machine, measured alongside the run it calibrates (a cyclictest):
+    an uninstrumented logstream_target writes a QPC-stamped line every ~5 ms into a pipe read
+    by a Python thread. A stall of the machine (or of a thread's CPU) shows as a late write
+    (a gap between consecutive stamps beyond the writer's normal period) or a late arrival
+    (arrival - stamp). noise(a, b) = the worst of both overlapping the window [a, b]."""
+    def __init__(self, target):
+        self.samples = []                     # (w, arrival) in QPC ticks
+        self.p = subprocess.Popen([str(target), "--count", "1000000", "--delay", "5"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        self.t = threading.Thread(target=self._read, daemon=True)
+        self.t.start()
+
+    def _read(self):
+        for line in self.p.stdout:
+            arrival = _qpc_now()
+            m = re.search(r'"w":(-?\d+)', line)
+            if m and int(m.group(1)) > 0:
+                self.samples.append((int(m.group(1)), arrival))
+
+    def stop(self):
+        try:
+            self.p.kill()
+        except OSError:
+            pass
+        self.p.wait()
+        self.t.join(timeout=10)
+        s = self.samples
+        gaps = sorted(b[0] - a[0] for a, b in zip(s, s[1:]))
+        self.period = gaps[len(gaps) // 2] if gaps else 0         # the writer's normal period (median)
+        # per interval between consecutive writes: (start, end, lateness) ; per write: delivery latency
+        self.late = [(a[0], b[0], max(0, b[0] - a[0] - self.period)) for a, b in zip(s, s[1:])]
+        return self
+
+    def noise(self, a, b):
+        """Worst write lateness / delivery latency (QPC ticks) overlapping [a, b]."""
+        worst = 0
+        for start, end, late in self.late:
+            if start <= b and end >= a:
+                worst = max(worst, late)
+        for w, arr in self.samples:
+            if w <= b and arr >= a:
+                worst = max(worst, arr - w)
+        return worst
+
+
 def check_stream_latency():
+    """Live log latency: a record reaches the controller's stdout reader promptly after the
+    event that made it. logstream_target calls LogSite(i) every 100 ms (50 calls) and stamps,
+    with QueryPerformanceCounter, each call (field "t" of the next tick line) and each of its
+    own stdout lines (field "w"); the reader stamps arrivals with the same counter. Per
+    backend: all 50 records arrive, each once and in call order, never before its event
+    (clock sanity), nothing dropped, and the latency event -> arrival meets the bar:
+      - quiet machine (the concurrent noise sampler, an uninstrumented writer, saw < 20 ms of
+        stall in the whole run): p99 < 100 ms, absolute (the original bar);
+      - noisy machine (a shared VM, a 2-core cloud runner): p99 of (latency - the stall the
+        sampler saw in that same record's window) < 100 ms -- the machine's own stalls are not
+        UHH's, but any latency UHH adds on top of them still fails.
+    The target's own lines are forwarded by UHH separately from the records (a pipe and a
+    forwarder thread), so a record can reach stdout before the tick line written just before
+    its event: reported (log_before_tick), not required (no such cross-stream promise)."""
     tracer, target = exe("uhh_trace.exe"), exe("logstream_target.exe")
     if not tracer or not target:
         return missing_bin("stream-latency", "uhh_trace/logstream_target")
+    freq = _qpc_freq()
+    ms = lambda ticks: ticks * 1000.0 / freq
+    quiet_ms, bar_ms, n = 20.0, 100.0, 50
     for backend in ("inline", "hw", "breakpoint"):
         name = f"stream-latency-{backend}"
-        ticks, logs, objects = {}, {}, []
+        ticks, logs, log_seq, objects = {}, {}, [], []
+        sampler = None
         try:
-            def consume(line, arrival):
+            def consume(line, _arrival):
+                arrival = _qpc_now()
                 if not line.startswith("{"):
                     return
                 try:
@@ -689,24 +770,54 @@ def check_stream_latency():
                 except json.JSONDecodeError:
                     return
                 if obj.get("kind") == "tick":
-                    ticks.setdefault(obj.get("i"), arrival)
+                    ticks.setdefault(obj.get("i"), (arrival, obj.get("w"), obj.get("t")))
                 elif obj.get("kind") == "probe_log":
                     match = re.fullmatch(r"LogSite\((-?\d+)\)", str(obj.get("message", "")))
                     if match:
-                        logs.setdefault(int(match.group(1)), arrival)
+                        i = int(match.group(1))
+                        log_seq.append(i)
+                        logs.setdefault(i, arrival)
                 else:
                     objects.append(obj)
 
+            sampler = _NoiseSampler(target)
+            time.sleep(0.2)
             rc, timed_out = trace_logstream(backend, [], 120, consume)
-            latencies = [logs[i] - ticks[i] for i in range(50) if i in ticks and i in logs]
-            ordered = all(logs.get(i, 0) >= ticks.get(i, float("inf")) for i in range(50))
-            p99 = sorted(latencies)[max(0, math.ceil(.99 * len(latencies)) - 1)] if latencies else float("inf")
+            sampler.stop()
+            # event i's stamp travels in tick i+1 ("t"); a tick's own write stamp is "w"
+            events = {i: ticks[i + 1][2] for i in range(n) if i + 1 in ticks and (ticks[i + 1][2] or 0) > 0}
+            lat = {i: logs[i] - events[i] for i in range(n) if i in logs and i in events}
+            fwd = [ticks[i][0] - ticks[i][1] for i in range(n) if i in ticks]
+            noise = {i: sampler.noise(events[i], logs[i]) for i in lat}
+            excess = {i: lat[i] - noise[i] for i in lat}
+            pct = lambda vals, q: sorted(vals)[max(0, math.ceil(q * len(vals)) - 1)] if vals else float("inf")
+            p50, p99 = pct(list(lat.values()), .5), pct(list(lat.values()), .99)
+            p99_excess = pct(list(excess.values()), .99)
+            run_noise = max((late for _, _, late in sampler.late), default=0)
+            run_noise = max([run_noise] + [arr - w for w, arr in sampler.samples])
+            quiet = ms(run_noise) < quiet_ms and len(sampler.samples) >= 100
+            causal = all(v >= 0 for v in lat.values()) and all(v >= 0 for v in fwd)
+            in_order = log_seq == list(range(n))
+            before_tick = sum(1 for i in range(n) if i in logs and i in ticks and logs[i] < ticks[i][0])
             rep = report(objects)
-            ok = (not timed_out and rc == 0 and len(ticks) == len(logs) == len(latencies) == 50 and
-                  ordered and p99 < .100 and rep.get("logs_written") == 50 and rep.get("log_dropped") == 0)
-            record(name, ok, f"pairs={len(latencies)}/50 p99={p99 * 1000:.1f}ms "
-                             f"written={rep.get('logs_written')} dropped={rep.get('log_dropped')} rc={rc}")
+            complete = len(lat) == n and len(ticks) == n + 1
+            lat_ok = ms(p99 if quiet else p99_excess) < bar_ms
+            ok = (not timed_out and rc == 0 and complete and in_order and causal and lat_ok and
+                  rep.get("logs_written") == n and rep.get("log_dropped") == 0)
+            worst = sorted(lat, key=lat.get)[-3:][::-1]
+            record(name, ok,
+                   f"pairs={len(lat)}/{n} ticks={len(ticks)}/{n + 1} in_order={in_order} causal={causal} "
+                   f"{'quiet' if quiet else 'noisy'}: bar={'p99' if quiet else 'p99(latency-noise)'}<{bar_ms:.0f}ms "
+                   f"p50={ms(p50):.1f}ms p99={ms(p99):.1f}ms p99_excess={ms(p99_excess):.1f}ms "
+                   f"worst(ms,noise)={[(i, round(ms(lat[i]), 1), round(ms(noise[i]), 1)) for i in worst]} "
+                   f"noise_run_max={ms(run_noise):.1f}ms sampler={len(sampler.samples)}@{ms(sampler.period):.1f}ms "
+                   f"fwd_p99={ms(pct(fwd, .99)):.1f}ms log_before_tick={before_tick} "
+                   f"written={rep.get('logs_written')} dropped={rep.get('log_dropped')} rc={rc}"
+                   + (" TIMEOUT" if timed_out else "")
+                   + ("" if in_order else f" seq={log_seq[:8]}..."))
         except Exception as e:
+            if sampler and sampler.p.poll() is None:
+                sampler.p.kill()
             record(name, False, repr(e))
 
 
@@ -2145,22 +2256,31 @@ def check_patch_race(trials=4):
     trampoline; every trial must exit 0 with every call returning 16. With
     PROBE_UNSAFE_FAST_PATCH the jump is written while they run: a thread resumes mid-jump
     and returns a wrong count or crashes -- this must happen in at least one trial,
-    proof the test can see the race the freeze removes."""
+    proof the test can see the race the freeze removes.
+    Each trial runs at least MIN_CYCLES attach/hook/detach cycles AND at least MIN_SECONDS
+    of them (whichever ends later; at most 25 cycles), however long a cycle takes on this
+    machine: the target runs until its stdin is closed (--until-stdin). A cycle against 8
+    spinning threads takes ~1 s on the 4-core VM but 6-8.5 s on a 2-core CI runner; a fixed
+    12 s window fitted only one there. A trial that cannot finish MIN_CYCLES within
+    TRIAL_BUDGET seconds fails (a hang or a pathological slowdown, not a pass)."""
+    MIN_CYCLES, MIN_SECONDS, TRIAL_BUDGET = 4, 12, 300
     t, a = exe("uhh_trace.exe"), exe("patchrace_target.exe")
     if not t or not a:
         return missing_bin("patch-race", "uhh_trace/patchrace_target")
     for mode in ("frozen", "unsafe"):
         name = f"patch-race-{mode}"
-        exits, cycles_all, notes, torn = [], [], [], []
+        exits, cycles_all, notes, torn, secs = [], [], [], [], []
         try:
             for _ in range(trials):
-                target = subprocess.Popen([str(a), "--threads", "8", "--seconds", "12"],
+                target = subprocess.Popen([str(a), "--threads", "8", "--seconds", str(TRIAL_BUDGET + 60),
+                                           "--until-stdin"], stdin=subprocess.PIPE,
                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 ready = target.stdout.readline()
                 if '"ready"' not in ready:
                     raise RuntimeError(f"target not ready: {ready!r}")
-                cycles = 0
-                while target.poll() is None and cycles < 25:
+                cycles, t0 = 0, time.monotonic()
+                while (target.poll() is None and cycles < 25 and time.monotonic() - t0 < TRIAL_BUDGET and
+                       (cycles < MIN_CYCLES or time.monotonic() - t0 < MIN_SECONDS)):
                     cmd = [str(t), "--backend", "inline", "--attach", str(target.pid), "--detach-after-ms", "400",
                            "-p", "patchrace_target.exe!RaceSite:-"]
                     if mode == "unsafe":
@@ -2174,8 +2294,9 @@ def check_patch_race(trials=4):
                     if pr.get("backend") != "inline" or (not pr.get("hits") and cycles > 1):   # first cycle loads the agent
                         notes.append(f"backend={pr.get('backend')} hits={pr.get('hits')} "
                                      f"err={(report(objs).get('error') or '')[:80]}")
+                secs.append(round(time.monotonic() - t0))
                 try:
-                    tout, _ = target.communicate(timeout=120)
+                    tout, _ = target.communicate(timeout=120)        # closes stdin: the target stops
                 except subprocess.TimeoutExpired:
                     target.kill(); tout, _ = target.communicate()
                 res = next((json.loads(l) for l in (tout or "").splitlines() if '"kind":"app"' in l), {})
@@ -2183,11 +2304,12 @@ def check_patch_race(trials=4):
             crashed = sum(1 for e in exits if e != 0)
             torn_total = sum(t or 0 for t in torn)
             if mode == "frozen":
-                ok = crashed == 0 and torn_total == 0 and min(cycles_all) >= 4 and not notes
+                ok = crashed == 0 and torn_total == 0 and min(cycles_all) >= MIN_CYCLES and not notes
             else:
                 ok = (crashed >= 1 or torn_total >= 1) and not any("hits=None" in n or "hits=0" in n for n in notes)
             record(name, ok, f"trials={trials} crashed={crashed} torn={torn} exits={[hex(e & 0xffffffff) for e in exits]} "
-                             f"hook_cycles={cycles_all}" + (f" notes={notes[:3]}" if notes else "")
+                             f"hook_cycles={cycles_all} secs={secs} (>= {MIN_CYCLES} cycles and {MIN_SECONDS} s each)"
+                             + (f" notes={notes[:3]}" if notes else "")
                              + ("" if ok or mode == "frozen" else " (unsafe never failed: test not sensitive)"))
         except Exception as e:
             record(name, False, repr(e))
@@ -5301,6 +5423,10 @@ def _realapps_scenarios(sysdir):
         ("cmd-tasklist", [sysdir / "cmd.exe", "/c", "tasklist /fo csv /nh"], "csv", ((0, 1, 2, 3), 1)),
         ("ps-modules", psargs + ["Get-Process | sort Id | % { try { '{0},{1},{2}' -f $_.Id,$_.ProcessName,"
                                  "(($_.Modules | % ModuleName) -join ';') } catch {} }"], "lines", (None, 0)),
+        # The same WMI process query as wmic, through PowerShell's CIM client: runs where WMIC
+        # is no longer shipped (Windows Server 2025, Windows 11 24H2).
+        ("ps-cim", psargs + ["Get-CimInstance Win32_Process | sort ProcessId | % { '{0},{1},{2}' -f "
+                             "$_.ProcessId,$_.Name,$_.ExecutablePath }"], "lines", (None, 0)),
         ("ps-fileversion", psargs + ["Get-Process -FileVersionInfo -EA SilentlyContinue | % { $_.FileName } | sort"],
          "lines", (None, "path")),
         ("ps-truth", psargs + [REALAPPS_PS_TRUTH], "truth", None),
@@ -5478,7 +5604,7 @@ def _realapps_verify_logs(objs, seen):
 def check_realapps():
     """Flagship use case on REAL programs: realapps_driver applies gated_config's callbacks
     (track_open_process / forget_closed_handle / log_read) to tasklist, wmic, cmd and
-    powershell (Get-Process .Modules / -FileVersionInfo, and a .NET P/Invoke script with
+    powershell (Get-Process .Modules / -FileVersionInfo, Get-CimInstance, and a .NET P/Invoke script with
     known handles), launched and attached, on every backend. Program output must equal the
     uninstrumented run (rows stable across two plain runs must be unchanged); every logged
     read's pid/name must be a real process (Toolhelp poll); reads through handles that did
@@ -5497,38 +5623,58 @@ def check_realapps():
         if only and scen not in only:
             continue
         if not Path(argv[0]).exists():
-            # Explicitly requested (--only realapps..., UHH_REALAPPS_ONLY): a FAILURE. In the
-            # full suite a program this Windows no longer ships (e.g. wmic) is a SKIP.
-            explicit = scen in only or any(o in n for o in ONLY for n in (f"realapps-{scen}", "check_realapps", "check-realapps"))
-            if explicit:
-                record(f"realapps-{scen}", False, f"{argv[0]} missing on this system (explicitly selected)")
+            # An OS component this Windows does not ship: skip_external (a SKIP in the full suite,
+            # a FAILURE when explicitly selected: --only realapps..., or UHH_REALAPPS_ONLY).
+            why = ("WMIC is a Feature on Demand that Windows Server 2025 / Windows 11 24H2 no longer install; "
+                   "realapps-ps-cim runs the same WMI process query" if scen == "wmic" else "not on this system")
+            if scen in only:
+                record(f"realapps-{scen}", False, f"optional external dependency absent: system program {argv[0]} "
+                                                  f"({why}) -- explicitly selected (UHH_REALAPPS_ONLY)")
             else:
-                skip_external(f"realapps-{scen}", f"system program {argv[0]} (not on this system)")
+                skip_external(f"realapps-{scen}", f"system program {argv[0]}", why)
             continue
-        base = None
-        bks = env_bks or ["breakpoint", "hw", "inline"]
-        if x86 and scen == "tasklist-m" and not env_bks:
-            bks = ["breakpoint"]   # 32-bit tasklist /m takes ~2 min even uninstrumented (and opens nothing)
-        for bk in bks:
-            name = f"realapps-{scen}-{bk}"
-            print(f"  .. {name}", file=sys.stderr, flush=True)
-            try:
-                # Plain (uninstrumented) runs right before and right after this one: a
-                # process list changes all the time, so only rows identical in both count.
-                if kind in ("csv", "lines") or (kind == "truth" and base is None):
-                    base = [_run_plain(argv, work / f"{scen}-{bk}-plain0.txt")]
-                _realapps_one(name, drv, argv, kind, cols, bk, base, work / f"{scen}-{bk}", x86,
-                              after=(lambda: _run_plain(argv, work / f"{scen}-{bk}-plain1.txt"))
-                              if kind in ("csv", "lines") else None)
-            except Exception as e:
-                record(name, False, repr(e))
+        # ps-fileversion lists the processes of ITS bitness that it can open: on a machine with
+        # no other 32-bit process (a CI runner) a 32-bit run lists nothing to compare. The check
+        # starts its own helpers of that bitness (findstr waiting on a pipe) for the scenario's
+        # whole duration: their rows and their reads are required, deterministically, on every
+        # machine.
+        helpers = []
+        if scen == "ps-fileversion":
+            helpers = [subprocess.Popen([str(sysdir / "findstr.exe"), "uhh-helper"], stdin=subprocess.PIPE,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for _ in range(3)]
+        own = (sysdir / "findstr.exe", [h.pid for h in helpers]) if helpers else None
+        try:
+            _realapps_scenario(scen, argv, kind, cols, x86, env_bks, drv, work, own)
+        finally:
+            for h in helpers:
+                h.kill(); h.wait()
     if os.environ.get("UHH_REALAPPS_KEEP"):
         print(f"  realapps work dir kept: {work}", file=sys.stderr)
     else:
         shutil.rmtree(work, ignore_errors=True)
 
 
-def _realapps_one(name, drv, argv, kind, cols, bk, base, stem, x86, after=None):
+def _realapps_scenario(scen, argv, kind, cols, x86, env_bks, drv, work, own):
+    base = None
+    bks = env_bks or ["breakpoint", "hw", "inline"]
+    if x86 and scen == "tasklist-m" and not env_bks:
+        bks = ["breakpoint"]   # 32-bit tasklist /m takes ~2 min even uninstrumented (and opens nothing)
+    for bk in bks:
+        name = f"realapps-{scen}-{bk}"
+        print(f"  .. {name}", file=sys.stderr, flush=True)
+        try:
+            # Plain (uninstrumented) runs right before and right after this one: a
+            # process list changes all the time, so only rows identical in both count.
+            if kind in ("csv", "lines") or (kind == "truth" and base is None):
+                base = [_run_plain(argv, work / f"{scen}-{bk}-plain0.txt")]
+            _realapps_one(name, drv, argv, kind, cols, bk, base, work / f"{scen}-{bk}", x86,
+                          after=(lambda: _run_plain(argv, work / f"{scen}-{bk}-plain1.txt"))
+                          if kind in ("csv", "lines") else None, own=own)
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+def _realapps_one(name, drv, argv, kind, cols, bk, base, stem, x86, after=None, own=None):
     t0 = time.perf_counter()
     poll = _ProcPoller()
     target = None
@@ -5602,6 +5748,16 @@ def _realapps_one(name, drv, argv, kind, cols, bk, base, stem, x86, after=None):
         # A 32-bit Get-Process -FileVersionInfo lists only the few 32-bit processes: >= 1 row.
         ok = ok and not missing and prc == plain_rc and sum(stable.values()) >= 1
         detail += f" stable_rows={sum(stable.values())} missing={len(missing)} exit={prc}/{base[0][0]}"
+        if own:
+            # The check's own helpers: each listed in both plain runs and the instrumented one,
+            # and each read by the instrumented program through a handle mapped to its pid/name.
+            img, own_pids = str(own[0]).lower(), own[1]
+            own_stable = sum(n for r, n in stable.items() if r.lower() == img)
+            own_mine = sum(n for r, n in mine.items() if r.lower() == img)
+            own_read = sorted({r[1] for r in reads if r[1] in own_pids and r[2].lower() == own[0].name.lower()})
+            ok = ok and own_stable >= len(own_pids) and own_mine >= len(own_pids) and len(own_read) == len(own_pids)
+            detail += (f" helpers={len(own_pids)}x{own[0].name}: stable={own_stable} instrumented={own_mine} "
+                       f"read={len(own_read)}/{len(own_pids)}")
         if missing:
             m0 = missing[0]
             key = ",".join(m0.split(",")[:2])
