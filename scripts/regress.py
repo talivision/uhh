@@ -1661,15 +1661,21 @@ def tp_co_expected(grp, iters):
     return sum(per[p] for p in grp)
 
 
+# The CET rows leave out tp_ovf (a callback overflowing its stack: TR9, a host-dependent runner finding of its
+# own -- one such crash took every later row of the run with it); it has nothing to do with shadow stacks.
+TP_CET_SKIP = ("ovf",)
 TP_GROUPS = {"breakpoint": [TP_PROBES], "inline": [TP_PROBES],
              "hw": [TP_PROBES[i:i + 3] for i in range(0, len(TP_PROBES), 3)]}
 
 
-def tp_runs(d, t, bk, mode, iters):
+def tp_runs(d, t, bk, mode, iters, skip=()):
     """Runs tp_driver for every probe group of `bk` in `mode` against target `t` (tp_target or
-    its /CETCOMPAT twin); returns (problems, target rows)."""
+    its /CETCOMPAT twin); returns (problems, target rows). `skip`: probes left out."""
     bad, rows = [], []
     for grp in TP_GROUPS[bk]:
+        grp = [p for p in grp if p not in skip]
+        if not grp:
+            continue
         targs = [t, "--iters", iters] + [f"--{x}" for x in ("spawn", "peek", "ovf") if x in grp]
         r, o = run([d, "--backend", bk, "--mode", mode, "--probes", ",".join(grp), "--"] + targs, timeout=300)
         tg = next((x for x in o if x.get("kind") == "target"), {})
@@ -2770,7 +2776,7 @@ def check_cet(threads=8, reads=500):
                 missing_bin(name, "tp_driver/tp_target_cet")
                 continue
             try:
-                bad, rows = tp_runs(tpd, tpc, bk, mode, 10)
+                bad, rows = tp_runs(tpd, tpc, bk, mode, 10, skip=TP_CET_SKIP)
                 ssp = sorted({str(x.get("shadow_stack")) for x in rows})
                 if enforced is not None and ssp != [str(bool(enforced))]:
                     bad.append(f"target shadow_stack={ssp} but cet_probe enforced={enforced}")
@@ -2866,7 +2872,7 @@ def check_cet_policy(threads=4, reads=200):
                 for mode in (("callfn", "co") if policy == "strict" else ("log",)):
                     name = f"cet-{policy}-tp-{bk}-{mode}"
                     try:
-                        bad, rows = tp_runs(tpd, copies["tp_target_cet"], bk, mode, 5)
+                        bad, rows = tp_runs(tpd, copies["tp_target_cet"], bk, mode, 5, skip=TP_CET_SKIP)
                         if policy == "block" and bk == "inline" and on:
                             # The agent / callback module must be /CETCOMPAT to load; until then
                             # the refusal must be clean (the error names the agent load).
