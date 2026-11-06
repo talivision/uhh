@@ -1558,9 +1558,11 @@ def check_callorig_hunt():
                         q.kill()
 
 
-# F5: case -> (the probed function that is left, its callback's log name, "co after" hits).
-CO_DEEP = {"deepthrow": ("co_throw", "throw", 10), "deepseh": ("co_seh", "seh", 10),
-           "deepjmp": ("co_jump", "jump", 10), "catchhit": ("co_throw", "throw", 5)}
+# F5: case -> (the probed function call_original runs, its callback's log name, how many of its
+# calls are left (no "-done" log), "co after" hits, "co after" logs).
+CO_DEEP = {"deepthrow": ("co_throw", "throw", 5, 10, 10), "deepseh": ("co_seh", "seh", 5, 10, 10),
+           "deepjmp": ("co_jump", "jump", 5, 10, 10), "catchhit": ("co_throw", "throw", 5, 5, 5),
+           "catchinside": ("co_outer", "outer", 0, 15, 0)}
 
 
 def check_callorig_deep():
@@ -1569,7 +1571,9 @@ def check_callorig_deep():
     than the left call's (susp_target deep*), or inside the catch block (catchhit). Every later
     hit must run its callback as on inline -- they used to be taken for hits inside the
     original (counted, no callback) until the next hit at the left frame's level or the 5 s
-    release. Exact hits and "co" logs (hits == logs), the target's row as uninstrumented,
+    release. Control (catchinside): the exception is caught INSIDE the original (a probed call
+    in that catch block, then a deeper one): those hits are inside the call -- counted, no
+    callback -- and the call returns normally. Exact hits and "co" logs (hits == logs), the target's row as uninstrumented,
     nothing dropped or interrupted, and the abandoned call_original never runs into the 5 s
     limit. Every backend."""
     d, t = exe("co_driver.exe"), exe("susp_target.exe")
@@ -1579,7 +1583,7 @@ def check_callorig_deep():
     def co_row(objs):
         return next((x for x in objs if x.get("kind") == "co"), {})
 
-    for case, (fn, nm, after) in CO_DEEP.items():
+    for case, (fn, nm, nleft, after, after_logs) in CO_DEEP.items():
         try:
             r0, o0 = run([t, case], timeout=60)
             base = co_row(o0)
@@ -1600,7 +1604,7 @@ def check_callorig_deep():
                 for p in probes(o):
                     loc = str(p.get("location", ""))
                     hb[loc.split("!", 1)[-1]] = p.get("hits")
-                want_logs = {f"co {nm}": 10, f"co {nm}-done": 5, "co after": after}
+                want_logs = {f"co {nm}": 10, f"co {nm}-done": 10 - nleft, "co after": after_logs}
                 want_hits = {fn: 10, "co_after": after}
                 got_logs = {k: logs.get(k, 0) for k in want_logs}
                 extra = sorted(k for k in logs if k not in want_logs)

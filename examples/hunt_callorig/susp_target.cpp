@@ -12,7 +12,8 @@
 // an SEH raise (deepseh) or a longjmp (deepjmp) -- caught / landed above it; then the program calls
 // a probed function from a DEEPER frame than the left call's (deeper(): a real frame below the
 // one that made the probed call). Every such later hit must run its callback (as inline does).
-// catchhit: the probed call is made inside the catch block itself.
+// catchhit: the probed call is made inside the catch block itself. catchinside: the control
+// case -- the exception is caught INSIDE the original: every probed call is inside it.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <setjmp.h>
@@ -51,6 +52,13 @@ static __declspec(noinline) intptr_t deeper(intptr_t x) {
     for (int i = 0; i < 64; ++i) pad[i] = x + i;
     return co_after(pad[x & 15]) + pad[0];
 }
+// catchinside: the ORIGINAL (co_outer) throws and catches inside itself -- a probed call in
+// the catch block -- then makes a deeper probed call: all of it is inside the original
+// (counted, no callback, as inline's nested-call rule), the call returns normally.
+static __declspec(noinline) intptr_t inner_try(intptr_t x) {
+    try { return co_throw(x); } catch (const std::runtime_error &) { return co_after(200 + x) + 1; }
+}
+CO_EXPORT intptr_t co_outer(intptr_t x) { const intptr_t a = inner_try(x); return a + deeper(x); }
 static __declspec(noinline) int seh_call(intptr_t x, intptr_t *r) {   // SEH and C++ objects: own frame
     __try { *r = co_seh(x); return 0; }
     __except (GetExceptionCode() == 0xE0C0FFEEu ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) { return 1; }
@@ -65,6 +73,11 @@ static int run_deep(const char *k) {
     intptr_t sum = 0, after = 0;
     int left = 0;
     for (intptr_t x = 0; x < 10; ++x) {
+        if (!strcmp(k, "catchinside")) {
+            sum += co_outer(x);
+            left += (int)(x & 1);
+            continue;
+        }
         if (!strcmp(k, "deepthrow") || !strcmp(k, "catchhit")) {
             try { sum += co_throw(x); }
             catch (const std::runtime_error &e) {
@@ -101,7 +114,8 @@ static bool read_gate() {
 
 int main(int argc, char **argv) {
     const char *k = argc > 1 ? argv[1] : "";
-    if (!strcmp(k, "deepthrow") || !strcmp(k, "deepseh") || !strcmp(k, "deepjmp") || !strcmp(k, "catchhit"))
+    if (!strcmp(k, "deepthrow") || !strcmp(k, "deepseh") || !strcmp(k, "deepjmp") || !strcmp(k, "catchhit") ||
+        !strcmp(k, "catchinside"))
         return run_deep(k);
     const bool co = !strcmp(k, "cosusp");
     if (!co && strcmp(k, "evsusp")) { fprintf(stderr, "susp_target: unknown case '%s'\n", k); return 2; }

@@ -729,6 +729,42 @@ bool walk_stack(HANDLE process, HANDLE thread, CONTEXT ctx,
     }
 }
 
+bool unwind_frames(HANDLE process, HANDLE thread, CONTEXT ctx,
+                   std::vector<std::pair<std::uint64_t, std::uint64_t>> &pc_sp, std::size_t max_frames) {
+    try {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        pc_sp.clear();
+        if (!g_dbghelp || find_session(process) == g_sessions.end() || !thread) return false;
+        STACKFRAME64 frame{};
+        ctx.ContextFlags |= CONTEXT_FULL;
+#if defined(_WIN64)
+        const DWORD machine = IMAGE_FILE_MACHINE_AMD64;
+        frame.AddrPC.Offset = ctx.Rip; frame.AddrStack.Offset = ctx.Rsp; frame.AddrFrame.Offset = ctx.Rbp;
+#else
+        const DWORD machine = IMAGE_FILE_MACHINE_I386;
+        frame.AddrPC.Offset = ctx.Eip; frame.AddrStack.Offset = ctx.Esp; frame.AddrFrame.Offset = ctx.Ebp;
+#endif
+        frame.AddrPC.Mode = frame.AddrStack.Mode = frame.AddrFrame.Mode = AddrModeFlat;
+        for (std::size_t i = 0; i < max_frames + 1; ++i) {
+            if (!g_api.stack_walk(machine, process, thread, &frame, &ctx, nullptr,
+                                  g_api.function_table_access, g_api.get_module_base, nullptr))
+                break;
+            if (i == 0) continue;                  // the first call reports frame 0 itself
+#if defined(_WIN64)
+            const std::uint64_t pc = ctx.Rip, sp = ctx.Rsp;
+#else
+            const std::uint64_t pc = ctx.Eip, sp = ctx.Esp;
+#endif
+            if (!pc || (!pc_sp.empty() && sp <= pc_sp.back().second && pc == pc_sp.back().first)) break;
+            pc_sp.emplace_back(pc, sp);
+        }
+        return true;
+    } catch (...) {
+        pc_sp.clear();
+        return false;
+    }
+}
+
 bool enumerate(HANDLE process, const std::string &module, const std::string &mask,
                std::vector<symbol_entry> &out) {
     try {
