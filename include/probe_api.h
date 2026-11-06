@@ -66,8 +66,9 @@ enum probe_flags {
     /* Hardware DATA watchpoints (PROBE_HW only): the callback fires when the probed
        ADDRESS is written (or read+written). No code is modified and no execution is
        hooked -- this observes DATA access, which inline/trampoline hooking cannot do.
-       The address is a data location (module+RVA of a variable) aligned to the word
-       size. Exactly one of WRITE/RW; absent = an ordinary execute breakpoint. */
+       The address is a data location (module+RVA of a variable), 4-byte aligned; one
+       dword is watched on both x64 and x86. Exactly one of WRITE/RW; absent = an
+       ordinary execute breakpoint. */
     PROBE_WATCH_WRITE     = 1u << 6,
     PROBE_WATCH_RW        = 1u << 7,
     /* Remove the probe after its first hit — e.g. a one-shot return hook, or an
@@ -76,8 +77,7 @@ enum probe_flags {
     PROBE_ONCE            = 1u << 8,
     /* PROBE_INLINE only. UNSAFE: write the hook's jump WITHOUT freezing the target. By
        default the controller suspends every other thread while an inline hook is
-       written (microseconds, at install/remove only -- never per hit; attach also holds
-       every thread until inline hooks are in) and moves any
+       written (microseconds, at install/remove only -- never per hit) and moves any
        thread caught inside the overwritten bytes onto the trampoline. With this flag a
        thread executing those bytes at that moment resumes mid-jump and crashes or
        misbehaves. For measurement/testing; do not use on code other threads may run. */
@@ -167,7 +167,10 @@ int probe_run(probe_session *);
    tail (unless stdout is NUL) has reached the same byte offset. A stdout whose reader went
    away (a closed pipe: `| head`) is not a failure: the live tail stops with a warning on
    stderr, every record still reaches the file, and probe_report says
-   "live_output_closed":true; `error` and the return value reflect real failures only. */
+   "live_output_closed":true; `error` and the return value reflect real failures only.
+   Returns 1 when the session ended without error AND the target exited with code 0 (or the
+   session was interrupted by Ctrl+C); a target exit code other than 0 returns 0 with no
+   error set: read the exit code from the probe_report record. */
 int probe_wait_for_exit(probe_session *);
 /* Catches the stdout tail up first, then writes only prehook/probe/probe_report records
    to out. File-backed logs are never replayed, including on repeated calls. */
@@ -205,7 +208,8 @@ void send_log_stack(probe_context *, const char *format, ...);
 const void *get_config(probe_context *);
 /* Call a function IN THE TARGET from a callback, on the thread that hit the probe:
    symbol is "module!Export[+0xOFF]", "module+0xRVA" or "0xADDRESS"; up to 8 integer/
-   pointer args (Windows x64 ABI / x86 stack args; stdcall or cdecl). *ret receives the
+   pointer args, each read as a uint64_t (cast every argument: an int passed on x86 is
+   misread) (Windows x64 ABI / x86 stack args; stdcall or cdecl). *ret receives the
    return register. Returns 1 on success. Inline: a direct call. Breakpoint/hw: the
    debugger runs the call on the stopped thread and restores its context exactly (other
    threads keep running; probes hit inside the callee do not re-enter callbacks) -- tens

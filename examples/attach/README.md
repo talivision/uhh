@@ -24,10 +24,11 @@ the attach.
 (`call_original`), reads the new handle and records it with the pid from `CLIENT_ID`, then
 returns the real status (`return_from`) -- see gated_config's README.
 
-The open and read probes must use the **same backend**: the map lives with the
-callbacks (in `uhh_attach` for breakpoint/hw, inside the target's injected
-`probe_api_agent.dll` for inline). The callbacks are the same source in every
-backend (shared with gated_config, `examples/gated_config/callbacks.cpp`).
+The open and read probes may use different backends: the handle -> pid map is
+`UHH_SHARED`, one piece of memory that breakpoint/hw callbacks (in `uhh_attach`) and
+inline callbacks (in the target's injected `probe_api_agent.dll`) both see. The callbacks
+are the same source in every backend (shared with gated_config,
+`examples/gated_config/callbacks.cpp`).
 
 The helpers all hold their buffer at the **same address** (same image, same ASLR
 base), so the address range alone cannot tell them apart: only the pid filter does.
@@ -81,11 +82,12 @@ Two consoles in the build directory (`build-x64\Release` or `build-x86\Release`;
 
    ```
    {"kind":"probe_log","probe":1,"tid":...,"message":"open pid=7516 name=probe_app.exe"}
-   {"kind":"probe_log","probe":2,"tid":...,"message":"map handle=0xa4 -> pid=7516 name=probe_app.exe"}
-   {"kind":"probe_log","probe":2,"tid":...,"message":"read handle=0xa4 pid=7516 name=probe_app.exe addr=0x7ff7fb509690 size=16"}
+   {"kind":"probe_log","probe":1,"tid":...,"message":"map handle=0xa4 -> pid=7516 name=probe_app.exe"}
+   {"kind":"probe_log","probe":3,"tid":...,"message":"read handle=0xa4 pid=7516 name=probe_app.exe addr=0x7ff7fb509690 size=16"}
    ...
    {"kind":"probe","location":"configparse.dll!ParseConfig+0x16","backend":"breakpoint","active":true,"hits":1}
    {"kind":"probe","location":"ntdll.dll!NtOpenProcess","backend":"inline","active":true,"hits":4}
+   {"kind":"probe","location":"ntdll.dll!NtClose","backend":"inline","active":true,"hits":...}
    {"kind":"probe","location":"ntdll.dll!NtReadVirtualMemory","backend":"inline","active":true,"hits":8000}
    {"kind":"probe_report",...,"overrides":1,"log_dropped":0,...}
    ```
