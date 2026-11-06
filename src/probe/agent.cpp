@@ -2517,8 +2517,14 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_stop(void *) {
     frozen(slot_set{}, [] {
         for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i)
             // Restore the original bytes -- unless the controller saw the module unload
-            // (the address is unmapped or holds another image now).
-            if (hooks[i] && shared->requests[i].status != PROBE_AGENT_UNLOADED) (void)hooks[i].disable();
+            // (the address is unmapped or holds another image now). A module that went away
+            // and is pending again (reloaded, not yet re-hooked when the detach came) still has
+            // its OLD hook object here, for code that may be unmapped: never written blind.
+            if (hooks[i] && shared->requests[i].status != PROBE_AGENT_UNLOADED &&
+                site_mapped((uint64_t)(uintptr_t)hooks[i].target_address())) {
+                uint32_t idx = i;
+                (void)seh_run([](void *p) { (void)hooks[*static_cast<uint32_t *>(p)].disable(); }, &idx);
+            }
     });
     // Keep the trampolines and stubs: a thread may still be on its way back through one
     // (it then jumps to the original code, which is intact). Deliberate leak, once.
