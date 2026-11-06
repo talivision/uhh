@@ -323,7 +323,7 @@ struct probe_session {
     bool detached = false;
     bool detaching = false;                    // detach() running: no new holds, arming, gates or agent work
     bool detached_hooks = false;               // detach removed the inline hooks (stop_drainer may settle)
-    bool guard_ready = false;                  // attach: controller-death guard up (or given up): arm breakpoint/hw
+    bool guard_ready = false;                  // attach: breakpoint/hw probes may arm (see guard_pending)
     ULONGLONG guard_since = 0;
     bool agent_init_started = false;           // this session started the agent's init
     std::vector<DWORD> detach_frozen;          // detach's own freeze of every thread (mirrored for the guard)
@@ -1470,7 +1470,12 @@ static bool has_inline(const probe_session *s) {
 // agent is loaded it is also the controller-death guard (probe_agent_shared.hpp): an attach
 // with inline probes from the start arms its breakpoint/hw probes once the guard is up, so no
 // unguarded trap exists there; a session that acquires the agent later is guarded from then on.
-static bool guard_pending(const probe_session *s) { return s->attached && s->shared && !s->guard_ready; }
+// Without inline probes an attach arms its breakpoint/hw probes at the attach's break-in (the
+// kernel's synthetic process/thread/module events are all in by then), not during that burst:
+// hw probes armed while it was still being reported crashed the target with a single step it
+// never expected (lifecycle-*-hw, CI; L1 had hidden it -- arming waited for the agent, and the
+// agent's guard swallowed stray traps of ours).
+static bool guard_pending(const probe_session *s) { return s->attached && !s->guard_ready; }
 
 // ---- UHH_SHARED: one callbacks DLL file, loaded by controller and target ---------------
 static bool image_has_section(const unsigned char *base, const char *name) {
@@ -4311,7 +4316,7 @@ extern "C" int probe_attach(probe_session *s, uint32_t pid) {
     if (!start_log_output(s)) return fail();
     { std::string which; s->sym_ready = uhh_sym::init(s->pi.hProcess, which); }
     if (!create_agent_channel(s)) return fail();
-    if (!s->shared) s->guard_ready = true;     // breakpoint/hw only: arm at once, no agent to wait for
+    s->guard_since = GetTickCount64();         // breakpoint/hw arm at the break-in or the agent's guard (5 s at most)
     return 1;
 }
 
@@ -8035,6 +8040,7 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
         //  while a held thread that owns the loader lock blocked the agent's LoadLibrary and
         //  froze the target until the install timeout (seen attaching to PowerShell). The
         //  hook write itself is safe without it: FREEZE suspends every thread for the patch.)
+        if (ok && s->initial_break && !s->shared && !s->guard_ready) ok = guard_set_ready(s, nullptr);   // no agent coming
         if (ok && s->initial_break && has_inline(s) && s->remote_work == probe_session::REMOTE_NONE &&
             (!s->remote_agent || (s->attached && !s->agent_init_started))) {
             // (Re-attach: the agent is still loaded from an earlier session -- just init it.)
@@ -8163,7 +8169,7 @@ extern "C" int probe_run(probe_session *s) {
         }
         drain_agent_logs(s);
         if (guard_pending(s) && s->guard_since && GetTickCount64() - s->guard_since > 5000 &&
-            !guard_set_ready(s, "agent not ready within 5 s")) break;
+            !guard_set_ready(s, s->shared ? "agent not ready within 5 s" : nullptr)) break;
         if (!s->held.empty() && GetTickCount64() - s->held_since > 5000) {
             // Never wedge the target: an install that does not confirm in 5 s is reported
             // and the threads run on (the affected probes simply stay inactive).

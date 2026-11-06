@@ -1165,7 +1165,10 @@ Two decisions that reverse earlier work:
   "controller-crash self-unhook: not worth the cost; the analyst sees the controller died and restarts the
   target". Now (as on main f9f3436): the agent goes in at launch/attach if inline probes are registered, or
   lazily when a callback/runtime add requests the first inline probe. bp/hw-only sessions inject nothing,
-  arm at once, and do not need the agent DLL. Inline sessions keep the guard (it covers their bp/hw probes
+  arm at the attach's break-in (no 5 s agent wait), and do not need the agent DLL. (Arming them during the
+  kernel's synthetic attach events instead, as main did, crashed hw targets with a stray single step on CI --
+  lifecycle-*-hw, detach-early/reattach/interrupt -- a bug L1 had masked: arming waited for the agent, whose
+  guard VEH also swallowed stray traps of ours.) Inline sessions keep the guard (it covers their bp/hw probes
   too; one that acquires the agent later is guarded from then on). Controller death in a bp/hw-only attached
   session is main's behaviour: kill-on-exit is off, so the target is not killed, but it keeps our INT3s/DRs
   and dies at its next hit (0x80000003 / 0x80000004) -- documented in limitations.md.
@@ -1173,8 +1176,11 @@ Two decisions that reverse earlier work:
   attached; after the kill the target runs on or dies only with our trap code, never another fault or a
   hang; outcomes listed); `lifecycle-reattach-{breakpoint,hw}` assert no agent module after every cycle;
   `lifecycle-agent-refused-{breakpoint,hw}` (a target admitting only Microsoft-signed DLLs) assert a normal
-  session with no agent attempt; new `lifecycle-no-agent-dll-*` (the agent DLL missing next to the
-  controller: bp/hw work, inline refuses cleanly). The guard checks that ran bp/hw-only sessions
+  session with no agent attempt; new `attach-lazy-agent-{breakpoint,hw}` (no agent module until a callback adds
+  the first inline probe, then it is injected and that very call is hooked) and `attach-no-agent-dll-*` (the
+  agent DLL missing next to the controller: bp/hw work, inline refuses cleanly). Note: breakpoint/hw callbacks
+  that use `UHH_SHARED` state still run from the controller's LOCAL copy of the agent DLL (nothing injected),
+  so such a controller still needs the file beside it. The guard checks that ran bp/hw-only sessions
   (`cxlib-killarm-*`, `cxlib-reptail-breakpoint`, `cxlib-touchkill-hw`, `cx2-touchprog-hw`,
   `cx2-evsusp-*`, `cx2-cosusp-*`) now add a never-called inline probe (`co_driver --guard`, `co_idle`) so
   they keep testing the guard's coverage of bp/hw state in inline sessions.
