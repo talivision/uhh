@@ -4505,7 +4505,7 @@ HUNT_CASES = [  # (scenario, n, extra driver args ("@" = the backend under test)
     ("veh", 150, (), 600), ("dll", 60, ("--work-backend", "@"), 900), ("ctx", 3000, (), 600),
     ("threads", 4, ("--slow-ms", "50"), 600), ("threads", 20, ("--tid",), 600),
     ("threads", 20, ("--recurse",), 600), ("early", 10, (), 300),
-    ("owndr", 200, (), 300),
+    ("owndr", 200, (), 300), ("owndr-live", 200, (), 300),
 ]
 
 
@@ -4558,9 +4558,9 @@ def check_hunt():
             if not hunt_selected(name):
                 continue
             try:
-                # 2 readers on the debug-event backends: 8 starve the exiting thread (below).
-                rc, tmo, tg, rd, wk, rep, st = hunt_run(bk, sc, 300, (), timeout=180,
-                                                        readers=8 if bk == "inline" else 2)
+                # 8 readers on every backend (the debug-event backends park threads that hit
+                # back to back, so the exiting one is not starved: hunt-starve-*).
+                rc, tmo, tg, rd, wk, rep, st = hunt_run(bk, sc, 300, (), timeout=180, readers=8)
                 hits = rd.get("hits") or 0
                 cut = rep.get("callbacks_interrupted")
                 ok = (not tmo and rep.get("app_exit") == code and hits > 0 and tg.get("bad") == 0 and cut is not None and
@@ -4571,18 +4571,50 @@ def check_hunt():
                                  f"reads_at_print={tg.get('reads_at_exit')} rc={rc} timeout={tmo}")
             except Exception as e:
                 record(name, False, repr(e))
+        # A displaced copy that faults (guard page: the program must still see its guard
+        # violation, once, at the real instruction -- every backend, incl. a hw probe's
+        # trampoline; a NEW call after the handler is a new hit, a retry is not: ROADMAP A9) and a DLL rebuilt at the same base (twin: the probe re-armed in the new
+        # image must run the NEW instruction, not a cached copy of the old one).
+        for sc, loc, n in (("guard", "hunt_target.exe!guard_touch", 50), ("twin", "twin.dll!TwinWork", 30)):
+            name = f"hunt-{sc}-{bk}"
+            if not hunt_selected(name):
+                continue
+            tr = exe("uhh_trace.exe")
+            if not tr or (sc == "twin" and not (BIN / "twin_a" / "twin.dll").exists()):
+                missing_bin(name, "uhh_trace / twin_a,twin_b")
+                continue
+            try:
+                _, o = run([tr, "--backend", bk, "-p", loc + ":-", "--", t, sc, "--n", n], timeout=180)
+                tg = next((x for x in o if x.get("kind") == "target"), {})
+                pr = next((x for x in o if x.get("kind") == "probe"), {})
+                rep = report(o)
+                want = 4 * n if sc == "guard" else 2 * n          # guard: 4 calls (a retry is no new call)
+                ok = (tg.get("bad") == 0 and pr.get("hits") == want and rep.get("app_exit") == 0 and
+                      rep.get("log_dropped") == 0 and
+                      (tg.get("guards") == 3 * n if sc == "guard" else tg.get("twin") == 2 * n))
+                record(name, ok, f"bad={tg.get('bad')} guards={tg.get('guards')} twin={tg.get('twin')} "
+                                 f"hits={pr.get('hits')}/{want} exit={rep.get('app_exit')} err={(rep.get('error') or '')[:120]}")
+            except Exception as e:
+                record(name, False, repr(e))
         # Starvation: 8 threads hitting the probe back to back while main sleeps 300 ms and
-        # calls ExitProcess. Uninstrumented: ~0.3 s. Every debug event freezes the whole
-        # process, so on breakpoint/hw a thread that hits no probe only runs in the gaps
-        # between events (Hunter A finding; see ROADMAP). Bar: exits within 60 s.
+        # calls ExitProcess. Uninstrumented: ~0.3 s. Every debug event freezes the whole process,
+        # so on breakpoint/hw a thread that hits no probe used to run only in the gaps between
+        # events (ROADMAP A5): now one event per hit and fairness parking. Bar: exits within
+        # 30 s (incl. delivering ~100k logs), and every hit is a delivered log or an honestly
+        # counted drop / interruption.
         name = f"hunt-starve-{bk}"
         if hunt_selected(name):
             try:
                 t0 = time.perf_counter()
                 rc, tmo, tg, rd, wk, rep, st = hunt_run(bk, "exit-process", 300, (), timeout=60, readers=8)
                 secs = time.perf_counter() - t0
-                ok = not tmo and rep.get("app_exit") == 6
-                record(name, ok, f"exit={rep.get('app_exit')} secs={secs:.1f} hits={(rd or {}).get('hits')} "
+                hits = (rd or {}).get("hits") or 0
+                cut = rep.get("callbacks_interrupted")
+                ok = (not tmo and rep.get("app_exit") == 6 and secs < 30 and hits > 0 and cut is not None and
+                      st["read"] + (rep.get("log_dropped") or 0) + cut == hits and st["unmapped"] == 0 and
+                      tg.get("bad") == 0 and (bk == "inline" or cut == 0))
+                record(name, ok, f"exit={rep.get('app_exit')} secs={secs:.1f} hits={hits} logs={st['read']} "
+                                 f"dropped={rep.get('log_dropped')} interrupted={cut} "
                                  f"reads_at_print={tg.get('reads_at_exit')} timeout={tmo}")
             except Exception as e:
                 record(name, False, repr(e))
@@ -7977,9 +8009,10 @@ def check_cxlib():
                 if q.poll() is None:
                     q.kill()
 
-    # -- (3, extra) the other INT3 of ours a thread can execute: the end of a displaced REP
-    # string copy (in UHH's scratch, no trap flag). The controller dies right after sending a
-    # thread into one (test-hook build): the guard must take that INT3 too.
+    # -- (3, extra) a thread inside a displaced REP string copy when the controller dies (test-
+    # hook build: right after sending a thread into one). The copy is the site's trampoline
+    # (it jumps back by itself, ROADMAP A5); a program single-stepping itself still gets the
+    # older copy ended by an INT3 of ours, which the guard takes. Either way: the target runs on.
     name = "cxlib-reptail-breakpoint"
     procs = []
     try:

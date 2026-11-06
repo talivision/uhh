@@ -2509,7 +2509,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
             // wait is short; bounded anyway (the thread then reports ready when it gets there).
             if (t) {
                 CloseHandle(t);
-                if (service_up) WaitForSingleObject(service_up, 5000);
+                if (service_up && !shared->early_init) WaitForSingleObject(service_up, 5000);
             }
         }
     }
