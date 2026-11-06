@@ -4366,7 +4366,6 @@ def check_hunt():
         return missing_bin("hunt", "hunt_driver / hunt_target / hunt_dll")
     _, o = run([t, "threads", "--n", 10], timeout=120)
     checksum = next((x for x in o if x.get("kind") == "target"), {}).get("checksum")
-    starve_base = None                  # (sleep overrun ms, print ms) of main, uninstrumented (hunt-starve-*)
     for bk in ("inline", "hw", "breakpoint"):
         for sc, n, extra, to in HUNT_CASES:
             extra = tuple(bk if x == "@" else x for x in extra)
@@ -4454,37 +4453,30 @@ def check_hunt():
         # one line and calls ExitProcess. Every debug event freezes the whole process, so on
         # breakpoint/hw a thread that hits no probe used to run only in the gaps between events
         # (ROADMAP A5: main's Sleep+print took 4 s typically, > 180 s at worst): now one event
-        # per hit and fairness parking. Measured where starvation shows -- main's OWN progress,
-        # by the target: how late its Sleep(300) returns and how long its line takes to go out
-        # -- against the same workload uninstrumented on this machine now (load-proof; wall
-        # time also counts delivering ~100k-250k logs). Bar: each within 1.5 s + 10x the
-        # uninstrumented one; exit within the 60 s timeout; every hit a delivered log or an
-        # honestly counted drop / interruption.
+        # per hit and fairness (hot threads yield). Measured where starvation shows and in a unit
+        # machine load does not distort: the reads the 8 threads made (= probe hits the session
+        # handled) between main's Sleep falling due and main running again -- counted by the
+        # target. Measured: with yield rounds 1.5k-6.5k hits (main's Sleep(10) steps every ~80 ms);
+        # without them (suspension parking) 45k-234k, and the original starvation was far
+        # worse (> 180 s). Bar: <= 20000 hits (inline: not judged, it freezes nothing); exit within the 60 s
+        # timeout; every hit a delivered log or an honestly counted drop / interruption. (Wall
+        # time is reported, not judged: on a loaded machine the session itself is slowed.)
         name = f"hunt-starve-{bk}"
         if hunt_selected(name):
             try:
-                if starve_base is None:
-                    os.environ["HUNT_READERS"] = "8"
-                    try:
-                        _, bo = run([t, "exit-process", "--n", 300], timeout=120)
-                    finally:
-                        os.environ.pop("HUNT_READERS", None)
-                    btg = next((x for x in bo if x.get("kind") == "target"), {})
-                    bmx = next((x for x in bo if x.get("kind") == "main_exit"), {})
-                    starve_base = (max(0, (btg.get("sleep_ms") or 0) - 300), bmx.get("print_ms") or 0)
                 t0 = time.perf_counter()
                 rc, tmo, tg, rd, wk, rep, st = hunt_run(bk, "exit-process", 300, (), timeout=60, readers=8)
                 secs = time.perf_counter() - t0
                 hits = (rd or {}).get("hits") or 0
                 cut = rep.get("callbacks_interrupted")
                 late = (tg.get("sleep_ms") or 10**9) - 300
-                pms = tg.get("print_ms") if tg.get("print_ms") is not None else 10**9
-                late_max, print_max = 1500 + 10 * starve_base[0], 1500 + 10 * starve_base[1]
-                ok = (not tmo and rep.get("app_exit") == 6 and late <= late_max and pms <= print_max and hits > 0 and
+                late_reads = tg.get("late_reads") if tg.get("late_reads") is not None else 10**9
+                pms = tg.get("print_ms")
+                ok = (not tmo and rep.get("app_exit") == 6 and (bk == "inline" or late_reads <= 20000) and hits > 0 and
                       cut is not None and st["read"] + (rep.get("log_dropped") or 0) + cut == hits and
                       st["unmapped"] == 0 and tg.get("bad") == 0 and (bk == "inline" or cut == 0))
-                record(name, ok, f"exit={rep.get('app_exit')} main: sleep_late={late}ms (max {late_max}) "
-                                 f"print={pms}ms (max {print_max}) uninstrumented={starve_base} secs={secs:.1f} "
+                record(name, ok, f"exit={rep.get('app_exit')} main: late_reads={late_reads} (max 20000) sleep_late={late}ms "
+                                 f"print={pms}ms secs={secs:.1f} "
                                  f"hits={hits} logs={st['read']} dropped={rep.get('log_dropped')} interrupted={cut} "
                                  f"reads_at_print={tg.get('reads_at_exit')} timeout={tmo}")
             except Exception as e:

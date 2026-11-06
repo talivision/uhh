@@ -400,6 +400,15 @@ struct probe_session {
     std::vector<std::pair<DWORD, HANDLE>> parked;
     bool parking = false;
     bool fine_timer = false;
+    uint32_t fair_events = 0;                   // debug events in the current fairness window
+    LONGLONG round_wake = 0;                    // the current yield round ends (system time, 100 ns)
+    std::unordered_set<DWORD> yielded_round;    // threads that yielded in the current round (once each)
+    uint64_t park_rounds = 0, parked_total = 0;   // fairness statistics (PROBE_TRACE: printed at the end)
+    // Yield stubs (see yield_thread): per thread, `resume address; code`, carved from blocks that
+    // are never freed (a thread may sleep inside one across a detach).
+    std::unordered_map<DWORD, uint64_t> yield_stubs;
+    uint64_t yield_next = 0, yield_end = 0, yield_fn = 0;
+    bool yield_unusable = false;
     ULONGLONG rekick_at = 0;
     std::unordered_set<uint64_t> early_unloaded;   // instances torn down at a newer LOAD (their late UNLOAD skipped)
     // Every mapped instance of every module, in LOAD order (module_bases keeps only the latest):
@@ -4769,6 +4778,16 @@ static void detach(probe_session *s) {
             SetThreadContext(t, &w);
         }
     }
+    // A thread asleep in a yield stub resumes at the address in its slot: if that is in a
+    // trampoline (freed at close), the real code instead.
+    for (const auto &kv : s->yield_stubs) {
+        uint64_t resume = 0, tr = 0; size_t n = 0;
+        if (!remote_read(s->pi.hProcess, kv.second, &resume, sizeof(void *), &n) || n != sizeof(void *)) continue;
+        if (const auto *d = dtramp_at(s, resume, &tr)) {
+            const uint64_t real = d->site + (resume - tr);
+            remote_write(s->pi.hProcess, kv.second, &real, sizeof(void *), &n);
+        }
+    }
     inplace_release_all(s);                                 // every INT3 is gone: nothing to hold for
     // Final pass, after every queued event has been continued: continuing an event can
     // restore the debug registers captured when the exception was raised. Clear our DR
@@ -5024,6 +5043,10 @@ static long suspend_count(HANDLE t) {
 }
 
 static void park_release(probe_session *s) {
+    if (!s->parked.empty()) { ++s->park_rounds; s->parked_total += s->parked.size(); }
+    if (trace_enabled() && !s->parked.empty())
+        std::fprintf(stderr, "  park-release n=%zu t=%lld\n", s->parked.size(),
+                     (long long)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
     for (auto &e : s->parked) { ResumeThread(e.second); CloseHandle(e.second); }
     s->parked.clear();
     s->parking = false;
@@ -5032,16 +5055,104 @@ static void park_release(probe_session *s) {
 // Park the thread whose hit is about to be continued (see probe_session::parked). Never a
 // thread we must keep running: one in a step (an in-place window waits on it), a call_func /
 // call_original thread, our agent's threads.
-static void park_thread(probe_session *s, DWORD tid) {
-    if (s->detaching || s->exited || thread_in_call(s, tid) || tid == s->inplace_owner || s->stepping.count(tid) ||
-        inplace_exempt(s, tid))
+// Make the thread whose hit is about to be continued sleep ~2 ms right after it (yield_stub:
+// registers, flags and XMM0-5 (x86 XMM0-7) saved, ntdll!NtDelayExecution, all restored, a jump to
+// where it was going). NOT a suspension: a thread suspended while it is still inside its debug
+// event resumes the frozen process only when it runs again -- suspending hot threads kept the
+// whole target frozen (main's Sleep(10) took 1-2.5 s); a thread asleep in its own code leaves it
+// running, so the threads that hit nothing get the CPU.
+static uint64_t yield_stub(probe_session *s, DWORD tid) {
+    if (auto it = s->yield_stubs.find(tid); it != s->yield_stubs.end()) return it->second;
+    if (s->yield_unusable) return 0;
+    if (!s->yield_fn) {
+        s->yield_fn = resolve_symbol(s, "ntdll.dll!NtDelayExecution");
+        if (!s->yield_fn) { s->yield_unusable = true; return 0; }
+    }
+    if (s->yield_next + 256 > s->yield_end) {
+        void *m = VirtualAllocEx(s->pi.hProcess, nullptr, 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (!m) { s->yield_unusable = true; return 0; }
+        s->yield_next = (uint64_t)(uintptr_t)m; s->yield_end = s->yield_next + 0x10000;
+    }
+    const uint64_t at = s->yield_next;
+    std::vector<unsigned char> c(16, 0);                       // [0]: resume address, [8]: wake-up (absolute)
+    auto put = [&](std::initializer_list<unsigned char> b) { c.insert(c.end(), b); };
+    auto put_u = [&](uint64_t v, int n) { for (int i = 0; i < n; ++i) c.push_back((unsigned char)(v >> (8 * i))); };
+#if defined(_WIN64)
+    put({0x9C, 0x53, 0x50, 0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53});   // pushfq; rbx rax rcx rdx r8-r11
+    put({0x48, 0x89, 0xE3});                                   // mov rbx, rsp
+    put({0x48, 0x83, 0xE4, 0xF0});                             // and rsp, -16
+    put({0x48, 0x81, 0xEC, 0x90, 0, 0, 0});                    // sub rsp, 0x90
+    put({0xF3, 0x0F, 0x7F, 0x44, 0x24, 0x30, 0xF3, 0x0F, 0x7F, 0x4C, 0x24, 0x40, 0xF3, 0x0F, 0x7F, 0x54, 0x24, 0x50,
+         0xF3, 0x0F, 0x7F, 0x5C, 0x24, 0x60, 0xF3, 0x0F, 0x7F, 0x64, 0x24, 0x70,
+         0xF3, 0x0F, 0x7F, 0xAC, 0x24, 0x80, 0, 0, 0});        // movdqu [rsp+0x30..0x80], xmm0..xmm5
+    put({0x31, 0xC9});                                         // xor ecx, ecx (not alertable)
+    put({0x48, 0x8D, 0x15});                                   // lea rdx, [rip+rel32] -> [8]: the wake-up time
+    { const int32_t r = (int32_t)(8 - (int64_t)(c.size() + 4)); put_u((uint32_t)r, 4); }
+    put({0x48, 0xB8}); put_u(s->yield_fn, 8);                  // mov rax, NtDelayExecution
+    put({0xFF, 0xD0});                                         // call rax
+    put({0xF3, 0x0F, 0x6F, 0x44, 0x24, 0x30, 0xF3, 0x0F, 0x6F, 0x4C, 0x24, 0x40, 0xF3, 0x0F, 0x6F, 0x54, 0x24, 0x50,
+         0xF3, 0x0F, 0x6F, 0x5C, 0x24, 0x60, 0xF3, 0x0F, 0x6F, 0x64, 0x24, 0x70,
+         0xF3, 0x0F, 0x6F, 0xAC, 0x24, 0x80, 0, 0, 0});        // movdqu xmm0..xmm5, [...]
+    put({0x48, 0x89, 0xDC});                                   // mov rsp, rbx
+    put({0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58, 0x5A, 0x59, 0x58, 0x5B, 0x9D});   // pops; popfq
+    put({0xFF, 0x25});                                         // jmp [rip+rel32] -> [0]
+    const int32_t rel = (int32_t)(0 - (int64_t)(c.size() + 4)); put_u((uint32_t)rel, 4);
+#else
+    put({0x9C, 0x60});                                         // pushfd; pushad
+    put({0x89, 0xE3});                                         // mov ebx, esp
+    put({0x83, 0xE4, 0xF0});                                   // and esp, -16
+    put({0x81, 0xEC, 0x90, 0, 0, 0});                          // sub esp, 0x90
+    put({0xF3, 0x0F, 0x7F, 0x44, 0x24, 0x10, 0xF3, 0x0F, 0x7F, 0x4C, 0x24, 0x20, 0xF3, 0x0F, 0x7F, 0x54, 0x24, 0x30,
+         0xF3, 0x0F, 0x7F, 0x5C, 0x24, 0x40, 0xF3, 0x0F, 0x7F, 0x64, 0x24, 0x50, 0xF3, 0x0F, 0x7F, 0x6C, 0x24, 0x60,
+         0xF3, 0x0F, 0x7F, 0x74, 0x24, 0x70, 0xF3, 0x0F, 0x7F, 0xBC, 0x24, 0x80, 0, 0, 0});   // movdqu [esp+0x10..0x80], xmm0..7
+    put({0xB8}); put_u(at + 8, 4);                             // mov eax, &[8]: the wake-up time
+    put({0x50, 0x6A, 0x00});                                   // push eax; push FALSE
+    put({0xB8}); put_u(s->yield_fn, 4);                        // mov eax, NtDelayExecution
+    put({0xFF, 0xD0});                                         // call eax (stdcall: pops its 2 args)
+    put({0xF3, 0x0F, 0x6F, 0x44, 0x24, 0x10, 0xF3, 0x0F, 0x6F, 0x4C, 0x24, 0x20, 0xF3, 0x0F, 0x6F, 0x54, 0x24, 0x30,
+         0xF3, 0x0F, 0x6F, 0x5C, 0x24, 0x40, 0xF3, 0x0F, 0x6F, 0x64, 0x24, 0x50, 0xF3, 0x0F, 0x6F, 0x6C, 0x24, 0x60,
+         0xF3, 0x0F, 0x6F, 0x74, 0x24, 0x70, 0xF3, 0x0F, 0x6F, 0xBC, 0x24, 0x80, 0, 0, 0});
+    put({0x89, 0xDC, 0x61, 0x9D});                             // mov esp, ebx; popad; popfd
+    put({0xFF, 0x25}); put_u(at, 4);                           // jmp [at] -> [0]
+#endif
+    if (c.size() > 256) { s->yield_unusable = true; return 0; }
+    size_t wrote = 0;
+    if (!remote_write(s->pi.hProcess, at, c.data(), c.size(), &wrote) || wrote != c.size()) { s->yield_unusable = true; return 0; }
+    FlushInstructionCache(s->pi.hProcess, (void *)(uintptr_t)at, c.size());
+    s->yield_next += 256;
+    try { s->yield_stubs[tid] = at; } catch (...) { return 0; }
+    return at;
+}
+static bool in_yield_stub(const probe_session *s, uint64_t ip) {
+    for (const auto &kv : s->yield_stubs) if (ip >= kv.second && ip < kv.second + 256) return true;
+    return false;
+}
+static void park_thread(probe_session *s, DWORD tid, DWORD disposition) {
+    if (disposition != DBG_CONTINUE || s->detaching || s->exited || thread_in_call(s, tid) || tid == s->inplace_owner ||
+        s->stepping.count(tid) || inplace_exempt(s, tid) || target_has_shadow_stack(s))
         return;
-    for (auto &e : s->parked) if (e.first == tid) return;
-    HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+    // Not when the program probes NtDelayExecution itself (the stub's call would be its hit).
+    if (s->yield_fn) for (const auto &p : s->probes) if (p->active && p->address == s->yield_fn) return;
+    if (!s->yielded_round.insert(tid).second) return;          // once per round
+    HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
     if (!t) return;
-    guard_note_hold(s, tid);
-    if (SuspendThread(t) == (DWORD)-1) { CloseHandle(t); return; }
-    try { s->parked.emplace_back(tid, t); } catch (...) { ResumeThread(t); CloseHandle(t); }
+    CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
+    const uint64_t stub = GetThreadContext(t, &c) && !in_yield_stub(s, (uint64_t)EMU_IP(c)) ? yield_stub(s, tid) : 0;
+    if (stub) {
+        const uint64_t resume = (uint64_t)EMU_IP(c);
+        size_t w = 0, w2 = 0;
+        // Every thread of a round sleeps until the SAME moment (absolute system time): they
+        // are off the CPU together from the last one's yield to then -- staggered 2 ms sleeps
+        // barely overlapped (the yields come one event apart).
+        const LONGLONG wake = s->round_wake;
+        if (remote_write(s->pi.hProcess, stub, &resume, sizeof(void *), &w) && w == sizeof(void *) &&
+            remote_write(s->pi.hProcess, stub + 8, &wake, sizeof(wake), &w2) && w2 == sizeof(wake)) {
+            EMU_IP(c) = (decltype(EMU_IP(c)))(stub + 16);
+            c.ContextFlags = CONTEXT_CONTROL;
+            if (SetThreadContext(t, &c)) ++s->parked_total;
+        }
+    }
+    CloseHandle(t);
 }
 // Called by the event loop around every wait. `blocked`: how long the last wait for a debug
 // event blocked (the target ran unfrozen meanwhile, give or take), `got`: an event came.
@@ -5081,12 +5192,27 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
     if (s->fair_window == steady_clock::time_point{}) s->fair_window = now;
     s->fair_gaps += blocked;
     if (got) s->last_event = now;
-    if (!got && now - s->last_event >= milliseconds(2)) {
-        if (!s->parked.empty()) park_release(s);                  // the others ran: the parked go on
-        s->parking = false;
-    }
+    if (got) ++s->fair_events;
     if (now - s->fair_window >= milliseconds(20)) {
-        if (!s->parking && got && s->fair_gaps * 10 < now - s->fair_window) s->parking = true;
+        const bool was = s->parking;
+        // Dense debug events (>= 2000/s: the target is mostly frozen) -- or little unfrozen
+        // time -- start a yield round: every thread whose hit is continued in the next window
+        // sleeps ~2 ms once (park_thread), so all of them are off the CPU together for a moment
+        // and a thread that hits nothing runs. (Measured: with the unfrozen-time rule alone, a
+        // fast session kept >10% unfrozen yet main's Sleep(300) returned 3-20 s late: whenever
+        // unfrozen, the hot threads had the CPU and trapped again before main was scheduled.)
+        s->parking = got && (s->fair_events >= 40 || s->fair_gaps * 10 < now - s->fair_window);
+        s->fair_events = 0;
+        if (s->parking) {
+            ++s->park_rounds; s->yielded_round.clear();
+            FILETIME ft; GetSystemTimeAsFileTime(&ft);
+            s->round_wake = (LONGLONG)(((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime) + 40000;   // now + 4 ms
+        }
+        if (s->parking && !was) {
+            if (trace_enabled())
+                std::fprintf(stderr, "  park-start t=%lld\n",
+                             (long long)duration_cast<microseconds>(now.time_since_epoch()).count());
+        }
         s->fair_window = now; s->fair_gaps = {};
     }
     // 1 ms timer resolution only while a parked thread or a context watch waits on this loop:
@@ -5098,7 +5224,7 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
         if (agent_has_pending(s)) retarget_pending(s);
         if (agent_has_pending(s) && !kick_agent(s)) std::fprintf(stderr, "probe: %s\n", s->error.c_str());
     }
-    const bool fine = !s->parked.empty() || !s->ctx_watch.empty() || s->rekick_at;
+    const bool fine = s->parking || !s->ctx_watch.empty() || s->rekick_at;   // (yields sleep 2 ms, not a tick)
     if (fine != s->fine_timer) { if (fine) timeBeginPeriod(1); else timeEndPeriod(1); s->fine_timer = fine; }
     return fine ? 1 : 20;
 }
@@ -7395,7 +7521,7 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
     // Fairness (see probe_session::parked): the thread of an exception event about to be
     // continued is parked while the target is starved of unfrozen time.
     if (ok && s->parking && event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT && !s->skip_continue)
-        park_thread(s, event.dwThreadId);
+        park_thread(s, event.dwThreadId, disposition);
     // A hardware probe was released while the process runs: threads still starting must meet
     // the thread-start fixup (see probe_session::hw_released). Armed here, outside the loops
     // over the probes that release them, and before any thread runs on.
@@ -7818,6 +7944,9 @@ extern "C" int probe_run(probe_session *s) {
         if (!why.empty()) s->error = why;
     }
     park_release(s);
+    if (trace_enabled())
+        std::fprintf(stderr, "  fairness: %llu park rounds, %llu threads parked\n", (unsigned long long)s->park_rounds,
+                     (unsigned long long)s->parked_total);
     ctx_watch_poll(s, true);
     if (s->fine_timer) { timeEndPeriod(1); s->fine_timer = false; }
     release_held(s, "session end");

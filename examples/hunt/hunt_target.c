@@ -267,7 +267,21 @@ static int twin_call(const char *dir, const char *sub) {
 }
 
 /* ---- ctx / exit ---- */
-static DWORD WINAPI reader_until_stop(void *p) { (void)p; while (!g_stop) hunt_read(); return 0; }
+/* exit scenarios: the reads made between main's Sleep falling due and main actually running
+   again -- debug events the session handled while main was ready but did not get to run */
+static volatile LONGLONG g_due_qpc;
+static volatile LONG g_due_reads = -1;
+static DWORD WINAPI reader_until_stop(void *p) {
+    (void)p;
+    while (!g_stop) {
+        hunt_read();
+        if (g_due_qpc && g_due_reads < 0) {
+            LARGE_INTEGER n; QueryPerformanceCounter(&n);
+            if (n.QuadPart >= g_due_qpc) InterlockedCompareExchange(&g_due_reads, g_reads, -1);
+        }
+    }
+    return 0;
+}
 
 /* ---- generic ---- */
 static DWORD WINAPI reader_n(void *p) { (void)p; for (DWORD i = 0; i < g_n; ++i) hunt_read(); return 0; }
@@ -352,10 +366,21 @@ int main(int argc, char **argv) {
            its Sleep returns, and how long its one report line takes to go out */
         LARGE_INTEGER f, t0, t1, t2;
         QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
+        g_due_qpc = t0.QuadPart + (LONGLONG)g_n * f.QuadPart / 1000;
+        if (getenv("HUNT_MAIN_HIGH")) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);   /* diagnostic */
+        if (getenv("HUNT_STEPS")) {           /* diagnostic: main's progress in 10 ms sleeps */
+            LARGE_INTEGER a; char line[4096]; int len = 0;
+            for (DWORD k = 0; k < g_n / 10 && len < 4000; ++k) {
+                Sleep(10); QueryPerformanceCounter(&a);
+                len += _snprintf_s(line + len, sizeof(line) - len, _TRUNCATE, "%lld ", (long long)((a.QuadPart - t0.QuadPart) * 1000 / f.QuadPart));
+            }
+            fprintf(stderr, "[steps %s]\n", line);
+        } else
         Sleep(g_n);
         QueryPerformanceCounter(&t1);
-        printf("{\"kind\":\"target\",\"scenario\":\"%s\",\"reads_at_exit\":%ld,\"bad\":%ld,\"sleep_ms\":%lld}\n", sc, g_reads,
-               g_bad, (long long)((t1.QuadPart - t0.QuadPart) * 1000 / f.QuadPart));
+        const LONG at_wake = g_reads, due = g_due_reads;
+        printf("{\"kind\":\"target\",\"scenario\":\"%s\",\"reads_at_exit\":%ld,\"bad\":%ld,\"sleep_ms\":%lld,\"late_reads\":%ld}\n",
+               sc, at_wake, g_bad, (long long)((t1.QuadPart - t0.QuadPart) * 1000 / f.QuadPart), due < 0 ? 0L : at_wake - due);
         fflush(stdout);
         QueryPerformanceCounter(&t2);
         printf("{\"kind\":\"main_exit\",\"print_ms\":%lld}\n", (long long)((t2.QuadPart - t1.QuadPart) * 1000 / f.QuadPart));
