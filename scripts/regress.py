@@ -4903,7 +4903,10 @@ def bigapps_judge(objs, out_text, err_text, bk, specs, required, exact):
     logged = [sp.rsplit(":", 1)[0] for sp in specs if not sp.endswith(":-")]
     want_logs = sum(hits.get(l, 0) for l in logged)
     written = rep.get("logs_written")
-    logs_out = out_text.count('"kind":"probe_log"')
+    # Delivered records: every probe_log line must parse (run() keeps the JSON lines) and their
+    # number must EQUAL logs_written -- fewer is a lost log, more a duplicated one.
+    logs_out = sum(1 for o in objs if o.get("kind") == "probe_log")
+    logs_raw = out_text.count('"kind":"probe_log"')
     unhandled = [l for l in err_text.splitlines() if "target crashed" in l or "unhandled exception" in l][:2]
     bad = []
     if not rep: bad.append("no probe_report")
@@ -4914,10 +4917,12 @@ def bigapps_judge(objs, out_text, err_text, bk, specs, required, exact):
     if missing: bad.append(f"no hits on {missing}")
     if not written: bad.append("no logs")
     if exact and written != want_logs: bad.append(f"logs_written={written} != logged hits={want_logs}")
-    if logs_out < (written or 0): bad.append(f"stdout probe_log lines={logs_out} < logs_written={written}")
+    if logs_raw != logs_out: bad.append(f"malformed/unparsable probe_log lines={logs_raw - logs_out}")
+    if written is None or logs_out != written:
+        bad.append(f"stdout probe_log records={logs_out} != logs_written={written}")
     if unhandled: bad.append(f"unhandled={unhandled}")
     short = {k.split("!")[-1]: v for k, v in hits.items()}
-    detail = f"hits={short} logs={written} dropped={rep.get('log_dropped')}"
+    detail = f"hits={short} logs={written} delivered={logs_out} dropped={rep.get('log_dropped')}"
     return not bad, detail, bad
 
 
