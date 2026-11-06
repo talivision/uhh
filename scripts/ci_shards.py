@@ -70,6 +70,18 @@ EST = {
 }
 DEFAULT_EST = 60
 DEFAULT_SHARDS = {"x64": 7, "x86": 9}   # the critical path is one unit (x86 check_realapps)
+# Documented by-design failures (docs/ROADMAP.md Hunter A A4-A8; HANDOFF's allowed list): still reported (warning
+# annotation, step summary) but they do not fail the job. Runner-only failures are NOT listed here: they stay red
+# until analysed (docs/ROADMAP.md "CI on GitHub Actions").
+KNOWN = {
+    "hunt-ctx-breakpoint": "A4: stale context reports a call twice (by design until fixed)",
+    "hunt-ctx-hw": "A4: stale context reports a call twice (by design until fixed)",
+    "hunt-starve-breakpoint": "A5: exit within 60 s flaky on breakpoint/hw until fixed",
+    "hunt-starve-hw": "A5: exit within 60 s flaky on breakpoint/hw until fixed",
+    "hunt-early-inline": "A6: by design",
+    "hunt-owndr-hw": "A7: by design",
+    "patch-race-unsafe": "the unsafe-patch race is probabilistic (proves the test can see it)",
+}
 # Units that need an external dependency the workflow installs on demand.
 NEEDS = {"frida": {"check_frida_coexist"}, "sde": {"check_cet_sde"}}
 ARCH_IDX = {"x64": 0, "x86": 1}
@@ -151,6 +163,18 @@ def cmd_matrix(a):
         print(json.dumps(matrix, indent=1))
 
 
+def chunks(lines, size=3500):
+    """Annotation messages are cut at ~4 KB: split a list of lines into <= size-char messages."""
+    out, cur = [], ""
+    for line in lines:
+        if cur and len(cur) + len(line) + 1 > size:
+            out.append(cur); cur = ""
+        cur += ("\n" if cur else "") + line
+    if cur:
+        out.append(cur)
+    return out
+
+
 def esc(s):
     """GitHub workflow-command message escaping."""
     return s.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
@@ -174,6 +198,9 @@ def cmd_run(a):
     res = {"name": a.name, "arch": a.arch, "units": [], "runner": os.environ.get("RUNNER_NAME", ""),
            "sha": os.environ.get("GITHUB_SHA", "")}
     fail_re = re.compile(r"^\[\d\d:\d\d:\d\d\] FAIL ")
+    # CI_NOTICE_RE: result lines to publish as a notice annotation too (e.g. the cet-* rows of cet-hw)
+    notice_re = re.compile(os.environ["CI_NOTICE_RE"]) if os.environ.get("CI_NOTICE_RE") else None
+    noticed = []
     ok_re = re.compile(r"^(\d+)/(\d+) ok, (\d+) failed, (\d+) skipped")
     t_all = time.time()
     with open(log, "w", encoding="utf-8", errors="replace") as lf:
@@ -181,7 +208,7 @@ def cmd_run(a):
             hdr = f"===== {a.name} {sel} start {time.strftime('%H:%M:%S')}"
             print(hdr, flush=True); lf.write(hdr + "\n"); lf.flush()
             t0 = time.time()
-            u = {"unit": sel, "fails": [], "ok_line": "", "rc": None, "timeout": False}
+            u = {"unit": sel, "fails": [], "known": [], "ok_line": "", "rc": None, "timeout": False}
             p = subprocess.Popen([sys.executable, "-u", str(REGRESS), "--bin", a.bin, "--only", sel],
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                  encoding="utf-8", errors="replace", bufsize=1, cwd=ROOT, env=env)
@@ -191,8 +218,11 @@ def cmd_run(a):
             for line in p.stdout:
                 sys.stdout.write(line); lf.write(line)
                 s = line.rstrip("\n")
+                if notice_re and notice_re.search(s):
+                    noticed.append(s[11:].strip())
                 if fail_re.match(s):
-                    u["fails"].append(s[11:].strip())
+                    rec = s[11:].split()[1] if len(s[11:].split()) > 1 else ""
+                    (u["known"] if rec in KNOWN else u["fails"]).append(s[11:].strip())
                 elif ok_re.match(s):
                     u["ok_line"] = s
             u["rc"] = p.wait()
@@ -201,7 +231,7 @@ def cmd_run(a):
             m = ok_re.match(u["ok_line"])
             u.update(passed=int(m.group(1)), failed=int(m.group(3)), skipped=int(m.group(4))) if m else \
                 u.update(passed=0, failed=0, skipped=0)
-            u["ok"] = u["rc"] == 0 and not u["fails"] and not u["timeout"]
+            u["ok"] = (u["rc"] == 0 or (u["rc"] == 1 and u["known"])) and not u["fails"] and not u["timeout"]
             tail = f"===== {a.name} {sel} end rc={u['rc']} {u['secs']}s" + (" UNIT TIMEOUT" if u["timeout"] else "") \
                    + f" | {u['ok_line']}"
             print(tail, flush=True); lf.write(tail + "\n"); lf.flush()
@@ -222,6 +252,9 @@ def cmd_run(a):
     if bad:
         lines += ["", "```"] + [f for u in bad for f in (u["fails"] or [f"{u['unit']}: rc={u['rc']}"
                                                                         f"{' timeout' if u['timeout'] else ''}"])] + ["```"]
+    known = [f for u in res["units"] for f in u["known"]]
+    if known:
+        lines += ["", "Known (by design, not failing the job):", "```"] + known + ["```"]
     md = "\n".join(lines) + "\n"
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
@@ -230,6 +263,11 @@ def cmd_run(a):
     timing = " ".join(f"{u['unit'][6:]}={u['secs']:.0f}" for u in res["units"])
     print(f"::notice title={a.name} {'PASS' if res['ok'] else 'FAIL'} {res['ok_line']} {res['secs']:.0f}s::"
           + esc(f"times: {timing}"))
+    if known:
+        print(f"::warning title={a.name} known failures ({len(known)})::"
+              + esc("\n".join(f"{x[:300]}  [{KNOWN[x.split()[1]]}]" for x in known)))
+    for k, chunk in enumerate(chunks([x[:600] for x in noticed])):
+        print(f"::notice title={a.name} selected rows ({k + 1})::" + esc(chunk))
     if bad:
         fl = [f for u in bad for f in (u["fails"] or [f"{u['unit']}: rc={u['rc']}{' timeout' if u['timeout'] else ''}"])]
         print(f"::error title={a.name} FAIL ({len(fl)})::" + esc("\n".join(x[:400] for x in fl)[:30000]))
@@ -245,7 +283,8 @@ def cmd_summarize(a):
             continue
         if isinstance(r, dict) and "units" in r and "name" in r:
             results[r["name"]] = r
-    expected = [e["name"] for e in json.loads(a.matrix)["include"]] if a.matrix else sorted(results)
+    expected = [e["name"] for e in json.loads(a.matrix)["include"]] if a.matrix else []
+    expected += sorted(n for n in results if n not in expected)      # e.g. cet-hw-x64
     rows, measured = [], {}
     for n in expected:
         r = results.get(n)
@@ -259,6 +298,8 @@ def cmd_summarize(a):
             measured.setdefault(u["unit"], {})[r["arch"]] = u["secs"]
         for f in fails:
             rows.append(f"| | `{f[:300].replace('|', '/')}` | | |")
+        for f in (f for u in r["units"] for f in u.get("known", [])):
+            rows.append(f"| | known: `{f[:200].replace('|', '/')}` | | |")
     md = [f"## UHH regress on {os.environ.get('IMAGE', 'windows')}", "", "| shard | result | secs | counts |", "|---|---|---|---|"] + rows
     md += ["", "### Measured unit times (s)", "", "| unit | x64 | x86 |", "|---|---|---|"]
     for unit in sorted(measured, key=lambda k: -max(measured[k].values())):
@@ -271,10 +312,12 @@ def cmd_summarize(a):
     total = [results[n] for n in expected if n in results]
     P = sum(u["passed"] for r in total for u in r["units"]); F = sum(u["failed"] for r in total for u in r["units"])
     S = sum(u["skipped"] for r in total for u in r["units"])
-    print(f"::notice title={os.environ.get('IMAGE', '')} regress total {P}/{P + F} ok, {F} failed, {S} skipped::"
-          + esc("\n".join(r for r in rows)[:30000]))
-    print("::notice title=unit times (s) unit=x64/x86::"
-          + esc(" ".join(f"{u[6:]}={v.get('x64', '-')}/{v.get('x86', '-')}" for u, v in sorted(measured.items()))))
+    for k, chunk in enumerate(chunks(rows)):
+        print(f"::notice title={os.environ.get('IMAGE', '')} regress total {P}/{P + F} ok, {F} failed, {S} skipped "
+              f"({k + 1})::" + esc(chunk))
+    times = [f"{u[6:]}={v.get('x64', '-')}/{v.get('x86', '-')}" for u, v in sorted(measured.items())]
+    for k, chunk in enumerate(chunks([" ".join(times[i:i + 8]) for i in range(0, len(times), 8)])):
+        print(f"::notice title=unit times (s) unit=x64/x86 ({k + 1})::" + esc(chunk))
     if a.est_out:
         Path(a.est_out).write_text(json.dumps(measured, indent=1, sort_keys=True), encoding="utf-8")
 

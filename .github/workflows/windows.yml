@@ -1,5 +1,6 @@
 # UHH regression suite on GitHub-hosted windows-2022 runners (x64 + x86), sharded.
 # How to trigger and read results: docs/ROADMAP.md, "CI on GitHub Actions".
+# Jobs: plan -> build (x64, x86) -> test <arch>-<NN> shards -> summary; cet-hw (windows-2025, enforced CET) alongside.
 name: windows-regress
 
 on:
@@ -44,6 +45,7 @@ jobs:
       matrix: ${{ steps.m.outputs.matrix }}
       arches: ${{ steps.m.outputs.arches }}
       image: ${{ steps.m.outputs.image }}
+      cet: ${{ steps.m.outputs.cet }}
     steps:
       - uses: actions/checkout@v6
       - id: m
@@ -51,10 +53,12 @@ jobs:
           ONLY: ${{ inputs.only }}
           ARCHES: ${{ inputs.arches || 'x64,x86' }}
           SHARDS: ${{ inputs.shards || '0' }}
-          IMAGE: ${{ inputs.image || 'windows-2025' }}   # TEMPORARY: one push run on the CET-enforcing image
+          IMAGE: ${{ inputs.image || 'windows-2022' }}   # pushes and pull requests: windows-2022
         run: |
           case "$IMAGE" in windows-20[0-9][0-9]) ;; *) echo "bad image $IMAGE"; exit 1;; esac
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          # cet-hw: on every push / PR; on a dispatch only when the selection includes the CET checks
+          case ",$ONLY," in ",,"|*cet*) echo "cet=true" >> "$GITHUB_OUTPUT";; *) echo "cet=false" >> "$GITHUB_OUTPUT";; esac
           python3 scripts/ci_shards.py matrix --only "$ONLY" --arches "$ARCHES" --shards "$SHARDS" --github-output "$GITHUB_OUTPUT"
 
   build:
@@ -103,30 +107,60 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Does a newer hosted image expose CET to the guest? (windows-2022's Xeon 8573C has CET, its guest CPUID does not.)
-  cet-probe:
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-2025]
+  # windows-2025 hosted runners (AMD EPYC, Server 2025 build 26100) ENFORCE user-mode CET shadow stacks for
+  # /CETCOMPAT processes (cet_probe: enforced=true, EnableUserShadowStack=1, SetContextIpValidation=1); the
+  # windows-2022 guests expose no CET. So every push also runs the CET checks on real CET hardware.
+  cet-hw:
+    needs: plan
+    if: needs.plan.outputs.cet == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 45
+    env:
+      CI_NOTICE_RE: '\] (PASS|SKIP|FAIL)  (cet-|conformance)'
     steps:
       - uses: actions/checkout@v6
-      - name: Build cet_probe only
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Build x64 (default VS generator; this image has no VS 2022)
         shell: pwsh
         run: |
-          $gen = if (Test-Path "${env:ProgramFiles}\Microsoft Visual Studio\2022") { 'Visual Studio 17 2022' } else { '' }
-          if ($gen) { cmake -S . -B build-cet -G $gen -A x64 } else { cmake -S . -B build-cet -A x64 }
-          cmake --build build-cet --config Release --target cet_probe
+          cmake -S . -B build-x64 -A x64
+          cmake --build build-x64 --config Release --parallel
       - name: CET probe
         shell: pwsh
         run: |
           $cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name.Trim()
           $os = Get-CimInstance Win32_OperatingSystem
-          $cet = (& build-cet\Release\cet_probe.exe 2>&1 | Out-String).Trim()
+          $cet = (& build-x64\Release\cet_probe.exe 2>&1 | Out-String).Trim()
           Write-Output "$cpu / $($os.Caption) $($os.Version)"; Write-Output $cet
-          Write-Output "::notice title=cet_probe ${{ matrix.os }}::$cpu / $($os.Caption) $($os.Version) $cet"
+          Write-Output "::notice title=cet_probe windows-2025::$cpu / $($os.Caption) $($os.Version) $cet"
+      - name: Cache Intel SDE 9.48
+        uses: actions/cache@v5
+        with:
+          path: C:\tools\sde-dl
+          key: sde-9.48.0-2024-11-25-win
+      - name: Intel SDE 9.48 at C:\tools\sde (check_cet selects check_cet_sde too)
+        shell: pwsh
+        run: |
+          $f = 'C:\tools\sde-dl\sde-external-9.48.0-2024-11-25-win.tar.xz'
+          if (-not (Test-Path $f)) {
+            New-Item -ItemType Directory -Force C:\tools\sde-dl | Out-Null
+            Invoke-WebRequest -UseBasicParsing -Uri 'https://downloadmirror.intel.com/843185/sde-external-9.48.0-2024-11-25-win.tar.xz' -OutFile $f
+          }
+          $h = (Get-FileHash -Algorithm SHA256 $f).Hash
+          if ($h -ne '022A1F2ED545E3BD7E301B8B3D3E40201EB2D95426D137704BE54EDC2E5CBCBF') { Remove-Item $f; throw "SDE sha256 mismatch: $h" }
+          7z x -y -oC:\tools\sde-x $f | Out-Null
+          7z x -y -oC:\tools\sde-x C:\tools\sde-x\sde-external-9.48.0-2024-11-25-win.tar | Out-Null
+          Move-Item C:\tools\sde-x\sde-external-9.48.0-2024-11-25-win C:\tools\sde
+      - name: regress.py check_cet,check_conformance under enforced CET
+        run: python -u scripts/ci_shards.py run --arch x64 --units "check_cet,check_conformance" --bin build-x64/Release --out ci-logs --name cet-hw-x64
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: logs-cet-hw-x64
+          path: ci-logs/
+          retention-days: 14
 
   test:
     needs: [plan, build]
@@ -187,7 +221,7 @@ jobs:
           retention-days: 14
 
   summary:
-    needs: [plan, build, test]
+    needs: [plan, build, test, cet-hw]
     if: always() && needs.plan.result == 'success'
     runs-on: ubuntu-latest
     steps:
