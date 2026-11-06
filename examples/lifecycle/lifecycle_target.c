@@ -236,7 +236,10 @@ static void find_agent_threads(void) {
     CloseHandle(snap);
 }
 
-static int thread_exited(HANDLE t) { return t && WaitForSingleObject(t, 0) == WAIT_OBJECT_0; }
+/* Confirmed exit: the handle is signalled within 2 s. A thread that is TERMINATING but not
+   yet signalled refuses SuspendThread (STATUS_THREAD_IS_TERMINATING -> ERROR_ACCESS_DENIED);
+   one that is still not gone after 2 s stays uninspected (not clean). */
+static int thread_exited(HANDLE t) { return t && WaitForSingleObject(t, 2000) == WAIT_OBJECT_0; }
 
 static void check(const char *kind) {
     char code_bad[256] = "", dr_bad[256] = "", dr_unknown_info[256] = "", why[96];
