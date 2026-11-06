@@ -301,13 +301,13 @@ struct probe_session {
     bool co_warned_entry = false, co_warned_dr = false, co_warned_left = false, co_warned_nargs = false;
     bool initial_break = false;
     std::unordered_map<DWORD, StepState> stepping;   // threads mid single-step
-    // Threads whose in-place step at a probe site faulted: the fault went to the target with
-    // OUR trap flag in its context. If the target's handler continues execution there, the
-    // INT3 is hit again (with TF set) -- the same execution restarting, not a new hit; if it
-    // continues elsewhere, the trap flag raises one stray step. thread -> probe site.
-    // A WOW64 (x86) handler's context comes back WITHOUT our trap flag: there the restart is
-    // the thread's next event being the INT3 at the site (whatever registers it repaired).
-    struct Refault { uint64_t site = 0; };
+    // Threads whose in-place step at a probe site faulted, the fault passed to the program
+    // (without our trap flag: see StepState::refire). thread -> probe site and fault code.
+    // If the handler continues execution there, the INT3 is hit again -- the same execution
+    // restarting, not a new hit; after a skip or an unwind the next INT3 at the site is a new
+    // hit. The thread's next event decides, by the exception's dispatcher frame
+    // (fault_retried). (A trap flag the program set itself raises one stray step: absorbed.)
+    struct Refault { uint64_t site = 0; DWORD code = 0; };
     std::unordered_map<DWORD, Refault> refault;
     // In-place window (see inplace_begin): while a thread steps an instruction at its real
     // address with our INT3 lifted, every other thread of the target is suspended by us, so
@@ -327,9 +327,13 @@ static bool register_runtime_inline(probe_session *s, Probe &p);
 // event it is handling is an implicit suspend + resume INSIDE the call (ROADMAP L13): killed in
 // the middle of one, the controller leaves that thread suspended once with nothing of ours
 // recording it (the guard resumes the event threads, call threads and explicit holds only).
-// While such a call runs, the thread is listed among the guard's held threads -- after a
-// controller death it gets one resume, a no-op unless the call was in progress -- and it is
-// taken off again right after. x64 controllers have no implicit suspend: nothing to do.
+// While such a call runs, the thread is listed among the guard's held threads as a CONDITIONAL
+// entry carrying its suspend count from before the call (probe_agent_guard::held_floor): after
+// a controller death the guard resumes it once only if its count is above that -- i.e. the
+// implicit suspension is in place. Killed before the call or after it returned, the entry is a
+// no-op even when the PROGRAM holds the thread suspended (an unconditional resume would have
+// released the program's own suspension). Taken off again right after the call. x64
+// controllers have no implicit suspend: nothing to do.
 struct GuardTouch {
 #if !defined(_WIN64)
     probe_agent_guard *g = nullptr;
@@ -343,6 +347,30 @@ struct GuardTouch {
     GuardTouch &operator=(const GuardTouch &) = delete;
 };
 #if !defined(_WIN64)
+// A thread's suspend count, read without changing it (NtQueryInformationThread
+// ThreadSuspendCount, Windows 8.1+). False: unknown. NOTE: it includes the debug freeze (+1 for
+// every thread while the target is stopped at a debug event) -- see guard_floor.
+static bool thread_suspend_count(DWORD tid, ULONG &count) {
+    using QueryFn = LONG (NTAPI *)(HANDLE, ULONG, void *, ULONG, ULONG *);
+    static auto query = reinterpret_cast<QueryFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+    HANDLE t = query ? OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid) : nullptr;
+    if (!t) return false;
+    count = 0;
+    const bool ok = query(t, 35 /* ThreadSuspendCount */, &count, sizeof(count), nullptr) >= 0;
+    CloseHandle(t);
+    return ok;
+}
+// The thread's suspend count WITHOUT the debug freeze, as the guard reads it once the controller
+// is gone (probe_agent_guard::held_floor): the freeze is the agent's service thread's count, a
+// thread nobody suspends. Unknown: PROBE_AGENT_HOLD_OURS (an unconditional entry, one resume).
+static uint32_t guard_floor(const probe_session *s, DWORD tid) {
+    const DWORD svc = (DWORD)s->shared->guard.service_tid;
+    ULONG count = 0, freeze = 0;
+    if (!svc || !thread_suspend_count(tid, count) || !thread_suspend_count(svc, freeze) || freeze > count ||
+        count - freeze >= PROBE_AGENT_HOLD_OURS)
+        return PROBE_AGENT_HOLD_OURS;
+    return (uint32_t)(count - freeze);
+}
 GuardTouch::GuardTouch(const probe_session *s, DWORD tid) {
     if (!s->attached || !s->shared || s->detached || !tid) return;
     auto &gg = s->shared->guard;
@@ -354,6 +382,7 @@ GuardTouch::GuardTouch(const probe_session *s, DWORD tid) {
     if (off) {} else
 #endif
     if (count >= 0 && count < (LONG)PROBE_AGENT_GUARD_TIDS) {
+        gg.held_floor[count] = guard_floor(s, tid);      // the count before the call: what the guard must leave
         gg.held_tids[count] = tid;
         MemoryBarrier();
         gg.held_count = count + 1;
@@ -362,9 +391,17 @@ GuardTouch::GuardTouch(const probe_session *s, DWORD tid) {
 #if defined(UHH_TEST_HOOKS)
     // UHH_TEST_DIE_IN_TOUCH=<tid>: at the first such call on that thread, do what the kernel
     // does inside it (suspend the thread) and die there -- the WOW64 implicit-suspend window.
+    // UHH_TEST_DIE_IN_TOUCH_MODE=before: die with the touch recorded but BEFORE the implicit
+    // suspension (regress cx2-touchprog-hw: the guard must leave the program's own suspension).
     static const DWORD die_tid = [] { const char *v = std::getenv("UHH_TEST_DIE_IN_TOUCH"); return v ? (DWORD)std::strtoul(v, nullptr, 10) : 0u; }();
-    if (die_tid && tid == die_tid) {
-        if (HANDLE t = OpenThread(THREAD_SUSPEND_RESUME, FALSE, tid)) SuspendThread(t);
+    static const bool die_before = [] { const char *v = std::getenv("UHH_TEST_DIE_IN_TOUCH_MODE"); return v && !std::strcmp(v, "before"); }();
+    if (die_tid && tid == die_tid && (!die_before || gg.enabled)) {
+        DWORD prev = (DWORD)-1;
+        if (!die_before)
+            if (HANDLE t = OpenThread(THREAD_SUSPEND_RESUME, FALSE, tid)) prev = SuspendThread(t);
+        std::fprintf(stderr, "probe: test: dying in a context call on thread %lu (guard enabled=%ld held=%ld "
+                             "floor=%lu suspended_before=%ld)\n", (unsigned long)tid, (long)gg.enabled,
+                     (long)gg.held_count, (unsigned long)(g ? gg.held_floor[n] : 0xFFFFFFFFu), (long)prev);
         std::fflush(nullptr);
         TerminateProcess(GetCurrentProcess(), 98);
     }
@@ -2952,7 +2989,7 @@ static void guard_note_hold(probe_session *s, DWORD tid) {
     auto &g = s->shared->guard;
     const LONG n = g.held_count;
     if (n < 0 || n >= (LONG)PROBE_AGENT_GUARD_TIDS) return;
-    g.held_tids[n] = tid;
+    g.held_tids[n] = tid; g.held_floor[n] = PROBE_AGENT_HOLD_OURS;
     MemoryBarrier();
     g.held_count = n + 1;
 }
@@ -2976,20 +3013,22 @@ static void guard_sync(probe_session *s) {
     for (auto &kv : s->stepping) if (n < PROBE_AGENT_GUARD_TIDS) g.step_tids[n++] = kv.first;
     g.step_count = (LONG)n;
     n = 0;
+    auto hold = [&](DWORD tid) {                        // a hold of ours: resumed once, unconditionally
+        if (!tid || n >= PROBE_AGENT_GUARD_TIDS) return;
+        g.held_tids[n] = tid; g.held_floor[n] = PROBE_AGENT_HOLD_OURS; ++n;
+    };
     for (const auto *list : {&s->held, &s->ipc_frozen, &s->call_deferred})
-        for (HANDLE t : *list)
-            if (const DWORD tid = GetThreadId(t); tid && n < PROBE_AGENT_GUARD_TIDS) g.held_tids[n++] = tid;
-    for (const auto &e : s->inplace_suspended)          // an in-place step window's suspensions
-        if (n < PROBE_AGENT_GUARD_TIDS) g.held_tids[n++] = e.first;
-    for (DWORD tid : s->detach_frozen) if (n < PROBE_AGENT_GUARD_TIDS) g.held_tids[n++] = tid;
+        for (HANDLE t : *list) hold(GetThreadId(t));
+    for (const auto &e : s->inplace_suspended) hold(e.first);   // an in-place step window's suspensions
+    for (DWORD tid : s->detach_frozen) hold(tid);
     // The threads whose events are being handled, and a call_original/call_func thread: a
     // 32-bit (WOW64) controller's Get/SetThreadContext on another thread is an implicit
     // suspend + resume inside the call, so a controller killed in the middle of one leaves
     // that thread suspended once with nothing of ours recording it (seen on x86: a thread
     // parked for good at its NtOpenProcess hit). One resume for each covers it -- a no-op
     // for a thread that is not suspended.
-    for (DWORD tid : s->handling) if (n < PROBE_AGENT_GUARD_TIDS) g.held_tids[n++] = tid;
-    if (s->in_call_tid && n < PROBE_AGENT_GUARD_TIDS) g.held_tids[n++] = s->in_call_tid;
+    for (DWORD tid : s->handling) hold(tid);
+    hold(s->in_call_tid);
     g.held_count = (LONG)n;
     n = 0;
     for (uint64_t b : s->scratch_blocks) if (n < PROBE_AGENT_GUARD_BLOCKS) g.blocks[n++] = b;
@@ -5011,6 +5050,85 @@ static void trace_thread_stacks(probe_session *s, const char *why) {
     }
 }
 
+// A thread whose in-place step at `site` faulted, the fault passed to the program (see
+// probe_session::refault), is at the INT3 at that site again, with no event in between: is
+// this its handler RETRYING the faulted execution (EXCEPTION_CONTINUE_EXECUTION at the site:
+// no new hit), or a FRESH execution after the handler skipped the instruction or unwound out
+// of it (a new hit)? The kernel built the exception's dispatcher frame -- the CONTEXT the
+// handler got and returned, and the EXCEPTION_RECORD -- on the thread's stack just below the
+// faulting SP, and a retry is the very first instruction after that CONTEXT was restored: it
+// is still there, naming the site, and the thread's registers are exactly its registers
+// (whatever the handler repaired). A skip left it naming another address; an unwind rewrote
+// it (x64 RtlUnwindEx uses it as its working context) or left its record marked
+// EXCEPTION_UNWINDING (x86 RtlUnwind) -- a fresh execution of the site then matches nothing
+// (comparing the registers with the fault's took a repaired retry for a new hit). `now` is the
+// thread's context at the INT3 (CONTEXT_INTEGER | CONTEXT_CONTROL).
+static bool fault_retried(probe_session *s, const CONTEXT &now, uint64_t site, DWORD code) {
+    const uint64_t sp = (uint64_t)EMU_SP(now);
+    constexpr uint64_t span = 32 * 1024;            // the frame (CONTEXT, record, XSAVE area) lies within
+    // Readable stack below SP, page by page (a query answers from the address's page UP).
+    uint64_t lo = sp;
+    while (lo > 0x10000 && sp - lo < span) {
+        MEMORY_BASIC_INFORMATION m{};
+        if (!VirtualQueryEx(s->pi.hProcess, (void *)(uintptr_t)(lo - 1), &m, sizeof(m)) || m.State != MEM_COMMIT ||
+            (m.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
+            break;
+        lo = std::max<uint64_t>((uint64_t)(uintptr_t)m.BaseAddress, sp > span ? sp - span : 0);
+    }
+    std::vector<unsigned char> buf((size_t)(sp - lo));
+    size_t got = 0;
+    if (buf.size() < sizeof(CONTEXT) || !remote_read(s->pi.hProcess, lo, buf.data(), buf.size(), &got) || got != buf.size())
+        return false;
+#if defined(_WIN64)
+    constexpr DWORD arch = CONTEXT_AMD64;
+    constexpr size_t align = 16, ip_at = offsetof(CONTEXT, Rip);
+    using ip_t = DWORD64;
+#else
+    constexpr DWORD arch = CONTEXT_i386;
+    constexpr size_t align = 4, ip_at = offsetof(CONTEXT, Eip);
+    using ip_t = DWORD;
+#endif
+    const DWORD need = (CONTEXT_CONTROL | CONTEXT_INTEGER) & ~arch;
+    for (size_t o = (size_t)((align - lo % align) % align); o + sizeof(CONTEXT) <= buf.size(); o += align) {
+        ip_t ip;
+        std::memcpy(&ip, buf.data() + o + ip_at, sizeof(ip));
+        if ((uint64_t)ip != site) continue;
+        CONTEXT c;
+        std::memcpy(&c, buf.data() + o, sizeof(c));
+        if (!(c.ContextFlags & arch) || (c.ContextFlags & need) != need) continue;
+#if defined(_WIN64)
+        const bool regs = c.Rsp == now.Rsp && c.Rax == now.Rax && c.Rcx == now.Rcx && c.Rdx == now.Rdx &&
+                          c.Rbx == now.Rbx && c.Rbp == now.Rbp && c.Rsi == now.Rsi && c.Rdi == now.Rdi &&
+                          c.R8 == now.R8 && c.R9 == now.R9 && c.R10 == now.R10 && c.R11 == now.R11 &&
+                          c.R12 == now.R12 && c.R13 == now.R13 && c.R14 == now.R14 && c.R15 == now.R15;
+#else
+        const bool regs = c.Esp == now.Esp && c.Eax == now.Eax && c.Ecx == now.Ecx && c.Edx == now.Edx &&
+                          c.Ebx == now.Ebx && c.Ebp == now.Ebp && c.Esi == now.Esi && c.Edi == now.Edi;
+#endif
+        if (!regs) continue;
+#if !defined(_WIN64)
+        // x86: KiUserExceptionDispatcher is entered with [esp] = &record, [esp+4] = &context,
+        // just below the two. An unwind (RtlUnwind) leaves this CONTEXT intact but marks its
+        // record unwinding.
+        const uint32_t at = (uint32_t)(lo + o);
+        for (size_t q = o > 0x1000 ? o - 0x1000 : 0; q + 8 <= o; q += 4) {
+            uint32_t pr = 0, pc = 0;
+            std::memcpy(&pr, buf.data() + q, 4); std::memcpy(&pc, buf.data() + q + 4, 4);
+            if (pc != at || pr < lo || pr + sizeof(EXCEPTION_RECORD) > sp) continue;
+            EXCEPTION_RECORD r;
+            std::memcpy(&r, buf.data() + (pr - lo), sizeof(r));
+            if (r.ExceptionCode == code && (uint64_t)(uintptr_t)r.ExceptionAddress == site &&
+                (r.ExceptionFlags & 0x6 /* EXCEPTION_UNWINDING | EXCEPTION_EXIT_UNWIND */))
+                return false;
+        }
+#else
+        (void)code;
+#endif
+        return true;
+    }
+    return false;
+}
+
 static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
                              std::unordered_map<DWORD, StepState> &stepping,
                              bool &initial_break, DWORD &disposition) {
@@ -5076,6 +5194,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     bool restart = false;            // this INT3 is a faulted in-place step restarting (see refault)
     if (auto rf = s->refault.find(event.dwThreadId); rf != s->refault.end() && step == stepping.end()) {
         const uint64_t site = rf->second.site;
+        const DWORD fault_code = rf->second.code;
         s->refault.erase(rf);                              // one event decides
         if (code == EXCEPTION_BREAKPOINT || code == EXCEPTION_SINGLE_STEP) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
@@ -5084,10 +5203,14 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             const bool tf = got && (w.EFlags & 0x100u);
             // The fault reached the program WITHOUT our trap flag (the in-place step re-runs a
             // faulting instruction without it; WOW64 drops it anyway), and this is the thread's
-            // next event: an INT3 at the site is its handler retrying the same execution,
-            // whatever registers it changed to repair the fault (comparing them took a repaired
-            // retry for a new hit: 2 callbacks).
-            const bool same = true;
+            // next event. An INT3 at the site is either its handler retrying the same execution
+            // (no new hit) or, after the handler skipped the instruction or unwound out of it,
+            // a fresh execution of the site (a new hit): the exception's own dispatcher frame
+            // tells (fault_retried).
+            const bool same = got && code == EXCEPTION_BREAKPOINT && address == site && fault_retried(s, w, site, fault_code);
+            if (trace_enabled() && code == EXCEPTION_BREAKPOINT && address == site)
+                std::fprintf(stderr, "refault tid=%lu site=0x%llx: %s\n", (unsigned long)event.dwThreadId,
+                             (unsigned long long)site, same ? "the handler's retry" : "a new execution");
             if ((tf || same) && code == EXCEPTION_BREAKPOINT && address == site) {
                 restart = true;                            // same execution: no new hit
             } else if (tf && code == EXCEPTION_SINGLE_STEP) {
@@ -5279,7 +5402,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
                 // Remember it, to tell a restart of this same execution (the handler continues
                 // at the site: the INT3 again) from a new hit.
                 if (event.u.Exception.dwFirstChance && address == step->second.site) {
-                    probe_session::Refault rf; rf.site = step->second.site;
+                    probe_session::Refault rf; rf.site = step->second.site; rf.code = code;
                     s->refault[event.dwThreadId] = rf;
                 }
             }
