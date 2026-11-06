@@ -164,6 +164,9 @@ def kill_tree(p):
 
 
 def cmd_run(a):
+    # The runner's console is cp1252; regress.py prints UTF-8-only text (em dashes, arrows).
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     log = out / f"{a.name}.log"
@@ -181,11 +184,11 @@ def cmd_run(a):
             u = {"unit": sel, "fails": [], "ok_line": "", "rc": None, "timeout": False}
             p = subprocess.Popen([sys.executable, "-u", str(REGRESS), "--bin", a.bin, "--only", sel],
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                 encoding="utf-8", errors="replace", bufsize=1, cwd=ROOT)
+                                 encoding="utf-8", errors="replace", bufsize=1, cwd=ROOT, env=env)
             timer = threading.Timer(a.unit_timeout, lambda: (u.update(timeout=True), kill_tree(p)))
             timer.daemon = True
             timer.start()
-            for line in p.stdout:
+            for line in p.stdout:  # noqa: the stream ends when regress.py (or the timeout kill) closes it
                 sys.stdout.write(line); lf.write(line)
                 s = line.rstrip("\n")
                 if fail_re.match(s):

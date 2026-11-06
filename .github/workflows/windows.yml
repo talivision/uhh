@@ -89,6 +89,31 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Does a newer hosted image expose CET to the guest? (windows-2022's Xeon 8573C has CET, its guest CPUID does not.)
+  cet-probe:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build cet_probe only
+        shell: pwsh
+        run: |
+          $gen = if (Test-Path "${env:ProgramFiles}\Microsoft Visual Studio\2022") { 'Visual Studio 17 2022' } else { '' }
+          if ($gen) { cmake -S . -B build-cet -G $gen -A x64 } else { cmake -S . -B build-cet -A x64 }
+          cmake --build build-cet --config Release --target cet_probe
+      - name: CET probe
+        shell: pwsh
+        run: |
+          $cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name.Trim()
+          $os = Get-CimInstance Win32_OperatingSystem
+          $cet = (& build-cet\Release\cet_probe.exe 2>&1 | Out-String).Trim()
+          Write-Output "$cpu / $($os.Caption) $($os.Version)"; Write-Output $cet
+          Write-Output "::notice title=cet_probe ${{ matrix.os }}::$cpu / $($os.Caption) $($os.Version) $cet"
+
   test:
     needs: [plan, build]
     runs-on: windows-2022
