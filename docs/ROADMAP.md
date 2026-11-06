@@ -1449,12 +1449,23 @@ Real-bug candidates (reproduce on runners, not on the VM so far):
 - **attach-new-inline x64 windows-2025 (1 run)**: "probe never became active" -- the load flake also seen once on
   the VM (Lifecycle section).
 
-- **transparency-* (x64, all 18 rows, once in 5 runs; run 42185253728 shard x64-04, CPU not yet recorded then)**: the
-  `ovf` case (a callback that overflows its stack, TR9) was not survived: breakpoint/hw controllers died 0xC00000FD /
-  0xC0000005 (callbacks run there), inline targets died with the stack trace recursing in
-  `probe_api_agent.dll+0x13339`, and every later case of the same run had no target row. The same shard passed on a
-  Xeon 8573C in the next run. Candidate: TR9's stack-overflow recovery depends on the host (exception-dispatch stack
-  needs grow with the XSAVE area: AVX-512 / AMX hosts); the CPU column now recorded per shard will tell.
+- 🔧 **transparency-* (x64, all 18 rows, once in 5 runs)** -- host found: it is the **Intel Xeon 6973P-C** runner
+  (Granite Rapids; AMX enabled in XCR0 = 0x600e7, XSAVE area 11008 bytes; GetEnabledXStateFeatures 0x608e7),
+  1 in ~15 x64 windows-2022 jobs (runfix1-diag 42192716058 x64-a, 42194976034 x64-g: every `ovf` row fails there,
+  every other CPU passes: EPYC 7763 / 9V74 / 9V45, Xeon 8370C / 8573C -- AVX-512, no AMX). The `ovf` case (TR9) has
+  a callback overflow its stack: on that host the overflow's exception frame (a CONTEXT with the XSAVE area of every
+  XCR0 feature, ~12 KB) does not fit the stack Windows leaves after the guard page. Fixed for the controller: its
+  callback thread runs under a stack guarantee of CONTEXT + XCR0 XSAVE + 16 KB (`probe_callback_stack_guarantee`,
+  SetThreadStackGuarantee): breakpoint/hw callbacks' overflows are caught there now ("callback raised 0xc00000fd;
+  abandoned"). Inline: the agent raises the program thread's TEB guarantee for the callback only and restores it
+  (the first version never applied it -- a probe request below the effective default is a no-op; fixed in 16c87b3:
+  the VM shows `tp ovf guarantee teb=20480` inside the inline callback, and every transparency row -- which compares
+  every TEB byte with the unprobed twin -- passes on the VM and runners; not yet seen on the AMX host). Open: on the AMX host
+  the TARGET's own later overflow (`overflow_caught`, no probe on it) dies under breakpoint/hw (AV in the unwind,
+  `read of ... reserved, not committed`) although the same target without UHH survives it; a bare ctypes debugger
+  (`ci-diag/dbgtest.py` on runfix1-diag) and a probe on another function only (`ovfx`) are queued to tell "any
+  debugger on AMX" (environment) from UHH; the gated AMX-host jobs (25-30 per diag run, `cpu: 6973P`) have not
+  landed on one since.
 - ✅ **ntdll-churn-{hw,breakpoint} (x64, 2 of 5 runs, Xeon 8370C in the last)** -- the probes never became ACTIVE
   inside the 300 ms window (report `active:false`, no `probe: active` line, nothing lost). On attach, breakpoint/hw
   probes arm only once the agent's controller-death guard is up (agent init on a remote thread). With 4 target
