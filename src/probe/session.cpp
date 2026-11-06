@@ -423,8 +423,10 @@ struct probe_session {
     std::vector<unsigned char> sysproc_buf;     // others_runnable's NtQuerySystemInformation buffer
     bool quiet_sampled = false;                 // the round's first idle tick passed
     std::unordered_set<DWORD> runnable_prev;    // others_runnable: runnable at the previous idle tick
+    std::unordered_map<DWORD, ULONG> cs_prev;   // ... and context-switch counts then
     int round_demand = -1;                      // this round: -1 no idle tick compared yet, 0 none ran, 1 one ran
-    uint64_t rounds_by_demand[3] = {};          // PROBE_TRACE statistics: rounds ending with demand -1 / 0 / 1
+    uint64_t rounds_by_demand[3] = {};
+    std::chrono::steady_clock::time_point round_fine_until{};   // the 1 ms timer stays on until then (fair_tick)          // PROBE_TRACE statistics: rounds ending with demand -1 / 0 / 1
     uint64_t park_rounds = 0, parked_total = 0;   // fairness statistics (PROBE_TRACE: printed at the end)
     // Yield stubs (see yield_thread): per thread, `resume address; code`, carved from blocks that
     // are never freed (a thread may sleep inside one across a detach).
@@ -5291,10 +5293,15 @@ struct SysProc {                         // SYSTEM_PROCESS_INFORMATION; SysThrea
                   WriteTransferCount, OtherTransferCount;
 };
 }
-// 1 = another thread wants the CPU, 0 = none does, -1 = unknown (query failed). Wanting it
-// means runnable at two idle ticks in a row (>= 1 ms apart): a thread the last event's thaw
-// made Ready for a moment (a thread-pool worker resuming only to wait again: measured) is
-// not; a starved thread still is; one that ran and went back to a wait of its own got its CPU.
+// 1 = another thread wants the CPU, 0 = none does, -1 = unknown (query failed). Wanting it:
+// - runnable at two idle ticks in a row (>= 1 ms apart) -- a starved thread still is; a thread
+//   the last event's thaw made Ready for a moment (a thread-pool worker resuming only to wait
+//   again on its queue: measured) is not; or
+// - it RAN since the previous tick (its context-switch count moved) and is not now back in a
+//   thread-pool queue wait: a thread that wakes now and then (a Sleep(10) loop, a timer) needs
+//   the CPU every time it wakes, and with rounds 320 ms apart each wake would wait that long
+//   (regress hunt-starve: main's Sleep steps). The thaw's own churn moves a queue-waiting
+//   worker's count, hence the exception for those.
 static int others_runnable(probe_session *s) {
     using QueryFn = LONG(NTAPI *)(ULONG, PVOID, ULONG, PULONG);
     static auto query = reinterpret_cast<QueryFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation"));
@@ -5310,6 +5317,7 @@ static int others_runnable(probe_session *s) {
     }
     if (st < 0) return -1;
     std::unordered_set<DWORD> now;
+    std::unordered_map<DWORD, ULONG> cs_now;
     const int r = [&]() -> int {
     for (size_t off = 0;;) {
         if (off + sizeof(SysProc) > buf.size()) return -1;
@@ -5320,6 +5328,18 @@ static int others_runnable(probe_session *s) {
                 if ((const unsigned char *)(t + i + 1) > buf.data() + buf.size()) return -1;
                 const DWORD tid = (DWORD)(uintptr_t)t[i].UniqueThread;
                 const ULONG state = t[i].ThreadState;
+                if (!s->yielded_round.count(tid)) {
+                    cs_now[tid] = t[i].ContextSwitches;
+                    const auto was = s->cs_prev.find(tid);
+                    if (was != s->cs_prev.end() && was->second != t[i].ContextSwitches &&
+                        !(state == 5 && t[i].WaitReason == 15 /* WrQueue */)) {
+                        if (trace_enabled() && s->rounds_by_demand[2] < 12)
+                            std::fprintf(stderr, "  fair-demand tid=%lu ran (cs %lu -> %lu) state=%lu wait=%lu\n", (unsigned long)tid,
+                                         (unsigned long)was->second, (unsigned long)t[i].ContextSwitches,
+                                         (unsigned long)state, (unsigned long)t[i].WaitReason);
+                        return 1;
+                    }
+                }
                 // 0 Initialized, 1 Ready, 2 Running, 3 Standby, 6 Transition, 7 DeferredReady
                 if ((state <= 3 || state == 6 || state == 7) && !s->yielded_round.count(tid)) {
                     now.insert(tid);
@@ -5346,6 +5366,7 @@ static int others_runnable(probe_session *s) {
     }
     }();
     s->runnable_prev = std::move(now);
+    s->cs_prev = std::move(cs_now);
     return r;
 }
 // An idle tick inside a yield round (no debug event pending: the round's hot threads sleep):
@@ -5374,7 +5395,7 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
         if (s->parking) ++s->rounds_by_demand[s->round_demand + 1];
         if (s->parking && s->round_demand >= 0)
             s->fair_period_ms = s->round_demand ? 20 : std::min<uint32_t>(320, s->fair_period_ms * 2);
-        s->round_demand = -1; s->quiet_sampled = false; s->runnable_prev.clear();
+        s->round_demand = -1; s->quiet_sampled = false; s->runnable_prev.clear(); s->cs_prev.clear();
         const bool was = s->parking;
         // Dense debug events (>= 2000/s: the target is mostly frozen) -- or little unfrozen
         // time -- start a yield round: every thread whose hit is continued in the next window
@@ -5388,6 +5409,7 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
             ++s->park_rounds; s->yielded_round.clear();
             FILETIME ft; GetSystemTimeAsFileTime(&ft);
             s->round_wake = (LONGLONG)(((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime) + 40000;   // now + 4 ms
+            s->round_fine_until = now + milliseconds(8);
         }
         if (s->parking && !was) {
             if (trace_enabled())
@@ -5406,7 +5428,10 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
         if (agent_has_pending(s)) retarget_pending(s);
         if (agent_has_pending(s) && !kick_agent(s)) std::fprintf(stderr, "probe: %s\n", s->error.c_str());
     }
-    const bool fine = s->parking || !s->ctx_watch.empty() || s->rekick_at;   // (yields sleep 2 ms, not a tick)
+    // While parking: only around a round's sleep (its deadline and the quiet ticks need it), not
+    // through the up to 320 ms of dense events between rounds (a process-wide 1 ms timer raises
+    // the clock interrupt rate for the whole machine).
+    const bool fine = (s->parking && now < s->round_fine_until) || !s->ctx_watch.empty() || s->rekick_at;
     if (fine != s->fine_timer) { if (fine) timeBeginPeriod(1); else timeEndPeriod(1); s->fine_timer = fine; }
     return fine ? 1 : 20;
 }

@@ -1076,29 +1076,15 @@ static ThreadSlot *own_thread_slot(DWORD tid) {
     return ts;
 }
 
-// This thread's slot, cached in a dynamic TLS slot (TlsAlloc'd at init; read straight from the
-// TEB's TlsSlots, which exist from a thread's first instruction -- unlike implicit TLS, see
-// tls_ready): the lookup and identity check run once per thread, not per hit. A slot passes
-// to another thread only from a dead owner, so a cached slot stays this thread's.
-static DWORD g_slot_tls = TLS_OUT_OF_INDEXES;    // < 64 or unused
-static inline ThreadSlot *cached_slot() {
-    const DWORD i = g_slot_tls;
-    if (i >= 64) return nullptr;
-#if defined(_WIN64)
-    return reinterpret_cast<ThreadSlot *>(__readgsqword(0x1480 + i * 8));
-#else
-    return reinterpret_cast<ThreadSlot *>(__readfsdword(0xE10 + i * 4));
-#endif
-}
-static inline void cache_slot(ThreadSlot *ts) {
-    const DWORD i = g_slot_tls;
-    if (i >= 64) return;
-#if defined(_WIN64)
-    __writegsqword(0x1480 + i * 8, (unsigned __int64)(uintptr_t)ts);
-#else
-    __writefsdword(0xE10 + i * 4, (unsigned long)(uintptr_t)ts);
-#endif
-}
+// This thread's slot, cached in the agent's own implicit TLS (not the TEB: a TlsAlloc'd slot
+// lives in the TEB's TlsSlots, and a probe hit must leave the program's TEB untouched --
+// regress transparency-*): the lookup and identity check run once per thread, not per hit.
+// A thread still in its loader initialisation has no TLS block yet (tls_ready): it looks the
+// slot up every time. A slot passes to another thread only from a dead owner, so a cached
+// slot stays this thread's.
+static thread_local ThreadSlot *t_slot;
+static inline ThreadSlot *cached_slot() { return tls_ready() ? t_slot : nullptr; }
+static inline void cache_slot(ThreadSlot *ts) { if (tls_ready()) t_slot = ts; }
 static ThreadSlot *my_slot(DWORD tid) {
     ThreadSlot *ts = cached_slot();
     if (!ts && (ts = own_thread_slot(tid)) != nullptr) cache_slot(ts);
@@ -1163,6 +1149,9 @@ struct OrigPost {                    // x64: written by uhh_orig_thunk (gpr +0x0
 };
 static_assert(offsetof(OrigPost, xmm) == 0x30, "uhh_orig_thunk layout");
 struct HitScope {
+    // Not zero-filled per hit (post / seen are written before they are read: only after
+    // call_original ran, see orig_ran) -- ~250 bytes of memset per hit showed on x86.
+    HitScope(const HitAcct &a, ThreadSlot *s) : acct(a), slot(s) {}
     HitAcct acct;                   // where it is counted: its unaccounted unit and running count
     ThreadSlot *slot;               // this thread's slot (null: none free, see thread_slot)
     volatile LONG abandoned = 0;
@@ -1177,8 +1166,8 @@ struct HitScope {
     bool orig_ran = false;
     uint64_t orig_ret = 0;          // RAX / EAX (x86 EDX: probe_context::orig_edx)
     DWORD orig_error = 0, orig_status = 0;
-    OrigPost post{};
-    uint64_t seen[6] = {};          // the context's registers matching post.gpr when the original returned
+    OrigPost post;
+    uint64_t seen[6];          // the context's registers matching post.gpr when the original returned
     unsigned char *x87_post = nullptr; // x86: FNSAVE image of the x87 state after the original (an ST0
                                        // result): mid_entry's 108-byte buffer, reloaded after the
                                        // extended-state restore
@@ -1801,9 +1790,12 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
 // does not (MXCSR always; AVX/AVX-512 when live, or unconditionally when the CPU cannot
 // report liveness), using intrinsics only -- then run the hit. The stub restores RFLAGS
 // (so the target's DF) on the way out.
+// N: the save area, sized to the CPU's need (g_xs.size): 1 KiB covers x87 + SSE + AVX (832
+// bytes) -- no stack probe per hit (an x86 frame over 4 KiB calls __chkstk); 4 KiB otherwise.
+template <uint32_t N>
 static __declspec(noinline) bool mid_entry_saved(safetyhook::Context &native, uint32_t index, uint64_t mask,
                                                   unsigned char *x87_post) {
-    alignas(64) unsigned char area[4096];
+    alignas(64) unsigned char area[N];
     __stosb(area + 512, 0, 64);                            // XSAVE header must start clean (no CRT call)
 #if defined(_WIN64)
     if (g_xs.compact) _xsavec64(area, mask); else _xsave64(area, mask);
@@ -1881,7 +1873,8 @@ static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
     if (xmode == 1) x87 = call_mid(native, index, x87_post);
     else if (xmode == 3 && g_xs.ok && (g_xs.mask & 0xE4ull))
         x87 = mid_entry_noxsave_sim(native, index, g_xs.mask & 0xE4ull, x87_post);
-    else if (mask) x87 = mid_entry_saved(native, index, mask, x87_post);
+    else if (mask) x87 = g_xs.size <= 1024 ? mid_entry_saved<1024>(native, index, mask, x87_post)
+                                           : mid_entry_saved<4096>(native, index, mask, x87_post);
     else if (!xs_ok) x87 = mid_entry_fx(native, index, x87_post);   // no XSAVE: x87 + MXCSR by FXSAVE
     else {
         unsigned int mxcsr = _mm_getcsr();                 // the common case: nothing live but MXCSR
@@ -2629,11 +2622,6 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
     InterlockedExchange(&g_cleared_n, 0);
     if (g_guard_wake) SetEvent(g_guard_wake);    // the service thread takes the new controller handle
     InterlockedIncrement(&g_tblock_gen);   // a new (zeroed) channel: every thread claims a hit block again
-    if (g_slot_tls == TLS_OUT_OF_INDEXES) {
-        const DWORD i = TlsAlloc();             // per-thread slot cache (cached_slot): only the TEB's 64 inline slots
-        if (i != TLS_OUT_OF_INDEXES && i >= 64) TlsFree(i);
-        else g_slot_tls = i;
-    }
     InterlockedExchange(&g_stopping, 0);   // a new session after a detach: callbacks run again
     resolve_callbacks();
     install_pending();
