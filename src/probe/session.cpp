@@ -409,6 +409,16 @@ struct probe_session {
     uint32_t fair_events = 0;                   // debug events in the current fairness window
     LONGLONG round_wake = 0;                    // the current yield round ends (system time, 100 ns)
     std::unordered_set<DWORD> yielded_round;    // threads that yielded in the current round (once each)
+    // Demand-driven rounds (fair_tick): a round is also a probe. While its hot threads sleep the
+    // target runs with no debug event at all, and the loop's idle ticks then sample every other
+    // thread's cycle count (QueryThreadCycleTime): a thread that gains cycles there wanted the CPU
+    // (it was starved, or merely runnable). Rounds come every 20 ms while some thread does; after
+    // each round in which none did, the period doubles, to 320 ms -- a lone hot thread, or one
+    // whose siblings are all blocked, then yields ~4 ms in 324 instead of 4 in 24.
+    uint32_t fair_period_ms = 20;
+    std::unordered_map<DWORD, uint64_t> quiet_cycles;   // the round's first idle-tick sample
+    bool quiet_sampled = false;                 // quiet_cycles holds this round's baseline
+    int round_demand = -1;                      // this round: -1 no idle tick compared yet, 0 none ran, 1 one ran
     uint64_t park_rounds = 0, parked_total = 0;   // fairness statistics (PROBE_TRACE: printed at the end)
     // Yield stubs (see yield_thread): per thread, `resume address; code`, carved from blocks that
     // are never freed (a thread may sleep inside one across a detach).
@@ -5097,7 +5107,7 @@ static void park_release(probe_session *s) {
                      (long long)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
     for (auto &e : s->parked) { ResumeThread(e.second); CloseHandle(e.second); }
     s->parked.clear();
-    s->parking = false;
+    s->parking = false; s->fair_period_ms = 20; s->round_demand = -1; s->quiet_sampled = false;
     s->fair_window = std::chrono::steady_clock::now(); s->fair_gaps = {};
 }
 // Park the thread whose hit is about to be continued (see probe_session::parked). Never a
@@ -5240,6 +5250,36 @@ static void retarget_pending(probe_session *s) {
     for (const auto &a : arm) arm_quietly(s, a.first, a.second);
     if (moved) arm_gates_for_pending(s);
 }
+// Cycle counts of the target's threads other than the round's yielders and the agent's own
+// (QueryThreadCycleTime: exact). Empty when the target has too many threads to read every tick.
+static std::unordered_map<DWORD, uint64_t> other_cycles(probe_session *s) {
+    std::unordered_map<DWORD, uint64_t> out;
+    if (s->threads.size() > 64) return out;
+    for (DWORD tid : s->threads) {
+        if (s->yielded_round.count(tid) || agent_thread(s, tid)) continue;
+        HANDLE t = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+        if (!t) continue;
+        ULONG64 c = 0;
+        if (QueryThreadCycleTime(t, &c)) out[tid] = c;
+        CloseHandle(t);
+    }
+    return out;
+}
+// An idle tick inside a yield round (no debug event pending: the round's hot threads sleep):
+// the first takes the baseline, each later one compares. Any other thread that gained cycles
+// in between ran -- with no event, so no freeze / thaw churn is counted (measured: a thread
+// pool worker blocked in its queue gains ~6k kernel cycles per debug event from the freezes).
+static void round_quiet_tick(probe_session *s) {
+    if (!s->parking || s->yielded_round.empty() || s->round_demand == 1) return;
+    auto now = other_cycles(s);
+    if (now.empty()) { s->round_demand = 1; return; }              // unknown: as before (20 ms rounds)
+    if (!s->quiet_sampled) { s->quiet_cycles = std::move(now); s->quiet_sampled = true; return; }
+    s->round_demand = 0;
+    for (const auto &e : now) {
+        const auto was = s->quiet_cycles.find(e.first);
+        if (was == s->quiet_cycles.end() || e.second > was->second) { s->round_demand = 1; return; }
+    }
+}
 static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blocked, bool got) {
     using namespace std::chrono;
     const auto now = steady_clock::now();
@@ -5247,7 +5287,14 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
     s->fair_gaps += blocked;
     if (got) s->last_event = now;
     if (got) ++s->fair_events;
-    if (now - s->fair_window >= milliseconds(20)) {
+    if (!got) round_quiet_tick(s);
+    if (now - s->fair_window >= milliseconds(s->fair_period_ms)) {
+        // The round that just ended: something else ran in its quiet time -> rounds every 20 ms
+        // (it may be starved); nothing did -> twice the period, to 320 ms; no quiet tick
+        // compared (the round never went quiet) -> unchanged.
+        if (s->parking && s->round_demand >= 0)
+            s->fair_period_ms = s->round_demand ? 20 : std::min<uint32_t>(320, s->fair_period_ms * 2);
+        s->round_demand = -1; s->quiet_sampled = false; s->quiet_cycles.clear();
         const bool was = s->parking;
         // Dense debug events (>= 2000/s: the target is mostly frozen) -- or little unfrozen
         // time -- start a yield round: every thread whose hit is continued in the next window
@@ -5267,6 +5314,7 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
                 std::fprintf(stderr, "  park-start t=%lld\n",
                              (long long)duration_cast<microseconds>(now.time_since_epoch()).count());
         }
+        if (!s->parking) s->fair_period_ms = 20;      // dense events again are noticed within 20 ms
         s->fair_window = now; s->fair_gaps = {};
     }
     // 1 ms timer resolution only while a parked thread or a context watch waits on this loop:

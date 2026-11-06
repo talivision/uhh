@@ -156,6 +156,22 @@ def calls_for(bk, m, threads=1):
     return n // threads if bk != "base" else n
 
 
+def case_spin(side, bk):
+    """Fairness: one thread hits the probe (empty callback) while another never hits anything
+    and always wants the CPU (hitcost_target --spin): the hot thread's ns per call and the
+    spinner's progress (spin_per_us; uninstrumented ~400-500 on the test VM)."""
+    n = calls_for(bk, "empty")
+    cmd = ([tgt("hitcost_target.exe"), "--no-wait", "--calls", n, "--threads", 1, "--spin"] if bk == "base" else
+           [side.exe("hitcost_driver.exe"), "--backend", bk, "--method", "empty",
+            *(["--watch-rva", sink_rva()] if bk == "watch" else []), "--",
+            tgt("hitcost_target.exe"), "--no-wait", "--calls", n, "--threads", 1, "--spin"])
+    rc, wall, logs, objs = run_to_file(side, cmd, 900)
+    t = first(objs, "target")
+    hits = first(objs, "probe").get("hits") if bk != "base" else n
+    return {"rc": rc, "ok": rc == 0 and hits == n and t.get("ns_per_call") is not None,
+            "ns_per_call": t.get("ns_per_call"), "spin_per_us": t.get("spin_per_us"), "wall_s": round(wall, 3)}
+
+
 def case_hit(side, bk, m, threads=1):
     """ns_per_call = in-target loop wall / calls per thread: what one call costs a thread
     (with T threads running at once). hits_per_s = all threads' calls / wall."""
@@ -346,6 +362,7 @@ def all_cases(group):
             c += [(f"hit/base/empty/t{t}", (lambda t: lambda s: case_hit(s, "base", None, t))(t))]
             c += [(f"hit/{bk}/{m}/t{t}", (lambda bk, m, t: lambda s: case_hit(s, bk, m, t))(bk, m, t))
                   for bk in HIT_BACKENDS for m in ("empty", "send_log")]
+        c += [(f"spin/{bk}/t1", (lambda bk: lambda s: case_spin(s, bk))(bk)) for bk in ["base"] + HIT_BACKENDS]
         c += [(f"attach/{bk}/{m}", (lambda bk, m: lambda s: case_attach(s, bk, m))(bk, m))
               for bk in BACKENDS for m in ("idle", "busy")]
     if group in ("extra", "all"):
@@ -409,7 +426,7 @@ def main():
                     rec = {"tag": a.tag, "round": r, "case": name, "side": sn, **res}
                     out.write(json.dumps(rec) + "\n"); out.flush()
                     short = {k: (round(v, 2) if isinstance(v, float) else v) for k, v in res.items()
-                             if k in ("ok", "ns_per_call", "hits_per_s", "logs_per_s", "p50_ms", "p99_ms",
+                             if k in ("ok", "ns_per_call", "spin_per_us", "hits_per_s", "logs_per_s", "p50_ms", "p99_ms",
                                       "lag_p50_ms", "lag_p99_ms", "attach_ms", "detach_ms", "launch_ms",
                                       "total_ms", "elapsed_ns", "wall_s", "pre_busy", "error")}
                     print(f"r{r} {name} {sn} {short}", flush=True)
