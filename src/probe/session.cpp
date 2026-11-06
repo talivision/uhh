@@ -253,6 +253,8 @@ struct probe_session {
     bool guard_ready = false;                  // attach: controller-death guard up (or given up): arm breakpoint/hw
     ULONGLONG guard_since = 0;
     bool agent_init_started = false;           // this session started the agent's init
+    std::vector<DWORD> detach_frozen;          // detach's own freeze of every thread (mirrored for the guard)
+    std::vector<DWORD> handling;               // threads whose debug event is being handled (nested: call_original)
     DWORD debug_tid = 0;                       // the thread that launched/attached: owns the debug object
     DWORD in_call_tid = 0;                     // thread currently running a call_func callee
     std::vector<HANDLE> call_deferred;         // other threads' hits during a call_func: rewound + suspended
@@ -2747,6 +2749,20 @@ static bool arm_module(probe_session *s, const std::string &module, uint64_t bas
 
 // The guard is up (or will not come): arm the breakpoint/hw probes held back until now.
 static void guard_sync(probe_session *s);
+// Called BEFORE the controller suspends a thread it does not resume within the same few
+// instructions: the guard's held list gets the thread first, so a controller killed between
+// the suspension and the next guard_sync still has it resumed (an entry for a thread that was
+// never suspended, or already resumed, costs a no-op ResumeThread). guard_sync rewrites the
+// list from the session's own bookkeeping after every event.
+static void guard_note_hold(probe_session *s, DWORD tid) {
+    if (!s->attached || !s->shared || s->detached || !tid) return;
+    auto &g = s->shared->guard;
+    const LONG n = g.held_count;
+    if (n < 0 || n >= (LONG)PROBE_AGENT_GUARD_TIDS) return;
+    g.held_tids[n] = tid;
+    MemoryBarrier();
+    g.held_count = n + 1;
+}
 static bool guard_set_ready(probe_session *s, const char *why) {
     if (s->guard_ready) return true;
     s->guard_ready = true;
@@ -2772,6 +2788,15 @@ static void guard_sync(probe_session *s) {
             if (const DWORD tid = GetThreadId(t); tid && n < PROBE_AGENT_GUARD_TIDS) g.held_tids[n++] = tid;
     for (const auto &e : s->inplace_suspended)          // an in-place step window's suspensions
         if (n < PROBE_AGENT_GUARD_TIDS) g.held_tids[n++] = e.first;
+    for (DWORD tid : s->detach_frozen) if (n < PROBE_AGENT_GUARD_TIDS) g.held_tids[n++] = tid;
+    // The threads whose events are being handled, and a call_original/call_func thread: a
+    // 32-bit (WOW64) controller's Get/SetThreadContext on another thread is an implicit
+    // suspend + resume inside the call, so a controller killed in the middle of one leaves
+    // that thread suspended once with nothing of ours recording it (seen on x86: a thread
+    // parked for good at its NtOpenProcess hit). One resume for each covers it -- a no-op
+    // for a thread that is not suspended.
+    for (DWORD tid : s->handling) if (n < PROBE_AGENT_GUARD_TIDS) g.held_tids[n++] = tid;
+    if (s->in_call_tid && n < PROBE_AGENT_GUARD_TIDS) g.held_tids[n++] = s->in_call_tid;
     g.held_count = (LONG)n;
     n = 0;
     for (uint64_t b : s->scratch_blocks) if (n < PROBE_AGENT_GUARD_BLOCKS) g.blocks[n++] = b;
@@ -2908,6 +2933,7 @@ static void inplace_suspend(probe_session *s, DWORD tid) {
     for (auto &e : s->inplace_suspended) if (e.first == tid) return;
     HANDLE t = OpenThread(THREAD_SUSPEND_RESUME, FALSE, tid);
     if (!t) return;
+    guard_note_hold(s, tid);
     if (SuspendThread(t) == (DWORD)-1) { CloseHandle(t); return; }
     try { s->inplace_suspended.emplace_back(tid, t); } catch (...) { ResumeThread(t); CloseHandle(t); }
 }
@@ -3404,6 +3430,7 @@ static void hold_thread(probe_session *s, DWORD tid) {
     // (QUERY_LIMITED: the controller-death guard mirrors held threads by id, GetThreadId.)
     HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
     if (!t) return;
+    guard_note_hold(s, tid);
     DWORD prev = SuspendThread(t);
     if (prev == (DWORD)-1) { CloseHandle(t); return; }
     if (trace_enabled()) std::fprintf(stderr, "  hold tid=%lu prev_suspend=%lu\n", (unsigned long)tid, (unsigned long)prev);
@@ -3752,8 +3779,10 @@ static void detach(probe_session *s) {
         HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT |
                               THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
         if (!t) continue;
+        guard_note_hold(s, tid);
         if (SuspendThread(t) == (DWORD)-1) { CloseHandle(t); continue; }
         frozen.push_back(t);
+        s->detach_frozen.push_back(tid);
     }
     for (auto &p : s->probes) {
         if (!p->active) continue;
@@ -3773,6 +3802,7 @@ static void detach(probe_session *s) {
     // surface after we let go. With every probe already removed nothing new can trap, so
     // run until the queue has been quiet for 200 ms: everything in flight lands here.
     for (HANDLE t : frozen) ResumeThread(t);
+    s->detach_frozen.clear(); guard_sync(s);
     // Only EXCEPTIONS are what this waits for: a target that keeps creating threads or
     // loading DLLs never goes quiet in thread/module events (that kept a detach busy for
     // minutes), so those are handled but do not extend the wait -- and the whole drain is
@@ -3798,7 +3828,12 @@ static void detach(probe_session *s) {
         if (s->skip_continue) { s->skip_continue = false; continue; }
         ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, disposition);
     }
-    for (HANDLE t : frozen) SuspendThread(t);                // freeze again for the fix-ups below
+    for (HANDLE t : frozen) {                                // freeze again for the fix-ups below
+        const DWORD tid = GetThreadId(t);
+        guard_note_hold(s, tid);
+        SuspendThread(t);
+        s->detach_frozen.push_back(tid);
+    }
     // A thread still mid single-step: put it on the real instruction stream (the INT3 is
     // gone) with the trap flag clear.
     for (auto &kv : s->stepping) {
@@ -3881,6 +3916,7 @@ static void detach(probe_session *s) {
     }
     if (!s->exited) DebugActiveProcessStop(s->pi.dwProcessId);
     for (HANDLE t : frozen) { ResumeThread(t); CloseHandle(t); }
+    s->detach_frozen.clear();
     // The final drain runs with the threads RUNNING: one the freeze caught between claiming a
     // ring slot and publishing it finishes the record first (frozen, it would be lost).
     stop_drainer(s);
@@ -3990,6 +4026,7 @@ static void ipc_freeze_thread(probe_session *s, DWORD tid) {
     HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION,
                           FALSE, tid);                     // (QUERY_LIMITED: GetThreadId, guard_sync)
     if (!t) return;
+    guard_note_hold(s, tid);
     if (SuspendThread(t) == (DWORD)-1) { CloseHandle(t); return; }
     s->ipc_frozen.push_back(t);
 }
@@ -4221,6 +4258,7 @@ static bool defer_hit_during_call(probe_session *s, DWORD tid, uint64_t address,
         w.EFlags &= ~0x10000u;                   // no RF: the probe must fire again
         ok = !!SetThreadContext(t, &w);
     }
+    if (ok) guard_note_hold(s, tid);
     if (ok && SuspendThread(t) != (DWORD)-1) {
         try { s->call_deferred.push_back(t); return true; } catch (...) { ResumeThread(t); }
     }
@@ -5601,10 +5639,17 @@ static void stop_drainer(probe_session *s) {
 // One debug event -> library state changes. Shared by probe_run and the detach path.
 static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &disposition);
 static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposition) {
+    s->handling.push_back(event.dwThreadId);
+    struct Handling {
+        probe_session *s;
+        ~Handling() { s->handling.pop_back(); }
+    } handling{s};
+    guard_note_hold(s, event.dwThreadId);            // see guard_sync: until the event is continued
     const bool ok = dispatch_event_impl(s, event, disposition);
     inplace_sync(s, event);
     // The guard's mirror, after EVERYTHING this event changed (an in-place window's holds are
-    // taken / handed over just above) and before the thread runs again.
+    // taken / handed over just above) and before the thread runs again. The event's thread
+    // stays listed until the next sync (its context may still be written before it continues).
     if (!s->exited) guard_sync(s);
     return ok;
 }
@@ -6391,6 +6436,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
     s->in_call_tid = st->tid; s->co_addr = probe->address; s->co_sp = c->hit_sp;
     s->co_entry_pending = !(probe->flags & PROBE_HW); s->co_left = false;
     auto clear_slot = [&](bool running) {
+        if (running) guard_note_hold(s, st->tid);
         if (running && SuspendThread(thread) == (DWORD)-1) return;
         if (borrowed) {                                                // the probe's own DR, back at its site
             uint32_t rw = 0, len = 0; hw_rw_len(probe->flags, rw, len);
@@ -6453,6 +6499,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
             // Left without a probe hit to show it (e.g. an exception caught by the caller):
             // the thread is above the hit's frame and not at the return address.
             next_poll = now + 20;
+            guard_note_hold(s, st->tid);
             if (SuspendThread(thread) != (DWORD)-1) {
                 CONTEXT r{}; r.ContextFlags = CONTEXT_CONTROL;
                 if (GetThreadContext(thread, &r)) {

@@ -6401,7 +6401,8 @@ def lc_brief(c):
         return f"DEAD/HUNG {c}"
     return (f"code_diff={c.get('code_diff')} {c.get('code_bad') or ''} dr_dirty={c.get('dr_dirty')} {c.get('dr_bad') or ''} "
             f"dr_stale={c.get('dr_stale')} dbg={c.get('debugger')} errors={c.get('errors')} {c.get('first_error') or ''} flips={c.get('flips')} "
-            f"agent={c.get('agent_loaded')}" + (f" late={c.get('late')} stuck={c.get('stuck_info')}" if c.get("late") or c.get("stuck") else "")
+            f"agent={c.get('agent_loaded')}" + (f" late={c.get('late')} stuck={c.get('stuck_info')} agent_thr={c.get('agent_thr')}" if c.get("late") or c.get("stuck") else "")
+            + (f" susp={c.get('susp_info')}" if c.get("susp") else "")
             ).replace("  ", " ")
 
 
@@ -6688,10 +6689,12 @@ def lc_controller_killed(cfgname, cfg):
             progressed = (c2.get("iterations") or 0) > (c.get("iterations") or 0)
             if not lc_clean(c2) or not progressed:
                 bad.append(f"kill@{when}: progressed={progressed} {lc_brief(c2)} unhandled={tg.unhandled()}")
+            first_susp = c.get("susp_info") if c.get("susp") else ""
             a = tg.quit()
             steps.append(f"quit={time.time() - t0:.0f}")
             if (a.get("rc") != 0 or a.get("late") or a.get("stuck")) and not any(x.startswith(f"kill@{when}") for x in bad):
-                bad.append(f"kill@{when}: exit={a.get('rc')} {lc_brief(a)} unhandled={tg.unhandled()}")
+                bad.append(f"kill@{when}: exit={a.get('rc')} {lc_brief(a)} unhandled={tg.unhandled()}"
+                           + (f" susp@4s={first_susp}" if first_susp else ""))
         except Exception as e:
             bad.append(f"kill@{when}: {e!r}")
         finally:

@@ -1099,6 +1099,20 @@ by itself, nothing dropped), detach while callbacks run / block in call_original
   bookkeeping (inplace_sync), and resumed once per hold. lifecycle_target's quit report now
   carries `late` (workers not ended 15 s after quit) and `stuck` (threads left suspended:
   tid:count:ip), and every lifecycle check fails on either. `lifecycle-controller-killed-*`
+- ✅ (L13, found at the merge, x86) With L12 fixed, x86 controller-killed-{breakpoint,hw,mixed}
+  still left ONE thread suspended in ~half the runs, parked at its NtOpenProcess hit (site or
+  site+1: the thread whose event the controller was handling). A 32-bit controller runs under
+  WOW64, where Get/SetThreadContext on another thread is an implicit suspend + resume inside the
+  call: killed in between, it leaves that thread suspended once with nothing of ours recording
+  it. The guard now also lists the threads whose events are being handled (nested ones too,
+  call_original) and the call_original/call_func thread, each published before the controller
+  touches it; one resume for each is a no-op on a thread that is not suspended. Every other hold
+  is published to the guard BEFORE the suspension (guard_note_hold), incl. detach's own freeze.
+  Defensive, same commit: after the controller process ends, the agent polls (10 ms, <= 30 s) for
+  its debug port to go instead of waiting for a trap to wake it. x86 bp+hw 10/10 (was 8 of 16
+  failing). Residual: a WOW64 implicit suspend of a thread that is neither the event's nor the
+  call's (e.g. arming a hardware probe on every thread) is not covered; the guard's extra
+  resume can undo a suspension the PROGRAM made of one of those threads at that instant.
 - Merged into merge-frida (agent protocol v19 = v18 + the guard): the guard takes the armed INT3s
   from merge-frida's INT3 table (every armed breakpoint, sorted; was its own 512-entry copy, so a
   session with more breakpoints left the rest unguarded), resumes the threads an in-place step
