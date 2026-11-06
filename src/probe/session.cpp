@@ -120,6 +120,7 @@ struct StepState {
     bool pushf_insn = false;   // PUSHF stepped in place: the pushed image carries OUR trap flag
     bool prog_tf = false;      // ... unless the program had TF set itself
     bool windowed = false;     // in place under the in-place window (other threads held, see inplace_begin)
+    bool refire = false;       // the in-place step faulted: re-running the instruction WITHOUT our trap flag
 };
 
 // One log line, optionally with a raw stack snapshot (return addresses only). Frames
@@ -3003,7 +3004,16 @@ static void inplace_watchdog(probe_session *s) {
                              "(a call through that site meanwhile may be missed). Further cases are not reported.\n",
                      (unsigned long)s->inplace_owner);
     }
-    if (auto it = s->stepping.find(s->inplace_owner); it != s->stepping.end()) it->second.windowed = false;
+    if (auto it = s->stepping.find(s->inplace_owner); it != s->stepping.end()) {
+        if (it->second.refire) {
+            // A faulted instruction re-run without our trap flag did not fault again (the memory
+            // changed meanwhile): it ran on with the byte lifted. Arm the site again.
+            end_inplace_step(s, it->first, it->second.site);
+            s->stepping.erase(it);
+        } else {
+            it->second.windowed = false;
+        }
+    }
     inplace_release_all(s);
 }
 // After every debug event: the window lasts exactly as long as its owner's in-place step.
@@ -4884,6 +4894,14 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     if (code == PROBE_IPC_CODE && handle_ipc(s, event)) { disposition = DBG_CONTINUE; return true; }
     auto step = stepping.find(event.dwThreadId);
     uint64_t address = (uint64_t)(uintptr_t)ex.ExceptionAddress;
+    if (step != stepping.end() && step->second.refire &&
+        (address != step->second.site || code == EXCEPTION_BREAKPOINT || code == EXCEPTION_SINGLE_STEP)) {
+        // A faulted instruction re-run without our trap flag (see refire) that did NOT fault
+        // again: the thread ran on with the byte lifted. Arm the site again; this event is new.
+        end_inplace_step(s, event.dwThreadId, step->second.site);
+        stepping.erase(step);
+        step = stepping.end();
+    }
     bool restart = false;            // this INT3 is a faulted in-place step restarting (see refault)
     if (auto rf = s->refault.find(event.dwThreadId); rf != s->refault.end() && step == stepping.end()) {
         const uint64_t site = rf->second.site;
@@ -4893,15 +4911,12 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             CONTEXT w{}; w.ContextFlags = CONTEXT_INTEGER | CONTEXT_CONTROL;
             const bool got = t && GetThreadContext(t, &w);
             const bool tf = got && (w.EFlags & 0x100u);
-#if defined(_WIN64)
-            const bool same = false;       // x64: our trap flag in the restored context marks the restart
-#else
-            // WOW64 (x86): the handler's context comes back WITHOUT our trap flag. The fault was
-            // dispatched to the program, and this is the thread's next event: an INT3 at the
-            // site is its handler retrying the same execution, whatever registers it changed to
-            // repair the fault (comparing them took a repaired retry for a new hit: 2 callbacks).
+            // The fault reached the program WITHOUT our trap flag (the in-place step re-runs a
+            // faulting instruction without it; WOW64 drops it anyway), and this is the thread's
+            // next event: an INT3 at the site is its handler retrying the same execution,
+            // whatever registers it changed to repair the fault (comparing them took a repaired
+            // retry for a new hit: 2 callbacks).
             const bool same = true;
-#endif
             if ((tf || same) && code == EXCEPTION_BREAKPOINT && address == site) {
                 restart = true;                            // same execution: no new hit
             } else if (tf && code == EXCEPTION_SINGLE_STEP) {
@@ -5058,13 +5073,40 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         // later stray single-step can't teleport it to site+insn_len; re-arm the byte
         // if the step was in-place. Pass the exception through unchanged.
         if (step != stepping.end()) {
+            if (!step->second.displaced && event.u.Exception.dwFirstChance && address == step->second.site &&
+                code != EXCEPTION_BREAKPOINT && step->second.windowed && !step->second.refire && !step->second.prog_tf) {
+                // The instruction faulted during its in-place step: the kernel hands the program's
+                // handler the context AS IT FAULTED -- with OUR trap flag (x64; WOW64 drops it),
+                // which the program must never see. Swallow this one and run the instruction once
+                // more without the flag (byte still lifted, window still held): it faults again,
+                // and THAT fault, with the program's own flags, is the one passed on (below). A
+                // guard page the faulting access consumed is put back first. Should the re-run
+                // not fault after all, the window's watchdog re-arms the site (inplace_watchdog).
+                HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
+                CONTEXT w{}; w.ContextFlags = CONTEXT_CONTROL;
+                if (t && GetThreadContext(t, &w) && (w.EFlags & 0x100u) && (uint64_t)EMU_IP(w) == address) {
+                    if (code == STATUS_GUARD_PAGE_VIOLATION && ex.NumberParameters >= 2) {
+                        MEMORY_BASIC_INFORMATION m{};
+                        void *page = (void *)(uintptr_t)ex.ExceptionInformation[1];
+                        DWORD old = 0;
+                        if (VirtualQueryEx(s->pi.hProcess, page, &m, sizeof(m)) && m.State == MEM_COMMIT && !(m.Protect & PAGE_GUARD))
+                            VirtualProtectEx(s->pi.hProcess, page, 1, m.Protect | PAGE_GUARD, &old);
+                    }
+                    w.EFlags &= ~0x100u;
+                    if (SetThreadContext(t, &w)) {
+                        CloseHandle(t);
+                        step->second.refire = true;
+                        disposition = DBG_CONTINUE; return true;
+                    }
+                }
+                if (t) CloseHandle(t);
+            }
             if (!step->second.displaced) {
                 end_inplace_step(s, event.dwThreadId, step->second.site);
                 // The instruction itself raised during its in-place step (e.g. the re-run of a
-                // faulting displaced copy): the program's handler gets it with our trap flag set
-                // in its context. Remember it, to tell a restart of this same execution (the
-                // handler continues at the site: the INT3 again, TF set) from a new hit, and to
-                // absorb the single stray step if the handler continues elsewhere.
+                // faulting displaced copy; re-run once more without our trap flag, above).
+                // Remember it, to tell a restart of this same execution (the handler continues
+                // at the site: the INT3 again) from a new hit.
                 if (event.u.Exception.dwFirstChance && address == step->second.site) {
                     probe_session::Refault rf; rf.site = step->second.site;
                     s->refault[event.dwThreadId] = rf;
@@ -5352,10 +5394,11 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     const bool is_syscall = probe->orig_insn.size() == 2 && probe->orig_insn[0] == 0x0F && probe->orig_insn[1] == 0x05;
     StepState st{probe, displaced, probe->address, probe->insn_len, displaced ? scratch_addr : 0,
                  tail, probe->rep_string, is_syscall};
+    st.prog_tf = prog_tf;          // (also kept for a displaced copy that faults and re-runs in place)
     if (!displaced) {
         bool pushf = false, may_block = false;
         site_traits(*probe, pushf, may_block);
-        st.pushf_insn = pushf; st.prog_tf = prog_tf;
+        st.pushf_insn = pushf;
         st.windowed = !may_block;
         if (st.windowed) inplace_begin(s, event.dwThreadId);    // the byte is lifted: hold every other thread
     }
