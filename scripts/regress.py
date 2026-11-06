@@ -7109,11 +7109,25 @@ def main():
     ap.add_argument("--bigapps-secs", type=int, default=40, help="workload length of each bigapps run")
     ap.add_argument("--soak-minutes", type=float, default=0,
                     help="opt-in soak tier (scripts/soak.py): every phase for this many minutes; 0 skips")
-    ap.add_argument("--only", default="", help="comma-separated substrings of check names to run (default: all)")
+    ap.add_argument("--only", default="",
+                    help="comma-separated substrings of check FUNCTION names (check_logs_order; '-' matches '_', "
+                         "so logs-order and check-logs-order work too) to run (default: all). Record names such as "
+                         "inplace-jmp8 are NOT matched (use inplace). A selector that matches no check function, or a "
+                         "selection that runs no check, is an error (exit 2)")
     args = ap.parse_args()
     BIN = args.bin.resolve()
     only = [x for x in args.only.split(",") if x]
     ONLY[:] = only
+
+    def fn_names(fn):
+        return (fn.__name__, fn.__name__.replace("_", "-"))
+    if only:
+        check_fns = [v for k, v in globals().items() if k.startswith("check_") and callable(v)]
+        unmatched = [o for o in only if not any(o in n for fn in check_fns for n in fn_names(fn))]
+        if unmatched:
+            print(f"regress.py: --only selector(s) {unmatched} match no check function (substrings of check_* "
+                  f"function names; '-' for '_'). Nothing was run.", file=sys.stderr)
+            sys.exit(2)
     feed_keystrokes()
 
     import os as _os
@@ -7136,8 +7150,7 @@ def main():
         sweep_logs()
         # Also matches the hyphenated name (check_logs_order -> check-logs-order), so
         # --only logs- selects the logs-* family by its record-name prefix.
-        names = (fn.__name__, fn.__name__.replace("_", "-"))
-        return not only or any(o in n for o in only for n in names)
+        return not only or any(o in n for o in only for n in fn_names(fn))
     print(f"UHH regression suite — bin={BIN}")
     if want(check_sites): check_sites()
     if want(check_gated_off): check_gated_off()
@@ -7229,6 +7242,10 @@ def main():
     if want(check_inplace_shapes): check_inplace_shapes()
     if want(check_lifecycle): check_lifecycle()
     if want(check_cet_sde): check_cet_sde()
+    if only and not RESULTS:
+        print(f"regress.py: --only {','.join(only)} selected only opt-in tiers that were not enabled "
+              f"(--bigapps / --soak-minutes / --volume-reads): no check ran.", file=sys.stderr)
+        sys.exit(2)
     print("-" * 72)
     failed = 0
     for name, status, detail in RESULTS:
