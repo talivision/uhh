@@ -230,7 +230,7 @@ reads, a slow (50 ms) callback under 32 threads.
 - ✅ (C20) attach_new: `attach-new-{breakpoint,hw,inline}` on ntdll!NtReadVirtualMemory; no sleeps (decoy's gate line, tracer's 'probe: waiting for a new' and 'probe: active' lines). The target gate stays: attach_new polls, so reads could otherwise precede the attach
 - ✅ (C6) anti-tamper/anti-debug: targets take a different path on detection (probed function called with -1); asserted per backend vs an uninstrumented baseline (`antitamper-*`, `antidebug-*`); per-backend visibility documented in examples/realworld/README.md (INT3/inline: code bytes vs disk; hw: DR7 only; debugger visible under every backend -- not hidden)
 - ⬜ (C7) Shared state across backends -- `UHH_SHARED` (user-approved 2026-11-05). Default stays "probes that share state use one backend". Opt-in: globals marked `UHH_SHARED` live in a shared PE section (`/SECTION:uhhshr,RWS`) of the callbacks DLL; the controller runs breakpoint/hw callbacks from ITS copy of that same DLL file and the target runs inline callbacks from its copy, so both see the same physical pages with plain native access. Per-session copy of the DLL (unique path) so separate sessions never share; deleted at close. Rules: no pointers in shared state (bases differ), constant/zero init only, lock-free atomics for sync. Only enabled when the DLL actually has the section (no behaviour change otherwise).
-  - ⬜ test: gated_config with MIXED backends (opens on breakpoint, reads on inline and vice versa) builds one handle->pid map; all reads attributed
+  - ✅ test: gated_config with MIXED backends builds one handle->pid map; all reads attributed -- `gated-e2e-*` (every flag/open/close/read backend assignment, launch + attach before/after the config parse, exact per-thread ground truth from the target; see "E2E gated_config evaluator findings"), plus `shared-mix-*`
   - ⬜ benchmark: per-hit cost with UHH_SHARED state vs plain globals, every backend -- must be equal
 - ⬜ Log sink speed (simple): UHH logs/s to NUL vs a plain writer's rate into a file; one manual console run. Bar: UHH is never the bottleneck.
 - ✗ (C10) helpers in probe_app: requested by the user; (C18) asm configparse: deliberate stable symbol+offset (add a PDB-local compiled variant later); (C19) _NT_SYMBOL_PATH is the requested symbol mechanism (tests may clear it)
@@ -1270,6 +1270,100 @@ INT3"); nothing shipped links it. `--only cxlib`.
   millions of parsed lines in Python memory). With the streaming reader, inline cycles took 1.0-2.9 s on
   x64 and 1.2-8.0 s on x86 (hw/breakpoint 0.9-3.3 s): 3/3 PASS per arch, 8 cycles each, rounds 2-5.
 
+## E2E gated_config evaluator findings (2026-11-06, regress `gated-e2e-*`)
+The flagship use case end to end against ground truth written by the TARGET itself.
+`probe_app --churn --truth FILE` opens its helpers, reads them and closes them over and over:
+first serially (a freed handle value is handed out again at once, for the next helper's pid),
+then 8 threads x 16 rounds at once. Opens alternate ntdll!NtOpenProcess (OpenThunk) and
+kernel32!OpenProcess, reads (1..256 bytes) alternate ReadThunk and kernel32!ReadProcessMemory,
+and every third cycle reads once through a DUPLICATE of the helper's CreateProcess handle
+(NtDuplicateObject: the open probe never sees it, and it nearly always gets the value just
+closed). Each operation is recorded by the thread that made it (tid, handle, pid, address,
+size, in order). Per run: 136 opens, 374 reads (46 through duplicates), 182 closes, handle
+values reused for different pids (4-34 per run), and 42-46 of the 46 duplicates on a value the map knew.
+`--parse-early` loads configparse.dll and parses the config once before the gate.
+The drivers gained per-role backends: `gated_config --close-backend`, and
+`uhh_attach --open/close/read-backend` with optional `--pid`/`--range`.
+- Matrix: every assignment of flag / open / close / read to {breakpoint, hw, inline} (81) x
+  {launch (gated_config); attach-pre (uhh_attach at the gate, configparse.dll not loaded: the flag
+  probe is pending); attach-post (configparse.dll loaded and parsed once before the attach: the
+  flag probe arms on a loaded module, the reload counts)} = 243 runs per arch, ~3.5 min x64 and
+  ~5 min x86. Asserted exactly in each run:
+  - one flag hit and one override;
+  - per target thread, the delivered `open`/`map`/`read` logs equal the target's own record in
+    order: the right pid for a reused handle, no unmapped read, and a duplicate-handle read logged
+    pid=0;
+  - read hits == read logs == truth reads, open hits == truth opens;
+  - logs_written == probe_log lines on stdout == records in the session file, and log_dropped ==
+    callbacks_interrupted == 0;
+  - no warning or refusal on stderr, the checksum equal to an uninstrumented run, exit 0.
+  **x64 244/244 PASS, x86 244/244 PASS** (243 combinations + baseline), twice per arch (the second time inside
+  `--only gated,attach,callorig,quickstart`: 322/322 on x64 and on x86).
+- No combination is refused. At most 4 probes are hw, and with all four on hw (fhw-ohw-chw-rhw),
+  call_original on the hw open borrows that probe's own debug register (session.cpp
+  call_original_in_place). The `close_backend_for` comment in callbacks.h said a 4th hw probe
+  would leave call_original without a register. That is outdated; the comment is corrected.
+  close_backend_for stays the default (a close is rare; bp costs nothing).
+- Sensitivity control: with `forget_closed_handle` disabled (a VM-only mutation, reverted), every
+  sampled combination FAILs: the duplicate-handle read is logged with the stale pid of the closed
+  handle (e.g. `want ('read', 0x140, 0, '?') got ('read', 0x140, 8564, 'probe_app.exe')`). So the
+  close probe is load-bearing and the evaluator sees it.
+- No library discrepancy found: the UHH_SHARED handle map is exact across every backend mix and
+  both attach timings, on both arches (C7's mixed-backend test item is closed by this).
+- Open: these are functional sizes. A long mixed-backend churn soak (`scripts/soak.py` has no
+  churn phase) and the UHH_SHARED per-hit benchmark (C7) are not done.
+## Codex review 2 findings (2026-11-06, code merged that day, regress `cx2-*`)
+A second read-only Codex review (merge-frida 6f0c533) reported 3 high-confidence bugs. Each was
+reproduced by a check that FAILED on the unfixed library (commit 85fd858 + the fixtures only),
+then fixed. Fixtures: `ctrl_target faultmix`, `co_target susp / many / manydead`. `--only cx2`.
+- ✅ (X1) **Real.** breakpoint (647130f): after a faulting probed instruction was passed to the program,
+  the thread's next INT3 at the site was always taken for the handler's RETRY -- also when the handler
+  had SKIPPED the instruction or UNWOUND out of it (SEH `__except`) and the next call executed the site
+  afresh: no callback, no hit (gospel: hits == logs, identical across backends). Reproduced:
+  `cx2-faultfresh-breakpoint` hits=101 logs=101 of 300 calls (retry / skip / unwind in turn), x64 and
+  x86; hw and inline 300/300. Fix (`fault_retried`): the exception's dispatcher frame, still on the
+  thread's stack below the faulting SP, decides. A retry is the first instruction after the handler's
+  CONTEXT was restored: that CONTEXT names the site and holds exactly the thread's registers (whatever
+  the handler repaired); after a skip it names another address, after an unwind it no longer matches
+  (x86: RtlUnwind marks the paired EXCEPTION_RECORD unwinding). The program never sees a trap flag
+  (ctrl-fault-*, cdx-faultreg-* unchanged). After: 300/300 on every backend, x64 and x86.
+  Residual: a hand-rolled x86 unwind (no RtlUnwind) whose next execution of the site has every
+  register identical and the stack below untouched is still taken for a retry.
+- ✅ (X2) **Real.** x86 controller (d7140db): GuardTouch listed a thread touched by a WOW64
+  Get/SetThreadContext (an implicit suspend inside the call) as an unconditional guard hold. A
+  controller killed while the entry was published but the implicit suspension was not in place
+  (before the call, or after it returned) made the guard resume a suspension the PROGRAM held.
+  Reproduced (test-hook build, `UHH_TEST_DIE_IN_TOUCH_MODE=before`): `cx2-touchprog-hw` the program's
+  ResumeThread returned 0 (want 1), its suspended worker ran 20-21 iterations. Fix: guard entries carry
+  a floor (`probe_agent_guard::held_floor`, protocol v21): GuardTouch records the thread's suspend
+  count before the call and the guard resumes it only while the count is above that (conditional
+  entries first, then our own holds once each). The count is NtQueryInformationThread
+  ThreadSuspendCount, which INCLUDES the debug freeze (+1 on every thread while the target is stopped
+  at an event; measured: a program-suspended thread read 2 inside an event, a running one 1 -- the
+  first version of this fix therefore left `cxlib-touchkill-hw` hung); the freeze is read off the
+  agent's service thread, which nobody suspends (`guard.service_tid`), and subtracted. Unknown
+  (no agent service thread, Windows < 8.1): an unconditional entry, as before. The check runs both
+  deaths -- before the implicit suspension and with it in place (on a program-suspended thread):
+  the guard must leave exactly the program's one suspension. After: PASS; `cxlib-touchkill-hw` PASS.
+  Open (same class, not changed): guard_sync's unconditional entries for the event threads and the
+  call_func/call_original thread (`handling`, `in_call_tid`) stay listed until the next sync, i.e.
+  past ContinueDebugEvent; a program that suspends such a thread right then and a controller death
+  before the next event would release it.
+- ✅ (X3) **Real.** inline agent: the thread table held 4096 thread ids and never freed a slot, so
+  after 4096 distinct probe-hitting threads over the process's life every further thread ran its
+  callbacks untracked (no active record): the detach drain counted 0 live callbacks, gave up after
+  three answers and the callback's log was lost (in_flight=1); such threads also had no recursion
+  guard (call_func refused). Reproduced: `cx2-manythreads-inline` / `cx2-manydead-inline` (4200 threads
+  alive at once, one hit each, then a callback outliving a detach, while they live / after they
+  exited): late log delivered=0, in_flight=1, x64 and x86. Fix: a full table takes over a dead
+  thread's slot (marked moving while the owner is re-checked, one sweeper at a time, its own hits
+  pass through); with more than 4096 such threads alive an overflow table (256) holds the rest; a
+  thread with no slot at all is counted live by the drain (`g_untracked_running`). After: PASS both.
+- Verification (e4efa5d): `--only cx2` 2 x 5/5 + 1 SKIP on x64, 2 x 6/6 on x86; `--only ctrl,cdx,cxlib,
+  lifecycle,detach,callorig` 138/138 on x86, 136/137 + 1 SKIP on x64 -- `cxlib-killarm-hw` once:
+  "controller-death guard unavailable (agent not ready within 5 s)" under VM load, so the hw probe was
+  armed without the guard; `--only cxlib` 3 x 9/9 on reruns.
+
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`
 - ✅ Per-log overhead ceilings in the suite (`log-throughput-*`)
@@ -1291,6 +1385,7 @@ INT3"); nothing shipped links it. `--only cxlib`.
 ## Production readiness (user decisions 2026-11-05)
 - 🔧 [fan-out] Intel CET shadow stacks (user-mode "Hardware-enforced Stack Protection", /CETCOMPAT): static audit done, every path that broke the shadow stack fixed or refused; **inline backend measured clean under Intel SDE's CET emulation (x64, 2026-11-06, below); the breakpoint/hw CET branches and the OS-level policies still need real CET hardware** (the test VM has no CET -- see below)
   - **The VM cannot test it:** its CPU is an Intel Core i5-6600 (Skylake, 2015 -- CET shipped with Tiger Lake / Zen 3), so `cet_probe` reports CPUID CET_SS=0, IBT=0, no OS CET_U state, RDSSP=0 and `EnableUserShadowStack=0` for a /CETCOMPAT process (Windows 10 19045, x64 and x86, under Proxmox/KVM). A newer host would also need a hypervisor that passes CET to the guest (KVM CET virtualization is recent). So every `cet-*` row on the VM proves only that /CETCOMPAT targets work under all backends, NOT that UHH survives an enforced shadow stack.
+  - **Real CET hardware: GitHub-hosted `windows-2025` runners (2026-11-06, CI job `cet-hw` on every push).** AMD EPYC 7763 / 9V45 under Hyper-V, Windows Server 2025 build 26100: `cet_probe` reports `cpuid_cet_ss=1, os_cet_u=1, ssp!=0, enforced=true`, policy `EnableUserShadowStack=1, SetContextIpValidation=1` (strict mode 0, BlockNonCetBinaries 0) for a /CETCOMPAT process (windows-2022 runners: Xeon 8573C, no CET in the guest). With shadow stacks ENFORCED: `cet-gated-breakpoint`, `cet-gated-inline`, `cet-gated-hw` PASS (`cet_enforced=True target_ssp=True`, hits 4000/4000, logs exact, checksum = uninstrumented; breakpoint sites displaced-stepped), `cet-ret-breakpoint` PASS (4/4, the in-place CALL/RET branch keyed on `EnableUserShadowStack` finally ran), the whole `cet-sde-*` set PASS (SDE 9.48 still hosts targets there), and the rest of the x64 suite on that image shows no CET-related failure (run 42182687993; probe_app_cet/cet_probe are the only /CETCOMPAT targets, so only the `cet-*` rows run under a shadow stack). So: the breakpoint/hw CET branches work on real hardware, and a debugger's cross-process SetThreadContext into displaced-step scratch memory is NOT refused under `SetContextIpValidation=1` in compatibility mode. Still open: strict mode, `BlockNonCetBinaries` vs the non-CETCOMPAT agent, and the breakpoint/hw `call_func` refusal row (no check exercises it yet) -- all runnable on that image (`workflow_dispatch image=windows-2025`).
   - **Measured under Intel SDE's CET emulation (`check_cet_sde`, rows `cet-sde-*`; SDE in `C:\tools\sde`, skipped when absent):**
     - Kit: **SDE 9.48.0 (2024-11-25) is the last Windows kit with the CET checker**: 9.53+ (9.58.0, 10.13.1 tried) print `SDE ERROR: CET is not supported on Windows` and the checker strings are gone from their `sde-mix-mt.dll`. Knobs: `-tgl -cet -cet_stderr -cet_call_stack -no-follow-child` (`-cet_abort` stops at the first report, `-cet_raise` kills the target with 0xC000008C). SDE prints one `Control flow error: IP: <ret> expected (shadow stack): A got (actual return address): B` per mismatching `ret`; the labels are swapped in 9.48 (A is the ordinary-stack address, B the shadow-stack entry -- proven by cet_smash's known addresses).
     - Positive control (`examples/cet/cet_smash.c`, /CETCOMPAT): `cet_smash smash` overwrites a return address with another valid one -- natively it just "lands" (exit 3); under SDE the first report is exactly that `ret` with the two addresses (`cet-sde-control-smash`), a clean run gives none (`cet-sde-control-clean`). `cet_smash calls N --wait --smash` is the witness workload: RDSSP after every iteration (`ssp_live`: non-zero only while the thread runs inside SDE) and the deliberate smash again at the end, so a run proves the checker was on to the last instruction.
@@ -1316,10 +1411,134 @@ INT3"); nothing shipped links it. `--only cxlib`.
 - ⬜ [fan-out, Codex] Docs: quickstart, API reference, per-backend limitations table, troubleshooting
 - 🔧 Inline cap raised to 128 per session (user: 128 is enough; error beyond) -- compile-time thunk table, per-request FREEZE flag; refusal test uses the 129th -- VM verify pending
 - ⏸ Follow child processes: design written -- [docs/child-processes.md](child-processes.md) (strategies with VM measurements from `bench/child_follow`, API options A-D, recommendation: ProcessDebugFlags inheritance + `probe_follow_children` + `get_pid`); **deferred by the owner (2026-11-06)**: a session follows one process; a child it starts runs unprobed -- attach to it with its own session. Processes the target did not create are unaffected either way (attach separately)
-- ⬜ (maybe) CI on GitHub Actions; (maybe) CMake package + versioned release zip
+- ✅ CI on GitHub Actions: the full suite sharded on hosted windows-2022 runners, x64 + x86, ~19 min, plus enforced-CET checks on windows-2025 (`.github/workflows/windows.yml`, `scripts/ci_shards.py`) -- see "CI on GitHub Actions" below (runner findings open there); ⬜ (maybe) CMake package + versioned release zip
 - 🔧 (very last) Soak test: hours under load; handles/memory/threads flat -- `scripts/soak.py` (phases mixed / hw / breakpoint / attach-detach cycles, per-minute samples to CSV, exactness + checksum + growth verdict), opt-in `regress.py --soak-minutes N`; probe_app `--pace`. x64 mixed 30 min PASS (57.6M reads, all logged, controller/target flat); 1-min calibration of every phase PASS. **The VM froze twice during the 30-min all-hw phase** (at ~18 and ~22 min, ~12k hw hits/s; guest RAM exhausted while UHH's own processes stayed at ~2.5 MB private) -- suspected kernel-side memory growth per debug event / DR context switch (host logs a burst of `Unhandled WRMSR(0x1d9)` DEBUGCTL from the guest during hw runs). soak.py now samples available RAM, kernel paged/nonpaged pool and system handles and aborts below 1.5 GB. Next: a 3-minute hw run with 15 s samples to measure pool growth per hit before any long hw soak
 - ✅ Controller-crash self-unhook -- originally ✗ (user: the analyst sees the controller died and restarts the target; not worth the cost); superseded for ATTACHED targets by Lifecycle L1 (the agent's controller-death guard undoes INT3s/DRs/holds and removes inline hooks, so the target survives). A launched target still ends with its controller
 - ✗ Named-object hardening (user: unlikely; a clash fails loudly)
+
+## CI on GitHub Actions (2026-11-06, `.github/workflows/windows.yml`, `scripts/ci_shards.py`)
+More Windows test capacity than the one VM: the repo is public, so GitHub-hosted runners are free (~20 concurrent
+jobs). The full suite, both arches, takes ~18 min wall on them (VM: ~36 min x64 + ~58 min x86, serial).
+They are NOT the VM: `windows-2022` = Windows Server 2022 (build 20348), 4 vCPU (2 cores) / 16 GB, Intel Xeon
+Platinum 8573C under Hyper-V (no CET in the guest), Defender real-time protection off; `windows-2025` = Server 2025
+(build 26100), AMD EPYC (7763 / 9V45), Visual Studio 2026 only (no VS 2022), **user-mode CET shadow stacks ENFORCED**.
+- **Triggers:** every push to any branch (pushes touching only `*.md` / `measurements/` are skipped, except
+  `docs/quickstart.md`), every pull request, and `workflow_dispatch` (Actions tab -> windows-regress -> Run workflow,
+  or `gh workflow run`) with inputs `only` (regress.py `--only` selectors, comma-separated; empty = full suite),
+  `arches` (`x64,x86` / `x64` / `x86`), `shards` (per arch; 0 = 7 x64 / 9 x86) and `image` (`windows-2022` default,
+  `windows-2025` = the whole selection under enforced CET). A newer push to the same branch cancels the older run.
+- **Jobs:** `plan` (ubuntu) packs the suite's check units into balanced shards from measured runtimes;
+  `build (x64|x86)` configures + builds Release (~2 min; no cache needed), posts runner facts, toolchain and
+  `cet_probe`, uploads `bin-<arch>`; `test <arch>-<NN>` downloads it and runs `ci_shards.py run`: ONE
+  `regress.py --only <unit>` per unit, timed, the whole output teed to `ci-logs/<arch>-<NN>.log` (+ `.json`), uploaded
+  as artifact `logs-<arch>-<NN>`; the job fails on any FAIL / non-zero exit / unit timeout (45 min) except the
+  documented by-design failures in `KNOWN` (hunt-ctx/starve/early/owndr, patch-race-unsafe: posted as warnings).
+  `cet-hw` (windows-2025, x64, on every push) builds, posts `cet_probe` and runs `check_cet,check_conformance` under
+  enforced CET, posting every `cet-*`/`conformance*` row. `summary` tabulates shard x arch (+ cet-hw) and the
+  measured unit times (artifact `unit-times`, feeds `EST` in ci_shards.py).
+- **Units:** `--only` matches substrings of check function names, so a unit is a check name that contains no other
+  one, plus every check containing it (`check_attach` = attach + attach_new, `check_cet` = cet + cet_sde,
+  `check_realworld`, `check_symbols`, `check_callorig`). `ci_shards.py units` lists them; the units are re-parsed from
+  regress.py main() on every run and must partition it exactly, so a new check is picked up automatically (60 s
+  estimate + a warning annotation until `EST` is refreshed). Opt-in tiers (`--volume-reads`, `--bigapps`,
+  `--soak-minutes`) are not run. Critical path: x86 `check_realapps` (~15 min, one unit).
+- **External deps:** every check runs explicitly selected, so `skip_external()` is a FAIL in CI where a full
+  unselected run would SKIP. The shards that need them install Frida 16.5.9 into `C:\work\fv16` (regress
+  `FRIDA_PY`) and Intel SDE 9.48 into `C:\tools\sde` (Intel's mirror, sha256-pinned, cached). A system program missing
+  on the image therefore shows as a FAIL.
+- **Reading results without a token** (public REST, 60 requests/h unauthenticated): runs
+  `GET /repos/talivision/uhh/actions/runs?branch=<b>`, jobs `GET .../actions/runs/<id>/jobs` (with per-step
+  conclusions), annotations `GET .../check-runs/<job id>/annotations`. Every test job posts a notice
+  (`<shard> PASS|FAIL N/M ok ... <secs>s` + per-unit times), an error annotation with all its `] FAIL` lines, a
+  warning with its known failures; `summary` posts the whole table (chunked, ~3.5 KB per annotation); `build` posts
+  runner facts, toolchain and the `cet_probe` JSON. Orchestrator helper:
+  `~/work/uhh-tools/fan/work/ci/gh.py runs <branch> | jobs <run> | notes <run> [job-name regex]` (2-12 calls per run).
+  Logs, artifacts and dispatch need auth: `~/work/tools/gh/bin/gh auth login` once, then
+  `gh run list -R talivision/uhh -b <branch>`, `gh run view <id> -R talivision/uhh --log-failed`,
+  `gh run download <id> -R talivision/uhh -p 'logs-*'`,
+  `gh workflow run windows.yml -R talivision/uhh --ref <branch> -f only=lifecycle,hunt -f arches=x64 [-f image=windows-2025]`.
+  Without auth: push the branch to the own repo (every push runs the full suite).
+
+### CI results (2026-11-06)
+Final run on `ci` (run 42187807241, commit 7b495fd, windows-2022 + cet-hw on windows-2025): **1333/1349 ok,
+16 failed = 7 known by-design + 9 runner findings below**; ~19 min wall (build ~2 min, then the x86 realapps shard).
+Shards are re-packed from `EST` (unit lists in each job's step summary).
+
+| shard | x64 result | x64 s | x64 cpu | x86 result | x86 s | x86 cpu |
+|---|---|---|---|---|---|---|
+| 01 (realapps) | PASS 24/24 | 562 | EPYC 7763 | FAIL 19/22: realapps-ps-fileversion-{bp,hw,inline} (env) | 897 | EPYC 7763 |
+| 02 (lifecycle / hunt) | PASS 48/48 | 371 | EPYC 9V74 | PASS 46/48 (2 known hunt) | 402 | EPYC 9V74 |
+| 03 (cet+sde / lifecycle) | PASS 118/118 | 311 | EPYC 7763 | PASS 48/48 | 379 | EPYC 7763 |
+| 04 | PASS 101/101 | 276 | Xeon 8573C | PASS 71/71 | 240 | EPYC 7763 |
+| 05 | FAIL 158/160: patch-race-frozen (env), patch-race-unsafe (known) | 270 | EPYC 9V74 | FAIL 81/82: stream-latency-breakpoint (flaky) | 262 | Xeon 8573C |
+| 06 | PASS 122/125 (3 known hunt) | 293 | EPYC 7763 | PASS 58/58 | 207 | EPYC 9V74 |
+| 07 | FAIL 95/97: ntdll-churn-{hw,breakpoint} (zero-hit cycles) | 343 | Xeon 8370C | FAIL 110/112: patch-race-frozen (env), patch-race-unsafe (known) | 244 | EPYC 7763 |
+| 08 | -- | | | PASS 92/92 | 262 | EPYC 7763 |
+| 09 | -- | | | FAIL 114/115: crash-logs-inline-4t | 258 | EPYC 7763 |
+| cet-hw (windows-2025) | PASS 28/28 (+2 SKIP: cet-sde-breakpoint/hw) | 242 | AMD EPYC | -- | | |
+
+Earlier runs on `ci`: 42180029465 (windows-2022, first full run: 1307/1321), 42182687993 (`image=windows-2025`, the
+whole suite under enforced CET: 1296/1315; x64 `cet-*` all PASS), 42185253728 (windows-2022: 1314/1349, incl. the
+18 transparency rows below), and a one-off diagnostic workflow (repeats + patch-race timing, removed again).
+
+### Runner findings (2026-11-06; each analysed: environment vs real bug)
+CET hardware (answers the CET question): `cet_probe` on windows-2025 (AMD EPYC 7763 and 9V45, Hyper-V, build 26100):
+`cpuid_cet_ss=1, os_cet_u=1, ssp!=0, enforced=true`, policy `EnableUserShadowStack=1, SetContextIpValidation=1`
+(strict mode 0, BlockNonCetBinaries 0) for a /CETCOMPAT process. windows-2022 (Xeon Platinum 8573C, which has CET)
+exposes no CET to the guest (`cpuid_cet_ss=0, enforced=false`). On windows-2025 the `cet-hw` job passes
+`cet-gated-{breakpoint,inline,hw}` and `cet-ret-breakpoint` with `cet_enforced=True target_ssp=True` (details in
+the CET item under "Production readiness").
+
+Real-bug candidates (reproduce on runners, not on the VM so far):
+- **crash-logs-inline-4t (both images; x86 8/8 runs, x64 6/8; never on the VM)**: `logs = hits - 1..3` when the
+  target dies (0xC0000005) with 4 inline threads logging. The missing logs are of threads that were counted as a hit
+  but killed by the process death before their callback's `send_log` ran (the gap is always <= threads-1, never on
+  breakpoint/hw, where the callback runs in the controller). So nothing in the ring is lost; the inline hit counter
+  counts a callback that never completed. Owner decision: count inline hits after the callback (or report
+  `callbacks_interrupted`) vs relax the check to `hits - logs <= threads - 1`.
+- **lifecycle-controller-killed-{mixed x64 (full run), inline x86 (diag 1 of 4)}**: kill@early-0.05 -> target DEAD
+  0xC0000005, not progressing. The L11 race (controller killed during install) with a new signature (access violation,
+  inline/mixed configs). 2 of ~7 runs on windows-2022; 0 on windows-2025.
+- **ret-probe-breakpoint (x64 + x86, 1 of 9 each)**: hits=5 for 4 NtOpenProcess calls (hw: never). Either the
+  breakpoint backend double-reports a `ret` (the hunt-ctx A4 class) or a sporadic 5th NtOpenProcess by a system
+  component in that run; needs the per-hit log (caller/tid) to decide.
+- **x86 transparency-{breakpoint,hw}-callfn on windows-2025 (build 26100)**: `call_func GetThreadPriority` /
+  `TlsGetValue` fail in the callback, the hw run's target dies 0xC0000005. Not CET (WoW64 is not enforced); a
+  breakpoint/hw `call_func` problem on WoW64 of the newer Windows build. Needs a Windows 11 24H2 / Server 2025 VM.
+- **x86 detach-inline on windows-2025**: detach reports `1 thread(s) frozen; <tid>:dr7=0:setfail` (clearing DR7 on
+  one thread failed) although every count is exact; the check fails on the setfail. WoW64 SetThreadContext on build
+  26100 (or a thread exiting at that instant).
+- **attach-new-inline x64 windows-2025 (1 run)**: "probe never became active" -- the load flake also seen once on
+  the VM (Lifecycle section).
+
+- **transparency-* (x64, all 18 rows, once in 5 runs; run 42185253728 shard x64-04, CPU not yet recorded then)**: the
+  `ovf` case (a callback that overflows its stack, TR9) was not survived: breakpoint/hw controllers died 0xC00000FD /
+  0xC0000005 (callbacks run there), inline targets died with the stack trace recursing in
+  `probe_api_agent.dll+0x13339`, and every later case of the same run had no target row. The same shard passed on a
+  Xeon 8573C in the next run. Candidate: TR9's stack-overflow recovery depends on the host (exception-dispatch stack
+  needs grow with the XSAVE area: AVX-512 / AMX hosts); the CPU column now recorded per shard will tell.
+- **ntdll-churn-{hw,breakpoint} (x64, 2 of 5 runs, Xeon 8370C in the last)**: some of the 8 attach/detach cycles see
+  0 hits (`cycle2: rc=0 detached=True backend=hw hits=0 ... err=probe...`, text cut in the annotation) while the
+  target's reads stay exact. New check (b65175d); needs the full log (gh auth) to see the error.
+- Seen once each, undetermined: x86 `logs-wedge-suspend` (`wedged=0`), x64 `detach-inline` (`1 thread(s) frozen;
+  all clean` yet FAIL, detail cut).
+
+Environment (runner) effects, not UHH bugs:
+- **patch-race-frozen (x64 + x86, deterministic)**: hook_cycles=[1,1,1,1], need >= 4 in the target's 12 s. Measured
+  (diag): one attach -> install -> 400 ms -> detach cycle against 8 spinning threads takes 6-8.5 s on the 2-core
+  runner (13 threads frozen, all clean, 20-78 M hits per cycle), so only one cycle fits; never crashed or torn. The
+  check's time budget assumes 4 real cores. (Also a perf note: attach/detach under full CPU saturation is slow.)
+- **stream-latency-{inline,hw} (x64, 3 of 15 diag rows)**: p99 192-387 ms > the 100 ms ceiling on a noisy
+  4-vCPU runner; and once stream-latency-breakpoint failed with p99=3.3 ms on the per-line ordering condition (a log
+  line read before its tick line). Timing ceilings; flaky on runners.
+- **realapps-ps-fileversion-* x86 (deterministic)**: the plain 32-bit `Get-Process -FileVersionInfo` lists only
+  itself and exits 1 on a runner -- no other WoW64 process exists there (the VM has some), so `stable_rows=0` fails.
+  The scenario's assumption, not UHH (all reads mapped, nothing dropped).
+- windows-2025 only: `realapps-wmic` (WMIC removed from Server 2025), `oldcrt` (VS 2026's LLVM ships no pre-14.40
+  msvcp140) -- absent deps, FAIL because explicitly selected; `realapps-ps-modules-breakpoint` once: an svchost loaded
+  fwpuclnt.dll between the plain and the instrumented run (a live process list).
+- Passing on runners where the VM was suspect: x86 `hunt-ctx-breakpoint` (no 600 s timeout), x86
+  `edgehunt-*-fmtptr` (B10), x64 `blog-pwsh-attach-detach-inline`, x86 `hunt-exit-*`.
 
 ## Later
 - ✅ x86 cumulative-session flakiness (possibly the same handle double-close; recheck) -- CLOSED with evidence (cfnest). The note dates from the first checkpoint (c617de4); its suspected cause, review finding I6 (handles closed twice on the launch failure path), was fixed long since. Rechecked with `ar_driver --repeat`: 60 sessions in ONE controller process, backends in turn (breakpoint, hw, inline), each a call_func + runtime data watch whose callback call_funcs during another thread's call: every session exact, nothing dropped, the controller's handle count flat (x64 73 -> 73, x86 89 -> 89). Regress `sessions-repeat` keeps it covered (also exercises the per-run callback-fiber host).

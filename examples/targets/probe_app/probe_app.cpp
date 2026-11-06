@@ -30,11 +30,30 @@
 // Read pattern (deterministic, so a filter on one pid + one address range selects an
 // exactly predictable count): global read i = t*R + k (thread t, its k-th read) reads
 // 16 bytes from helper (i % N) at base + 64 * ((i / N) % 4).
+//
+// --churn (with --truth FILE): the end-to-end ground-truth workload (regress gated-e2e-*).
+// Instead of long-lived handles, the helpers are opened, read and closed over and over --
+// handle VALUES are reused for different pids -- first serially, then from W threads at
+// once (R rounds each): open (alternately ntdll!NtOpenProcess through OpenThunk and
+// kernel32!OpenProcess), 1-4 reads of varying sizes (1..256 bytes; alternately ReadThunk
+// and kernel32!ReadProcessMemory: both end in ntdll!NtReadVirtualMemory), CloseHandle
+// (ntdll!NtClose). Every operation is recorded by the thread that made it (tid, handle, pid,
+// address, size; a global sequence number: an open after it returned, a close before it
+// starts) and written to FILE as JSON lines in sequence order at the end. Every third cycle
+// also reads once through a DUPLICATE of the helper's process handle (op "dup", then
+// "read-unmapped"): a handle the open probe never saw, usually with the value just closed. The schedule and
+// the checksum (sum of every byte read) are deterministic, so an uninstrumented run gives
+// the same checksum.
+// --parse-early: load configparse.dll and parse the config once BEFORE the gate too (its
+// result is printed as {"kind":"parsed","phase":"early",...} and otherwise ignored), and
+// again after it: a tool that attaches at the gate finds configparse.dll already loaded and
+// already parsed once, and only the second parse decides the feature.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <immintrin.h>
 #include <tlhelp32.h>
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -219,6 +238,119 @@ static void read_worker(std::vector<Helper> &helpers, uint64_t t, uint64_t reads
     }
 }
 
+// --- Churn (--churn): open / read / close over and over, with the target's own record ---
+struct TruthRec { uint64_t seq; char op; DWORD tid; uint64_t handle; DWORD pid; uint64_t addr; unsigned size; };
+static std::atomic<uint64_t> g_seq{0};
+constexpr unsigned kChurnSizes[] = {1, 3, 8, 16, 17, 64, 100, 128, 200, 255, 256};
+constexpr unsigned kChurnSizeCount = sizeof(kChurnSizes) / sizeof(kChurnSizes[0]);
+
+struct ChurnResult { uint64_t reads = 0, opens = 0, checksum = 0; std::vector<TruthRec> log; std::string error; };
+
+static HANDLE churn_open(const Helper &h, bool via_kernel32, ChurnResult &r) {
+    HANDLE out{};
+    if (via_kernel32) out = OpenProcess(PROCESS_VM_READ, FALSE, h.hello.pid);
+    else {
+        ObjectAttributes oa{sizeof(oa)};
+        ClientId cid{(HANDLE)(uintptr_t)h.hello.pid, nullptr};
+        if (OpenThunk(&out, PROCESS_VM_READ, &oa, &cid) < 0) out = nullptr;
+    }
+    if (!out) { r.error = "open of helper " + std::to_string(h.hello.pid) + " failed"; return nullptr; }
+    r.log.push_back({g_seq.fetch_add(1), 'O', GetCurrentThreadId(), (uint64_t)(uintptr_t)out, h.hello.pid, 0, 0});
+    ++r.opens;
+    return out;
+}
+
+static void churn_close(HANDLE handle, const Helper &h, ChurnResult &r) {
+    // Recorded BEFORE the close: once it returns, another thread's open may get this value.
+    r.log.push_back({g_seq.fetch_add(1), 'C', GetCurrentThreadId(), (uint64_t)(uintptr_t)handle, h.hello.pid, 0, 0});
+    if (!CloseHandle(handle) && r.error.empty()) r.error = "close failed";
+}
+
+static bool churn_read(const Helper &h, HANDLE handle, unsigned size, unsigned off, bool via_kernel32, ChurnResult &r) {
+    unsigned char buffer[kBufferSize]{}; SIZE_T got = 0;
+    const uint64_t addr = h.hello.address + off;
+    LONG status = via_kernel32 ? (ReadProcessMemory(handle, (const void *)(uintptr_t)addr, buffer, size, &got) ? 0 : -1)
+                               : ReadThunk(handle, (const void *)(uintptr_t)addr, buffer, size, &got);
+    bool ok = status >= 0 && got == size;
+    for (unsigned j = 0; ok && j < size; ++j) ok = buffer[j] == (unsigned char)(off + j);
+    if (!ok) { r.error = "churn read of " + std::to_string(size) + " at +" + std::to_string(off) + " failed"; return false; }
+    for (unsigned j = 0; j < size; ++j) r.checksum += buffer[j];
+    r.log.push_back({g_seq.fetch_add(1), 'R', GetCurrentThreadId(), (uint64_t)(uintptr_t)handle, h.hello.pid, addr, size});
+    ++r.reads;
+    return true;
+}
+
+// One open -> reads -> close cycle of helper `h`; the schedule depends only on (t, round).
+static bool churn_cycle(const Helper &h, uint64_t t, uint64_t round, ChurnResult &r) {
+    HANDLE handle = churn_open(h, ((t + round) & 1) != 0, r);
+    if (!handle) return false;
+    const unsigned nreads = 1 + (unsigned)((t * 5 + round * 3) % 4);
+    bool ok = true;
+    for (unsigned k = 0; ok && k < nreads; ++k) {
+        const unsigned size = kChurnSizes[(t * 7 + round * 5 + k * 3) % kChurnSizeCount];
+        const unsigned off = (unsigned)(((t * 29 + round * 13 + k * 7) * 37) % (kBufferSize - size + 1));
+        ok = churn_read(h, handle, size, off, ((k + round) & 1) != 0, r);
+    }
+    churn_close(handle, h, r);
+    // Every third cycle: a handle the open probe never sees -- a duplicate of the helper's
+    // CreateProcess handle (ntdll!NtDuplicateObject, not NtOpenProcess) -- usually gets the
+    // value just closed, which the map knew for some pid. One read through it must be logged
+    // as UNMAPPED (pid 0): only the close probe forgetting the old value makes that so.
+    if (ok && (t + round) % 3 == 0) {
+        HANDLE dup{};
+        if (!DuplicateHandle(GetCurrentProcess(), h.pi.hProcess, GetCurrentProcess(), &dup, PROCESS_VM_READ, FALSE, 0) || !dup) {
+            r.error = "duplicate of a helper handle failed"; return false;
+        }
+        r.log.push_back({g_seq.fetch_add(1), 'D', GetCurrentThreadId(), (uint64_t)(uintptr_t)dup, h.hello.pid, 0, 0});
+        const unsigned size = kChurnSizes[(t + round) % kChurnSizeCount];
+        ok = churn_read(h, dup, size, (unsigned)((t * 11 + round) % (kBufferSize - size + 1)), (round & 1) != 0, r);
+        if (ok) r.log.back().op = 'U';                       // a read through an unmapped handle
+        churn_close(dup, h, r);
+    }
+    return ok && r.error.empty();
+}
+
+// Serial phase (this thread: open/read/close each helper twice -- a freed handle value is
+// handed out again at once, so it is reused for the next helper's pid), then W threads x
+// R rounds at once. Returns the merged result; the truth file is written in seq order.
+static ChurnResult run_churn(std::vector<Helper> &helpers, size_t threads, uint64_t rounds, const std::string &truth) {
+    const uint64_t n = helpers.size();
+    ChurnResult serial;
+    for (uint64_t k = 0; k < 2 * n && serial.error.empty(); ++k)
+        churn_cycle(helpers[(size_t)(k % n)], 1000 + k, k, serial);
+    std::vector<ChurnResult> results(threads);
+    if (serial.error.empty()) {
+        std::atomic<size_t> ready{0}; std::atomic<bool> go{false};
+        std::vector<std::thread> pool;
+        for (size_t t = 0; t < threads; ++t) pool.emplace_back([&, t] {
+            ready.fetch_add(1); while (!go.load(std::memory_order_acquire)) YieldProcessor();
+            for (uint64_t round = 0; round < rounds; ++round)
+                if (!churn_cycle(helpers[(size_t)((t * 3 + round) % n)], t, round, results[t])) break;
+        });
+        while (ready.load() != threads) YieldProcessor();
+        go.store(true, std::memory_order_release);
+        for (auto &th : pool) th.join();
+    }
+    ChurnResult all = std::move(serial);
+    for (auto &r : results) {
+        if (all.error.empty() && !r.error.empty()) all.error = r.error;
+        all.reads += r.reads; all.opens += r.opens; all.checksum += r.checksum;
+        all.log.insert(all.log.end(), r.log.begin(), r.log.end());
+    }
+    std::sort(all.log.begin(), all.log.end(), [](const TruthRec &a, const TruthRec &b) { return a.seq < b.seq; });
+    if (FILE *f = std::fopen(truth.c_str(), "wb")) {
+        for (const auto &e : all.log)
+            std::fprintf(f, "{\"seq\":%llu,\"op\":\"%s\",\"tid\":%lu,\"handle\":%llu,\"pid\":%lu,\"addr\":%llu,\"size\":%u}\n",
+                         (unsigned long long)e.seq, e.op == 'O' ? "open" : e.op == 'R' ? "read" : e.op == 'U' ? "read-unmapped" : e.op == 'D' ? "dup" : "close",
+                         (unsigned long)e.tid, (unsigned long long)e.handle, (unsigned long)e.pid,
+                         (unsigned long long)e.addr, e.size);
+        std::fclose(f);
+    } else if (all.error.empty()) {
+        all.error = "cannot write " + truth;
+    }
+    return all;
+}
+
 // W threads released together; returns the elapsed time of the read phase.
 static double run_reads(std::vector<Helper> &helpers, size_t threads, uint64_t reads,
                         std::vector<ThreadResult> &results) {
@@ -266,7 +398,8 @@ int main(int argc, char **argv) try {
     size_t helper_count = 4, threads = std::thread::hardware_concurrency();
     uint64_t reads = 1000;
     uint64_t decoy_opens = 0;
-    bool existing_hook = false, wait = true, until_key = false;
+    bool existing_hook = false, wait = true, until_key = false, churn = false, parse_early = false;
+    std::string truth;
     std::string config = "reads_enabled=0\n";   // shipped config: the feature is OFF
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -281,11 +414,15 @@ int main(int argc, char **argv) try {
         else if (a == "--until-key") until_key = true;
         else if (a == "--decoy-opens") decoy_opens = _strtoui64(next(), nullptr, 10);
         else if (a == "--open-via") g_open_kernel32 = std::string(next()) == "kernel32";
+        else if (a == "--churn") churn = true;
+        else if (a == "--truth") truth = next();
+        else if (a == "--parse-early") parse_early = true;
         else throw std::runtime_error("usage: probe_app [--helpers N] [--threads W] [--reads R] [--pace P] [--prehook] "
-                                      "[--config k=v;...] [--no-wait] [--until-key] [--decoy-opens N]");
+                                      "[--config k=v;...] [--no-wait] [--until-key] [--decoy-opens N] [--churn --truth FILE] [--parse-early]");
     }
     require(helper_count >= 1 && helper_count <= 64 && threads >= 1 && threads <= 256 &&
             reads >= 1 && reads <= 1000000000ULL, "helper/thread/read counts");
+    require(!churn || !truth.empty(), "--churn needs --truth FILE");
 
     g_ntread = (NtRead)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtReadVirtualMemory");
     g_ntopen = (NtOpen)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtOpenProcess");
@@ -305,6 +442,17 @@ int main(int argc, char **argv) try {
                     (unsigned long long)helpers[k].hello.address, kBufferSize);
     }
 
+    // 1b. --parse-early: the config library is loaded and the config parsed once before the
+    //     gate (a tool attaching at the gate finds both done); only the parse after it counts.
+    if (parse_early) {
+        HMODULE early = LoadLibraryA((exe_directory() + "configparse.dll").c_str());
+        require(early != nullptr, "load configparse.dll (early)");
+        auto parse = (parse_config_fn)GetProcAddress(early, "ParseConfig"); require(parse != nullptr, "ParseConfig");
+        parsed_config first{};
+        require(parse(config.c_str(), &first) == 1, "config parse (early)");
+        std::printf("{\"kind\":\"parsed\",\"phase\":\"early\",\"reads_enabled\":%u}\n", first.reads_enabled);
+    }
+
     // 2. Gate.
     std::printf("{\"kind\":\"waiting\",\"pid\":%lu,\"helpers\":%llu}\n", GetCurrentProcessId(),
                 (unsigned long long)helper_count);
@@ -312,7 +460,7 @@ int main(int argc, char **argv) try {
     if (wait) require(wait_for_key(), "keystroke");
 
     // 3. Late-load the config library and parse the shipped config.
-    require(GetModuleHandleA("configparse.dll") == nullptr, "configparse.dll loaded before the gate");
+    require(parse_early || GetModuleHandleA("configparse.dll") == nullptr, "configparse.dll loaded before the gate");
     HMODULE dll = LoadLibraryA((exe_directory() + "configparse.dll").c_str());
     require(dll != nullptr, "load configparse.dll");
     auto parse = (parse_config_fn)GetProcAddress(dll, "ParseConfig"); require(parse != nullptr, "ParseConfig");
@@ -323,7 +471,12 @@ int main(int argc, char **argv) try {
     std::vector<ThreadResult> results;
     double elapsed_ns = 0;
     uint64_t success = 0, checksum = 0, rounds = 0;
-    if (parsed.reads_enabled) {
+    ChurnResult churned;
+    if (parsed.reads_enabled && churn) {
+        churned = run_churn(helpers, threads, reads, truth);
+        require(churned.error.empty(), churned.error);
+        success = churned.reads; checksum = churned.checksum; rounds = 1;
+    } else if (parsed.reads_enabled) {
         // --decoy-opens: open (and close) ourselves N times first through the same stub, so
         // an open-tracking map sees many opens -- and reused handle values -- before the
         // helpers are opened. None of these handles is ever read.
@@ -360,7 +513,7 @@ int main(int argc, char **argv) try {
                 "\"reads_per_thread\":%llu,\"successful_reads\":%llu,\"checksum\":%llu,\"elapsed_ns\":%.0f,"
                 "\"prehook\":%s,\"prehook_calls\":%llu,\"configparse_base\":%llu,\"shadow_stack\":%s,\"rounds\":%llu}\n",
                 parsed.reads_enabled, (unsigned long long)helper_count,
-                (unsigned long long)(parsed.reads_enabled ? helper_count : 0), (unsigned long long)threads,
+                (unsigned long long)(!parsed.reads_enabled ? 0 : churn ? churned.opens : helper_count), (unsigned long long)threads,
                 (unsigned long long)reads, (unsigned long long)success, (unsigned long long)checksum, elapsed_ns,
                 existing_hook ? "true" : "false", (unsigned long long)hook_calls,
                 (unsigned long long)(uintptr_t)dll, ssp ? "true" : "false", (unsigned long long)rounds);

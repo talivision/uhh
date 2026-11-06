@@ -50,6 +50,9 @@ Checks:
   - logs-*: adversarial log delivery (examples/logs_eval): exact text for hostile formats on
     every backend, per-thread order across mixed backends, a producer killed/suspended
     mid-record, the controller killed while attached, the stdout reader going away.
+  - gated-e2e-<mode>-f<b>-o<b>-c<b>-r<b>: the flagship use case end to end, every backend for
+    each of the flag/open/close/read probes, launch and attach (before/after the config parse),
+    compared EXACTLY with the target's own per-thread record (probe_app --churn --truth).
 A missing project-built binary (an example not built) is a FAIL, never a SKIP (missing_bin()).
 SKIP is only for a check that does not apply to this build (x86-only / x64-only: skip()) or
 an absent OPTIONAL EXTERNAL dependency -- Frida, Intel SDE, a system program this Windows
@@ -7913,6 +7916,400 @@ def check_sessions_repeat(n=60):
     except Exception as e:
         record("sessions-repeat", False, repr(e))
 
+
+# --- gated-e2e-*: the flagship use case end to end, against the TARGET's own ground truth ------
+E2E_BACKENDS = ("breakpoint", "hw", "inline")
+E2E_SHORT = {"breakpoint": "bp", "hw": "hw", "inline": "in"}
+E2E_CLOSE_LOCATION = "ntdll.dll!NtClose"
+E2E_RX_OPEN = re.compile(r"open pid=(\d+) name=(\S+)$")
+E2E_RX_MAP = re.compile(r"map handle=0x([0-9a-f]+) -> pid=(\d+) name=(\S+)$")
+E2E_RX_READ = re.compile(r"read handle=0x([0-9a-f]+) pid=(\d+) name=(\S+) addr=0x([0-9a-f]+) size=(\d+)$")
+
+
+def e2e_truth(path):
+    """probe_app --churn's own record: every open/read/close in sequence order."""
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(l) for l in f if l.strip()]
+
+
+def e2e_expected(truth):
+    """tid -> the exact log sequence the gated_config callbacks must produce for that thread:
+    an open logs `open` + `map`, a read one `read` line, a close nothing."""
+    by = collections.defaultdict(list)
+    for e in truth:
+        if e["op"] == "open":
+            by[e["tid"]] += [("open", e["pid"], "probe_app.exe"), ("map", e["handle"], e["pid"], "probe_app.exe")]
+        elif e["op"] == "read":
+            by[e["tid"]].append(("read", e["handle"], e["pid"], "probe_app.exe", e["addr"], e["size"]))
+        elif e["op"] == "read-unmapped":      # through a duplicated handle the map never saw
+            by[e["tid"]].append(("read", e["handle"], 0, "?", e["addr"], e["size"]))
+    return by
+
+
+def e2e_got(objs, helper_pids):
+    """tid -> the delivered log sequence (parsed), plus anything that is no expected shape.
+    Opens of a process that is not a helper (a start-up open of the target's own, seen once on
+    a freshly built binary's first launch -- see gated-map) are set aside: they must still be
+    mapped correctly, and no read may use them."""
+    by, foreign, extra = collections.defaultdict(list), [], []
+    for o in objs:
+        if o.get("kind") != "probe_log":
+            continue
+        m, tid = str(o.get("message", "")), o.get("tid")
+        if (x := E2E_RX_OPEN.match(m)):
+            t = ("open", int(x[1]), x[2].lower())
+        elif (x := E2E_RX_MAP.match(m)):
+            t = ("map", int(x[1], 16), int(x[2]), x[3].lower())
+        elif (x := E2E_RX_READ.match(m)):
+            t = ("read", int(x[1], 16), int(x[2]), x[3].lower(), int(x[4], 16), int(x[5]))
+        else:
+            foreign.append(m[:80]); continue
+        if t[0] in ("open", "map") and t[1 if t[0] == "open" else 2] not in helper_pids:
+            extra.append((tid,) + t); continue
+        by[tid].append(t)
+    return by, foreign, extra
+
+
+def e2e_session_file_logs(stderr_text):
+    """probe_log records in the session JSONL file (the path is on stderr); deletes the file."""
+    m = re.search(r"^probe: logs -> (.+)$", stderr_text or "", re.M)
+    if not m:
+        return None
+    p = Path(m.group(1).strip())
+    try:
+        with open(p, "rb") as f:
+            n = sum(1 for l in f if l.startswith(b'{"kind":"probe_log"'))
+    except OSError:
+        return None
+    try:
+        p.unlink()
+    except OSError:
+        pass
+    return n
+
+
+def e2e_judge(combo, rc, target_rc, objs, t_objs, stderr_text, truth, base, flag_hits_want=1):
+    """Exact comparison of one run with the target's ground truth. Returns (ok, detail)."""
+    fb, ob, cb, rb = combo
+    bad = []
+    rep, a = report(objs), app(t_objs)
+    hp = helper_pids(t_objs)
+    pr = {x.get("location"): x for x in probes(objs)}
+    fl, op, cl, rd = (pr.get(FLAG_LOCATION, {}), pr.get(OPEN_LOCATION, {}), pr.get(E2E_CLOSE_LOCATION, {}),
+                      pr.get(READ_LOCATION, {}))
+    t_opens = [e for e in truth if e["op"] == "open"]
+    t_reads = [e for e in truth if e["op"] in ("read", "read-unmapped")]
+    t_unmapped = [e for e in truth if e["op"] == "read-unmapped"]
+    t_dups = [e for e in truth if e["op"] == "dup"]
+    t_closes = [e for e in truth if e["op"] == "close"]
+    # The workload really did reuse handle values for different pids (else this proves nothing).
+    pids_of = collections.defaultdict(set)
+    for e in t_opens:
+        pids_of[e["handle"]].add(e["pid"])
+    reused = sum(1 for v in pids_of.values() if len(v) > 1)
+    # A duplicate that got a value the map once knew (so a stale entry would mislabel it).
+    known = {e["handle"] for e in t_opens}
+    stale_bait = sum(1 for e in t_dups if e["handle"] in known)
+    if rc != 0 or target_rc != 0 or rep.get("app_exit") not in (0, None):
+        bad.append(f"rc={rc}/{target_rc} app_exit={rep.get('app_exit')}")
+    if rep.get("error") is not None:
+        bad.append(f"error={str(rep.get('error'))[:100]}")
+    if (a.get("reads_enabled") != 1 or a.get("checksum") != base.get("checksum") or
+            a.get("successful_reads") != base.get("successful_reads") or a.get("opened") != base.get("opened")):
+        bad.append(f"app reads_enabled={a.get('reads_enabled')} reads={a.get('successful_reads')}/{base.get('successful_reads')} "
+                   f"opened={a.get('opened')}/{base.get('opened')} checksum_same={a.get('checksum') == base.get('checksum')}")
+    if (len(t_reads) != base.get("successful_reads") or len(t_opens) != base.get("opened") or not reused or
+            not stale_bait or len(t_unmapped) != len(t_dups)):
+        bad.append(f"truth reads={len(t_reads)} opens={len(t_opens)} reused_handles={reused} "
+                   f"dups={len(t_dups)} stale_bait={stale_bait} unmapped_reads={len(t_unmapped)}")
+    want_bk = {"flag": (fl, fb), "open": (op, ob), "close": (cl, cb), "read": (rd, rb)}
+    wrong_bk = {k: p.get("backend") for k, (p, b) in want_bk.items() if p.get("backend") != b or p.get("active") is not True}
+    if wrong_bk:
+        bad.append(f"backend/active {wrong_bk}")
+    if fl.get("hits") != flag_hits_want or rep.get("overrides") != 1:
+        bad.append(f"flag hits={fl.get('hits')} overrides={rep.get('overrides')}")
+    want, (got, foreign, extra) = e2e_expected(truth), e2e_got(objs, hp)
+    # Extra (non-helper) opens: per thread, in order, each `open pid=P name=N` is followed by
+    # exactly one `map handle=H -> pid=P name=N` (H != 0) of its own -- nothing else, nothing missing.
+    extra_bad, ex_by = [], collections.defaultdict(list)
+    for x in extra:
+        ex_by[x[0]].append(x[1:])
+    for tid, seq in ex_by.items():
+        if len(seq) % 2 or any(not (o[0] == "open" and m[0] == "map" and m[1] != 0 and m[2] == o[1] and m[3] == o[2])
+                               for o, m in zip(seq[0::2], seq[1::2])):
+            extra_bad.append((tid, seq[:4]))
+    if foreign or extra_bad:
+        bad.append(f"foreign={foreign[:2]} extra_unpaired={extra_bad[:2]}")
+    if op.get("hits") != len(t_opens) + sum(1 for x in extra if x[1] == "open"):
+        bad.append(f"open hits={op.get('hits')} want={len(t_opens)}+{sum(1 for x in extra if x[1] == 'open')} extra")
+    n_read_logs = sum(1 for seq in got.values() for t in seq if t[0] == "read")
+    if rd.get("hits") != len(t_reads) or n_read_logs != len(t_reads):
+        bad.append(f"read hits={rd.get('hits')} logs={n_read_logs} truth={len(t_reads)}")
+    if (cl.get("hits") or 0) < len(t_closes):        # the program closes other handles too
+        bad.append(f"close hits={cl.get('hits')} < truth closes {len(t_closes)}")
+    unmapped_n = sum(1 for seq in got.values() for t in seq if t[0] == "read" and t[2] == 0) - len(t_unmapped)
+    wrong_tids = [tid for tid in set(want) | set(got) if want.get(tid, []) != got.get(tid, [])]
+    if wrong_tids:
+        tid = wrong_tids[0]
+        w, g = want.get(tid, []), got.get(tid, [])
+        i = next((k for k, (p, q) in enumerate(zip(w, g)) if p != q), min(len(w), len(g)))
+        bad.append(f"{len(wrong_tids)} thread(s) differ (unmapped reads={unmapped_n}); tid {tid} @{i}/{len(w)}: "
+                   f"want {w[i:i + 2]} got {g[i:i + 2]}")
+    delivered = sum(1 for o in objs if o.get("kind") == "probe_log")
+    in_file = e2e_session_file_logs(stderr_text)
+    if not (rep.get("logs_written") == delivered == in_file) or rep.get("log_dropped") != 0 or rep.get("callbacks_interrupted") != 0:
+        bad.append(f"logs_written={rep.get('logs_written')} delivered={delivered} file={in_file} "
+                   f"dropped={rep.get('log_dropped')} interrupted={rep.get('callbacks_interrupted')}")
+    warns = [l[:140] for l in (stderr_text or "").splitlines() if "warning" in l.lower() or "refused" in l.lower()]
+    if warns:
+        bad.append(f"warnings={warns[:2]}")
+    detail = (f"reads={n_read_logs}/{len(t_reads)} opens={op.get('hits')}/{len(t_opens)} closes>={len(t_closes)}:"
+              f"{cl.get('hits')} reused={reused} dup_unmapped={len(t_unmapped)} stale_bait={stale_bait} logs={rep.get('logs_written')}/{delivered}/{in_file} "
+              f"flag={fl.get('hits')}/{rep.get('overrides')}" + (f" extra_opens={len(extra)}" if extra else ""))
+    return not bad, detail + ("" if not bad else " BAD: " + " | ".join(bad))
+
+
+def e2e_target_args(threads, rounds, truth, parse_early=False):
+    return ["--helpers", HELPERS, "--threads", threads, "--reads", rounds, "--churn", "--truth", truth,
+            *(["--parse-early"] if parse_early else [])]
+
+
+def e2e_launch(combo, threads, rounds, truth):
+    fb, ob, cb, rb = combo
+    r, o = run([exe("gated_config.exe"), "--flag-backend", fb, "--open-backend", ob, "--close-backend", cb,
+                "--read-backend", rb, FLAG_LOCATION, READ_LOCATION, "--", exe("probe_app.exe"), "--no-wait",
+                *e2e_target_args(threads, rounds, truth)], timeout=240)
+    return r.returncode, report(o).get("app_exit"), o, o, r.stderr
+
+
+def e2e_attach(combo, threads, rounds, truth, post):
+    """probe_app runs on its own and waits at its gate (post: with configparse.dll already
+    loaded and the config parsed once); uhh_attach attaches by pid, every probe that can arm
+    is confirmed active, then the gate is released."""
+    fb, ob, cb, rb = combo
+    procs = []
+    try:
+        tgt = subprocess.Popen([str(exe("probe_app.exe")), *map(str, e2e_target_args(threads, rounds, truth, post))],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        procs.append(tgt)
+        tout = Lines(tgt.stdout)
+        waiting = tout.wait_for(lambda l: '"kind":"waiting"' in l, 60)
+        if not waiting:
+            raise RuntimeError("target never reached its gate")
+        if post and not any('"phase":"early","reads_enabled":0' in l for l in tout.lines):
+            raise RuntimeError("no early parse before the gate")
+        att = subprocess.Popen([str(exe("uhh_attach.exe")), str(json.loads(waiting)["pid"]), "--flag-backend", fb,
+                                "--open-backend", ob, "--close-backend", cb, "--read-backend", rb],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        procs.append(att)
+        aout, aerr = Lines(att.stdout), Lines(att.stderr)
+        if not aout.wait_for(lambda l: '"kind":"attached"' in l, 60):
+            raise RuntimeError(f"uhh_attach did not attach: {aerr.lines[-3:]}")
+        for loc in (OPEN_LOCATION, E2E_CLOSE_LOCATION, READ_LOCATION) + ((FLAG_LOCATION,) if post else ()):
+            if not aerr.wait_for(lambda l, loc=loc: l.startswith(f"probe: active {loc} "), 60):
+                raise RuntimeError(f"{loc} never became active: {aerr.lines[-3:]}")
+        tgt.stdin.write("x"); tgt.stdin.flush()
+        tgt.wait(timeout=240); att.wait(timeout=60)
+        o, t_objs = aout.objs(), tout.objs()
+        aerr.t.join(timeout=30)
+        return att.returncode, tgt.returncode, o, t_objs, "\n".join(aerr.lines)
+    finally:
+        for pr in procs:                    # only the processes this run started
+            if pr.poll() is None:
+                pr.kill()
+
+
+def check_gated_e2e(threads=8, rounds=16):
+    """The flagship use case (examples/gated_config + examples/attach) end to end with EXACT
+    ground truth written by the target itself (probe_app --churn --truth): EVERY assignment of
+    the four roles -- flag (configparse.dll!ParseConfig+0x16), open (ntdll!NtOpenProcess,
+    call_original map), close (ntdll!NtClose, forget) and read (ntdll!NtReadVirtualMemory) --
+    over {breakpoint, hw, inline} (81; at most 4 hw probes, so none exceeds the debug registers:
+    an hw open's call_original borrows its own DR when all 4 are taken), in three modes:
+      launch      gated_config launches probe_app;
+      attach-pre  uhh_attach attaches at the gate, before configparse.dll is loaded (flag pending);
+      attach-post probe_app --parse-early: configparse.dll loaded and the config parsed once
+                  before the gate; the flag probe arms on the loaded module, the reload counts.
+    The workload: helpers opened, read (1..256 bytes, through ReadThunk and ReadProcessMemory)
+    and closed over and over from several threads (handle values reused for different pids;
+    asserted). Exact: one flag hit and one override; per target thread the delivered `open`,
+    `map` and `read` logs equal the target's own record in order (right pid and name for a
+    reused handle, no unmapped read; a read through a DUPLICATED helper handle -- never seen by
+    the open probe, usually holding a value the map knew -- logged unmapped, pid 0: the close
+    probe forgot the old value); read hits == read logs == truth; open hits == truth;
+    logs_written == delivered on stdout == records in the session file; nothing dropped or
+    interrupted; no warning; checksum == an uninstrumented run; exit 0 everywhere.
+    UHH_E2E=<comma substrings of the record name> runs a subset (debugging)."""
+    g, a, p = exe("gated_config.exe"), exe("uhh_attach.exe"), exe("probe_app.exe")
+    if not g or not a or not p:
+        return missing_bin("gated-e2e", "gated_config/uhh_attach/probe_app")
+    sel = [x for x in os.environ.get("UHH_E2E", "").split(",") if x]
+    tmp = Path(tempfile.gettempdir()) / f"uhh-e2e-{os.getpid()}"
+    tmp.mkdir(exist_ok=True)
+    base = {}
+    try:
+        _, bo = run([p, "--no-wait", *e2e_target_args(threads, rounds, tmp / "base.jsonl"),
+                     "--config", "reads_enabled=1"], timeout=120)
+        base = app(bo)
+        bt = e2e_truth(tmp / "base.jsonl")
+        ok = (base.get("reads_enabled") == 1 and base.get("successful_reads") == sum(e["op"] in ("read", "read-unmapped") for e in bt) > 0
+              and base.get("opened") + sum(e["op"] == "dup" for e in bt) == sum(e["op"] == "close" for e in bt)
+              and base.get("opened") == sum(e["op"] == "open" for e in bt))
+        record("gated-e2e-baseline", ok, f"uninstrumented: reads={base.get('successful_reads')} opens={base.get('opened')} "
+                                         f"dups={sum(e['op'] == 'dup' for e in bt)} "
+                                         f"checksum={base.get('checksum')}")
+        if not ok:
+            return
+    except Exception as e:
+        return record("gated-e2e-baseline", False, repr(e))
+    combos = [(f, o, c, r) for f in E2E_BACKENDS for o in E2E_BACKENDS for c in E2E_BACKENDS for r in E2E_BACKENDS]
+    for mode in ("launch", "attach-pre", "attach-post"):
+        for combo in combos:
+            name = f"gated-e2e-{mode}-" + "-".join(f"{k}{E2E_SHORT[b]}" for k, b in zip("focr", combo))
+            if sel and not any(s in name for s in sel):
+                continue
+            truth_path = tmp / "truth.jsonl"
+            try:
+                truth_path.unlink(missing_ok=True)
+                if mode == "launch":
+                    rc, trc, o, t_objs, err = e2e_launch(combo, threads, rounds, truth_path)
+                else:
+                    rc, trc, o, t_objs, err = e2e_attach(combo, threads, rounds, truth_path, mode == "attach-post")
+                truth = e2e_truth(truth_path) if truth_path.exists() else []
+                ok, detail = e2e_judge(combo, rc, trc, o, t_objs, err, truth, base)
+                record(name, ok, detail)
+            except Exception as e:
+                record(name, False, repr(e)[:300])
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def check_cx2_review():
+    """Second Codex review of the code merged on 2026-11-06 (docs/ROADMAP.md "Codex review 2
+    findings"), each reproduced on the unfixed code first:
+      cx2-faultfresh-<b>: a probed load faults and the program's handler, in turn, retries it
+        (commits the page), SKIPS it (emulates the load) or UNWINDS out of it (SEH __except).
+        The next call is a fresh execution of the site on the same thread with no other event
+        in between: one hit, one log per call on every backend (breakpoint took it for a retry
+        of the faulted execution: no callback, no hit), the handler never sees a trap flag.
+      cx2-touchprog-hw (x86 controller): the PROGRAM holds a thread suspended; the controller
+        arms a hw probe at attach (a context call on every thread) and dies inside the call on
+        that thread, before the implicit WOW64 suspension and (second run) with it in place
+        (test-hook build). The guard must leave exactly the program's suspension (it resumed
+        every thread the call had listed, once: the program's suspension was released).
+      cx2-manythreads-inline / cx2-manydead-inline: 4200 threads (all alive at once: distinct
+        ids, more than the agent's 4096-entry thread table) make one inline hit each; then a
+        callback on yet another thread outlives a detach -- while those threads still live, and
+        after they have all exited. Its log must be delivered (it ran untracked: the detach
+        drain counted 0 live callbacks and gave up, the log was dropped)."""
+    cd, ct = exe("ctrl_driver.exe"), exe("ctrl_target.exe")
+    d, t, dth = exe("co_driver.exe"), exe("co_target.exe"), exe("co_driver_th.exe")
+    if not cd or not ct or not d or not t or not dth:
+        return missing_bin("cx2-review", "ctrl_driver/ctrl_target/co_driver/co_target/co_driver_th")
+
+    N = 300
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"cx2-faultfresh-{bk}"
+        try:
+            r, o = run([cd, "--scenario", "faultmix", "--backend", bk, "--", ct, "faultmix", "--n", N], timeout=180)
+            res = next((x for x in o if x.get("kind") == "ctrl_result"), {})
+            logs = [x for x in o if x.get("kind") == "probe_log"]
+            hits = sum(x.get("hits", 0) for x in o if x.get("kind") == "probe")
+            rep = report(o)
+            bad = []
+            if r.returncode != 0: bad.append(f"exit={r.returncode}")
+            if rep.get("error") is not None: bad.append(f"error={rep.get('error')}")
+            if rep.get("log_dropped", 0) != 0: bad.append(f"log_dropped={rep.get('log_dropped')}")
+            if hits != N or len(logs) != N: bad.append(f"hits={hits} logs={len(logs)} (want {N} each)")
+            third = N // 3
+            if (res.get("retry"), res.get("skip"), res.get("unwind")) != (third, third, third):
+                bad.append(f"handler retry={res.get('retry')} skip={res.get('skip')} unwind={res.get('unwind')} (want {third} each)")
+            if res.get("sum") is None or res.get("sum") != res.get("want"):
+                bad.append(f"target sum={res.get('sum')} want={res.get('want')}")
+            if res.get("tf") != 0: bad.append(f"tf_in_handler={res.get('tf')}")
+            if res.get("stray") != 0: bad.append(f"stray_single_steps={res.get('stray')}")
+            record(name, not bad, " ".join(bad) or f"hits={hits} logs={len(logs)} retry/skip/unwind="
+                                                   f"{res.get('retry')}/{res.get('skip')}/{res.get('unwind')}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    name = "cx2-touchprog-hw"
+    if not pe_is_x86(t):
+        skip(name, "x86 only (an x64 controller has no implicit suspend)")
+    else:
+        def touchprog(mode):
+            """co_target susp: the controller dies in its context call on the program-suspended
+            worker, before (mode "before") or inside (default: suspended) the implicit suspension."""
+            procs = []
+            try:
+                tgt = subprocess.Popen([str(t), "susp", "--wait"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, text=True)
+                procs.append(tgt)
+                tout = Lines(tgt.stdout)
+                sl = tout.wait_for(lambda l: '"kind":"susp"' in l, 30)
+                w = tout.wait_for(lambda l: '"kind":"waiting"' in l, 30)
+                if not sl or not w:
+                    raise RuntimeError("target never reached its gate")
+                env = dict(os.environ, UHH_TEST_DIE_IN_TOUCH=str(json.loads(sl)["tid"]))
+                if mode:
+                    env["UHH_TEST_DIE_IN_TOUCH_MODE"] = mode
+                att = subprocess.Popen([str(dth), "--backend", "hw", "--case", "susp", "--attach", str(json.loads(w)["pid"])],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env)
+                procs.append(att)
+                aerr = Lines(att.stderr)
+                att.wait(timeout=90)                       # dies arming the hw probe on every thread
+                aerr.t.join(timeout=30)
+                tgt.stdin.write("x"); tgt.stdin.flush()
+                tgt.wait(timeout=90)
+                row = next((x for x in tout.objs() if x.get("kind") == "co"), {})
+                rc = tgt.returncode & 0xFFFFFFFF
+                bad = []
+                if att.returncode != 98: bad.append(f"controller_rc={att.returncode} (98: died in the touch)")
+                died = next((l for l in aerr.lines if l.startswith("probe: test: dying")), "")
+                if "enabled=1" not in died: bad.append(f"not killed in a guarded touch: {died!r}")
+                if rc != 0: bad.append(f"target_rc=0x{rc:x}")
+                if row.get("first") != 0 or row.get("prev") != 1 or row.get("ran_while_suspended") != 0:
+                    bad.append(f"ResumeThread prev={row.get('prev')} (want 1: the program's own suspension) "
+                               f"ran_while_suspended={row.get('ran_while_suspended')} (want 0)")
+                if row.get("done") != 1 or row.get("sum") != sum(i * 3 + 5 for i in range(20)):
+                    bad.append(f"target row={row}")
+                return bad
+            finally:
+                for q in procs:
+                    if q.poll() is None:
+                        q.kill()
+        try:
+            bad = [f"[{m or 'suspended'}] {x}" for m in ("before", None) for x in touchprog(m)]
+            record(name, not bad, " ".join(bad) or "died before / inside the implicit suspension: the program's "
+                                                   "suspension kept (prev=1, worker never ran) both times")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    for case in ("many", "manydead"):
+        name = f"cx2-{case}threads-inline" if case == "many" else "cx2-manydead-inline"
+        try:
+            def detach_now(tgt, att, tout):
+                t0 = time.time(); att.stdin.write("\n"); att.stdin.flush()
+                att.wait(timeout=200)
+                return time.time() - t0
+            row, aout, aerr, arc, trc, took = cx_attached_run(case, "inline", d, t, detach_now, timeout=200)
+            sm = cx_detach_summary(aerr.lines)
+            done = [l for l in aout.lines if '"message":"co late-done' in l]
+            n = row.get("threads", 0)
+            bad = []
+            if n != 4200 or row.get("called") != n or row.get("distinct") != n:
+                bad.append(f"threads={n} called={row.get('called')} distinct={row.get('distinct')} (want 4200 each)")
+            if row.get("ret") != CX_LATE_SUM or row.get("done") != 1:
+                bad.append(f"target ret={row.get('ret')} want {CX_LATE_SUM} done={row.get('done')}")
+            if len(done) != 1 or f"sum={CX_LATE_SUM}" not in done[0]:
+                bad.append(f"late log delivered={len(done)}")
+            if sm.get("log_dropped") != 0 or sm.get("in_flight") != 0 or sm.get("hits") != n + 1 or sm.get("logs_written") != n + 2:
+                bad.append(f"summary={sm} (want hits={n + 1} logs_written={n + 2} dropped=0 in_flight=0)")
+            if arc != 0 or trc != 0: bad.append(f"driver_rc={arc} target_rc={trc}")
+            record(name, not bad, " ".join(bad) or f"threads={n} detach_took={took:.1f}s summary={sm}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
 def main():
     global BIN
     ap = argparse.ArgumentParser()
@@ -8061,6 +8458,7 @@ def main():
     if want(check_lifecycle): check_lifecycle()
     if want(check_cet_sde): check_cet_sde()
     if want(check_cxlib): check_cxlib()
+    if want(check_cx2_review): check_cx2_review()
     if want(check_symbols_grammar): check_symbols_grammar()
     if want(check_quickstart): check_quickstart()
     if want(check_callfunc_concurrent): check_callfunc_concurrent()
@@ -8069,6 +8467,7 @@ def main():
     if want(check_inline_absolute): check_inline_absolute()
     if want(check_cet_agent): check_cet_agent()
     if want(check_sessions_repeat): check_sessions_repeat()
+    if want(check_gated_e2e): check_gated_e2e()
     if only and not RESULTS:
         print(f"regress.py: --only {','.join(only)} selected only opt-in tiers that were not enabled "
               f"(--bigapps / --soak-minutes / --volume-reads): no check ran.", file=sys.stderr)

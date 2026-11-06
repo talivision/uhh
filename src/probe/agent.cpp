@@ -897,7 +897,8 @@ struct HitScope;
    cannot live in a thread_local: with no TLS there was no guard, and an allocating callback
    on the allocator recursed until the stack overflowed. A fixed table keyed by thread id:
    a thread claims its slot on its first hit and keeps it (a reused id reuses the slot);
-   after the claim only the owning thread touches its slot.
+   after the claim only the owning thread touches its slot -- until it is gone and a new
+   thread takes the slot over (the table is full: see take_dead_slot).
    The slot is also the call_func guard: call_func runs only inside a callback, i.e. while
    `active` marks this thread, so a probe its callee hits is counted without a callback (see
    call_func_guarded). One mechanism, no separate "in call_func" registry.
@@ -920,16 +921,76 @@ struct ThreadSlot {
 };
 constexpr uint32_t AGENT_THREAD_SLOTS = 4096;
 static ThreadSlot g_threads[AGENT_THREAD_SLOTS];
-static ThreadSlot *thread_slot(DWORD tid, bool claim) {
-    for (uint32_t n = 0; n < AGENT_THREAD_SLOTS; ++n) {
-        ThreadSlot &s = g_threads[((tid >> 2) + n) & (AGENT_THREAD_SLOTS - 1)];
+// When every slot is owned (4096 distinct thread ids have hit a probe over the process's life),
+// a dead thread's slot is taken over -- thread ids are reused, but a short-lived thread's own
+// slot was never freed, and a thread without a slot ran untracked: its callback was invisible
+// to the detach drain (count_live_callbacks), which stopped waiting and dropped its log. With
+// more than 4096 probe-hitting threads ALIVE at once, the overflow table holds the rest.
+constexpr uint32_t AGENT_OVERFLOW_SLOTS = 256;
+static ThreadSlot g_overflow[AGENT_OVERFLOW_SLOTS];
+constexpr LONG SLOT_MOVING = 1;          // being handed to a new owner (never a thread id: those are multiples of 4)
+// Callbacks running on a thread with no slot at all (both tables owned by live threads):
+// counted as live by the detach drain.
+static volatile LONG g_untracked_running;
+static ThreadSlot *slot_in(ThreadSlot *table, uint32_t size, DWORD tid, bool claim) {
+    for (uint32_t n = 0; n < size; ++n) {
+        ThreadSlot &s = table[((tid >> 2) + n) & (size - 1)];
         const LONG t = s.tid;
         if (t == (LONG)tid) return &s;
         if (t) continue;
         if (!claim) return nullptr;
         if (InterlockedCompareExchange(&s.tid, (LONG)tid, 0) == 0) return &s;
     }
-    return nullptr;                      // 4096 distinct thread ids: this thread runs unguarded
+    return nullptr;                      // full (or, without claim, not there)
+}
+// The slot owner `tid` no longer exists in this process (exited, or the id now names a thread
+// of another process). Not certain (a transient failure to open it): not gone.
+static bool slot_owner_gone(LONG tid) {
+    HANDLE h = OpenThread(SYNCHRONIZE | THREAD_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)tid);
+    if (!h) {
+        const DWORD e = GetLastError();
+        return e == ERROR_INVALID_PARAMETER || e == ERROR_ACCESS_DENIED;
+    }
+    const bool gone = GetProcessIdOfThread(h) != GetCurrentProcessId() || WaitForSingleObject(h, 0) == WAIT_OBJECT_0;
+    CloseHandle(h);
+    return gone;
+}
+// A full table: take over a slot whose owner is gone, nearest this thread's own position
+// first (its lookups probe from there). The slot is marked moving while the owner is checked
+// a second time, so a new thread given the dead owner's id meanwhile cannot have picked it up
+// (it no longer matches): only then is it reset and handed over. A dead owner killed inside a
+// callback leaves that hit in flight (callbacks_interrupted), as with a reused id.
+// One sweeper at a time (another thread meanwhile gets no slot for this hit); a probe its own
+// calls hit (NtOpenThread, ...) passes straight through, as the agent's own work.
+static volatile LONG64 g_sweep_after;    // no takeover sweep before this tick: the last found every owner alive
+static volatile LONG g_sweeper;          // the thread sweeping
+static ThreadSlot *take_dead_slot(ThreadSlot *table, uint32_t size, DWORD tid) {
+    if (GetTickCount64() < (ULONGLONG)g_sweep_after) return nullptr;
+    if (InterlockedCompareExchange(&g_sweeper, (LONG)tid, 0) != 0) return nullptr;
+    struct Done { ~Done() { InterlockedExchange(&g_sweeper, 0); } } done;
+    for (uint32_t n = 0; n < size; ++n) {
+        ThreadSlot &s = table[((tid >> 2) + n) & (size - 1)];
+        const LONG t = s.tid;
+        if (!t || t == SLOT_MOVING || t == (LONG)tid || !slot_owner_gone(t)) continue;
+        if (InterlockedCompareExchange(&s.tid, SLOT_MOVING, t) != t) continue;
+        if (!slot_owner_gone(t)) { InterlockedExchange(&s.tid, t); continue; }   // the id lives again: leave it
+        s.active = nullptr; s.active_cell = nullptr; s.moved_from = s.moved_to = 0;
+        s.teb = nullptr; s.stack = 0; s.born = 0; s.busy = 0;
+        InterlockedExchange(&s.tid, (LONG)tid);
+        return &s;
+    }
+    InterlockedExchange64(&g_sweep_after, (LONG64)GetTickCount64() + 100);
+    return nullptr;
+}
+static ThreadSlot *thread_slot(DWORD tid, bool claim) {
+    if (ThreadSlot *s = slot_in(g_threads, AGENT_THREAD_SLOTS, tid, claim)) return s;
+    // The table is full (or, without claim, tid has no slot there): the overflow table, or a
+    // dead thread's slot in either.
+    if (ThreadSlot *s = slot_in(g_overflow, AGENT_OVERFLOW_SLOTS, tid, false)) return s;
+    if (!claim) return nullptr;
+    if (ThreadSlot *s = take_dead_slot(g_threads, AGENT_THREAD_SLOTS, tid)) return s;
+    if (ThreadSlot *s = slot_in(g_overflow, AGENT_OVERFLOW_SLOTS, tid, true)) return s;
+    return take_dead_slot(g_overflow, AGENT_OVERFLOW_SLOTS, tid);   // null: g_untracked_running
 }
 // The current thread's creation time (0: unknown). Hits it causes (a probe on
 // NtQueryInformationThread) pass straight through: see ThreadSlot::busy.
@@ -975,7 +1036,7 @@ struct OrigPost {                    // x64: written by uhh_orig_thunk (gpr +0x0
 static_assert(offsetof(OrigPost, xmm) == 0x30, "uhh_orig_thunk layout");
 struct HitScope {
     volatile LONG64 *cell;          // hit_stripes cell: its in-flight count
-    ThreadSlot *slot;               // this thread's slot (null: table full)
+    ThreadSlot *slot;               // this thread's slot (null: none free, see thread_slot)
     volatile LONG abandoned = 0;
     const void *xmm6 = nullptr;     // x64: the hit's XMM6..XMM15 (safetyhook Context, contiguous)
     uintptr_t canary = 0;           // (uintptr_t)this ^ HIT_CANARY while the callback runs
@@ -1381,7 +1442,7 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     // target's registers untouched (the callback behaves as a no-op mutation).
     // A hit is a callback run: while being unhooked the hook passes straight through and
     // that pass is NOT counted (else a detach would report hits that have no callback/log).
-    if (g_agent_threads.has(c.tid)) return false;          // the agent's own work: see g_agent_threads
+    if (g_agent_threads.has(c.tid) || g_sweeper == (LONG)c.tid) return false;   // the agent's own work: see g_agent_threads, take_dead_slot
     const probe_callback cb = callbacks[index];
     if (!cb) return false;
     ThreadSlot *const ts = own_thread_slot(c.tid);
@@ -1429,9 +1490,11 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     scope.xmm0 = &native.xmm0;
     scope.x87_post = x87_post;
     if (ts) { ts->active_cell = &cell; ts->active = &scope; }
+    else InterlockedIncrement(&g_untracked_running);       // no slot at all: see count_live_callbacks
     c.hit_scope = &scope;
     bool callback_ok = run_callback(cb, &c);
     if (ts) ts->active = nullptr;
+    else InterlockedDecrement(&g_untracked_running);
     scope.canary = 0;
     InterlockedExchangeAdd64(&cell, -PROBE_AGENT_INFLIGHT_ONE);
     if (!callback_ok) {
@@ -2099,6 +2162,26 @@ static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
     if (g_guard_wake) SetEvent(g_guard_wake);
     return EXCEPTION_CONTINUE_EXECUTION;
 }
+// A dead controller's suspensions of thread t (probe_agent_guard::held_tids). Conditional
+// entries first, each against the suspend count it recorded (a call that may suspend the thread
+// implicitly, see held_floor): resumed only while the count is above it -- the implicit
+// suspension is in place; a suspension the PROGRAM made is never released. (Before the
+// unconditional ones: a hold of ours under the call is part of the recorded count.) Then the
+// holds of ours, once each. A count that cannot be read (before Windows 8.1): resumed, as a hold.
+static void resume_holds(const probe_agent_guard &g, HANDLE t, DWORD tid) {
+    LONG count = g.held_count;
+    if (count > (LONG)PROBE_AGENT_GUARD_TIDS) count = PROBE_AGENT_GUARD_TIDS;
+    LONG ours = 0;
+    for (LONG i = 0; i < count; ++i) {
+        if (g.held_tids[i] != tid) continue;
+        const uint32_t before = g.held_floor[i];
+        if (before == PROBE_AGENT_HOLD_OURS) { ++ours; continue; }
+        ULONG now = 0;
+        if (!g_nt_qit || g_nt_qit(t, 35 /* ThreadSuspendCount */, &now, sizeof(now), nullptr) < 0 || now > before)
+            ResumeThread(t);
+    }
+    for (; ours > 0; --ours) ResumeThread(t);
+}
 extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_stop(void *);
 // The controller is gone and left its state behind: undo all of it, once.
 static void guard_cleanup() {
@@ -2122,7 +2205,8 @@ static void guard_cleanup() {
         THREADENTRY32 te{}; te.dwSize = sizeof(te);
         for (BOOL more = Thread32First(snap, &te); more; more = Thread32Next(snap, &te)) {
             if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
-            HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, te.th32ThreadID);
+            HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT |
+                                  THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
             if (!t) continue;
             if (SuspendThread(t) != (DWORD)-1) {              // no heap / lock use while it is suspended
                 CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS | CONTEXT_CONTROL;
@@ -2135,8 +2219,7 @@ static void guard_cleanup() {
             }
             // The controller's holds: once per entry (a thread can be held twice, e.g. a deferred
             // call_original hit that an in-place step window then suspended again).
-            if (!pass)
-                for (LONG k = tid_count(g.held_tids, g.held_count, te.th32ThreadID); k > 0; --k) ResumeThread(t);
+            if (!pass) resume_holds(g, t, te.th32ThreadID);
             CloseHandle(t);
         }
         CloseHandle(snap);
@@ -2150,40 +2233,44 @@ static void guard_cleanup() {
 // and send a log -- on a thread that exists, is not suspended and is still inside the callback
 // its slot records (the record's frame is on the thread's stack, above its SP, canary intact).
 // Dead / suspended threads and records a non-unwinding longjmp left behind are not counted.
-static LONG count_live_callbacks() {
-    LONG n = 0;
-    const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
-    for (ThreadSlot &ts : g_threads) {
-        const DWORD tid = (DWORD)ts.tid;
-        const HitScope *h = ts.active;
-        if (!tid || !h || tid == self) continue;
-        HANDLE t = OpenThread(THREAD_QUERY_LIMITED_INFORMATION | THREAD_GET_CONTEXT | SYNCHRONIZE, FALSE, tid);
-        if (!t) continue;                                          // gone
-        bool live = WaitForSingleObject(t, 0) == WAIT_TIMEOUT && GetProcessIdOfThread(t) == pid;
-        if (live && g_nt_qit) {                                    // suspended (by the program): cannot finish now
-            ULONG suspended = 0;
-            if (g_nt_qit(t, 35 /* ThreadSuspendCount */, &suspended, sizeof(suspended), nullptr) >= 0 && suspended)
-                live = false;
-        }
-        if (live) {
-            CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
-            if (GetThreadContext(t, &c)) {
+static bool callback_live(const ThreadSlot &ts, DWORD self, DWORD pid) {
+    const DWORD tid = (DWORD)ts.tid;
+    const HitScope *h = ts.active;
+    if (!tid || tid == (DWORD)SLOT_MOVING || !h || tid == self) return false;
+    HANDLE t = OpenThread(THREAD_QUERY_LIMITED_INFORMATION | THREAD_GET_CONTEXT | SYNCHRONIZE, FALSE, tid);
+    if (!t) return false;                                          // gone
+    bool live = WaitForSingleObject(t, 0) == WAIT_TIMEOUT && GetProcessIdOfThread(t) == pid;
+    if (live && g_nt_qit) {                                        // suspended (by the program): cannot finish now
+        ULONG suspended = 0;
+        if (g_nt_qit(t, 35 /* ThreadSuspendCount */, &suspended, sizeof(suspended), nullptr) >= 0 && suspended)
+            live = false;
+    }
+    if (live) {
+        CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
+        if (GetThreadContext(t, &c)) {
 #if defined(_WIN64)
-                const uintptr_t sp = (uintptr_t)c.Rsp;
+            const uintptr_t sp = (uintptr_t)c.Rsp;
 #else
-                const uintptr_t sp = (uintptr_t)c.Esp;
+            const uintptr_t sp = (uintptr_t)c.Esp;
 #endif
-                const uintptr_t a = (uintptr_t)h;
-                live = a > sp && (!ts.stack || a + sizeof(HitScope) <= ts.stack);
-                if (live) {
-                    __try { live = h->canary == (a ^ HIT_CANARY); }
-                    __except (EXCEPTION_EXECUTE_HANDLER) { live = false; }
-                }
+            const uintptr_t a = (uintptr_t)h;
+            live = a > sp && (!ts.stack || a + sizeof(HitScope) <= ts.stack);
+            if (live) {
+                __try { live = h->canary == (a ^ HIT_CANARY); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { live = false; }
             }
         }
-        CloseHandle(t);
-        n += live;
     }
+    CloseHandle(t);
+    return live;
+}
+static LONG count_live_callbacks() {
+    // A callback on a thread with no slot (more than 4096 + 256 probe-hitting threads alive at
+    // once) cannot be checked: counted as live.
+    LONG n = g_untracked_running;
+    const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    for (const ThreadSlot &ts : g_threads) n += callback_live(ts, self, pid);
+    for (const ThreadSlot &ts : g_overflow) n += callback_live(ts, self, pid);
     return n;
 }
 static void answer_live_query() {
@@ -2205,6 +2292,7 @@ static HANDLE service_up;               // set by service_main once it runs (ini
 // (ROADMAP CC8/B5). The INSTALL_DONE raised here tells the controller it may release.
 static DWORD WINAPI service_main(void *) {
     TidScope<8> own(g_agent_threads);
+    InterlockedExchange(&shared->guard.service_tid, (LONG)GetCurrentThreadId());   // see held_floor
     InterlockedExchange(&service_running, 1);
     InterlockedExchange(&shared->service_ready, 1);
     if (service_up) SetEvent(service_up);
@@ -2216,6 +2304,7 @@ static DWORD WINAPI service_main(void *) {
     // a trap that never comes: threads it held would stay suspended for good.
     ULONGLONG ctl_gone_at = 0;
     for (;;) {
+        InterlockedExchange(&shared->guard.service_tid, (LONG)GetCurrentThreadId());   // see held_floor
         // Take a new session's controller handle (the old one, if any, is no longer ours to watch).
         if (HANDLE h = (HANDLE)(uintptr_t)InterlockedExchange64(&shared->guard.controller_process, 0)) {
             if (g_ctl) CloseHandle(g_ctl);
