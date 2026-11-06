@@ -5172,6 +5172,7 @@ static bool site_executable(HANDLE h, uint64_t a) {
 // another instance of its module has that site as code: move the probe there (newest first).
 static void retarget_pending(probe_session *s) {
     bool moved = false;
+    std::vector<std::pair<std::string, uint64_t>> arm;           // armed after the scan (arming may add probes)
     for (auto &p : s->probes) {
         if (!(p->flags & PROBE_INLINE) || !p->address || !p->base || p->active || p->retired) continue;
         if (site_executable(s->pi.hProcess, p->address)) continue;
@@ -5182,11 +5183,12 @@ static void retarget_pending(probe_session *s) {
             if (trace_enabled()) std::fprintf(stderr, "  retarget %s 0x%llx -> 0x%llx\n", p->location.c_str(),
                                               (unsigned long long)p->address, (unsigned long long)(it->second + off));
             p->base = p->address = 0; p->vetted = false;
-            arm_module(s, it->first, it->second);
+            arm.emplace_back(it->first, it->second);
             moved = true;
             break;
         }
     }
+    for (const auto &a : arm) arm_module(s, a.first, a.second);
     if (moved) arm_gates_for_pending(s);
 }
 static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blocked, bool got) {
