@@ -15,7 +15,8 @@
 //   prot        VirtualProtect calls while NtProtectVirtualMemory is probed (the agent's own
 //               hook writes call it too -- those must not run the program's callback)
 //   cfkill      a thread killed (TerminateThread) while its callback is inside call_func, then
-//               short threads until one gets the dead thread's id; each hits the probe
+//               thread ids taken (threads created suspended, ended unrun) until one is the dead
+//               thread's id: that thread and 19 more run, each hitting the probe twice
 //   cfmany      100 threads inside call_func at once, the callee hitting another probe
 //   cflock      a call_func callee needing a lock another thread holds at its own probe hit
 //   absret      a call whose return site is followed within 5 bytes by a loop head (machine
@@ -352,15 +353,41 @@ int main(int argc, char **argv) {
         }
         CloseHandle(v);
         CfReuse r; r.victim = vtid;
+        // Get the dead id back. Windows hands a freed thread id out again only once the id
+        // table's free list it went to has run dry (freed ids queue behind it; one list per
+        // CPU, the creating thread's CPU picks it) -- on a long-running machine that can take
+        // far more threads than a test can run. So take ids fast: threads created suspended
+        // and ended before they ever run (no callback, no hit), the creator moving across the
+        // CPUs, until one is given the dead id -- that one runs cf_short; then 19 more do.
         int threads = 0;
-        for (int after = 0; threads < 3000 && after < 20; ++threads) {
+        long consumed = 0;
+        const ULONGLONG t0 = GetTickCount64();
+        DWORD_PTR pm = 0, sm = 0;
+        GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm);
+        int cpu = 0;
+        while (killed && !r.reused.load() && consumed < 4000000 && GetTickCount64() - t0 < 150000) {
+            if (pm && (consumed & 255) == 0) {
+                do cpu = (cpu + 1) % (int)(8 * sizeof(DWORD_PTR)); while (!(pm & ((DWORD_PTR)1 << cpu)));
+                SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)1 << cpu);
+            }
+            DWORD tid = 0;
+            HANDLE t = CreateThread(nullptr, 64 * 1024, cf_short, &r, CREATE_SUSPENDED | STACK_SIZE_PARAM_IS_A_RESERVATION, &tid);
+            if (!t) break;
+            ++consumed;
+            if (tid == vtid) { ResumeThread(t); ++threads; }      // the dead id: this one runs
+            else TerminateThread(t, 0);
+            WaitForSingleObject(t, INFINITE); CloseHandle(t);
+        }
+        if (pm) SetThreadAffinityMask(GetCurrentThread(), pm);
+        const ULONGLONG ms = GetTickCount64() - t0;
+        for (int after = 1; r.reused.load() && after < 20; ++after, ++threads) {
             HANDLE t = CreateThread(nullptr, 0, cf_short, &r, 0, nullptr);
             if (!t) break;
             WaitForSingleObject(t, INFINITE); CloseHandle(t);
-            if (r.reused.load()) ++after;
         }
-        printf("{\"kind\":\"ar\",\"case\":\"cfkill\",\"killed\":%d,\"reused\":%ld,\"threads\":%d,\"calls\":%ld}\n",
-               killed, r.reused.load(), threads, r.calls.load());
+        printf("{\"kind\":\"ar\",\"case\":\"cfkill\",\"killed\":%d,\"reused\":%ld,\"threads\":%d,\"calls\":%ld,"
+               "\"consumed\":%ld,\"ms\":%llu}\n", killed, r.reused.load(), threads, r.calls.load(), consumed,
+               (unsigned long long)ms);
     } else if (!strcmp(k, "cflock")) {
         InitializeCriticalSection(&g_cf_cs);
         g_cf_waiting = CreateEventW(nullptr, TRUE, FALSE, nullptr);

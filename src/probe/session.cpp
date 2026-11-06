@@ -362,8 +362,11 @@ struct probe_session {
     // call_original in flight (breakpoint/hw, see call_original): the probe address the call
     // starts at, the hit's SP, whether the breakpoint entry pass is still pending (the call's
     // own first INT3 execution: not a hit), and whether the thread was seen OUTSIDE the call
-    // (a hit at or above the hit's SP: it left by exception/longjmp without returning).
-    uint64_t co_addr = 0, co_sp = 0;
+    // (a hit at or above the hit's SP: it left by exception/longjmp without returning -- or a
+    // deeper one once the original's return address slot at co_sp no longer holds co_ret, see
+    // co_slot_gone).
+    uint64_t co_addr = 0, co_sp = 0, co_ret = 0;
+    uint64_t co_exc_sp = 0;                    // the SP of the last exception raised on the call's thread (co_unwound)
     bool co_entry_pending = false, co_left = false;
     int co_borrowed_slot = -1;                 // a hw probe's own DR lent to the call_original thread's return catch
     bool co_warned_entry = false, co_warned_dr = false, co_warned_left = false, co_warned_nargs = false;
@@ -5460,6 +5463,89 @@ static void arm_restore_fixup(probe_session *s) {
     }
 }
 
+// call_original (breakpoint/hw): the call's thread is DEEPER than the hit's frame (sp < co_sp),
+// and yet the original has been left (ROADMAP F5). While the original runs, the return
+// address the call pushed stays in its slot at co_sp (the original's frame is below it).
+// Once an exception or longjmp left it, the program's next calls from the frame that caught
+// it reuse that stack: the slot is overwritten (a return address into the catching frame,
+// a local). So a slot no longer holding co_ret means the original's frame is gone -- unless
+// co_ret lies in one of the few slots just below it (a thunk that moved its own return
+// address down: still inside). A slot still holding co_ret proves nothing either way (a left
+// frame whose slot was not reused yet): such a hit stays counted without a callback, as
+// before, until the thread is seen above, the slot changes, or the 5 s release.
+static bool co_slot_gone(probe_session *s, uint64_t sp) {
+    if (!s->co_addr || !s->co_ret || sp >= s->co_sp) return false;
+    const size_t w = sizeof(void *);
+    uint64_t v = 0; size_t n = 0;
+    if (!remote_read(s->pi.hProcess, s->co_sp, &v, w, &n) || n != w || v == s->co_ret) return false;
+    const uint64_t lo = std::max(sp, s->co_sp >= 64 ? s->co_sp - 64 : 0);
+    unsigned char below[64];
+    const size_t len = (size_t)(s->co_sp - lo);
+    if (len && (!remote_read(s->pi.hProcess, lo, below, len, &n) || n != len)) return false;
+    for (size_t o = len; o >= w; o -= w) {
+        uint64_t x = 0;
+        std::memcpy(&x, below + o - w, w);
+        if (x == s->co_ret) return false;
+    }
+    return true;
+}
+
+// call_original (breakpoint/hw), a hit deeper than the hit's frame whose slot still holds
+// co_ret (co_slot_gone has no answer): an exception was raised on the call's thread during
+// the call (at SP co_exc_sp) and this thread is below that point -- in its dispatch (a VEH,
+// a filter, a C++ catch block: those run on the dispatch's stack while the frames the
+// exception passed are still physically there) or in deeper code since. The unwinder tells
+// which frames are logically live: from here it walks up through the dispatch into the
+// raise point and on through every live frame, the original's included -- unless the
+// exception was already unwound past the original to a catching frame above it (a C++
+// catch block: its frames unwind straight into the catching frame, x64 through the unwind
+// consolidation frame, x86 through the catching frame's EBP). So the original is LEFT iff
+// the walk reaches the frame above the hit's (sp >= co_sp + ptr) directly from below the
+// raise point, never through a frame between the raise point and the hit's frame (the
+// original's own, or a live callee's). x86 walks lean on frame pointers / FPO data, so a
+// LEFT there also needs the SEH chain to agree: no registration left between the raise
+// point and the hit's frame (an unwind to a frame above removed every one of them; a live
+// original keeps its own). A walk that stops early decides nothing (inside, as before).
+static uint64_t thread_teb(HANDLE thread, const CONTEXT &ctx);
+static bool co_unwound(probe_session *s, DWORD tid, const CONTEXT &at, uint64_t pc) {
+    if (!s->co_addr || !s->co_ret || !s->co_exc_sp || !s->sym_ready) return false;
+    CONTEXT w = at;
+#if defined(_WIN64)
+    w.Rip = pc;
+    const uint64_t sp = w.Rsp;
+#else
+    w.Eip = (DWORD)pc;
+    const uint64_t sp = w.Esp;
+#endif
+    if (sp >= s->co_exc_sp || sp >= s->co_sp) return false;
+    HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
+    if (!t) return false;
+    std::vector<std::pair<uint64_t, uint64_t>> fr;
+    uhh_sym::unwind_frames(s->pi.hProcess, t, w, fr, 512);
+    const uint64_t above = s->co_sp + sizeof(void *);
+    uint64_t prev = sp;
+    bool left = false;
+    for (const auto &f : fr) {
+        if (f.second >= above) { left = prev < s->co_exc_sp; break; }
+        prev = f.second;
+    }
+#if !defined(_WIN64)
+    const uint64_t teb = left ? thread_teb(t, at) : 0;
+    if (left && !teb) left = false;
+    uint32_t rec = 0; size_t n = 0;
+    if (left && (!remote_read(s->pi.hProcess, teb, &rec, 4, &n) || n != 4)) left = false;
+    for (int i = 0; left && i < 256 && rec != 0xFFFFFFFFu && rec <= s->co_sp; ++i) {
+        if (rec >= s->co_exc_sp) { left = false; break; }         // a registered frame still live in between
+        if (!remote_read(s->pi.hProcess, rec, &rec, 4, &n) || n != 4) left = false;
+    }
+#endif
+    CloseHandle(t);
+    if (trace_enabled() && left)
+        std::fprintf(stderr, "  call_original: tid=%lu left (unwound past the hit's frame at a hit below the raise point)\n",
+                     (unsigned long)tid);
+    return left;
+}
+
 // While one callback's call_original runs the original in place, another thread that hits
 // a probe must not run ITS callback now: that callback may call call_original too, and only
 // one can be in flight. Instead the hit is undone -- the thread is put back AT the probe
@@ -5942,7 +6028,8 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
 #else
                 const uint64_t sp = native.Esp;
 #endif
-                if (sp >= s->co_sp && defer_hit_during_call(s, event.dwThreadId, hit_pc, false)) {
+                if ((sp >= s->co_sp || co_slot_gone(s, sp) || co_unwound(s, event.dwThreadId, native, hit_pc)) &&
+                    defer_hit_during_call(s, event.dwThreadId, hit_pc, false)) {
                     s->co_left = true; CloseHandle(thread); handled = true; return true;   // left the call (see breakpoint)
                 }
             }
@@ -6625,10 +6712,12 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
 #endif
         if (s->co_entry_pending && address == s->co_addr && sp == s->co_sp) {
             s->co_entry_pending = false; co_pass = true;
-        } else if (sp >= s->co_sp && defer_hit_during_call(s, event.dwThreadId, address, true)) {
+        } else if ((sp >= s->co_sp || co_slot_gone(s, sp) || co_unwound(s, event.dwThreadId, native, address)) &&
+                   defer_hit_during_call(s, event.dwThreadId, address, true)) {
             // The call_original thread is back at (or above) the hit's frame without having
-            // returned: the original was left by an exception or longjmp. This hit is a NEW
-            // one -- rewind it; it is serviced normally once the call is released.
+            // returned, or deeper with the original's frame gone (co_slot_gone): the original
+            // was left by an exception or longjmp. This hit is a NEW one -- rewind it; it is
+            // serviced normally once the call is released.
             s->co_left = true; CloseHandle(thread); disposition = DBG_CONTINUE; return true;
         }
     }
@@ -8413,7 +8502,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
     if (!SetThreadContext(thread, &w)) { CloseHandle(thread); return 0; }
     s->dr_used |= (uint8_t)(1u << slot);                               // reserved: no probe arms it meanwhile
     s->dr_ever |= (uint8_t)(1u << slot);                               // ours: detach / the guard clear it too
-    s->in_call_tid = st->tid; s->co_addr = probe->address; s->co_sp = c->hit_sp;
+    s->in_call_tid = st->tid; s->co_addr = probe->address; s->co_sp = c->hit_sp; s->co_ret = ret_addr; s->co_exc_sp = 0;
     s->co_borrowed_slot = borrowed ? slot : -1;
     s->co_entry_pending = !(probe->flags & PROBE_HW); s->co_left = false;
     // Mirrored BEFORE the thread runs with it (the slot) -- and the thread off the guard's list
@@ -8480,6 +8569,21 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
             if (ev.dwThreadId == st->tid && ev.dwDebugEventCode == EXIT_THREAD_DEBUG_EVENT) {
                 thread_gone = true; why = "the thread exited inside the original";
             }
+            if (ev.dwThreadId == st->tid && ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT && ev.u.Exception.dwFirstChance) {
+                // The program's own exception (not a probe trap or step): its dispatch starts
+                // below this SP (co_unwound).
+                const DWORD code = ev.u.Exception.ExceptionRecord.ExceptionCode;
+                if (code != EXCEPTION_BREAKPOINT && code != EXCEPTION_SINGLE_STEP && code != 0x4000001Eu &&
+                    code != 0x4000001Fu && code != PROBE_IPC_CODE) {
+                    CONTEXT r{}; r.ContextFlags = CONTEXT_CONTROL;
+                    if (GetThreadContext(thread, &r))
+#if defined(_WIN64)
+                        s->co_exc_sp = r.Rsp;
+#else
+                        s->co_exc_sp = r.Esp;
+#endif
+                }
+            }
             service_event(s, ev);                                          // everything else as usual
         }
         poll_calls(s);
@@ -8495,7 +8599,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
             // 32-bit (WOW64) controller's call suspends the thread implicitly inside the call
             // (GuardTouch; a residual window of the call's own length, as for any WOW64 debugger).
             next_poll = now + 20;
-            CONTEXT r{}; r.ContextFlags = CONTEXT_CONTROL;
+            CONTEXT r{}; r.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS;
             bool got;
             { GuardTouch touch(s, st->tid); got = !!GetThreadContext(thread, &r); }
             if (got) {
@@ -8504,14 +8608,39 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
 #else
                 const uint64_t sp = r.Esp, pc = r.Eip;
 #endif
-                if (sp >= s->co_sp + ptr && pc != ret_addr) s->co_left = true;
+                // co_slot_gone reads two stack words of the running thread: the slot at co_sp only
+                // changes once the original's frame is gone (a thunk moving its return address down
+                // writes the copy first, and the copy is read after the slot).
+                if ((sp >= s->co_sp + ptr && pc != ret_addr) || co_slot_gone(s, sp)) {
+                    s->co_left = true;
+                } else if (s->co_exc_sp && sp < s->co_exc_sp && s->sym_ready) {
+                    // co_unwound walks the thread's stack: only on a stopped thread (frames that do not
+                    // change under the walk). Rare -- an exception was raised during this call and the
+                    // thread is below its raise point -- so the suspension is taken for that case only.
+                    guard_note_hold(s, st->tid);
+                    if (SuspendThread(thread) != (DWORD)-1) {
+                        CONTEXT q{}; q.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS;
+                        if (GetThreadContext(thread, &q)) {
+#if defined(_WIN64)
+                            const uint64_t qsp = q.Rsp, qpc = q.Rip;
+#else
+                            const uint64_t qsp = q.Esp, qpc = q.Eip;
+#endif
+                            if ((qsp >= s->co_sp + ptr && qpc != ret_addr) || co_slot_gone(s, qsp) ||
+                                co_unwound(s, st->tid, q, qpc))
+                                s->co_left = true;
+                        }
+                        ResumeThread(thread);
+                    }
+                    guard_resync(s);
+                }
             }
         }
         if (!done && now > until && !s->co_left) {
             s->co_left = true; why = "the original did not return within 5 s (released, it runs on)";
         }
     }
-    s->in_call_tid = 0; s->co_addr = 0; s->co_entry_pending = false; s->co_left = false; s->co_borrowed_slot = -1;
+    s->in_call_tid = 0; s->co_addr = 0; s->co_ret = 0; s->co_exc_sp = 0; s->co_entry_pending = false; s->co_left = false; s->co_borrowed_slot = -1;
     if (done) {
         CONTEXT cur{}; cur.ContextFlags = CONTEXT_DEBUG_REGISTERS;
         if (GetThreadContext(thread, &cur)) {          // keep any DR armed meanwhile, drop ours

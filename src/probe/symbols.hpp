@@ -33,6 +33,11 @@ bool containing_function(HANDLE process, std::uint64_t address, std::uint64_t &s
 bool walk_stack(HANDLE process, HANDLE thread, CONTEXT ctx,
                 std::uint64_t pc, std::uint64_t sp, std::uint64_t fp,
                 std::vector<std::uint64_t> &frames, std::size_t max_frames);
+// A virtual unwind from ctx (its pc / sp): after each step, the caller's pc and its stack
+// pointer on return (x64: from the images' unwind data, as the OS unwinder). False when
+// dbghelp is not up; the list stops where the walk does.
+bool unwind_frames(HANDLE process, HANDLE thread, CONTEXT ctx,
+                   std::vector<std::pair<std::uint64_t, std::uint64_t>> &pc_sp, std::size_t max_frames);
 bool enumerate(HANDLE process, const std::string &module, const std::string &mask,
                std::vector<symbol_entry> &out);
 void cleanup(HANDLE process);
