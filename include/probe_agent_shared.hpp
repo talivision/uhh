@@ -133,9 +133,9 @@ struct probe_agent_guard {
     volatile LONG dr_mask;              /* DR slots the controller owns or has owned */
     volatile LONG step_count, held_count, block_count;
     uint32_t step_tids[PROBE_AGENT_GUARD_TIDS];        /* threads mid single-step (trap flag ours) */
-    uint32_t held_tids[PROBE_AGENT_GUARD_TIDS];        /* threads the controller holds suspended (once each):
-                                                          install holds, hook-write freezes, call_func
-                                                          deferrals, in-place step windows */
+    uint32_t held_tids[PROBE_AGENT_GUARD_TIDS];        /* threads the controller holds suspended, one entry
+                                                          per suspension: install holds, hook-write freezes,
+                                                          call_func/call_original deferrals, in-place windows */
     uint64_t blocks[PROBE_AGENT_GUARD_BLOCKS];         /* 64 KiB out-of-line step blocks */
 };
 

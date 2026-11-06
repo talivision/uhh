@@ -1974,11 +1974,13 @@ static bool int3_original(uint64_t at, unsigned char &original) {
         if (shared->int3[i].address == at) { original = shared->int3[i].original; return true; }
     return false;
 }
-static bool tid_listed(const uint32_t *list, LONG count, DWORD tid) {
+static LONG tid_count(const uint32_t *list, LONG count, DWORD tid) {
     if (count > (LONG)PROBE_AGENT_GUARD_TIDS) count = PROBE_AGENT_GUARD_TIDS;
-    for (LONG i = 0; i < count; ++i) if (list[i] == tid) return true;
-    return false;
+    LONG n = 0;
+    for (LONG i = 0; i < count; ++i) n += list[i] == tid;
+    return n;
 }
+static bool tid_listed(const uint32_t *list, LONG count, DWORD tid) { return tid_count(list, count, tid) != 0; }
 // First in line for every exception, but acts only on OUR traps once no debugger is attached
 // (a live controller handles them before any handler in the target sees them).
 static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
@@ -2073,7 +2075,10 @@ static void guard_cleanup() {
                 }
                 ResumeThread(t);
             }
-            if (!pass && tid_listed(g.held_tids, g.held_count, te.th32ThreadID)) ResumeThread(t);   // the controller's hold
+            // The controller's holds: once per entry (a thread can be held twice, e.g. a deferred
+            // call_original hit that an in-place step window then suspended again).
+            if (!pass)
+                for (LONG k = tid_count(g.held_tids, g.held_count, te.th32ThreadID); k > 0; --k) ResumeThread(t);
             CloseHandle(t);
         }
         CloseHandle(snap);
@@ -2100,17 +2105,28 @@ static DWORD WINAPI service_main(void *) {
     InterlockedExchange(&shared->service_ready, 1);
     if (service_up) SetEvent(service_up);
     notify_installed();
+    // The controller process can be gone while the kernel still shows our debug port (its
+    // debug object is torn down after the process is signaled). The traps that would wake us
+    // again may all have been taken by then -- the VEH acts on ours before the port clears --
+    // so after the controller ends, poll for the port to go (bounded) instead of waiting for
+    // a trap that never comes: threads it held would stay suspended for good.
+    ULONGLONG ctl_gone_at = 0;
     for (;;) {
         // Take a new session's controller handle (the old one, if any, is no longer ours to watch).
         if (HANDLE h = (HANDLE)(uintptr_t)InterlockedExchange64(&shared->guard.controller_process, 0)) {
             if (g_ctl) CloseHandle(g_ctl);
-            g_ctl = h;
+            g_ctl = h; ctl_gone_at = 0;
         }
+        const bool polling = ctl_gone_at && !g_orphan_cleaned && shared->guard.enabled &&
+                             GetTickCount64() - ctl_gone_at < 30000;
         HANDLE waits[3] = {service_event, g_guard_wake, g_ctl};
-        DWORD w = WaitForMultipleObjects(g_ctl ? 3 : 2, waits, FALSE, INFINITE);
+        DWORD w = WaitForMultipleObjects(g_ctl ? 3 : 2, waits, FALSE, polling ? 10 : INFINITE);
         if (w == WAIT_OBJECT_0) { install_pending(); notify_installed(); continue; }
-        if (w == WAIT_OBJECT_0 + 2) { CloseHandle(g_ctl); g_ctl = nullptr; }
-        else if (w == WAIT_FAILED) { if (g_ctl) { CloseHandle(g_ctl); g_ctl = nullptr; } else return 1; }
+        if (w == WAIT_OBJECT_0 + 2) { CloseHandle(g_ctl); g_ctl = nullptr; ctl_gone_at = GetTickCount64(); }
+        else if (w == WAIT_FAILED) {
+            if (!g_ctl) return 1;
+            CloseHandle(g_ctl); g_ctl = nullptr; ctl_gone_at = GetTickCount64();
+        }
         if (guard_orphaned()) guard_cleanup();
     }
 }

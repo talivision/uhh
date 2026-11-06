@@ -1089,6 +1089,34 @@ by itself, nothing dropped), detach while callbacks run / block in call_original
   a target's own debugger-free INT3 at one of our sites while orphaned, and any single-step on a
   thread without debug registers of its own once the controller is gone, are taken as ours
   (a program single-stepping itself after its controller died would lose those steps).
+- ✅ (L12, found at the merge) The guard never resumed a thread the controller held suspended:
+  the held handles (install holds, hook-write freezes, call_original/call_func deferrals) were
+  opened without THREAD_QUERY_LIMITED_INFORMATION, so GetThreadId returned 0 and the mirrored
+  held list was all zeros. After a controller kill the target ran on with those threads parked
+  for good (x64 breakpoint: 1-3 workers suspended at their NtReadVirtualMemory/NtClose hit, rewound
+  by a call_original deferral, in 4 of 7 runs on eval-lifecycle itself; invisible to the check
+  except as a 60 s quit). Now opened with query rights, mirrored after the in-place window's own
+  bookkeeping (inplace_sync), and resumed once per hold. lifecycle_target's quit report now
+  carries `late` (workers not ended 15 s after quit) and `stuck` (threads left suspended:
+  tid:count:ip), and every lifecycle check fails on either. `lifecycle-controller-killed-*`
+- ✅ (L13, found at the merge, x86) With L12 fixed, x86 controller-killed-{breakpoint,hw,mixed}
+  still left ONE thread suspended in ~half the runs, parked at its NtOpenProcess hit (site or
+  site+1: the thread whose event the controller was handling). A 32-bit controller runs under
+  WOW64, where Get/SetThreadContext on another thread is an implicit suspend + resume inside the
+  call: killed in between, it leaves that thread suspended once with nothing of ours recording
+  it. The guard now also lists the threads whose events are being handled (nested ones too,
+  call_original) and the call_original/call_func thread, each published before the controller
+  touches it; one resume for each is a no-op on a thread that is not suspended. Every other hold
+  is published to the guard BEFORE the suspension (guard_note_hold), incl. detach's own freeze.
+  Defensive, same commit: after the controller process ends, the agent polls (10 ms, <= 30 s) for
+  its debug port to go instead of waiting for a trap to wake it. x86 bp+hw 10/10 (was 8 of 16
+  failing). Residual: a WOW64 implicit suspend of a thread that is neither the event's nor the
+  call's (e.g. arming a hardware probe on every thread) is not covered; the guard's extra
+  resume can undo a suspension the PROGRAM made of one of those threads at that instant.
+- Merge verification (2026-11-06, VM, after L12/L13): `--only lifecycle,interrupt,attach,gated,detach,
+  transparency,callorig,callfunc` 151/151 on x64 and 151/151 on x86; L11
+  (`lifecycle-controller-killed-breakpoint`, now also failing on a thread left suspended) 11/11 on x64
+  and 6/6 on x86 on the final code, no unhandled #DB/INT3 seen in any run since the merge.
 - Merged into merge-frida (agent protocol v19 = v18 + the guard): the guard takes the armed INT3s
   from merge-frida's INT3 table (every armed breakpoint, sorted; was its own 512-entry copy, so a
   session with more breakpoints left the rest unguarded), resumes the threads an in-place step

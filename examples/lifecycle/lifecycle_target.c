@@ -31,6 +31,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <tlhelp32.h>
+#include <psapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -151,6 +152,88 @@ static int thread_dirty(HANDLE t, char *why, size_t cap) {
     return 0;
 }
 
+/* Quit: worker threads still running 15 s later (`late`; every loop polls g_stop within ms),
+   and every thread of the process left SUSPENDED (`stuck`: tid:suspend-count:ip) -- e.g. by a
+   controller that is gone. */
+static LONG g_stuck, g_late;
+static char g_stuck_info[256];
+static void find_suspended(LONG *count, char *info, size_t cap) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    THREADENTRY32 te; te.dwSize = sizeof(te);
+    DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    if (snap == INVALID_HANDLE_VALUE) return;
+    for (BOOL more = Thread32First(snap, &te); more; more = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+        HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, te.th32ThreadID);
+        if (!t) continue;
+        DWORD prev = SuspendThread(t);
+        CONTEXT c; memset(&c, 0, sizeof(c)); c.ContextFlags = CONTEXT_CONTROL;
+        GetThreadContext(t, &c);
+        if (prev != (DWORD)-1) ResumeThread(t);
+        CloseHandle(t);
+        if (prev == (DWORD)-1 || prev == 0) continue;
+#if defined(_WIN64)
+        unsigned long long ip = c.Rip;
+#else
+        unsigned long long ip = c.Eip;
+#endif
+        const char *at = "";                       /* a probe-able site of ours? */
+        for (int i = 0; i < NSITES; ++i) if (g_site[i] && (ULONG_PTR)g_site[i] == ip) at = g_site_name[i];
+        ++*count;
+        size_t n = strlen(info);
+        _snprintf_s(info + n, cap - n, _TRUNCATE, "%s%lu:%ld:0x%llx%s%s", n ? "," : "",
+                    te.th32ThreadID, (long)prev, ip, *at ? "=" : "", at);
+    }
+    CloseHandle(snap);
+}
+
+/* "module+0xoff" for an address (diagnostics). */
+static void describe_ip(unsigned long long ip, char *out, size_t cap) {
+    HMODULE m = NULL; char path[MAX_PATH] = "";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)(ULONG_PTR)ip, &m) && GetModuleFileNameA(m, path, sizeof(path))) {
+        const char *b = strrchr(path, '\\');
+        _snprintf_s(out, cap, _TRUNCATE, "%s+0x%llx", b ? b + 1 : path, ip - (unsigned long long)(ULONG_PTR)m);
+    } else _snprintf_s(out, cap, _TRUNCATE, "0x%llx", ip);
+}
+/* Quit diagnostics: where the injected agent's threads are (a guard cleanup that never
+   finished would show here): tid:ip, for threads that started inside probe_api_agent.dll. */
+static char g_agent_thr[384];
+static void find_agent_threads(void) {
+    typedef LONG(NTAPI *QitFn)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    QitFn qit = (QitFn)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
+    HMODULE agent = GetModuleHandleA("probe_api_agent.dll");
+    MODULEINFO mi; memset(&mi, 0, sizeof(mi));
+    if (!qit || !agent || !K32GetModuleInformation(GetCurrentProcess(), agent, &mi, sizeof(mi))) return;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    THREADENTRY32 te; te.dwSize = sizeof(te);
+    DWORD pid = GetCurrentProcessId();
+    if (snap == INVALID_HANDLE_VALUE) return;
+    for (BOOL more = Thread32First(snap, &te); more; more = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid) continue;
+        HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+        if (!t) continue;
+        ULONG_PTR start = 0;
+        qit(t, 9 /*ThreadQuerySetWin32StartAddress*/, &start, sizeof(start), NULL);
+        if (start >= (ULONG_PTR)mi.lpBaseOfDll && start < (ULONG_PTR)mi.lpBaseOfDll + mi.SizeOfImage) {
+            DWORD prev = SuspendThread(t);
+            CONTEXT c; memset(&c, 0, sizeof(c)); c.ContextFlags = CONTEXT_CONTROL;
+            GetThreadContext(t, &c);
+            if (prev != (DWORD)-1) ResumeThread(t);
+#if defined(_WIN64)
+            unsigned long long ip = c.Rip;
+#else
+            unsigned long long ip = c.Eip;
+#endif
+            char where[96]; describe_ip(ip, where, sizeof(where));
+            size_t n = strlen(g_agent_thr);
+            _snprintf_s(g_agent_thr + n, sizeof(g_agent_thr) - n, _TRUNCATE, "%s%lu:%s", n ? "," : "", te.th32ThreadID, where);
+        }
+        CloseHandle(t);
+    }
+    CloseHandle(snap);
+}
+
 static void check(const char *kind) {
     char code_bad[256] = "", dr_bad[256] = "", why[96];
     int code_diff = 0, dr_dirty = 0, threads = 0;
@@ -188,12 +271,14 @@ static void check(const char *kind) {
           _snprintf_s(dr_bad + n, sizeof(dr_bad) - n, _TRUNCATE, "%s%lu:%s", n ? "," : "", te.th32ThreadID, why); }
     }
     CloseHandle(snap);
-    printf("{\"kind\":\"%s\",\"code_diff\":%d,\"code_bad\":\"%s\",\"dr_dirty\":%d,\"dr_bad\":\"%s\",\"dr_stale\":%ld,\"threads\":%d,"
+    LONG susp = 0; char susp_info[256] = "";
+    find_suspended(&susp, susp_info, sizeof(susp_info));
+    printf("{\"kind\":\"%s\",\"susp\":%ld,\"susp_info\":\"%s\",\"code_diff\":%d,\"code_bad\":\"%s\",\"dr_dirty\":%d,\"dr_bad\":\"%s\",\"dr_stale\":%ld,\"threads\":%d,"
            "\"debugger\":%d,\"agent_loaded\":%d,\"iterations\":%lld,\"errors\":%ld,\"first_error\":\"%s\","
-           "\"flips\":%ld,\"slow_calls\":%ld,\"churned\":%ld,\"dll_cycles\":%ld}\n",
-           kind, code_diff, code_bad, dr_dirty, dr_bad, g_dr_stale, threads, IsDebuggerPresent() ? 1 : 0,
+           "\"flips\":%ld,\"slow_calls\":%ld,\"churned\":%ld,\"dll_cycles\":%ld,\"late\":%ld,\"stuck\":%ld,\"stuck_info\":\"%s\",\"agent_thr\":\"%s\"}\n",
+           kind, susp, susp_info, code_diff, code_bad, dr_dirty, dr_bad, g_dr_stale, threads, IsDebuggerPresent() ? 1 : 0,
            GetModuleHandleA("probe_api_agent.dll") != NULL, (long long)g_iters, g_errors, g_first_error,
-           g_flips, g_slow_calls, g_churned, g_dll_cycles);
+           g_flips, g_slow_calls, g_churned, g_dll_cycles, g_late, g_stuck, g_stuck_info, g_agent_thr);
     fflush(stdout);
 }
 
@@ -293,7 +378,12 @@ int main(int argc, char **argv) {
         else if (!strncmp(line, "quit", 4)) break;
     }
     InterlockedExchange(&g_stop, 1);
-    WaitForMultipleObjects(n, pool, TRUE, 60000);
+    if (WaitForMultipleObjects(n, pool, TRUE, 15000) == WAIT_TIMEOUT) {
+        for (int i = 0; i < n; ++i) if (WaitForSingleObject(pool[i], 0) == WAIT_TIMEOUT) ++g_late;
+        find_suspended(&g_stuck, g_stuck_info, sizeof(g_stuck_info));
+        find_agent_threads();
+        WaitForMultipleObjects(n, pool, TRUE, 45000);
+    }
     check("app");
     return g_errors ? 1 : 0;
 }
