@@ -170,6 +170,8 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     name: test ${{ matrix.name }} (${{ needs.plan.outputs.image }})
+    env:
+      CI_IMAGE: ${{ needs.plan.outputs.image }}   # ci_shards.py ABSENT: OS components this image does not ship
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -216,6 +218,26 @@ jobs:
           7z x -y -oC:\tools\sde-x C:\tools\sde-x\sde-external-9.48.0-2024-11-25-win.tar | Out-Null
           Move-Item C:\tools\sde-x\sde-external-9.48.0-2024-11-25-win C:\tools\sde
           & C:\tools\sde\sde.exe -version
+      # check_oldcrt needs a pre-14.40 msvcp140.dll of the target's bitness. windows-2022 has one (VS 2022's bundled
+      # LLVM: the check's own default lookup); newer images do not (VS 2026's LLVM ships none). There: the 14.29.30133
+      # redistributable DLL from the PyPI wheel msvc-runtime (sha256-pinned), via regress UHH_OLD_MSVCP.
+      - name: Old msvcp140 14.29 (check_oldcrt; images without one)
+        if: matrix.oldmsvcp && needs.plan.outputs.image != 'windows-2022'
+        shell: pwsh
+        run: |
+          $w = @{
+            x64 = @('5c/cb/0c91c4cecc540ef9995d5274a8444cb2003119f7d36d098ed2e99e5e86dd/msvc_runtime-14.29.30133-cp39-cp39-win_amd64.whl', '957B1F1353D2E682F7B496CCE8D55DD836F397C984AA52A64C9378CD04DEBB22');
+            x86 = @('d2/4b/89e86f51e7f8447c38cc180cd4562b3865ada217e207384db193ebfcc448/msvc_runtime-14.29.30133-cp39-cp39-win32.whl', 'D486D45D466598D52BB53FE663E60676109DEDE8105DEA09A7C9B2A5B9E80A57')
+          }['${{ matrix.arch }}']
+          New-Item -ItemType Directory -Force C:\tools\oldmsvcp | Out-Null
+          $f = 'C:\tools\oldmsvcp\msvc_runtime.zip'
+          Invoke-WebRequest -UseBasicParsing -Uri "https://files.pythonhosted.org/packages/$($w[0])" -OutFile $f
+          $h = (Get-FileHash -Algorithm SHA256 $f).Hash
+          if ($h -ne $w[1]) { throw "msvc-runtime wheel sha256 mismatch: $h" }
+          Expand-Archive -Force $f C:\tools\oldmsvcp\x
+          $dll = 'C:\tools\oldmsvcp\x\msvc_runtime-14.29.30133.data\data\msvcp140.dll'
+          Write-Output "$dll $((Get-Item $dll).VersionInfo.FileVersion)"
+          "UHH_OLD_MSVCP=$dll" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
       - name: regress.py ${{ matrix.units }}
         run: python -u scripts/ci_shards.py run --arch ${{ matrix.arch }} --units "${{ matrix.units }}" --bin build-${{ matrix.arch }}/Release --out ci-logs --name ${{ matrix.name }}
       - uses: actions/upload-artifact@v6
@@ -244,3 +266,4 @@ jobs:
         with:
           name: unit-times
           path: unit-times.json
+

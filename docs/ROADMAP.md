@@ -1481,16 +1481,25 @@ Platinum 8573C under Hyper-V (no CET in the guest), Defender real-time protectio
   `check_realworld`, `check_symbols`, `check_callorig`). `ci_shards.py units` lists them; the units are re-parsed from
   regress.py main() on every run and must partition it exactly, so a new check is picked up automatically (60 s
   estimate + a warning annotation until `EST` is refreshed). Opt-in tiers (`--volume-reads`, `--bigapps`,
-  `--soak-minutes`) are not run. Critical path: x86 `check_realapps` (~15 min, one unit).
+  `--soak-minutes`) are not run. A long unit is SPLIT into parts run as units of their own (`SPLIT` in
+  ci_shards.py: `check_realapps:<part>` = regress `--only check_realapps` with `UHH_REALAPPS_ONLY` /
+  `UHH_REALAPPS_BACKENDS`; parts tasklist-m, ps-modules-<backend>, ps-fileversion-<backend>, rest = every other
+  scenario, parsed from `_realapps_scenarios()` so a new one is never lost). Critical path now: x86 `check_hunt`
+  (~7 min; longest shard 443 s) instead of x86 `check_realapps` (~15 min as one unit).
 - **External deps:** every check runs explicitly selected, so `skip_external()` is a FAIL in CI where a full
   unselected run would SKIP. The shards that need them install Frida 16.5.9 into `C:\work\fv16` (regress
-  `FRIDA_PY`) and Intel SDE 9.48 into `C:\tools\sde` (Intel's mirror, sha256-pinned, cached). A system program missing
-  on the image therefore shows as a FAIL.
+  `FRIDA_PY`) and Intel SDE 9.48 into `C:\tools\sde` (Intel's mirror, sha256-pinned, cached). `check_oldcrt` needs a
+  pre-14.40 msvcp140.dll: windows-2022 has one (VS 2022's bundled LLVM, the check's own lookup); on other images the
+  shard fetches the 14.29.30133 DLL from the PyPI wheel `msvc-runtime` (sha256-pinned) into `UHH_OLD_MSVCP`. An OS
+  component an image does not ship at all is listed per image in `ABSENT` (ci_shards.py; windows-2025:
+  `realapps-wmic`): its `skip_external()` row is posted as a warning like `KNOWN`, only on that image and only with
+  skip_external's "optional external dependency absent" text. Any other absent system program is a FAIL.
 - **Reading results without a token** (public REST, 60 requests/h unauthenticated): runs
   `GET /repos/talivision/uhh/actions/runs?branch=<b>`, jobs `GET .../actions/runs/<id>/jobs` (with per-step
   conclusions), annotations `GET .../check-runs/<job id>/annotations`. Every test job posts a notice
-  (`<shard> PASS|FAIL N/M ok ... <secs>s` + per-unit times), an error annotation with all its `] FAIL` lines, a
-  warning with its known failures; `summary` posts the whole table (chunked, ~3.5 KB per annotation); `build` posts
+  (`<shard> PASS|FAIL N/M ok ... <secs>s` + per-unit times), error annotations with every `] FAIL` line IN FULL
+  (chunked at 3.4 KB, a longer line split across parts, max 10 per step; the step summary and the `summary` job's
+  "Failures (full detail)" section always have every line whole), a warning with its known / absent failures; `summary` posts the whole table (chunked, ~3.5 KB per annotation); `build` posts
   runner facts, toolchain and the `cet_probe` JSON. Orchestrator helper:
   `~/work/uhh-tools/fan/work/ci/gh.py runs <branch> | jobs <run> | notes <run> [job-name regex]` (2-12 calls per run).
   Logs, artifacts and dispatch need auth: `~/work/tools/gh/bin/gh auth login` once, then
@@ -1563,20 +1572,72 @@ Real-bug candidates (reproduce on runners, not on the VM so far):
 - Seen once each, undetermined: x86 `logs-wedge-suspend` (`wedged=0`), x64 `detach-inline` (`1 thread(s) frozen;
   all clean` yet FAIL, detail cut).
 
-Environment (runner) effects, not UHH bugs:
+Environment (runner) effects, and how the checks were made robust without proving less (branch `citune`; full
+run 42203177441 at df3bddc, windows-2022 + cet-hw: 1830/1843 ok; every check below PASS on both arches; longest
+shard 443 s, was ~900 s; the 13 FAILs are the KNOWN hunt rows and findings owned elsewhere: crash-logs-inline-4t
+x64+x86, ret-probe-breakpoint x86, ntdll-churn-breakpoint x86, gated-e2e-attach-post-fbp-oin-cbp-rbp x64 (new check,
+another branch), logs-wedge-{exit x64, kill + suspend x86} (`wedged=0`: the wedge never formed on the runner)):
 - **patch-race-frozen (x64 + x86, deterministic)**: hook_cycles=[1,1,1,1], need >= 4 in the target's 12 s. Measured
   (diag): one attach -> install -> 400 ms -> detach cycle against 8 spinning threads takes 6-8.5 s on the 2-core
-  runner (13 threads frozen, all clean, 20-78 M hits per cycle), so only one cycle fits; never crashed or torn. The
-  check's time budget assumes 4 real cores. (Also a perf note: attach/detach under full CPU saturation is slow.)
-- **stream-latency-{inline,hw} (x64, 3 of 15 diag rows)**: p99 192-387 ms > the 100 ms ceiling on a noisy
-  4-vCPU runner; and once stream-latency-breakpoint failed with p99=3.3 ms on the per-line ordering condition (a log
-  line read before its tick line). Timing ceilings; flaky on runners.
+  runner (13 threads frozen, all clean, 20-78 M hits per cycle), so only one cycle fits; never crashed or torn.
+  **Fix:** cycle-count based. patchrace_target `--until-stdin` runs until the check closes its stdin; each trial
+  runs >= 4 cycles AND >= 12 s (whichever is later; <= 25 cycles; 300 s budget, else FAIL), so the VM keeps at
+  least its old exposure (VM x64: 6 cycles/trial in 12-17 s) and a runner gets 4 (28-31 s/trial). A second runner
+  effect surfaced then: the report taken 400 ms after the attach can still show `hits=0` (the install against 8
+  spinning threads is not finished yet), although the same cycle's detach summary counts 20-78 M hits; "this cycle's
+  hook ran" now uses the detach-time count (stderr `probe: detached: hits=N`). patch-race-unsafe unchanged (still
+  KNOWN: fails when the race is not seen; with more cycles it now sees it more often: crashed=3/4 on a runner).
+- **stream-latency-* (x64 + x86)**: NOT scheduler noise. Rewritten to measure the real latency: logstream_target
+  stamps each LogSite call and each of its own lines with QueryPerformanceCounter, the reader stamps arrivals with
+  the same counter, and an uninstrumented writer (the same target, a line every ~5 ms) runs alongside as a
+  scheduler-noise sampler (cyclictest-style: late writes and late arrivals). Bar: p99 < 100 ms when the sampler saw
+  < 50 ms of stall in the run (quiet: the original absolute bar), else p99 of (latency - the stall the sampler saw in
+  that record's own window) < 100 ms; plus all 50 records once and in call order, never before their event. Diag
+  runs (CI 42192197211, 42195891554, 42198334462: 10-24 runs per arch x {0,2,4 CPU burners} x {TEMP on C:, D:}):
+  the sampler showed a QUIET machine (stalls 1-5 ms) while records were held 50 ms - 2.5 s, consecutive records
+  released together while the target kept running on schedule (x64 hw: #24-#46 all at once, 2.5 s late). Watching
+  the session log file located the hold BEFORE the file (event -> in file == event -> stdout; file -> stdout ~0):
+  UHH writes each batch to `%TEMP%\uhh\logs\*.jsonl` first, and appends on the runner's C: (network-backed managed
+  disk) block when the lazy writer flushes (worst near ~1 s after the first write: sample #8-#10 is the slowest in
+  almost every run). Same job, same commit (run 42198334462, 10 runs per arch each): TEMP on the runner's D: (local
+  temp disk) -> 60/60 PASS, breakpoint/hw p99 ~0.5 ms (one 10 ms), the #8-#10 bump gone, sampler appends <= 10 ms;
+  TEMP on C: -> 1 FAIL (breakpoint 221 ms, #25+#26 released together), several 50-63 ms holds, sampler appends
+  stalling up to 364 ms. Earlier C: runs: 2.5 s (x64 hw), 205 ms (x86 inline), 164 / 136 ms (hw).
+  The VM shows the same holds, from Defender: A/B on the VM, same C: disk, x64, 3 runs each: TEMP =
+  `C:\Users\admin\AppData\Local\Temp` (real-time scan on) -> 2/3 FAIL (inline 427 / 180 ms holds at #8-#10, near
+  misses 91 / 79 ms); TEMP in the Defender-excluded `C:\work\...` -> 9/9 PASS (worst 30 ms).
+  **Fix (check):** the controller's TEMP/TMP is `<build dir>/uhh-latency-tmp` (next to the binaries: the VM's
+  `C:\work`, the CI workspace on D:, both local and AV-excluded), so the check measures UHH's pipeline, not the
+  user profile's AV or the runner's OS disk. VM after the fix: 17/18 PASS over 3 runs x 2 arches x 3 backends; the
+  one FAIL (x64 hw, #8-#10 held 366 ms before the file) came with the sampler's own appends stalling 243 ms in that
+  run (the VM's disk is shared with the other agents' builds). **Finding for the owners (UHH design):** live stdout
+  latency is bounded by the session file's write latency -- the writer thread writes each batch to the file, then
+  to stdout, so an AV scan of the new file or a slow disk (the first lazy-writer flush, ~1 s after the first write,
+  is the usual culprit) holds live records 0.1-2.5 s. Candidates: write stdout before / independently of the file
+  (the file stays the complete record), or give the file its own thread. The check deliberately does NOT discount
+  disk stalls (the sampler's file is not UHH's file; discounting would hide exactly this).
+  The 3.3 ms breakpoint failure was the old per-line ordering condition: the target's own lines are FORWARDED by
+  UHH (pipe + forwarder thread, since 2f2f8c1), so a record can reach stdout before the tick line the target wrote
+  just before the event; measured `log_before_tick` = 4-12 of 50 per run with 4 CPU burners, 0 otherwise. No such
+  cross-stream promise exists (docs/api.md promises whole lines only): now reported, not required. (Possible UHH
+  improvement: the writer drains the forward pipe's pending bytes before a batch.) Perf note: inline p50 ~15.6 ms
+  everywhere = one timer quantum of the drainer's idle `Sleep(1)`.
 - **realapps-ps-fileversion-* x86 (deterministic)**: the plain 32-bit `Get-Process -FileVersionInfo` lists only
   itself and exits 1 on a runner -- no other WoW64 process exists there (the VM has some), so `stable_rows=0` fails.
-  The scenario's assumption, not UHH (all reads mapped, nothing dropped).
-- windows-2025 only: `realapps-wmic` (WMIC removed from Server 2025), `oldcrt` (VS 2026's LLVM ships no pre-14.40
-  msvcp140) -- absent deps, FAIL because explicitly selected; `realapps-ps-modules-breakpoint` once: an svchost loaded
-  fwpuclnt.dll between the plain and the instrumented run (a live process list).
+  **Fix:** the check starts 3 helpers of its own bitness (`<sysdir>\findstr.exe` waiting on a pipe) for the whole
+  scenario and REQUIRES each in both plain runs and the instrumented one, and each read by the instrumented program
+  through a handle mapped to its pid and name (`helpers=3xfindstr.exe: stable=3 instrumented=3 read=3/3`) -- on
+  every machine, both arches.
+- **windows-2025 only**: `realapps-wmic` (WMIC is a Feature on Demand Server 2025 no longer installs) -> new scenario
+  `realapps-ps-cim` (the same WMI process query through PowerShell `Get-CimInstance`, every image, all backends)
+  and `realapps-wmic` absent = `skip_external()` with that reason, posted by CI as ABSENT on windows-2025 only.
+  `oldcrt` (VS 2026's LLVM ships no pre-14.40 msvcp140) -> CI provides msvcp140 14.29.30133 via `UHH_OLD_MSVCP`
+  (PyPI `msvc-runtime` wheel, sha256-pinned). Verified on windows-2025 (diag jobs of run 42192197211): x64 and x86
+  `realapps-ps-cim-*`, `realapps-ps-fileversion-*`, `oldcrt-{inline,breakpoint}` (app_local=True, 2000/2000) PASS,
+  wmic ABSENT. `realapps-ps-modules-breakpoint` once: an svchost loaded fwpuclnt.dll between the plain and the
+  instrumented run (a live process list).
+- New on runners with ps-cim: x86 `realapps-ps-cim-inline` `intr=1` once (a callback interrupted when PowerShell
+  exited: the crash-logs-inline-4t class -- an inline hit whose callback never completed because the process ended).
 - Passing on runners where the VM was suspect: x86 `hunt-ctx-breakpoint` (no 600 s timeout), x86
   `edgehunt-*-fmtptr` (B10), x64 `blog-pwsh-attach-detach-inline`, x86 `hunt-exit-*`.
 
