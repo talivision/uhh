@@ -605,6 +605,10 @@ static bool controller_dead(const probe_agent_shared *sh) {
     return dead;
 }
 
+struct HitScope;
+static HitScope *log_carrier(probe_context *c);
+static void log_carried(HitScope *h, bool dropped);
+
 // Format and stack are produced BEFORE claiming a ring slot so a slot is held only
 // for a copy. A full ring makes the producer wait (backpressure); see the ring's comment in
 // probe_agent_shared.hpp for the only cases that do not end in the ring.
@@ -620,8 +624,14 @@ static void agent_log(probe_context *c, bool stack, const char *format, va_list 
     local.frame_count = stack ? capture_stack(c, local.frames, PROBE_STACK_MAX_FRAMES) : 0;
     local.has_stack = stack ? 1 : 0;
     local.probe = state->index; local.tid = c->tid;
+    // The callback's first record carries its hit's unaccounted unit (probe_agent_stripe):
+    // from the publish on, the hit is accounted by this record, not as interrupted.
+    HitScope *const carrier = log_carrier(c);
+    local.carry = carrier ? 1 : 0; local.reserved = 0;
     auto *sh = state->shared;
-    if (sh->controller_gone) { InterlockedIncrement(&sh->log_dropped); return; }   // nobody will read it
+    if (sh->controller_gone) {                                    // nobody will read it
+        InterlockedIncrement(&sh->log_dropped); log_carried(carrier, true); return;
+    }
     LONG64 pos = sh->log_head;
     probe_agent_log *rec = nullptr;
     // Heartbeat watch: time is accumulated in small steps so a debugger freezing the whole
@@ -643,9 +653,9 @@ static void agent_log(probe_context *c, bool stack, const char *format, va_list 
             pos = sh->log_head;
         } else if (diff < 0) {
             // Full: wait for a slot rather than lose the record.
-            if (sh->controller_gone) { InterlockedIncrement(&sh->log_dropped); return; }
+            if (sh->controller_gone) { InterlockedIncrement(&sh->log_dropped); log_carried(carrier, true); return; }
             if (sh->ring_stalled && sh->log_ipc && !ipc_failed) {
-                if (deliver_by_ipc(&local, state->index)) return;
+                if (deliver_by_ipc(&local, state->index)) { log_carried(carrier, false); return; }
                 ipc_failed = true;
             }
             ULONGLONG now = GetTickCount64();
@@ -657,7 +667,7 @@ static void agent_log(probe_context *c, bool stack, const char *format, va_list 
                 idle = 0;
                 if (controller_dead(sh)) {
                     InterlockedExchange(&sh->controller_gone, 1);
-                    InterlockedIncrement(&sh->log_dropped); return;
+                    InterlockedIncrement(&sh->log_dropped); log_carried(carrier, true); return;
                 }
             }
             SwitchToThread();
@@ -670,9 +680,11 @@ static void agent_log(probe_context *c, bool stack, const char *format, va_list 
     rec->text_len = local.text_len;
     std::memcpy(rec->text, local.text, local.text_len + 1);
     rec->has_stack = local.has_stack; rec->frame_count = local.frame_count;
+    rec->carry = local.carry; rec->reserved = 0;
     if (local.frame_count) std::memcpy(rec->frames, local.frames, local.frame_count * sizeof(uint64_t));
     MemoryBarrier();
-    InterlockedExchange64(&rec->seq, pos + 1);                    // publish
+    InterlockedExchange64(&rec->seq, pos + 1);                    // publish (with carry: the unit goes with it)
+    log_carried(carrier, false);
 }
 
 // One warning per probe, delivered as a log record (the callback runs inside the target).
@@ -911,7 +923,8 @@ struct HitScope;
 struct ThreadSlot {
     volatile LONG tid;
     HitScope *active;                    // the hit whose callback this thread is running
-    volatile LONG64 *active_cell;        // that hit's hit_stripes cell
+    probe_agent_stripe *active_line;     // that hit's hit_stripes line
+    volatile LONG active_logged;         // ... and its unaccounted unit left with its first log
     uintptr_t moved_from, moved_to;      // a fault moved out of a trampoline (tramp_veh)
     const void *teb;                     // the owner's identity: TEB, stack base, creation time
     uintptr_t stack;
@@ -974,9 +987,10 @@ struct OrigPost {                    // x64: written by uhh_orig_thunk (gpr +0x0
 };
 static_assert(offsetof(OrigPost, xmm) == 0x30, "uhh_orig_thunk layout");
 struct HitScope {
-    volatile LONG64 *cell;          // hit_stripes cell: its in-flight count
+    probe_agent_stripe *line;       // hit_stripes line: its unaccounted unit and running count
     ThreadSlot *slot;               // this thread's slot (null: table full)
     volatile LONG abandoned = 0;
+    bool logged = false;            // its first log carried the unaccounted unit (see agent_log)
     const void *xmm6 = nullptr;     // x64: the hit's XMM6..XMM15 (safetyhook Context, contiguous)
     uintptr_t canary = 0;           // (uintptr_t)this ^ HIT_CANARY while the callback runs
     const void *xmm0 = nullptr;     // the hit's XMM0..XMM5 (vector/float arguments; safetyhook Context)
@@ -1277,19 +1291,45 @@ extern "C" int probe_add_symbol_cfg(probe_session *s, const char *symbol, probe_
 }
 
 static volatile LONG g_stopping;
-// Callbacks running right now are counted with their hits in the SHARED block (hit_stripes'
-// high bits): what is still in flight when the process dies (ExitProcess kills threads
-// mid-callback) is reported by the controller as callbacks_interrupted.
+// Every hit is counted with an unaccounted unit in the SHARED block (hit_stripes' high bits)
+// that leaves with the callback's first log or when it returns: what is left when the process
+// dies (ExitProcess kills threads mid-callback) is reported by the controller as
+// callbacks_interrupted (probe_agent_stripe).
+// A callback ended (returned, or was unwound past): it no longer runs, and its unaccounted
+// unit goes -- unless its first log already carried it (probe_agent_stripe).
+static void hit_settle(probe_agent_stripe *line, bool logged) {
+    if (!logged) InterlockedExchangeAdd64(&line->value, -PROBE_AGENT_INFLIGHT_ONE);
+    InterlockedDecrement64(&line->running);
+}
 // An exception or longjmp left the original (call_original) and is unwinding past this
 // hit's callback: settle what call_mid would have on return (once).
 static void hit_scope_abandon(HitScope *h) {
     if (InterlockedExchange(&h->abandoned, 1)) return;
     if (h->slot && h->slot->active == h) h->slot->active = nullptr;
-    InterlockedExchangeAdd64(h->cell, -PROBE_AGENT_INFLIGHT_ONE);
+    hit_settle(h->line, h->logged);
 }
+// The hit a record from c may carry: c's own, on its own thread while its callback runs (the
+// slot names it), and only for its first record. A thread without a slot (the table is full)
+// carries nothing: its unit leaves when the callback returns, as before v21.
+static HitScope *log_carrier(probe_context *c) {
+    if (!c || !c->hit_scope) return nullptr;
+    ThreadSlot *ts = thread_slot(GetCurrentThreadId(), false);
+    if (!ts || ts->active != c->hit_scope) return nullptr;
+    auto *h = static_cast<HitScope *>(c->hit_scope);
+    return h->logged ? nullptr : h;
+}
+// The carrier's record was published / handed over (the controller retires the unit), or
+// dropped (counted in log_dropped: the unit goes here).
+static void log_carried(HitScope *h, bool dropped) {
+    if (!h) return;
+    if (dropped) InterlockedExchangeAdd64(&h->line->value, -PROBE_AGENT_INFLIGHT_ONE);
+    h->logged = true;
+    if (h->slot) InterlockedExchange(&h->slot->active_logged, 1);
+}
+// Callbacks still executing (an unhook waits for them).
 static bool any_inflight() {
     if (!shared) return false;
-    return probe_agent_inflight(shared) != 0;
+    return probe_agent_running(shared) != 0;
 }
 
 // XSAVE support, probed once: mask = XCR0 restricted to x87|SSE|AVX|AVX-512 components.
@@ -1387,16 +1427,22 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     ThreadSlot *const ts = own_thread_slot(c.tid);
     if (ts && ts->busy) return false;                      // the agent's own query: see ThreadSlot
     uint32_t stripe = (c.tid >> 2) & (PROBE_AGENT_STRIPES - 1);
-    volatile LONG64 &cell = shared->hit_stripes[index][stripe].value;
-    // ONE atomic add counts the hit and marks a callback in flight (see hit_stripes): a thread
+    probe_agent_stripe &line = shared->hit_stripes[index][stripe];
+    volatile LONG64 &cell = line.value;
+    // ONE atomic add counts the hit and its unaccounted unit (see probe_agent_stripe): a thread
     // killed between two separate counters left a hit that was neither logged nor interrupted.
+    // `running` is separate: it is not accounting (a kill between the two adds is harmless).
     InterlockedExchangeAdd64(&cell, 1 + PROBE_AGENT_INFLIGHT_ONE);
-    // g_stopping is checked only once this hit is in flight: probe_agent_stop sets it and then
-    // waits for in-flight callbacks, so a hit is either seen by that wait or sees the flag
+    InterlockedIncrement64(&line.running);
+    // g_stopping is checked only once this hit is running: probe_agent_stop sets it and then
+    // waits for running callbacks, so a hit is either seen by that wait or sees the flag
     // (both sides use full-barrier interlocked operations). Checked first, a thread between
     // the check and the add ran its callback after the detach (its IPC then raised an
     // exception nobody handled, visible to the target).
-    if (g_stopping) { InterlockedExchangeAdd64(&cell, -(1 + PROBE_AGENT_INFLIGHT_ONE)); return false; }
+    if (g_stopping) {
+        InterlockedExchangeAdd64(&cell, -(1 + PROBE_AGENT_INFLIGHT_ONE)); InterlockedDecrement64(&line.running);
+        return false;
+    }
     // A probe hit by code the callback itself runs (call_func of a probed function, or a
     // probed API called directly) is counted but does not re-enter a callback -- exactly
     // what breakpoint/hw do inside call_func. Re-entering recursed until the stack overflowed.
@@ -1407,12 +1453,12 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
         // stack were reused too, a dead thread's: another creation time. That hit stays in
         // flight (interrupted).
         const uint64_t now = thread_born(ts);
-        if (!ts->born || !now || now == ts->born) InterlockedExchangeAdd64(ts->active_cell, -PROBE_AGENT_INFLIGHT_ONE);
+        if (!ts->born || !now || now == ts->born) hit_settle(ts->active_line, ts->active_logged != 0);
         ts->born = now;
         ts->active = nullptr;
     }
     if (ts && ts->active) {
-        InterlockedExchangeAdd64(&cell, -PROBE_AGENT_INFLIGHT_ONE); return false;
+        hit_settle(&line, false); return false;
     }
     // The mid-hook stub preserves GPRs, flags and XMM0-15 only. The callback (and the CRT
     // it calls) may touch x87/MXCSR/YMM/ZMM state -- e.g. vzeroupper -- which the target
@@ -1421,19 +1467,19 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     // Extended state (MXCSR, AVX/AVX-512) and DF are handled in mid_entry, BEFORE any of
     // this C code runs -- see there.
     forget_region();     // validated regions are trusted within ONE hit only (see RegionCache)
-    HitScope scope{&cell, ts};
+    HitScope scope{&line, ts};
     scope.canary = (uintptr_t)&scope ^ HIT_CANARY;
 #if defined(_WIN64)
     scope.xmm6 = &native.xmm6;
 #endif
     scope.xmm0 = &native.xmm0;
     scope.x87_post = x87_post;
-    if (ts) { ts->active_cell = &cell; ts->active = &scope; }
+    if (ts) { ts->active_line = &line; ts->active_logged = 0; ts->active = &scope; }
     c.hit_scope = &scope;
     bool callback_ok = run_callback(cb, &c);
     if (ts) ts->active = nullptr;
     scope.canary = 0;
-    InterlockedExchangeAdd64(&cell, -PROBE_AGENT_INFLIGHT_ONE);
+    hit_settle(&line, scope.logged);
     if (!callback_ok) {
         // A faulting callback is a no-op: its register changes are discarded -- unless it had
         // already run the original (call_original). Falling through would run the original a
@@ -2295,7 +2341,10 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
         service_event = OpenEventW(SYNCHRONIZE, FALSE, name);
         if (service_event) {
             service_up = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-            HANDLE t = CreateThread(nullptr, 0, service_main, nullptr, 0, nullptr);
+            // Above normal priority, like the controller's threads in the target (see session.cpp
+            // create_remote_thread_boosted): a busy program must not delay installs and arming.
+            HANDLE t = CreateThread(nullptr, 0, service_main, nullptr, CREATE_SUSPENDED, nullptr);
+            if (t) { SetThreadPriority(t, THREAD_PRIORITY_HIGHEST); ResumeThread(t); }
             // service_ready is set by the thread itself, once running. Init does not finish
             // (so the controller reports nothing "active" and releases nothing) before then:
             // a DLL with inline sites loaded right after -- e.g. at once after an attach --

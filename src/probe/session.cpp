@@ -3955,6 +3955,7 @@ static void pump(probe_session *s, DWORD ms) {
 
 static void ipc_thaw(probe_session *s);
 static void pump(probe_session *s, DWORD ms);
+static HANDLE create_remote_thread_boosted(HANDLE process, LPTHREAD_START_ROUTINE entry, void *argument, DWORD *tid);
 static void detach(probe_session *s) {
     s->error.clear();
     // From here on nothing may start new agent work, arm anything, gate or hold a thread: the
@@ -3984,8 +3985,8 @@ static void detach(probe_session *s) {
         auto local_stop = reinterpret_cast<uintptr_t>(GetProcAddress(s->local_agent, "probe_agent_stop"));
         if (local_stop) {
             uint64_t remote_stop = s->remote_agent + local_stop - reinterpret_cast<uintptr_t>(s->local_agent);
-            HANDLE t = CreateRemoteThread(s->pi.hProcess, nullptr, 0,
-                                          reinterpret_cast<LPTHREAD_START_ROUTINE>((uintptr_t)remote_stop), nullptr, 0, nullptr);
+            HANDLE t = create_remote_thread_boosted(s->pi.hProcess,
+                                                    reinterpret_cast<LPTHREAD_START_ROUTINE>((uintptr_t)remote_stop), nullptr, nullptr);
             if (t) {                                   // keep dispatching until it has run
                 ULONGLONG until = GetTickCount64() + 5000;
                 while (!s->exited && WaitForSingleObject(t, 0) == WAIT_TIMEOUT && GetTickCount64() < until) pump(s, 20);
@@ -5581,10 +5582,26 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     disposition = DBG_CONTINUE; return true;
 }
 
+// Our threads in the target (agent load / init / stop) run above normal priority. The target
+// may keep every CPU busy: a new normal-priority thread then waits behind its threads for a
+// whole scheduling quantum (Windows Server: ~190 ms) at every start and wake-up -- measured on
+// 2-vCPU CI runners with 4 spinning target threads, an attach armed its breakpoint/hw probes
+// (which wait for the agent's controller-death guard) only 0.3-1.5 s after the attach, and a
+// detach took as long. The agent's work is short and never spins, so the boost costs the
+// program nothing but those milliseconds. (CREATE_SUSPENDED: the priority is in place before
+// the thread's first instruction.)
+static HANDLE create_remote_thread_boosted(HANDLE process, LPTHREAD_START_ROUTINE entry, void *argument, DWORD *tid) {
+    HANDLE t = CreateRemoteThread(process, nullptr, 0, entry, argument, CREATE_SUSPENDED, tid);
+    if (!t) return t;
+    SetThreadPriority(t, THREAD_PRIORITY_HIGHEST);
+    ResumeThread(t);
+    return t;
+}
+
 static bool start_remote(probe_session *s, LPTHREAD_START_ROUTINE entry,
                          void *argument, probe_session::RemoteWork work) {
     s->remote_fault.clear();
-    s->remote_thread = CreateRemoteThread(s->pi.hProcess, nullptr, 0, entry, argument, 0, &s->remote_tid);
+    s->remote_thread = create_remote_thread_boosted(s->pi.hProcess, entry, argument, &s->remote_tid);
     if (!s->remote_thread) { set_error(s, win_error("create agent thread")); return false; }
     if (trace_enabled()) std::fprintf(stderr, "  remote work=%d tid=%lu\n", (int)work, (unsigned long)s->remote_tid);
     s->remote_work = work; return true;
@@ -5738,6 +5755,9 @@ static bool complete_remote_thread(probe_session *s, DWORD result) {
 // s->probes (the debug loop may be growing it); does not hold agent_mu while a full stdout
 // queue applies backpressure.
 static void enqueue_agent_record(probe_session *s, const probe_agent_log &rec) {
+    // A callback's first record carries its hit's unaccounted unit: taken now, the hit is
+    // accounted by this record (logs_written, or controller_dropped below), not as interrupted.
+    if (s->shared) probe_agent_retire_carry(s->shared, rec);
     try {
         LogRecord r;
         uint32_t len = rec.text_len < PROBE_AGENT_LOG_TEXT_CAP ? rec.text_len : PROBE_AGENT_LOG_TEXT_CAP - 1;
@@ -5928,7 +5948,7 @@ static void stop_drainer(probe_session *s) {
     // an answer from the agent (no service thread) the wait is bounded (15 s), as before.
     if (s->shared && !s->exited && s->drainer.joinable()) {
         MemoryBarrier();
-        if (const uint64_t running = probe_agent_inflight(s->shared))
+        if (const uint64_t running = probe_agent_running(s->shared))
             std::fprintf(stderr, "probe: %s: %llu callback(s) still running; delivering their logs\n",
                          s->detached_hooks ? "detach" : "close", (unsigned long long)running);
     }
@@ -5939,7 +5959,7 @@ static void stop_drainer(probe_session *s) {
         ULONGLONG last_answer = start;
         for (;;) {
             MemoryBarrier();
-            const uint64_t inflight = probe_agent_inflight(s->shared);
+            const uint64_t inflight = probe_agent_running(s->shared);     // callbacks that may still log
             if (!inflight && s->shared->log_head == s->shared->log_tail) break;
             const ULONGLONG now = GetTickCount64();
             if (inflight) {
@@ -6430,7 +6450,7 @@ extern "C" void probe_close(probe_session *s) {
         // A config block stays in a detached target while any inline callback is still in flight
         // there (its thread suspended by the program, or past the drain): that callback's
         // get_config points into it. Freed, it read freed (or reused) memory.
-        const uint64_t left = s->detached && !s->exited && s->shared ? probe_agent_inflight(s->shared) : 0;
+        const uint64_t left = s->detached && !s->exited && s->shared ? probe_agent_running(s->shared) : 0;
         if (left && !s->config_blocks.empty())
             std::fprintf(stderr, "probe: detach: %zu config block(s) left in the target for %llu callback(s) still in flight\n",
                          s->config_blocks.size(), (unsigned long long)left);

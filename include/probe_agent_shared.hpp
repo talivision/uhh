@@ -10,7 +10,7 @@
 #include <cstdio>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 20;
+constexpr uint32_t PROBE_AGENT_VERSION = 21;
 constexpr uint32_t PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH = 1u << 9;   /* agent side only needs this one */   /* == PROBE_UNSAFE_FAST_PATCH (asserted in session.cpp) */
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 128;   /* inline probes per session; the 129th is refused */
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
@@ -82,6 +82,10 @@ struct probe_agent_log {
     uint32_t has_stack;
     uint32_t text_len;             /* text may contain NULs (%c of 0): this is its length */
     volatile LONG owner;           /* tid of the producer that claimed the slot; 0 = free/unknown */
+    uint32_t carry;                /* 1: the FIRST record of a running callback -- it carries that hit's
+                                      unaccounted unit (hit_stripes[probe][stripe of tid]); the controller
+                                      retires the unit when it takes the record (v21, see hit_stripes) */
+    uint32_t reserved;
     uint64_t frames[32];           /* == PROBE_STACK_MAX_FRAMES */
 };
 
@@ -140,10 +144,23 @@ struct probe_agent_guard {
 };
 
 /* Hit counting and in-flight tracking are striped over cache-line-separated counters
-   (indexed by thread id) so threads hitting the same probe do not contend on one line.
-   Exact: the controller sums the stripes. */
+   (indexed by thread id: (tid >> 2) % PROBE_AGENT_STRIPES) so threads hitting the same probe
+   do not contend on one line. Exact: the controller sums the stripes.
+   value:   low 48 bits = hits; high 16 bits = UNACCOUNTED hits -- callbacks that have neither
+            delivered a log nor returned. A hit adds 1 + one unit in ONE atomic add. The unit
+            leaves exactly once: when the callback returns without having logged (the agent
+            subtracts it), or, when it logs, with its FIRST record -- published with carry = 1
+            (one store: the ring's seq), the controller subtracts it when it takes that record
+            (ring or PROBE_IPC_LOG). So a thread killed at ANY instant (process exit) leaves
+            hits == logs + dropped + unaccounted exactly: killed before its record is published,
+            the unit stays (callbacks_interrupted); after, the record is delivered and the unit
+            goes with it. (v20 dropped the unit only when the callback returned: a thread
+            killed between publishing its log and returning was counted both as a log and as
+            interrupted.)
+   running: callbacks executing now (whether or not they logged): what an unhook / a detach
+            drain waits for. Not used for accounting. */
 constexpr uint32_t PROBE_AGENT_STRIPES = 16;
-struct alignas(64) probe_agent_stripe { volatile LONG64 value; char pad[56]; };
+struct alignas(64) probe_agent_stripe { volatile LONG64 value; volatile LONG64 running; char pad[48]; };
 
 struct probe_agent_shared {
     uint32_t magic;
@@ -161,10 +178,9 @@ struct probe_agent_shared {
     volatile LONG ring_stalled;    /* controller: the ring is stuck behind a live producer's slot -- use PROBE_IPC_LOG */
     volatile LONG log_ipc;         /* controller: 1 while it is the debugger and services PROBE_IPC_LOG */
     uint32_t controller_pid;       /* lets producers tell a dead controller from a busy one */
-    /* Per probe, striped by thread: the low 48 bits count hits, the high 16 bits count
-       callbacks running now. One atomic add does both, so a thread killed at ANY instant
-       (process exit) leaves hits == logs + dropped + interrupted exactly. Non-zero in-flight
-       after the target exited = callbacks cut off by the process dying. */
+    /* Per probe, striped by thread: hits + unaccounted units, and running callbacks (see
+       probe_agent_stripe). Non-zero unaccounted after the target exited and the ring was
+       drained = callbacks cut off by the process dying before their first log. */
     probe_agent_stripe hit_stripes[PROBE_AGENT_MAX_PROBES][PROBE_AGENT_STRIPES];
     probe_agent_request requests[PROBE_AGENT_MAX_PROBES];
     probe_agent_log logs[PROBE_AGENT_LOG_CAP];
@@ -184,7 +200,7 @@ struct probe_agent_shared {
     volatile LONG live_callbacks;
 };
 
-constexpr LONG64 PROBE_AGENT_INFLIGHT_ONE = 1LL << 48;   /* one running callback in a hit_stripes cell */
+constexpr LONG64 PROBE_AGENT_INFLIGHT_ONE = 1LL << 48;   /* one unaccounted hit in a hit_stripes cell */
 
 inline uint64_t probe_agent_hits(const probe_agent_shared *sh, uint32_t index) {
     uint64_t n = 0;
@@ -193,11 +209,30 @@ inline uint64_t probe_agent_hits(const probe_agent_shared *sh, uint32_t index) {
     return n;
 }
 
+/* Unaccounted hits (see probe_agent_stripe): callbacks without a delivered log that have not
+   returned, plus first records published but not yet taken by the controller. After the
+   final drain: callbacks_interrupted / the detach line's in_flight. */
 inline uint64_t probe_agent_inflight(const probe_agent_shared *sh) {
     uint64_t n = 0;
     for (uint32_t p = 0; p < PROBE_AGENT_MAX_PROBES; ++p)
         for (uint32_t i = 0; i < PROBE_AGENT_STRIPES; ++i) n += (uint64_t)sh->hit_stripes[p][i].value >> 48;
     return n;
+}
+/* Callbacks executing now (a dead thread's stays counted). */
+inline uint64_t probe_agent_running(const probe_agent_shared *sh) {
+    uint64_t n = 0;
+    for (uint32_t p = 0; p < PROBE_AGENT_MAX_PROBES; ++p)
+        for (uint32_t i = 0; i < PROBE_AGENT_STRIPES; ++i) n += (uint64_t)sh->hit_stripes[p][i].running;
+    return n;
+}
+/* The controller took a record with carry = 1: retire its hit's unaccounted unit. The record
+   lives in memory the target can write: bounded, and never below zero (a CAS, so a bogus
+   carry cannot borrow from the hit count). */
+inline void probe_agent_retire_carry(probe_agent_shared *sh, const probe_agent_log &rec) {
+    if (rec.carry != 1 || rec.probe >= PROBE_AGENT_MAX_PROBES) return;
+    volatile LONG64 &cell = sh->hit_stripes[rec.probe][(rec.tid >> 2) & (PROBE_AGENT_STRIPES - 1)].value;
+    for (LONG64 v = cell; ((uint64_t)v >> 48) != 0; v = cell)
+        if (InterlockedCompareExchange64(&cell, v - PROBE_AGENT_INFLIGHT_ONE, v) == v) return;
 }
 
 inline void probe_agent_mapping_name(DWORD pid, wchar_t (&name)[64]) {

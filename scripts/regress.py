@@ -2889,9 +2889,14 @@ def check_gated_mem(threads=8, reads=1000):
 def check_crash_logs(n=5000, threads=4):
     """Log delivery when the TARGET crashes: several threads log on every probed call; the
     first to reach n calls dies with an unhandled access violation while the others are
-    still logging. Every hit counted must have its log delivered (logs == hits, at least
-    n) -- for inline they sit in the shared ring at the moment of death -- and none may be
-    counted as dropped. Single-thread run too: exactly n."""
+    still logging. Every hit is accounted EXACTLY (the gospel): hits == logs + log_dropped +
+    callbacks_interrupted, with log_dropped == 0 and hits >= n. Inline: the process death
+    kills the other threads wherever they are -- one killed inside its callback before its
+    log was published is callbacks_interrupted (at most one per thread); one killed after
+    publishing is a delivered log and NOT interrupted (its record carried the hit's unit,
+    probe_agent_shared v21; v20 counted it twice -- 3 of 36 runner runs). breakpoint/hw run
+    callbacks in the controller: interrupted == 0, logs == hits. Single-thread run too:
+    exactly n logs, nothing interrupted (the thread crashes after its hit returned)."""
     d, t = exe("hitcost_driver.exe"), exe("hitcost_target.exe")
     if not d or not t:
         return missing_bin("crash-logs", "hitcost driver/target")
@@ -2906,9 +2911,13 @@ def check_crash_logs(n=5000, threads=4):
                 tids = {x.get("tid") for x in o if x.get("kind") == "probe_log"}
                 pr = next(iter(probes(o)), {})
                 hits = pr.get("hits") or 0
-                ok = (rep.get("app_exit") == 0xC0000005 and logs == hits and rep.get("log_dropped") == 0 and
-                      (hits == n if nt == 1 else hits >= n and len(tids) == nt))
-                record(name, ok, f"exit=0x{(rep.get('app_exit') or 0):x} hits={hits} logs={logs} (n={n}) "
+                intr = rep.get("callbacks_interrupted")
+                exact = intr is not None and hits == logs + (rep.get("log_dropped") or 0) + intr
+                ok = (rep.get("app_exit") == 0xC0000005 and exact and rep.get("log_dropped") == 0 and
+                      (hits == n and logs == n and intr == 0 if nt == 1 else
+                       hits >= n and len(tids) == nt and intr <= (nt - 1 if bk == "inline" else 0)))
+                record(name, ok, f"exit=0x{(rep.get('app_exit') or 0):x} hits={hits} logs={logs} "
+                                 f"interrupted={intr} (hits == logs + dropped + interrupted: {exact}; n={n}) "
                                  f"threads_logging={len(tids)}/{nt} dropped={rep.get('log_dropped')}")
             except Exception as e:
                 record(name, False, repr(e))
