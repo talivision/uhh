@@ -701,6 +701,23 @@ std::string symbolize(HANDLE process, std::uint64_t address) {
     }
 }
 
+// The stack-walk session (keyed by the real process handle: StackWalk64 needs the target's
+// memory, e.g. x64 .pdata), created on first use with the same modules as the names session.
+// Every walker (walk_stack, unwind_frames) goes through here. Caller holds g_mutex.
+template <class SessionIt>
+static bool ensure_walker(SessionIt session) {
+    if (session->walker) return true;
+    std::vector<wchar_t> path(32768, L'\0');
+    if (!g_api.get_search_path(session->key, path.data(), static_cast<DWORD>(path.size())) ||
+        !g_api.initialize(session->process, path.data(), FALSE))
+        return false;
+    session->walker = true;
+    for (const auto &m : session->modules)
+        g_api.load_module(session->process, nullptr, m.image_path.c_str(), nullptr,
+                          static_cast<DWORD64>(m.base), static_cast<DWORD>(m.size), nullptr, 0);
+    return true;
+}
+
 bool walk_stack(HANDLE process, HANDLE thread, CONTEXT ctx,
                 std::uint64_t pc, std::uint64_t sp, std::uint64_t fp,
                 std::vector<std::uint64_t> &frames, std::size_t max_frames) {
@@ -710,16 +727,7 @@ bool walk_stack(HANDLE process, HANDLE thread, CONTEXT ctx,
         const auto session = find_session(process);
         if (!g_dbghelp || session == g_sessions.end() || !thread || max_frames == 0)
             return false;
-        if (!session->walker) {                     // the walk session, on first use
-            std::vector<wchar_t> path(32768, L'\0');
-            if (!g_api.get_search_path(session->key, path.data(), static_cast<DWORD>(path.size())) ||
-                !g_api.initialize(session->process, path.data(), FALSE))
-                return false;
-            session->walker = true;
-            for (const auto &m : session->modules)
-                g_api.load_module(session->process, nullptr, m.image_path.c_str(), nullptr,
-                                  static_cast<DWORD64>(m.base), static_cast<DWORD>(m.size), nullptr, 0);
-        }
+        if (!ensure_walker(session)) return false;  // the walk session, on first use
         frames.push_back(pc);
 
         STACKFRAME64 frame{};
@@ -772,7 +780,8 @@ bool unwind_frames(HANDLE process, HANDLE thread, CONTEXT ctx,
     try {
         std::lock_guard<std::mutex> lock(g_mutex);
         pc_sp.clear();
-        if (!g_dbghelp || find_session(process) == g_sessions.end() || !thread) return false;
+        const auto session = find_session(process);
+        if (!g_dbghelp || session == g_sessions.end() || !thread || !ensure_walker(session)) return false;
         STACKFRAME64 frame{};
         ctx.ContextFlags |= CONTEXT_FULL;
 #if defined(_WIN64)
