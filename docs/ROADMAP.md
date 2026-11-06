@@ -1166,28 +1166,15 @@ Two decisions that reverse earlier work:
   target". Now (as on main f9f3436): the agent goes in at launch/attach if inline probes are registered, or
   lazily when a callback/runtime add requests the first inline probe. bp/hw-only sessions inject nothing,
   arm at the attach's break-in (no 5 s agent wait), and do not need the agent DLL.
-  Found on the way (CI + VM PROBE_TRACE, `lifecycle-{reattach,detach-early,interrupt}-hw`): hw-only targets
-  died of an unhandled single step at a probed address during the detach drain. A thread created by one of
-  ours starts with its CREATE THREAD-time copy of its creator's debug registers; created around the release,
-  it carried our released DR images (`dr7=0x415`, all three slots) without being in any release bookkeeping,
-  so its #DB was taken for the program's own breakpoint and passed on. Masked since L1: the agent's guard VEH
-  swallowed such traps. Now CREATE_THREAD clears, before the thread runs, every enabled slot of a register
-  we have used that holds an address we armed (active probes and gates are set again right after). Inline sessions keep the guard (it covers their bp/hw probes
-  too; one that acquires the agent later is guarded from then on). Controller death in a bp/hw-only attached
-  session is main's behaviour: kill-on-exit is off, so the target is not killed, but it keeps our INT3s/DRs
-  and dies at its next hit (0x80000003 / 0x80000004) -- documented in limitations.md.
-  Checks: `lifecycle-controller-killed-{breakpoint,hw}` now assert the new rule (no agent module while
-  attached; after the kill the target runs on or dies only with our trap code, never another fault or a
-  hang; outcomes listed); `lifecycle-reattach-{breakpoint,hw}` assert no agent module after every cycle;
-  `lifecycle-agent-refused-{breakpoint,hw}` (a target admitting only Microsoft-signed DLLs) assert a normal
-  session with no agent attempt; new `attach-lazy-agent-{breakpoint,hw}` (no agent module until a callback adds
-  the first inline probe, then it is injected and that very call is hooked) and `attach-no-agent-dll-*` (the
-  agent DLL missing next to the controller: bp/hw work, inline refuses cleanly). Note: breakpoint/hw callbacks
-  that use `UHH_SHARED` state still run from the controller's LOCAL copy of the agent DLL (nothing injected),
-  so such a controller still needs the file beside it. The guard checks that ran bp/hw-only sessions
-  (`cxlib-killarm-*`, `cxlib-reptail-breakpoint`, `cxlib-touchkill-hw`, `cx2-touchprog-hw`,
-  `cx2-evsusp-*`, `cx2-cosusp-*`) now add a never-called inline probe (`co_driver --guard`, `co_idle`) so
-  they keep testing the guard's coverage of bp/hw state in inline sessions.
+  Found on the way (CI + VM PROBE_TRACE, `lifecycle-{reattach,detach-early,interrupt}-hw`, x64 and x86): hw-only
+  targets died of an unhandled single step at a probed address during the detach drain. A worker's #DB was in
+  flight when the detach released the probes (its DRs cleared); delivering it restored the debug registers
+  captured at the raise (`dr7=0x415`, all three slots still ours), and by then the thread no longer counted as
+  unsettled (hw_unsettled: its registers had changed), so the #DB was taken for the program's own breakpoint
+  and passed on. Masked since L1: the agent's guard VEH swallowed such traps. Now, while detaching, a #DB from
+  a slot we have used holding an address we armed is ours (cleared on that thread, RF, continued). VM
+  PROBE_TRACE repro, 80 attach/detach cycles per arch: before, a crash within 3-7 cycles; after, none
+  (22 / 6 such #DBs taken as ours, x64 / x86).
 - **Bounded detach wait.** Codex library review (4) made a live detach wait without a time limit for inline
   callbacks that can still finish. Now it waits at most 15 s (logs delivered meanwhile), then completes:
   stderr `probe: detach: N callback(s) still running after 15 s; not waiting longer`, the detach line and

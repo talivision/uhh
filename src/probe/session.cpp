@@ -2331,33 +2331,6 @@ static bool hw_slot_is_ours(const probe_session *s, const CONTEXT &c, int slot) 
     if (!((c.Dr7 >> (slot * 2)) & 3)) return true;                       // disabled: nothing to keep
     return s->hw_armed_ever.count(dr_address(c, slot)) != 0;
 }
-// A new thread starts with its creator's debug registers: one created by a thread of ours that
-// still had a released probe's (or install gate's) DR -- its release not yet reached that thread,
-// or the detach's -- runs with that stale image, and the thread is in no release bookkeeping
-// (hw_unsettled), so its #DB there was taken for the PROGRAM's own breakpoint and passed on: the
-// target died of an unhandled single step (lifecycle-*-hw: a churning thread creating threads
-// during the detach drain; the agent's guard VEH used to swallow it). At its CREATE_THREAD, before
-// it runs any code, a slot in a register we have used holding an address we armed is ours: off
-// (active probes and gates are set again right after). A program arming a fresh thread's DR at
-// exactly an address we probe stays a residual.
-static void clear_inherited_drs(probe_session *s, DWORD tid, HANDLE thread) {
-    CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    GuardTouch touch(s, tid);
-    if (!GetThreadContext(thread, &c)) return;
-    bool changed = false;
-    for (int slot = 0; slot < 4; ++slot) {
-        if (!(s->dr_ever & (1u << slot)) || !((c.Dr7 >> (slot * 2)) & 3) ||
-            !s->hw_armed_ever.count(dr_address(c, slot)))
-            continue;
-        c.Dr7 &= ~((DWORD64)3 << (slot * 2)) & ~((DWORD64)0xF << (16 + slot * 4));
-        changed = true;
-    }
-    if (!changed) return;
-    if (!(c.Dr7 & 0xFF)) c.Dr7 &= ~(decltype(c.Dr7))0x300;
-    if (trace_enabled()) std::fprintf(stderr, "  inherited DRs cleared tid=%lu dr7=0x%llx\n", (unsigned long)tid,
-                                      (unsigned long long)c.Dr7);
-    SetThreadContext(thread, &c);
-}
 static void migrate_hw(probe_session *s, Probe &p, DWORD tid) {
     const int old = p.dr_slot;
     const uint8_t foreign = target_slots_any(s);
@@ -7921,8 +7894,6 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
         // its own: our probes move out of its way first (hw_yield_to_target).
         if (s->dr_used && event.u.CreateThread.hThread && !s->detaching)
             hw_yield_to_target(s, event.dwThreadId, event.u.CreateThread.hThread);
-        if (s->dr_ever && event.u.CreateThread.hThread)          // our DRs copied from its creator
-            clear_inherited_drs(s, event.dwThreadId, event.u.CreateThread.hThread);
         if (event.u.CreateThread.hThread && !s->detaching)     // new thread inherits the gates
             for (auto &g : s->gates) set_dr_on_thread(event.u.CreateThread.hThread, g.second, g.first, true, 0, 0, s);
         if (s->hw_active && event.u.CreateThread.hThread)     // new thread inherits the DRs
