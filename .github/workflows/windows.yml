@@ -1,20 +1,167 @@
-name: Windows prototype gates
-on: [workflow_dispatch]
+# UHH regression suite on GitHub-hosted windows-2022 runners (x64 + x86), sharded.
+# How to trigger and read results: docs/ROADMAP.md, "CI on GitHub Actions".
+name: windows-regress
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - '**'
+      - '!**.md'
+      - 'docs/quickstart.md'          # check_quickstart compares it with examples/quickstart
+      - '!measurements/**'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      only:
+        description: 'regress.py --only selectors, comma-separated (substrings of check_* names); empty = full suite'
+        default: ''
+        required: false
+      arches:
+        description: 'x64,x86 | x64 | x86'
+        default: 'x64,x86'
+        required: false
+      shards:
+        description: 'shards per arch (0 = default: x64 9, x86 10)'
+        default: '0'
+        required: false
+
+concurrency:
+  group: regress-${{ github.event_name }}-${{ github.ref }}-${{ inputs.only }}-${{ inputs.arches }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
-  correctness:
-    runs-on: windows-2022
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+      arches: ${{ steps.m.outputs.arches }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - id: m
+        env:
+          ONLY: ${{ inputs.only }}
+          ARCHES: ${{ inputs.arches || 'x64,x86' }}
+          SHARDS: ${{ inputs.shards || '0' }}
+        run: python3 scripts/ci_shards.py matrix --only "$ONLY" --arches "$ARCHES" --shards "$SHARDS" --github-output "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    runs-on: windows-2022
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(needs.plan.outputs.arches) }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Configure
+        shell: pwsh
+        run: |
+          $platform = @{ x64 = 'x64'; x86 = 'Win32' }['${{ matrix.arch }}']
+          cmake -S . -B build-${{ matrix.arch }} -G "Visual Studio 17 2022" -A $platform
+      - name: Build (Release)
+        run: cmake --build build-${{ matrix.arch }} --config Release --parallel
+      - name: Runner facts + CET probe
+        shell: pwsh
+        run: |
+          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+          $os = Get-CimInstance Win32_OperatingSystem
+          $facts = "cpu=$($cpu.Name.Trim()) cores=$($cpu.NumberOfCores) lp=$($cpu.NumberOfLogicalProcessors) ram=$([math]::Round($os.TotalVisibleMemorySize/1MB,1))GB os=$($os.Caption) $($os.Version)"
+          $mp = try { (Get-MpComputerStatus).RealTimeProtectionEnabled } catch { 'n/a' }
+          $facts += " defender_rt=$mp"
+          $cet = & "build-${{ matrix.arch }}\Release\cet_probe.exe" 2>&1 | Out-String
+          $cet = $cet.Trim()
+          Write-Output $facts
+          Write-Output $cet
+          Write-Output "::notice title=runner ${{ matrix.arch }}::$facts"
+          Write-Output "::notice title=cet_probe ${{ matrix.arch }}::$cet"
+          "### Runner ${{ matrix.arch }}`n`n$facts`n`n``````json`n$cet`n```````n" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@v6
+        with:
+          name: bin-${{ matrix.arch }}
+          path: |
+            build-${{ matrix.arch }}/Release/
+            !build-${{ matrix.arch }}/Release/**/*.ilk
+          if-no-files-found: error
+          retention-days: 7
+
+  test:
+    needs: [plan, build]
+    runs-on: windows-2022
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    name: test ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - run: cmake -S . -B build -A x64
-      - run: cmake --build build --config Release
-      - run: ctest --test-dir build -C Release --output-on-failure
-      - run: python -m unittest discover -s tests -p 'test_*.py' -v
-      - run: python scripts/bench.py --bin build/Release --iterations 2000 --reads-iterations 200 --repeats 3 --out results
-      - uses: actions/upload-artifact@v4
+      - uses: actions/download-artifact@v7
+        with:
+          name: bin-${{ matrix.arch }}
+          path: build-${{ matrix.arch }}/Release
+      - name: Defender exclusion for the workspace (as on the test VM, which excludes C:\work)
+        shell: pwsh
+        run: |
+          try { Add-MpPreference -ExclusionPath $env:GITHUB_WORKSPACE } catch { Write-Output "no Defender: $_" }
+      - name: Frida 16.5.9 venv at C:\work\fv16 (regress FRIDA_PY)
+        if: matrix.frida
+        shell: pwsh
+        run: |
+          python -m venv C:\work\fv16
+          C:\work\fv16\Scripts\python.exe -m pip install --disable-pip-version-check -q frida==16.5.9
+          C:\work\fv16\Scripts\python.exe -c "import frida; print('frida', frida.__version__)"
+      - name: Cache Intel SDE 9.48
+        if: matrix.sde
+        uses: actions/cache@v5
+        with:
+          path: C:\tools\sde-dl
+          key: sde-9.48.0-2024-11-25-win
+      - name: Intel SDE 9.48 at C:\tools\sde (regress SDE_EXE; the last Windows kit with the CET checker)
+        if: matrix.sde
+        shell: pwsh
+        run: |
+          $f = 'C:\tools\sde-dl\sde-external-9.48.0-2024-11-25-win.tar.xz'
+          if (-not (Test-Path $f)) {
+            New-Item -ItemType Directory -Force C:\tools\sde-dl | Out-Null
+            Invoke-WebRequest -UseBasicParsing -Uri 'https://downloadmirror.intel.com/843185/sde-external-9.48.0-2024-11-25-win.tar.xz' -OutFile $f
+          }
+          $h = (Get-FileHash -Algorithm SHA256 $f).Hash
+          if ($h -ne '022A1F2ED545E3BD7E301B8B3D3E40201EB2D95426D137704BE54EDC2E5CBCBF') { Remove-Item $f; throw "SDE sha256 mismatch: $h" }
+          7z x -y -oC:\tools\sde-x $f | Out-Null
+          7z x -y -oC:\tools\sde-x C:\tools\sde-x\sde-external-9.48.0-2024-11-25-win.tar | Out-Null
+          Move-Item C:\tools\sde-x\sde-external-9.48.0-2024-11-25-win C:\tools\sde
+          & C:\tools\sde\sde.exe -version
+      - name: regress.py ${{ matrix.units }}
+        run: python -u scripts/ci_shards.py run --arch ${{ matrix.arch }} --units "${{ matrix.units }}" --bin build-${{ matrix.arch }}/Release --out ci-logs --name ${{ matrix.name }}
+      - uses: actions/upload-artifact@v6
         if: always()
         with:
-          name: windows-probe-results
-          path: results/
+          name: logs-${{ matrix.name }}
+          path: ci-logs/
+          retention-days: 14
+
+  summary:
+    needs: [plan, build, test]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: logs-*
+          path: all-logs
+      - name: Table (shard x arch) and measured unit times
+        env:
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+        run: python3 scripts/ci_shards.py summarize --dir all-logs --matrix "$MATRIX" --est-out unit-times.json
+      - uses: actions/upload-artifact@v6
+        with:
+          name: unit-times
+          path: unit-times.json
