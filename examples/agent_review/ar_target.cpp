@@ -23,6 +23,10 @@
 //   cfmanyq     cfmany without the barrier (the callee does not wait for the others)
 //   cfwatch     a data-watch hit (whose callback call_funcs) while another thread's callback
 //               is inside call_func
+//   cfwatchlock cfwatch, the call_func'ing callback holding a lock the watch callback takes
+//   drresume    a hw probe armed (from a callback) AT the instruction a thread inside a user APC
+//               resumes at (after NtDelayExecution's syscall): the very first instruction after
+//               the context restore must hit it
 //   coborrow    breakpoint/hw call_original on a hw probe that has to lend its own DR (all 4
 //               used), the original raising and continuing an exception (NtContinue)
 //   drrestore   a hw probe armed (from a callback) while one thread is inside an exception
@@ -167,7 +171,31 @@ static volatile intptr_t g_cfw_seen;
 static HANDLE g_cfw_in;
 AR_EXPORT intptr_t ar_cfw_setup(intptr_t addr) { g_cfw_seen = addr; return addr; }   // probed: watches addr
 AR_EXPORT intptr_t ar_cfw_slow() { SetEvent(g_cfw_in); Sleep(500); return 11; }    // call_func'd
-static DWORD WINAPI cfw_caller(void *) { return (DWORD)ar_cf_site(5); }
+static intptr_t g_cfw_x = 5;                             // 6: cfwatchlock (the callback holds a lock)
+static DWORD WINAPI cfw_caller(void *) { return (DWORD)ar_cf_site(g_cfw_x); }
+
+// ---- drresume (regress `hw-dr-restore-first`) -------------------------------------------
+static volatile intptr_t g_dr2_seen;
+AR_EXPORT intptr_t ar_dr2_arm(intptr_t at) { g_dr2_seen = at; return at; }       // probed: arms a hw probe AT `at`
+static DWORD g_dr2_tid;
+static DWORD WINAPI dr2_apc_thread(void *) {
+    g_dr2_tid = GetCurrentThreadId();
+    SleepEx(15000, TRUE);                                // the APC ends with NtContinue back into the wait's return
+    return 0;
+}
+// Where a thread interrupted in NtDelayExecution resumes: right after its kernel transition
+// (x64: after `syscall`; x86 WOW64: after `call edx`).
+static uintptr_t delay_resume_site() {
+    const auto *p = (const unsigned char *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtDelayExecution");
+    for (int i = 0; p && i < 32; ++i) {
+#if defined(_WIN64)
+        if (p[i] == 0x0F && p[i + 1] == 0x05) return (uintptr_t)(p + i + 2);
+#else
+        if (p[i] == 0xFF && p[i + 1] == 0xD2) return (uintptr_t)(p + i + 2);
+#endif
+    }
+    return 0;
+}
 
 // ---- coborrow (regress `hw-co-borrow-restore`) ------------------------------------------
 static volatile intptr_t g_cob_seen;
@@ -365,7 +393,8 @@ int main(int argc, char **argv) {
         CloseHandle(te); CloseHandle(ta);
         printf("{\"kind\":\"ar\",\"case\":\"drrestore\",\"inside\":%d,\"main\":%ld,\"exception\":%ld,\"apc\":%ld}\n",
                inside, g_dr_calls[0].load(), g_dr_calls[1].load(), g_dr_calls[2].load());
-    } else if (!strcmp(k, "cfwatch")) {
+    } else if (!strcmp(k, "cfwatch") || !strcmp(k, "cfwatchlock")) {
+        if (!strcmp(k, "cfwatchlock")) g_cfw_x = 6;
         g_cfw_in = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         ar_cfw_setup((intptr_t)&g_cfw_var);               // its callback watches g_cfw_var
         HANDLE a = CreateThread(nullptr, 0, cfw_caller, nullptr, 0, nullptr);
@@ -373,7 +402,20 @@ int main(int argc, char **argv) {
         g_cfw_var = 1;                                    // the watch hit, while a's callee runs
         WaitForSingleObject(a, 15000);
         DWORD e = 0; GetExitCodeThread(a, &e); CloseHandle(a);
-        printf("{\"kind\":\"ar\",\"case\":\"cfwatch\",\"inside\":%d,\"caller\":%lu,\"var\":%ld}\n", inside, e, g_cfw_var);
+        printf("{\"kind\":\"ar\",\"case\":\"%s\",\"inside\":%d,\"caller\":%lu,\"var\":%ld}\n", k, inside, e, g_cfw_var);
+    } else if (!strcmp(k, "drresume")) {
+        for (auto &e : g_dr_inside) e = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        g_dr_go = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        HANDLE ta = CreateThread(nullptr, 0, dr2_apc_thread, nullptr, 0, nullptr);
+        Sleep(100);                                       // ta in its alertable wait
+        QueueUserAPC(dr_apc, ta, 0);
+        const int inside = WaitForSingleObject(g_dr_inside[1], 15000) == WAIT_OBJECT_0;
+        const uintptr_t site = delay_resume_site();
+        if (site) ar_dr2_arm((intptr_t)site);             // its callback: a hw probe at the resume site
+        SetEvent(g_dr_go);
+        WaitForSingleObject(ta, 15000); CloseHandle(ta);
+        printf("{\"kind\":\"ar\",\"case\":\"drresume\",\"inside\":%d,\"site\":%d,\"apc_tid\":%lu}\n",
+               inside, site ? 1 : 0, g_dr2_tid);
     } else if (!strcmp(k, "coborrow")) {
         ar_dr_arm(1);                                     // arms ar_dr_site at runtime: 4 DRs in use
         intptr_t other = ar_cob_other(3), sum = 0;

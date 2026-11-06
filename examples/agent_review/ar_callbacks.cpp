@@ -65,6 +65,7 @@ AR_CB void ar_on_prot(probe_context *c) {
              via_ntdll ? "ntdll" : "other");
 }
 
+static SRWLOCK g_cfw_lock = SRWLOCK_INIT;               // cfwatchlock (one callback holds it across call_func)
 // cfkill / cfmany / cflock (regress `callfunc-*`): call_func from a callback (cflock and
 // cfmany also on breakpoint/hw: concurrent calls). A probe the
 // callee hits is counted without a callback (no "ar cf-inner" from inside call_func).
@@ -76,6 +77,11 @@ AR_CB void ar_on_cf(probe_context *c) {
         send_log(c, "ar cf-unblocked");
     } else if (x == 5) {                                // cfwatch: a slow callee (a watch hit meanwhile)
         const int ok = call_func(c, "ar_target.exe!ar_cfw_slow", &r, 0);
+        send_log(c, "ar cfw slow ok=%d r=%d", ok, (int)r);
+    } else if (x == 6) {                                // cfwatchlock: a lock held across call_func
+        AcquireSRWLockExclusive(&g_cfw_lock);
+        const int ok = call_func(c, "ar_target.exe!ar_cfw_slow", &r, 0);
+        ReleaseSRWLockExclusive(&g_cfw_lock);
         send_log(c, "ar cfw slow ok=%d r=%d", ok, (int)r);
     } else if (x == 2 || x == 4) {                      // cflock: the lock holder / the call waiting for it
         const int ok = x == 2 ? call_func(c, "ar_target.exe!ar_cf_inner", &r, 1, (uint64_t)2)
@@ -124,4 +130,21 @@ AR_CB void ar_on_cob(probe_context *c) {
     const int ok = call_original(c, 1, &r);
     if (ok) return_from(c, r, 0);
     send_log(c, "ar cob ok=%d r=%d", ok, (int)r);
+}
+// cfwatchlock: the watch callback takes the lock another callback holds across call_func.
+AR_CB void ar_on_cfwl_watch(probe_context *c) {
+    AcquireSRWLockExclusive(&g_cfw_lock);
+    uint64_t r = 0;
+    const int ok = call_func(c, "ar_target.exe!ar_cf_inner", &r, 1, (uint64_t)3);
+    ReleaseSRWLockExclusive(&g_cfw_lock);
+    send_log(c, "ar cfw watch ok=%d r=%d", ok, (int)r);
+}
+AR_CB void ar_on_cfwl_setup(probe_context *c) {
+    send_log(c, "ar cfw setup=%d", probe_watch(get_session(c), get_func_arg(c, 0), ar_on_cfwl_watch, PROBE_WATCH_WRITE));
+}
+
+// drresume (regress `hw-dr-restore-first`): a hw probe at the given address.
+AR_CB void ar_on_dr2_site(probe_context *c) { send_log(c, "ar dr2 hit"); }
+AR_CB void ar_on_dr2_arm(probe_context *c) {
+    if (!probe_add_address(get_session(c), get_func_arg(c, 0), ar_on_dr2_site, PROBE_HW)) send_log(c, "ar dr2 refused");
 }

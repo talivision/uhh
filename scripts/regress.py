@@ -7739,6 +7739,44 @@ def check_callfunc_concurrent():
             rec(name, bad, f"row={rw} logs={lg}", r)
         except Exception as e:
             record(name, False, repr(e))
+    for bk in ("breakpoint", "hw"):
+        # Codex review: the watch callback takes a lock the call_func'ing callback holds across
+        # the call. A data-watch hit must wait like any other hit (callbacks never overlap);
+        # run during the parked call it blocked the debug thread for good (timeout: hang).
+        name = f"callfunc-watch-lock-{bk}"
+        try:
+            r, o = go(bk, "cfwatchlock", ["ar_target.exe!ar_cf_site=ar_on_cf", "ar_target.exe!ar_cfw_setup=ar_on_cfwl_setup"], 60)
+            rw, rep, lg, bad = row(o), report(o), logs(o), []
+            if (rw.get("inside"), rw.get("caller"), rw.get("var")) != (1, 6, 1): bad.append(f"row={rw}")
+            want = {"ar cfw setup=1": 1, "ar cfw slow ok=1 r=11": 1, "ar cfw watch ok=1 r=9": 1}
+            if lg != want: bad.append(f"logs={lg}")
+            common(r, rep, bad)
+            rec(name, bad, f"row={rw} logs={lg}", r)
+        except Exception as e:
+            record(name, False, repr(e))
+    dth = exe("ar_driver_th.exe")
+    for bk in ("breakpoint", "hw"):
+        # Codex review: a call_func timing out while its callee's return trap is already queued
+        # (the timeout ran first: forced by the UHH_TEST_LATE_TRAP hook, every call). The late
+        # trap belongs to the abandoned call: swallowed -- it reached the target as an unknown
+        # breakpoint (the target died). Every call returns 0, the program is unaffected.
+        name = f"callfunc-late-trap-{bk}"
+        if not dth:
+            missing_bin(name, "ar_driver_th"); continue
+        try:
+            env = dict(os.environ, UHH_TEST_LATE_TRAP="1")
+            r = subprocess.run([str(dth), "--backend", bk, "--probe", "ar_target.exe!ar_cf_site=ar_on_cf", "--", str(t), "cfmanyq"],
+                               capture_output=True, text=True, timeout=300, env=env)
+            o = [json.loads(x) for x in r.stdout.splitlines() if x.strip().startswith("{")]
+            rw, rep, lg, bad = row(o), report(o), logs(o), []
+            if rw.get("sum") != sum(range(1000, 1000 + n)) or rw.get("arrived") != n: bad.append(f"row={rw}")
+            if lg != {"ar cf-many ok=0 good=0": n}: bad.append(f"logs={lg} (want every call timed out)")
+            if hits_of(o, "ar_cf_site") != n: bad.append(f"hits={hits_of(o, 'ar_cf_site')} want={n}")
+            if "target crashed" in (r.stderr or ""): bad.append("target crashed")
+            if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
+            rec(name, bad, f"{n} late return traps swallowed, row={rw}", r)
+        except Exception as e:
+            record(name, False, repr(e))
     name = "callfunc-lock-inline"
     try:
         r, o = go("inline", "cflock", ["ar_target.exe!ar_cf_site=ar_on_cf"], 90)
@@ -7812,6 +7850,22 @@ def check_hw_dr_restore():
         record("hw-dr-restore", not bad, "; ".join(bad) or f"row={rw} hits={hits}")
     except Exception as e:
         record("hw-dr-restore", False, repr(e))
+    # Codex review: the FIRST instruction after the restore. A hw probe is armed (from a
+    # callback) exactly where a thread inside a user APC resumes -- right after its wait's
+    # kernel transition in NtDelayExecution. That instruction must hit it: on x86 the old DRs
+    # were re-applied only after it had run (trap flag) and the hit was lost.
+    try:
+        r, o = run([d, "--backend", "hw", "--probe", "ar_target.exe!ar_dr2_arm=ar_on_dr2_arm", "--", t, "drresume"], timeout=120)
+        rw, rep, bad = next((x for x in o if x.get("kind") == "ar"), {}), report(o), []
+        tid = rw.get("apc_tid")
+        mine = [x for x in o if x.get("kind") == "probe_log" and x.get("message") == "ar dr2 hit" and x.get("tid") == tid]
+        if (rw.get("inside"), rw.get("site")) != (1, 1): bad.append(f"row={rw}")
+        if len(mine) != 1: bad.append(f"resume-site hits on the APC thread={len(mine)} (want 1)")
+        if any(x.get("message") == "ar dr2 refused" for x in o if x.get("kind") == "probe_log"): bad.append("arm refused")
+        if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
+        record("hw-dr-restore-first", not bad, "; ".join(bad) or f"row={rw} hit at the first resumed instruction")
+    except Exception as e:
+        record("hw-dr-restore-first", False, repr(e))
 
 
 def check_inline_absolute():

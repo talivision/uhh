@@ -60,9 +60,8 @@ from where the callback runs: breakpoint/hw in the controller, inline inside the
   `GetCurrentProcessId()` in a breakpoint/hw callback is the controller's pid.
   *Workaround:* `call_func(c, "kernel32.dll!GetCurrentProcessId", &v, 0)` (or
   `GetCurrentThreadId`); target memory only through `get_mem`/`set_mem`.
-- **D2: concurrency.** Breakpoint/hw callbacks never overlap (a data-watch hit during a
-  `call_func` is the one exception, see [call_func](#call_func-and-call_original)); inline
-  callbacks of different target threads run at the same time. `thread_local` is per target thread
+- **D2: concurrency.** Breakpoint/hw callbacks never overlap; inline callbacks of
+  different target threads run at the same time. `thread_local` is per target thread
   inline, but one controller thread for all target threads on breakpoint/hw.
   *Workaround:* make shared state atomic or locked; key per-thread state by the target tid.
 - **D3: a faulting or throwing callback** is abandoned on every backend (hit counted,
@@ -134,10 +133,12 @@ data) prints on all backends.
   *Workaround:* call only non-blocking, non-throwing callees; cache results; prefer
   `call_original` for the probed function.
 - **Concurrent `call_func` on breakpoint/hw** (✅ Detours D3, Frida F5, Hunter A2): calls from
-  several threads' callbacks all succeed, one after the other (the held hits replay when the
-  call is over). A data-watch hit cannot be held back: its callback runs during another
-  thread's call (its own `call_func` works -- it used to return 0); it must not take a lock
-  that callback holds across `call_func`. `call_original` likewise runs one at a time.
+  several threads' callbacks all succeed, one after the other: other threads' hits wait while
+  a call is in flight -- code probes are rewound and hit again, a data watch's thread is held
+  right after its access and its callback runs once the call is over (it used to run during
+  the call, where its own `call_func` returned 0). `call_original` likewise runs one at a time.
+  One corner: a hardware hit on a thread that is at that moment single-stepping over a
+  breakpoint probe is handled at once.
 - **Inline `call_original` is a real call from the agent** (📄 Transparency findings). The
   original sees the agent's return address (`_ReturnAddress()`), a new frame for its stack
   arguments, and only the hit's argument registers (x64 RCX RDX R8 R9 XMM0-5; x86 EAX ECX

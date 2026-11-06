@@ -138,6 +138,11 @@ struct LogRecord {
     uint64_t sym_unload = 0, sym_size = 0;
 };
 
+#if defined(_WIN64)
+#define UHH_PC(ctx) (ctx).Rip
+#else
+#define UHH_PC(ctx) (ctx).Eip
+#endif
 // A debug event handled on a fiber of the debug thread (see "Callback fibers"): its
 // callback can park inside call_func while the loop dispatches other events.
 struct EventFiber {
@@ -152,6 +157,7 @@ struct EventFiber {
     Outcome call_outcome = WAITING;
     HANDLE call_held = nullptr;               // the callee returned while a call_original ran: thread suspended by us
     HANDLE resume_after = nullptr;            // the thread is suspended for the rest of the handling: resume, never continue
+    bool stop_suspended = false;              // ...from the start (a replayed data-watch hit): call_func resumes it to call
 };
 
 struct probe_session {
@@ -248,7 +254,7 @@ struct probe_session {
     bool entry_seen = false;
     bool thread_start_fixup = false;           // library INT3 at ntdll!RtlUserThreadStart armed
     bool restore_fixup = false;                // library INT3s at ntdll!NtContinue[Ex] armed
-    std::unordered_set<DWORD> restore_step;    // x86: a WOW64 restore without DRs, trap set (restore_fixup)
+    std::unordered_map<DWORD, uint64_t> restore_resume;   // x86: a WOW64 restore sent through call_trap -> its real EIP
     bool thread_start_due = false;             // a hw probe was released: arm it after this event
     HANDLE svc_event = nullptr;                // agent service: "install pending requests"
     std::vector<HANDLE> held;                  // threads held until inline installs confirm
@@ -319,6 +325,15 @@ struct probe_session {
     EventFiber *cur_fiber = nullptr;
     DWORD event_tid = 0;                       // the thread of the event being handled now (0: none)
     std::unordered_map<DWORD, EventFiber *> calls;
+    // A call_func that timed out may already have its return trap (or a callee fault) QUEUED;
+    // it arrives after the thread was restored: tid -> the IP the thread was left at when its
+    // handling ended (it has not run since if it is still there).
+    struct LateCall { uint64_t ip = 0; };
+    std::unordered_map<DWORD, LateCall> call_late;
+    // Data-watch hits held while a call is in flight (callbacks never overlap): the thread is
+    // suspended right after the access, its callback replayed once no call is left.
+    struct WatchHeld { HANDLE thread = nullptr; DEBUG_EVENT ev{}; };
+    std::vector<WatchHeld> watch_deferred;
     // call_original in flight (breakpoint/hw, see call_original): the probe address the call
     // starts at, the hit's SP, whether the breakpoint entry pass is still pending (the call's
     // own first INT3 execution: not a hit), and whether the thread was seen OUTSIDE the call
@@ -3075,6 +3090,7 @@ static void guard_sync(probe_session *s) {
     for (DWORD tid : s->handling) hold(tid);
     hold(s->in_call_tid);
     for (const auto &c : s->calls) hold(c.first);
+    for (const auto &h : s->watch_deferred) hold(h.ev.dwThreadId);
     g.held_count = (LONG)n;
     n = 0;
     for (uint64_t b : s->scratch_blocks) if (n < PROBE_AGENT_GUARD_BLOCKS) g.blocks[n++] = b;
@@ -4096,11 +4112,16 @@ static bool fiber_step(probe_session *s, EventFiber *f, const DEBUG_EVENT *ev) {
     bool ok = true;
     if (f->done) {
         ok = f->ok;
-        if (f->resume_after) { ResumeThread(f->resume_after); CloseHandle(f->resume_after); f->resume_after = nullptr; }
+        if (f->resume_after) {
+            auto l = s->call_late.find(f->ev.dwThreadId);           // a timed-out call: where it was left
+            CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
+            if (l != s->call_late.end() && GetThreadContext(f->resume_after, &c)) l->second.ip = (uint64_t)UHH_PC(c);
+            ResumeThread(f->resume_after); CloseHandle(f->resume_after); f->resume_after = nullptr;
+        }
         else if (!s->skip_continue && ev && !ContinueDebugEvent(ev->dwProcessId, ev->dwThreadId, f->disposition)) {
             set_error(s, win_error("continue debug event")); ok = false;
         }
-        f->done = false;
+        f->done = false; f->stop_suspended = false;
         try { s->fiber_pool.push_back(f); } catch (...) { DeleteFiber(f->fiber); delete f; }
     }
     s->skip_continue = outer_skip;
@@ -4140,6 +4161,20 @@ static bool defer_hits_now(const probe_session *s, DWORD tid) {
     if (s->in_call_tid) return tid != s->in_call_tid;                  // call_original
     return !s->calls.empty() && !s->calls.count(tid);                  // call_func (not the callee's own)
 }
+// The held data-watch hits (hold_watch_hit), once no call is in flight and no callback is
+// running (only from a loop on the debug thread's own fiber): each event is handled again,
+// on a fiber, with the thread stopped by our suspension instead of by the event.
+static void replay_held_watches(probe_session *s) {
+    while (!s->watch_deferred.empty() && s->calls.empty() && !s->in_call_tid && !s->cur_fiber) {
+        probe_session::WatchHeld h = s->watch_deferred.front();
+        s->watch_deferred.erase(s->watch_deferred.begin());
+        if (s->exited) { CloseHandle(h.thread); continue; }
+        EventFiber *f = fiber_get(s);
+        if (!f) { ResumeThread(h.thread); CloseHandle(h.thread); continue; }   // (no fiber: the hit is dropped)
+        f->ev = h.ev; f->resume_after = h.thread; f->stop_suspended = true;
+        fiber_step(s, f, nullptr);
+    }
+}
 // The 5 s call_func timeout; calls whose callee returned while a call_original ran
 // (resumed once it is over: call_original allows no other one meanwhile).
 static bool poll_calls(probe_session *s) {
@@ -4157,6 +4192,7 @@ static bool poll_calls(probe_session *s) {
             again = true; break;
         }
     }
+    replay_held_watches(s);
     return ok;
 }
 // End every parked call (the process is gone, or the session stops dispatching).
@@ -4170,17 +4206,45 @@ static void finish_calls(probe_session *s) {
     }
     s->calls_closing = false;
     if (!s->exited) release_deferred(s);
+    replay_held_watches(s);
+    for (auto &h : s->watch_deferred) { ResumeThread(h.thread); CloseHandle(h.thread); }   // (not on the main fiber)
+    s->watch_deferred.clear();
 }
 // Dispatch one debug event of this session and continue it -- or hand it to the call_func
 // it ends. Every loop that waits for debug events goes through here.
+static void reapply_hw_thread(probe_session *s, DWORD tid);
+#if defined(UHH_TEST_HOOKS)
+// UHH_TEST_LATE_TRAP: every call_func times out exactly as its return trap is dequeued -- the
+// race where poll_calls runs first, forced (regress callfunc-late-trap-*).
+static bool test_late_trap() { static const bool on = std::getenv("UHH_TEST_LATE_TRAP") != nullptr; return on; }
+#endif
+// Continue an event that belongs to nothing any more (see service_event).
+static bool swallow_event(probe_session *s, const DEBUG_EVENT &ev, const char *why) {
+    if (trace_enabled())
+        std::fprintf(stderr, "  %s tid=%lu code=0x%08lx at 0x%llx: swallowed\n", why, (unsigned long)ev.dwThreadId,
+                     (unsigned long)ev.u.Exception.ExceptionRecord.ExceptionCode,
+                     (unsigned long long)(uintptr_t)ev.u.Exception.ExceptionRecord.ExceptionAddress);
+    if (!ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE)) { set_error(s, win_error("continue debug event")); return false; }
+    return true;
+}
 static bool service_event(probe_session *s, DEBUG_EVENT &ev) {
     if (ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
+        const auto &er = ev.u.Exception.ExceptionRecord;
+        DWORD code = er.ExceptionCode;                       // a WOW64 trap in its WOW64 form: the same
+        if (code == 0x4000001Eu /*STATUS_WX86_SINGLE_STEP*/) code = EXCEPTION_SINGLE_STEP;
+        else if (code == 0x4000001Fu /*STATUS_WX86_BREAKPOINT*/) code = EXCEPTION_BREAKPOINT;
+        const uint64_t at = (uint64_t)(uintptr_t)er.ExceptionAddress;
+        const bool at_trap = s->call_trap && code == EXCEPTION_BREAKPOINT && at == s->call_trap;
         auto it = s->calls.find(ev.dwThreadId);
+#if defined(UHH_TEST_HOOKS)
+        if (it != s->calls.end() && at_trap && !it->second->call_held && test_late_trap()) {
+            call_resume(s, ev.dwThreadId, EventFiber::TIMEOUT, nullptr);
+            it = s->calls.find(ev.dwThreadId);
+        }
+#endif
         if (it != s->calls.end()) {
-            const auto &er = ev.u.Exception.ExceptionRecord;
-            const bool trap = er.ExceptionCode == EXCEPTION_BREAKPOINT && (uint64_t)(uintptr_t)er.ExceptionAddress == s->call_trap;
-            if (trap || !(er.ExceptionCode == EXCEPTION_BREAKPOINT || er.ExceptionCode == EXCEPTION_SINGLE_STEP)) {
-                const EventFiber::Outcome how = trap ? EventFiber::TRAPPED : EventFiber::FAULTED;
+            if (at_trap || !(code == EXCEPTION_BREAKPOINT || code == EXCEPTION_SINGLE_STEP)) {
+                const EventFiber::Outcome how = at_trap ? EventFiber::TRAPPED : EventFiber::FAULTED;
                 if (!s->in_call_tid || s->calls_closing) return call_resume(s, ev.dwThreadId, how, &ev);
                 // A call_original is running: hold this thread at its trap/fault until it is
                 // over (its callback could call_original as well).
@@ -4199,7 +4263,49 @@ static bool service_event(probe_session *s, DEBUG_EVENT &ev) {
             }
             if (trace_enabled())
                 std::fprintf(stderr, "  call_func: own-thread event 0x%08lx at 0x%llx\n", (unsigned long)er.ExceptionCode,
-                             (unsigned long long)(uintptr_t)er.ExceptionAddress);
+                             (unsigned long long)at);
+        } else if (at_trap) {
+            auto r = s->restore_resume.find(ev.dwThreadId);
+            if (r != s->restore_resume.end()) {
+                // x86: a context restore sent through our INT3 (restore_fixup): the DRs the
+                // 64-bit layer just put back are stale -- ours again, then the real EIP, before
+                // its first instruction runs.
+                const uint64_t eip = r->second;
+                s->restore_resume.erase(r);
+                reapply_hw_thread(s, ev.dwThreadId);
+                HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, ev.dwThreadId);
+                CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
+                if (t && GetThreadContext(t, &c)) {
+#if defined(_WIN64)
+                    c.Rip = eip;
+#else
+                    c.Eip = (DWORD)eip;
+#endif
+                    SetThreadContext(t, &c);
+                }
+                if (t) CloseHandle(t);
+                return swallow_event(s, ev, "restore-resume");
+            }
+            // The return trap of a call_func that already timed out (it was queued when the
+            // timeout ran): the thread was restored meanwhile and continues from there.
+            s->call_late.erase(ev.dwThreadId);
+            return swallow_event(s, ev, "call_func: late return");
+        } else if (!s->call_late.empty()) {
+            // Likewise a callee FAULT queued before its call timed out: not the program's.
+            auto l = s->call_late.find(ev.dwThreadId);
+            if (l != s->call_late.end()) {
+                // Raised before the restore: the thread has not run since it was left at l->ip
+                // (a fault it raises after running from there is the program's own).
+                bool stale = false;
+                if (l->second.ip && code != EXCEPTION_BREAKPOINT && code != EXCEPTION_SINGLE_STEP) {
+                    HANDLE t = OpenThread(THREAD_GET_CONTEXT, FALSE, ev.dwThreadId);
+                    CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
+                    stale = t && GetThreadContext(t, &c) && (uint64_t)UHH_PC(c) == l->second.ip && at != l->second.ip;
+                    if (t) CloseHandle(t);
+                }
+                s->call_late.erase(l);
+                if (stale) return swallow_event(s, ev, "call_func: late callee fault");
+            }
         }
         if (EventFiber *f = fiber_get(s)) { f->ev = ev; return fiber_step(s, f, &ev); }
     }
@@ -4754,6 +4860,7 @@ static void enforce_owned_drs(const probe_session *s, DWORD tid, CONTEXT &c, boo
 // image of the context about to be restored up to date first: our ACTIVE probes' slots only
 // (a handler may have just armed the program's own DR in that record: regress cdx-owndrx). Armed
 // with the thread-start fixup: once a hardware probe is armed or released at runtime.
+static bool ensure_call_trap(probe_session *s);
 static void restore_fixup(probe_context *c) {
     probe_session *s = get_session(c);
     if (!s || !s->dr_ever) return;
@@ -4776,15 +4883,15 @@ static void restore_fixup(probe_context *c) {
 #if !defined(_WIN64)
         // WOW64: a 32-bit record WITHOUT debug registers (a user APC's: flags 0x10003) is
         // continued by the 64-bit layer from ITS copy of the context -- the DR image captured
-        // before the arm, out of a 32-bit debugger's reach. Re-apply after the restore
-        // instead: the trap flag in the record stops the thread one instruction after it
-        // (restore_step_done). Not when the program set the trap flag itself.
-        if (!s->hw_active || !(img.ContextFlags & CONTEXT_CONTROL & ~CONTEXT_i386)) return;
-        DWORD fl = 0; size_t got = 0;
-        if (!remote_read(s->pi.hProcess, rec + offsetof(CONTEXT, EFlags), &fl, 4, &got) || got != 4 || (fl & 0x100)) return;
-        fl |= 0x100;
-        if (remote_write(s->pi.hProcess, rec + offsetof(CONTEXT, EFlags), &fl, 4, &got) && got == 4)
-            s->restore_step.insert(c->tid);
+        // before the arm, out of a 32-bit debugger's reach. Re-apply after the restore and
+        // BEFORE the first instruction runs: the record resumes at our private INT3
+        // (call_trap), where restore_resume_hit puts the DRs back and the thread at its real EIP.
+        if (!s->hw_active || !(img.ContextFlags & CONTEXT_CONTROL & ~CONTEXT_i386) || !ensure_call_trap(s)) return;
+        DWORD eip = 0; size_t got = 0;
+        const uint64_t at_eip = rec + offsetof(CONTEXT, Eip);
+        if (!remote_read(s->pi.hProcess, at_eip, &eip, 4, &got) || got != 4 || eip == (DWORD)s->call_trap) return;
+        const DWORD trap = (DWORD)s->call_trap;
+        if (remote_write(s->pi.hProcess, at_eip, &trap, 4, &got) && got == 4) s->restore_resume[c->tid] = eip;
 #endif
         return;                                              // DRs not restored from this record
     }
@@ -4802,29 +4909,6 @@ static void restore_fixup(probe_context *c) {
     const size_t d0 = offsetof(CONTEXT, Dr0), dn = offsetof(CONTEXT, Dr6) - d0;     // Dr0..Dr3
     remote_write(s->pi.hProcess, rec + d0, reinterpret_cast<char *>(&img) + d0, dn, &n);
     remote_write(s->pi.hProcess, rec + offsetof(CONTEXT, Dr7), &img.Dr7, sizeof(img.Dr7), &n);
-}
-// The trap restore_fixup set (x86): the thread is past its context restore -- re-apply our
-// debug registers now and swallow the step. A hardware hit at that same instruction is
-// still handled (its status bits stay; only the single-step bit and the trap flag go).
-static bool restore_step_done(probe_session *s, const DEBUG_EVENT &ev) {
-    if (s->restore_step.empty() || !s->restore_step.count(ev.dwThreadId)) return false;
-    if (s->stepping.count(ev.dwThreadId)) return false;      // our own step over the NtContinue INT3 first
-    const DWORD code = ev.u.Exception.ExceptionRecord.ExceptionCode;
-    if (code != EXCEPTION_SINGLE_STEP && code != 0x4000001E /* STATUS_WX86_SINGLE_STEP */) return false;
-    s->restore_step.erase(ev.dwThreadId);
-    reapply_hw_thread(s, ev.dwThreadId);
-    HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, ev.dwThreadId);
-    if (!t) return true;
-    CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS;
-    bool rest = false;
-    if (GetThreadContext(t, &c)) {
-        c.EFlags &= ~0x100u; c.Dr6 &= ~(decltype(c.Dr6))0x4000;
-        rest = (c.Dr6 & 0xF) != 0;
-        SetThreadContext(t, &c);
-    }
-    CloseHandle(t);
-    if (trace_enabled()) std::fprintf(stderr, "  restore-step tid=%lu: DRs re-applied\n", (unsigned long)ev.dwThreadId);
-    return !rest;                                            // a DR hit too: handled as usual
 }
 static void arm_restore_fixup(probe_session *s) {
     if (s->restore_fixup || !(s->entry_seen || s->attached)) return;
@@ -4882,6 +4966,37 @@ static void resume_deferred_hits(probe_session *s) {
     for (HANDLE t : s->call_deferred) { ResumeThread(t); CloseHandle(t); }
     s->call_deferred.clear();
 }
+
+// A data-watch hit while a call is in flight cannot be replayed by re-executing (the access
+// has happened), but its callback can wait: the thread is held (suspended) right after the
+// access, its status bits kept for its event (dr6_lost: it has not run since), and the event
+// is handled again -- callback, call_func and all -- once no call is left (replay_held_watches).
+// Only a hit that is ours alone: every status bit one of our data watches (none of the
+// target's own slots, no execute probe sharing it).
+static bool hold_watch_hit(probe_session *s, const DEBUG_EVENT &event, const CONTEXT &native, uint8_t theirs) {
+    const DWORD64 fired = native.Dr6 & 0xF;
+    if (!fired || (fired & theirs)) return false;
+    for (int slot = 0; slot < 4; ++slot) {
+        if (!(fired & (1u << slot))) continue;
+        const Probe *p = nullptr;
+        for (auto &q : s->probes) if (q->active && (q->flags & PROBE_HW) && q->dr_slot == slot) { p = q.get(); break; }
+        if (!p || p->internal || !(p->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW))) return false;
+    }
+    HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
+                          FALSE, event.dwThreadId);
+    if (!t) return false;
+    guard_note_hold(s, event.dwThreadId);
+    if (SuspendThread(t) == (DWORD)-1) { CloseHandle(t); return false; }
+    try {
+        auto &l = s->dr6_lost[event.dwThreadId];
+        l.regs = native; l.bits |= fired;
+        s->watch_deferred.push_back({t, event});
+    } catch (...) { ResumeThread(t); CloseHandle(t); return false; }
+    if (trace_enabled()) std::fprintf(stderr, "  watch hit held during a call tid=%lu dr6=0x%llx\n",
+                                      (unsigned long)event.dwThreadId, (unsigned long long)fired);
+    return true;
+}
+
 
 // ---- Callback memory access (breakpoint/hw callbacks) ---------------------------------
 // The SAME policy as the inline agent's range check, so get_mem/set_mem answer the same on
@@ -5143,6 +5258,10 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
         }
         if (exec_only && s->stepping.find(event.dwThreadId) == s->stepping.end() &&
             defer_hit_during_call(s, event.dwThreadId, pc, false)) {
+            CloseHandle(thread); handled = true; return true;
+        }
+        if (!exec_only && s->stepping.find(event.dwThreadId) == s->stepping.end() &&
+            hold_watch_hit(s, event, native, theirs)) {
             CloseHandle(thread); handled = true; return true;
         }
     }
@@ -6526,7 +6645,8 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
         s->refault.erase(event.dwThreadId);
         s->hw_unsettled.erase(event.dwThreadId);
         s->dr6_lost.erase(event.dwThreadId);
-        s->restore_step.erase(event.dwThreadId);
+        s->restore_resume.erase(event.dwThreadId);
+        s->call_late.erase(event.dwThreadId);
         auto it = s->stepping.find(event.dwThreadId);
         if (ok && it != s->stepping.end()) {
             // Only the in-place path lifted the byte; a displaced step left it armed.
@@ -6631,7 +6751,6 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
         break;
     }
     case EXCEPTION_DEBUG_EVENT:
-        if (restore_step_done(s, event)) break;
         ok = handle_exception(s, event, s->stepping, s->initial_break, disposition);
         s->cb_tid = 0;
         for (DWORD tid : s->pending_hold) hold_thread(s, tid);
@@ -7074,13 +7193,24 @@ struct TebErrors {
     }
 };
 
+// One INT3 in the target, ours alone: call_func's callees return into it (and x86 context
+// restores are sent through it, see restore_fixup).
+static bool ensure_call_trap(probe_session *s) {
+    if (s->call_trap) return true;
+    void *mem = VirtualAllocEx(s->pi.hProcess, nullptr, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    unsigned char cc = 0xcc; size_t w = 0;
+    if (!mem || !remote_write(s->pi.hProcess, (uint64_t)(uintptr_t)mem, &cc, 1, &w)) return false;
+    s->call_trap = (uint64_t)(uintptr_t)mem;
+    return true;
+}
+
 static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint64_t *ret, int nargs, const uint64_t *args) {
     if (nargs < 0 || nargs > 8 || st->released || s->exited || s->calls_closing) return 0;
     // The callback must run on its own event's fiber, stopped at that event (see "Callback
     // fibers"): that is where it can wait for the callee. Otherwise (no fiber could be
     // made, or the thread is already held after a timed-out call) the call is refused.
     EventFiber *const f = s->cur_fiber;
-    if (!f || f->ev.dwThreadId != st->tid || f->resume_after || s->calls.count(st->tid)) {
+    if (!f || f->ev.dwThreadId != st->tid || (f->resume_after && !f->stop_suspended) || s->calls.count(st->tid)) {
         if (!f && !s->call_fiber_warned) {
             s->call_fiber_warned = true;
             std::fprintf(stderr, "probe: call_func refused: no callback fiber available\n");
@@ -7098,12 +7228,7 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
         }
         return 0;
     }
-    if (!s->call_trap) {
-        void *mem = VirtualAllocEx(s->pi.hProcess, nullptr, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-        unsigned char cc = 0xcc; size_t w = 0;
-        if (!mem || !remote_write(s->pi.hProcess, (uint64_t)(uintptr_t)mem, &cc, 1, &w)) return 0;
-        s->call_trap = (uint64_t)(uintptr_t)mem;
-    }
+    if (!ensure_call_trap(s)) return 0;
     HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, FALSE, st->tid);
     if (!thread) return 0;
     CONTEXT saved{}; saved.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_FLOATING_POINT;
@@ -7135,7 +7260,16 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
     f->call_start = GetTickCount64(); f->call_deadline = f->call_start + 5000;
     f->call_outcome = EventFiber::WAITING;
     f->call_held = nullptr;
-    if (!ContinueDebugEvent(st->pid, st->tid, DBG_CONTINUE)) {
+    // Let it run: continue its event -- or, for a replayed data-watch hit, resume it (it
+    // was held by suspension, see replay_held_watches); its trap is then a normal event.
+    bool running = false;
+    if (f->stop_suspended) {
+        running = ResumeThread(f->resume_after) != (DWORD)-1;
+        if (running) { CloseHandle(f->resume_after); f->resume_after = nullptr; f->stop_suspended = false; }
+    } else {
+        running = !!ContinueDebugEvent(st->pid, st->tid, DBG_CONTINUE);
+    }
+    if (!running) {
         s->calls.erase(st->tid); SetThreadContext(thread, &saved); CloseHandle(thread); return 0;
     }
     fiber_park(s, f);                       // the loop runs on; resumed by service_event / poll_calls
@@ -7172,6 +7306,7 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
         if (SuspendThread(thread) != (DWORD)-1) {
             SetThreadContext(thread, &saved); teb_errors.restore(s->pi.hProcess);
             f->resume_after = thread; thread = nullptr;
+            s->call_late[st->tid] = {};                                // see service_event, fiber_step
         } else {
             st->released = true;                                       // cannot stop it: nothing to write back
         }
