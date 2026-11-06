@@ -33,6 +33,14 @@ Contents: [scope](#scope) · [resource limits](#resource-limits) ·
 - **No accessor for XMM/x87 registers, the instruction pointer or flags** (📄 Calling-convention
   CC7). Float/double arguments in XMM cannot be read; a float result cannot be set.
   *Workaround:* pass float results through with `call_original` + `return_from`.
+- **Sandboxed processes that admit only Microsoft-signed DLLs (Code Integrity Guard: every
+  Chromium/Edge renderer, most of their utility processes) cannot load the agent** (Real large
+  apps RB2). An inline session attached to one fails cleanly (`LoadLibraryW failed for
+  probe_api_agent.dll (the target admits only Microsoft-signed DLLs ...)`, detached, target
+  untouched); breakpoint/hw sessions work, but without the agent there is no controller-death
+  guard (stderr: `controller-death guard unavailable`): a controller killed while attached
+  leaves its INT3s/DRs in the target.
+  *Workaround:* breakpoint or hw in such processes, and end the session with `probe_close`/Ctrl+C.
 - **The debugger is not hidden** (✗ Codex workaround audit C6; Controller static review).
   See [visibility](#visibility-to-the-target-anti-debug).
 

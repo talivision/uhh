@@ -5542,6 +5542,7 @@ def _realapps_one(name, drv, argv, kind, cols, bk, base, stem, x86, after=None):
         seen = poll.finish()
         alive_pids = {p for p, _ in poll.always}
         alive_names = {n for _, n in poll.always}
+        alive_always = list(poll.always)
         if target and target.poll() is None:
             target.kill()
     secs = time.perf_counter() - t0
@@ -5569,6 +5570,13 @@ def _realapps_one(name, drv, argv, kind, cols, bk, base, stem, x86, after=None):
         stable = Counter({r: n for r, n in (Counter(_realapps_rows(base[0][1], kind, cols)) &
                                             Counter(_realapps_rows(base[1][1], kind, cols))).items()
                           if _row_alive(r, cols, alive_pids, alive_names)})
+        if cols and cols[1] == "path":
+            # A bare image path stands for every process of that image: only as many as were
+            # alive for the WHOLE run must be listed (another agent's conhost/powershell that
+            # ended between the plain runs and this one is not lost output).
+            per_name = Counter(n for _, n in alive_always)
+            stable = Counter({r: min(n, per_name[r.rsplit("\\", 1)[-1].lower()]) for r, n in stable.items()})
+            stable = +stable
         mine = Counter(_realapps_rows(prog_out, kind, cols))
         missing = sorted((stable - mine).elements())
         # A 32-bit Get-Process -FileVersionInfo lists only the few 32-bit processes: >= 1 row.
@@ -7833,13 +7841,15 @@ def realbig_robocopy(bk, mode, arch, work, base):
         tgt = subprocess.Popen([str(a) for a in argv], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             t0 = time.time()
-            while time.time() - t0 < 60 and not (dst.exists() and any(dst.rglob("*.dat"))):
-                time.sleep(0.1)
-            time.sleep(0.5)
+            while time.time() - t0 < 60 and not dst.exists():
+                time.sleep(0.05)
+            time.sleep(0.2)
             if tgt.poll() is not None:
                 return False, f"robocopy ended before the attach (rc={tgt.returncode})", ["too fast"], ""
             snap = realbig_snapshot(tgt.pid, REALBIG_ROBO_PROBES)
-            dms = 2500         # many/ takes 15-35 s plain, ~6 s under inline (warm): detach well before the end
+            # Detach soon: a warm copy of many/ takes only ~4 s under inline (the plain base copy,
+            # of freshly written files, 15-55 s: the first read of a new file is the slow one).
+            dms = 1500
             s = realbig_session(bk, REALBIG_ROBO_PROBES, ["--attach", tgt.pid, "--detach-after-ms", dms], 900)
             alive = tgt.poll() is None
             bad, detail = realbig_judge(s, bk, REALBIG_ROBO_PROBES, [REALBIG_ROBO_PROBES[i].rsplit(":", 1)[0] for i in (0, 2, 3)], False)
@@ -7852,7 +7862,7 @@ def realbig_robocopy(bk, mode, arch, work, base):
             if '"kind":"detached"' not in s["out"]: bad.append("not detached")
             rc = tgt.wait(timeout=900)
             if rc != 1: bad.append(f"robocopy exit={rc} (want 1)")
-            extra = f"base={base['robo_many_secs']:.1f}s total={time.time() - t0:.1f}s x{(time.time() - t0) / max(base['robo_many_secs'], 0.1):.1f}"
+            extra = f"plain_first_copy={base['robo_many_secs']:.1f}s total={time.time() - t0:.1f}s"
         finally:
             if tgt.poll() is None:
                 tgt.kill()

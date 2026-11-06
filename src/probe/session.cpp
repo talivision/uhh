@@ -1182,7 +1182,11 @@ static std::string narrow_path(const std::wstring &w) {
 // An event's module name: from its file handle, else from the mapping (see mapped_image_path).
 static std::string event_module_name(HANDLE process, HANDLE file, uint64_t base) {
     std::string name = module_name_from_handle(file);
-    if (name.empty() && process) name = basename_of(narrow_path(mapped_image_path(process, base)));
+    if (name.empty() && process) {
+        name = basename_of(narrow_path(mapped_image_path(process, base)));
+        if (trace_enabled()) std::fprintf(stderr, "  module without a file handle @0x%llx: name from the mapping '%s'\n",
+                                          (unsigned long long)base, name.c_str());
+    }
     return name;
 }
 
