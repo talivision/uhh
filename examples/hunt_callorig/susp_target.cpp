@@ -44,10 +44,11 @@ CO_EXPORT intptr_t co_jump(jmp_buf *env, intptr_t x) {
     if (x & 1) longjmp(*env, (int)x);
     return x * 5 + g_zero;
 }
-// A real frame below its caller's: the probed call it makes is deeper than the left one.
+// A real frame below its caller's, larger than any frame the left call was made from
+// (jump_call's jmp_buf included): the probed call it makes is deeper than the left one.
 static __declspec(noinline) intptr_t deeper(intptr_t x) {
-    volatile intptr_t pad[16];
-    for (int i = 0; i < 16; ++i) pad[i] = x + i;
+    volatile intptr_t pad[64];
+    for (int i = 0; i < 64; ++i) pad[i] = x + i;
     return co_after(pad[x & 15]) + pad[0];
 }
 static __declspec(noinline) int seh_call(intptr_t x, intptr_t *r) {   // SEH and C++ objects: own frame
