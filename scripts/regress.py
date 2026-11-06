@@ -1558,6 +1558,64 @@ def check_callorig_hunt():
                         q.kill()
 
 
+# F5: case -> (the probed function that is left, its callback's log name, "co after" hits).
+CO_DEEP = {"deepthrow": ("co_throw", "throw", 10), "deepseh": ("co_seh", "seh", 10),
+           "deepjmp": ("co_jump", "jump", 10), "catchhit": ("co_throw", "throw", 5)}
+
+
+def check_callorig_deep():
+    """ROADMAP F5: a breakpoint/hw call_original whose original is LEFT (C++ throw, SEH raise,
+    longjmp) and caught above it; the program then calls a probed function from a DEEPER frame
+    than the left call's (susp_target deep*), or inside the catch block (catchhit). Every later
+    hit must run its callback as on inline -- they used to be taken for hits inside the
+    original (counted, no callback) until the next hit at the left frame's level or the 5 s
+    release. Exact hits and "co" logs (hits == logs), the target's row as uninstrumented,
+    nothing dropped or interrupted, and the abandoned call_original never runs into the 5 s
+    limit. Every backend."""
+    d, t = exe("co_driver.exe"), exe("susp_target.exe")
+    if not d or not t:
+        return missing_bin("callorig-deep", "co_driver/susp_target")
+
+    def co_row(objs):
+        return next((x for x in objs if x.get("kind") == "co"), {})
+
+    for case, (fn, nm, after) in CO_DEEP.items():
+        try:
+            r0, o0 = run([t, case], timeout=60)
+            base = co_row(o0)
+        except Exception as e:
+            base = {}
+        for bk in ("breakpoint", "hw", "inline"):
+            name = f"callorig-deep-{case}-{bk}"
+            try:
+                r, o = run([d, "--backend", bk, "--case", case, "--module", "susp_target.exe", "--", t, case],
+                           timeout=180)
+                row, rep = co_row(o), report(o)
+                logs = {}
+                for x in o:
+                    m = str(x.get("message", ""))
+                    if x.get("kind") == "probe_log" and m.startswith("co "):
+                        logs[m] = logs.get(m, 0) + 1
+                hb = {}
+                for p in probes(o):
+                    loc = str(p.get("location", ""))
+                    hb[loc.split("!", 1)[-1]] = p.get("hits")
+                want_logs = {f"co {nm}": 10, f"co {nm}-done": 5, "co after": after}
+                want_hits = {fn: 10, "co_after": after}
+                got_logs = {k: logs.get(k, 0) for k in want_logs}
+                extra = sorted(k for k in logs if k not in want_logs)
+                slow = "within 5 s" in (r.stderr or "")
+                ok = (bool(base) and base.get("left") == 5 and row == base and
+                      all(hb.get(k) == v for k, v in want_hits.items()) and got_logs == want_logs and not extra and
+                      rep.get("log_dropped") == 0 and rep.get("callbacks_interrupted", 0) == 0 and
+                      rep.get("error") is None and rep.get("app_exit") == 0 and r.returncode == 0 and not slow)
+                record(name, ok, f"row={row} want={base} hits={hb} logs={got_logs} extra={extra[:3]} "
+                                 f"dropped={rep.get('log_dropped')} intr={rep.get('callbacks_interrupted')} "
+                                 f"err={rep.get('error')} rc={r.returncode} released_at_5s={slow}")
+            except Exception as e:
+                record(name, False, repr(e))
+
+
 CC_NAMES = ["CcCdecl0", "CcCdecl3", "CcStd3", "CcStd10", "CcFast4", "CcThisGet", "CcVec", "CcI64", "CcStdI64",
             "CcS12", "CcS8", "CcDbl", "CcFlt", "CcRetBig", "CcRetBigStd", "CcRet8", "CcHot", "CcIlt",
             "CcImpThunk", "CcJmpDst"]          # = cc_shared.h's CC_FNS, in id order
@@ -6991,7 +7049,9 @@ def check_agent_review():
 def check_callfunc_registry():
     """Inline call_func's recursion guard (a probe its callee hits is counted, no callback).
     callfunc-kill-reuse: a thread is killed (TerminateThread) while its callback is inside
-    call_func; short threads then run until one gets the dead thread's id. Every hit of every
+    call_func; thread ids are then taken (threads created suspended and ended unrun, the creator
+    moving across the CPUs: Windows reuses a freed id only once its free list has run dry) until
+    a thread gets the dead thread's id; it and 19 more run. Every hit of every
     later thread -- the reused id included -- runs its callback and logs; the killed hit is
     accounted as interrupted: hits == logs + interrupted, nothing dropped. (The guard used to
     be a thread-id table that a killed thread never left: the reused id's callbacks were
@@ -7024,12 +7084,14 @@ def check_callfunc_registry():
         return next((x for x in o if x.get("kind") == "ar"), {})
 
     try:
-        r, o = go("cfkill", ["ar_target.exe!ar_cf_site=ar_on_cf"])
+        r, o = go("cfkill", ["ar_target.exe!ar_cf_site=ar_on_cf"], timeout=300)
         rw, rep, lg, bad = row(o), report(o), logs(o), []
         hits, calls = hits_of(o, "ar_cf_site"), rw.get("calls", -1)
         intr, logged = rep.get("callbacks_interrupted"), lg.get("ar cf", 0)
         if rw.get("killed") != 1: bad.append(f"victim not killed inside call_func: {rw}")
-        if not rw.get("reused"): bad.append(f"no thread reused the dead id in {rw.get('threads')} threads")
+        if rw.get("reused") != 1 or rw.get("threads") != 20:
+            bad.append(f"the dead id was not given out again: reused={rw.get('reused')} threads={rw.get('threads')} "
+                       f"after {rw.get('consumed')} ids in {rw.get('ms')} ms")
         if hits != calls + 1: bad.append(f"hits={hits} want={calls + 1}")
         if logged != calls: bad.append(f"logged={logged} want={calls} (callbacks skipped)")
         if set(lg) - {"ar cf"}: bad.append(f"logs={lg}")
@@ -7038,7 +7100,8 @@ def check_callfunc_registry():
         if rep.get("log_dropped") != 0: bad.append(f"dropped={rep.get('log_dropped')}")
         if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
         record("callfunc-kill-reuse", not bad, "; ".join(bad) or
-               f"threads={rw.get('threads')} reused={rw.get('reused')} hits={hits} logs={logged} interrupted={intr}")
+               f"threads={rw.get('threads')} reused={rw.get('reused')} (after {rw.get('consumed')} ids, {rw.get('ms')} ms) "
+               f"hits={hits} logs={logged} interrupted={intr}")
     except Exception as e:
         record("callfunc-kill-reuse", False, repr(e))
 
@@ -10144,6 +10207,7 @@ def main():
     if want(check_callorig): check_callorig()
     if want(check_portability): check_portability()
     if want(check_callorig_hunt): check_callorig_hunt()
+    if want(check_callorig_deep): check_callorig_deep()
     if want(check_callconv): check_callconv()
     if want(check_agent_review): check_agent_review()
     if want(check_callfunc_registry): check_callfunc_registry()

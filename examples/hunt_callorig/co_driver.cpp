@@ -1,6 +1,7 @@
 // co_driver --backend b [--inner-backend b2] --case name [--module m.exe] [--attach pid [--detach-after ms | --detach-on-stdin]]
 //           [-- co_target.exe name]
-// --module: the probed functions' module (default co_target.exe; susp_target.exe for evsusp/cosusp).
+// --module: the probed functions' module (default co_target.exe; susp_target.exe for evsusp/cosusp
+// and deepthrow/deepseh/deepjmp/catchhit).
 // --detach-on-stdin: detach when a line arrives on stdin. co_driver_th is the same driver
 // linked with the test-hook build of the library (probe_api_testhooks, regress cxlib-killarm).
 // call_original / return_from edge-case hunt (regress `callorig-hunt`): probes co_target's
@@ -78,6 +79,9 @@ int main(int argc, char **argv) {
     else if (k == "rep") ok = add("CoRepSite", co_on_spin, bk);
     else if (k == "susp" || k == "evsusp") ok = add("co_add", co_on_spin, bk);
     else if (k == "cosusp") ok = add("co_hold", co_on_hold, bk);
+    else if (k == "deepthrow" || k == "catchhit") ok = add("co_throw", co_on_throw, bk) && add("co_after", co_on_after, bk);
+    else if (k == "deepseh") ok = add("co_seh", co_on_seh, bk) && add("co_after", co_on_after, bk);
+    else if (k == "deepjmp") ok = add("co_jump", co_on_jump, bk) && add("co_after", co_on_after, bk);
     else if (k == "late" || k == "cfgfree" || k == "many" || k == "manydead") {
         static co_bigcfg big{};                  // larger than PROBE_AGENT_CONFIG_CAP (256)
         big.backend = bk; big.n = (uint32_t)sizeof(big.pat);
