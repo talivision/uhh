@@ -2235,11 +2235,10 @@ static DWORD WINAPI service_main(void *) {
         const bool polling = ctl_gone_at && !g_orphan_cleaned && shared->guard.enabled &&
                              GetTickCount64() - ctl_gone_at < 30000;
         // A guarded session whose controller never handed over its process handle (it died
-        // first): watch its pid instead.
-        const bool watch_pid = !g_ctl && !ctl_gone_at && !g_orphan_cleaned && shared->guard.enabled;
+        // first): poll for the debug port to go instead (the check below).
+        const bool watch_port = !g_ctl && !ctl_gone_at && !g_orphan_cleaned && shared->guard.enabled;
         HANDLE waits[3] = {service_event, g_guard_wake, g_ctl};
-        DWORD w = WaitForMultipleObjects(g_ctl ? 3 : 2, waits, FALSE, polling ? 10 : watch_pid ? 100 : INFINITE);
-        if (w == WAIT_TIMEOUT && watch_pid && controller_dead(shared)) ctl_gone_at = GetTickCount64();
+        DWORD w = WaitForMultipleObjects(g_ctl ? 3 : 2, waits, FALSE, polling ? 10 : watch_port ? 100 : INFINITE);
         if (w == WAIT_OBJECT_0) {
             // A detach drain asking how many callbacks can still finish: answer only -- the
             // session is over, so no install round (and no INSTALL_DONE raised to nobody).
@@ -2327,11 +2326,9 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
     // watch it: its named service event went with it (no service thread) or it never handed
     // over its process handle. Nobody else would then undo what it left -- the threads it had
     // frozen for this install round stayed suspended and the target hung (runner kill loop).
-    // Clean up here, once the kernel has dropped the debug port.
-    if (shared->guard.enabled && !g_orphan_cleaned && controller_dead(shared)) {
-        for (const ULONGLONG t0 = GetTickCount64(); !no_debug_port() && GetTickCount64() - t0 < 30000; ) Sleep(10);
-        if (guard_orphaned()) guard_cleanup();
-    }
+    // The debug port is the signal: it goes as the dying controller's handles are closed,
+    // BEFORE its process object is signaled (measured: port gone, process not yet "dead").
+    if (!g_orphan_cleaned && guard_orphaned()) guard_cleanup();
     return 0;
 }
 
