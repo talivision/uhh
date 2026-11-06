@@ -1229,7 +1229,12 @@ INT3"); nothing shipped links it. `--only cxlib`.
   all-thread DR write (arm, release, gates, entry re-apply) now keeps the status read just before it with
   the thread's registers; at the thread's next event, unchanged registers mean that event is the queued
   #DB and the status is carried into its handling.
-  After H1+H2 (merge-frida 2715fab merged): see the verification counts below.
+  Verification on hwonce with merge-frida 32d7d36 merged: `hw-once-slots` 5/5 x (breakpoint, inline) on x64
+  and x86; strict `ctrl-owndr-*` / `cdx-owndrx-*` (`--only ctrl_review,cdx_review`, 29/29) 3/3 per arch,
+  plus 6 more runs of each owndr fixture x every backend per arch, all exact (before: breakpoint 1/3,
+  hw 2/3, inline 1/6 failing on 4d74322); `--only watchpoint,dynwatch,edge,entry_hold,callorig,lifecycle`
+  149/149 x64, 143/144 x86 (`lifecycle-target-dies-breakpoint` kill@detach once without final
+  accounting; 16/16 on 4 reruns of every target-dies config; breakpoint config: no hw code involved).
 - ✅ (H3) `ntdll-churn-inline` fitted only 2-4 attach/hook/detach cycles (hw/breakpoint 10-12) before the
   target's fixed 4 x 4,000,000 reads ended. Measured per cycle (x64): attach incl. uhh_trace start 0.4-3.0 s
   on every backend, hook active 0.05-0.1 s later; then inline is dominated by its own logs -- callbacks run
