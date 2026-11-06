@@ -49,6 +49,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--crash-after") && i + 1 < argc) g_crash_after = atoll(argv[++i]);
         else if (!strcmp(argv[i], "--no-wait")) no_wait = 1;
         else if (!strcmp(argv[i], "--qpc-arg")) g_qpc_arg = 1;
+        else if (!strcmp(argv[i], "--print-rva")) {   /* g_sink's RVA: hit_site writes it on every call */
+            printf("{\"kind\":\"rva\",\"sink\":%llu}\n",
+                   (unsigned long long)((uintptr_t)&g_sink - (uintptr_t)GetModuleHandleA(NULL)));
+            return 0;
+        }
     }
     if (threads < 1 || threads > 64) threads = 1;
     QueryPerformanceFrequency(&g_freq);
