@@ -95,8 +95,8 @@ What each backend makes visible (asserted by `regress.py`, `antitamper-*`):
 | hw | **no** | yes | `tampered`, `debug_registers` at `before`, every call `guarded_fn(-1)` |
 
 The in-memory `.text` checksum alone does NOT see the INT3 or the inline hook: both are
-in place before the target takes its baseline (launch arms them at process creation /
-holds the entry point until the hooks are in). Only the disk comparison does.
+in place before the target takes its baseline (launch arms breakpoints at process creation
+and installs inline hooks at the loader breakpoint). Only the disk comparison does.
 
 ## `antidebug_target.c`
 

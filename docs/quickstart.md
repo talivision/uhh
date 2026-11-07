@@ -80,9 +80,11 @@ Without `--no-wait`, `probe_app` waits for a key press (UHH passes the console's
 through). Redirecting stdout to a file is optional but faster: logs written to a console
 slow the target, and UHH warns about it once.
 
-Options (from `examples/gated_config/main.cpp`): `--flag-backend b`, `--read-backend b`,
-`--open-backend b` (`b` = `breakpoint`, `hw` or `inline`), `--no-log` (count hits only),
-`--pid P` (log only reads of that process), `--range BASE:SIZE` (repeatable, up to 8).
+Options (from `examples/gated_config/main.cpp`): `--flag-backend b` (default breakpoint),
+`--read-backend b` (default inline), `--open-backend b` (default: the read backend),
+`--close-backend b` (default: the open backend, breakpoint if that is hw), with `b` =
+`breakpoint`, `hw` or `inline`; `--no-log` (count hits only), `--pid P` (log only reads of
+that process), `--range BASE:SIZE` (repeatable, up to 8).
 
 **stderr** shows the session's progress (captured on x64; pids, tids and addresses vary):
 
@@ -207,7 +209,9 @@ Use two consoles in the build directory.
    read is seen), and exactly 500 logged reads (helper 1 at offset 64 gets every 16th read;
    `logs_written` 508 = 500 reads + 4 `open` + 4 `map`).
 
-Usage: `uhh_attach <target_pid> --pid P --range BASE:SIZE [--backend breakpoint|hw|inline] [--flag-backend b]`.
+Usage: `uhh_attach <target_pid> [--pid P] [--range BASE:SIZE] [--backend b] [--flag-backend b] [--open-backend b] [--close-backend b] [--read-backend b]`
+(`--backend` sets open and read, default breakpoint; close defaults to the open backend,
+breakpoint if that is hw; the flag probe defaults to breakpoint).
 See [examples/attach/README.md](../examples/attach/README.md) for the derivation of the
 500.
 
@@ -233,9 +237,11 @@ with `probe: error: debug launch (Win32=2)`). Module names in `-p` follow the
 [location grammar](api.md#locations): `kernel32!X` is `kernel32.dll!X`, and the program
 itself is named with its extension (`app.exe!Func`).
 
-Other options: `--attach-new <image> [--timeout ms]`, `--fallback-hw`,
-`--allow-unsafe-site`, `--allow-prehooked`, `--unsafe-fast-patch` (see the flags in
-[api.md](api.md#probe-flags)).
+Other options: `--attach <pid> [--detach-after-ms N | --detach-on-stdin]` (detach after N ms
+or a line on stdin; the target runs on), `--attach-new <image> [--timeout ms]`,
+`--fallback-hw`, `--allow-unsafe-site`, `--allow-prehooked`, `--unsafe-fast-patch` (see the
+flags in [api.md](api.md#probe-flags)). The default backend is `breakpoint`. `--list` takes
+exactly `--list <module> [--mask <pattern>]`.
 
 ## 4. Your own tool
 

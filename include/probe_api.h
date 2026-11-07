@@ -269,7 +269,9 @@ int call_func(probe_context *, const char *symbol, uint64_t *ret, int nargs, ...
    return_from makes the probed function return to its caller as soon as the callback
    ends: the original body is not run (again). Resumes at a real `ret` (x86: `ret nargs*4`)
    with SP at the hit's return address, so the CPU pops the normal and shadow stacks
-   together (CET-safe on every backend). The caller gets: x64 RAX = value; x86 EAX = the low
+   together (CET-safe on every backend; on breakpoint/hw after call_original under a CET
+   shadow stack, whose entry the original's own ret already popped, the thread resumes at
+   the return address directly). The caller gets: x64 RAX = value; x86 EAX = the low
    half of value and EDX = its high half (an __int64 or 8-byte struct result) -- except that
    after call_original, a value whose high half is 0 leaves EDX as the original returned it,
    so return_from(c, r, nargs) passes ANY integer result through unchanged (to return a
@@ -283,13 +285,16 @@ int call_func(probe_context *, const char *symbol, uint64_t *ret, int nargs, ...
    __thiscall, __fastcall and __vectorcall pop theirs, i.e. every slot get_func_arg can see
    (__stdcall: all of them, 64-bit/double ones counting 2; __fastcall/__vectorcall: those after
    the register ones; __thiscall: those after `this`; a hidden return pointer counts 1);
-   pass 0 for an x86 __cdecl (or varargs) function (the caller pops); ignored on x64. The API
+   pass 0 for an x86 __cdecl (or varargs) function (the caller pops); ignored on x64 (but a
+   value outside 0..255 makes return_from do nothing, on every backend). The API
    cannot know the convention: after call_original the count the original REALLY popped
    (measured) is used and a different nargs is warned once per probe; without call_original
    a wrong nargs is NOT caught and leaves the caller's ESP off by the difference. Refused
    (no effect, warned once) where call_original is. Other register changes the callback made
    (set_reg) are kept; SP is always the hit's. Calling call_original without return_from lets
-   the original run a second time on fall-through (warned once per probe). See
+   the original run a second time on fall-through (warned once per probe) -- except on
+   breakpoint/hw under a CET shadow stack, where it cannot run twice: the caller gets the
+   original's result (warned once). See
    docs/ROADMAP.md, "call_original findings" and "Calling-convention findings". */
 int call_original(probe_context *, int nargs, uint64_t *ret);
 void return_from(probe_context *, uint64_t value, int nargs);
@@ -300,9 +305,9 @@ void return_from(probe_context *, uint64_t value, int nargs);
    only probe_add_symbol[_cfg] / probe_add_address / probe_watch may be used, and the new
    probe's callback must be EXPORTED (dllexport) by the module of the calling callback: an
    inline callback's request names it by export and the controller resolves that name there,
-   so a non-exported callback is refused (0) on every backend. Configs and symbols have no
-   extra size limit from a callback (a config's limit is 4 GB everywhere, see probe_add_symbol);
-   an inline probe's config may be that size too. */
+   so a non-exported callback is refused (0) on every backend. A config has no extra size
+   limit from a callback (4 GB everywhere, see probe_add_symbol), an inline probe's included;
+   a symbol string sent from an inline callback is limited to 64 KiB. */
 probe_session *get_session(probe_context *);
 
 #define PROBE_LOG(c, ...) send_log((c), __VA_ARGS__)

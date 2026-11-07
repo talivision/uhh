@@ -466,11 +466,11 @@ PowerShell + detach) under every backend, against an uninstrumented baseline.
 - (note) `attach-new` failed once because ANOTHER agent's probe_app.exe started in the
   same second on the shared VM and was attached instead (image-name matching is
   inherently racy on a shared box; not a library bug).
-- ⬜ (B6) API reality the docs should mention: `bcrypt!BCryptGenRandom` re-enters itself
+- ✅ (B6, docs/limitations.md "Coverage and timing") API reality the docs should mention: `bcrypt!BCryptGenRandom` re-enters itself
   (2 hits per call), so entry counts != API calls and a naive return-capture needs a 5th
   hw slot; probes report every caller of a system export (CoCreateInstance 25 hits for 24
   target calls). The examples filter; the per-backend limitations doc should say so.
-- ⬜ (B7) docs: per-hit cost seen as frame time at 1 kHz (`blog-game-*`, x64 VM): inline
+- ✅ (B7, docs/limitations.md per-backend table, README backend table) docs: per-hit cost seen as frame time at 1 kHz (`blog-game-*`, x64 VM): inline
   p50 1 us / p99 10 us, 0 missed frames; hw p50 ~220 us / p99 ~520 us, breakpoint p50
   ~300 us / p99 ~660 us, a few frames over budget -- belongs in the backend table.
 
@@ -2447,7 +2447,7 @@ windows-2022, and cet-hw).
   - Tests: `cet-image` (probe_app_cet/cet_probe carry the CETCOMPAT bit, probe_app does not), `cet-probe` (what the machine enforces), `cet-gated-{breakpoint,inline,hw}` (gated_config with all probes on one backend against `probe_app_cet`, exact hits/logs, checksum equal to an uninstrumented CET run, target's own RDSSP == cet_probe), `cet-ret-breakpoint`; `conformance-inline` sp_moved 10; under SDE: `cet-sde-{probe,control-clean,control-smash,calls-base,calls-inline,relcall-inline,gated-inline,sp-inline}`, `cet-sde-co-<case>-inline` (11 cases), SKIP rows `cet-sde-breakpoint` / `cet-sde-hw` saying why.
 - ⬜ [fan-out] Windows 11 VM on the Proxmox server, run the suite there too (later)
 - ✅ [fan-out] Stability on real large apps (important): browsers / heavily multi-threaded / JIT processes under all backends -- Edge renderer + browser, PowerShell 5.1, robocopy /MT:16, findstr /s, x64 + x86, launch and attach/detach with a no-residue check; 1 library bug fixed (RB1, attach to sandboxed processes), CIG refusal clarified (RB2). See "Real large apps findings"; regress `realbig-*` (default subset; all rows with `--bigapps`)
-- ⬜ [fan-out, Codex] Docs: quickstart, API reference, per-backend limitations table, troubleshooting
+- ✅ [fan-out, Codex] Docs: quickstart, API reference, per-backend limitations table, troubleshooting -- docs/quickstart.md, docs/api.md, docs/limitations.md ("Per-backend table"), docs/troubleshooting.md, brought up to date with main 607fe19 (branch `docs2`, 2026-11-08)
 - 🔧 Inline cap raised to 128 per session (user: 128 is enough; error beyond) -- compile-time thunk table, per-request FREEZE flag; refusal test uses the 129th -- VM verify pending
 - ⏸ Follow child processes: design written -- [docs/child-processes.md](child-processes.md) (strategies with VM measurements from `bench/child_follow`, API options A-D, recommendation: ProcessDebugFlags inheritance + `probe_follow_children` + `get_pid`); **deferred by the owner (2026-11-06)**: a session follows one process; a child it starts runs unprobed -- attach to it with its own session. Processes the target did not create are unaffected either way (attach separately)
 - ✅ CI on GitHub Actions: the full suite sharded on hosted windows-2022 runners, x64 + x86, ~19 min, plus enforced-CET checks on windows-2025 (`.github/workflows/windows.yml`, `scripts/ci_shards.py`) -- see "CI on GitHub Actions" below (runner findings open there); ⬜ (maybe) CMake package + versioned release zip

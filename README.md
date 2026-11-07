@@ -2,9 +2,10 @@
 
 A Windows user-mode instrumentation library where **one C callback source runs
 unchanged under multiple selectable backends, chosen per probe**. Write a probe
-once; decide later whether it is delivered by a software breakpoint or an inline
-mid-function hook. Every callback gets the full machine context and full control —
-read and write registers and memory, change arguments, flip a return value, log.
+once; decide later whether it is delivered by a software breakpoint, a hardware
+breakpoint or an inline mid-function hook. Every callback gets the full machine context
+and full control — read and write registers and memory, change arguments, flip a return
+value, call functions in the target, log.
 
 ```c
 /* The same callback works on x64 and x86, under any backend. */
@@ -29,17 +30,19 @@ Two nouns, two prefixes, and the compiler keeps them apart (both are opaque type
 
 | Takes | Functions | Meaning |
 |---|---|---|
-| a **session** | `probe_add_symbol`, `probe_add_symbol_cfg`, `probe_add_address`, `probe_watch`, `probe_launch`, `probe_run`, `probe_report`, `probe_close` | the instrumentation run (control plane) |
-| a **context** `c` | `get_reg`, `set_reg`, `get_func_arg`, `get_mem`, `set_mem`, `get_config`, `send_log`, `send_log_stack`, `get_session` | this one hit (data plane) |
+| a **session** | `probe_session_create`, `probe_add_symbol`, `probe_add_symbol_cfg`, `probe_add_address`, `probe_watch`, `probe_launch` / `probe_attach` / `probe_attach_new`, `probe_run`, `probe_wait_for_exit`, `probe_report`, `probe_close` | the instrumentation run (control plane) |
+| a **context** `c` | `get_reg`, `set_reg`, `get_func_arg`, `get_mem`, `set_mem`, `get_config`, `send_log`, `send_log_stack`, `call_func`, `call_original`, `return_from`, `get_session` | this one hit (data plane) |
 
-`get_session(c)` is the bridge: **every control-plane call works from inside any
-callback** — breakpoint, hardware, or inline. The target is stopped, so a probe added
-there is armed before the target runs another instruction. From an inline callback (which
-executes inside the target) the call is forwarded to the controller synchronously; the
-callback source does not change.
+`get_session(c)` is the bridge: **probes can be added from inside any callback** —
+breakpoint, hardware or inline (`probe_add_symbol[_cfg]`, `probe_add_address`,
+`probe_watch`; the new probe's callback must be exported). A breakpoint/hw probe added there
+is armed before the target resumes; an inline one holds the calling thread until its hook
+is in. From an inline callback (which runs inside the target) the call is forwarded to the
+controller synchronously; the callback source does not change.
 
 ```c
-/* malloc -> watch: probe the allocator, follow the pointer, watch the memory. */
+/* malloc -> watch: probe the allocator, follow the pointer, watch the memory.
+   (Callbacks are extern "C" __declspec(dllexport), as in examples/dynwatch.) */
 void on_write(probe_context *c) { send_log_stack(c, "write to watched block"); }
 
 void on_return(probe_context *c) {                      /* one-shot, at malloc's return  */
@@ -54,97 +57,84 @@ void on_malloc(probe_context *c) {                      /* malloc entry         
 probe_add_symbol(s, "ucrtbase.dll!malloc", on_malloc, PROBE_BREAKPOINT);
 ```
 
-`send_log` and `send_log_stack` append `probe_log` JSON lines to a per-session file under
-`%TEMP%\uhh\logs`; its path is printed once as `probe: logs -> ...`. Both the debugger
-callbacks and inline agent feed one bounded controller queue, so filesystem backpressure
-waits instead of dropping logs or growing memory. A background tailer copies new complete
-lines to controller stdout with raw-handle writes (up to 64 KiB each), flushing the
-driver's CRT stdout first. This keeps the target decoupled from a slow console while logs
-remain live; redirecting stdout to `NUL` disables tailing and leaves the complete file.
-A launched target whose stdout/stderr would be a pipe or a file gets its own pipe instead,
-and UHH forwards its bytes unchanged a line at a time: every record stays a whole line of
-its own, even when the target writes one byte per `WriteFile`, 4 KiB CRT chunks, binary
-data or a prompt without a newline (shown after ~50 ms idle; records wait for its next
-newline). A console stays inherited, so interactive targets keep their console.
-If a console tail falls behind for more than about a second, UHH prints a one-time
-redirect-to-file-or-pipe performance warning on stderr.
-The writer flushes on idle or within about 10 ms. `send_log_stack` captures only raw
-return addresses at the hit; the writer resolves them to `module!function+0xoff` (plus
-`file:line` with PDBs), so symbol work never runs in the hit path. `probe_report` catches
-the tail up, then emits only pre-hook/probe/summary records; its summary includes
-`logs_written`, `log_dropped`, `callbacks_interrupted` (inline callbacks cut off mid-run because
-the target process died -- their hits are counted, their logs never existed),
-`controller_peak_ws_mb`, and `live_output_closed` (stdout's reader went away, e.g. `| head`:
-the live tail stopped with a stderr warning, the session file still has every log; not an
-error). See
-[`examples/dynwatch`](examples/dynwatch).
+**Logs.** `send_log` and `send_log_stack` append `probe_log` JSON lines to a per-session
+file under `%TEMP%\uhh\logs` (its path is printed as `probe: logs -> ...`) and to the
+controller's stdout. Records are not dropped for speed: when the writer falls behind, the
+logging thread waits. Every record carries `"seq"` (0, 1, 2, ...) and the final `probe_report` line
+says how many records stdout got (`stdout_logs`), so a capture proves its own completeness.
+`send_log_stack` captures raw return addresses at the hit and resolves them to
+`module!function+0xoff` (plus `file:line` with PDBs) later, off the hit path. When stdout
+is a pipe or a file, a launched target's own output is forwarded a whole line at a time, so
+records never land inside one of its lines. Details: [api.md](docs/api.md#output-logs-and-report).
 
 ## Backends
 
-| Backend | How | Per-hit cost | Modifies code? | Multithread |
+| Backend | How | Added cost per hit, x64 / x86 | Modifies code? | Callback runs |
 |---|---|---|---|---|
-| `PROBE_INLINE` | injected SafetyHook mid-hook | ~tens of ns | trampoline (≥5 bytes) | exact |
-| `PROBE_HW` | execute debug register (DR0–3) | ~tens of µs | none | exact (≤4 probes) |
-| `PROBE_BREAKPOINT` | external debugger, native-bitness INT3 | ~hundreds of µs | 1 byte | exact |
+| `PROBE_INLINE` | SafetyHook mid-hook installed by the injected agent DLL | ~0.07 / ~0.14 µs | jump of ≥5 bytes | in the target, on the hit thread |
+| `PROBE_HW` | execute debug register (DR0–3), or a data watchpoint | ~91 / ~151 µs | no (≤4 probes) | in the controller |
+| `PROBE_BREAKPOINT` | external debugger, INT3 with displaced stepping | ~77 / ~142 µs | 1 byte | in the controller |
+
+(Single thread on the test VM, `bench/BENCHMARKS.md`; a 1 kHz frame loop measured inline
+frames at 1 µs p50, hw ~220 µs and breakpoint ~300 µs: [limitations.md](docs/limitations.md#per-backend-table).)
 
 All three are **exact under multithreading** (no dropped hits). The software
-breakpoint achieves this with **displaced (out-of-line) stepping** — the `INT3`
-stays armed while the original instruction runs from a per-thread scratch buffer, so
-no other thread can cross the site unobserved and no thread is suspended (no race, no
-deadlock). The hardware breakpoint modifies no code at all and handles any
-instruction, including the control-flow sites displaced stepping routes to an
-in-place fallback. Inline is the fastest where the site has room for a trampoline.
+breakpoint achieves this with **displaced (out-of-line) stepping**: the `INT3` stays armed
+while the original instruction runs from a per-site trampoline, so no other thread can
+cross the site unobserved and no thread is suspended (except around the few instructions
+that must run in place). The hardware breakpoint modifies no probed code at all. Inline is the fastest where the site has room for its jump.
 
-**When probes go live.** On launch, breakpoint and hw probes are armed from the target's first
-instruction. Inline probes go live at its entry point, once the injected agent is in (the main
-thread is held there until then). Loader-time activity, such as DLL initialisation and the
-loader's own registry queries, is therefore seen only by breakpoint/hw probes. A map that an
-inline probe builds does not know handles opened before that point.
+**When probes go live.** On launch, breakpoint and hw probes are armed from the target's
+first instruction, inline probes at the loader breakpoint (static imports mapped, before any
+DLL initialiser or TLS callback runs). On attach, each probe counts from its
+`probe: active` line on stderr. Probes may name a module that is not loaded yet: they stay
+pending and arm when it loads.
 
-Backends are picked **per probe** and interoperate in one session — e.g. a
-breakpoint on a config-flag site (fires once) mixed with an inline hook on a hot
-read path (millions of hits). Probe locations are `module+0xRVA` or `module!Name[+0xOFF]`
-(an export of the target image, else a symbol from the module's PDB -- beside the image or
-via `_NT_SYMBOL_PATH` -- e.g. `flagfeature.dll!Feature::IsEnabled`), and
-probes may be registered **before the target module is loaded** — they stay pending
-and activate on load.
+Backends are picked **per probe** and interoperate in one session — e.g. a breakpoint on a
+config-flag site (fires once) mixed with an inline hook on a hot read path (millions of
+hits). Probe locations are `module+0xRVA` or `module!Name[+0xOFF]` (an export, else a symbol
+from the module's PDB — beside the image or via `_NT_SYMBOL_PATH` — e.g.
+`flagfeature.dll!Feature::IsEnabled`).
 
 ## Writing your own tool
 
-Copy an example ([`gated_config`](examples/gated_config), or a smaller one:
+Copy an example ([`examples/quickstart`](examples/quickstart) is the smallest; then
 [`filetrace`](examples/filetrace), [`flagflip`](examples/flagflip),
-[`regtrace`](examples/regtrace)). The layout is always the same:
+[`regtrace`](examples/regtrace), [`gated_config`](examples/gated_config)). The layout is
+always the same:
 
 - `callbacks.cpp`: the callbacks, each `extern "C" __declspec(dllexport)`. Build it into
   your driver **and** add it to `probe_api_agent`'s sources in `CMakeLists.txt`. Inline
-  callbacks run inside the target from the injected `probe_api_agent.dll`, found by
-  export name. A callback that is not in the agent DLL fails `probe_add_symbol` with
-  "inline callback is not a named export" or "... is not exported by the agent DLL".
+  callbacks run inside the target from the injected `probe_api_agent.dll`, found by export
+  name: a callback missing from the agent fails its install
+  (`inline agent failed to install <loc> (status=-2)`).
 - State that probes share (a handle -> name map, say) must be `UHH_SHARED` (see
-  `probe_api.h`) when the probes may use different backends.
-  Breakpoint/hw callbacks run in the controller and inline ones run in the target, so a
-  plain global exists once in each process.
-- `main.cpp`: `probe_session_create`, then `probe_add_symbol[_cfg]` per probe (a
-  `--backend` option per probe is cheap), then `probe_launch`, `probe_run`,
+  `probe_api.h`) when the probes may use different backends: breakpoint/hw callbacks run in
+  the controller and inline ones in the target, so a plain global exists once in each.
+- `main.cpp`: `probe_session_create`, `probe_add_symbol[_cfg]` per probe (a `--backend`
+  option per probe is cheap), `probe_launch` (or `probe_attach`), `probe_run`,
   `probe_wait_for_exit`, `probe_report` and `probe_close`.
-- Arguments: `get_func_arg(c, i)` is the i-th argument of a normal (cdecl/stdcall/x64)
-  function. A C++ member function on x86 is `__thiscall`, with `this` in ECX and not on
-  the stack; `get_reg(c, PROBE_REG_CX)` reads `this` on both arches.
-- `call_original` takes up to 16 arguments (`NtCreateFile` has 11). On hw it needs a free
-  debug register while it runs, so at most 3 hw probes leave room for it.
+- Arguments: `get_func_arg(c, i)` is the i-th argument at a function entry. A C++ member
+  function on x86 is `__thiscall`, with `this` in ECX and not on the stack;
+  `get_reg(c, PROBE_REG_CX)` reads `this` on both arches.
+- `call_original` takes up to 16 arguments (`NtCreateFile` has 11). On breakpoint/hw it needs
+  a free debug register while it runs (a hw probe lends its own), so keep at most 3 hw probes
+  when other probes use it.
 
 ## Documentation
 
-- [docs/quickstart.md](docs/quickstart.md): build, run `gated_config` (launch and attach), write your own tool.
-- [docs/api.md](docs/api.md): reference for every function, flag and macro in `include/probe_api.h`.
-- [docs/limitations.md](docs/limitations.md): what UHH does not do, or does differently per backend, with workarounds.
-- [docs/troubleshooting.md](docs/troubleshooting.md): stderr messages and common failures, with causes and fixes.
+- [docs/quickstart.md](docs/quickstart.md): build, run `gated_config` (launch and attach) and `uhh_trace`, write your own tool.
+- [docs/api.md](docs/api.md): every function, flag and macro in `include/probe_api.h`, with its per-backend semantics.
+- [docs/limitations.md](docs/limitations.md): the per-backend table, and what UHH does not do, with workarounds.
+- [docs/troubleshooting.md](docs/troubleshooting.md): the messages UHH prints and common failures, with causes and fixes.
+- [docs/symbols.md](docs/symbols.md): DbgHelp, symbol paths, stack snapshots per backend.
 
 ## Build
 
-Requires Windows, Visual Studio 2022 (MSVC) and CMake -- nothing else, and **no network**:
-SafetyHook and Zydis are vendored in `third_party/` (see `third_party/README.md`) and used by
-default. Pass `-DUHH_VENDORED_DEPS=OFF` to fetch the same tags from GitHub instead.
+Requires Windows, Visual Studio 2022 (MSVC, with MASM) and CMake 3.28+ — nothing else, and
+**no network**: SafetyHook and Zydis are vendored in `third_party/` (see
+`third_party/README.md`). Pass `-DUHH_VENDORED_DEPS=OFF` to fetch the same tags from GitHub
+instead.
 
 ```sh
 # x64
@@ -176,7 +166,7 @@ after a keystroke it late-loads `configparse.dll`, parses `reads_enabled=0`, and
 nothing. Only when the flag is on does it open its helper processes by pid
 (`ntdll!NtOpenProcess`) and read their memory from many threads (`ntdll!NtReadVirtualMemory`).
 The probes sit on those ntdll syscall stubs, so every caller is seen whatever wrapper it
-went through -- under every backend, inline included. The examples turn the feature on **from outside, without
+went through, under every backend. The examples turn the feature on **from outside, without
 modifying the target or its config**: a breakpoint inside `configparse.dll` flips the
 parsed flag `0 -> 1` just before it is stored, and further probes log (and filter)
 every read — this is how you build metrics on a code path that normally never runs.
@@ -187,18 +177,15 @@ every read — this is how you build metrics on a code path that normally never 
   only the reads of one helper process inside one address range.
 
 ```sh
-build-x64\Release\gated_config.exe configparse.dll!ParseConfig+0x16 ntdll.dll!NtReadVirtualMemory -- build-x64\Release\probe_app.exe
-python scripts/regress.py --bin build-x64/Release      # everything, incl. both examples
+build-x64\Release\gated_config.exe configparse.dll!ParseConfig+0x16 ntdll.dll!NtReadVirtualMemory -- build-x64\Release\probe_app.exe --no-wait
+python scripts/regress.py --bin build-x64/Release      # the regression suite (long; --only <names> narrows it)
 ```
 
 ## Status
 
-Verified on x64 **and** x86: all three backends (inline, hardware, software
-breakpoint), deferred module+RVA probes, and the mixed `gated_config` scenario.
-Software breakpoints are multithread-safe via displaced stepping and proven exact at
-**2,000,000 reads across 8 threads (zero dropped hits)**; hardware and inline are
-exact under multithreading too. The backend mix matrix passes for breakpoint-flag
-combinations.
-
-Roadmap (see [`docs/ROADMAP.md`](docs/ROADMAP.md)): further hot-path measurement,
-inline-over-existing-hook chaining, and the remaining adversarial correctness cases.
+Verified on x64 **and** x86 by the regression suite (`scripts/regress.py`; on GitHub Actions
+for every push, x64 + x86, plus enforced-CET checks on `windows-2025` runners): all three
+backends and their mixes, launch and attach/detach, exact hits and logs under heavy
+multithreading (e.g. 2,000,000 reads across 8 threads on software breakpoints, zero dropped),
+real applications (PowerShell, Edge, robocopy, findstr) and CET shadow stacks. Open items and
+findings: [`docs/ROADMAP.md`](docs/ROADMAP.md).

@@ -55,14 +55,15 @@ any leftover), sockets on 127.0.0.1 only, DNS with `DNS_QUERY_NO_WIRE_QUERY`.
   scratch region in the target (`kernelbase!VirtualAlloc`) for the out-buffer -- a
   deliberate, documented side effect. On breakpoint/hw each `call_func` is tens of
   microseconds.
-* **Per-hit cost shows up as frame jitter** (`game`): inline costs well under a
-  microsecond per frame; hw and breakpoint cost tens to hundreds of microseconds per hit
-  (a debug event round trip), visible as `cost_us` percentiles in the target's line.
+* **Per-hit cost shows up as frame jitter** (`game`): inline costs about a microsecond per
+  frame; hw and breakpoint cost about 100-300 microseconds per hit (a debug event round
+  trip), visible as `cost_us` percentiles in the target's line (numbers:
+  [limitations.md](../../docs/limitations.md#per-backend-table)).
 
 ## Issues these replicas found
 
 See "Blog-replica findings" in [`docs/ROADMAP.md`](../../docs/ROADMAP.md): a hw #DB with a
 lost DR6 killing the target, hw DRs lost on threads still starting up, `call_func`
 deadlocking when another thread hit a probe during the call (breakpoint/hw), a forwarded
-export into a later-loaded module failing the launch, and an intermittent attach-hold
-stall when injecting into PowerShell (open).
+export into a later-loaded module failing the launch, and an attach-hold stall when
+injecting into PowerShell (all fixed).

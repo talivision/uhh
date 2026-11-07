@@ -19,8 +19,8 @@ A value operation carries only a key handle. The name exists only at the open, s
 The map is `UHH_SHARED`, so the groups may use different backends. Hardware has only 4
 debug registers, and `call_original` on hw needs one free while it runs. hw therefore
 takes the open group (3 + 1 free) or the value and close probes (3), never all six.
-`--backend hw` is refused with that reason. An inline open group goes live at the target's
-entry point. Value operations on keys the loader opened before then therefore log
+`--backend hw` is refused with that reason. An inline open group goes live at the loader
+breakpoint. Value operations on keys the loader opened before then therefore log
 `key=?` (seen when the value group is breakpoint/hw).
 
 `regtrace_target` is the fixture. Under `HKCU\Software\UHHTest`, each thread creates its own

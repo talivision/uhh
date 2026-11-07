@@ -68,9 +68,11 @@ Contents: [concepts](#concepts) · [types and macros](#types-and-macros) ·
 ### When probes go live
 
 - **Launch:** breakpoint and hw probes are armed from the target's first instruction.
-  Inline probes go live at the image entry point; the main thread is held there until the
-  agent confirms the hooks. Loader-time activity (TLS callbacks, static DLL initialisers)
-  is therefore seen only by breakpoint/hw probes.
+  Inline probes go live at the loader breakpoint: the main thread loads the agent there,
+  after the static imports are mapped and before any DLL initialiser or TLS callback runs.
+  Only the loader's own work before that point is seen by breakpoint/hw probes alone. (If that
+  early load cannot run, a thread of the agent's loads it and the main thread is held at the
+  entry point until the hooks are confirmed.) Probes on a module loaded later arm at its load.
 - **Attach:** the target keeps running while probes arm. Each probe counts from its
   `probe: active ...` line on stderr. Breakpoint/hw-only sessions arm at once (nothing is
   injected). In a session with inline probes, breakpoint/hw probes arm once the injected
@@ -274,7 +276,8 @@ Ends the session and frees it; `s` is invalid afterwards.
 
 - May be called from another thread while `probe_run` runs: it asks `probe_run` to stop
   (detach an attached target, end a launched one), waits until `probe_run` has returned
-  (`probe: close: still waiting for probe_run to stop (Ns)` every 15 s), then tears down.
+  (`probe: close: still waiting for probe_run to stop (Ns; it is <phase>)` every 15 s), then
+  tears down.
 - A launched target that is still running is terminated (exit code 3).
 - An attached target that is still running is detached. stderr then shows
   `probe: detached: hits=.. logs_written=.. log_dropped=.. in_flight=.. running=..`
@@ -287,7 +290,7 @@ Ends the session and frees it; `s` is invalid afterwards.
 
 ## Callback functions
 
-These take the hit's context `c`. Passing a NULL context returns 0 / does nothing.
+These take the hit's context `c`. With a NULL context they return 0 and log no record.
 
 ### `uint64_t get_reg(probe_context *c, enum probe_register r)`
 ### `int set_reg(probe_context *c, enum probe_register r, uint64_t value)`
@@ -383,14 +386,18 @@ ran; `*ret` receives the return register.
   in.
 - **Breakpoint/hw:** the debugger runs the call on the stopped thread and restores its
   context exactly. It costs tens of microseconds, so cache results. Other threads keep
-  running; their hits on code probes wait until the call ends (a data-watchpoint hit cannot
-  wait and runs its callback during the call). Calls do not nest: a `call_func` made while
-  another one is in flight returns 0. A call
-  that does not return within 5 s is abandoned (`probe: call_func timed out after 5 s;
+  running; their hits wait until the call ends (a code probe's thread is rewound and hits
+  again; a data watch's thread is held right after its access, and its callback runs once
+  the call is over). Calls from several threads' callbacks all succeed, one after the other.
+  A call that does not return within 5 s is abandoned (`probe: call_func timed out after 5 s;
   thread restored`). A callee that raises an exception, even one it handles itself, is
   abandoned at that exception (returns 0, `*ret` untouched, the target never sees it).
   The callee is entered through a real `call` (a 3-byte stub in the target), so it works
-  under CET shadow stacks too (measured on enforced-CET hardware, CI windows-2025).
+  under CET shadow stacks too (measured on enforced-CET hardware, CI windows-2025). The
+  callee's frame goes 512+ bytes below the hit's SP: where that stack is not committed yet,
+  the thread first grows it itself; within the last pages of the thread's stack reservation
+  the call is refused (returns 0, one stderr line per probe:
+  `call_func refused: the thread's stack is nearly exhausted ...`).
 - **Inline:** a direct call. An exception in the callee is dispatched in the target as usual
   (handled inside: returns 1; unhandled: 0), and the target's vectored handlers see it.
 - Prefer `call_original` for the probed function itself, and keep `call_func` to callees
@@ -444,7 +451,8 @@ address, so the normal and shadow stacks stay in sync.
   the original.
 - A struct result over 8 bytes goes through the hidden pointer (`get_func_arg(c, 0)`, x64
   member functions 1): write it with `set_mem` and `return_from(c, pointer, nargs)`.
-- `nargs` (x86 only; ignored on x64) = the **stack** argument slots the callee pops:
+- `nargs` (counts on x86 only; on x64 any value 0..255 does the same; outside 0..255
+  `return_from` does nothing, on every backend) = the **stack** argument slots the callee pops:
   `__stdcall` all of them (64-bit/double ones count 2), `__fastcall`/`__vectorcall` those
   after the register ones, `__thiscall` those after `this`; a hidden return pointer counts
   1. Pass 0 for `__cdecl` and varargs functions (the caller pops). After `call_original` the
@@ -454,7 +462,8 @@ address, so the normal and shadow stacks stay in sync.
 - Other register changes (`set_reg`) are kept; SP is always the hit's.
 - Refused (no effect, warned once) where `call_original` is refused.
 - `call_original` without `return_from` lets the original run a **second** time on fall
-  through (warned once per probe).
+  through (warned once per probe). Exception: on breakpoint/hw under a CET shadow stack it
+  cannot run twice, so the caller gets the original's result (warned once).
 
 Note the asymmetry: `call_original`'s `nargs` counts the arguments the function takes;
 `return_from`'s counts the x86 stack slots the callee pops (`__thiscall` with no other
@@ -469,8 +478,10 @@ if (!call_original(c, 11, &status)) return;   // refused: the call runs normally
 return_from(c, status, 11);                    // the caller sees the real status
 ```
 
-Warnings about `call_original` / `return_from` go to stderr (`probe: warning: <location>:
-...`) and, once per probe, into the log as a `uhh warning: ...` record, on every backend.
+Warnings about `call_original` / `return_from` go into the log as a `uhh warning: ...`
+record, once per probe, on every backend; breakpoint/hw also print them on stderr
+(`probe: warning: <location>: ...`). The breakpoint/hw refusal for want of a debug register
+is a stderr line only.
 
 ### `probe_session *get_session(probe_context *c)`
 
@@ -484,16 +495,19 @@ source works in every backend.
 
 - Only `probe_add_symbol`, `probe_add_symbol_cfg`, `probe_add_address` and `probe_watch` may
   be called from a callback.
-- The new probe's callback must be **exported** by the module of the calling callback
-  (`a probe added from a callback needs a callback exported by name (dllexport)`): an inline
-  request names it by export and the controller resolves that name there. Keep a callback
-  and the callbacks it adds in one module.
-- A failure returns 0 to the callback and prints `probe: dynamic add failed: <reason>`; it
-  does not become the session's error.
+- The new probe's callback must be **exported** (`a probe added from a callback needs a
+  callback exported by name (dllexport)`). An inline request names it by export and the
+  controller resolves that name in the calling callback's module (breakpoint/hw accept any
+  export), so keep a callback and the callbacks it adds in one module.
+- A failure returns 0 to the callback and does not become the session's error. Refusals by
+  the controller print `probe: dynamic add failed: <reason>`; an inline request that cannot be
+  read prints `probe: dynamic add from inline callback: ...`; an inline add with a null or
+  non-exported callback or a null config is refused in the target, without a message.
 - A probe added for a module that is not loaded yet returns 1 and stays pending; if it
   cannot be armed when the module loads, stderr shows `probe: runtime probe <loc> failed to
   arm: <reason>` and the probe is dropped.
-- Configs and symbols have no extra size limit from a callback.
+- Configs have no extra size limit from a callback (4 GB everywhere); a symbol string sent
+  from an inline callback is limited to 64 KiB.
 
 Example (README): watch the block `malloc` returns.
 
@@ -531,8 +545,12 @@ UHH_SHARED OpenRecord g_by_handle[kHandleSlots];   // examples/gated_config/call
   into either process (store values, handles, indices); lock-free atomics for
   synchronisation (`std::atomic_ref` in the examples).
 - Per session: each session uses its own copy of the agent DLL
-  (`%TEMP%\uhh\<pid>-<tick>-<n>\probe_api_agent.dll`, deleted at close), so separate
-  sessions never share.
+  (`%TEMP%\uhh\<pid>-<tick>-<n>\probe_api_agent.dll`, deleted at close -- after a detach the
+  target still has it loaded, and a later session removes it), so separate
+  sessions never share. To keep that copy off the launch's critical path, a controller
+  prepares the next session's copy in `%TEMP%\uhh\warm`; one is used only while `%TEMP%\uhh`
+  is writable by this user alone (plus SYSTEM / Administrators) and only if it is exactly
+  this build's agent (version stamp, PE identity and checksum), else a fresh copy is made.
 - A breakpoint/hw callback of a module with `UHH_SHARED` globals must be an export that the
   agent DLL also has (it is run from there): otherwise `callback uses UHH_SHARED state but
   is not a named export ...` or `UHH_SHARED callback '<name>' is not exported by the agent
@@ -545,11 +563,14 @@ UHH_SHARED OpenRecord g_by_handle[kHandleSlots];   // examples/gated_config/call
 
 Every `send_log`/`send_log_stack` record is appended as one JSON line to a per-session file,
 `%TEMP%\uhh\logs\uhh-<controller pid>-<n>.jsonl`; its path is printed once as
-`probe: logs -> ...`. The file is not deleted at close. A background thread copies new
-complete lines to the controller's stdout (the live tail). Redirect stdout to `NUL` to
-disable the tail and keep only the file. If a console tail falls behind for more than
-about a second, UHH prints a one-time warning suggesting a redirect to a file or pipe.
-Records reach the file within about 10 ms or when the writer is idle.
+`probe: logs -> ...`. The file is not deleted at close. The controller's log writer writes
+each batch of lines to its stdout first (the live tail), then hands it to the file's own
+appender thread, so a slow disk write never holds up stdout; a batch goes out within about
+10 ms, at once when the writer was idle. Logging never drops a record: when the writer falls
+behind, the logging thread waits. Redirect stdout to `NUL` to disable the tail and keep only
+the file. If a console tail falls behind for more than about a second, UHH prints a one-time
+warning suggesting a redirect to a file or pipe. Every flush (`probe_wait_for_exit`,
+`probe_report`, `probe_close`) waits until the file is complete.
 
 ```json
 {"kind":"probe_log","probe":3,"tid":5124,"message":"read handle=0xa4 pid=7516 name=probe_app.exe addr=0x7ff7fb509690 size=16","seq":0}
@@ -577,13 +598,13 @@ characters in the text or a stack frame are escaped.
 | `probe.active` | armed at report time; false = still pending, refused, or unloaded |
 | `probes`, `active`, `hits` | totals over the user's probes |
 | `overrides` | register changes made by callbacks (`set_reg` with a new value) |
-| `log_dropped` | records lost; non-zero only when the controller stopped consuming (e.g. it died, or its log file failed) |
+| `log_dropped` | records not in the session file: non-zero only when the controller stopped consuming (it died), ran out of memory for a record, or the file failed (every record after the failure; some may still be on stdout, see `stdout_logs`) |
 | `callbacks_interrupted` | inline callbacks cut off by the target process dying before their first log; their hits are counted, their logs never existed (one killed after its first log counts as that log) |
-| `logs_written` | records written to the session file |
+| `logs_written` | records in the session file (it holds `seq` 0..`logs_written`-1) |
 | `controller_peak_ws_mb` | the controller's peak working set |
 | `app_exit` | the target's exit code (1 if it did not exit, e.g. after a detach) |
 | `live_output_closed` | stdout's reader went away; the file still has every record |
-| `stdout_logs` | `probe_log` records the live tail wrote to stdout before this report (null when stdout is `NUL`: no tail). Equal to `logs_written` unless the tail stopped (`live_output_closed` / `live_output_error`) |
+| `stdout_logs` | `probe_log` records the live tail wrote to stdout before this report (null when stdout is `NUL`: no tail). Equal to `logs_written` unless the tail stopped (`live_output_closed` / `live_output_error`: fewer) or the session file failed (`error` says so; stdout may hold `stdout_logs - logs_written` more) |
 | `live_output_error` | a stdout write failed for another reason (also on stderr and in `error`); the file still has every record |
 | `error` | the session's first error, or null |
 
@@ -648,7 +669,8 @@ suite's portability matrix).
 | `call_func` cost | tens of microseconds | a direct call |
 | `PROBE_ONCE` | supported | refused |
 | Visible to the program | INT3 byte (breakpoint) or DR7 (hw) | hook jump in the code; page protection changes when hooks are written |
-| Live from | the first instruction (launch) | the entry point (launch) |
-| Per-hit cost | ~hundreds of us (breakpoint), ~tens of us (hw) | ~tens of ns to ~1 us |
+| Live from (launch) | the first instruction | the loader breakpoint (before any DLL initialiser) |
+| Added cost per hit, x64 / x86 | breakpoint ~77 / ~142 us, hw ~91 / ~151 us | ~0.07 / ~0.14 us, plus ~0.1 / ~0.15 us per `send_log` |
 
-Details and the remaining corner cases are in [limitations.md](limitations.md).
+The full per-backend table (threads, side effects, visibility, CET, x86) and the remaining
+corner cases are in [limitations.md](limitations.md#per-backend-table).

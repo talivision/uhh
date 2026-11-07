@@ -2,8 +2,8 @@
 
 UHH reports on **stderr**, every line starting with `probe:`. Errors read
 `probe: error: <reason>`; the first error of a session is also the report's `"error"`
-field. Callback-level warnings about `call_original` / `return_from` additionally appear
-once per probe in the log as a `uhh warning: ...` record. Below: symptom -> cause -> fix,
+field. Warnings about `call_original` / `return_from` appear once per probe in the log as a
+`uhh warning: ...` record (inline: only there, the agent has no stderr). Below: symptom -> cause -> fix,
 grouped by phase. Background for most items is in [limitations.md](limitations.md).
 
 First steps for any problem:
@@ -43,13 +43,16 @@ First steps for any problem:
 | `no new <image> appeared` | `probe_attach_new` timed out; processes already running are ignored | start the target after the `probe: waiting for a new <image>` line |
 | `probe_run must be called on the thread that called probe_launch/probe_attach` | Windows binds the debug object to that thread | call launch/attach and `probe_run` on the same thread; `probe_close` may come from another |
 | `create temporary log directory (Win32=...)` / `create probe log file` | `%TEMP%` not writable | point `TEMP` at a writable directory |
-| `probe: warning: could not make a per-session copy of the agent DLL; UHH_SHARED state is shared with other sessions using the same file` | the per-session copy under `%TEMP%\uhh` failed | free space / permissions in `%TEMP%`; until then do not run two sessions with `UHH_SHARED` callbacks at once |
+| `probe: warning: could not make a per-session copy of the agent DLL; UHH_SHARED state is shared with other sessions using the same file` | the per-session copy under `%TEMP%\uhh\<pid>-<tick>-<n>` could not be made | free space / permissions in `%TEMP%`; until then do not run two sessions with `UHH_SHARED` callbacks at once |
+| `probe: agent init thread ended by the target before it returned (...)` | the target ended (ExitProcess / TerminateProcess) while the agent was initialising | none: not an error, the target's end is the outcome (`app_exit` in the report) |
 
 ## Adding probes
 
 | Message | Cause | Fix |
 |---|---|---|
 | `location must be module+0xRVA or module!Export[+0xOFF]`, `symbol offset must be +0xHEX`, `location has an invalid RVA` | location syntax | see [api.md](api.md#locations) |
+| `probe callback is null`, `non-empty probe config is null`, `probe config is larger than 4 GB` | bad arguments | - |
+| `session already exited` | a probe added after the target exited | - |
 | `unknown probe flags` | a bit not in `enum probe_flags` | - |
 | `requested probe type/options are unsupported in this build` | not exactly one backend flag, or an option on the wrong backend: `PROBE_ONCE` with inline, `PROBE_FALLBACK_HW` / `PROBE_ALLOW_*` / `PROBE_UNSAFE_FAST_PATCH` without inline, a watch flag without hw, both watch flags, `PROBE_AT_RETURN` | see the flag table in [api.md](api.md#probe-flags) |
 | `too many hardware probes (max 4 DR slots)` | a 5th hw probe (execute and watch count together) | move probes to breakpoint/inline |
@@ -61,7 +64,8 @@ First steps for any problem:
 | `absolute-address probes need a running target` | `probe_add_address` / `probe_watch` before launch | call them from a callback (or after launch) |
 | `probe_watch address must be 4-byte aligned (watches one dword)` | unaligned watch address | watch the aligned dword containing it |
 | `use probe_watch for data watchpoints` | watch flags passed to `probe_add_address` | use `probe_watch` |
-| `probe: dynamic add failed: <reason>` | an add from a callback was refused; the callback got 0 | fix the reason; the session continues |
+| `probe_watch takes PROBE_WATCH_WRITE/RW and PROBE_ONCE only` | another flag (e.g. `PROBE_BREAKPOINT`) passed to `probe_watch` | pass only those (`PROBE_HW` is accepted and implied) |
+| `probe: dynamic add failed: <reason>` / `probe: dynamic add from inline callback: ...` | an add from a callback was refused; the callback got 0 | fix the reason; the session continues |
 | `probe: runtime probe <loc> failed to arm: <reason>` | a probe added from a callback could not be armed when its module loaded | same reasons as below; that probe is dropped |
 
 ## A probe does not fire
@@ -79,7 +83,7 @@ First steps for any problem:
 | `probe: warning: inline install not confirmed within 5 s` then `released N held thread(s) (install timeout)` | the agent could not install in time (loader lock held, a stuck thread) | the affected probes stay inactive; rerun with `PROBE_TRACE=1` to see the thread stacks; consider breakpoint/hw |
 | `inline agent failed to install <loc> (status=N)` | `-2`: callback not in the agent DLL; `-3`: the hook could not be built; `-1`: bad request | see Build for `-2`; for `-3` try breakpoint/hw |
 | `target exited before inline probes were ready` | the target ended before the agent confirmed the hooks | normal for very short programs; use breakpoint/hw |
-| Inline probe misses early calls; maps show `pid=0` / `key=?` for early handles | inline goes live at the entry point (launch) or at its `active` line (attach) | breakpoint/hw for loader-time activity ([limitations.md](limitations.md#coverage-and-timing)) |
+| Inline probe misses early calls; maps show `pid=0` / `key=?` for early handles | on launch inline goes live at the loader breakpoint (the loader's own work before it is not seen); on attach at its `active` line | breakpoint/hw for the loader's own activity ([limitations.md](limitations.md#coverage-and-timing)) |
 | hw probe never fires under Intel SDE | execute debug registers do not match SDE's code cache | expected; see [limitations.md](limitations.md#cet-shadow-stacks) |
 
 ## During the run
@@ -95,6 +99,9 @@ First steps for any problem:
 | `return_from nargs=N but the original popped M bytes (ret M); the original's count is used` | wrong x86 `nargs` for the convention | pass the stack slots the callee pops ([api.md](api.md#callback-functions)) |
 | `probe: warning: <loc>: the original did not return within 5 s (released, it runs on)` / `... left without returning (exception or longjmp)` / `... the thread exited inside the original` | breakpoint/hw `call_original` ended abnormally; the rest of the callback did not run | expected for blocking, throwing or exiting functions |
 | `call_func` returns 0 | unknown module/export, `nargs` outside 0..8, address not executable code; on breakpoint/hw also: the callee raised an exception, or the 5 s timeout (`probe: call_func timed out after 5 s; thread restored`) | pass every argument as `uint64_t`; call only non-blocking, non-throwing callees; cache results |
+| `probe: warning: <loc>: call_func refused: the thread's stack is nearly exhausted (...)` | breakpoint/hw: the callee's frame would come within the last pages of the thread's stack reservation | none needed for the program (it is unaffected); call from a site with more stack left, or inline |
+| `probe: warning: <loc>: call_original without return_from under CET shadow stacks: the original's result is returned (it cannot run twice)` | breakpoint/hw, CET target: the fall-through re-run cannot happen | add `return_from(c, ret, nargs)` |
+| `probe: warning: <loc>: the program uses DRn itself on thread N and no debug register is free: the probe yields there ...` | the target uses debug registers itself; UHH never takes the target's slot | fewer hw probes, or breakpoint/inline for that site |
 | `probe: logs are being written to a console, which is slowing the target; ...` | the live tail to a console is slow | redirect stdout to a file or pipe (or `NUL`: the file keeps everything) |
 | `probe: warning: live output closed (Win32=...)` | stdout's reader went away (`| head`) | not an error; the session file has every record (`"live_output_closed":true`) |
 | `probe: <time> target crashed: tid=N exception 0x... at module+0x...` plus a stack | the target died of an unhandled exception | compare with an uninstrumented run; check `set_reg`/`set_mem`/`return_from` in your callbacks; try another backend |
@@ -103,7 +110,7 @@ First steps for any problem:
 | Hits higher than the calls you expected | every caller of a system export is seen, and some APIs re-enter themselves | filter in the callback ([limitations.md](limitations.md#coverage-and-timing)) |
 | The target behaves differently under UHH | it is debugged under every backend (anti-debug checks, no unhandled-exception filter), or checks its code against disk | expected; see [limitations.md](limitations.md#visibility-to-the-target-anti-debug) |
 | The tool exits 1 but `"error":null` | `probe_wait_for_exit` returns 0 when the target's exit code is not 0 | check `app_exit` in the report |
-| `log_dropped` > 0 | the controller stopped consuming (it died, or the log file failed: `probe: error: write probe log file ...`) | check disk space in `%TEMP%\uhh\logs` |
+| `log_dropped` > 0 | the controller stopped consuming (it died), or the session file failed: `probe: error: write probe log file (Win32=N); the session log file is incomplete: it holds records seq 0..K (logs_written); every later record is counted in log_dropped, those that reached stdout too (stdout_logs - logs_written of them)` | check disk space in `%TEMP%\uhh\logs`; a stdout capture may still be complete (`stdout_logs` records, `seq` without gap) |
 | `callbacks_interrupted` > 0 | the target died (ExitProcess / TerminateProcess) while inline callbacks ran | expected at process exit; their hits are counted. stderr names each one: `probe: callbacks interrupted by the target's end: N cut off while running: <probe> (tid T); unexplained=0` (`unexplained` > 0 would be an accounting fault: report it) |
 
 Informational lines (no action needed): `probe: <loc> -> hardware fallback (...)`,
@@ -113,7 +120,8 @@ Informational lines (no action needed): `probe: <loc> -> hardware fallback (...)
 `probe: <loc> retired: its module unloaded` (absolute-address probes),
 `probe: <loc> was re-hooked by another tool that relocated our breakpoint to 0x...;
 following it there`, `probe: repaired hardware breakpoint state on thread N`,
-`probe: warning: thread N was killed while writing a log record; ...`.
+`probe: warning: thread N was killed while writing a log record; ...`,
+`probe: detach: N thread(s) frozen; all clean`, `probe: detached from pid N`.
 
 ## Detach, Ctrl+C and close
 
@@ -126,7 +134,8 @@ following it there`, `probe: repaired hardware breakpoint state on thread N`,
 | `probe: detached: hits=.. logs_written=.. log_dropped=.. in_flight=.. running=..` | final counts after the detach | hits = logs_written + log_dropped + in_flight (in_flight: callbacks still running that had not logged yet; running: all still running -- any log they write after the detach is lost) |
 | `probe: detach: agent work still pending after 5 s; it will install nothing` | the agent's thread could not start (the target holds its loader lock) | none; nothing is installed after the detach |
 | `probe: detach: N config block(s) left in the target for M callback(s) still in flight` | a deliberate, bounded leak so in-flight callbacks never read freed config | none |
-| `probe: close: still waiting for probe_run to stop (Ns)` | `probe_close` from another thread waits for `probe_run` to finish its detach | wait; see the detach lines |
+| `probe: close: still waiting for probe_run to stop (Ns; it is <phase>)` | `probe_close` from another thread waits for `probe_run` to finish (the phase: detaching, draining the log ring, in the debug loop, ending the session) | wait; see the detach lines |
+| `probe: ended: the target exited before the detach (exit code N): hits=.. logs_written=.. log_dropped=.. in_flight=..` | `probe_close` asked for a detach, but the target ended first | none; these are the final counts (`in_flight`: callbacks the target's end interrupted) |
 | `probe: session failed (<reason>): detaching from the target` | an internal error ended an attached session; the target was released cleanly | fix `<reason>` |
 
 ## Is my captured output complete?

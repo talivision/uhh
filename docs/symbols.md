@@ -24,6 +24,9 @@ therefore searches in this order:
    -property installationPath`. The installation is searched for a `dbghelp.dll`
    with `symsrv.dll` in the same directory. UHH does not assume that a TestPlatform
    extension directory is present or stable.
+   The answer (a path, or none) is cached for a day in `%TEMP%\uhh\vs-dbghelp-<arch>.txt`
+   (the lookup costs ~40 ms per controller); delete that file after installing Visual
+   Studio to make UHH look again.
 3. The system `dbghelp.dll` (System32 for x64, SysWOW64 for a Win32 controller on
    64-bit Windows), as a local-symbol-and-exports fallback.
 
@@ -139,8 +142,8 @@ kernel32's names on a first lookup after the target has exited.
 
 ## Stacks per backend (`send_log_stack`)
 
-Every backend captures raw return addresses at the hit and symbolizes them at report
-time, so the same callback logs the same stack. The walkers differ:
+Every backend captures raw return addresses at the hit; the controller's log writer
+symbolizes them as it writes the record, so the same callback logs the same stack. The walkers differ:
 
 | Backend | x64 | x86 |
 |---|---|---|
