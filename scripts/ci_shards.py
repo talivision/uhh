@@ -65,7 +65,7 @@ EST = {
     "check_mix_matrix": (23, 32), "check_multithread_exact": (10, 11), "check_newapp_files": (1, 2),
     "check_newapp_flag": (5, 4), "check_newapp_reg": (2, 2), "check_ntdll_churn": (75, 111),
     "check_oldcrt": (2, 3), "check_patch_race": (166, 204), "check_portability": (8, 8),
-    "check_powershell_detach": (1, 1), "check_prehook_attach": (3, 3), "check_prehook_chain": (1, 1), "check_quickstart": (1, 1),
+    "check_powershell_detach": (1, 1), "check_detach_slow_reader": (2, 2), "check_prehook_attach": (3, 3), "check_prehook_chain": (1, 1), "check_quickstart": (1, 1),
     "check_realapps:tasklist-m": (14, 360), "check_realapps:ps-modules-breakpoint": (230, 8),
     "check_realapps:ps-modules-hw": (140, 7), "check_realapps:ps-modules-inline": (35, 6),
     "check_realapps:ps-fileversion-breakpoint": (25, 200), "check_realapps:ps-fileversion-hw": (20, 190),

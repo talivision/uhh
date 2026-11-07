@@ -67,6 +67,7 @@ does not ship (skip_external(); a FAIL when --only named the check).
 import argparse
 import collections
 from collections import Counter
+import io
 import json
 import math
 import os
@@ -10788,7 +10789,7 @@ def check_powershell_detach():
     # long flush and came out far BELOW logs_written), and the records after the report must
     # end in a probe_final whose counts close the books: hits == logs_written + log_dropped +
     # in_flight, and the capture holds exactly its stdout_logs records, seq without a gap.
-    for rep, backend in ((r, b) for r in range(reps) for b in backends):
+    for k, backend in ((r, b) for r in range(reps) for b in backends):
         name = f"stdout-powershell-detach-{backend}"
         work = Path(tempfile.mkdtemp(prefix="uhh-pslog-"))
         tgt = None
@@ -10814,7 +10815,7 @@ def check_powershell_detach():
                 partial = verify_capture(out)
                 lines = err.strip().splitlines()
                 waits = [l for l in lines if "still waiting for probe_run" in l][:1]
-                record(name, False, f"rep={rep} no end within 240 s: captured so far={partial['logs']} "
+                record(name, False, f"rep={k} no end within 240 s: captured so far={partial['logs']} "
                                     f"report={'yes' if partial['report'] else 'no'} stderr={waits + lines[-4:]}")
                 continue
             took = time.time() - t0
@@ -10847,7 +10848,7 @@ def check_powershell_detach():
                 fin = {"hits": dh, "logs_written": dw, "log_dropped": dd, "in_flight": di, "stdout_logs": cap["logs"]}
             ok = (alive and finals <= 1 and after_final == 0 and consistent and closed and cap["bad"] == 0 and cap["gaps"] == 0 and
                   fin.get("log_dropped") == 0 and rep.get("error") is None and cap["logs"] > 0)
-            record(name, ok, f"rep={rep} took={took:.0f}s report: hits={hits} written={rep.get('logs_written')} stdout_logs={rep.get('stdout_logs')} "
+            record(name, ok, f"rep={k} took={took:.0f}s report: hits={hits} written={rep.get('logs_written')} stdout_logs={rep.get('stdout_logs')} "
                              f"consistent={consistent} final={ {k: fin.get(k) for k in ('hits', 'logs_written', 'log_dropped', 'in_flight', 'stdout_logs')} } "
                              f"captured={cap['logs']} bad={cap['bad']} seq_gaps={cap['gaps']} target_alive={alive} "
                              f"finals={finals} json_after_final={after_final}"
@@ -10858,6 +10859,113 @@ def check_powershell_detach():
             if tgt and tgt.poll() is None:
                 tgt.kill()
                 tgt.wait()
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def check_detach_slow_reader():
+    """A live detach must END while the attached target keeps the log ring full (CI 42364458533:
+    x86 stdout-powershell-detach-inline, probe_close "still waiting for probe_run to stop (180s)"
+    with 8.7M records streamed; the detach ran only once the test killed the target). The
+    drainer thread took drain_mu again nanoseconds after each pass; the debug loop, waiting for
+    it in its per-turn drain, starved and never got back to the stop request. Every trigger of
+    a live detach goes through that loop: --detach-after-ms (timed), --detach-on-stdin, and
+    Ctrl+Break (a plain --attach). uhh_trace --attach of logstream_target (4 threads, full
+    speed, inline + --stack) with its stdout read SLOWLY by this script (the ring stays full):
+    the trigger at ~3 s; the tool must exit within DETACH_END_S of it (the detach waits at most
+    15 s for running callbacks), the target alive, the detach line's books closed (hits ==
+    logs_written + log_dropped + in_flight, nothing dropped), and every record written to
+    stdout read here (stdout_logs of probe_final / the report == probe_log lines read)."""
+    import signal
+    tracer, target = exe("uhh_trace.exe"), exe("logstream_target.exe")
+    if not tracer or not target:
+        return missing_bin("detach-slowreader", "uhh_trace/logstream_target")
+    DETACH_END_S = 60
+    reps = int(os.environ.get("UHH_SLOWREADER_REPS", "1"))
+    for rep, how in ((r, h) for r in range(reps) for h in ("timed", "stdin", "ctrlbreak")):
+        name = f"detach-slowreader-{how}-inline"
+        procs = []
+        work = Path(tempfile.mkdtemp(prefix="uhh-slowrd-"))
+        try:
+            tgt = subprocess.Popen([str(target), "--count", "2000000000", "--threads", "4", "--delay", "0", "--no-ticks"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            procs.append(tgt)
+            time.sleep(1)
+            a = [str(tracer), "--backend", "inline", "--stack", "-p", "logstream_target.exe!LogSite:d",
+                 "--attach", str(tgt.pid)]
+            a += {"timed": ["--detach-after-ms", "3000"], "stdin": ["--detach-on-stdin"], "ctrlbreak": []}[how]
+            att = subprocess.Popen(a, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   env=dict(os.environ, TEMP=str(work), TMP=str(work)),
+                                   creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+            procs.append(att)
+            aerr = Lines(io.TextIOWrapper(att.stderr, errors="replace"))
+            st = {"logs": 0, "final": None, "report": None, "first": None}
+
+            def slow_read():                          # ~1 MB/s: far below what 4 logging threads produce
+                carry = b""
+                while True:
+                    chunk = att.stdout.read1(16384) if hasattr(att.stdout, "read1") else att.stdout.read(16384)
+                    if not chunk:
+                        break
+                    lines = (carry + chunk).split(b"\n")
+                    carry = lines.pop()
+                    for l in lines:
+                        if l.startswith(b'{"kind":"probe_log"'):
+                            st["logs"] += 1
+                            if st["first"] is None: st["first"] = time.time()
+                        elif l.startswith(b'{"kind":"probe_final"'): st["final"] = json.loads(l)
+                        elif l.startswith(b'{"kind":"probe_report"'): st["report"] = json.loads(l)
+                    time.sleep(0.016)
+            rd = threading.Thread(target=slow_read, daemon=True)
+            rd.start()
+            t_att = time.time()
+            if not aerr.wait_for(lambda l: l.startswith("probe: active logstream_target.exe!LogSite"), 90):
+                raise RuntimeError("LogSite never became active: " + " | ".join(aerr.lines[-3:])[:300])
+            if how == "timed":
+                trig = time.time() + 3.0              # --detach-after-ms 3000 counts from the attach
+            else:
+                time.sleep(3)
+                trig = time.time()
+                if how == "stdin":
+                    att.stdin.write(b"\n"); att.stdin.flush()
+                else:
+                    att.send_signal(signal.CTRL_BREAK_EVENT)
+            try:
+                att.wait(timeout=trig - time.time() + DETACH_END_S + 30)
+            except subprocess.TimeoutExpired:
+                pass
+            took = time.time() - trig
+            if att.poll() is None:
+                waits = [l for l in aerr.lines if "still waiting for probe_run" in l][:1]
+                att.kill(); att.wait()
+                record(name, False, f"rep={rep} no end {took:.0f} s after the {how} trigger: read={st['logs']} "
+                                    f"stderr={waits + aerr.lines[-3:]}")
+                continue
+            rd.join(timeout=120)
+            aerr.t.join(timeout=30)
+            alive = tgt.poll() is None
+            sm = cx_detach_summary(aerr.lines)
+            last = st["final"] or st["report"] or {}
+            bad = []
+            if took > DETACH_END_S: bad.append(f"ended {took:.0f}s after the trigger (> {DETACH_END_S}s)")
+            if not alive: bad.append("target died")
+            if att.returncode != 0: bad.append(f"rc={att.returncode}")
+            if not sm or sm.get("hits") != sm.get("logs_written", 0) + sm.get("log_dropped", 0) + sm.get("in_flight", 0) \
+                    or sm.get("log_dropped") != 0:
+                bad.append(f"summary={sm}")
+            if st["logs"] == 0 or last.get("stdout_logs") != st["logs"]:
+                bad.append(f"read={st['logs']} stdout_logs={last.get('stdout_logs')}")
+            if how == "ctrlbreak" and not any("interrupted" in l for l in aerr.lines):
+                bad.append("no 'interrupted' line")
+            record(name, not bad, f"rep={rep} " + (" ".join(bad) or
+                   f"ended {took:.1f}s after the {how} trigger; read={st['logs']} summary={sm}") +
+                   ("" if not bad else f" stderr={aerr.lines[-3:]}"))
+        except Exception as e:
+            record(name, False, repr(e))
+        finally:
+            for q in procs:
+                if q.poll() is None:
+                    q.kill()
+                    q.wait()
             shutil.rmtree(work, ignore_errors=True)
 
 
@@ -11084,6 +11192,7 @@ def main():
     if want(check_realbig): check_realbig("" if args.bigapps else REALBIG_DEFAULT)
     if want(check_stdout_powershell): check_stdout_powershell()
     if want(check_powershell_detach): check_powershell_detach()
+    if want(check_detach_slow_reader): check_detach_slow_reader()
     if want(check_stdout_console): check_stdout_console(args.console_records)
     if only and not RESULTS:
         print(f"regress.py: --only {','.join(only)} selected only opt-in tiers that were not enabled "

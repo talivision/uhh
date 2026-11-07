@@ -196,7 +196,8 @@ struct EventFiber {
 struct probe_session {
     std::vector<std::unique_ptr<Probe>> probes;
     std::mutex agent_mu;
-    std::mutex drain_mu;                       // shared ring has exactly one consumer at a time
+    std::mutex drain_mu;                       // shared ring has exactly one consumer at a time (lock_drain)
+    std::atomic<int> drain_waiters{0};         // threads blocked taking drain_mu: the drainer lets them in
     uint32_t agent_map[PROBE_AGENT_MAX_PROBES] = {};   // agent request index -> probes[] index (under agent_mu)
     std::thread drainer;                       // empties the agent's log ring continuously
     std::atomic<uint64_t> controller_dropped{0}; // only broken file I/O/allocation can lose controller logs
@@ -8023,6 +8024,22 @@ static void pack_agent_record(probe_session *s, const probe_agent_log &rec, std:
     }
 }
 
+// drain_mu, taken FAIRLY. The drainer thread releases it between passes and takes it again
+// nanoseconds later; a std::mutex (an SRW lock) has no handoff, so another thread waiting for
+// it -- the debug loop's per-turn drain, a report, a module unload -- could lose that race for
+// minutes while the target kept the ring full (CI: a live detach not even started 240 s after
+// its request, probe_run starved in its drain while 8.7M records streamed). A thread that
+// finds it taken says so here; the drainer does not start another pass while one waits.
+static std::unique_lock<std::mutex> lock_drain(probe_session *s) {
+    std::unique_lock<std::mutex> lock(s->drain_mu, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        s->drain_waiters.fetch_add(1);
+        lock.lock();
+        s->drain_waiters.fetch_sub(1);
+    }
+    return lock;
+}
+
 // Move published inline-log records out of the shared ring (single consumer). Called
 // every debug-loop turn, on idle timeouts, and at report, so the ring never fills
 // just because the run is long.
@@ -8034,7 +8051,7 @@ static size_t drain_agent_logs(probe_session *s) {
     if (!s->shared) return 0;
     auto *sh = s->shared;
     size_t moved = 0;
-    std::lock_guard<std::mutex> consume(s->drain_mu);
+    auto consume = lock_drain(s);
     const LONG64 stop = sh->log_head;
     // Records go to the writer in packs (enqueue_logs), each before drain_mu is released: a
     // flush that drains first (report, unload, detach) still finds every record queued.
@@ -8082,7 +8099,7 @@ static bool ring_owner_gone(probe_session *s, DWORD tid) {
 // the same producer as a later one published during the scan (per-thread order).
 static void deliver_past_stall(probe_session *s) {
     auto *sh = s->shared;
-    std::lock_guard<std::mutex> consume(s->drain_mu);
+    auto consume = lock_drain(s);
     LONG64 tail = sh->log_tail, head = sh->log_head;
     if (head <= tail || sh->logs[(uint64_t)tail % PROBE_AGENT_LOG_CAP].seq != tail) return;
     for (LONG64 pos = tail + 1; pos < head; ++pos) {
@@ -8119,7 +8136,7 @@ static void check_ring_stall(probe_session *s, RingStall &st) {
     }
     if (now - st.since < 20) return;
     if (ring_owner_gone(s, owner)) {
-        std::lock_guard<std::mutex> consume(s->drain_mu);
+        auto consume = lock_drain(s);
         if (sh->log_tail != tail || rec.seq != tail || (DWORD)rec.owner != owner) return;
         if (sh->log_head == tail) {                       // died between the owner and head CAS
             InterlockedCompareExchange(&rec.owner, 0, (LONG)owner);
@@ -8145,7 +8162,7 @@ static void start_drainer(probe_session *s) {
     if (s->drainer.joinable() || !s->shared) return;
     s->drain_stop = false;
     s->drainer = std::thread([s] {
-        unsigned idle = 0;
+        unsigned idle = 0, yields = 0;
         RingStall stall;
         // Idle waits of 0.5 ms (a high-resolution timer) while records came recently: Sleep(1)
         // lasts a whole timer tick (15.6 ms unless something raised the resolution), and a ring
@@ -8165,6 +8182,13 @@ static void start_drainer(probe_session *s) {
         ULONGLONG last_record = GetTickCount64();
         while (!s->drain_stop.load(std::memory_order_relaxed)) {
             InterlockedIncrement64(&sh->drain_beat);                  // "controller alive"
+            if (s->drain_waiters.load()) {           // another consumer goes first (lock_drain)
+                // (It may wait behind a third holder that is itself held up by a slow stdout:
+                // after a few yields, sleep rather than spin.)
+                if (++yields < 64) SwitchToThread(); else Sleep(1);
+                continue;
+            }
+            yields = 0;
             if (drain_agent_logs(s)) { idle = 0; last_record = GetTickCount64(); continue; }
             check_ring_stall(s, stall);
             if (++idle < 64) { SwitchToThread(); continue; }
@@ -8204,7 +8228,7 @@ static void drain_final(probe_session *s) {
         for (ULONGLONG until = GetTickCount64() + 500; sh->log_head != sh->log_tail && GetTickCount64() < until; ) {
             if (!drain_agent_logs(s)) Sleep(1);
         }
-    std::lock_guard<std::mutex> consume(s->drain_mu);
+    auto consume = lock_drain(s);
     // head and tail live in memory the TARGET can write: never trust them for the loop
     // bound. At most one ring's worth of slots can hold unread records.
     const LONG64 tail = sh->log_tail;
