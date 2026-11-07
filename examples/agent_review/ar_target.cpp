@@ -93,28 +93,94 @@ static int seh_call(intptr_t x, intptr_t *r, DWORD *code) {
     __except (*code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) { return 1; }
 }
 
-// Offset of the first `call rel32` in fn that targets callee (-1: none in the first 256 bytes).
-static long call_offset(const void *fn, const void *callee) {
-    const unsigned char *p = (const unsigned char *)fn;
+// ---- where: the probe sites, found by scanning code bytes ------------------------------
+// The scan must find the same instruction at EVERY image base. Bytes the loader rewrites for
+// the base (base-relocation fixups: absolute addresses in immediates and displacements) are
+// data, not code: x86 ar_load_self begins `push offset scopetable` (68 imm32), and loaded at
+// 0x8A0000 that imm32 reads 28 F8 8B 00 -- an "8B 00" the scan took for the load, putting the
+// probe INSIDE the push. The patch then corrupted the push and the program ran the hook jump's
+// displacement bytes as code: 0xC0000096 on the first call (regress agent-unwind, an x86 CI
+// runner whose ASLR base was one of the 12 such bases). A candidate overlapping a fixup is
+// skipped, and `where` re-runs the scan at every 64 KiB-aligned base (the fixups applied to a
+// copy of the code) and reports the bases where it would find something else (must be none).
+struct Fixup { uintptr_t rva; uint32_t width; };
+static uint8_t *image_base() { return (uint8_t *)GetModuleHandleW(nullptr); }
+// Every base-relocation fixup of this image with an rva in [lo, hi).
+static std::vector<Fixup> fixups_in(uintptr_t lo, uintptr_t hi) {
+    std::vector<Fixup> out;
+    uint8_t *base = image_base();
+    const auto *nt = (const IMAGE_NT_HEADERS *)(base + ((const IMAGE_DOS_HEADER *)base)->e_lfanew);
+    const IMAGE_DATA_DIRECTORY &dd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+    for (DWORD at = 0; dd.VirtualAddress && at + sizeof(IMAGE_BASE_RELOCATION) <= dd.Size;) {
+        const auto *blk = (const IMAGE_BASE_RELOCATION *)(base + dd.VirtualAddress + at);
+        if (blk->SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION)) break;
+        const auto *e = (const WORD *)(blk + 1);
+        for (DWORD k = 0; k < (blk->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / 2; ++k) {
+            const uint32_t w = (e[k] >> 12) == IMAGE_REL_BASED_HIGHLOW ? 4 : (e[k] >> 12) == IMAGE_REL_BASED_DIR64 ? 8 : 0;
+            const uintptr_t r = blk->VirtualAddress + (e[k] & 0xFFF);
+            if (w && r + w > lo && r < hi) out.push_back({r, w});
+        }
+        at += blk->SizeOfBlock;
+    }
+    return out;
+}
+constexpr long k_window = 256 + 8;       // bytes a scan reads from the function start
+// Code to scan: p = its bytes, rva = where they sit in the image, fx = the fixups among them.
+struct Code {
+    const unsigned char *p; uintptr_t rva; const std::vector<Fixup> *fx;
+    bool relocated(long i, long n) const {
+        for (const Fixup &f : *fx)
+            if (f.rva < rva + i + n && f.rva + f.width > rva + i) return true;
+        return false;
+    }
+};
+// Offset of the first `call rel32` targeting the function at callee_rva (-1: none in the
+// first 256 bytes). A rel32 call is base-independent: compared as rvas.
+static long call_offset(const Code &c, uintptr_t callee_rva) {
     for (long i = 0; i < 256; ++i)
-        if (p[i] == 0xE8 && p + i + 5 + *(const int32_t *)(p + i + 1) == (const unsigned char *)callee) return i;
+        if (c.p[i] == 0xE8 && !c.relocated(i, 5) &&
+            c.rva + i + 5 + (uintptr_t)(intptr_t) * (const int32_t *)(c.p + i + 1) == callee_rva) return i;
     return -1;
 }
 // The probe site for ar_load_self: the load of *p must lie inside the patch. x64: the first
 // `mov eax,[rcx]` (8B 01); x86: `mov eax,[eax]`/`mov ecx,[ecx]`/... (8B /r, mod=0, same reg)
 // after the argument load. The site is the function entry when the load starts within its
 // first 5 bytes (a patch at the entry relocates it), else the load itself.
-static long load_offset(const void *fn) {
-    const unsigned char *p = (const unsigned char *)fn;
+static long load_offset(const Code &c) {
+    const unsigned char *p = c.p;
     for (long i = 0; i < 96; ++i) {
+        if (c.relocated(i, 2)) continue;
 #if defined(_WIN64)
         if (p[i] == 0x8B && p[i + 1] == 0x01) return i;
 #else
-        if (p[i] == 0x8B && (p[i + 1] & 0xC0) == 0 && ((p[i + 1] >> 3) & 7) == (p[i + 1] & 7) && (p[i + 1] & 7) < 4 &&
-            (p[i + 1] & 7) != 4) return i;
+        if (p[i] == 0x8B && (p[i + 1] & 0xC0) == 0 && ((p[i + 1] >> 3) & 7) == (p[i + 1] & 7) && (p[i + 1] & 7) < 4) return i;
 #endif
     }
     return -1;
+}
+// The five sites of the unwind case: {probed function, callee (null: the load site)}.
+struct Site { const void *fn, *callee; };
+static const Site k_sites[5] = {{(void *)ar_mid_cpp, (void *)ar_thrower}, {(void *)ar_mid_seh, (void *)ar_faulter},
+                                {(void *)ar_self_cpp, (void *)ar_thrower}, {(void *)ar_self_seh, (void *)ar_faulter},
+                                {(void *)ar_load_self, nullptr}};
+static uintptr_t rva_of(const void *p) { return (uintptr_t)p - (uintptr_t)image_base(); }
+static long scan_site(const Code &c, const Site &s) { return s.callee ? call_offset(c, rva_of(s.callee)) : load_offset(c); }
+// The scan of each site at the base this image would have at `base`: its code copied with
+// every fixup moved by the difference (as the loader would have written it).
+static void scan_at(uintptr_t base, const std::vector<Fixup> (&fx)[5], long (&out)[5]) {
+    const uintptr_t delta = base - (uintptr_t)image_base();
+    for (int k = 0; k < 5; ++k) {
+        unsigned char buf[8 + k_window + 8];               // [rva - 8, rva + window + 8)
+        const uintptr_t rva = rva_of(k_sites[k].fn);
+        memcpy(buf, image_base() + rva - 8, sizeof(buf));
+        for (const Fixup &f : fx[k]) {
+            const intptr_t at = (intptr_t)(f.rva - (rva - 8));
+            if (at < 0 || at + (intptr_t)f.width > (intptr_t)sizeof(buf)) continue;   // straddles the copy: data either way
+            if (f.width == 4) { uint32_t v; memcpy(&v, buf + at, 4); v += (uint32_t)delta; memcpy(buf + at, &v, 4); }
+            else { uint64_t v; memcpy(&v, buf + at, 8); v += (uint64_t)delta; memcpy(buf + at, &v, 8); }
+        }
+        out[k] = scan_site(Code{buf + 8, rva, &fx[k]}, k_sites[k]);
+    }
 }
 
 // ---- faultafter -------------------------------------------------------------------------
@@ -291,10 +357,27 @@ int main(int argc, char **argv) {
     const char *k = argc > 1 ? argv[1] : "";
     if (argc > 2 && !strcmp(argv[2], "--wait") && !wait_gate()) return 3;
     if (!strcmp(k, "where")) {
-        printf("{\"kind\":\"where\",\"mid_cpp\":%ld,\"mid_seh\":%ld,\"self_cpp\":%ld,\"self_seh\":%ld,\"load\":%ld}\n",
-               call_offset((void *)ar_mid_cpp, (void *)ar_thrower), call_offset((void *)ar_mid_seh, (void *)ar_faulter),
-               call_offset((void *)ar_self_cpp, (void *)ar_thrower), call_offset((void *)ar_self_seh, (void *)ar_faulter),
-               load_offset((void *)ar_load_self));
+        std::vector<Fixup> fx[5];
+        long at[5];
+        for (int i = 0; i < 5; ++i) {
+            const uintptr_t rva = rva_of(k_sites[i].fn);
+            fx[i] = fixups_in(rva - 8, rva + k_window + 8);
+            at[i] = scan_site(Code{(const unsigned char *)k_sites[i].fn, rva, &fx[i]}, k_sites[i]);
+        }
+        // Every other base this image could be given (x86: the whole 2 GB user range; x64:
+        // the same set -- only the fixups' low bytes can matter for a 2-byte pattern).
+        long layouts = 0, bad = 0;
+        unsigned long long first_bad = 0;
+        for (uintptr_t b = 0x10000; b < 0x80000000u; b += 0x10000, ++layouts) {
+            long o[5];
+            scan_at(b, fx, o);
+            if (memcmp(o, at, sizeof(o))) { if (!bad++) first_bad = b; }
+        }
+        printf("{\"kind\":\"where\",\"mid_cpp\":%ld,\"mid_seh\":%ld,\"self_cpp\":%ld,\"self_seh\":%ld,\"load\":%ld,"
+               "\"base\":%llu,\"load_rva\":%llu,\"fixups\":%zu,\"layouts\":%ld,\"layouts_bad\":%ld,\"first_bad\":%llu}\n",
+               at[0], at[1], at[2], at[3], at[4], (unsigned long long)(uintptr_t)image_base(),
+               (unsigned long long)rva_of((void *)ar_load_self), fx[0].size() + fx[1].size() + fx[2].size() +
+               fx[3].size() + fx[4].size(), layouts, bad, first_bad);
     } else if (!strcmp(k, "unwind")) {
         intptr_t mid_cpp = 0, mid_seh = 0, self_cpp = 0, self_seh = 0, load = 0;
         int caught = 0, seh_raised = 0, seh_av = 0;

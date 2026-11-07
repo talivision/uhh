@@ -7810,13 +7810,164 @@ def check_logs_stdout_closed(threads=4):
                 pass
 
 
-def check_agent_review():
-    """Inline-agent static review (examples/agent_review), one reproduction per finding:
-    agent-unwind: a C++ throw / SEH raise / AV from a callee whose CALL instruction is inline-
+def pe_layout(data):
+    """(preferred image base, SizeOfImage, offset of the ImageBase field, offset of
+    DllCharacteristics, {rva: width} of every base-relocation fixup, rva -> file offset)."""
+    pe = struct.unpack_from("<I", data, 0x3C)[0]
+    nsec, osz = struct.unpack_from("<H", data, pe + 6)[0], struct.unpack_from("<H", data, pe + 20)[0]
+    opt = pe + 24
+    plus = struct.unpack_from("<H", data, opt)[0] == 0x20B
+    base = struct.unpack_from("<Q" if plus else "<I", data, opt + (24 if plus else 28))[0]
+    size = struct.unpack_from("<I", data, opt + 56)[0]
+    dirs = opt + (112 if plus else 96)
+    rrva, rsz = struct.unpack_from("<II", data, dirs + 5 * 8)
+    secs = [struct.unpack_from("<IIII", data, opt + osz + 40 * i + 8) for i in range(nsec)]
+
+    def fo(rva):
+        for vs, va, rs, rp in secs:
+            if va <= rva < va + max(vs, rs):
+                return rp + rva - va
+        raise ValueError(f"rva {rva:#x} in no section")
+    fix, at = {}, 0
+    while rrva and at + 8 <= rsz:
+        page, bsz = struct.unpack_from("<II", data, fo(rrva + at))
+        if bsz < 8:
+            break
+        for k in range((bsz - 8) // 2):
+            e = struct.unpack_from("<H", data, fo(rrva + at) + 8 + 2 * k)[0]
+            if e >> 12 in (3, 10):
+                fix[page + (e & 0xFFF)] = 4 if e >> 12 == 3 else 8
+        at += bsz
+    return base, size, opt + (24 if plus else 28), opt + 70, fix, fo
+
+
+def check_agent_unwind():
+    """agent-unwind: a C++ throw / SEH raise / AV from a callee whose CALL instruction is inline-
     probed (the hook relocates that call), caught by the hooked function and by its caller,
     and a load relocated by the hook faulting inside the hooked function's own __try -- the
     program's handlers get every one (x64: no unwind data for the trampoline used to end in
-    std::terminate / an unhandled exception). agent-faultafter: a callback that ran the
+    std::terminate / an unhandled exception). The row equals the uninstrumented run; hits and
+    "ar" logs are exact; nothing dropped or interrupted.
+    The sites are found by ar_target scanning its own code (`where`). That scan once took bytes
+    of a RELOCATED address for the load (x86 ar_load_self's `push offset scopetable` at an ASLR
+    base 0x8A0000 holds 8B 00): the probe went inside that push and the target died with
+    0xC0000096 on the first call, on 12 of the 32767 possible x86 bases (CI, 1 run in many).
+    agent-unwind-layouts: the scan finds the same sites at every 64 KiB-aligned base (ar_target
+    re-scans its code with the fixups applied for each). agent-unwind-rebased: the whole case on
+    a copy of ar_target whose fixed image base (ASLR off) makes a relocated address in
+    ar_load_self's scan window hold such a pattern -- the CI failure, made deterministic."""
+    d, t = exe("ar_driver.exe"), exe("ar_target.exe")
+    if not d or not t:
+        return missing_bin("agent-unwind", "ar_driver/ar_target")
+
+    def row(objs, kind="ar"):
+        r = dict(next((x for x in objs if x.get("kind") == kind), {}))
+        r.pop("kind", None)
+        return r
+
+    sites = ("mid_cpp", "mid_seh", "self_cpp", "self_seh", "load")
+
+    def scenario(target, base_row):
+        """Run the unwind case on `target` with the probes at its `where` sites: (bad, where)."""
+        _, wo = run([target, "where"], timeout=60)
+        w = row(wo, "where")
+        if any(w.get(k, -1) < 0 for k in sites):
+            return [f"site scan failed: {w}"], w
+        specs = [f"ar_target.exe!ar_{k}+0x{w[k]:x}=ar_on_site" for k in sites[:4]]
+        specs.append("ar_target.exe!ar_load_self" + (f"+0x{w['load']:x}" if w["load"] >= 5 else "") + "=ar_on_site")
+        args = [d]
+        for sp in specs:
+            args += ["--probe", sp]
+        r, o = run(args + ["--", target, "unwind"], timeout=180)
+        rep, bad = report(o), []
+        if not base_row: bad.append("no baseline row")
+        if row(o) != base_row: bad.append(f"row={row(o)} want={base_row}")
+        if rep.get("log_dropped") != 0: bad.append(f"dropped={rep.get('log_dropped')}")
+        if rep.get("callbacks_interrupted", 0) != 0: bad.append(f"intr={rep.get('callbacks_interrupted')}")
+        if rep.get("error") is not None: bad.append(f"err={rep.get('error')}")
+        if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
+        hits = [p.get("hits") for p in probes(o)]
+        if hits != [10] * 5: bad.append(f"hits={hits}")
+        logs = {}
+        for x in o:
+            m = str(x.get("message", ""))
+            if x.get("kind") == "probe_log" and m.startswith("ar "):
+                logs[m] = logs.get(m, 0) + 1
+        if logs != {"ar site": 50}: bad.append(f"logs={logs}")
+        return bad, w
+
+    try:
+        _, bo = run([t, "unwind"], timeout=60)
+        base_row = row(bo)
+        bad, w = scenario(t, base_row)
+        record("agent-unwind", not bad, "; ".join(bad + [f"sites={w}"]) if bad else f"row={base_row} sites={w}")
+    except Exception as e:
+        record("agent-unwind", False, repr(e))
+        return
+
+    # agent-unwind-layouts
+    lb = w.get("layouts_bad")
+    record("agent-unwind-layouts", lb == 0 and w.get("layouts", 0) >= 32767,
+           f"bases={w.get('layouts')} giving other sites={lb}" + (f" (first {w.get('first_bad', 0):#x})" if lb else "")
+           + f" fixups_in_windows={w.get('fixups')} base={w.get('base', 0):#x}")
+
+    # agent-unwind-rebased
+    tmp = Path(tempfile.mkdtemp(prefix="uhh-unwind-"))
+    try:
+        data = bytearray(t.read_bytes())
+        pref, size, base_off, dllch_off, fix, fo = pe_layout(data)
+        x86 = pe_is_x86(t)
+        lo = w["load_rva"]
+        # Bases where a fixup in ar_load_self's scan window gets bytes 2-3 = a pattern the load
+        # scan accepts (x86 8B 09/12/1B: mov r,[r], away from the crowded low 16 MB; x64 8B 01).
+        targets = (0x098B, 0x128B, 0x1B8B) if x86 else (0x018B,)
+        cands = []
+        for rva, width in sorted(fix.items()):
+            if not lo - width < rva < lo + 96:
+                continue
+            k = struct.unpack_from("<I", data, fo(rva))[0] - (pref & 0xFFFFFFFF)
+            for hi in targets:
+                b = ((hi - ((k >> 16) & 0xFFFF)) & 0xFFFF) << 16
+                if 0x10000 <= b and b + size < 0x7FFE0000 and b not in cands:
+                    cands.append(b)
+        if not cands:
+            record("agent-unwind-rebased", True, f"no base-relocated bytes in ar_load_self's scan window "
+                                                 f"({'x86' if x86 else 'x64'}): nothing layout-dependent to test")
+            return
+        tried, done, bad = [], [], []
+        for b in cands[:8]:
+            # Rebase the file to b (every fixup moved, as editbin /REBASE does), ASLR off.
+            img = bytearray(data)
+            for rva, width in fix.items():
+                fmt, mask = ("<I", 0xFFFFFFFF) if width == 4 else ("<Q", 0xFFFFFFFFFFFFFFFF)
+                struct.pack_into(fmt, img, fo(rva), (struct.unpack_from(fmt, img, fo(rva))[0] + b - pref) & mask)
+            struct.pack_into("<I" if x86 else "<Q", img, base_off, b)
+            struct.pack_into("<H", img, dllch_off, struct.unpack_from("<H", img, dllch_off)[0] & ~0x40)  # DYNAMIC_BASE off
+            copy = tmp / f"b{b:08x}" / "ar_target.exe"
+            copy.parent.mkdir()
+            copy.write_bytes(bytes(img))
+            _, wo2 = run([copy, "where"], timeout=60)
+            w2 = row(wo2, "where")
+            if w2.get("base") != b:
+                tried.append(f"{b:#x}: loaded at {w2.get('base', 0):#x}")
+                continue
+            done.append(f"{b:#x}")
+            if any(w2.get(k) != w.get(k) for k in sites):
+                bad.append(f"base {b:#x}: sites {({k: w2.get(k) for k in sites})} != {({k: w.get(k) for k in sites})}")
+            bad += [f"base {b:#x}: {x}" for x in scenario(copy, base_row)[0]]
+        if not done:
+            bad.append(f"no candidate base was honoured: {tried}")
+        record("agent-unwind-rebased", not bad, "; ".join(bad) if bad else
+               f"bases={done} (not loadable: {len(tried)}) each row={base_row}")
+    except Exception as e:
+        record("agent-unwind-rebased", False, repr(e))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def check_agent_review():
+    """Inline-agent static review (examples/agent_review), one reproduction per finding
+    (agent-unwind: check_agent_unwind). agent-faultafter: a callback that ran the
     original and then faults must not run the original again. agent-threadinit: an
     allocating callback on RtlAllocateHeap while threads start (hits before the thread's TLS
     exists) must not recurse. agent-ljframe0: x64 longjmp without unwinding out of
@@ -7858,29 +8009,6 @@ def check_agent_review():
         if rep.get("error") is not None: bad.append(f"err={rep.get('error')}")
         if rep.get("app_exit") != 0 or r.returncode != 0: bad.append(f"app_exit={rep.get('app_exit')} rc={r.returncode}")
         return bad
-
-    # agent-unwind
-    try:
-        _, wo = run([t, "where"], timeout=60)
-        w = row(wo, "where")
-        _, bo = run([t, "unwind"], timeout=60)
-        base = row(bo)
-        specs = []
-        for key in ("mid_cpp", "mid_seh", "self_cpp", "self_seh"):
-            specs.append(f"ar_target.exe!ar_{key}+0x{w.get(key, -1):x}=ar_on_site")
-        lo = w.get("load", -1)
-        specs.append(("ar_target.exe!ar_load_self" + (f"+0x{lo:x}" if lo >= 5 else "")) + "=ar_on_site")
-        if any(w.get(k, -1) < 0 for k in ("mid_cpp", "mid_seh", "self_cpp", "self_seh", "load")):
-            record("agent-unwind", False, f"site scan failed: {w}")
-        else:
-            r, o = go("unwind", specs)
-            bad = common(r, o, base)
-            hits = [p.get("hits") for p in probes(o)]
-            if hits != [10] * 5: bad.append(f"hits={hits}")
-            if ar_logs(o) != {"ar site": 50}: bad.append(f"logs={ar_logs(o)}")
-            record("agent-unwind", not bad, "; ".join(bad) or f"row={row(o)} sites={w}")
-    except Exception as e:
-        record("agent-unwind", False, repr(e))
 
     # agent-faultafter
     try:
@@ -11764,6 +11892,7 @@ def main():
     if want(check_callorig_deep): check_callorig_deep()
     if want(check_callconv): check_callconv()
     if want(check_agent_review): check_agent_review()
+    if want(check_agent_unwind): check_agent_unwind()
     if want(check_callfunc_registry): check_callfunc_registry()
     if want(check_transparency): check_transparency()
     if want(check_interrupt): check_interrupt()
