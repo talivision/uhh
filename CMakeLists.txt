@@ -193,7 +193,8 @@ add_library(probe_api_agent SHARED
     examples/logs_eval/logs_callbacks.cpp
     examples/agent_review/ar_callbacks.cpp
     examples/transparency/tp_callbacks.cpp
-    examples/quickstart/my_callbacks.cpp)
+    examples/quickstart/my_callbacks.cpp
+    bench/frida/uhh_count_callbacks.cpp)
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     target_sources(probe_api_agent PRIVATE src/probe/agent_x64.asm)   # uhh_orig_thunk (call_original)
 endif()
@@ -338,6 +339,11 @@ target_include_directories(hitcost_driver_shared PRIVATE include)
 target_compile_definitions(hitcost_driver_shared PRIVATE HITCOST_SHARED)
 target_link_libraries(hitcost_driver_shared PRIVATE probe_api)
 add_dependencies(hitcost_driver_shared hitcost_target probe_api_agent)
+# UHH side of the bench/frida count workload (vs_frida.py): one probe, one counting callback.
+add_executable(uhh_count bench/frida/uhh_count.cpp bench/frida/uhh_count_callbacks.cpp)
+target_include_directories(uhh_count PRIVATE include)
+target_link_libraries(uhh_count PRIVATE probe_api)
+add_dependencies(uhh_count probe_app probe_api_agent)
 # Control-plane timing (attach / detach / launch) for bench/perfab/perf_ab.py.
 add_executable(lifecycle_bench bench/perfab/lifecycle_bench.cpp bench/hitcost/hitcost_callbacks.cpp)
 target_include_directories(lifecycle_bench PRIVATE include)

@@ -1,212 +1,151 @@
-# Frida benchmark harness
+# UHH vs Frida: the comparison harness (current Frida, 17.26+)
 
-Frida equivalents of this repo's gated instrumentation scenario, so Frida's
-`Interceptor` (the industry-standard inline hook) can be timed head-to-head with
-our native inline/breakpoint backends on the **same workload, same machine**
-(the baseline requirement in `docs/plan-v2.md` -> "Benchmarking baselines").
-
-Everything here runs on the **Windows VM** against the compiled `probe_app.exe` /
-`configparse.dll`. Nothing in this directory is built by CMake; it is pure
-JS + Python driven by the `frida` module.
+`vs_frida.py` runs the same workloads under UHH and under Frida on the same machine, with
+the same clocks, and checks correctness exactly for every run. The agents in `agents/` are
+written the way the current Frida documentation says to write them. Results and their
+interpretation are in [`../BENCHMARKS.md`](../BENCHMARKS.md), in the section "UHH vs Frida
+17.26.1 (2026-11-07, supersedes the earlier comparison)".
 
 ```
 bench/frida/
-  read_logger.js    # analogue of callbacks.cpp log_read   (hot inline read probe)
-  enable_reads.js   # analogue of callbacks.cpp enable_reads (deferred flag flip)
-  bench_frida.py    # harness: baseline vs Frida, comparable JSON/CSV
-  README.md
+  vs_frida.py            driver: every workload x every method, repeats, exact judges, summary
+  agents/prelude.js      prepended to every agent (PARAMS, target resolution, exit handshake)
+  agents/count_js.js     Interceptor.attach, JavaScript onEnter (run under QuickJS and under V8)
+  agents/count_cmodule.js  Interceptor.attach, CModule (C) onEnter
+  agents/count_hw.js     hardware breakpoint / write watchpoint on every thread + exception handler
+  agents/gated_js.js     the whole examples/gated_config, JavaScript callbacks, batched send()
+  agents/gated_cmodule.js  the same with C callbacks, a lock-free ring and binary send()
+  uhh_count.cpp, uhh_count_callbacks.cpp   UHH side of the count/hit workloads (same callback on every backend)
+  (legacy, superseded: bench_frida.py, gated_full.*, read_*.js, enable_reads.js -- frida 16.5.9, see below)
 ```
 
-## What each piece maps to
+## Run it
 
-| Ours (`examples/gated_config/callbacks.cpp`) | Frida here |
-|---|---|
-| `log_read`: inline hook at `ReadSite`, reads `get_func_arg(c,0)` / `get_func_arg(c,3)`, `PROBE_LOG` | `read_logger.js`: `Interceptor.attach(ntdll!NtReadVirtualMemory)`, `args[0]`/`args[3]` |
-| `read_logger` CLI: filter by resolved PID + address range | `read_logger.js` `configure({ onlyPid, rangeStart, rangeSize, selectedHandle })` |
-| `enable_reads`: deferred **breakpoint** at `configparse.dll+ParsedFlagSite`, sets `PROBE_REG_AX`=1 | `enable_reads.js`: hook `ParseConfig` (default) or the flag-site register (`flagsite`) |
-| `note_open`: `NtOpenProcess` return probe building handle->PID map | `GetProcessId(handle)` cached in `read_logger.js` (see note below) |
-| controller delivers the gate keystroke via a stdin pipe (`src/session.cpp`) | `device.input(pid, b"x")` after `{"kind":"waiting"}` |
-
----
-
-## Install (on the Windows VM)
-
-Requires a 64-bit Python 3.8+ for an x64 target, or a 32-bit Python for an
-x86 / WoW64 target **matching the target's bitness is not required** (frida can
-inject cross-bitness), but using the matching Python avoids surprises.
+On the Windows VM (frida 17.26.1 lives in its own venv, `C:\work\frida17`; `C:\work\fv16`
+is the old 16.5.9 one and is untouched):
 
 ```bat
-python -m pip install --upgrade pip
-python -m pip install frida==16.5.9 frida-tools==12.6.1
+python -m venv C:\work\frida17
+C:\work\frida17\Scripts\python -m pip install frida==17.26.1 frida-tools
+cmake --build build-x64 --config Release --target probe_app configparse gated_config uhh_count hitcost_target probe_api_agent
+C:\work\frida17\Scripts\python -u bench\frida\vs_frida.py --rel build-x64\Release --arch x64 --repeats 3 --out rows-x64.jsonl
+:: x86: build-x86 (cmake -A Win32), --rel build-x86\Release --arch x86. The SAME 64-bit Python and
+:: frida drive 32-bit targets (frida injects its 32-bit agent through its helper).
 ```
 
-Pinned versions this harness was written against: **frida 16.5.9 / frida-tools
-12.6.1**. The scripts also run on **frida 17.x** (which removed the static
-`Module.getExportByName`/`findBaseAddress` helpers) via the version shims at the
-top of each `.js`. If you use 17.x, just `pip install frida frida-tools` and
-expect identical behaviour. Verify:
+`--workloads count,gated,churn,hit` and `--methods <substrings>` select a subset. The GitHub
+workflow `.github/workflows/bench-frida.yml` runs the same thing on fresh windows-2022 and
+windows-2025 runners (results as `::notice::` annotations plus the raw rows as an artifact).
 
-```bat
-frida --version
-python -c "import frida; print(frida.__version__)"
-```
+## Workloads and methods
 
-Run **elevated** (Administrator) - injecting into a spawned child needs
-`SeDebugPrivilege` on most setups. Disable Frida's own output buffering is not
-needed; the harness reads probe_app's stdout through Frida's `pipe` stdio.
+| workload | target | what every method does |
+|---|---|---|
+| count | `probe_app` (reads enabled by config), 8 threads x 50,000 reads | one probe at `ntdll!NtReadVirtualMemory`; the callback reads argument 0 and argument 3 and bumps a counter; no logging |
+| gated | `probe_app` with its shipped config (feature DISABLED) | the whole `examples/gated_config`: flip the parsed flag at `configparse.dll!ParseConfig+0x16` (a probe that is set before the DLL is loaded), handle -> pid -> name map at `NtOpenProcess` (from the real returned handle), forget at `NtClose`, log EVERY `NtReadVirtualMemory` as `read handle=.. pid=.. name=.. addr=.. size=..` with its thread id, deliver every record to the host |
+| churn | `probe_app --churn --truth FILE` | the same tools; helpers opened, read, closed over and over from 8 threads (handle values reused for different pids, reads through duplicated handles the map never saw); judged per thread against the target's own record |
+| hit | `hitcost_target`, one thread, N calls of `hit_site` | the bare per-hit cost of each mechanism (counting callback), and of a write watchpoint on the global `hit_site` updates |
 
----
+| method | UHH | Frida |
+|---|---|---|
+| inline hook, native callback | `uhh-inline` | `frida-cmodule` (Interceptor + CModule C callback) |
+| inline hook, script callback | -- | `frida-js` (QuickJS, the default runtime), `frida-js-v8` |
+| hardware breakpoint | `uhh-hw` (debug registers, out-of-process debugger) | `frida-hw` (`Thread#setHardwareBreakpoint` + `Process.setExceptionHandler`, in-process) |
+| hardware watchpoint | `uhh-watch` | `frida-watch` (`Thread#setHardwareWatchpoint`) |
+| software breakpoint | `uhh-breakpoint` | none in Frida's local (in-process) backends: `Interceptor.breakpointKind` exists only in the Barebone backend |
 
-## Build inputs it expects
+Every Frida method SPAWNS the target (spawn suspended, attach, load the agent, resume): Frida's
+equivalent of UHH's launch. UHH is driven through `gated_config.exe` / `uhh_count.exe`.
 
-Point `--bin` at a build output dir that contains (from `cmake --build`):
+## What current Frida offers, and how the agents use it
 
-```
-probe_app.exe      configparse.dll
-probe_app.map      configparse.map   (only needed for --flag-method flagsite)
-```
+Read from the 17.x documentation (frida.re/docs/javascript-api, best-practices, the 17.22-17.26
+release notes) and checked against the frida-gum source where the docs are silent:
 
-Build as the main README describes, e.g.:
+- **Interceptor.attach(target, callbacks)** with `onEnter(args)`/`onLeave(retval)`. Docs:
+  "callbacks have a significant impact on performance ... omit the callback you don't need";
+  for hot functions "use Interceptor in conjunction with CModule to implement the callbacks in
+  C". `this` is a per-invocation, per-thread object (state from onEnter to onLeave). JavaScript
+  callbacks run under the script's runtime lock, so callbacks of different threads are
+  SERIALIZED; CModule callbacks are plain native calls and run concurrently.
+- **Instruction probes**: `Interceptor.attach(address, function (args) {...})` hooks an
+  arbitrary instruction; `this.context.rax/eax` can be assigned. This is the exact
+  equivalent of UHH's `ParseConfig+0x16` probe that sets EAX=1; the 7 bytes at that site
+  (`mov [rbx],eax; mov eax,1`) relocate fine. (The old comparison claimed the site was "a 2-byte
+  `mov [rcx],eax` + ret, too short for any trampoline" -- wrong for the current
+  `parse_x64.asm`/`parse_x86.asm`.) 17.26 adds instrumentation options (`relocation:
+  'forced'`, `scenario: 'offline'`, `writeRedirect`) for even tighter sites.
+- **Process.attachModuleObserver({onAdded})** (17.x): called "synchronously right after that
+  module has been loaded but before the application has had a chance to use it ... a good
+  time to apply your instrumentation". This is Frida's pending/deferred probe: `gated_*.js`
+  installs the flag probe there, when `configparse.dll` maps.
+- **Process.attachThreadObserver({onAdded})** (17.x): existing threads right away, each new
+  thread "synchronously from that new thread". With it, per-thread hardware breakpoints cover
+  every thread including future ones -- the old comparison said Frida had "no process-wide or
+  future-thread arming", true of 16.5.9 only.
+- **Thread#setHardwareBreakpoint(id, address) / setHardwareWatchpoint(id, address, size,
+  'r'|'w'|'rw')** + **Process.setExceptionHandler(cb)**: the hit is an `EXCEPTION_SINGLE_STEP`
+  in the target's own exception dispatch (`details.type === 'single-step'`); return `true` to
+  continue. Frida's own test only shows a one-shot breakpoint (it unsets it in the handler).
+  To keep an EXECUTE breakpoint armed, the handler must set the resume flag (EFLAGS.RF, bit 16)
+  -- `details.context` has no EFLAGS, so it is written in `details.nativeContext` (the Windows
+  CONTEXT: `EFlags` at +0x44 on x64, +0xC0 on x86). A watchpoint traps after the access and
+  needs nothing. The old `read_hwbp.js` set TF through `ctx.rflags`, which does not exist, so
+  each thread counted one hit and never re-armed: that was its "8 of 16,000".
+- **CModule**: `new CModule(source, symbols)` compiles C with the built-in TinyCC (no
+  optimizer) into memory; exported functions become NativePointers that Interceptor accepts as
+  native `onEnter`/`onLeave` (`GumInvocationContext *`). "All data is read-only, so writable
+  globals should be declared extern, allocated using e.g. Memory.alloc(), and passed in as
+  symbols". The old `read_cmodule.js` wrote to a CModule global (`g_calls++`), i.e. to
+  read-only memory, from the hook: the first call faulted inside the hook, which is the "CModule
+  hangs on load" it reported. Available in C: a curated subset of GLib (`g_atomic_int_add`,
+  `g_thread_yield`, ...) and Gum (`gum_invocation_context_get_nth_argument`,
+  `GUM_IC_GET_INVOCATION_DATA`, `gum_invocation_context_get_thread_id`); no `snprintf`.
+  External functions (e.g. `NtQuerySystemInformation`) are passed as symbols too.
+- **send(message[, data])** is asynchronous, but "the total overhead of sending a single
+  message is not optimized for high frequencies ... Frida leaves it up to you to batch".
+  `data` is an ArrayBuffer of raw bytes: the binary path. `gated_js.js` batches text records
+  (4,096 per send(), and a 20 ms timer flush); `gated_cmodule.js` batches binary records from
+  a native ring (one send() per drained chunk, up to 65,536 records). `recv(type, cb).wait()`
+  blocks the calling thread until the host posts: the agents use it at
+  `RtlExitUserProcess` so the final records are delivered before the process is gone.
+- **Runtimes**: QuickJS (default, interpreter) or V8 (`create_script(..., runtime='v8')`, JIT).
+  Both are measured.
+- **Stalker** (dynamic recompilation, per thread) is a code tracer: following every worker
+  thread to count calls of one function re-translates all their code. Not used here: it is
+  not how anyone counts or logs calls of one function, and 17.26's Stalker changes (register
+  spills off the target stack) do not change that.
 
-```bat
-cmake -S . -B build-x64 -A x64
-cmake --build build-x64 --config RelWithDebInfo
-```
+## Pitfalls found while writing the agents (details in BENCHMARKS.md, "Frida findings")
 
-Then `--bin build-x64\RelWithDebInfo`. For x86: `-A Win32` -> `build-x86`.
+- Under the V8 runtime, an Interceptor JS hook on `ntdll!NtClose` (even an empty `onEnter`)
+  crashes the target (VM and CI, x64 and x86); QuickJS is fine. vs_frida keeps `frida-js-v8` in
+  the gated/churn plans so the crash stays visible; `--skip frida-js-v8` leaves it out.
+- Frida's own module registry reads the process's memory through `NtReadVirtualMemory` on every
+  DLL load (~150 calls); a hook on it sees them. `prelude.js` `isFridaSelfRead` skips self-reads
+  with a cloaked return address nearby (`Cloak.hasRangeContaining`).
+- A `NativeFunction` call releases the JS lock (default `scheduling: 'cooperative'`): buffers
+  used around it must be per call, not shared.
 
----
+## The Frida 17 failure on the VM (root cause)
 
-## Run
+`frida 17.25.2` aborted with `Unable to locate the ntdll loader TLS routines` on this VM, for
+spawn and for attach. Frida 17.25.0 (2026-10-30) introduced a cross-platform manual mapper
+that maps the agent into the target without touching the filesystem, and the PE mapper has to
+call the loader's `LdrpHandleTlsData`/`LdrpReleaseTlsEntry` to register the agent's static
+TLS. Those are not exported; frida-gum found them by disassembling ntdll with heuristics that
+"only matched recent Windows 11 builds, so mapping any image with static TLS aborted on older
+systems" (frida-gum commit 4576833, 2026-11-03, issue #1203). The fix ("TLS routines are
+located by behavior instead of by signature ... Vista through Windows 11") shipped in
+**17.26.0** (2026-11-05). The error is raised by `g_error` in the HOST process (python.exe),
+which maps the agent out-of-process. Nothing was wrong with the VM: `pip install
+frida==17.26.1` works on it unchanged (reproduced side by side: 17.25.2 aborts, 17.26.1 and
+16.5.9 attach).
 
-Quick comparison (clean baseline; reads enabled via config so the baseline has no
-instrumentation at all):
+## Legacy scripts (frida 16.5.9, superseded)
 
-```bat
-python bench_frida.py --bin build-x64\RelWithDebInfo
-```
-
-Full real gate (late DLL load + flag flip via Frida + stdin keystroke), matching
-`scripts/check_scenario.py` end to end:
-
-```bat
-python bench_frida.py --bin build-x64\RelWithDebInfo --gated --threads 4 --reads 200
-```
-
-High-volume (millions of reads, more threads than cores - plan-v2 requirement):
-
-```bat
-python bench_frida.py --bin build-x64\RelWithDebInfo --high-volume
-:: == --threads (2*ncores) --reads 2000000  -> tens of millions of reads
-```
-
-Isolate attach cost, add the pre-existing-hook axis, more repeats:
-
-```bat
-python bench_frida.py --bin build-x64\RelWithDebInfo --with-attach-baseline --prehook --repeats 9
-```
-
-Run the scripts standalone for a functional smoke test (no timing):
-
-```bat
-frida -f build-x64\RelWithDebInfo\probe_app.exe -l enable_reads.js -l read_logger.js ^
-      --runtime=v8 -- --threads 2 --reads 20
-:: at the frida> prompt: %resume   then press a key in probe_app's console
-```
-
----
-
-## Methodology ("overhead per read")
-
-The number we care about is the **extra time Frida's Interceptor adds to each
-`NtReadVirtualMemory` call**. We get it without trusting any external clock:
-
-1. **In-target clock.** `probe_app` wraps its gated W-threads x R-reads loop in
-   `QueryPerformanceCounter` and prints `elapsed_ns`. `scripts/bench.py` reads
-   the same field, so Frida's rows line up against our inline/veh-sw/debug-sw/
-   debug-hw rows column-for-column.
-2. **Baseline = no Frida.** `probe_app --no-wait --config reads_enabled=1`: the
-   workload runs with zero instrumentation. (Enabling via config, not via a
-   flag-flip hook, keeps the baseline genuinely clean. The flag flip is a
-   once-per-run cost, dwarfed by millions of reads, and is measured separately in
-   `--gated` mode.)
-3. **Instrumented = Frida attached, only `ntdll!NtReadVirtualMemory` hooked.** No
-   other code is touched, so the delta is the hook's cost.
-4. **Count mode, not log mode.** The read hook reads `args[0]`+`args[3]` and bumps
-   a counter - it does **not** `send()` per call. Sending per call would measure
-   Frida's message IPC, not the hook; it is the wrong comparison for our inline
-   `log_read`, whose `PROBE_LOG` only enqueues to a per-thread queue. (Use
-   `mode:'log'` for functional logging; never for high-volume timing.)
-5. **Medians.** Each configuration runs `--repeats` times (default 5).
-   `added = median(frida) - median(baseline)`; `slowdown = median(frida)/median(baseline)`.
-
-Two normalizations are reported:
-- `median_ns_per_iteration = elapsed_ns / reads_per_thread` - **bench.py's
-  definition** (W threads run concurrently, so an "iteration" is one per-thread
-  read round). Use this column to sit beside our results.
-- `median_ns_per_read_total = elapsed_ns / (threads*reads)` and
-  `added_ns_per_read_total` - the intuitive per-call overhead.
-
-Correctness is gated like `check_scenario.py`: every run asserts
-`reads_enabled == 1` and `successful_reads == threads*reads`, and the harness
-prints Frida's own `hook_calls` count, which should be ~`threads*reads` (one per
-gated read; the local buffer verification in `app.cpp` does not go through
-`NtReadVirtualMemory`).
-
-### Output
-
-`--out` (default `bench/frida/results/`):
-- `raw.jsonl` - one line per run (`elapsed_ns`, `successful_reads`, `checksum`,
-  `frida_read_calls`, `frida_matched`, `frida_overrides`).
-- `summary.json` / `summary.csv` - medians per mode. Columns match
-  `scripts/bench.py`'s `summary.csv`
-  (`workload,callback,mutation,prehook,mode,repeats,median_ns_per_iteration,
-  min_/max_ns_per_iteration,added_ns_per_iteration,slowdown`) plus Frida extras
-  (`threads,reads_per_thread,total_reads,median_ns_per_read_total,
-  added_ns_per_read_total,flag_method,frida_version`). `mode` is `baseline`,
-  `frida`, and optionally `frida-attach`, so you can paste these rows directly
-  under the `reads,mutate,register,*` rows in `measurements/.../summary.csv`.
-
----
-
-## Where Frida's model differs from ours (read before interpreting numbers)
-
-- **No deferred/pending probe on a module-load debug event.** Our controller
-  registers `configparse.dll+RVA` *before the DLL exists* and arms it from the
-  external debugger's `LOAD_DLL_DEBUG_EVENT`. A Frida agent lives **inside** the
-  target and has no debug-event loop, so `enable_reads.js` instead watches for the
-  load from within: `Process.attachModuleObserver` (frida >= 16.2) or, as a
-  fallback, `Interceptor.attach(ntdll!LdrLoadDll, { onLeave })`. `LdrLoadDll`
-  returns before `LoadLibraryA` returns, which is before `ParseConfig` runs, so
-  the flag is still caught in time - functionally equivalent, mechanically
-  different.
-- **The flag site is too short for an inline hook - on *both* tools.**
-  `ParsedFlagSite` is a 2-byte `mov [rcx],eax` + `ret`; our tool deliberately uses
-  a **software breakpoint** there, not an inline jump. Frida's `Interceptor` is
-  *also* an inline trampoline and may not find enough relocatable bytes either.
-  So `enable_reads.js` defaults to `--flag-method parseconfig`: hook the exported
-  `ParseConfig` and overwrite `parsed_config.reads_enabled` in `onLeave`. The
-  direct register-flip mirror (`--flag-method flagsite`, set `EAX`=1 via
-  `this.context.eax/rax`) is provided and will attach where byte-count permits; it
-  falls back with a clear message otherwise. Frida does not expose a simple
-  hardware-breakpoint primitive from JS, so it has no clean no-code-modification
-  option at that site the way our HW/breakpoint backends do.
-- **Handle->PID resolution.** UHH's `track_open_process`
-  (examples/gated_config/callbacks.cpp) builds a handle->PID map at `NtOpenProcess`
-  (probe_app opens every helper by pid there). `read_logger.js` instead resolves with
-  `GetProcessId(handle)`, **cached per handle** (one syscall per distinct handle,
-  then a JS-map hit) - the same "resolve once, cache, never on the hot path
-  uncached" rule.
-- **In-target vs out-of-process.** `BaseAddress` in `NtReadVirtualMemory` names
-  the **remote** (child) process. Frida runs in-target, so `ptr(base).read*()`
-  would read the wrong process - we log the raw args only, exactly as `log_read`
-  does. The address-range filter compares the pointer value; it needs no memory read.
-- **`args[i]` is arch-neutral**, like our `get_func_arg`: registers on x64, stack on
-  x86, handled by Frida. One script covers x64, x86-native and WoW64 targets (for
-  WoW64, inject the matching-bitness agent; frida handles this).
-- **Per-call `send()` is not free.** Frida's strength (scriptable JS, rich
-  messaging) is also why logging *every* hit over the message channel is far
-  heavier than our deferred binary `PROBE_LOG`. The benchmark's `count` mode
-  removes that asymmetry so the comparison is hook-vs-hook; `log` mode shows the
-  real cost of actually streaming records out.
-```
+`bench_frida.py`, `gated_full.py/.js`, `read_logger.js`, `read_cmodule.js`, `read_stalker.js`,
+`read_hwbp.js`, `enable_reads.js` and `../bench_matrix.py` produced the 2026-11-04/-07 numbers.
+They are kept for the record; see BENCHMARKS.md for why they were superseded (Frida only
+counted while UHH logged and delivered; the CModule and hardware-breakpoint agents were buggy;
+UHH hooked `probe_app!ReadThunk` while Frida hooked `ntdll!NtReadVirtualMemory`).
