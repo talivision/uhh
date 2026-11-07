@@ -46,6 +46,12 @@ unless noted; spreads are wide on this VM -- the A-D range is given where it mat
 | idle event -> stdout latency p50 (ms) | 0.27 | 0.27 | 0.26 | 0.28 |
 | inline launch, lifecycle_bench launch_ms (A-D medians) | 112-221 | 54-157 | 110-236 | 52-142 |
 
+Against the CURRENT merge-frida (535ebec, with psdetach's fair drain lock; session E, 6 rounds, `-pab` rows `E-*`):
+x64 inline empty hit 68.2 -> 67.4, send_log 1 thread 211 -> 207, logs/s to a file 2.90M -> 2.99M, gated 787 -> **700**
+ns/read, launch 110 -> 78 ms: no x64 regression. x86: empty hit 139 -> 136, gated 912 -> **817**, logs/s to a file
+2.14M -> 2.51M, launch 220 -> 86 ms, but **send_log 1 thread 264 -> 319 ns** (the open residual above; the no-warm side
+measured the same, 321).
+
 ## Update: branch `perf4` (2026-11-07 night): UHH vs Frida 17.26.1, same sessions
 
 UHH = `perf4` c2edf28 (on merge-frida 59f6d61; agent protocol v26), Frida 17.26.1, same VM, same

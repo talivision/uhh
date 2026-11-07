@@ -2160,8 +2160,12 @@ them, and per-thread rings lose the global claim order that makes cross-thread r
 cores, that moves CPU rather than removing it). What is left on x86 gated is target-side per record (claim CAS on the
 shared head, owner CAS, the copy) plus the controller's two writes per batch.
 
+Against the current merge-frida (535ebec, session E): x64 no regression (empty hit 68.2 -> 67.4, send_log/t1 211 -> 207,
+logs/s to a file +3%, gated -11%, launch -29%); x86 gated -10%, logs/s to a file +18%, launch -61%.
 Open / measured residual: perf_ab x86 `hit/inline/send_log/t1` (one thread logging flat out, the target's ns per call)
-measured 309-331 vs base 262-266 ns in four of five comparisons (C's no-warm side 250); sink/inline/file (the same
+measured 309-331 vs base 262-266 ns in five of six comparisons (C's no-warm side 250; E vs merge-frida 264 -> 319,
+x86 only: x64 207 vs 211); a producer that outruns the controller waits on a full ring, so this case measures the
+pipeline's throughput as seen by the target; sink/inline/file (the same
 producer, end-to-end logs/s) moved -26..+33% between sessions; neither is explained yet (not the hold: session A's
 hold-off side showed the same; not the drain bound: reverted). Each perf_ab case runs a fresh controller, so the
 warm-copy scan (MsMpEng) runs during these 50-100 ms windows.
