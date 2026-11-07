@@ -245,11 +245,16 @@ struct probe_session {
     std::thread log_filer;
     std::mutex file_mu;                        // never held while taking another lock
     std::condition_variable file_cv, file_idle;
-    std::deque<std::string> file_queue;
+    struct FileChunk { std::string bytes; uint64_t records = 0; };   // a batch and its probe_log records
+    std::deque<FileChunk> file_queue;
     std::vector<std::string> file_spare;       // appended chunks, emptied, for the writer to reuse (no allocation churn)
     size_t file_queued = 0;                    // bytes in file_queue
+    // file_failed: the session file stopped growing (an append failed, or a batch could not be
+    // handed over); it holds exactly the records counted in logs_written (seq 0..logs_written-1).
     bool file_stop = false, file_busy = false, file_failed = false;
     std::string file_error;
+    bool file_broken = false;                  // tail_mu: file_failed, for the tail's waits (bytes past
+                                               // log_bytes_written never reach the file, nor stdout through it)
     bool tail_stop = false, tail_failed = false, console_warning = false;
     bool live_output_closed = false;           // stdout's reader went away: a warning, not an error
     std::string tail_error;
@@ -832,6 +837,49 @@ static bool append_log_file(probe_session *s, const char *bytes, size_t size, st
     return true;
 }
 
+// The error of a session file that stopped growing: what failed, then what the file holds.
+// logs_written counts the records IN THE FILE -- as at 0fb6cee, where a batch whose file write
+// failed was counted in log_dropped although stdout already had it -- so the file is exactly
+// seq 0..logs_written-1, and every later record is in log_dropped; the ones of those that
+// reached stdout anyway are stdout_logs - logs_written (stdout's seq 0..stdout_logs-1).
+static std::string file_incomplete(const std::string &why, uint64_t in_file) {
+    return why + "; the session log file is incomplete: it holds " +
+           (in_file ? "records seq 0.." + std::to_string(in_file - 1) : std::string("no records")) +
+           " (logs_written); every later record is counted in log_dropped, those that reached stdout too"
+           " (stdout_logs - logs_written of them)";
+}
+
+// The session file takes no more batches (file_failed, with `message`; a first failure wins) and
+// the tail's waits stop waiting for bytes that will never be in it. file_mu, tail_mu not held.
+static void break_log_file(probe_session *s, const std::string &message) {
+    {
+        std::lock_guard<std::mutex> lock(s->file_mu);
+        if (!s->file_failed) { s->file_failed = true; s->file_error = message; }
+    }
+    { std::lock_guard<std::mutex> lock(s->tail_mu); s->file_broken = true; }
+    s->file_idle.notify_all();
+    s->tail_caught_up.notify_all();
+}
+
+// The appender could not append a chunk of `records` records (codex4 #1/#2): neither it nor any
+// chunk queued behind it will be in the file (never a gap: the file stays a prefix of the
+// records). Their records were counted in logs_written when they were handed over; they move to
+// log_dropped (controller_dropped), under stdout_mu so a report sees them moved or not yet.
+// No lock held.
+static void file_lost(probe_session *s, uint64_t records, const std::string &why) {
+    std::string message;
+    {
+        std::lock_guard<std::mutex> out_lock(s->stdout_mu);
+        std::lock_guard<std::mutex> lock(s->file_mu);
+        for (const auto &c : s->file_queue) { records += c.records; s->file_queued -= c.bytes.size(); }
+        s->file_queue.clear();
+        s->controller_dropped.fetch_add(records, std::memory_order_relaxed);
+        s->logs_written.fetch_sub(records, std::memory_order_relaxed);
+        message = file_incomplete(why, s->logs_written.load());
+    }
+    break_log_file(s, message);
+}
+
 // Live tail: the session file's appender thread. Appends the batches the writer handed over, in
 // order; then, if stdout is behind the file (records deferred while the target was inside one of
 // its lines), replays them as the forwarder would (tail_catch_up_locked reads the file).
@@ -839,12 +887,14 @@ static bool append_log_file(probe_session *s, const char *bytes, size_t size, st
 // live records ride out a stalled file, and a full-speed stream keeps a flat footprint -- the chunks
 // are recycled (file_spare), never allocated per batch (regress stream-volume-inline: peak <= 1.2x
 // from 2M to 20M records; a 16 MB, then a 2 MB queue of fresh copies grew x86 18 -> 24 MB on CI).
+// An append that fails ends the file there (file_lost); nothing escapes this thread (an exception
+// before the append counts as a failed append, one after it costs the recycling only).
 static constexpr size_t FILE_QUEUE_CAP = 1u << 20;
-static constexpr size_t FILE_SPARE_MAX = 24;
+static constexpr size_t FILE_SPARE_MAX = 24;   // file_spare is reserved this big: recycling never allocates
 static void log_filer_main(probe_session *s) {
     uint64_t nth = 0;
     for (;;) {
-        std::string chunk;
+        probe_session::FileChunk chunk;
         {
             std::unique_lock<std::mutex> lock(s->file_mu);
             s->file_cv.wait(lock, [s] { return s->file_stop || !s->file_queue.empty(); });
@@ -853,37 +903,41 @@ static void log_filer_main(probe_session *s) {
             s->file_queue.pop_front();
             s->file_busy = true;
         }
-        std::string error;
-        bool ok;
         ++nth;
+        bool appended = false;
+        std::string error;
+        try {
 #if defined(UHH_TEST_HOOKS)
-        test_file_throw(nth, true);
+            test_file_throw(nth, true);
 #endif
+            appended = append_log_file(s, chunk.bytes.data(), chunk.bytes.size(), &error);
+            bool behind = false;
+            if (appended) {
+                std::lock_guard<std::mutex> lock(s->tail_mu);
+                s->log_bytes_written += chunk.bytes.size();
+                behind = s->log_bytes_tailed < s->log_bytes_written && s->tail_enabled && !s->tail_failed;
+            }
+            if (behind && s->fwd_out_active) {
+                std::lock_guard<std::mutex> out_lock(s->stdout_mu);
+                tail_catch_up_locked(s, nullptr, 0, 0);
+            }
+        } catch (const std::exception &e) {
+            if (!appended) error = std::string("probe log file appender failed: ") + e.what();
+        } catch (...) {
+            if (!appended) error = "probe log file appender failed";
+        }
+        if (!appended) file_lost(s, chunk.records, error);
         {
             std::lock_guard<std::mutex> lock(s->file_mu);
-            ok = !s->file_failed;                        // after a failure: discarded, never half a file
-        }
-        if (ok) ok = append_log_file(s, chunk.data(), chunk.size(), &error);
-        bool behind = false;
-        if (ok) {
-            std::lock_guard<std::mutex> lock(s->tail_mu);
-            s->log_bytes_written += chunk.size();
-            behind = s->log_bytes_tailed < s->log_bytes_written && s->tail_enabled && !s->tail_failed;
-        }
-        if (behind && s->fwd_out_active) {
-            std::lock_guard<std::mutex> out_lock(s->stdout_mu);
-            tail_catch_up_locked(s, nullptr, 0, 0);
-        }
-        {
-            std::lock_guard<std::mutex> lock(s->file_mu);
-            s->file_queued -= chunk.size();
+            s->file_queued -= chunk.bytes.size();
             s->file_busy = false;
-            if (!ok && !s->file_failed) { s->file_failed = true; s->file_error = error; }
-            chunk.clear();                                // keeps its capacity
+            try {
 #if defined(UHH_TEST_HOOKS)
-            test_file_throw(nth, false);
+                test_file_throw(nth, false);
 #endif
-            if (s->file_spare.size() < FILE_SPARE_MAX) s->file_spare.push_back(std::move(chunk));
+                chunk.bytes.clear();                      // keeps its capacity
+                if (s->file_spare.size() < FILE_SPARE_MAX) s->file_spare.push_back(std::move(chunk.bytes));
+            } catch (...) {}                              // not recycled: the writer allocates one
         }
         s->file_idle.notify_all();
         { std::lock_guard<std::mutex> lock(s->tail_mu); }  // no lost wakeup for flush_log_writer
@@ -921,6 +975,9 @@ static bool write_log_batch(probe_session *s, const std::string &bytes, uint64_t
     // it. stdout_mu is held from the stdout write to logs_written, so a report (which holds
     // stdout_mu) sees a batch on stdout and in logs_written, or in neither. Without a live tail
     // (stdout is NUL) the file is the output and is written here, as before.
+    // A file that fails (an append, or no memory to hand a batch over) takes no later batch and
+    // stops the writer, as a failed synchronous write did at 0fb6cee: logs_written counts the
+    // records in the file, the rest go to log_dropped (file_incomplete says so in the error).
     bool tail;
     {
         std::lock_guard<std::mutex> lock(s->tail_mu);
@@ -929,7 +986,12 @@ static bool write_log_batch(probe_session *s, const std::string &bytes, uint64_t
     if (!tail || !s->log_filer.joinable()) {
         if (!wait_log_file(s)) { writer_failed(s, s->file_error, records); return false; }   // in order behind the appender
         std::string error;
-        if (!append_log_file(s, bytes.data(), bytes.size(), &error)) { writer_failed(s, error, records); return false; }
+        if (!append_log_file(s, bytes.data(), bytes.size(), &error)) {
+            error = file_incomplete(error, s->logs_written.load());
+            break_log_file(s, error);
+            writer_failed(s, error, records);
+            return false;
+        }
         s->logs_written.fetch_add(records, std::memory_order_relaxed);
         { std::lock_guard<std::mutex> lock(s->queue_mu); }   // no lost wakeup: a live probe_report waits for a mark
         s->queue_flushed.notify_all();
@@ -981,13 +1043,35 @@ static bool write_log_batch(probe_session *s, const std::string &bytes, uint64_t
         s->log_bytes_produced += bytes.size();
         if (now) s->log_bytes_tailed = s->log_bytes_produced;
     }
-    {
+    // Handed over with its records counted in logs_written, in one step under file_mu: the
+    // appender moves them back out (file_lost) if it cannot append them. Not handed over: the
+    // file failed meanwhile, or no memory for the queue entry.
+    bool handed = false, failed = false;
+    try {
         std::lock_guard<std::mutex> lock(s->file_mu);
-        s->file_queued += copy.size();
-        s->file_queue.push_back(std::move(copy));
+        failed = s->file_failed;
+        if (!failed) {
+            s->file_queue.push_back({std::move(copy), records});
+            s->file_queued += s->file_queue.back().bytes.size();
+            s->logs_written.fetch_add(records, std::memory_order_relaxed);
+            handed = true;
+        }
+    } catch (...) {}
+    if (!handed) {
+        out_lock.unlock();
+        if (!failed) {                                  // out of memory: the file ends after what is queued
+            wait_log_file(s);
+            break_log_file(s, file_incomplete("probe log writer: out of memory", s->logs_written.load()));
+        }
+        std::string error;
+        {
+            std::lock_guard<std::mutex> lock(s->file_mu);
+            error = s->file_error;
+        }
+        writer_failed(s, error, records);
+        return false;
     }
     s->file_cv.notify_one();
-    s->logs_written.fetch_add(records, std::memory_order_relaxed);
     out_lock.unlock();
     { std::lock_guard<std::mutex> lock(s->queue_mu); }   // no lost wakeup: a live probe_report waits for a mark
     s->queue_flushed.notify_all();
@@ -1603,7 +1687,7 @@ static bool start_log_output(probe_session *s) {
         // The session file's own appender, with a live tail (write_log_batch). None (no thread):
         // the writer appends itself, as before.
         if (s->tail_enabled) {
-            try { s->log_filer = std::thread(log_filer_main, s); } catch (...) {}
+            try { s->file_spare.reserve(FILE_SPARE_MAX); s->log_filer = std::thread(log_filer_main, s); } catch (...) {}
         }
         s->log_writer = std::thread(log_writer_main, s);
         (void)log_tailer_main;               // kept for reference; the writer writes stdout directly
@@ -1716,9 +1800,12 @@ static void flush_log_writer(probe_session *s, bool up_to_now) {
     if (s->tail_enabled) {
         std::unique_lock<std::mutex> lock(s->tail_mu);
         uint64_t target = s->log_bytes_produced;
-        // While the (running) target is inside a line, records wait for its newline.
+        // While the (running) target is inside a line, records wait for its newline. A session
+        // file that stopped growing (file_broken) ends at log_bytes_written: records deferred
+        // past it never reach stdout -- waiting for them hung probe_report/probe_close (codex4 #1).
         s->tail_caught_up.wait(lock, [s, target] {
-            return s->log_bytes_tailed >= target || s->tail_failed || s->out_midline.load();
+            return s->log_bytes_tailed >= (s->file_broken ? std::min(target, s->log_bytes_written) : target) ||
+                   s->tail_failed || s->out_midline.load();
         });
         tail_error = s->tail_error;
     }
@@ -9734,7 +9821,8 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
     // The counts, in causal order: stdout_logs and logs_written (both frozen while stdout_mu is
     // held: the writer holds it across a batch's stdout AND file write), then the hits (a hit
     // is counted before its log exists). So stdout_logs <= logs_written <= hits even on a target that is
-    // still running; once it exited or was detached they are exact. (The hits used to be read
+    // still running (except after a session-file failure: logs_written then counts the file only,
+    // and stdout may hold more -- file_incomplete); once it exited or was detached they are exact. (The hits used to be read
     // BEFORE the flush: a report on a live target that flushed 5.3M records showed a probe's
     // hits far below its own logs_written.)
     bool live_closed, tail_on;
@@ -9807,8 +9895,9 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
                  (unsigned long long)written,
                  (unsigned long long)peak_mb, s->exit_code, live_closed ? "true" : "false");
     // stdout_logs: probe_log records the live tail wrote to stdout -- equal to logs_written
-    // unless stdout is NUL (no tail: null), its reader went away (live_output_closed) or a
-    // stdout write failed (live_output_error, also on stderr and in "error"). A capture is
+    // unless stdout is NUL (no tail: null), its reader went away (live_output_closed), a
+    // stdout write failed (live_output_error, also on stderr and in "error") or the session
+    // file failed ("error": the file holds seq 0..logs_written-1; stdout may hold more). A capture is
     // complete when it holds stdout_logs probe_log lines with seq 0..stdout_logs-1.
     if (out == stdout) { s->reported_to_stdout = true; s->reported_stdout_logs = stdout_logs; }
     if (tail_on) std::fprintf(out, "\"stdout_logs\":%llu,", (unsigned long long)stdout_logs);
