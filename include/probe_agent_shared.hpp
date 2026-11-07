@@ -185,7 +185,9 @@ struct alignas(64) probe_agent_stripe { volatile LONG64 value; volatile LONG64 r
             or their first record was dropped (one store, made when that happens);
    running  1 while the owner runs a callback (detach / unhook drains wait for 0);
    retired  written ONLY by the controller: carried first records it took (log_carry names
-            the block, probe_agent_log::reserved = index + 1).
+            the block, probe_agent_log::reserved = index + 1);
+   probe    the probe whose callback the owner runs or last ran (diagnostics only: names the
+            callback a thread was killed in -- probe_agent_cut_off).
    Unaccounted hits of a block = sum(hits) - done - retired: a callback that has neither ended
    unlogged nor had its carried record taken -- exactly the stripes' high bits. A thread killed
    at any instant leaves hits == logs + dropped + unaccounted, as before. 64-bit fields are
@@ -196,7 +198,8 @@ struct alignas(64) probe_agent_tblock {
     volatile LONG running;
     volatile LONG64 done;
     volatile LONG64 retired;
-    char pad[40];
+    volatile LONG probe;
+    char pad[36];
     volatile LONG64 hits[PROBE_AGENT_MAX_PROBES];
 };
 inline LONG64 probe_agent_load64(const volatile LONG64 *p) {
@@ -299,6 +302,31 @@ inline uint64_t probe_agent_unlogged(const probe_agent_shared *sh) {
         if (r.seq == (LONG64)((uint64_t)pos + 1) && r.carry == 1) ++carried;
     }
     return n > carried ? n - carried : 0;
+}
+/* After the target ended: the unaccounted hits (callbacks_interrupted) split into callbacks that
+   were still RUNNING when their thread died -- cut off by the target's end (ExitProcess /
+   TerminateProcess kill threads mid-callback) -- and the rest (`unexplained`: an unaccounted
+   unit with no callback running behind it -- an accounting fault, never expected). each(probe,
+   tid, n) is called per cut-off callback group (tid 0: a striped thread, unknown). */
+template <class F> inline uint64_t probe_agent_cut_off(const probe_agent_shared *sh, uint64_t &unexplained, F each) {
+    uint64_t cut = 0;
+    unexplained = 0;
+    for (uint32_t p = 0; p < PROBE_AGENT_MAX_PROBES; ++p)
+        for (uint32_t i = 0; i < PROBE_AGENT_STRIPES; ++i) {
+            const uint64_t un = (uint64_t)probe_agent_load64(&sh->hit_stripes[p][i].value) >> 48;
+            const LONG64 r = probe_agent_load64(&sh->hit_stripes[p][i].running);
+            const uint64_t c = r > 0 ? (un < (uint64_t)r ? un : (uint64_t)r) : 0;
+            if (c) each(p, 0u, c);
+            cut += c; unexplained += un - c;
+        }
+    for (uint32_t b = 0; b < PROBE_AGENT_TBLOCKS; ++b) {
+        const probe_agent_tblock &t = sh->tblocks[b];
+        const uint64_t un = probe_agent_tblock_unaccounted(t);
+        const uint64_t c = un && t.running != 0 ? 1 : 0;   /* one callback at a time per thread */
+        if (c) each((uint32_t)t.probe, (uint32_t)t.owner, c);
+        cut += c; unexplained += un - c;
+    }
+    return cut;
 }
 /* Callbacks executing now (a dead thread's stays counted). */
 inline uint64_t probe_agent_running(const probe_agent_shared *sh) {

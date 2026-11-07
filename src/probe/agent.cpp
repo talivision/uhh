@@ -1696,6 +1696,7 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
 #endif
     scope.xmm0 = &native.xmm0;
     scope.x87_post = x87_post;
+    if (acct.blk) acct.blk->probe = (LONG)index;          // diagnostics: probe_agent_cut_off
     if (ts) { ts->active_acct = acct; ts->active_logged = 0; ts->active = &scope; }
     else InterlockedIncrement(&g_untracked_running);       // no slot at all: see count_live_callbacks
     c.hit_scope = &scope;

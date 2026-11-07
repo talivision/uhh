@@ -313,6 +313,7 @@ struct probe_session {
     DWORD ipc_freezer = 0;                     // the agent thread doing that write (0 = no freeze)
     int hw_active = 0;
     bool launched = false, exited = false, inline_ready = false;
+    bool cut_off_said = false;                        // probe_report named the interrupted callbacks
     bool interrupted = false, ctrl_counted = false;   // Ctrl+C ended this session / counted in g_ctrl_sessions
     std::atomic<bool> ran{false};              // probe_run has started (read by probe_close on any thread)
     int shadow_stack = -1;                     // target has hardware shadow stacks (CET): -1 unknown, 0/1
@@ -8535,6 +8536,21 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
     uint64_t interrupted = 0;
     if (s->exited && s->shared)
         interrupted = probe_agent_inflight(s->shared);
+    if (interrupted && !s->cut_off_said) {
+        // Say which callbacks the target's end cut off (the thread died inside them) and
+        // whether every interrupted hit is one of those (unexplained=0), once per session.
+        s->cut_off_said = true;
+        std::string where;
+        uint64_t unexplained = 0;
+        const uint64_t cut = probe_agent_cut_off(s->shared, unexplained, [&](uint32_t index, uint32_t tid, uint64_t n) {
+            std::string loc = "probe #" + std::to_string(index);
+            for (const auto &p : s->probes)
+                if ((p->flags & PROBE_INLINE) && p->agent_index == index) { loc = p->location; break; }
+            where += " " + loc + (tid ? " (tid " + std::to_string(tid) + ")" : "") + (n > 1 ? " x" + std::to_string(n) : "");
+        });
+        std::fprintf(stderr, "probe: callbacks interrupted by the target's end: %llu cut off while running:%s; "
+                             "unexplained=%llu\n", (unsigned long long)cut, where.c_str(), (unsigned long long)unexplained);
+    }
     std::fprintf(out, "{\"kind\":\"probe_report\",\"probes\":%llu,\"active\":%llu,"
                  "\"hits\":%llu,\"overrides\":%llu,\"log_dropped\":%llu,\"callbacks_interrupted\":%llu,"
                  "\"logs_written\":%llu,\"controller_peak_ws_mb\":%llu,\"app_exit\":%lu,"
