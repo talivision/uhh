@@ -262,7 +262,9 @@ Correctness on CI: every UHH run exact (count, gated, churn, hit; all four image
 every frida-cmodule / frida-hw / frida-watch run exact. Frida-js-v8 crashed the target in
 gated and churn, 3/3 on all four, so the V8 + `NtClose` crash is not specific to the VM.
 Frida-js churn was 0/3 there because of the shared-buffer bug in my first `gated_js.js`
-(Frida finding 3; fixed in f7aa0ad). The CI ranking agrees with the VM's, with two
+(Frida finding 3; fixed in f7aa0ad). The follow-up run 42336882930 (f7aa0ad, lean sizes,
+frida-js-v8 left out of gated/churn) was exact in every row on all four image/arch
+combinations, frida-js churn included. The CI ranking agrees with the VM's, with two
 differences. On these 2-core runners Frida's JS count is much cheaper (+1.1-1.9 us vs +7.3 us
 on the 4-core VM), probably because 8 threads contend less for the one JS runtime lock. And UHH
 inline's gated cost on x64 is lower (+0.8-1.0 us vs +2.1 us). Frida CModule still beats it
