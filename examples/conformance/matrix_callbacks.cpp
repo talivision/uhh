@@ -136,6 +136,11 @@ static void entry_control_plane(probe_context *c) {
     send_log(c, "M add.null-callback=%d", probe_add_symbol(s, "conformance_target.exe!pm_dummy", nullptr, PROBE_BREAKPOINT));
     send_log(c, "M add.inline-once=%d", probe_add_symbol(s, "conformance_target.exe!pm_dummy", pm_noop, PROBE_INLINE | PROBE_ONCE));
     send_log(c, "M add.static-callback=%d", probe_add_symbol(s, "conformance_target.exe!pm_dummy2", pm_static_cb, PROBE_BREAKPOINT));
+    // A callback exported by ANOTHER module (kernel32!GetTickCount stands in for a second
+    // callback DLL; never called): refused on every backend -- inline resolves the name only in
+    // the calling callback's module, and breakpoint/hw refuse the same request.
+    send_log(c, "M add.other-module=%d", probe_add_symbol(s, "conformance_target.exe!pm_dummy2",
+                                                          reinterpret_cast<probe_callback>(&GetTickCount), PROBE_BREAKPOINT));
     pm_big_config big{};
     big.cookie = 0xB16C0F16B16C0F16ull; memset(big.body, 0x11, sizeof(big.body)); big.tail = 0x7A117A117A117A11ull;
     send_log(c, "M add.config-308=%d", probe_add_symbol_cfg(s, "conformance_target.exe!pm_dummy3", pm_noop, PROBE_BREAKPOINT,

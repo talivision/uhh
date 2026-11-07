@@ -1408,7 +1408,7 @@ PORTABILITY_DOCUMENTED = {
 }
 PORTABILITY_REQUIRED = {
     "A": ["adds.entry", "adds.regs", "adds.other", "args", "mem.get.rw", "mem.set.high", "call_func.plain",
-          "add.ok", "add.static-callback", "add.config-308", "add.long-symbol", "log.long", "reg.get.0",
+          "add.ok", "add.static-callback", "add.other-module", "add.config-308", "add.long-symbol", "log.long", "reg.get.0",
           "reg.set.1", "target.cf", "target.out", "stack.entry"],
     "B": ["adds.fault", "adds.conc", "adds.report", "adds.bigcfg", "fault.before", "conc.total", "config.big",
           "target.fault_r", "target.fault_mark"],
@@ -1440,7 +1440,8 @@ def portability_expect(phase, x86):
                   "call_func.empty-symbol": "0", "call_func.address": "1 r=42", "call_func.module-rva": "1 r=42",
                   "call_func.negative-arg": "1 r=-15", "call_func.bad-address": "0",
                   "session": "1", "session.null-ctx": "0", "add.ok": "1", "add.no-export": "0", "add.no-type": "0",
-                  "add.null-callback": "0", "add.static-callback": "0", "add.config-308": "1", "add.long-symbol": "1",
+                  "add.null-callback": "0", "add.static-callback": "0", "add.other-module": "0",
+                  "add.config-308": "1", "add.long-symbol": "1",
                   "add.null-session": "0", "add-address.zero": "0", "watch.on-breakpoint": "0",
                   "log.null-format-follows": "1", "log.bad-format": "k",
                   "reg.get.invalid": "0 0", "reg.set.invalid": "0 0", "call_original.mid": "0 r=1234",
@@ -1617,8 +1618,9 @@ def co_expect(case, base, x86):
         hits = {"co_jump": 10, "co_after": 3}; logs = {"co jump": 10, "co jump-done": 5, "co after": 3}
     elif case == "threads":
         hits = {"co_add": 4800}; logs = {"co add": 4800, "co add-done": 4800}
-    elif case == "mid":
-        hits = {"CoMidPush+0x1": 5}; logs = {"co mid ok=0": 5}
+    elif case == "mid":   # call_original and return_from both refused: ONE warning record per probe
+        hits = {"CoMidPush+0x1": 5}
+        logs = {"co mid ok=0": 5, "uhh warning: call_original refused: not at a function entry ([SP] is no return address)": 1}
     elif case == "nargs":
         row["sum"] = base["sum"] + 20 * 1000
         hits = {"co_add": 20}; logs = {"co nargs": 20, "co nargs-done": 20}
@@ -1650,7 +1652,12 @@ def check_callorig_hunt():
     thiscall and x64 8 args; a probe at the return-to address; return_from over a callee-
     saved prologue; a probe inside the original (same backend: counted, no callback; another
     backend: fires); detach and Ctrl+Break while call_original is in flight. Each run's target
-    row is compared with the uninstrumented run; hits and "co" logs are exact; nothing dropped."""
+    row is compared with the uninstrumented run; hits, "co" logs and "uhh warning" records are
+    exact (a warning is one record per probe on every backend); nothing dropped.
+    callorig-hunt-warn-dr-breakpoint: four hw probes take every debug register, so call_original
+    from two breakpoint probes is refused ("needs one free debug register"): exactly one
+    "uhh warning" record per probe, like every other call_original warning (it used to be one
+    stderr line per session and no record)."""
     d, t = exe("co_driver.exe"), exe("co_target.exe")
     if not d or not t:
         return missing_bin("callorig-hunt", "co_driver/co_target")
@@ -1663,7 +1670,7 @@ def check_callorig_hunt():
         cnt = {}
         for x in objs:
             m = str(x.get("message", ""))
-            if x.get("kind") == "probe_log" and m.startswith("co "):
+            if x.get("kind") == "probe_log" and m.startswith(("co ", "uhh warning")):
                 cnt[m] = cnt.get(m, 0) + 1
         return cnt
 
@@ -1706,6 +1713,22 @@ def check_callorig_hunt():
                              f"err={rep.get('error')} rc={r.returncode}")
         except Exception as e:
             record(name, False, repr(e))
+    name = "callorig-hunt-warn-dr-breakpoint"
+    try:
+        r, o = run([d, "--backend", "breakpoint", "--case", "drfull", "--", t, "nested"], timeout=300)
+        dr_warn = "uhh warning: call_original refused: needs one free debug register (all 4 in use)"
+        want_logs = {"co outer": 6, "co outer refused": 6, "co innerco": 6, "co innerco refused": 6, dr_warn: 2}
+        row, logs, hb, rep = co_row(o), co_logs(o), hits_by(o), report(o)
+        want = dict(bases["nested"])                # refused: the hits fall through, the program as uninstrumented
+        recs = [x for x in o if x.get("kind") == "probe_log" and x.get("message") == dr_warn]
+        per_probe = sorted(str(x.get("probe", x.get("location", x.get("site", "?")))) for x in recs)
+        ok = (bool(want) and row == want and logs == want_logs and hb.get("co_outer") == 6 and hb.get("co_inner") == 6
+              and len(set(per_probe)) == 2 and rep.get("log_dropped") == 0 and rep.get("error") is None
+              and rep.get("app_exit") == 0 and r.returncode == 0)
+        record(name, ok, f"row={row} want={want} logs={logs} hits={hb} warn_probes={per_probe} "
+                         f"dropped={rep.get('log_dropped')} err={rep.get('error')} rc={r.returncode}")
+    except Exception as e:
+        record(name, False, repr(e))
     # Detach (probe_close from another thread) and Ctrl+Break while call_original is in flight:
     # the attached target finishes every call correctly, unhooked from then on.
     import signal
@@ -3426,7 +3449,7 @@ def check_cet_policy(threads=4, reads=200):
     mismatch is fatal, also in non-image code the kernel would fix up in compatibility mode --
     the transparency fixture (call_func, call_original + return_from) and gated_config on every
     backend. BlockNonCetBinaries (cet-block-*): only /CETCOMPAT images may load; breakpoint/hw
-    need nothing in the target; inline needs the agent (and the callback module) loaded.
+    need nothing in the target; inline needs the agent (which holds the callbacks) loaded.
     The detail says whether the machine enforced the policy (cet_probe of the same policy);
     on a machine without CET the rows prove only that the policy copies run."""
     pr_exe, tpd, gc = exe("cet_probe.exe"), exe("tp_driver.exe"), exe("gated_config.exe")
@@ -3461,12 +3484,12 @@ def check_cet_policy(threads=4, reads=200):
                     try:
                         bad, rows = tp_runs(tpd, copies["tp_target_cet"], bk, mode, 5, skip=TP_CET_SKIP)
                         if policy == "block" and bk == "inline" and on:
-                            # The agent / callback module must be /CETCOMPAT to load; until then
-                            # the refusal must be clean (the error names the agent load).
+                            # The agent (it holds the inline callbacks) must be /CETCOMPAT to load;
+                            # until then the refusal must be clean (the error names the agent load).
                             r2, o2 = run([tpd, "--backend", bk, "--mode", mode, "--probes", "add", "--",
                                           copies["tp_target_cet"], "--iters", 2], timeout=120)
                             err = (report(o2).get("error") or "")
-                            # until the agent AND the callback module are /CETCOMPAT
+                            # until the agent is /CETCOMPAT
                             if bad and "LoadLibrary" in err:
                                 record(name, True, f"policy IN EFFECT: inline refused cleanly: {err[:100]}")
                                 continue
@@ -9040,7 +9063,7 @@ def check_cet_sde(n=20, threads=2, reads=50):
             rc, o, v, arc, ao, ael = attached([cot, case, "--wait"],
                                               lambda pid: [exe("co_driver.exe"), "--backend", "inline", "--case", case,
                                                            "--attach", pid], locs)
-            row, rep, lg, hb = row_of(o, "co"), report(ao), logs_of(ao, "co "), hits_of(ao)
+            row, rep, lg, hb = row_of(o, "co"), report(ao), logs_of(ao, ("co ", "uhh warning")), hits_of(ao)
             got_logs = {k: lg.get(k, 0) for k in want_logs}
             extra = sorted(k for k in lg if k not in want_logs and not (case == "retaddr" and k == "co retsite"))
             ok = (bool(base) and row == want_row and all(hb.get(k) == x for k, x in want_hits.items()) and

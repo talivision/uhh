@@ -392,6 +392,7 @@ struct probe_session {
     uint64_t ret_gadgets = 0;                  // return_from: `ret` / `ret N` gadgets in the target
     bool warned_cb_fault = false;              // one stderr warning for a faulting controller-side callback
     DWORD cb_tid = 0;                          // thread whose callback / IPC is being serviced (0 = none)
+    const Probe *cb_probe = nullptr;           // whose callback runs (an IPC add: its inline origin probe)
     std::wstring agent_copy;                   // per-session copy of the agent DLL (UHH_SHARED), deleted at close
     std::vector<DWORD> pending_hold;           // callers of a runtime inline add: hold until it lands
     bool attached = false;                     // probe_attach: detach (not kill) on close
@@ -4738,6 +4739,9 @@ extern "C" probe_session *probe_session_create(void) {
     catch (...) { std::fprintf(stderr, "probe: error: session allocation failed\n"); return nullptr; }
 }
 
+static constexpr const char *kAddForeignCallback =
+    "a probe added from a callback needs a callback exported by the calling callback's module";
+
 // Dynamic (post-launch) control-plane calls come from a callback while the target is
 // stopped. A failure there returns 0 to the callback but must not poison the session's
 // end-of-run status, so the error is logged and the previous error state restored.
@@ -4753,15 +4757,27 @@ struct DynamicScope {
     }
 };
 
-// A probe added from INSIDE a callback (any backend) must have a named-export callback: an
-// inline callback's control calls reach the controller by export name, so only exports can
-// work there. Requiring it on every backend keeps one callback source portable (a static
-// function used to work from a breakpoint/hw callback and return 0 from an inline one).
+// A probe added from INSIDE a callback (any backend) must have a callback EXPORTED BY THE
+// CALLING CALLBACK'S MODULE: an inline callback's control calls reach the controller by export
+// name, resolved only among the exports of the module holding the origin probe's callback (the
+// target is untrusted: it must not pick functions of other controller modules, handle_ipc).
+// Requiring the same on every backend keeps one callback source portable (a static function,
+// or an export of another module, used to work from a breakpoint/hw callback and return 0
+// from an inline one).
 static bool callback_ok_from_callback(probe_session *s, probe_callback cb) {
+    if (!s->cb_tid || GetCurrentThreadId() != s->debug_tid || !cb) return true;
     std::string name;
-    if (!s->cb_tid || GetCurrentThreadId() != s->debug_tid || !cb || callback_export_name(cb, name)) return true;
-    set_error(s, "a probe added from a callback needs a callback exported by name (dllexport)");
-    return false;
+    if (!callback_export_name(cb, name)) {
+        set_error(s, "a probe added from a callback needs a callback exported by name (dllexport)");
+        return false;
+    }
+    HMODULE mine{}, caller{};
+    if (s->cb_probe && s->cb_probe->callback && module_of(reinterpret_cast<const void *>(cb), mine) &&
+        module_of(reinterpret_cast<const void *>(s->cb_probe->callback), caller) && mine != caller) {
+        set_error(s, kAddForeignCallback);
+        return false;
+    }
+    return true;
 }
 
 // The export name(s) the agent resolves an inline probe's callback by (all names of a folded
@@ -5484,11 +5500,12 @@ static bool fiber_step(probe_session *s, EventFiber *f, const DEBUG_EVENT *ev) {
     const bool outer_skip = s->skip_continue;
     EventFiber *const outer = s->cur_fiber;
     const DWORD outer_cb = s->cb_tid, outer_event = s->event_tid;
+    const Probe *const outer_probe = s->cb_probe;
     s->skip_continue = false;
     f->return_to = GetCurrentFiber();
     s->cur_fiber = f;
     SwitchToFiber(f->fiber);
-    s->cur_fiber = outer; s->cb_tid = outer_cb; s->event_tid = outer_event;
+    s->cur_fiber = outer; s->cb_tid = outer_cb; s->event_tid = outer_event; s->cb_probe = outer_probe;
     bool ok = true;
     if (f->done) {
         ok = f->ok;
@@ -5514,8 +5531,9 @@ static bool fiber_step(probe_session *s, EventFiber *f, const DEBUG_EVENT *ev) {
 // Called on a parked fiber by call_func: back to the loop that resumed it.
 static void fiber_park(probe_session *s, EventFiber *f) {
     const DWORD cb = s->cb_tid, ev = s->event_tid;
+    const Probe *const probe = s->cb_probe;
     SwitchToFiber(f->return_to);
-    s->cb_tid = cb; s->event_tid = ev;
+    s->cb_tid = cb; s->event_tid = ev; s->cb_probe = probe;
 }
 static bool call_resume(probe_session *s, DWORD tid, EventFiber::Outcome how, const DEBUG_EVENT *ev) {
     auto it = s->calls.find(tid);
@@ -6860,10 +6878,10 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
     }
     // The callback is named; find the controller's copy of the same source. Prefer the
     // module that holds the originating inline probe's callback, then the executable.
-    probe_callback cb = nullptr; bool origin = false;
+    probe_callback cb = nullptr; const Probe *origin = nullptr;
     for (auto &p : s->probes)
         if ((p->flags & PROBE_INLINE) && p->agent_index == req.origin_site && p->callback) {
-            origin = true;
+            origin = p.get();
             HMODULE m{};
             if (fetched && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                               reinterpret_cast<LPCSTR>(p->callback), &m))
@@ -6877,14 +6895,14 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
         }
     if (!origin) return false;
     int32_t result = 0;
-    struct CbTid { probe_session *s; ~CbTid() { s->cb_tid = 0; } } cb_tid_scope{s};
-    s->cb_tid = event.dwThreadId;
+    struct CbTid { probe_session *s; const Probe *prev; ~CbTid() { s->cb_tid = 0; s->cb_probe = prev; } } cb_tid_scope{s, s->cb_probe};
+    s->cb_tid = event.dwThreadId; s->cb_probe = origin;
     if (cfg_too_big) {
         std::fprintf(stderr, "probe: error: probe config is larger than 4 GB\n");   // as probe_add_symbol_cfg says it
     } else if (!fetched) {
         std::fprintf(stderr, "probe: dynamic add from inline callback: cannot read its arguments from the target\n");
-    } else if (!cb) {
-        std::fprintf(stderr, "probe: dynamic add from inline callback: no controller-side export '%s'\n", name.c_str());
+    } else if (!cb) {                                // as callback_ok_from_callback says it on breakpoint/hw
+        std::fprintf(stderr, "probe: dynamic add failed: %s ('%s' is not exported there)\n", kAddForeignCallback, name.c_str());
     } else if (req.op == PROBE_IPC_ADD_ADDRESS) result = probe_add_address(s, req.address, cb, req.flags);
     else if (req.op == PROBE_IPC_WATCH)       result = probe_watch(s, req.address, cb, req.flags);
     else if (req.op == PROBE_IPC_ADD_SYMBOL)
@@ -7299,7 +7317,11 @@ static void cet_after_original(probe_session *s, Probe *probe, probe_context *c)
 static void run_callback(probe_session *s, Probe *probe, probe_context *c) {
     const probe_regs before = c->regs;
     DWORD code = 0;
-    if (seh_callback(probe->callback, c, &code)) { cet_after_original(s, probe, c); return; }
+    const Probe *const outer = s->cb_probe;          // a nested event's callback (call_func) restores it
+    s->cb_probe = probe;
+    const bool done = seh_callback(probe->callback, c, &code);
+    s->cb_probe = outer;
+    if (done) { cet_after_original(s, probe, c); return; }
     if (code == UHH_CALL_RELEASED) { c->regs = before; return; }   // call_original ended the callback (see there)
     // A faulting callback is a no-op: its register changes are discarded and a return_from it
     // asked for is dropped (the hit falls through into the original) -- exactly as inline
@@ -10602,6 +10624,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
     }
     if (slot < 0) {
         CloseHandle(thread);
+        warn_record(c, probe, "call_original refused: needs one free debug register (all 4 in use)");
         co_warn(s->co_warned_dr, probe, "call_original refused: needs one free debug register (all 4 in use)");
         return 0;
     }
