@@ -2088,6 +2088,84 @@ edgehunt,cxlib,gated,portability` on c2edf28 337/337; CI full suite 2079/2079 on
 (3f97146, only `patch-race-unsafe`). New checks: `transparency-*-fpu` (7 modes now), MXCSR at the
 mid-function site, `stream-latency-inline-wake`.
 
+## perf5 findings (2026-11-07, branch `perf5`: the two x86 cells left -- gated and churn -- agent protocol v27)
+Goal: UHH inline ahead of Frida 17.26.1 CModule in x86 gated and x86 churn, x64 not regressed, every guarantee
+kept. Measured with `bench/frida/vs_frida.py` (same sessions, 6-8 repeats, interleaved) and `bench/perfab/perf_ab.py`
+(base = the branch point, merge-frida e3b1bea = perf4's code, with only the phase stamps added), quiet-VM placeholder in the other heavy
+slot; four sessions A-D (builds evolving, D = final code). Tables: bench/BENCHMARKS.md "Update: branch perf5"; raw
+rows `bench/results/perf5-2026-11-07/`. Profiled first with the new phase stamps (`UHH_BENCH_PHASES=1`, a bench
+knob: QPC-stamped lifecycle phases on stderr; `bench/perfab/phases.py` turns a run into a timeline, `--repeat N`
+gives per-phase medians).
+
+**Churn was launch, and launch was antivirus.** The x86 phase timeline of a 1-round churn run (gated_config,
+4 probes): 7 ms to session_create, then **~110 ms inside the FIRST probe_add** (a breakpoint probe with a
+UHH_SHARED callback loads the controller's per-session copy of the agent DLL: LoadLibrary of a freshly written
+8.3 MB file -- Defender scans every new image at its first mapping; 740 ms right after a build, ~90-110 ms warm),
+then ~40 ms in uhh_sym::init (vswhere + a walk of the Visual Studio tree looking for a dbghelp with symsrv, then
+the system one), then CreateProcess, the loader breakpoint and the early agent (~20 ms). The target's own run was
+the same as the baseline's. What changed:
+1. **The agent copy is prepared on its own thread** from the first probe that needs it (an inline add, or a
+   breakpoint/hw add whose module has UHH_SHARED state); a UHH_SHARED callback is checked against the agent
+   FILE's export table at add time (same refusal, same moment) and bound to the loaded copy before the target can
+   run (`ensure_local_agent`, at the channel or `bind_pending_shared`). Closed unlaunched / failed launch: joined
+   and cleaned (regress `ctrl-agentprep-{unlaunched,badlaunch}`).
+2. **The copy is written without the UHH_SHARED section's trailing zeros** (`write_trimmed_agent`: SizeOfRawData
+   shrunk, later sections and debug-directory file offsets moved, PE checksum recomputed; anything unexpected, e.g.
+   a signed image, falls back to CopyFile). That section holds every UHH_SHARED global of every callback module
+   linked into the agent: 7.5 of the 8.3 MB, nearly all zero. The loader zero-fills the rest of the section and it
+   stays shared (regress `shared-mix`, `gated-*` exercise the map that lives there). Scan ~90 -> ~50 ms.
+3. **Warm copies.** A scanned file is not scanned again, also after a rename (measured with a LoadLibrary probe
+   script: fresh 91 ms, renamed 2 ms). So each session takes a copy an earlier session prepared, by an atomic
+   directory rename out of `%TEMP%\uhh\warm\<sig>-*` (sig = the source agent's size + write time), and after its own
+   load leaves one for the next (a background thread: trimmed copy, CreateFileMapping SEC_IMAGE so the scanner sees
+   it, never loaded or run -- so its shared section is the file's bytes, exactly as a fresh copy's; at most 2 per
+   build; a dead preparer's `t-*` is swept). Measured: started BEFORE the session's own load its scan queued in front
+   of that load (launch 128 vs 53 ms): it starts after. Knob `UHH_BENCH_NO_WARM=1` (bench only). Warm-taken copy:
+   agent loaded 2 ms after the copy step (x64 11 ms after session start).
+4. **dbghelp in the background**: located and loaded on a thread from `probe_session_create`; the VS lookup's answer
+   is cached for a day (`%TEMP%\uhh\vs-dbghelp-<arch>.txt`; a cached path that is no longer a dbghelp+symsrv pair is
+   looked up again).
+5. **Found on the way (deadlock): inheritable handles across concurrent CreateProcess.** With dbghelp's lookup on a
+   thread, vswhere (spawned with bInheritHandles, its stdout a pipe) ran while the launch created the target (also
+   inheriting): the TARGET inherited vswhere's pipe write end, the lookup's ReadFile never saw EOF, held the symbols
+   mutex, and the launch waited on it forever (sampler: run_vswhere in ZwReadFile, the main thread in the mutex).
+   `uhh_sym::inherit_lock` now spans each child's inheritable handles from creation to close (vswhere's pipe; the
+   target's forward-pipe ends), so neither child inherits the other's.
+   Result, x86 1-round churn: probe_launch returns at ~45 ms instead of ~260 (x64 ~21 ms warm), threads released at
+   ~65 instead of ~200 ms. vs_frida x86 churn: UHH ahead in all four sessions (pooled over A-D, 26 runs each: +0.155 vs
+   +0.311 s added wall; x64 +0.165 vs +0.377).
+
+**Gated: the controller's small writes.** Counters (`UHH_BENCH_PHASES` prints them at close): an 8-thread gated run
+handed the writer ~31 records per drain pass, and an empty queue ended the writer's batch, so every handful of records
+cost two WriteFile calls (stdout and the session file) -- on a 4-core VM with 8 busy target threads that CPU comes out
+of the target's. Now a batch that arrives less than 500 us after the previous write waits until 500 us have passed
+since it (`UHH_BENCH_WRITE_HOLD_US`, 0 = off); the first record after a quiet spell is written at once (idle latency
+unchanged: p50 0.27 -> 0.28 ms, `stream-latency-inline-wake`); a flush (`flush_waiters`: report, close, a live report's
+up-to-now flush), a stop or a half-full queue ends the hold at once. A churn run: 79 file writes for 38,694 records.
+perf_ab x86 gated/inline 8 x 50,000: -8.6..-8.9% ns/read in every session (871 -> 794, 891 -> 814, 868 -> 811,
+884 -> 806), x64 -4.6..-10%; with the hold off (session A) no gain: the hold is the change that matters there.
+Ending the hold at one pack (256 records) instead of a half-full queue cost a single fast producer ~25% of its
+logs/s (sink/inline/file x64): reverted.
+
+**Ring layout (protocol v27)** -- kept, measured neutral to slightly positive on gated: the record's header (seq,
+owner, probe, tid, text_len, carry, block) and the start of its text on its first cache line, slots a whole number of
+lines (the header used to follow the 1 KB text: three lines per record each side); log_head on a line of its own,
+log_tail and drain_beat (now a plain store: the drainer is its only writer -- an x86 LOCK CMPXCHG8B per drainer loop
+before) on the next. Tried and reverted: bounding the drain pass by the ring instead of reading log_head (the idle
+drainer then polled the line the next producer claims: x86 send_log/t1 +20%); `alignas(64)` on the record (a
+producer builds one on its stack: an over-aligned local re-aligns the x86 frame; now padding).
+Not done, and why: per-thread claim batching (a thread's reserved but unused slots stall every later record behind
+them, and per-thread rings lose the global claim order that makes cross-thread records causal) and binary records
+(formatting moves from the target to the controller: on this 4-core VM, where 8 target threads already saturate the
+cores, that moves CPU rather than removing it). What is left on x86 gated is target-side per record (claim CAS on the
+shared head, owner CAS, the copy) plus the controller's two writes per batch.
+
+Open / measured residual: perf_ab x86 `hit/inline/send_log/t1` (one thread logging flat out, the target's ns per call)
+measured 309-331 vs base 262-266 ns in four of five comparisons (C's no-warm side 250); sink/inline/file (the same
+producer, end-to-end logs/s) moved -26..+33% between sessions; neither is explained yet (not the hold: session A's
+hold-off side showed the same; not the drain bound: reverted). Each perf_ab case runs a fresh controller, so the
+warm-copy scan (MsMpEng) runs during these 50-100 ms windows.
+
 ## Real-world cases
 - ✅ Microsoft Detours samples replicated (`examples/famous/detours_*`: simple, traceapi, withdll/attach, retval) -- findings above
 - ✅ (1) Real binaries via `uhh_trace`: curl `CreateFileW` + `connect` (all backends); ✅ findstr via `ntdll!NtCreateFile`

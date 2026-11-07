@@ -5,6 +5,47 @@ is kept for history and is SUPERSEDED (see "Why the earlier comparison was super
 Reproduce with `bench/frida/vs_frida.py` (how: `bench/frida/README.md`); raw rows in
 `bench/results/frida17-2026-11-07/`.
 
+## Update: branch `perf5` (2026-11-07, late): UHH vs Frida 17.26.1, same sessions
+
+UHH = `perf5` (agent protocol v27; on merge-frida 535ebec), Frida 17.26.1, same VM, same `vs_frida.py`, every run
+exact. **Session D** (the final build; 8 threads x 50,000 reads, hit 200,000 calls, churn 8 x 2,000 (x64) /
+8 x 1,000 (x86) rounds, 6 repeats, quiet-VM placeholder). Added ns per event (median [min..max], over the session's
+baseline); churn: added wall seconds. The last column pools sessions A-D (26 runs per method and arch, each run
+against its own session's baseline median; A-C were earlier builds of this branch). Raw rows:
+`bench/results/perf5-2026-11-07/` (`<session>-<arch>-vsf.jsonl`, perf_ab rows `-pab.jsonl`).
+
+| workload | arch | **uhh-inline** (D) | frida-cmodule (D) | pooled A-D: uhh vs frida |
+|---|---|---:|---:|---:|
+| count | x64 | **+101** [92..130] | +304 [254..451] | |
+| gated | x64 | **+266** [236..294] | +419 [323..683] | **+283** vs +439 |
+| hit | x64 | **+76.7** [73.7..78.1] | +253 [251..262] | |
+| churn (s) | x64 | **+0.26** [0.15..0.40] | +0.49 [0.26..0.69] | **+0.165** vs +0.377 |
+| count | x86 | **+109** [64..230] | +239 [179..584] | |
+| gated | x86 | **+329** [265..1,557] | +341 [320..543] | **+337** vs +385 |
+| hit | x86 | **+153** [147..155] | +281 [280..289] | |
+| churn (s) | x86 | **-0.02** [-0.21..0.09] | +0.14 [0.10..0.24] | **+0.155** vs +0.311 |
+
+- **Ahead of Frida CModule in every inline cell on both arches**, x86 gated and x86 churn included. Per session (median
+  added): x86 gated +337/+395 (A), +419/+396 (B: two UHH runs at 1,140 and 1,433 ns/read), +329/+391 (C),
+  +329/+341 (D); x86 churn +0.38/+0.40, +0.22/+0.33, +0.04/+0.32, -0.02/+0.14 s. x86 gated is ahead in three of four
+  sessions and pooled; UHH's x86 gated spread has rare slow runs (D's max 2,079 ns/read) that Frida's does not.
+- Churn is fixed cost, and that cost was the antivirus scan of each session's new agent copy plus dbghelp's lookup:
+  now a trimmed copy, a pre-scanned warm copy taken by rename, both prepared off the critical path (ROADMAP
+  "perf5 findings"). x86 1-round churn: probe_launch ~260 -> ~45 ms.
+
+Before / after this branch (perf_ab, base = the branch point e3b1bea; 5 rounds; session D unless noted; ns per call
+unless noted; spreads are wide on this VM -- the A-D range is given where it matters):
+
+| | x64 base | x64 perf5 | x86 base | x86 perf5 |
+|---|---:|---:|---:|---:|
+| inline empty hit, 1 thread | 68.5 | 70.3 | 136 | 136 |
+| send_log hit, 4 threads | 635 | 656 | 754 | 762 |
+| send_log hit, 1 thread | 176 | 163 | 266 | 317 (four sessions 309-331, one 250: open, see ROADMAP) |
+| gated_config inline 8 x 50,000 (ns/read) | 750 | **700** | 884 | **806** (A-D: -6.5..-8.9% each) |
+| logs/s, 1 thread to a file | 3.75M | 2.91M (A: 3.19M -> 3.98M) | 2.77M | 2.86M (A: 2.42M -> 3.21M) |
+| idle event -> stdout latency p50 (ms) | 0.27 | 0.27 | 0.26 | 0.28 |
+| inline launch, lifecycle_bench launch_ms (A-D medians) | 112-221 | 54-157 | 110-236 | 52-142 |
+
 ## Update: branch `perf4` (2026-11-07 night): UHH vs Frida 17.26.1, same sessions
 
 UHH = `perf4` c2edf28 (on merge-frida 59f6d61; agent protocol v26), Frida 17.26.1, same VM, same
