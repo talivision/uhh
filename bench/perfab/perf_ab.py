@@ -17,6 +17,9 @@ Cases (names are <family>/<backend>/<variant>):
                          (in-target QPC loop), hits/s, probe hits (must equal calls). bk = inline,
                          hw (execute), watch (hw data watchpoint, write, on the global hit_site
                          writes), breakpoint; base = no instrumentation.
+  hitsh/<bk>/<method>/t1 the same with hitcost_driver_shared (callbacks module opted in to
+                         UHH_SHARED: breakpoint/hw callbacks run from the controller's copy of the
+                         agent DLL). Group "methods": every method on every backend + these.
   sink/<bk>/<nul|file|pipe>  send_log, 1 thread: logs/s end to end (process wall), exact count
                          checked on file and pipe.
   latency/<bk>/idle      uhh_trace on logstream_target (50 LogSite calls 100 ms apart): event ->
@@ -157,8 +160,12 @@ HIT_CALLS = {
     ("hw", "send_log_stack"): 5_000, ("breakpoint", "send_log_stack"): 5_000,
     ("hw", "call_func"): 5_000, ("breakpoint", "call_func"): 5_000,
     ("hw", "call_original"): 5_000, ("breakpoint", "call_original"): 5_000,
+    ("inline", "add_once"): 5_000, ("hw", "add_once"): 2_000, ("breakpoint", "add_once"): 2_000,
 }
 METHODS = ["empty", "send_log", "get_func_arg", "get_mem", "send_log_stack", "call_original", "call_func"]
+# Group "methods" (bench/BENCHMARKS.md "Per-method cost"): one context operation per hit.
+ALL_METHODS = ["empty", "get_reg", "set_reg", "get_func_arg", "get_mem", "set_mem", "send_log", "send_log_stack",
+               "call_func", "call_original", "add_once", "counter_plain", "counter_shared"]
 BACKENDS = ["inline", "hw", "breakpoint"]
 HIT_BACKENDS = ["inline", "hw", "watch", "breakpoint"]     # watch = hw data watchpoint (write) on g_sink
 _RVA = {}
@@ -208,14 +215,14 @@ def case_waiter(side, bk):
             "wait_share": (t.get("waits") or 0) / due if due else None, "wall_s": round(wall, 3)}
 
 
-def case_hit(side, bk, m, threads=1):
+def case_hit(side, bk, m, threads=1, driver="hitcost_driver.exe"):
     """ns_per_call = in-target loop wall / calls per thread: what one call costs a thread
     (with T threads running at once). hits_per_s = all threads' calls / wall."""
     n = calls_for(bk, m, threads)
     if bk == "base":
         cmd = [tgt("hitcost_target.exe"), "--no-wait", "--calls", n, "--threads", threads]
     else:
-        cmd = [side.exe("hitcost_driver.exe"), "--backend", bk, "--method", m,
+        cmd = [side.exe(driver), "--backend", bk, "--method", m,
                *(["--watch-rva", sink_rva()] if bk == "watch" else []), "--",
                tgt("hitcost_target.exe"), "--no-wait", "--calls", n, "--threads", threads]
     rc, wall, logs, objs = run_to_file(side, cmd, 900)
@@ -227,9 +234,11 @@ def case_hit(side, bk, m, threads=1):
         return res
     rep, pr = first(objs, "probe_report"), first(objs, "probe")
     want_logs = n * threads if m in ("send_log", "send_log_stack") else 0
+    # add_once: every hit added a one-shot probe at its return address, which fired exactly once
+    once = sum(p.get("hits") or 0 for p in kind(objs, "probe")[1:])
     res.update(hits=pr.get("hits"), logs=logs, dropped=rep.get("log_dropped"),
                ok=rc == 0 and ns is not None and pr.get("hits") == n * threads and logs == want_logs
-               and rep.get("log_dropped", 0) == 0)
+               and rep.get("log_dropped", 0) == 0 and once == (n * threads if m == "add_once" else 0))
     return res
 
 
@@ -395,8 +404,15 @@ def case_gated(side, bk):
 
 
 def all_cases(group):
-    """core: the owner's per-probe-type time table + attach/detach. extra: the rest."""
+    """core: the owner's per-probe-type time table + attach/detach. extra: the rest.
+    methods: the per-method table and UHH_SHARED vs plain globals (not part of "all")."""
     c = []
+    if group == "methods":
+        c += [("hit/base/empty/t1", lambda s: case_hit(s, "base", None, 1))]
+        c += [(f"hit/{bk}/{m}/t1", (lambda bk, m: lambda s: case_hit(s, bk, m, 1))(bk, m))
+              for bk in BACKENDS for m in ALL_METHODS]
+        c += [(f"hitsh/{bk}/{m}/t1", (lambda bk, m: lambda s: case_hit(s, bk, m, 1, "hitcost_driver_shared.exe"))(bk, m))
+              for bk in BACKENDS for m in ("empty", "counter_plain", "counter_shared")]
     if group in ("core", "all"):
         for t in (1, 4):
             c += [(f"hit/base/empty/t{t}", (lambda t: lambda s: case_hit(s, "base", None, t))(t))]
@@ -432,7 +448,7 @@ def main():
     ap.add_argument("--tmp", default=r"C:\work\uhh-perf-tmp")
     ap.add_argument("--only", default=""); ap.add_argument("--skip", default="")
     ap.add_argument("--tag", default="")
-    ap.add_argument("--group", default="core", choices=("core", "extra", "all"))
+    ap.add_argument("--group", default="core", choices=("core", "extra", "all", "methods"))
     a = ap.parse_args()
     T = Path(a.targets)
     sides = {}

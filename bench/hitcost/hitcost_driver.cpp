@@ -1,6 +1,6 @@
 // hitcost_driver --backend inline|breakpoint|hw [--method empty|get_reg|get_func_arg|get_mem|
 //                set_mem|send_log|send_log_stack|call_func|counter_plain|counter_shared|
-//                call_original|log_alt] -- hitcost_target.exe [args]
+//                call_original|log_alt|set_reg|add_once] -- hitcost_target.exe [args]
 // --backend watch --watch-rva R: a hardware data watchpoint (PROBE_HW | PROBE_WATCH_WRITE) on
 // hitcost_target.exe+R (g_sink, written by hit_site on every call: hitcost_target --print-rva).
 // hitcost_driver_shared: the same, with the callbacks module opted in to UHH_SHARED.
@@ -14,7 +14,7 @@ struct hitcost_config { uint32_t method; uint32_t pad; };
 int main(int argc, char **argv) {
     static const char *const methods[] = {"empty", "get_reg", "get_func_arg", "get_mem", "set_mem",
                                           "send_log", "send_log_stack", "call_func", "counter_plain", "counter_shared",
-                                          "call_original", "log_alt"};
+                                          "call_original", "log_alt", "set_reg", "add_once"};
     uint32_t backend = PROBE_INLINE; hitcost_config cfg{0, 0}; int i = 1; unsigned long long watch_rva = 0;
     for (; i < argc && std::strcmp(argv[i], "--"); ++i) {
         if (!std::strcmp(argv[i], "--backend") && i + 1 < argc) {
@@ -25,7 +25,10 @@ int main(int argc, char **argv) {
             watch_rva = std::strtoull(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--method") && i + 1 < argc) {
             const char *m = argv[++i];
-            for (uint32_t k = 0; k < sizeof(methods) / sizeof(*methods); ++k) if (!std::strcmp(m, methods[k])) cfg.method = k;
+            uint32_t k = 0;
+            while (k < sizeof(methods) / sizeof(*methods) && std::strcmp(m, methods[k])) ++k;
+            if (k == sizeof(methods) / sizeof(*methods)) { std::fprintf(stderr, "unknown --method %s\n", m); return 2; }
+            cfg.method = k;
         }
     }
     if (i + 1 >= argc) return 2;

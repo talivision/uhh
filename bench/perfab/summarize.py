@@ -16,6 +16,7 @@ MATERIAL_PCT = 5.0    # a non-overlapping difference smaller than this is report
 # metric, better ("lo" | "hi"), unit/format
 METRICS = {
     "hit": [("ns_per_call", "lo", "ns/call"), ("hits_per_s", "hi", "hits/s")],
+    "hitsh": [("ns_per_call", "lo", "ns/call")],
     "spin": [("ns_per_call", "lo", "ns/call"), ("spin_per_us", "hi", "spins/us")],
     "waiter": [("ns_per_call", "lo", "ns/call"), ("wait_share", "hi", "timeouts done / due")],
     "mt": [("hits_per_s", "hi", "hits/s")],
