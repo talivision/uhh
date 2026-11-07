@@ -35,7 +35,7 @@ def child_of(ppid, name, timeout=30):
         time.sleep(0.005)
 
 
-def run(cmd, mode, tgt_name, tmp, here, bindir, secs):
+def run(cmd, mode, tgt_name, tmp, here, bindir, secs, delay=0.5):
     out, err = tmp / "out.jsonl", tmp / "err.txt"
     env = dict(os.environ, UHH_LOGPROF="1", TEMP=str(tmp), TMP=str(tmp))
     with open(out, "wb") as fo, open(err, "wb") as fe:
@@ -47,7 +47,7 @@ def run(cmd, mode, tgt_name, tmp, here, bindir, secs):
             tool = "sampler.py" if mode.startswith("smp") else "threadstates.py"
             extra = ["--maps", str(bindir), "--top", "12", "--per-thread", "14"] if tool == "sampler.py" else []
             prof = subprocess.run([sys.executable, str(here / tool), "--pid", str(pid), "--seconds", str(secs),
-                                   "--delay", "0.5"] + extra, capture_output=True, text=True).stdout
+                                   "--delay", str(delay)] + extra, capture_output=True, text=True).stdout
         rc = p.wait(); wall = time.perf_counter() - t0
     lines = open(out, "rb").read().splitlines()
     logs = sum(1 for l in lines if l.startswith(b'{"kind":"probe_log"'))
@@ -62,7 +62,7 @@ def main():
     ap.add_argument("--modes", default="plain,smp-ctl,smp-tgt")
     ap.add_argument("--cases", default="hit1,hit4,gated")
     ap.add_argument("--calls", type=int, default=2_000_000); ap.add_argument("--reads", type=int, default=50_000)
-    ap.add_argument("--secs", type=float, default=1.5)
+    ap.add_argument("--secs", type=float, default=1.5); ap.add_argument("--delay", type=float, default=0.5)
     a = ap.parse_args()
     b = Path(a.bin).resolve(); t = Path(a.targets).resolve() if a.targets else b
     here = Path(__file__).resolve().parent
@@ -79,7 +79,7 @@ def main():
     for c in a.cases.split(","):
         cmd, tn = cases[c]
         for m in a.modes.split(","):
-            rc, wall, logs, objs, lp, prof = run(cmd, m, tn, tmp, here, b, a.secs)
+            rc, wall, logs, objs, lp, prof = run(cmd, m, tn, tmp, here, b, a.secs, a.delay)
             tg = next((o for o in objs if o.get("kind") in ("target", "app")), {})
             rep = next((o for o in objs if o.get("kind") == "probe_report"), {})
             n = tg.get("calls") or tg.get("successful_reads") or 0
