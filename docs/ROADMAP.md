@@ -1175,6 +1175,28 @@ Two decisions that reverse earlier work:
   a slot we have used holding an address we armed is ours (cleared on that thread, RF, continued). VM
   PROBE_TRACE repro, 80 attach/detach cycles per arch: before, a crash within 3-7 cycles; after, none
   (22 / 6 such #DBs taken as ours, x64 / x86).
+  Inline sessions keep the guard (it covers their bp/hw probes too; one that acquires the agent later is
+  guarded from then on). Controller death in a bp/hw-only attached session is main's behaviour: kill-on-exit
+  is off, so the target is not killed, but it keeps our INT3s/DRs and dies at its next hit -- documented in
+  limitations.md. Measured (VM Win10, x64 and x86, `lifecycle-controller-killed-{breakpoint,hw}`, controller
+  TerminateProcess'd): killed with probes live -> the target died at its next hit, 0x80000003 (breakpoint) /
+  0x80000004 (hw; also 0x80000003 when a breakpoint probe beside them was mid-step); killed 50 ms into the
+  attach (nothing armed yet) -> alive and clean; no probe_api_agent.dll in the target at any point.
+  Checks: `lifecycle-controller-killed-{breakpoint,hw}` now assert the new rule (no agent module while
+  attached; after the kill the target runs on or dies only with our trap code, never another fault or a
+  hang; outcomes listed); `lifecycle-reattach-{breakpoint,hw}` assert no agent module after every cycle;
+  `lifecycle-agent-refused-{breakpoint,hw}` (a target admitting only Microsoft-signed DLLs) assert a normal
+  session with no agent attempt; new `attach-lazy-agent-{breakpoint,hw}` (no agent module until a callback adds
+  the first inline probe, then it is injected and that very call is hooked) and `attach-no-agent-dll-*` (the
+  agent DLL missing next to the controller: bp/hw work, inline refuses cleanly). Note: breakpoint/hw callbacks
+  that use `UHH_SHARED` state still run from the controller's LOCAL copy of the agent DLL (nothing injected),
+  so such a controller still needs the file beside it. The guard checks that ran bp/hw-only sessions
+  (`cxlib-killarm-*`, `cxlib-reptail-breakpoint`, `cxlib-touchkill-hw`, `cx2-touchprog-hw`,
+  `cx2-evsusp-*`, `cx2-cosusp-*`) now add a never-called inline probe (`co_driver --guard`, `co_idle`) so
+  they keep testing the guard's coverage of bp/hw state in inline sessions (the test hook
+  UHH_TEST_DIE_IN_TOUCH now fires only while arming a user hw probe, as those checks intend).
+  `stdout-powershell-detach-*`: a detach with no record after the report (now that a breakpoint-only attach
+  has no agent to stop, it can be that fast) has no `probe_final` by design; the report then closes the books.
 - **Bounded detach wait.** Codex library review (4) made a live detach wait without a time limit for inline
   callbacks that can still finish. Now it waits at most 15 s (logs delivered meanwhile), then completes:
   stderr `probe: detach: N callback(s) still running after 15 s; not waiting longer`, the detach line and
