@@ -338,6 +338,11 @@ target_include_directories(hitcost_driver_shared PRIVATE include)
 target_compile_definitions(hitcost_driver_shared PRIVATE HITCOST_SHARED)
 target_link_libraries(hitcost_driver_shared PRIVATE probe_api)
 add_dependencies(hitcost_driver_shared hitcost_target probe_api_agent)
+# Control-plane timing (attach / detach / launch) for bench/perfab/perf_ab.py.
+add_executable(lifecycle_bench bench/perfab/lifecycle_bench.cpp bench/hitcost/hitcost_callbacks.cpp)
+target_include_directories(lifecycle_bench PRIVATE include)
+target_link_libraries(lifecycle_bench PRIVATE probe_api)
+add_dependencies(lifecycle_bench hitcost_target probe_api_agent)
 
 # --- streaming logs: visible latency and per-thread ordering --------------------------
 add_executable(logstream_target examples/targets/logstream/logstream_target.c)

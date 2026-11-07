@@ -15,12 +15,25 @@ __declspec(dllexport) __declspec(noinline) intptr_t hit_site(intptr_t i);
 static long long g_calls = 10000000; static int g_avx = 0;
 static long long g_crash_after = 0;            /* >0: die with an unhandled access violation after N calls */
 static volatile LONG g_go;
+static volatile LONG g_done;
+static volatile LONG64 g_spins;              /* --spin: iterations of a thread that hits nothing */
 static int g_qpc_arg = 0;                      /* --qpc-arg: pass a QPC timestamp (microseconds, low 31 bits) instead of i */
 static LARGE_INTEGER g_freq;
 static intptr_t qpc_us(void) {                 /* same clock as Python's time.perf_counter_ns, in us, 31 bits (fits x86) */
     LARGE_INTEGER t; QueryPerformanceCounter(&t);
     long long us = (t.QuadPart / g_freq.QuadPart) * 1000000LL + (t.QuadPart % g_freq.QuadPart) * 1000000LL / g_freq.QuadPart;
     return (intptr_t)(us & 0x7fffffffLL);
+}
+
+/* --spin: a thread that never hits the probe and always wants the CPU -- the thread a
+   debugger's fairness must not starve. Its iteration count over the timed loop is reported. */
+static DWORD WINAPI spin(void *arg) {
+    (void)arg;
+    while (!g_go) YieldProcessor();
+    LONG64 n = 0;
+    while (!g_done) { ++n; if ((n & 1023) == 0) g_spins = n; }
+    g_spins = n;
+    return 0;
 }
 
 static DWORD WINAPI loop(void *arg) {
@@ -41,7 +54,7 @@ __declspec(dllexport) __declspec(noinline) intptr_t hit_site(intptr_t i) {
 }
 
 int main(int argc, char **argv) {
-    int no_wait = 0, threads = 1;
+    int no_wait = 0, threads = 1, spinner = 0;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--calls") && i + 1 < argc) g_calls = atoll(argv[++i]);
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = atoi(argv[++i]);
@@ -49,6 +62,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--crash-after") && i + 1 < argc) g_crash_after = atoll(argv[++i]);
         else if (!strcmp(argv[i], "--no-wait")) no_wait = 1;
         else if (!strcmp(argv[i], "--qpc-arg")) g_qpc_arg = 1;
+        else if (!strcmp(argv[i], "--spin")) spinner = 1;
+        else if (!strcmp(argv[i], "--print-rva")) {   /* g_sink's RVA: hit_site writes it on every call */
+            printf("{\"kind\":\"rva\",\"sink\":%llu}\n",
+                   (unsigned long long)((uintptr_t)&g_sink - (uintptr_t)GetModuleHandleA(NULL)));
+            return 0;
+        }
     }
     if (threads < 1 || threads > 64) threads = 1;
     QueryPerformanceFrequency(&g_freq);
@@ -56,18 +75,24 @@ int main(int argc, char **argv) {
     if (!no_wait) { char b; DWORD got = 0; ReadFile(GetStdHandle(STD_INPUT_HANDLE), &b, 1, &got, NULL); }
     HANDLE h[64];
     for (int t = 0; t < threads; ++t) h[t] = CreateThread(NULL, 0, loop, NULL, 0, NULL);
+    HANDLE sp = spinner ? CreateThread(NULL, 0, spin, NULL, 0, NULL) : NULL;
     Sleep(50);
     LARGE_INTEGER f, t0, t1; QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&t0);
     InterlockedExchange(&g_go, 1);
     WaitForMultipleObjects((DWORD)threads, h, TRUE, INFINITE);
     QueryPerformanceCounter(&t1);
+    InterlockedExchange(&g_done, 1);
+    if (sp) { WaitForSingleObject(sp, INFINITE); CloseHandle(sp); }
     for (int t = 0; t < threads; ++t) CloseHandle(h[t]);
     double ns = (double)(t1.QuadPart - t0.QuadPart) * 1e9 / (double)f.QuadPart;
     /* wall time per call per thread: with T threads running in parallel, this is the
        per-hit cost each thread sees (contention shows up as growth with T). */
-    printf("{\"kind\":\"target\",\"name\":\"hitcost\",\"calls\":%lld,\"threads\":%d,\"avx\":%d,\"ns_per_call\":%.2f}\n",
-           g_calls, threads, g_avx, ns / (double)g_calls);
+    /* spin_share: the spinner's iterations per ns of the timed window (--spin; 0 without) --
+       compared with an uninstrumented run, the CPU share a thread that hits nothing got. */
+    printf("{\"kind\":\"target\",\"name\":\"hitcost\",\"calls\":%lld,\"threads\":%d,\"avx\":%d,\"ns_per_call\":%.2f,"
+           "\"spins\":%lld,\"spin_per_us\":%.3f}\n",
+           g_calls, threads, g_avx, ns / (double)g_calls, (long long)g_spins, (double)g_spins * 1000.0 / ns);
     fflush(stdout);
     return 0;
 }

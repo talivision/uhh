@@ -1,0 +1,15 @@
+{"method": "baseline", "repeat": 0, "elapsed_ns": 178108500, "successful_reads": 400000, "checksum": 38400000}
+{"method": "baseline", "repeat": 1, "elapsed_ns": 173481500, "successful_reads": 400000, "checksum": 38400000}
+{"method": "baseline", "repeat": 2, "elapsed_ns": 166437500, "successful_reads": 400000, "checksum": 38400000}
+{"method": "uhh:inline", "repeat": 0, "elapsed_ns": 1250542800, "successful_reads": 400000, "checksum": 38400000, "hits": 400000, "overrides": 1, "log_dropped": 0, "rc": 0}
+{"method": "uhh:inline", "repeat": 1, "elapsed_ns": 1131913000, "successful_reads": 400000, "checksum": 38400000, "hits": 400000, "overrides": 1, "log_dropped": 0, "rc": 0}
+{"method": "uhh:inline", "repeat": 2, "elapsed_ns": 1021223100, "successful_reads": 400000, "checksum": 38400000, "hits": 400000, "overrides": 1, "log_dropped": 0, "rc": 0}
+{"method": "uhh:hw", "repeat": 0, "elapsed_ns": 63457364500, "successful_reads": 400000, "checksum": 38400000, "hits": 400000, "overrides": 1, "log_dropped": 0, "rc": 0}
+{"method": "uhh:hw", "repeat": 1, "elapsed_ns": 59075617900, "successful_reads": 400000, "checksum": 38400000, "hits": 400000, "overrides": 1, "log_dropped": 0, "rc": 0}
+{"method": "uhh:hw", "repeat": 2, "elapsed_ns": 58683677100, "successful_reads": 400000, "checksum": 38400000, "hits": 400000, "overrides": 1, "log_dropped": 0, "rc": 0}
+{"method": "uhh:breakpoint", "repeat": 0, "elapsed_ns": 42633138800, "successful_reads": 400000, "checksum": 38400000, "hits": 400000, "overrides": 1, "log_dropped": 0, "rc": 0}
+{"method": "uhh:breakpoint", "repeat": 1, "elapsed_ns": 41194229100, "successful_reads": 400000, "checksum": 38400000, "hits": 400000, "overrides": 1, "log_dropped": 0, "rc": 0}
+{"method": "uhh:breakpoint", "repeat": 2, "elapsed_ns": 41629881800, "successful_reads": 400000, "checksum": 38400000, "hits": 400000, "overrides": 1, "log_dropped": 0, "rc": 0}
+{"method": "frida:interceptor", "repeat": 0, "elapsed_ns": 3304736800, "successful_reads": 400000, "checksum": 38400000, "hits": 400000, "frida_stats": {"calls": 400000, "matched": 400000, "logged": 0, "resolveCalls": 0}}
+{"method": "frida:interceptor", "repeat": 1, "elapsed_ns": 2710206000, "successful_reads": 400000, "checksum": 38400000, "hits": 400000, "frida_stats": {"calls": 400000, "matched": 400000, "logged": 0, "resolveCalls": 0}}
+{"method": "frida:interceptor", "repeat": 2, "elapsed_ns": 3182897100, "successful_reads": 400000, "checksum": 38400000, "hits": 400000, "frida_stats": {"calls": 400000, "matched": 400000, "logged": 0, "resolveCalls": 0}}

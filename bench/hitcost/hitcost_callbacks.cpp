@@ -6,7 +6,7 @@
 
 struct hitcost_config { uint32_t method; uint32_t pad; };
 enum { M_EMPTY, M_GET_REG, M_GET_ARG, M_GET_MEM, M_SET_MEM, M_SEND_LOG, M_SEND_LOG_STACK, M_CALL_FUNC,
-       M_COUNTER_PLAIN, M_COUNTER_SHARED };
+       M_COUNTER_PLAIN, M_COUNTER_SHARED, M_CALL_ORIGINAL };
 
 static volatile uint64_t g_sink;
 // UHH_SHARED cost: the same atomic increment on a plain global and on a shared one. With
@@ -33,6 +33,9 @@ extern "C" __declspec(dllexport) void hitcost_empty(probe_context *c) {
     case M_CALL_FUNC: { uint64_t r = 0; call_func(c, "kernel32.dll!GetCurrentProcessId", &r, 0); g_sink += r; break; }
     case M_COUNTER_PLAIN: g_plain_counter.fetch_add(1, std::memory_order_relaxed); break;
     case M_COUNTER_SHARED: g_shared_counter.fetch_add(1, std::memory_order_relaxed); break;
+    // Detours-style replacement: run the original now and return its result (hit_site is
+    // cdecl with one argument: x86 caller pops, so return_from nargs = 0).
+    case M_CALL_ORIGINAL: { uint64_t r = 0; if (call_original(c, 1, &r)) return_from(c, r, 0); break; }
     default: break;
     }
 }
