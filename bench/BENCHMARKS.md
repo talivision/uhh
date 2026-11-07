@@ -5,6 +5,60 @@ is kept for history and is SUPERSEDED (see "Why the earlier comparison was super
 Reproduce with `bench/frida/vs_frida.py` (how: `bench/frida/README.md`); raw rows in
 `bench/results/frida17-2026-11-07/`.
 
+## Update: branch `perf4` (2026-11-07 night): UHH vs Frida 17.26.1, same sessions
+
+UHH = `perf4` c2edf28 (on merge-frida 59f6d61; agent protocol v26), Frida 17.26.1, same VM, same
+`vs_frida.py`, every run exact. **Session A** (the main table): 8 threads x 50,000 reads, hit 200,000
+calls, churn 8 x 2,000 (x64) / 8 x 1,000 (x86) rounds, 6 repeats, quiet-VM placeholder in the other heavy
+slot. hw/breakpoint columns: session C, lean sizes (8 x 12,500, hit 50,000), 3 repeats (hw stays external
+by owner decision: out of scope). Added ns per event (median [min..max], over the session's pooled
+baseline); churn: added wall seconds. Raw rows: `bench/results/perf4-2026-11-07/` (fin3 = A, fin1 = B, fin2 = C).
+
+| workload | arch | **uhh-inline** | **frida-cmodule** | uhh-hw | frida-hw | uhh-breakpoint |
+|---|---|---:|---:|---:|---:|---:|
+| count | x64 | **+108** [99..184] | +331 [255..569] | +118,325 | +23,060 | +98,209 |
+| gated (every read logged + delivered) | x64 | **+335** [294..369] | +423 [337..712] | +123,972 | -- | +105,487 |
+| hit | x64 | **+73** [70..77] | +252 [241..255] | +91,128 | +23,146 | +76,905 |
+| churn (s) | x64 | **+0.265** [0.186..0.487] | +0.290 [-0.008..0.409] | | | |
+| count | x86 | **+133** [81..501] | +284 [241..314] | +214,959 | +19,865 | +200,466 |
+| gated | x86 | +377 [372..413] | +376 [333..599] | +229,735 | -- | +211,557 |
+| hit | x86 | **+141** [140..148] | +279 [272..299] | +151,435 | +47,170 | +142,157 |
+| churn (s) | x86 | +0.311 [0.016..0.344] | **+0.261** [0.158..0.478] | | | |
+
+- **Ahead of Frida CModule:** x64 in all four (count 3.1x less, gated 1.3x, hit 3.5x, churn marginally);
+  x86 count (2.1x) and hit (2.0x).
+- **Not won on x86: gated is a tie** (+377 vs +376 in session A; UHH's spread 372..413 is narrower than
+  Frida's 333..599) and **churn is behind** (+0.31 vs +0.26 s; wall clock of a ~1 s run, both spreads
+  wide). Session B (lean sizes 8 x 12,500, 5 repeats, the build BEFORE the x86 get_func_arg change) had x86
+  count +232 vs +193 and gated +451 vs +357 -- behind; earlier sessions (perf_ab A/B rounds, same day)
+  had x86 gated +403 vs +446 and +423 vs +580. Frida's x86 gated row moves +281..+599 between sessions;
+  a 100,000-read run is ~50-90 ms of target time.
+- Churn is mostly fixed cost (launch, agent injection, teardown, measured to process exit for UHH and to
+  the last record for Frida): with 1 round per thread UHH added +0.17 s (x64) / +0.47 s (x86) and Frida
+  +0.15 / +0.44 (`churn1-*` rows).
+
+Before / after this branch (perf_ab, base = merge-frida 3f06c24, interleaved, 3 rounds, quiet gate; final
+build; rows `fin1-*-pab`, `fin3-*-pab`, `j2-*`; ns per call unless noted):
+
+| | x64 base | x64 perf4 | x86 base | x86 perf4 |
+|---|---:|---:|---:|---:|
+| inline empty hit, 1 thread | 90.9 | **65.2** | 151 | **134** (136 with x86 stack args: fin3) |
+| inline empty hit, 4 threads | 148 | 149 | 193 | **185** |
+| send_log hit, 1 thread | 360 | **177** | 421 | **261** (fin3) |
+| send_log hit, 4 threads | 1,299 | **625** | 1,682 (j2, 6 rounds) | **749** |
+| gated_config inline 8 x 50,000 (ns/read; uninstrumented 416-422 / 513-540) | 838 | **759** | 1,050 | **918** (fin3) |
+| controller CPU per log, gated (GetProcessTimes; noisy) | 781 | **625** | 1,055 | **820** |
+| logs/s, 1 thread to a file | 2.38M | **2.98M** | 2.09M | **2.36M** |
+| controller CPU per log, 1 thread to a file | 461 | **242** | 586 | **438** |
+| idle event -> stdout latency p50 / p99 (ms) | 15.8 / 16.6 | **0.28 / 8.9** | 15.8 / 16.7 | **0.28 / 13.3** |
+| idle controller CPU (Mcycles/s, idle_cpu.py) | 3.6 | **2.3** | 3.8 | **2.4** |
+| inline launch (lifecycle_bench launch_ms) | 207 | **111** | 259 | **129** |
+
+What changed is in docs/ROADMAP.md, "perf4 findings". The count/hit callback (`uhh_count_call`) now does
+exactly the CModule agent's work (a plain `sink ^=` and one 32-bit atomic add; it did two 64-bit atomic
+RMWs, LOCK CMPXCHG8B loops on x86); the library rows above (perf_ab) use hitcost's own callbacks and are
+unaffected by it.
+
 ## Update: branch `perf` (2026-11-07 evening) against the same Frida 17.26.1 rows
 
 Same VM, same `vs_frida.py`, lean sizes (8 x 12,500 reads = 100,000 events, hit 50,000 calls),

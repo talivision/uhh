@@ -1991,9 +1991,32 @@ What changed and why (each measured; see the before/after table in BENCHMARKS):
    Event -> stdout p50 15.8 -> 0.3 ms (x64 and x86); idle controller CPU 3.5 -> 2.1 Mcycles/s (x64), 3.8 -> 2.6 (x86)
    (`bench/perfab/idle_cpu.py`, QueryProcessCycleTime; GetProcessTimes charges such short wake-ups nothing).
    New check `stream-latency-inline-wake` (p50 < 8 ms, half a tick).
-6. **Benchmark fairness (count/hit).** `uhh_count_call` did two 64-bit atomic RMWs per call (x86: two contended
+6. **x86 get_func_arg** reads the hit's own stack arguments directly (`stack_arg`): the bounds range_ok
+   trusts (this thread's stack above the frame), and only when the address is outside every published hook
+   shadow and the INT3 table's span (read under its seqlock) -- else the full path. 2-3 reads per hit in
+   count/gated: x86 vs_frida hit +176 -> +141 ns, count +232 -> +133.
+7. **Benchmark fairness (count/hit).** `uhh_count_call` did two 64-bit atomic RMWs per call (x86: two contended
    LOCK CMPXCHG8B loops) where Frida's CModule agent does `sink ^= ...` and one `g_atomic_int_add`: now the same
    operations. This is the benchmark's callback, not the library.
+
+Also measured: inline launch (lifecycle_bench) 207 -> 111 ms x64, 259 -> 129 ms x86, idle controller CPU
+3.6 -> 2.3 Mcycles/s. The launch gain is NOT attributed to one change (no log traffic in that window; not
+bisected).
+
+Status vs Frida CModule (BENCHMARKS "Update: branch perf4"): ahead on x64 in count, gated, hit, churn
+(churn marginally) and on x86 in count and hit. **Open:** x86 gated is a tie (+377 vs +376 ns/read in the
+main session; earlier sessions both ways), x86 churn behind (+0.31 vs +0.26 s, fixed launch/teardown cost
+dominates a ~1 s run). What is left on x86 gated is target-side per record (format + claiming a ring slot
+on the header line all 8 producers CAS) and the controller's two file writes per batch (write batch size
+and an AV-scanned vs excluded %TEMP% made no measurable difference; a run without the session file was
+started but cut by a Windows Update restart of the VM and is not counted). A further step would be per-thread
+claim batching or a binary record formatted by the controller -- both change the ring protocol.
+
+Correctness (perf4): VM `--only logs,stdout,crash_logs,stream,gated,conformance,portability,transparency,
+edgehunt,cxlib,carry,hunt` on 3f97146: x64 498/498 (1 n/a), x86 494/494; x86 `conformance,transparency,
+edgehunt,cxlib,gated,portability` on c2edf28 337/337; CI full suite 2079/2079 (7113233) and 2078/2079
+(3f97146, only `patch-race-unsafe`). New checks: `transparency-*-fpu` (7 modes now), MXCSR at the
+mid-function site, `stream-latency-inline-wake`.
 
 ## Real-world cases
 - ✅ Microsoft Detours samples replicated (`examples/famous/detours_*`: simple, traceapi, withdll/attach, retval) -- findings above
