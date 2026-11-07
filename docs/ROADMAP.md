@@ -2309,14 +2309,17 @@ keeping the full output, a ring of hardware-breakpoint events and a full minidum
   differed was a service host (CryptSvc's svchost in all three) whose module LIST changed during the
   instrumented run (the VM row: the same pid listed with other modules -- cryptnet/winhttp/mswsock/... loaded on
   demand -- and in another order). A plain control with no UHH anywhere (three uninstrumented x86 `tasklist /m`
-  back to back, the check's exact failure condition on the middle one) failed 1 of 19 triples on a runner: a
+  back to back, the check's exact failure condition on the middle one) failed 1 of 91 triples on runners: a
   svchost whose wintypes.dll / staterepository modules came and went during the middle run. Fix (check): an
   independent observer (`_ModPoller`: every process's module list every 0.5 s, EnumProcessModulesEx) runs during
   the instrumented run of the module-listing scenarios (tasklist-m, ps-modules); a process whose module list
   changed DURING the run is not comparable (like a process that did not live through it) and is reported
   (`modules_moved_during_run=N[...]`); every other stable row must still be identical. It caught the control
   triple's pid. A process the observer cannot open is never excluded. The failure detail now diffs module lists
-  split on `,` too (tasklist) and says when only the order differs.
+  split on `,` too (tasklist) and says when only the order differs. After (diag loops, windows-2022): x86
+  tasklist-m 54/54 PASS (every one `modules_moved_during_run=0`), x64 tasklist-m 459/459 rows PASS, one of them
+  with `modules_moved_during_run=1['"TiWorker.exe",...']` (a servicing worker loading modules mid-run: before, a
+  FAIL).
 - ✅ (FL4) **x86 `hw-once-slots-{breakpoint,inline}`: target killed by STATUS_SINGLE_STEP** (CI 42194952645,
   agentscope 42317542060; "run ended after 75 of 4000 calls"). Reproduced on runners: 32 failures in 2,836 rows (1,418 runs of the check)
   (diag loops, x86 windows-2022; 0 in 120 on the VM), always the same: a worker's `lock inc g_w1` raised the data
