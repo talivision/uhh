@@ -8032,13 +8032,16 @@ static size_t drain_agent_logs(probe_session *s) {
     for (;;) {
         if (tail >= stop) break;
         auto &rec = sh->logs[(uint64_t)tail % PROBE_AGENT_LOG_CAP];
-        LONG64 seq = rec.seq;
+        LONG64 seq = probe_agent_load64(&rec.seq);
         if (seq != tail + 1 && seq != -(tail + 1)) break;
-        MemoryBarrier();
+        // x86/x64 (TSO) order loads with loads and stores after older loads: reading the record
+        // after its seq, and freeing the slot after reading it, need only the compiler barriers --
+        // not a fence and a LOCKed exchange per record (the producer publishes the same way).
+        _ReadWriteBarrier();
         if (seq == tail + 1) pack_agent_record(s, rec, batch, map);    // -(tail + 1): delivered past a stall already
+        _ReadWriteBarrier();
         rec.owner = 0;
-        MemoryBarrier();
-        InterlockedExchange64(&rec.seq, tail + PROBE_AGENT_LOG_CAP);    // slot free again
+        probe_agent_store64(&rec.seq, tail + PROBE_AGENT_LOG_CAP);     // slot free again (after owner: store order)
         ++tail;
         ++moved;
         if (!batch.empty() && batch.back().packed >= LOG_PACK) { sh->log_tail = tail; enqueue_logs(s, batch); }
