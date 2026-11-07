@@ -1,0 +1,6 @@
+method,repeats,median_elapsed_ns,median_ns_per_read,added_ns_per_read,slowdown,hits_exact,hits,checksum,notes
+baseline,3,208497000,521.2425,0.0,1.0,True,400000,38400000,
+uhh:inline,3,1443515400,3608.7885,3087.546,6.9234,True,"[400000, 400000, 400000]",38400000,"{""overrides"": 1, ""log_dropped"": 0}"
+uhh:hw,3,108081282300,270203.2058,269681.9633,518.3829,True,"[400000, 400000, 400000]",38400000,"{""overrides"": 1, ""log_dropped"": 0}"
+uhh:breakpoint,3,83214174700,208035.4367,207514.1943,399.1145,True,"[400000, 400000, 400000]",38400000,"{""overrides"": 1, ""log_dropped"": 0}"
+frida:interceptor,3,4311708600,10779.2715,10258.029,20.68,True,"[400000, 400000, 400000]",38400000,
