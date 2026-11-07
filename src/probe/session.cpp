@@ -2038,7 +2038,8 @@ static void prepare_local_agent(probe_session *s) {
                                    std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(counter++);
                 std::wstring copy = dir + L"\\probe_api_agent.dll";
                 bench_phase("agent_copy", nullptr);
-                warm_sig = agent_signature(s->agent_path);
+                static const bool no_warm = std::getenv("UHH_BENCH_NO_WARM") != nullptr;   // bench knob, not API
+                if (!no_warm) warm_sig = agent_signature(s->agent_path);
                 warm_root = root; warm_src = s->agent_path;
                 const bool warm = !warm_sig.empty() && take_warm_copy(root, warm_sig, dir);
                 bench_phase("agent_copy_kind", warm ? "warm" : "new");

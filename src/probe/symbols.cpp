@@ -292,6 +292,56 @@ bool find_vs_dbghelp(std::wstring &result) {
     return run_vswhere(vswhere, install_path) && search_vs_directory(install_path, result);
 }
 
+// find_vs_dbghelp runs vswhere (a process) and walks the Visual Studio tree: ~40 ms, every
+// controller process. Its answer (a path, or none) is kept for a day in %TEMP%\uhh\vs-dbghelp-
+// <arch>.txt; a cached path that is no longer a usable dbghelp + symsrv pair is looked up again.
+bool find_vs_dbghelp_cached(std::wstring &result) {
+    const std::wstring tmp = environment_variable(L"TEMP");
+#if defined(_WIN64)
+    const wchar_t *arch = L"x64";
+#else
+    const wchar_t *arch = L"x86";
+#endif
+    const std::wstring dir = tmp.empty() ? std::wstring() : join_path(tmp, L"uhh");
+    const std::wstring cache = dir.empty() ? std::wstring() : join_path(dir, (std::wstring(L"vs-dbghelp-") + arch + L".txt").c_str());
+    if (!cache.empty()) {
+        WIN32_FILE_ATTRIBUTE_DATA a{};
+        FILETIME now{};
+        GetSystemTimeAsFileTime(&now);
+        auto ticks = [](const FILETIME &f) { return ((ULONGLONG)f.dwHighDateTime << 32) | f.dwLowDateTime; };
+        if (GetFileAttributesExW(cache.c_str(), GetFileExInfoStandard, &a) && ticks(now) >= ticks(a.ftLastWriteTime) &&
+            ticks(now) - ticks(a.ftLastWriteTime) < 864000000000ull && a.nFileSizeLow < 4096) {
+            HANDLE f = CreateFileW(cache.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (f != INVALID_HANDLE_VALUE) {
+                wchar_t buf[2048] = {};
+                DWORD got = 0;
+                const BOOL ok = ReadFile(f, buf, sizeof(buf) - sizeof(wchar_t), &got, nullptr);
+                CloseHandle(f);
+                if (ok && got >= sizeof(wchar_t) && buf[0] == L'#') {          // "#" + path (empty: none)
+                    std::wstring path(buf + 1, got / sizeof(wchar_t) - 1);
+                    if (path.empty()) return false;
+                    std::wstring directory = path.substr(0, path.find_last_of(L'\\') == std::wstring::npos ? 0 : path.find_last_of(L'\\'));
+                    if (usable_dbghelp_directory(directory, result)) return true;
+                }
+            }
+        }
+    }
+    const bool found = find_vs_dbghelp(result);
+    if (!cache.empty()) {
+        CreateDirectoryW(dir.c_str(), nullptr);
+        const std::wstring part = cache + L"." + std::to_wstring(GetCurrentProcessId());
+        HANDLE f = CreateFileW(part.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        if (f != INVALID_HANDLE_VALUE) {
+            const std::wstring text = L"#" + (found ? result : std::wstring());
+            DWORD wrote = 0;
+            const BOOL ok = WriteFile(f, text.data(), (DWORD)(text.size() * sizeof(wchar_t)), &wrote, nullptr);
+            CloseHandle(f);
+            if (!ok || !MoveFileExW(part.c_str(), cache.c_str(), MOVEFILE_REPLACE_EXISTING)) DeleteFileW(part.c_str());
+        }
+    }
+    return found;
+}
+
 std::wstring system_dbghelp_path() {
     std::vector<wchar_t> directory(MAX_PATH);
 #if !defined(_WIN64)
@@ -398,7 +448,7 @@ bool load_dbghelp() {
         std::wstring path;
         if (find_sdk_dbghelp(path) && try_path(path, true)) return true;
         path.clear();
-        if (find_vs_dbghelp(path) && try_path(path, true)) return true;
+        if (find_vs_dbghelp_cached(path) && try_path(path, true)) return true;
         path = system_dbghelp_path();
         if (try_path(path, false)) return true;
         if (path.empty()) g_load_error = "could not locate dbghelp.dll";
