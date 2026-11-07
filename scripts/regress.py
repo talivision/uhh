@@ -4955,12 +4955,11 @@ def check_init_cutoff():
             rep = report(o)
             cut_line = next((l for l in r.stderr.splitlines() if "agent init thread ended by the target" in l), "")
             cut = bool(cut_line)
-            # exit-process: the cut-off must be seen. exit-terminate: on x86 the cut-off line was
-            # missing now and then (CI 1 of 1 row, VM 1 of 14; cause not established -- the thread's
-            # exit not reported before the process's, or the init not started yet) with the right
-            # exit code and no error: that pair is what is checked there.
-            ok = (target.returncode == code and rep.get("app_exit") == code and not rep.get("error") and
-                  (cut or sc == "exit-terminate"))
+            # The cut-off line is required on both. exit-terminate on x86 lacked it now and then: the
+            # init thread was the process's LAST thread to exit, whose exit the kernel reports as
+            # EXIT_PROCESS (from that thread) with no EXIT_THREAD of its own -- VM, PROBE_TRACE, 30
+            # runs: 4 such. The session now reports a pending init at EXIT_PROCESS too (XH3 notes).
+            ok = target.returncode == code and rep.get("app_exit") == code and not rep.get("error") and cut
             record(name, ok, f"app_exit={rep.get('app_exit')} target_rc={target.returncode} cut_said={cut} "
                              f"cut_line={cut_line[len('probe: '):][:120]!r} "
                              f"error={(rep.get('error') or '')[:160]}")

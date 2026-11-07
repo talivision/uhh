@@ -2337,6 +2337,17 @@ CI full suite on 9efd83c (run 42388653548): 2109/2109, all shards green (x64 + x
   co_unwound's SEH records, the PUSHF scrub at SP. Left as is: not seen, and the failed
   frame write above did not spend the guard on Server 2022 (whether a cross-process READ of
   a guard page spends it was not measured).
+- ✅ (XH3 side note) **x86 `init-cutoff-exit-terminate-inline` now and then without the
+  "agent init thread ended by the target before it returned" line** (exit code and no error
+  right; the check had stopped requiring the line in a37911d). Cause: with TerminateProcess(self)
+  every thread is killed and the LAST one to exit reports its exit as EXIT_PROCESS_DEBUG_EVENT
+  (dwThreadId = that thread), with no EXIT_THREAD of its own; when that was the stalled init
+  thread, complete_remote_thread never ran. (ExitProcess kills the other threads first and the
+  caller exits last, so exit-process always had the line.) Evidence, VM x86, 30 runs with
+  PROBE_TRACE ("exit-process reported by tid=..."): 26 ended the init thread first (EXIT_THREAD,
+  the usual line), 4 had EXIT_PROCESS reported by the init thread itself. **Fix**: EXIT_PROCESS
+  with an init still pending (not returned) reports the same line ("the process's last thread" /
+  "with the process" when it never ran); the check requires the line again on both.
 - ❌ Tried and rejected: creating UHH's threads with `THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH` (no
   program DllMain/TLS callouts at all). Such threads get no static TLS for the dynamically loaded
   agent: its magic-static guards (`_Init_thread_epoch`) fault -- an attach crashed the target
