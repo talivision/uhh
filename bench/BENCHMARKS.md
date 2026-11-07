@@ -11,6 +11,47 @@ is itself a positive result.
 Reproduce with `bench/bench_matrix.py` (driver) and `bench/frida/*.js` (the four
 Frida methods). Raw per-run numbers in `bench/results/`.
 
+## 2026-11-07 re-run (merge-frida 034b245; full gated_config on branch `perf` 74d62a5)
+
+Same VM (i5-6600, Win10 19045), frida 16.5.9, W=8 x R=50,000 = 400,000 reads, 3 repeats, x64 AND
+x86 (frida 16.5.9 instruments the 32-bit probe_app from its 64-bit host fine). Raw data:
+`bench/results/frida-2026-11-07/`. The 2026-11-04 tables below are kept for history.
+
+**Matrix (bench_matrix.py; UHH rows = gated_config, which LOGS every read; Frida = count mode):**
+
+| method | x64 added ns/read | x64 slowdown | x86 added ns/read | x86 slowdown | hits exact |
+|---|---:|---:|---:|---:|---|
+| baseline | 0 (434 ns/read) | 1.0x | 0 (521 ns/read) | 1.0x | -- |
+| UHH inline | +2,396 | 6.5x | +3,088 | 6.9x | 400,000, 0 dropped |
+| UHH hw | +147,255 | 341x | +269,682 | 518x | 400,000, 0 dropped |
+| UHH breakpoint | +103,641 | 240x | +207,514 | 399x | 400,000, 0 dropped |
+| Frida Interceptor (count, no send) | +7,524 | 18.3x | +10,258 | 20.7x | 400,000 |
+
+Why UHH inline went from +62.5 ns (2026-11-04) to +2,396 ns/read: then, 399,488 of the 400,000
+log records were DROPPED (`log_dropped`); since the "no dropped logs" rule every record is
+delivered (the ring applies backpressure), so the inline row now measures hook + delivering
+400,000 records (~350k records/s through the controller), not the hook alone. The hook alone is
+~0.1 us (`bench/perfab`, hit/inline/empty). CModule / Stalker / hwbp were not re-run (Frida-side,
+unchanged; see below). The hw / breakpoint rows are merge-frida's (before the `perf` fairness
+fix: breakpoint -16..-24% and hw -14..-16% per hit further, single thread: bench/results/main-vs-merge-frida-2026-11-07.md).
+
+**The whole gated_config example in both tools** (`bench/frida/gated_full.py` + `gated_full.js`,
+perf 74d62a5): config ships disabled and is flipped at parse; handle -> pid map at
+NtOpenProcess (forgotten at NtClose); EVERY NtReadVirtualMemory logged as one record (handle,
+pid, address, size) delivered to the host (Frida batches 4,096 records per send()). Ground truth:
+probe_app's own `opened` lines.
+
+| tool | arch | read window (in-target) | ns/read | wall (start -> last record) | records | wrong pid | no pid |
+|---|---|---:|---:|---:|---|---|---|
+| UHH (flag: breakpoint, reads: inline) | x64 | 1,031 ms | 2,578 | 1.63 s | 400,000 x3 | 0 | 0 |
+| Frida Interceptor | x64 | 4,909 ms | 12,273 | 5.43 s | 400,000 x3 | 0 | 0 |
+| UHH | x86 | 1,322 ms | 3,305 | 2.18 s | 400,000 x3 | 0 | 0 |
+| Frida Interceptor | x86 | 5,696 ms | 14,240 | 6.42 s | 400,000 x3 | 0 | 0 |
+
+Both are exact (every read logged once with the right pid); UHH is 4.3-4.8x faster on the full
+example. (Frida 16.5.9 has no `Process.attachModuleObserver`: gated_full.js hooks ParseConfig
+after LdrLoadDll there.)
+
 ## TL;DR
 
 - **UHH completes the exact 8-thread × 50,000-read workload on all three backends

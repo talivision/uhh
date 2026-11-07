@@ -1778,9 +1778,17 @@ the report (count, valid JSON per line, CRC multiset of the lines, `seq` coverag
   hit rate even when nothing is starved) plus ~5 us/hit of ctx_watch_begin; inline +27 ns x64 / +111 ns x86
   per empty hit (per-hit accounting, not yet pinned to one change); x86 send_log +58%; bp/hw attach
   45 -> ~200 ms (agent on every attach), fixed by agentscope (45 ms).
-  - ⬜ Fairness back-off (4ac7ef6 on `perf`, rounds 20 -> 80 ms while no non-yielding thread runs): unbuilt, unmeasured;
-    needs hitcost A/B + hunt-starve/detach on both arches
-  - ⬜ Root-cause inline (x86 especially) and x86 send_log per-hit growth; ctx_watch_begin's Suspend/Resume pair per event
+  - 🔧 Phase 2 on `perf` (74d62a5; results file "Phase 2"): demand-driven fairness (rounds 20 ms while another
+    thread is runnable / ran / sleeps in the quiet time, else up to 80 ms), per-thread inline hit blocks (agent
+    protocol v25, no LOCK per hit), TLS-cached thread slot, stack fast path, ctx_watch on the event's handle.
+    Regress (hunt, detach, crash_logs, logs, cxlib, cx2, lifecycle, ret_probe, transparency) x64 262/262, x86 259/259.
+    Per hit vs main: breakpoint -38..-43%; hw / hw-watch +23..+48% (was +50..+77%); inline x64 +15% (was +33%);
+    inline x86 +75% (was +108%: the rest is the x87 save, 116 ns with it off vs main 103); x86 send_log +58% open
+  - ⬜ hw within ~5% of main: per-round cost (shorter probe rounds once no demand), cheaper quiet-time probe;
+    a timed wait starves exactly like a Sleep but cannot be seen (why the back-off stops at 80 ms)
+  - ⬜ x86 send_log +1.2 us per log (profile: not the stack VirtualQuery alone); x86 x87 save (~70 ns) -- cheaper form?
+  - ✅ UHH vs Frida re-run 2026-11-07 x64 + x86 (bench/BENCHMARKS.md): matrix + the full gated_config in both tools
+    (both exact; UHH 4.3-4.8x faster); inline matrix row now includes delivering every log (no drops)
 
 ## Real-world cases
 - ✅ Microsoft Detours samples replicated (`examples/famous/detours_*`: simple, traceapi, withdll/attach, retval) -- findings above

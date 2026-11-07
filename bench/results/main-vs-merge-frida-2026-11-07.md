@@ -311,3 +311,203 @@ timer tick (266 = 17, 314 = 20 ticks): detach is dominated by waits, not work.
 | attach/breakpoint/idle | detach_ms (ms) | 266 (0%) | 329 (10%) | +23.7% **REGRESSION** | 3/3 |
 | attach/breakpoint/busy | attach_ms (ms) | 46.0 (3%) | 340 (130%) | +638.8% **REGRESSION** | 3/3 |
 | attach/breakpoint/busy | detach_ms (ms) | 266 (0%) | 327 (11%) | +22.8% **REGRESSION** | 3/3 |
+
+## Phase 2 (2026-11-07, branch `perf`): the two regressions fixed -- before/after
+
+Commits on `perf` (on merge-frida 034b245): 5d0a573, 91d7df7, 67161f7, 74d62a5 (+ harness
+e1b99e2, ea1f395, 22d7deb). Agentscope is not on merge-frida yet, so it is not in `perf`:
+attach/detach below are unchanged by phase 2 (agentscope's own numbers are in the first table).
+
+**Fairness yields (breakpoint / hw / hw watch).** Cause, measured: the A5 yield rounds (every
+20 ms each hot thread sleeps ~4 ms) -- with a lone hot thread they buy nothing and cost ~30% of
+the hit rate. Now demand-driven: a round is also a probe -- in its quiet time (no event pending)
+the controller reads the target's thread states (NtQuerySystemInformation) and keeps 20 ms
+rounds only while another thread is runnable (two idle ticks in a row), ran in between (not a
+pool worker re-waiting on its queue), or sits in a Sleep (its timeout elapses only while the
+process is not frozen: hunt-starve's main); otherwise the period doubles, to 80 ms. Findings on
+the way (bench/perfab/threadstates.py): during the freeze of a debug event every thread reads
+Waiting/Suspended and thread-pool workers gain cycles from each freeze and thaw, so states are
+read only in the quiet time; a thread blocked with a TIMEOUT starves too (its timeout elapses
+only while the process runs) and cannot be told from one blocked for good -- hence the 80 ms
+cap (with 320 ms hunt-starve failed: main slept 300 ms for 3-11 s). Also: ctx_watch_begin reads
+the suspend count through the debug event's own thread handle (no OpenThread/CloseHandle per
+event). A spinner thread that never hits (hitcost_target --spin) keeps its CPU: ~500 spins/us
+on perf and merge-frida vs 33-47 on main.
+
+**Inline per-hit accounting.** Agent protocol v25: a thread owns a per-thread hit block in the
+shared section and is its only writer (plain stores; 64-bit fields as one MOVQ on x86); the
+controller alone writes the block's `retired`, named by the carried record. Same exact
+accounting (hits == logs + dropped + unaccounted at any kill instant; running counts for
+detach; the runfix1 log carry). The thread slot is cached in implicit TLS (a TlsAlloc slot
+would write the TEB: regress transparency-* caught it); range_ok trusts the thread's own stack
+above its frame (x86 get_func_arg read the stack arguments through a VirtualQuery every hit);
+HitScope no longer zero-filled; 1 KiB XSAVE area when it fits. Remaining x86 gap: the x87
+state save the transparency work added on x86 (every hit; main did not keep x87 -- see the
+UHH_BENCH_XSTATE=none row).
+
+**Regression families** (`hunt,check_detach,crash_logs,logs,cxlib,cx2,lifecycle,ret_probe,
+transparency`) on 74d62a5, VM: **x64 262/262 ok, x86 259/259 ok** (hunt-starve late_reads
+4-5k, bar 20000). Full CI pushed (branch `perf`).
+
+### Before / after (median per hit, 3 interleaved rounds, same VM, main / merge-frida / perf)
+
+| probe type | arch | thr | callback | main | merge-frida | **perf** | perf vs main | perf vs mf |
+|---|---|---|---|---:|---:|---:|---|---|
+| inline | x64 | 1 | empty | 83 ns | 110 ns | **96 ns** | +15% | -13% |
+| inline | x64 | 1 | send_log | 1.48 us | 1.48 us | **1.29 us** | ~ (noisy) | ~ |
+| hw (execute) | x64 | 1 | empty | 100 us | 163 us | **141 us** | +41% | -14% |
+| hw data watch | x64 | 1 | empty | 100 us | 159 us | **137 us** | +37% | -14% |
+| breakpoint | x64 | 1 | empty | 148 us | 110 us | **84 us** | **-43%** | -24% |
+| hw / watch / bp | x64 | 4 | empty | 330 / 321 / 497 us | 561 / 541 / 393 us | **449 / 414 / 308 us** | +36% / +29% / **-38%** | -20% / -24% / -22% |
+| inline | x86 | 1 | empty | 103 ns | 215 ns | **181 ns** (116 ns with the x87/xstate save off) | +75% | -16% |
+| inline | x86 | 1 | send_log | 2.14 us | 3.23 us | **3.40 us** | +58% | ~ |
+| hw (execute) | x86 | 1 | empty | 156 us | 238 us | **201 us** | +29% | -16% |
+| hw data watch | x86 | 1 | empty | 154 us | 234 us | **197 us** | +28% | -16% |
+| breakpoint | x86 | 1 | empty | 247 us | 179 us | **150 us** | **-39%** | -16% |
+| hw / watch / bp | x86 | 4 | empty | 573 / 583 / 929 us | 893 / 873 / 690 us | **748 / 715 / 555 us** | +30% / +23% / **-40%** | -16% / -18% / -20% |
+| spinner beside one hot hw thread (spins/us) | x64 / x86 | | | 47 / 29 | 541 / 363 | 492 / 353 | fairness kept | |
+
+x86 inline with `UHH_BENCH_XSTATE=none` (benchmark knob: no x87/AVX save): 116 ns vs 184 ns
+default (5 runs each) -- the accounting part of the x86 gap is closed (116 vs main's 103); the
+remaining ~70 ns is the x87 state save the transparency work added on x86 (main did not keep a
+mid-function site's live x87 stack / status word: a correctness fix, kept).
+
+**Bars not met (honest):** hw / hw-watch per hit are still +23..+48% over main (bar: ~5%);
+inline x86 +75% (x87 save) and x86 send_log +58% (not root-caused; the stack fast path did not
+move it); inline x64 +15% (bar: a few ns). What remains on hw: with the period capped at 80 ms a
+lone hot thread still pays a ~4 ms round per 84 ms plus the quiet-time probes, and the verdicts
+are noisy (rounds whose quiet ticks see a thread mid-thaw keep 20 ms). Scratch measurements on
+the way: hw ~106-113 us/hit (x64, +6..13%) with rounds off or backed off to 320 ms -- but 320 ms
+starved timed waits (hunt-starve). Next steps: per-round cost (the 4 ms sleep could shrink once a
+round finds no demand), a cheaper quiet-time probe, and the x86 send_log profile.
+
+Attach/detach: unchanged by phase 2 (perf = merge-frida there: bp/hw attach ~100-230 ms); the
+agentscope branch alone fixes it (45 ms, = main; first table).
+
+### Full tables (phase 2 final run)
+
+### x64 (final: main / merge-frida 034b245 / perf 74d62a5, 3 interleaved rounds)
+
+| case | metric | main median (spread) | mf median (spread) | perf median (spread) | mf vs main | perf vs main | rounds |
+|---|---|---:|---:|---:|---|---|---|
+| hit/base/empty/t1 | ns_per_call (ns/call) | 2.49 (1%) | 2.49 (5%) | 2.50 (2%) | +0.0% ~ | +0.4% ~ | 3/3/3 |
+| hit/base/empty/t1 | hits_per_s (hits/s) | 401,606,426 (1%) | 401,606,426 (5%) | 400,000,000 (2%) | +0.0% ~ | -0.4% ~ | 3/3/3 |
+| hit/inline/empty/t1 | ns_per_call (ns/call) | 83.3 (2%) | 110 (6%) | 95.5 (9%) | +31.7% **REGRESSION** | +14.6% **REGRESSION** | 3/3/3 |
+| hit/inline/empty/t1 | hits_per_s (hits/s) | 12,009,127 (2%) | 9,121,591 (6%) | 10,475,592 (10%) | -24.0% **REGRESSION** | -12.8% **REGRESSION** | 3/3/3 |
+| hit/inline/send_log/t1 | ns_per_call (ns/call) | 1,476 (19%) | 1,483 (28%) | 1,286 (37%) | +0.5% ~ | -12.9% ~ | 3/3/3 |
+| hit/inline/send_log/t1 | hits_per_s (hits/s) | 677,727 (23%) | 674,482 (27%) | 777,708 (28%) | -0.5% ~ | +14.8% ~ | 3/3/3 |
+| hit/hw/empty/t1 | ns_per_call (ns/call) | 99,883 (3%) | 163,258 (10%) | 141,206 (3%) | +63.4% **REGRESSION** | +41.4% **REGRESSION** | 3/3/3 |
+| hit/hw/empty/t1 | hits_per_s (hits/s) | 10,012 (3%) | 6,125 (9%) | 7,082 (3%) | -38.8% **REGRESSION** | -29.3% **REGRESSION** | 3/3/3 |
+| hit/hw/send_log/t1 | ns_per_call (ns/call) | 98,627 (3%) | 162,619 (3%) | 146,249 (9%) | +64.9% **REGRESSION** | +48.3% **REGRESSION** | 3/3/3 |
+| hit/hw/send_log/t1 | hits_per_s (hits/s) | 10,139 (3%) | 6,149 (3%) | 6,838 (10%) | -39.4% **REGRESSION** | -32.6% **REGRESSION** | 3/3/3 |
+| hit/watch/empty/t1 | ns_per_call (ns/call) | 99,591 (3%) | 158,977 (3%) | 136,830 (7%) | +59.6% **REGRESSION** | +37.4% **REGRESSION** | 3/3/3 |
+| hit/watch/empty/t1 | hits_per_s (hits/s) | 10,041 (3%) | 6,290 (3%) | 7,308 (7%) | -37.4% **REGRESSION** | -27.2% **REGRESSION** | 3/3/3 |
+| hit/watch/send_log/t1 | ns_per_call (ns/call) | 100,023 (6%) | 159,343 (6%) | 131,267 (6%) | +59.3% **REGRESSION** | +31.2% **REGRESSION** | 3/3/3 |
+| hit/watch/send_log/t1 | hits_per_s (hits/s) | 9,998 (6%) | 6,276 (6%) | 7,618 (6%) | -37.2% **REGRESSION** | -23.8% **REGRESSION** | 3/3/3 |
+| hit/breakpoint/empty/t1 | ns_per_call (ns/call) | 147,866 (1%) | 110,267 (6%) | 83,798 (9%) | -25.4% **gain** | -43.3% **gain** | 3/3/3 |
+| hit/breakpoint/empty/t1 | hits_per_s (hits/s) | 6,763 (1%) | 9,069 (6%) | 11,933 (8%) | +34.1% **gain** | +76.5% **gain** | 3/3/3 |
+| hit/breakpoint/send_log/t1 | ns_per_call (ns/call) | 153,366 (6%) | 118,084 (9%) | 95,190 (5%) | -23.0% **gain** | -37.9% **gain** | 3/3/3 |
+| hit/breakpoint/send_log/t1 | hits_per_s (hits/s) | 6,520 (6%) | 8,469 (8%) | 10,505 (5%) | +29.9% **gain** | +61.1% **gain** | 3/3/3 |
+| hit/base/empty/t4 | ns_per_call (ns/call) | 34.3 (4%) | 37.0 (8%) | 37.0 (8%) | +7.9% **REGRESSION** | +7.8% **REGRESSION** | 3/3/3 |
+| hit/base/empty/t4 | hits_per_s (hits/s) | 116,720,163 (4%) | 108,137,334 (8%) | 108,225,108 (8%) | -7.4% **REGRESSION** | -7.3% **REGRESSION** | 3/3/3 |
+| hit/inline/empty/t4 | ns_per_call (ns/call) | 167 (28%) | 207 (23%) | 146 (44%) | +24.0% ~ | -12.9% ~ | 3/3/3 |
+| hit/inline/empty/t4 | hits_per_s (hits/s) | 23,913,433 (38%) | 19,280,825 (29%) | 27,451,788 (32%) | -19.4% ~ | +14.8% ~ | 3/3/3 |
+| hit/inline/send_log/t4 | ns_per_call (ns/call) | 6,744 (12%) | 7,665 (11%) | 8,044 (4%) | +13.6% **REGRESSION** | +19.3% **REGRESSION** | 3/3/3 |
+| hit/inline/send_log/t4 | hits_per_s (hits/s) | 593,093 (11%) | 521,876 (10%) | 497,259 (4%) | -12.0% **REGRESSION** | -16.2% **REGRESSION** | 3/3/3 |
+| hit/hw/empty/t4 | ns_per_call (ns/call) | 329,806 (4%) | 561,284 (4%) | 449,383 (11%) | +70.2% **REGRESSION** | +36.3% **REGRESSION** | 3/3/3 |
+| hit/hw/empty/t4 | hits_per_s (hits/s) | 12,128 (4%) | 7,127 (4%) | 8,901 (11%) | -41.2% **REGRESSION** | -26.6% **REGRESSION** | 3/3/3 |
+| hit/hw/send_log/t4 | ns_per_call (ns/call) | 320,225 (6%) | 557,316 (2%) | 446,986 (6%) | +74.0% **REGRESSION** | +39.6% **REGRESSION** | 3/3/3 |
+| hit/hw/send_log/t4 | hits_per_s (hits/s) | 12,491 (5%) | 7,177 (2%) | 8,949 (6%) | -42.5% **REGRESSION** | -28.4% **REGRESSION** | 3/3/3 |
+| hit/watch/empty/t4 | ns_per_call (ns/call) | 321,221 (3%) | 540,894 (2%) | 413,505 (5%) | +68.4% **REGRESSION** | +28.7% **REGRESSION** | 3/3/3 |
+| hit/watch/empty/t4 | hits_per_s (hits/s) | 12,452 (3%) | 7,395 (2%) | 9,673 (5%) | -40.6% **REGRESSION** | -22.3% **REGRESSION** | 3/3/3 |
+| hit/watch/send_log/t4 | ns_per_call (ns/call) | 317,677 (5%) | 537,317 (4%) | 435,234 (6%) | +69.1% **REGRESSION** | +37.0% **REGRESSION** | 3/3/3 |
+| hit/watch/send_log/t4 | hits_per_s (hits/s) | 12,591 (4%) | 7,444 (4%) | 9,190 (6%) | -40.9% **REGRESSION** | -27.0% **REGRESSION** | 3/3/3 |
+| hit/breakpoint/empty/t4 | ns_per_call (ns/call) | 496,603 (1%) | 393,208 (1%) | 308,347 (8%) | -20.8% **gain** | -37.9% **gain** | 3/3/3 |
+| hit/breakpoint/empty/t4 | hits_per_s (hits/s) | 8,055 (1%) | 10,173 (1%) | 12,972 (8%) | +26.3% **gain** | +61.1% **gain** | 3/3/3 |
+| hit/breakpoint/send_log/t4 | ns_per_call (ns/call) | 512,691 (2%) | 415,396 (2%) | 323,450 (2%) | -19.0% **gain** | -36.9% **gain** | 3/3/3 |
+| hit/breakpoint/send_log/t4 | hits_per_s (hits/s) | 7,802 (2%) | 9,629 (2%) | 12,367 (2%) | +23.4% **gain** | +58.5% **gain** | 3/3/3 |
+| spin/base/t1 | ns_per_call (ns/call) | 7.04 (9%) | 7.51 (59%) | 6.77 (23%) | +6.7% ~ | -3.8% ~ | 3/3/3 |
+| spin/base/t1 | spin_per_us (spins/us) | 235 (56%) | 237 (64%) | 227 (64%) | +0.9% ~ | -3.6% ~ | 3/3/3 |
+| spin/inline/t1 | ns_per_call (ns/call) | 102 (9%) | 135 (4%) | 113 (3%) | +32.9% **REGRESSION** | +11.5% **REGRESSION** | 3/3/3 |
+| spin/inline/t1 | spin_per_us (spins/us) | 1,114 (9%) | 1,241 (1%) | 1,188 (8%) | +11.4% **gain** | +6.7% ~ | 3/3/3 |
+| spin/hw/t1 | ns_per_call (ns/call) | 100,833 (5%) | 169,743 (4%) | 162,659 (1%) | +68.3% **REGRESSION** | +61.3% **REGRESSION** | 3/3/3 |
+| spin/hw/t1 | spin_per_us (spins/us) | 46.7 (12%) | 541 (7%) | 492 (11%) | +1059.8% **gain** | +954.5% **gain** | 3/3/3 |
+| spin/watch/t1 | ns_per_call (ns/call) | 100,301 (4%) | 158,549 (3%) | 166,050 (7%) | +58.1% **REGRESSION** | +65.6% **REGRESSION** | 3/3/3 |
+| spin/watch/t1 | spin_per_us (spins/us) | 40.0 (8%) | 523 (7%) | 525 (10%) | +1208.4% **gain** | +1213.0% **gain** | 3/3/3 |
+| spin/breakpoint/t1 | ns_per_call (ns/call) | 150,081 (9%) | 117,131 (8%) | 114,092 (6%) | -22.0% **gain** | -24.0% **gain** | 3/3/3 |
+| spin/breakpoint/t1 | spin_per_us (spins/us) | 33.3 (109%) | 539 (7%) | 538 (2%) | +1516.0% **gain** | +1512.5% **gain** | 3/3/3 |
+| attach/inline/idle | attach_ms (ms) | 180 (23%) | 209 (21%) | 110 (103%) | +16.4% ~ | -38.9% ~ | 3/3/3 |
+| attach/inline/idle | detach_ms (ms) | 345 (0%) | 314 (10%) | 314 (10%) | -9.1% ~ | -9.1% ~ | 3/3/3 |
+| attach/inline/busy | attach_ms (ms) | 200 (47%) | 222 (56%) | 112 (107%) | +10.8% ~ | -44.0% ~ | 3/3/3 |
+| attach/inline/busy | detach_ms (ms) | 329 (10%) | 329 (14%) | 314 (5%) | +0.0% ~ | -4.7% ~ | 3/3/3 |
+| attach/hw/idle | attach_ms (ms) | 45.5 (3%) | 223 (86%) | 203 (47%) | +390.9% **REGRESSION** | +345.2% **REGRESSION** | 3/3/3 |
+| attach/hw/idle | detach_ms (ms) | 266 (0%) | 329 (10%) | 314 (0%) | +23.8% **REGRESSION** | +17.9% **REGRESSION** | 3/3/3 |
+| attach/hw/busy | attach_ms (ms) | 46.6 (7%) | 240 (57%) | 107 (101%) | +415.3% **REGRESSION** | +130.6% **REGRESSION** | 3/3/3 |
+| attach/hw/busy | detach_ms (ms) | 266 (0%) | 295 (17%) | 300 (2%) | +10.9% ~ | +12.8% **REGRESSION** | 3/3/3 |
+| attach/breakpoint/idle | attach_ms (ms) | 45.4 (1%) | 213 (39%) | 195 (83%) | +370.2% **REGRESSION** | +330.0% **REGRESSION** | 3/3/3 |
+| attach/breakpoint/idle | detach_ms (ms) | 266 (12%) | 345 (9%) | 314 (10%) | +29.6% **REGRESSION** | +17.9% **REGRESSION** | 3/3/3 |
+| attach/breakpoint/busy | attach_ms (ms) | 46.2 (80%) | 137 (70%) | 208 (32%) | +195.8% **REGRESSION** | +350.5% **REGRESSION** | 3/3/3 |
+| attach/breakpoint/busy | detach_ms (ms) | 266 (0%) | 314 (4%) | 322 (11%) | +17.9% **REGRESSION** | +21.1% **REGRESSION** | 3/3/3 |
+
+### x86 (final: main / merge-frida 034b245 / perf 74d62a5, 3 interleaved rounds)
+
+| case | metric | main median (spread) | mf median (spread) | perf median (spread) | mf vs main | perf vs main | rounds |
+|---|---|---:|---:|---:|---|---|---|
+| hit/base/empty/t1 | ns_per_call (ns/call) | 2.51 (2%) | 2.54 (2%) | 2.51 (1%) | +1.2% ~ | +0.0% ~ | 3/3/3 |
+| hit/base/empty/t1 | hits_per_s (hits/s) | 398,406,375 (2%) | 393,700,787 (2%) | 398,406,375 (1%) | -1.2% ~ | +0.0% ~ | 3/3/3 |
+| hit/inline/empty/t1 | ns_per_call (ns/call) | 103 (9%) | 215 (5%) | 181 (5%) | +107.5% **REGRESSION** | +75.4% **REGRESSION** | 3/3/3 |
+| hit/inline/empty/t1 | hits_per_s (hits/s) | 9,671,180 (10%) | 4,661,353 (5%) | 5,512,375 (4%) | -51.8% **REGRESSION** | -43.0% **REGRESSION** | 3/3/3 |
+| hit/inline/send_log/t1 | ns_per_call (ns/call) | 2,142 (2%) | 3,230 (15%) | 3,396 (9%) | +50.8% **REGRESSION** | +58.5% **REGRESSION** | 3/3/3 |
+| hit/inline/send_log/t1 | hits_per_s (hits/s) | 466,856 (2%) | 309,575 (14%) | 294,488 (9%) | -33.7% **REGRESSION** | -36.9% **REGRESSION** | 3/3/3 |
+| hit/hw/empty/t1 | ns_per_call (ns/call) | 155,671 (2%) | 237,924 (1%) | 200,998 (6%) | +52.8% **REGRESSION** | +29.1% **REGRESSION** | 3/3/3 |
+| hit/hw/empty/t1 | hits_per_s (hits/s) | 6,424 (2%) | 4,203 (1%) | 4,975 (6%) | -34.6% **REGRESSION** | -22.6% **REGRESSION** | 3/3/3 |
+| hit/hw/send_log/t1 | ns_per_call (ns/call) | 164,124 (0%) | 251,195 (3%) | 212,235 (3%) | +53.1% **REGRESSION** | +29.3% **REGRESSION** | 3/3/3 |
+| hit/hw/send_log/t1 | hits_per_s (hits/s) | 6,093 (0%) | 3,981 (3%) | 4,712 (3%) | -34.7% **REGRESSION** | -22.7% **REGRESSION** | 3/3/3 |
+| hit/watch/empty/t1 | ns_per_call (ns/call) | 154,019 (2%) | 233,982 (1%) | 196,614 (4%) | +51.9% **REGRESSION** | +27.7% **REGRESSION** | 3/3/3 |
+| hit/watch/empty/t1 | hits_per_s (hits/s) | 6,493 (2%) | 4,274 (1%) | 5,086 (4%) | -34.2% **REGRESSION** | -21.7% **REGRESSION** | 3/3/3 |
+| hit/watch/send_log/t1 | ns_per_call (ns/call) | 165,059 (2%) | 249,513 (1%) | 203,072 (10%) | +51.2% **REGRESSION** | +23.0% **REGRESSION** | 3/3/3 |
+| hit/watch/send_log/t1 | hits_per_s (hits/s) | 6,058 (2%) | 4,008 (1%) | 4,924 (10%) | -33.8% **REGRESSION** | -18.7% **REGRESSION** | 3/3/3 |
+| hit/breakpoint/empty/t1 | ns_per_call (ns/call) | 247,233 (4%) | 178,987 (1%) | 149,875 (9%) | -27.6% **gain** | -39.4% **gain** | 3/3/3 |
+| hit/breakpoint/empty/t1 | hits_per_s (hits/s) | 4,045 (4%) | 5,587 (1%) | 6,672 (9%) | +38.1% **gain** | +65.0% **gain** | 3/3/3 |
+| hit/breakpoint/send_log/t1 | ns_per_call (ns/call) | 257,662 (3%) | 193,460 (4%) | 156,932 (3%) | -24.9% **gain** | -39.1% **gain** | 3/3/3 |
+| hit/breakpoint/send_log/t1 | hits_per_s (hits/s) | 3,881 (3%) | 5,169 (4%) | 6,372 (3%) | +33.2% **gain** | +64.2% **gain** | 3/3/3 |
+| hit/base/empty/t4 | ns_per_call (ns/call) | 60.5 (12%) | 55.2 (14%) | 57.4 (9%) | -8.9% ~ | -5.2% ~ | 3/3/3 |
+| hit/base/empty/t4 | hits_per_s (hits/s) | 66,072,019 (12%) | 72,503,172 (13%) | 69,686,411 (9%) | +9.7% ~ | +5.5% ~ | 3/3/3 |
+| hit/inline/empty/t4 | ns_per_call (ns/call) | 156 (43%) | 251 (5%) | 221 (2%) | +60.7% **REGRESSION** | +41.0% **REGRESSION** | 3/3/3 |
+| hit/inline/empty/t4 | hits_per_s (hits/s) | 25,572,177 (34%) | 15,914,064 (5%) | 18,132,366 (2%) | -37.8% **REGRESSION** | -29.1% **REGRESSION** | 3/3/3 |
+| hit/inline/send_log/t4 | ns_per_call (ns/call) | 9,086 (5%) | 11,475 (6%) | 11,298 (3%) | +26.3% **REGRESSION** | +24.3% **REGRESSION** | 3/3/3 |
+| hit/inline/send_log/t4 | hits_per_s (hits/s) | 440,228 (6%) | 348,571 (6%) | 354,061 (3%) | -20.8% **REGRESSION** | -19.6% **REGRESSION** | 3/3/3 |
+| hit/hw/empty/t4 | ns_per_call (ns/call) | 573,489 (1%) | 893,439 (3%) | 748,095 (5%) | +55.8% **REGRESSION** | +30.4% **REGRESSION** | 3/3/3 |
+| hit/hw/empty/t4 | hits_per_s (hits/s) | 6,975 (1%) | 4,477 (3%) | 5,347 (5%) | -35.8% **REGRESSION** | -23.3% **REGRESSION** | 3/3/3 |
+| hit/hw/send_log/t4 | ns_per_call (ns/call) | 619,639 (1%) | 947,662 (2%) | 769,576 (1%) | +52.9% **REGRESSION** | +24.2% **REGRESSION** | 3/3/3 |
+| hit/hw/send_log/t4 | hits_per_s (hits/s) | 6,455 (1%) | 4,221 (2%) | 5,198 (1%) | -34.6% **REGRESSION** | -19.5% **REGRESSION** | 3/3/3 |
+| hit/watch/empty/t4 | ns_per_call (ns/call) | 582,937 (2%) | 873,052 (2%) | 715,261 (5%) | +49.8% **REGRESSION** | +22.7% **REGRESSION** | 3/3/3 |
+| hit/watch/empty/t4 | hits_per_s (hits/s) | 6,862 (2%) | 4,582 (2%) | 5,592 (5%) | -33.2% **REGRESSION** | -18.5% **REGRESSION** | 3/3/3 |
+| hit/watch/send_log/t4 | ns_per_call (ns/call) | 623,293 (0%) | 947,956 (0%) | 775,650 (3%) | +52.1% **REGRESSION** | +24.4% **REGRESSION** | 3/3/3 |
+| hit/watch/send_log/t4 | hits_per_s (hits/s) | 6,418 (0%) | 4,220 (0%) | 5,157 (3%) | -34.2% **REGRESSION** | -19.6% **REGRESSION** | 3/3/3 |
+| hit/breakpoint/empty/t4 | ns_per_call (ns/call) | 928,957 (8%) | 690,260 (1%) | 555,257 (5%) | -25.7% **gain** | -40.2% **gain** | 3/3/3 |
+| hit/breakpoint/empty/t4 | hits_per_s (hits/s) | 4,306 (8%) | 5,795 (1%) | 7,204 (5%) | +34.6% **gain** | +67.3% **gain** | 3/3/3 |
+| hit/breakpoint/send_log/t4 | ns_per_call (ns/call) | 970,461 (3%) | 742,797 (3%) | 594,635 (7%) | -23.5% **gain** | -38.7% **gain** | 3/3/3 |
+| hit/breakpoint/send_log/t4 | hits_per_s (hits/s) | 4,122 (3%) | 5,385 (3%) | 6,727 (7%) | +30.6% **gain** | +63.2% **gain** | 3/3/3 |
+| spin/base/t1 | ns_per_call (ns/call) | 14.4 (16%) | 16.1 (17%) | 15.5 (42%) | +12.0% **REGRESSION** | +7.6% ~ | 3/3/3 |
+| spin/base/t1 | spin_per_us (spins/us) | 249 (40%) | 223 (67%) | 228 (2%) | -10.3% ~ | -8.5% ~ | 3/3/3 |
+| spin/inline/t1 | ns_per_call (ns/call) | 116 (7%) | 230 (8%) | 191 (4%) | +98.2% **REGRESSION** | +64.6% **REGRESSION** | 3/3/3 |
+| spin/inline/t1 | spin_per_us (spins/us) | 1,239 (4%) | 1,419 (6%) | 1,454 (3%) | +14.5% **gain** | +17.3% **gain** | 3/3/3 |
+| spin/hw/t1 | ns_per_call (ns/call) | 158,096 (2%) | 237,073 (2%) | 231,879 (1%) | +50.0% **REGRESSION** | +46.7% **REGRESSION** | 3/3/3 |
+| spin/hw/t1 | spin_per_us (spins/us) | 29.2 (25%) | 363 (2%) | 353 (7%) | +1144.1% **gain** | +1107.7% **gain** | 3/3/3 |
+| spin/watch/t1 | ns_per_call (ns/call) | 155,949 (0%) | 232,886 (1%) | 225,898 (1%) | +49.3% **REGRESSION** | +44.9% **REGRESSION** | 3/3/3 |
+| spin/watch/t1 | spin_per_us (spins/us) | 29.1 (5%) | 368 (4%) | 345 (4%) | +1165.0% **gain** | +1084.3% **gain** | 3/3/3 |
+| spin/breakpoint/t1 | ns_per_call (ns/call) | 248,406 (5%) | 181,768 (1%) | 174,958 (3%) | -26.8% **gain** | -29.6% **gain** | 3/3/3 |
+| spin/breakpoint/t1 | spin_per_us (spins/us) | 30.2 (88%) | 425 (4%) | 396 (6%) | +1307.5% **gain** | +1211.9% **gain** | 3/3/3 |
+| attach/inline/idle | attach_ms (ms) | 190 (18%) | 208 (82%) | 195 (47%) | +9.0% ~ | +2.4% ~ | 3/3/3 |
+| attach/inline/idle | detach_ms (ms) | 329 (10%) | 314 (0%) | 314 (5%) | -4.8% ~ | -4.7% ~ | 3/3/3 |
+| attach/inline/busy | attach_ms (ms) | 94.1 (115%) | 113 (82%) | 227 (77%) | +20.5% ~ | +141.0% ~ | 3/3/3 |
+| attach/inline/busy | detach_ms (ms) | 314 (5%) | 314 (5%) | 329 (9%) | +0.0% ~ | +5.0% ~ | 3/3/3 |
+| attach/hw/idle | attach_ms (ms) | 46.9 (2%) | 210 (14%) | 231 (185%) | +347.8% **REGRESSION** | +393.7% **REGRESSION** | 3/3/3 |
+| attach/hw/idle | detach_ms (ms) | 297 (11%) | 314 (0%) | 345 (9%) | +5.5% **REGRESSION** | +16.0% **REGRESSION** | 3/3/3 |
+| attach/hw/busy | attach_ms (ms) | 46.3 (113%) | 142 (78%) | 215 (56%) | +206.3% **REGRESSION** | +364.7% **REGRESSION** | 3/3/3 |
+| attach/hw/busy | detach_ms (ms) | 266 (0%) | 304 (24%) | 274 (19%) | +14.3% ~ | +3.0% ~ | 3/3/3 |
+| attach/breakpoint/idle | attach_ms (ms) | 46.6 (2%) | 198 (61%) | 217 (49%) | +325.2% **REGRESSION** | +365.7% **REGRESSION** | 3/3/3 |
+| attach/breakpoint/idle | detach_ms (ms) | 297 (11%) | 314 (0%) | 314 (0%) | +5.5% **REGRESSION** | +5.6% **REGRESSION** | 3/3/3 |
+| attach/breakpoint/busy | attach_ms (ms) | 47.2 (2%) | 214 (228%) | 116 (91%) | +353.3% **REGRESSION** | +146.6% **REGRESSION** | 3/3/3 |
+| attach/breakpoint/busy | detach_ms (ms) | 266 (0%) | 321 (8%) | 320 (14%) | +20.6% **REGRESSION** | +20.3% **REGRESSION** | 3/3/3 |
