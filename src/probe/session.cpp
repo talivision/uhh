@@ -16,6 +16,7 @@
 #include <map>
 #include <set>
 #include <algorithm>
+#include <charconv>
 #include <vector>
 #include <Zydis/Zydis.h>
 #include "symbols.hpp"   // dbghelp+symsrv loaded dynamically; honours _NT_SYMBOL_PATH
@@ -559,7 +560,7 @@ static bool start_log_output(probe_session *s);
 static bool enqueue_log(probe_session *s, LogRecord &&record);
 static size_t drain_agent_logs(probe_session *s);
 static void deliver_past_stall(probe_session *s);
-static void enqueue_agent_record(probe_session *s, const probe_agent_log &rec);
+static void enqueue_agent_record(probe_session *s, const probe_agent_log &rec, std::vector<LogRecord> *batch = nullptr);
 static void flush_log_writer(probe_session *s, bool up_to_now = false);
 static void stop_log_output(probe_session *s);
 static void forward_finish(probe_session *s);
@@ -616,12 +617,16 @@ static void append_json_string(std::string &out, const std::string &value) {
     out.push_back('"');
 }
 
-static std::string format_log_line(probe_session *s, const LogRecord &r) {
-    char prefix[96];
-    int n = std::snprintf(prefix, sizeof(prefix),
-                          "{\"kind\":\"probe_log\",\"probe\":%u,\"tid\":%u,\"message\":",
-                          r.probe, r.tid);
-    std::string line(prefix, n > 0 ? (size_t)n : 0);
+// Appends the record's JSON line to `line` (the writer's batch): no temporary string and no
+// printf per record -- the x86 (WOW64) controller's per-record formatting showed in profiles of
+// a log-bound inline target (send_log there waits on this pipeline: the ring's backpressure).
+static void append_log_line(std::string &line, probe_session *s, const LogRecord &r) {
+    char num[24];
+    line += "{\"kind\":\"probe_log\",\"probe\":";
+    line.append(num, (size_t)(std::to_chars(num, num + sizeof(num), r.probe).ptr - num));
+    line += ",\"tid\":";
+    line.append(num, (size_t)(std::to_chars(num, num + sizeof(num), r.tid).ptr - num));
+    line += ",\"message\":";
     append_json_string(line, r.text);
     if (r.has_stack) {
         line += ",\"stack\":[";
@@ -632,9 +637,9 @@ static std::string format_log_line(probe_session *s, const LogRecord &r) {
         line.push_back(']');
     }
     // Last, so every consumer matching the line's start keeps working (fields only added).
-    n = std::snprintf(prefix, sizeof(prefix), ",\"seq\":%llu}\n", (unsigned long long)s->log_seq++);
-    line.append(prefix, n > 0 ? (size_t)n : 0);
-    return line;
+    line += ",\"seq\":";
+    line.append(num, (size_t)(std::to_chars(num, num + sizeof(num), (unsigned long long)s->log_seq++).ptr - num));
+    line += "}\n";
 }
 
 static void writer_failed(probe_session *s, const std::string &message, uint64_t unwritten) {
@@ -726,15 +731,26 @@ static void log_writer_main(probe_session *s) {
             std::string batch;
             uint64_t batch_records = 0;
             auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
+            // Records are taken in chunks (one lock and one wake-up per chunk, not per record).
+            // A popped record counts as unwritten until its batch is written, so a writer
+            // failure mid-chunk still accounts for every one of them (writer_failed).
+            std::vector<LogRecord> chunk;
             for (;;) {
-                LogRecord record;
-                {
+                if (chunk.empty()) {
                     std::lock_guard<std::mutex> lock(s->queue_mu);
                     if (s->log_queue.empty()) break;
-                    record = std::move(s->log_queue.front());
-                    s->log_queue.pop_front();
-                    s->queue_writable.notify_one();
+                    const size_t n = std::min<size_t>(s->log_queue.size(), 256);
+                    chunk.reserve(n);
+                    for (size_t k = 0; k < n; ++k) {
+                        if (!s->log_queue.front().sym_unload) ++unwritten;
+                        chunk.push_back(std::move(s->log_queue.front()));
+                        s->log_queue.pop_front();
+                    }
+                    std::reverse(chunk.begin(), chunk.end());           // taken from the back below, in order
+                    s->queue_writable.notify_all();
                 }
+                LogRecord record = std::move(chunk.back());
+                chunk.pop_back();
                 if (record.sym_unload) {
                     // Every record queued before this unload is formatted (symbolized) by now.
                     uhh_sym::unregister_module(s->pi.hProcess, record.sym_unload);
@@ -744,15 +760,17 @@ static void log_writer_main(probe_session *s) {
                     s->queue_flushed.notify_all();
                     continue;
                 }
-                ++unwritten;
-                std::string line = format_log_line(s, record);
-                if (!batch.empty() && batch.size() + line.size() > BATCH_BYTES) {
+                const size_t before = batch.size();
+                append_log_line(batch, s, record);
+                if (before && batch.size() > BATCH_BYTES) {             // over: write what was there first
+                    std::string line = batch.substr(before);
+                    batch.resize(before);
                     if (!write_log_batch(s, batch, batch_records)) return;
                     unwritten -= batch_records;
-                    batch.clear(); batch_records = 0;
+                    batch.swap(line); batch_records = 0;
                     deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
                 }
-                batch += line; ++batch_records;
+                ++batch_records;
                 if (batch.size() >= BATCH_BYTES || std::chrono::steady_clock::now() >= deadline) {
                     if (!write_log_batch(s, batch, batch_records)) return;
                     unwritten -= batch_records;
@@ -1264,6 +1282,36 @@ static bool enqueue_log(probe_session *s, LogRecord &&record) {
     if (warned) warn_console_once(s);
     s->queue_readable.notify_one();
     return true;
+}
+
+// enqueue_log for many records at once (the agent-ring drainer): one queue lock and one writer
+// wake-up per chunk instead of per record -- per record, the wake-up of a writer that had just
+// emptied the queue was most of the controller's cost per inline log (the producers in the target
+// wait on that pipeline: the ring's backpressure). Same backpressure and accounting as enqueue_log;
+// `records` is left empty.
+static void enqueue_logs(probe_session *s, std::vector<LogRecord> &records) {
+    size_t i = 0;
+    while (i < records.size()) {
+        std::unique_lock<std::mutex> lock(s->queue_mu);
+        bool blocked = s->log_queue.size() >= probe_session::LOG_QUEUE_CAP && !s->writer_failed;
+        auto blocked_at = std::chrono::steady_clock::now();
+        s->queue_writable.wait(lock, [s] {
+            return s->log_queue.size() < probe_session::LOG_QUEUE_CAP || s->writer_failed;
+        });
+        if (s->writer_failed) {
+            s->controller_dropped.fetch_add(records.size() - i, std::memory_order_relaxed);
+            break;
+        }
+        bool warned = blocked && std::chrono::steady_clock::now() - blocked_at >= std::chrono::seconds(1);
+        for (; i < records.size() && s->log_queue.size() < probe_session::LOG_QUEUE_CAP; ++i) {
+            try { s->log_queue.push_back(std::move(records[i])); ++s->logs_enqueued; }
+            catch (...) { s->controller_dropped.fetch_add(1, std::memory_order_relaxed); }
+        }
+        lock.unlock();
+        if (warned) warn_console_once(s);
+        s->queue_readable.notify_one();
+    }
+    records.clear();
 }
 
 // up_to_now: wait only for the records queued when the call started, not for an empty queue
@@ -7667,7 +7715,7 @@ static bool complete_remote_thread(probe_session *s, DWORD result) {
 // One ring record (or a PROBE_IPC_LOG copy of one) -> the writer's queue. Never touches
 // s->probes (the debug loop may be growing it); does not hold agent_mu while a full stdout
 // queue applies backpressure.
-static void enqueue_agent_record(probe_session *s, const probe_agent_log &rec) {
+static void enqueue_agent_record(probe_session *s, const probe_agent_log &rec, std::vector<LogRecord> *batch) {
     // A callback's first record carries its hit's unaccounted unit: taken now, the hit is
     // accounted by this record (logs_written, or controller_dropped below), not as interrupted.
     if (s->shared) probe_agent_retire_carry(s->shared, rec);
@@ -7683,7 +7731,8 @@ static void enqueue_agent_record(probe_session *s, const probe_agent_log &rec) {
         }
         uint32_t n = rec.frame_count > PROBE_STACK_MAX_FRAMES ? PROBE_STACK_MAX_FRAMES : rec.frame_count;
         r.frames.assign(rec.frames, rec.frames + n);
-        enqueue_log(s, std::move(r));
+        if (batch) batch->push_back(std::move(r));      // the caller enqueues the batch (enqueue_logs)
+        else enqueue_log(s, std::move(r));
     } catch (...) {
         s->controller_dropped.fetch_add(1, std::memory_order_relaxed);   // out of memory: count it, keep going
     }
@@ -7702,6 +7751,9 @@ static size_t drain_agent_logs(probe_session *s) {
     size_t moved = 0;
     std::lock_guard<std::mutex> consume(s->drain_mu);
     const LONG64 stop = sh->log_head;
+    // Records go to the writer in chunks (enqueue_logs), each before drain_mu is released: a
+    // flush that drains first (report, unload, detach) still finds every record queued.
+    std::vector<LogRecord> batch;
     for (;;) {
         LONG64 tail = sh->log_tail;
         if (tail >= stop) break;
@@ -7709,13 +7761,15 @@ static size_t drain_agent_logs(probe_session *s) {
         LONG64 seq = rec.seq;
         if (seq != tail + 1 && seq != -(tail + 1)) break;
         MemoryBarrier();
-        if (seq == tail + 1) enqueue_agent_record(s, rec);    // -(tail + 1): delivered past a stall already
+        if (seq == tail + 1) enqueue_agent_record(s, rec, &batch);    // -(tail + 1): delivered past a stall already
         rec.owner = 0;
         MemoryBarrier();
         InterlockedExchange64(&rec.seq, tail + PROBE_AGENT_LOG_CAP);    // slot free again
         sh->log_tail = tail + 1;
         ++moved;
+        if (batch.size() >= 256) enqueue_logs(s, batch);
     }
+    enqueue_logs(s, batch);
     return moved;
 }
 
