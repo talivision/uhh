@@ -603,6 +603,9 @@ static void append_json_string(std::string &out, const std::string &value) {
     out.push_back('"');
     const auto *p = reinterpret_cast<const unsigned char *>(value.data());
     for (size_t i = 0, n = value.size(); i < n; ) {
+        size_t run = i;                                  // printable ASCII needing no escape: one append
+        while (run < n && p[run] >= 0x20 && p[run] < 0x80 && p[run] != '"' && p[run] != '\\') ++run;
+        if (run > i) { out.append(value, i, run - i); i = run; continue; }
         unsigned char ch = p[i];
         if (ch == '"' || ch == '\\') { out.push_back('\\'); out.push_back((char)ch); ++i; continue; }
         if (ch >= 0x20 && ch < 0x80) { out.push_back((char)ch); ++i; continue; }
