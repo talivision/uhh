@@ -2269,6 +2269,54 @@ Each claim was checked with a regress check that FAILED on 0fb6cee (same tests, 
 
 CI full suite on 9efd83c (run 42388653548): 2109/2109, all shards green (x64 + x86, windows-2022, and cet-hw).
 
+## Codex review 4 findings (2026-11-08, read-only Codex review of 0fb6cee..a37911d -- the session-file appender; branch `appfix`, regress `stream-filefail-*`)
+
+Three high-confidence claims, all in the FAILURE paths of `log_filer_main` (codex3 #5). All three real; each forced by a
+`stream-filefail-*` check that FAILED on a37911d (same tests, test hooks added: commit 8e33247) before the fix (310daab).
+New test hooks (probe_api_testhooks only): `UHH_TEST_FILE_FAIL_AT=n` (the n-th session-file append fails, ERROR_DISK_FULL),
+`UHH_TEST_FILE_THROW_AT=n` + `UHH_TEST_FILE_THROW_IN=spare|append` (the appender throws std::bad_alloc at its n-th chunk);
+`stdout_target deferred` (an unfinished line, 5 probed calls, then the rest of the line).
+
+Semantics kept from 0fb6cee (the synchronous file write): a failed file write is an error (stderr + report "error", same
+`write probe log file (Win32=N)` text) and stops the writer; **logs_written counts the records IN THE FILE** -- at 0fb6cee
+too a batch whose file write failed went to log_dropped although stdout had it -- so the file holds exactly seq
+0..logs_written-1 (no gap: the file stops at the first failed append), every later record is in log_dropped, and
+hits == logs_written + log_dropped + callbacks_interrupted still holds. stdout_logs tells stdout apart: stdout holds seq
+0..stdout_logs-1, so stdout_logs - logs_written records reached stdout but not the file (the one case where stdout_logs >
+logs_written). The error now says so: `write probe log file (Win32=112); the session log file is incomplete: it holds
+records seq 0..6 (logs_written); every later record is counted in log_dropped, those that reached stdout too
+(stdout_logs - logs_written of them)`.
+
+1. **Hang after a failed append of deferred records (session.cpp flush_log_writer) -- real, fixed.** Records deferred behind
+   an unfinished target line wait in the file for its newline; their append failed, log_bytes_written never reached
+   log_bytes_produced, and the tail wait checked neither the file failure nor the writer error. `stream-filefail-deferred-<bk>`
+   (first append fails): a37911d `controller HUNG (killed); no probe_report` (both backends, 60 s). Fix: a failure marks the
+   file broken (`file_broken`, under tail_mu, set before the appender clears file_busy); the tail wait then ends at
+   log_bytes_written. After: `file=0=logs_written stdout=0=stdout_logs hits=5=written+dropped(5)`, the target's bytes exact.
+2. **Records counted written that the file lacks (log_filer_main) -- real, fixed.** A failed append discarded that chunk and
+   every chunk queued behind it, but their records were already in logs_written. `stream-filefail-queued-<bk>` (the 8th
+   append stalled 400 ms, then fails; a record every 100 ms queues behind it): a37911d `file has 7 records, logs_written=11`
+   (both backends). Fix: queued chunks carry their record count; logs_written is counted with the hand-over under file_mu
+   (so the appender can never subtract first); a failed append moves its chunk's and every queued chunk's records from
+   logs_written to log_dropped under stdout_mu + file_mu (a report sees them moved or not yet); the writer refuses a
+   hand-over after a failure and stops (writer_failed); a hand-over that runs out of memory waits for the queued chunks,
+   then ends the file the same way. After: `file=7=logs_written stdout=11=stdout_logs hits=50=written+dropped(43)`.
+   The synchronous path (stdout NUL: no appender) gives the same error text.
+3. **std::terminate on an exception in the appender (file_spare.push_back) -- real, fixed.** `stream-filefail-throw-spare`
+   (the 3rd chunk's recycling throws) and `-append` (throws before the 3rd append): a37911d died 0xC0000409, no report.
+   Fix: file_spare is reserved to FILE_SPARE_MAX before the thread starts (recycling never allocates); the recycle step
+   catches (the chunk is just not recycled) and the append step catches (an exception before the append is a failed
+   append, as in #2). After: throw-spare `file=50=logs_written`, no error; throw-append `file=2=logs_written stdout=3
+   hits=50=written+dropped(48)`, error `probe log file appender failed: bad allocation; the session log file is incomplete...`.
+
+VM x64 (310daab): stream-filefail 8/8, stream-filestall 2/2, stream-latency 4/4 (p99 0.6-0.9 ms), stream-volume 3/3
+(inline 2M/20M peak 22/22 MB, flat), stream-live 3/3, stream-order, stdout-* 9/9. Throughput kept (bench/perfab/perf_ab.py,
+x64 VM, a37911d vs appfix, 3 interleaved rounds): sink/inline nul 4.06M -> 4.01M logs/s, file 3.35M -> 3.62M, pipe 2.19M ->
+2.26M (all ~); latency/*/idle and live/*/load ~ (latency/breakpoint/idle p99 0.51 -> 0.40 ms, flagged gain, noise).
+
+CI full suite on f06d6ab (appfix merged with merge-frida f9c78d3; run 42407192851): 2141/2141, all shards green (x64 + x86,
+windows-2022, and cet-hw).
+
 ## x86hunt findings (2026-11-08, branch `x86hunt`: two new x86 inline failures in the full VM suite on main 0fb6cee; regress `hunt-*` alien, `init-cutoff-*`, agent protocol v28)
 
 - ✅ (XH1) **`hunt-early-inline` x86: `reads=11 hits=12 logs=12`** -- one hit and log the program
