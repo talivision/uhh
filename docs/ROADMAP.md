@@ -1908,6 +1908,25 @@ Measured (VM, `bench/perfab/perf_ab.py` main-tip vs binlog interleaved, 3 rounds
 
 Medians; perf_ab rounds 3/3 ok on every row, every vs_frida run exact (8/8 per method and arch).
 
+After merging merge-frida 5f13966 (perf phase 3: the same writer chunking, x86 hook and get_func_arg
+savings), binlog vs that merge-frida, same harnesses (VM quiet: only this job held a slot; rows
+`mf-*` in `bench/results/binlog-2026-11-07/`):
+
+| | x64 mf | x64 binlog | x86 mf | x86 binlog |
+|---|---:|---:|---:|---:|
+| per-hit `send_log`, 1 thread (empty hook 91 / 152 ns) | 508 ns | **338** | 759 | **425** |
+| logs/s to a file / a pipe (`sink/inline`) | 1.72M / 1.37M | **2.30M / 1.98M** | 1.17M / 0.87M | **1.99M / 1.78M** |
+| gated_config inline, perf_ab 8 x 50,000 (uninstrumented 412-433 / 514-519) | 1,053 ns/read | **821** | 1,532 | **1,048** |
+| vs_frida gated, uhh-inline ns/read (baseline 423-442 / 548-556) | 1,086 | **986** | 1,728 | **1,232** |
+| vs_frida gated, frida-cmodule, same sessions | 1,028 / 808 | | 983 / 1,089 | |
+| live lag under full load p50 / p99 (`live/inline/load`) | 4.3 / 5.9 ms | 4.4 / 6.8 | 0.7-2.5 / 15.9 | 4.5 / 6.6-12 |
+
+x86 `live` p50 is higher because the target now logs ~1.8x faster than the consumer drains at full rate:
+the pipeline saturates and the lag is the buffered depth (ring 4,096 + queue 2,048 records), as on x64 in
+both builds; p99 is lower. Idle event -> stdout latency is unchanged (15.8 ms p50, 8 rounds each; an
+occasional 37-70 ms p99 round seen on both builds -- the drainer's timer wait is now bounded by 1 ms
+regardless). Correctness of the merged build: VM families x64 392/392, x86 388/388; CI full suite 2071/2071.
+
 x86 gated after merging merge-frida (perf phase 3, 5f13966: the same writer change, plus x86 hook and
 get_func_arg savings), investigated further (temporary per-stage QPC counters in the controller, x86 gated
 8 x 50,000): the controller now keeps up -- writer busy ~0.5 us/record (format 0.27, two WriteFile 0.18,
