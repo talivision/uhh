@@ -9021,7 +9021,7 @@ def check_cet_sde(n=20, threads=2, reads=50):
             rc, o, v, arc, ao, ael = attached([cot, case, "--wait"],
                                               lambda pid: [exe("co_driver.exe"), "--backend", "inline", "--case", case,
                                                            "--attach", pid], locs)
-            row, rep, lg, hb = row_of(o, "co"), report(ao), logs_of(ao, "co "), hits_of(ao)
+            row, rep, lg, hb = row_of(o, "co"), report(ao), logs_of(ao, ("co ", "uhh warning")), hits_of(ao)
             got_logs = {k: lg.get(k, 0) for k in want_logs}
             extra = sorted(k for k in lg if k not in want_logs and not (case == "retaddr" and k == "co retsite"))
             ok = (bool(base) and row == want_row and all(hb.get(k) == x for k, x in want_hits.items()) and
