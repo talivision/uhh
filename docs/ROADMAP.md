@@ -821,8 +821,10 @@ Before the fixes, x64 differed in 18 keys (A: 10, B: 2, C: every target row -- t
   the HIT's handlers and could unwind the thread out of the call).
 - 📄 (D5) `PROBE_ONCE` is breakpoint/hw only (refused inline, from any caller); now in the header.
 - 📄 (D6) A probe added from an inline callback names its callback by export, resolved in the
-  module of the calling callback only (breakpoint/hw take the pointer as is): keep a callback and
-  the callbacks it adds in one module.
+  module of the calling callback only (a trust boundary: the target must not name functions of
+  other controller modules). polish (2026-11-08): breakpoint/hw used to take any export; they now
+  refuse a callback of another module the same way (`portability-matrix-A` `add.other-module` = 0
+  on every backend): keep a callback and the callbacks it adds in one module.
 - Agree on every backend (verified, no change): get_reg of all 16 ids at a mid-function site,
   set_reg of each (x86: values wider than 32 bits read back whole in the callback, the target gets
   the low half; R8..R15 are 0 / refused), invalid ids, CF preserved, every memory case above incl.

@@ -106,8 +106,10 @@ inside the target (📄 Portability D1-D6).
   *Workaround:* `call_func` only callees that do not raise.
 - **D5: `PROBE_ONCE` is breakpoint/hw only** (refused inline).
   *Workaround:* inline, keep an atomic flag in the callback and return early.
-- **D6: a probe added from a callback** must name an exported callback, on every backend; an
-  inline request is resolved by export name in the calling callback's module.
+- **D6: a probe added from a callback** must name a callback exported by the calling
+  callback's module, on every backend: an inline request is resolved by export name in that
+  module only (the target is untrusted), and breakpoint/hw refuse the same requests (a static
+  function or another module's export: 0).
   *Workaround:* keep a callback and the callbacks it adds in one module, all exported.
 - **State shared between probes of different backends** exists twice unless marked
   `UHH_SHARED` (Gaps P2; Codex workaround audit C7). *Workaround:* `UHH_SHARED` (see

@@ -304,8 +304,9 @@ void return_from(probe_context *, uint64_t value, int nargs);
    controller synchronously. Same callback source works in every backend. From a callback,
    only probe_add_symbol[_cfg] / probe_add_address / probe_watch may be used, and the new
    probe's callback must be EXPORTED (dllexport) by the module of the calling callback: an
-   inline callback's request names it by export and the controller resolves that name there,
-   so a non-exported callback is refused (0) on every backend. A config has no extra size
+   inline callback's request names it by export and the controller resolves that name only
+   there (the target is untrusted), so a non-exported callback, or one of another module, is
+   refused (0) on every backend. A config has no extra size
    limit from a callback (4 GB everywhere, see probe_add_symbol), an inline probe's included;
    a symbol string sent from an inline callback is limited to 64 KiB. */
 probe_session *get_session(probe_context *);

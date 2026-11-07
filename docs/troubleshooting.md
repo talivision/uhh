@@ -60,6 +60,7 @@ First steps for any problem:
 | `too many inline probes (max 128)` | the 129th inline probe | breakpoint/hw for the rest |
 | `inline callback is not a named export` | an inline callback without `__declspec(dllexport)` | export it (`extern "C" __declspec(dllexport)`) |
 | `a probe added from a callback needs a callback exported by name (dllexport)` | a static (non-exported) callback passed from inside a callback | export it, in the same module as the calling callback |
+| `a probe added from a callback needs a callback exported by the calling callback's module` | a callback of another module passed from inside a callback (inline: `... ('<name>' is not exported there)`) | move it into the calling callback's module |
 | `callback uses UHH_SHARED state but is not a named export ...` / `UHH_SHARED callback '<name>' is not exported by the agent DLL` | a breakpoint/hw callback in a module with `UHH_SHARED` globals runs from the agent DLL, so it must be an export the agent has | export it and add its file to the agent sources |
 | `absolute-address probes need a running target` | `probe_add_address` / `probe_watch` before launch | call them from a callback (or after launch) |
 | `probe_watch address must be 4-byte aligned (watches one dword)` | unaligned watch address | watch the aligned dword containing it |

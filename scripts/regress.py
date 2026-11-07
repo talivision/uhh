@@ -1408,7 +1408,7 @@ PORTABILITY_DOCUMENTED = {
 }
 PORTABILITY_REQUIRED = {
     "A": ["adds.entry", "adds.regs", "adds.other", "args", "mem.get.rw", "mem.set.high", "call_func.plain",
-          "add.ok", "add.static-callback", "add.config-308", "add.long-symbol", "log.long", "reg.get.0",
+          "add.ok", "add.static-callback", "add.other-module", "add.config-308", "add.long-symbol", "log.long", "reg.get.0",
           "reg.set.1", "target.cf", "target.out", "stack.entry"],
     "B": ["adds.fault", "adds.conc", "adds.report", "adds.bigcfg", "fault.before", "conc.total", "config.big",
           "target.fault_r", "target.fault_mark"],
@@ -1440,7 +1440,8 @@ def portability_expect(phase, x86):
                   "call_func.empty-symbol": "0", "call_func.address": "1 r=42", "call_func.module-rva": "1 r=42",
                   "call_func.negative-arg": "1 r=-15", "call_func.bad-address": "0",
                   "session": "1", "session.null-ctx": "0", "add.ok": "1", "add.no-export": "0", "add.no-type": "0",
-                  "add.null-callback": "0", "add.static-callback": "0", "add.config-308": "1", "add.long-symbol": "1",
+                  "add.null-callback": "0", "add.static-callback": "0", "add.other-module": "0",
+                  "add.config-308": "1", "add.long-symbol": "1",
                   "add.null-session": "0", "add-address.zero": "0", "watch.on-breakpoint": "0",
                   "log.null-format-follows": "1", "log.bad-format": "k",
                   "reg.get.invalid": "0 0", "reg.set.invalid": "0 0", "call_original.mid": "0 r=1234",
@@ -1712,7 +1713,6 @@ def check_callorig_hunt():
                              f"err={rep.get('error')} rc={r.returncode}")
         except Exception as e:
             record(name, False, repr(e))
-    # Detach (probe_close from another thread) and Ctrl+Break while call_original is in flight:
     name = "callorig-hunt-warn-dr-breakpoint"
     try:
         r, o = run([d, "--backend", "breakpoint", "--case", "drfull", "--", t, "nested"], timeout=300)
@@ -1729,6 +1729,7 @@ def check_callorig_hunt():
                          f"dropped={rep.get('log_dropped')} err={rep.get('error')} rc={r.returncode}")
     except Exception as e:
         record(name, False, repr(e))
+    # Detach (probe_close from another thread) and Ctrl+Break while call_original is in flight:
     # the attached target finishes every call correctly, unhooked from then on.
     import signal
     for bk in ("breakpoint", "hw", "inline"):

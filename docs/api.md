@@ -495,10 +495,13 @@ source works in every backend.
 
 - Only `probe_add_symbol`, `probe_add_symbol_cfg`, `probe_add_address` and `probe_watch` may
   be called from a callback.
-- The new probe's callback must be **exported** (`a probe added from a callback needs a
-  callback exported by name (dllexport)`). An inline request names it by export and the
-  controller resolves that name in the calling callback's module (breakpoint/hw accept any
-  export), so keep a callback and the callbacks it adds in one module.
+- The new probe's callback must be **exported by the calling callback's module**, on every
+  backend. An inline request names it by export and the controller resolves that name only
+  in that module (the target is untrusted: it must not name functions of other controller
+  modules); breakpoint/hw refuse the same requests. Not exported: `a probe added from a
+  callback needs a callback exported by name (dllexport)`; another module's export: `a probe
+  added from a callback needs a callback exported by the calling callback's module`. Keep a
+  callback and the callbacks it adds in one module.
 - A failure returns 0 to the callback and does not become the session's error. Refusals by
   the controller print `probe: dynamic add failed: <reason>`; an inline request that cannot be
   read prints `probe: dynamic add from inline callback: ...`; an inline add with a null or
