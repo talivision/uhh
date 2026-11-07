@@ -2332,8 +2332,8 @@ keeping the full output, a ring of hardware-breakpoint events and a full minidum
   event's report (`efl=0x200`), every other register equal. The watch hit arrived with no status, matched no
   probe by address (a data trap reports the next instruction) and was passed on: the target died at
   p2edge_target+0x1140 (after the `lock inc`). Every x86 all-thread DR write (arm, release, gates) had the same
-  exposure. Fix: `same_thread_regs` ignores EFLAGS bit 1 (architecturally always 1). After: see the
-  verification line below.
+  exposure. Fix: `same_thread_regs` ignores EFLAGS bit 1 (architecturally always 1). After (same loops, 4 x86
+  windows-2022 jobs): 0 failures in 1,282 rows (641 runs; at the old rate ~14 were expected, P(0) ~ 5e-7).
 
 ## Later
 - ✅ x86 cumulative-session flakiness (possibly the same handle double-close; recheck) -- CLOSED with evidence (cfnest). The note dates from the first checkpoint (c617de4); its suspected cause, review finding I6 (handles closed twice on the launch failure path), was fixed long since. Rechecked with `ar_driver --repeat`: 60 sessions in ONE controller process, backends in turn (breakpoint, hw, inline), each a call_func + runtime data watch whose callback call_funcs during another thread's call: every session exact, nothing dropped, the controller's handle count flat (x64 73 -> 73, x86 89 -> 89). Regress `sessions-repeat` keeps it covered (also exercises the per-run callback-fiber host). (Separately: `callfunc-kill-reuse` -- inline, needs the OS to hand a killed thread's id to a new thread of the same process within 3000 creations -- failed on the shared VM in Nov-06 evening runs on the cfnest build AND on an unmodified baseline build (2/2): system-wide thread-id reuse under other agents' load, not a UHH regression.)
