@@ -2109,18 +2109,22 @@ static bool image_id(const unsigned char *img, size_t n, AgentId &id, DWORD *che
 static bool same_id(const AgentId &a, const AgentId &b) {
     return a.stamp == b.stamp && a.size_of_image == b.size_of_image && a.entry == b.entry && a.sections == b.sections;
 }
-// The PE checksum (as CheckSumMappedFile, and as write_trimmed_agent computes it) of img with its
-// CheckSum field taken as 0.
-static DWORD pe_checksum(const unsigned char *img, size_t n, size_t checksum_at) {
+// The PE checksum (as CheckSumMappedFile, and as write_trimmed_agent computes it) of img; its
+// CheckSum field is zeroed first. A ones'-complement sum: folding once at the end gives the same
+// value as folding after every word.
+static DWORD pe_checksum(std::vector<unsigned char> &img, size_t checksum_at) {
+    const size_t n = img.size();
+    if (checksum_at + 4 > n) return 0;
+    std::memset(img.data() + checksum_at, 0, 4);
     uint64_t sum = 0;
-    const size_t words = n / 2;
-    for (size_t i = 0; i < words; ++i) {
-        uint16_t w = 0;
-        if (2 * i != checksum_at && 2 * i != checksum_at + 2) std::memcpy(&w, img + 2 * i, 2);
-        sum += w; sum = (sum & 0xFFFF) + (sum >> 16);
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t v; std::memcpy(&v, img.data() + i, 8);
+        sum += (v & 0xFFFF) + ((v >> 16) & 0xFFFF) + ((v >> 32) & 0xFFFF) + (v >> 48);
     }
-    if (n & 1) { sum += img[n - 1]; sum = (sum & 0xFFFF) + (sum >> 16); }
-    sum = (sum & 0xFFFF) + (sum >> 16);
+    for (; i + 2 <= n; i += 2) { uint16_t w; std::memcpy(&w, img.data() + i, 2); sum += w; }
+    if (n & 1) sum += img[n - 1];
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
     return (DWORD)(sum + n);
 }
 // A directory nobody but this user (and SYSTEM / Administrators, who can do anything anyway) can
@@ -2227,7 +2231,7 @@ static bool take_warm_copy(const std::wstring &root, const std::wstring &sig, co
             // One link only: a hard link to a file elsewhere could be changed through its other name.
             if (GetFileInformationByHandle(f, &bi) && bi.nNumberOfLinks == 1 && !(bi.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
                 read_whole_file(f, img) && image_id(img.data(), img.size(), have, &sum, &sum_at) && same_id(have, want) &&
-                sum != 0 && pe_checksum(img.data(), img.size(), sum_at) == sum) {
+                sum != 0 && pe_checksum(img, sum_at) == sum) {
                 hold = f; got = true; break;
             }
             CloseHandle(f);

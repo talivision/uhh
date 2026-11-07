@@ -898,10 +898,12 @@ def check_stream_latency():
     -> stdout; disk_run_max = the longest 120-byte append the sampler saw in that temp dir.
     The controller's %TEMP% (where UHH puts its session file) is <build dir>/uhh-latency-tmp,
     next to the binaries: a local, AV-excluded directory on the test machines (the VM's
-    C:/work, the CI workspace). UHH writes every batch to that file BEFORE stdout, so a
-    stalling file write holds live records: in the user's %TEMP% a real-time AV scan of the
-    new file (VM: 180-430 ms at records #8-#10) or a slow disk (CI runners' C:: 50 ms-2.5 s)
-    -- a UHH design finding (docs/ROADMAP.md, CI section), not this check's subject."""
+    C:/work, the CI workspace). UHH wrote every batch to that file before (or beside) stdout on
+    one thread, so a stalling file write held live records: a real-time AV scan of the new file
+    in %TEMP% (VM: 180-430 ms at records #8-#10), a slow disk (CI runners' C:: 50 ms-2.5 s), the
+    cache manager flushing the new file ~1 s in (VM: 16 ms-1.5 s at record #8; the 327 ms FAIL
+    on 0fb6cee). Since codex3 #5 stdout comes first and the file has a thread of its own
+    (regress stream-filestall-*; docs/ROADMAP.md "Codex review 3")."""
     tracer, target = exe("uhh_trace.exe"), exe("logstream_target.exe")
     if not tracer or not target:
         return missing_bin("stream-latency", "uhh_trace/logstream_target")
