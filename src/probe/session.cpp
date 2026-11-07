@@ -2203,14 +2203,20 @@ static uint8_t target_slots_any(const probe_session *s) {
     return m;
 }
 // The integer registers, IP, SP and flags: equal -> the thread has not run in between.
+// EFLAGS bit 1 is reserved (always 1 in the hardware register) and is not compared: a WOW64
+// thread whose #DB is QUEUED reads EFlags with it set (0x206), the same thread at that event's
+// report with it clear (0x204) -- nothing ran. Compared, "has not run" failed on every x86
+// target, so the debug status our DR write zeroed was never carried into the queued #DB
+// (dr6_lost) and a data-watch hit arrived with no status: passed to the target as an
+// unhandled single step (hw-once-slots x86, ~1% of runs on CI runners).
 static bool same_thread_regs(const CONTEXT &a, const CONTEXT &b) {
 #if defined(_WIN64)
-    return a.Rip == b.Rip && a.Rsp == b.Rsp && a.EFlags == b.EFlags && a.Rax == b.Rax && a.Rbx == b.Rbx &&
+    return a.Rip == b.Rip && a.Rsp == b.Rsp && ((a.EFlags ^ b.EFlags) & ~0x2u) == 0 && a.Rax == b.Rax && a.Rbx == b.Rbx &&
            a.Rcx == b.Rcx && a.Rdx == b.Rdx && a.Rsi == b.Rsi && a.Rdi == b.Rdi && a.Rbp == b.Rbp && a.R8 == b.R8 &&
            a.R9 == b.R9 && a.R10 == b.R10 && a.R11 == b.R11 && a.R12 == b.R12 && a.R13 == b.R13 && a.R14 == b.R14 &&
            a.R15 == b.R15;
 #else
-    return a.Eip == b.Eip && a.Esp == b.Esp && a.EFlags == b.EFlags && a.Eax == b.Eax && a.Ebx == b.Ebx &&
+    return a.Eip == b.Eip && a.Esp == b.Esp && ((a.EFlags ^ b.EFlags) & ~0x2u) == 0 && a.Eax == b.Eax && a.Ebx == b.Ebx &&
            a.Ecx == b.Ecx && a.Edx == b.Edx && a.Esi == b.Esi && a.Edi == b.Edi && a.Ebp == b.Ebp;
 #endif
 }
