@@ -5462,7 +5462,8 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
         // and a thread that hits nothing runs. (Measured: with the unfrozen-time rule alone, a
         // fast session kept >10% unfrozen yet main's Sleep(300) returned 3-20 s late: whenever
         // unfrozen, the hot threads had the CPU and trapped again before main was scheduled.)
-        s->parking = got && (s->fair_events >= 40 || s->fair_gaps * 10 < now - s->fair_window);
+        const bool dense = s->fair_events >= 40 || s->fair_gaps * 10 < now - s->fair_window;
+        s->parking = got && dense;
         s->fair_events = 0;
         if (s->parking) {
             ++s->park_rounds; s->yielded_round.clear();
@@ -5475,7 +5476,9 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
                 std::fprintf(stderr, "  park-start t=%lld\n",
                              (long long)duration_cast<microseconds>(now.time_since_epoch()).count());
         }
-        if (!s->parking) { s->fair_period_ms = 20; s->quiet_rounds = 0; }   // dense events again: noticed within 20 ms
+        // Dense events stopped: the next dense phase starts afresh (noticed within 20 ms). A window
+        // that merely ended on an idle tick (a round's quiet time) keeps the back-off state.
+        if (!dense) { s->fair_period_ms = 20; s->quiet_rounds = 0; }
         s->fair_window = now; s->fair_gaps = {};
     }
     // 1 ms timer resolution only while a parked thread or a context watch waits on this loop:
