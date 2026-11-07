@@ -1891,31 +1891,6 @@ static __declspec(noinline) bool mid_entry_fx(safetyhook::Context &native, uint3
 }
 
 #if !defined(_WIN64)
-// x86, only the x87 state live: FXSAVE before, FXSAVE again after the callback, and FXRSTOR only
-// when the x87 part of the two images differs. Exact: the compared part is everything FXRSTOR
-// would put back of the x87 state -- control, status (TOP), abridged tag, last opcode,
-// instruction and operand pointers, and the 8 registers -- and any x87 instruction the callback
-// runs (other than a control one, which shows in CW/SW/TW) moves the instruction pointer, so an
-// equal image means an untouched state. MXCSR (also in the image) is put back either way. Most
-// callbacks never run x87 code (x86 MSVC code is SSE2; only a float RETURN uses ST0), and a
-// second FXSAVE is cheaper than an FXRSTOR. (bench: UHH_BENCH_XSTATE=fx keeps the plain pair)
-static __declspec(noinline) bool mid_entry_fxcmp(safetyhook::Context &native, uint32_t index, unsigned char *x87_post) {
-    alignas(16) unsigned char fx[512], fy[512];
-    _fxsave(fx);
-    const bool x87 = call_mid(native, index, x87_post);
-    _fxsave(fy);
-    const uint32_t *a = reinterpret_cast<const uint32_t *>(fx), *b = reinterpret_cast<const uint32_t *>(fy);
-    bool same = a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3] && a[4] == b[4] && a[5] == b[5];
-    for (int i = 0; same && i < 8; ++i) {                  // ST(i): 10 bytes of each 16-byte slot at 32
-        const unsigned char *x = fx + 32 + 16 * i, *y = fy + 32 + 16 * i;
-        same = *reinterpret_cast<const uint64_t *>(x) == *reinterpret_cast<const uint64_t *>(y) &&
-               *reinterpret_cast<const uint16_t *>(x + 8) == *reinterpret_cast<const uint16_t *>(y + 8);
-    }
-    if (!same) _fxrstor(fx);
-    else _mm_setcsr(a[6]);                                 // MXCSR (image bytes 24-27)
-    return x87;
-}
-
 // x86 bench knob (xstate_mode 5, UHH_BENCH_XSTATE=fnsave): the x87 state by FNSAVE / FRSTOR
 // (108 bytes, x87 only; FNSAVE leaves the FPU initialised, so the program's control word is put
 // back for the callback), MXCSR by hand; AVX state, when live, by XSAVE as usual.
@@ -1987,7 +1962,7 @@ static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
     // component would (plus MXCSR and XMM0-7, which the hook stub reloads anyway) -- measured
     // ~20 ns a hit cheaper than XSAVEC / XRSTOR into the save area (154 vs 174 ns).
     if (xmode == 0 && mask == 1) {
-        x87 = mid_entry_fxcmp(native, index, x87_post);
+        x87 = mid_entry_fx(native, index, x87_post);
         if (x87) x87_restore(x87_post);
         return;
     }

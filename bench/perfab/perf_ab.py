@@ -73,10 +73,13 @@ QPF = (lambda f: (k32.QueryPerformanceFrequency(ctypes.byref(f)), f.value)[1])(c
 
 class Side:
     def __init__(self, name, bindir, tmp):
+        # NAME=DIR?VAR=VALUE&VAR2=VALUE2: the same build with environment knobs (bench toggles)
+        bindir, _, knobs = bindir.partition("?")
         self.name, self.bin, self.tmp = name, Path(bindir), Path(tmp)
         self.tmp.mkdir(parents=True, exist_ok=True)
         # The controller's %TEMP% (session log files): a local dir per side, emptied after each run.
         self.env = dict(os.environ, TEMP=str(self.tmp), TMP=str(self.tmp))
+        self.env.update(kv.split("=", 1) for kv in knobs.split("&") if kv)
 
     def exe(self, n):
         return str(self.bin / n)

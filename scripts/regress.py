@@ -973,6 +973,15 @@ def check_stream_latency():
                    f"written={rep.get('logs_written')} dropped={rep.get('log_dropped')} rc={rc}"
                    + (" TIMEOUT" if timed_out else "")
                    + ("" if in_order else f" seq={log_seq[:8]}..."))
+            if backend == "inline":
+                # Inline after a quiet spell: the agent wakes the sleeping drainer (agent protocol
+                # v26, probe_agent_drain_wait) -- a record 100 ms after the last one is not left
+                # for the drainer's next timer tick (15.6 ms: the p50 here before the wake-up).
+                # Median, so the machine's own stalls do not decide it (noisy: minus the noise).
+                p50_wake = p50 if quiet else pct(list(excess.values()), .5)
+                record("stream-latency-inline-wake", complete and ms(p50_wake) < 8.0,
+                       f"p50={ms(p50):.2f}ms p50_excess={ms(pct(list(excess.values()), .5)):.2f}ms "
+                       f"({'quiet' if quiet else 'noisy'}; bar p50 < 8 ms, half a 15.6 ms timer tick) pairs={len(lat)}/{n}")
         except Exception as e:
             if sampler and sampler.p.poll() is None:
                 sampler.p.kill()
