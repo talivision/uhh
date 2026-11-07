@@ -314,8 +314,9 @@ inline void probe_agent_retire_carry(probe_agent_shared *sh, const probe_agent_l
     if (rec.carry != 1 || rec.probe >= PROBE_AGENT_MAX_PROBES) return;
     if (rec.reserved) {                         /* the owner's block (v25): the controller's own counter */
         if (rec.reserved > PROBE_AGENT_TBLOCKS) return;
-        probe_agent_tblock &t = sh->tblocks[rec.reserved - 1];
-        if (probe_agent_tblock_unaccounted(t)) InterlockedIncrement64(&t.retired);
+        /* No bound check here (it summed the block's 128 counters per record): the sums clamp a
+           block's unaccounted at zero, so a bogus carry cannot borrow from another block. */
+        InterlockedIncrement64(&sh->tblocks[rec.reserved - 1].retired);
         return;
     }
     volatile LONG64 &cell = sh->hit_stripes[rec.probe][(rec.tid >> 2) & (PROBE_AGENT_STRIPES - 1)].value;

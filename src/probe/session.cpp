@@ -16,6 +16,7 @@
 #include <map>
 #include <set>
 #include <algorithm>
+#include <charconv>
 #include <vector>
 #include <Zydis/Zydis.h>
 #include "symbols.hpp"   // dbghelp+symsrv loaded dynamically; honours _NT_SYMBOL_PATH
@@ -427,7 +428,9 @@ struct probe_session {
     std::unordered_set<DWORD> runnable_prev;    // others_runnable: runnable at the previous idle tick
     std::unordered_map<DWORD, ULONG> cs_prev;   // ... and context-switch counts then
     int round_demand = -1;                      // this round: -1 no idle tick compared yet, 0 none ran, 1 one ran
+    uint32_t quiet_rounds = 0;                  // rounds in a row that found no demand (fair_tick's hysteresis)
     uint64_t rounds_by_demand[3] = {};          // PROBE_TRACE statistics: rounds ending with demand -1 / 0 / 1
+    std::chrono::steady_clock::time_point round_fine_until{};   // the 1 ms timer only until then (fair_tick)
     uint64_t park_rounds = 0, parked_total = 0;   // fairness statistics (PROBE_TRACE: printed at the end)
     // Yield stubs (see yield_thread): per thread, `resume address; code`, carved from blocks that
     // are never freed (a thread may sleep inside one across a detach).
@@ -609,12 +612,16 @@ static void append_json_string(std::string &out, const std::string &value) {
     out.push_back('"');
 }
 
-static std::string format_log_line(probe_session *s, const LogRecord &r) {
-    char prefix[96];
-    int n = std::snprintf(prefix, sizeof(prefix),
-                          "{\"kind\":\"probe_log\",\"probe\":%u,\"tid\":%u,\"message\":",
-                          r.probe, r.tid);
-    std::string line(prefix, n > 0 ? (size_t)n : 0);
+// Appends the record's JSON line to `line` (the writer's batch): no temporary string and no
+// printf per record -- the x86 (WOW64) controller's per-record formatting showed in profiles of
+// a log-bound inline target (send_log there waits on this pipeline: the ring's backpressure).
+static void append_log_line(std::string &line, probe_session *s, const LogRecord &r) {
+    char num[24];
+    line += "{\"kind\":\"probe_log\",\"probe\":";
+    line.append(num, (size_t)(std::to_chars(num, num + sizeof(num), r.probe).ptr - num));
+    line += ",\"tid\":";
+    line.append(num, (size_t)(std::to_chars(num, num + sizeof(num), r.tid).ptr - num));
+    line += ",\"message\":";
     append_json_string(line, r.text);
     if (r.has_stack) {
         line += ",\"stack\":[";
@@ -625,9 +632,9 @@ static std::string format_log_line(probe_session *s, const LogRecord &r) {
         line.push_back(']');
     }
     // Last, so every consumer matching the line's start keeps working (fields only added).
-    n = std::snprintf(prefix, sizeof(prefix), ",\"seq\":%llu}\n", (unsigned long long)s->log_seq++);
-    line.append(prefix, n > 0 ? (size_t)n : 0);
-    return line;
+    line += ",\"seq\":";
+    line.append(num, (size_t)(std::to_chars(num, num + sizeof(num), (unsigned long long)s->log_seq++).ptr - num));
+    line += "}\n";
 }
 
 static void writer_failed(probe_session *s, const std::string &message, uint64_t unwritten) {
@@ -719,15 +726,26 @@ static void log_writer_main(probe_session *s) {
             std::string batch;
             uint64_t batch_records = 0;
             auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
+            // Records are taken in chunks (one lock and one wake-up per chunk, not per record).
+            // A popped record counts as unwritten until its batch is written, so a writer
+            // failure mid-chunk still accounts for every one of them (writer_failed).
+            std::vector<LogRecord> chunk;
             for (;;) {
-                LogRecord record;
-                {
+                if (chunk.empty()) {
                     std::lock_guard<std::mutex> lock(s->queue_mu);
                     if (s->log_queue.empty()) break;
-                    record = std::move(s->log_queue.front());
-                    s->log_queue.pop_front();
-                    s->queue_writable.notify_one();
+                    const size_t n = std::min<size_t>(s->log_queue.size(), 256);
+                    chunk.reserve(n);
+                    for (size_t k = 0; k < n; ++k) {
+                        if (!s->log_queue.front().sym_unload) ++unwritten;
+                        chunk.push_back(std::move(s->log_queue.front()));
+                        s->log_queue.pop_front();
+                    }
+                    std::reverse(chunk.begin(), chunk.end());           // taken from the back below, in order
+                    s->queue_writable.notify_all();
                 }
+                LogRecord record = std::move(chunk.back());
+                chunk.pop_back();
                 if (record.sym_unload) {
                     // Every record queued before this unload is formatted (symbolized) by now.
                     uhh_sym::unregister_module(s->pi.hProcess, record.sym_unload);
@@ -737,15 +755,17 @@ static void log_writer_main(probe_session *s) {
                     s->queue_flushed.notify_all();
                     continue;
                 }
-                ++unwritten;
-                std::string line = format_log_line(s, record);
-                if (!batch.empty() && batch.size() + line.size() > BATCH_BYTES) {
+                const size_t before = batch.size();
+                append_log_line(batch, s, record);
+                if (before && batch.size() > BATCH_BYTES) {             // over: write what was there first
+                    std::string line = batch.substr(before);
+                    batch.resize(before);
                     if (!write_log_batch(s, batch, batch_records)) return;
                     unwritten -= batch_records;
-                    batch.clear(); batch_records = 0;
+                    batch.swap(line); batch_records = 0;
                     deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
                 }
-                batch += line; ++batch_records;
+                ++batch_records;
                 if (batch.size() >= BATCH_BYTES || std::chrono::steady_clock::now() >= deadline) {
                     if (!write_log_batch(s, batch, batch_records)) return;
                     unwritten -= batch_records;
@@ -5116,7 +5136,7 @@ static void park_release(probe_session *s) {
                      (long long)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
     for (auto &e : s->parked) { ResumeThread(e.second); CloseHandle(e.second); }
     s->parked.clear();
-    s->parking = false; s->fair_period_ms = 20; s->round_demand = -1; s->quiet_sampled = false;
+    s->parking = false; s->fair_period_ms = 20; s->round_demand = -1; s->quiet_sampled = false; s->quiet_rounds = 0;
     s->fair_window = std::chrono::steady_clock::now(); s->fair_gaps = {};
 }
 // Park the thread whose hit is about to be continued (see probe_session::parked). Never a
@@ -5364,7 +5384,7 @@ static int others_runnable(probe_session *s) {
                     cs_now[tid] = t[i].ContextSwitches;
                     const auto was = s->cs_prev.find(tid);
                     if (was != s->cs_prev.end() && was->second != t[i].ContextSwitches &&
-                        !(state == 5 && t[i].WaitReason == 15 /* WrQueue */)) {
+                        state == 5 && t[i].WaitReason != 15 /* WrQueue */) {
                         if (trace_enabled() && s->rounds_by_demand[2] < 12)
                             std::fprintf(stderr, "  fair-demand tid=%lu ran (cs %lu -> %lu) state=%lu wait=%lu\n", (unsigned long)tid,
                                          (unsigned long)was->second, (unsigned long)t[i].ContextSwitches,
@@ -5425,9 +5445,16 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
         // (it may be starved); nothing did -> twice the period, to 80 ms; no quiet tick
         // compared (the round never went quiet) -> unchanged.
         if (s->parking) ++s->rounds_by_demand[s->round_demand + 1];
-        if (s->parking && s->round_demand >= 0)
-            s->fair_period_ms = s->round_demand ? 20 : std::min<uint32_t>(80, s->fair_period_ms * 2);
-        s->round_demand = -1; s->quiet_sampled = false; s->runnable_prev.clear(); s->cs_prev.clear();
+        // Hysteresis: back off only after 8 rounds in a row found nobody (~200 ms). A thread in a
+        // timed wait shows only when its timeout completes -- and the timeout elapses only while
+        // the process is not frozen (measured: a 10 ms WaitForSingleObject loop beside a hot hw
+        // probe completed 13 times in 1.75 s with no rounds, 9 in 2.1 s when one sighting reset
+        // the period for a single round): one sighting keeps it served for the next ones.
+        if (s->parking && s->round_demand >= 0) {
+            if (s->round_demand) { s->fair_period_ms = 20; s->quiet_rounds = 0; }
+            else if (++s->quiet_rounds >= 8) s->fair_period_ms = std::min<uint32_t>(80, s->fair_period_ms * 2);
+        }
+        s->round_demand = -1; s->quiet_sampled = false; s->runnable_prev.clear();   // cs_prev carries over
         const bool was = s->parking;
         // Dense debug events (>= 2000/s: the target is mostly frozen) -- or little unfrozen
         // time -- start a yield round: every thread whose hit is continued in the next window
@@ -5441,13 +5468,14 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
             ++s->park_rounds; s->yielded_round.clear();
             FILETIME ft; GetSystemTimeAsFileTime(&ft);
             s->round_wake = (LONGLONG)(((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime) + 40000;   // now + 4 ms
+            s->round_fine_until = now + milliseconds(10);
         }
         if (s->parking && !was) {
             if (trace_enabled())
                 std::fprintf(stderr, "  park-start t=%lld\n",
                              (long long)duration_cast<microseconds>(now.time_since_epoch()).count());
         }
-        if (!s->parking) s->fair_period_ms = 20;      // dense events again are noticed within 20 ms
+        if (!s->parking) { s->fair_period_ms = 20; s->quiet_rounds = 0; }   // dense events again: noticed within 20 ms
         s->fair_window = now; s->fair_gaps = {};
     }
     // 1 ms timer resolution only while a parked thread or a context watch waits on this loop:
@@ -5459,7 +5487,14 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
         if (agent_has_pending(s)) retarget_pending(s);
         if (agent_has_pending(s) && !kick_agent(s)) std::fprintf(stderr, "probe: %s\n", s->error.c_str());
     }
-    const bool fine = s->parking || !s->ctx_watch.empty() || s->rekick_at;   // (yields sleep 2 ms, not a tick)
+    // While parking: always while rounds still find (or recently found) demand -- a thread in a
+    // timed wait needs it (hunt-starve: with a 15.6 ms timer between rounds main's Sleep(300) did
+    // not end within 60 s; its timeout is re-armed at every freeze and thaw) -- but once rounds
+    // have backed off (nobody else wants the CPU), only around a round: measured on the VM, a
+    // 1 ms system timer kept on through the dense events cost a lone hot thread ~30% (hw 144 ->
+    // 110 us/hit, breakpoint 90 -> 72; rounds switched off entirely: 109 / 71).
+    const bool fine = (s->parking && (s->quiet_rounds < 8 || now < s->round_fine_until)) || !s->ctx_watch.empty() ||
+                      s->rekick_at;
     if (fine != s->fine_timer) { if (fine) timeBeginPeriod(1); else timeEndPeriod(1); s->fine_timer = fine; }
     return fine ? 1 : 20;
 }

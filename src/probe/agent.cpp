@@ -1616,10 +1616,19 @@ static void load_regs(probe_regs &r, const safetyhook::Context &native) {
 // x87_post (x86): a 108-byte buffer owned by the caller; returns true when it holds the x87
 // state return_from must leave (an ST0 result of call_original), to reload after any
 // extended-state restore.
+// Every field set below, none zero-filled first (a memset of the whole context per hit showed
+// on x86): orig_pop must stay the last field, or a new one would be left uninitialised here.
+static_assert(sizeof(probe_context) - (offsetof(probe_context, orig_pop) + sizeof(int32_t)) < 8,
+              "call_mid initialises probe_context field by field: add the new field there");
 static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char *x87_post) {
-    probe_context c{};
+    probe_context c;
     load_regs(c.regs, native);
+#if !defined(_WIN64)
+    c.regs.r8 = c.regs.r9 = c.regs.r10 = c.regs.r11 = c.regs.r12 = c.regs.r13 = c.regs.r14 = c.regs.r15 = 0;
+#endif
     c.regs.pc = sites[index]; c.hit_sp = c.regs.rsp;
+    c.backend = nullptr; c.ret_pop = 0; c.called_original = 0; c.returned = 0; c.hit_scope = nullptr;
+    c.orig_edx = 0; c.orig_pop = 0;
     const auto &request = shared->requests[index];
     c.config = !request.config_len ? nullptr
              : request.config_len > PROBE_AGENT_CONFIG_CAP ? (void *)(uintptr_t)request.config_remote : (void *)request.config;

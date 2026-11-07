@@ -17,6 +17,8 @@ static long long g_crash_after = 0;            /* >0: die with an unhandled acce
 static volatile LONG g_go;
 static volatile LONG g_done;
 static volatile LONG64 g_spins;              /* --spin: iterations of a thread that hits nothing */
+static int g_waiter_ms = 0, g_waiter_sleep = 0;  /* --waiter MS / --sleeper MS: a thread in timed waits */
+static volatile LONG64 g_waits;              /* ... how many of them completed during the timed loop */
 static int g_qpc_arg = 0;                      /* --qpc-arg: pass a QPC timestamp (microseconds, low 31 bits) instead of i */
 static LARGE_INTEGER g_freq;
 static intptr_t qpc_us(void) {                 /* same clock as Python's time.perf_counter_ns, in us, 31 bits (fits x86) */
@@ -33,6 +35,21 @@ static DWORD WINAPI spin(void *arg) {
     LONG64 n = 0;
     while (!g_done) { ++n; if ((n & 1023) == 0) g_spins = n; }
     g_spins = n;
+    return 0;
+}
+
+/* --waiter / --sleeper: a thread that never hits the probe and only waits with a timeout
+   (WaitForSingleObject on an event nobody sets, or Sleep): how many timeouts complete during the
+   timed loop vs its wall time / MS -- does a debugger freezing the process stall timeouts? */
+static DWORD WINAPI waiter(void *arg) {
+    HANDLE never = CreateEventA(NULL, TRUE, FALSE, NULL);
+    (void)arg;
+    while (!g_go) Sleep(1);
+    while (!g_done) {
+        if (g_waiter_sleep) Sleep((DWORD)g_waiter_ms); else WaitForSingleObject(never, (DWORD)g_waiter_ms);
+        if (!g_done) InterlockedIncrement64(&g_waits);
+    }
+    CloseHandle(never);
     return 0;
 }
 
@@ -63,6 +80,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--no-wait")) no_wait = 1;
         else if (!strcmp(argv[i], "--qpc-arg")) g_qpc_arg = 1;
         else if (!strcmp(argv[i], "--spin")) spinner = 1;
+        else if (!strcmp(argv[i], "--waiter") && i + 1 < argc) g_waiter_ms = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--sleeper") && i + 1 < argc) { g_waiter_ms = atoi(argv[++i]); g_waiter_sleep = 1; }
         else if (!strcmp(argv[i], "--print-rva")) {   /* g_sink's RVA: hit_site writes it on every call */
             printf("{\"kind\":\"rva\",\"sink\":%llu}\n",
                    (unsigned long long)((uintptr_t)&g_sink - (uintptr_t)GetModuleHandleA(NULL)));
@@ -76,6 +95,7 @@ int main(int argc, char **argv) {
     HANDLE h[64];
     for (int t = 0; t < threads; ++t) h[t] = CreateThread(NULL, 0, loop, NULL, 0, NULL);
     HANDLE sp = spinner ? CreateThread(NULL, 0, spin, NULL, 0, NULL) : NULL;
+    HANDLE wt = g_waiter_ms > 0 ? CreateThread(NULL, 0, waiter, NULL, 0, NULL) : NULL;
     Sleep(50);
     LARGE_INTEGER f, t0, t1; QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&t0);
@@ -84,6 +104,7 @@ int main(int argc, char **argv) {
     QueryPerformanceCounter(&t1);
     InterlockedExchange(&g_done, 1);
     if (sp) { WaitForSingleObject(sp, INFINITE); CloseHandle(sp); }
+    if (wt) { WaitForSingleObject(wt, INFINITE); CloseHandle(wt); }
     for (int t = 0; t < threads; ++t) CloseHandle(h[t]);
     double ns = (double)(t1.QuadPart - t0.QuadPart) * 1e9 / (double)f.QuadPart;
     /* wall time per call per thread: with T threads running in parallel, this is the
@@ -91,8 +112,9 @@ int main(int argc, char **argv) {
     /* spin_share: the spinner's iterations per ns of the timed window (--spin; 0 without) --
        compared with an uninstrumented run, the CPU share a thread that hits nothing got. */
     printf("{\"kind\":\"target\",\"name\":\"hitcost\",\"calls\":%lld,\"threads\":%d,\"avx\":%d,\"ns_per_call\":%.2f,"
-           "\"spins\":%lld,\"spin_per_us\":%.3f}\n",
-           g_calls, threads, g_avx, ns / (double)g_calls, (long long)g_spins, (double)g_spins * 1000.0 / ns);
+           "\"spins\":%lld,\"spin_per_us\":%.3f,\"waits\":%lld,\"waits_due\":%.1f}\n",
+           g_calls, threads, g_avx, ns / (double)g_calls, (long long)g_spins, (double)g_spins * 1000.0 / ns,
+           (long long)g_waits, g_waiter_ms > 0 ? ns / 1e6 / g_waiter_ms : 0.0);
     fflush(stdout);
     return 0;
 }
