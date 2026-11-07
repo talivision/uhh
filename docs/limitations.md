@@ -263,7 +263,8 @@ data) prints on all backends.
 - **Per-thread order** is kept across backends, except that a record behind two unfinished
   ring slots of other threads at the same instant can be overtaken (Log delivery findings).
 - **Inline callbacks killed by process exit** (ExitProcess/TerminateProcess) before their
-  first log are reported as `callbacks_interrupted`; their logs never existed (Hunter A3).
+  first log are reported as `callbacks_interrupted`; their logs never existed (Hunter A3). The
+  report's stderr line names the probe and thread of each callback cut off while running.
 - **Session log files are not deleted.** They accumulate in `%TEMP%\uhh\logs`.
   *Workaround:* delete old `uhh-*.jsonl` files yourself.
 - **A console is a slow log sink.** *Workaround:* redirect stdout to a file or pipe, or to
