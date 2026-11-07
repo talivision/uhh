@@ -5,7 +5,7 @@ is kept for history and is SUPERSEDED (see "Why the earlier comparison was super
 Reproduce with `bench/frida/vs_frida.py` (how: `bench/frida/README.md`); raw rows in
 `bench/results/frida17-2026-11-07/`.
 
-## Per-method cost (branch `bench2`, 2026-11-08)
+## Per-method cost (branch `bench2`, 2026-11-08; send_log_stack / call_func rows updated by `perf6`)
 
 What one callback operation costs on each backend. `hitcost_target` calls `hit_site` (exported, cdecl, one
 argument) in a tight loop and times the loop in-process (QPC); `hitcost_driver --method m` probes it with a callback
@@ -27,8 +27,8 @@ op cost. Breakpoint/hw in **us**, inline in **ns**. Uninstrumented call: 2.5 ns 
 | get_mem 64 B at SP | 86.2 (2%) | 8.4 | 95.5 (3%) | 4.0 | 81.0 (3%) | 13.5 |
 | set_mem 8 B at SP (after an 8 B get_mem) | 86.0 (3%) | 8.2 | 100.8 (4%) | 9.3 | 90.4 (6%) | 22.9 |
 | send_log("hit %llu", arg0) | 81.3 (1%) | 3.5 | 91.2 (5%) | ~0 | 247 (34%) | 179 |
-| send_log_stack | 233.0 (0%) | 155 | 249.7 (2%) | 158 | 7,265 (77%) | 7,197 |
-| call_func(kernel32!GetCurrentProcessId) | 279.5 (1%) | 202 | 290.6 (4%) | 199 | 2,802 (6%) | 2,734 |
+| send_log_stack (perf6) | 163.4 (2%) | **86** | 173.6 (4%) | **85** | 1,285 (19%) | **1,216** |
+| call_func(kernel32!GetCurrentProcessId) (inline: perf6) | 279.5 (1%) | 202 | 290.6 (4%) | 199 | 139 (18%) | **69** |
 | call_original + return_from | 300.4 (3%) | 223 | 250.2 (1%) | 159 | 935 (18%) | 867 |
 | control op: add_once (see below) | 274.1 (7%) | 196 | 285.5 (8%) | 194 | 305,962 (3%) | 305,895 |
 | **x86** empty = the hit itself | 124.4 (2%) | 124.4 | 138.2 (11%) | 138.2 | 136 (4%) | **134** |
@@ -38,8 +38,8 @@ op cost. Breakpoint/hw in **us**, inline in **ns**. Uninstrumented call: 2.5 ns 
 | get_mem 64 B at SP | 130.9 (2%) | 6.5 | 146.3 (9%) | 8.1 | 159 (2%) | 22.5 |
 | set_mem 8 B at SP (after an 8 B get_mem) | 139.2 (1%) | 14.8 | 152.4 (2%) | 14.2 | 174 (6%) | 37.3 |
 | send_log("hit %llu", arg0) | 135.0 (1%) | 10.6 | 148.7 (2%) | 10.5 | 269 (1%) | 133 |
-| send_log_stack | 894 (2%) | 770 | 1,275 (4%) | 1,136 | 10,822 (14%) | 10,686 |
-| call_func(kernel32!GetCurrentProcessId) | 412 (9%) | 288 | 426 (3%) | 288 | 2,881 (1%) | 2,744 |
+| send_log_stack (perf6) | 325 (1%) | **200** | 371 (9%) | **233** | 2,902 (21%) | **2,764** |
+| call_func(kernel32!GetCurrentProcessId) (inline: perf6) | 412 (9%) | 288 | 426 (3%) | 288 | 221 (3%) | **86** |
 | call_original + return_from | 499 (5%) | 375 | 392 (4%) | 254 | 1,552 (3%) | 1,416 |
 | control op: add_once (see below) | 428 (17%) | 303 | 448 (7%) | 310 | 419,491 (4%) | 419,354 |
 
@@ -60,19 +60,56 @@ Reading it:
   is ~120 us from a breakpoint/hw callback (x64; x86 ~180 us) and ~228 us from an INLINE callback (x64; x86 ~295 us:
   the request is forwarded to the controller synchronously and the thread waits for the INT3 to be armed).
 
-Surprises (measured, not changed here):
-- **x86 send_log_stack on breakpoint/hw is 0.77-1.1 ms per hit** (x64 155 us) for a 4-frame stack (hit_site, loop,
-  kernel32, ntdll): StackWalk64 over a WOW64 target from the 32-bit controller (each frame's FPO/unwind lookup reads
-  target memory through dbghelp). Symbolization is not part of it (deferred to the report). hw is 360 us slower than
-  breakpoint here on x86 only -- not explained.
-- **Inline call_func is ~2.7 us** for a callee that takes ~1 ns: the symbol string is resolved on every call
-  (GetModuleHandleA + GetProcAddress) and the address is checked with VirtualQuery (a syscall) before the call. A
-  per-symbol cache would need invalidation on module unload; not done.
+Surprises found by this table, and what `perf6` did about them (before/after: "Update: perf6" below):
+- **x86 send_log_stack on breakpoint/hw was 0.77-1.1 ms per hit** (x64 155 us) for a 4-frame stack. Cause: StackWalk64
+  read the target in ~170-280 ReadProcessMemory calls of ~14 bytes per walk, ~50 of them FAILING (the x86 walker probes
+  the bytes before candidate return addresses byte by byte, unmapped ones included), 2-8 us each under WOW64. Fixed:
+  reads served from per-walk page copies (an unreadable page answers "unreadable" without a call) -- 8 page reads per
+  walk; frames identical. hw was slower than breakpoint on x86 because at a hw hit the walker sees the real prologue
+  bytes (not our INT3) and walks one frame more (the caller the breakpoint path re-inserts from [esp]); it is ~35 us
+  now. The writer's per-frame symbolization (dbghelp, same few addresses again and again) is cached by address
+  (cleared at every module load/unload), which is what made inline send_log_stack 5x cheaper on x64 (the log queue's
+  backpressure had made the program wait on the writer).
+- **Inline call_func was ~2.7 us** for a callee that takes ~1 ns: GetModuleHandleA + GetProcAddress + a VirtualQuery per
+  call. Fixed: a lock-free per-symbol cache, valid while no module has unloaded since the entry was resolved (the
+  loader's DLL notification, sent before an image is unmapped, bumps a generation); regress `cdx-cfreuse-*` (a DLL
+  unloaded and another mapped at its base under the same name: never called through the stale entry).
+- **Adding a probe from an inline callback costs ~100 us more than from breakpoint/hw** (x64 ~205 vs ~100 us): the
+  inline callback reaches the controller through one more debug event (a raised exception: the target stops, the
+  debugger wakes, continues it) -- the same round trip as a breakpoint hit, and it is what makes the add synchronous
+  (the probe is armed when the call returns, probe_api.h). The controller can only act inside a debug event (one
+  debug thread owns the session), so that round trip stays. perf6 trimmed what was around it (one read of the
+  request instead of two, no stderr line per successful add -- a console write each); within noise in the table.
 - **Inline call_original + return_from is 0.9 us (x64) / 1.4 us (x86)**, ~13x an empty hit: the x64 thunk saves the
   hit's nonvolatile GPRs and XMM6-15 into an unwindable machine frame, x86 relinks the SEH chain (both needed so an
   exception in the original reaches the program's handlers).
 - Inline send_log (34%) and send_log_stack (77% x64) have wide spreads at these sizes (3 rounds); the medians agree
   with the earlier perf_ab sessions (send_log 1 thread 163-317 ns).
+
+### Update: perf6 (2026-11-08) -- the three outliers, before/after
+
+`perf_ab.py --group methods --rounds 3`, interleaved, base = merge-frida 5aad1ad, perf6 = branch `perf6` (same
+targets for both; quiet-VM placeholder held for the round). Median (spread) per hit; breakpoint/hw in us, inline in
+ns. Raw rows `bench/results/perf6-2026-11-08/` (x86 inline send_log_stack: a second run, `ab-x86-inline-stack.jsonl`,
+mid = perf6 without the x86 capture change, new = with it; the main run's x86 inline cell predates that change).
+
+| cell | x64 base | x64 perf6 | | x86 base | x86 perf6 | |
+|---|---:|---:|---:|---:|---:|---:|
+| breakpoint send_log_stack (us) | 236.0 (5%) | 163.4 (2%) | 1.4x | 895 (2%) | 325 (1%) | 2.8x |
+| hw send_log_stack (us) | 249.5 (1%) | 173.6 (4%) | 1.4x | 1,267 (65%) | 371 (9%) | 3.4x |
+| inline send_log_stack (ns) | 6,943 (186%) | 1,285 (19%) | 5.4x | 9,896 (26%) | 2,902 (21%) | 3.4x |
+| inline call_func (ns) | 2,774 (0%) | 139 (18%) | 20x | 2,844 (1%) | 221 (3%) | 12.9x |
+| breakpoint add_once (us) | 256.6 (1%) | 257.1 (5%) | = | 420 (8%) | 428 (9%) | = |
+| hw add_once (us) | 286.5 (6%) | 279.5 (6%) | = | 442 (4%) | 441 (3%) | = |
+| inline add_once (us) | 290.7 (2%) | 283.8 (3%) | = | 410 (3%) | 413 (9%) | = |
+| empty (bp us / hw us / inline ns) | 77.0 / 89.8 / 67.7 | 77.7 / 88.8 / 69.3 | = | 123 / 136 / 140 | 125 / 138 / 135 | = |
+
+Op cost after (minus the same run's empty hit): send_log_stack x64 86 / 85 us (bp / hw; was 159 / 160 in this run),
+x86 200 / 233 us (was 772 / 1,131); inline send_log_stack 1.2 us x64 / 2.8 us x86 (was 6.9 / 9.8); inline call_func
+69 ns x64 / 86 ns x86 (was 2.7 us). How (docs/ROADMAP.md "perf6 findings"): the stack walk reads the target by page
+per walk (and answers reads in unreadable pages itself); the log writer's symbolization is cached by address; inline
+call_func resolutions are cached until a module unloads; the x86 inline capture classifies stack values from the TEB
+bounds and keeps module code regions until an unload. Frames reported are unchanged (`--only stack`, x64 + x86).
 
 ### UHH_SHARED state vs plain globals (C7): equal on every backend
 

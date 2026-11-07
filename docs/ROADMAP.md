@@ -1895,7 +1895,7 @@ stop request.
 - ✅ Per-log overhead ceilings in the suite (`log-throughput-*`)
 - ✅ Inline extended-state strategy measured (`bench/hitcost`): gated save = +1-5% vs +70% for a full save; gated is default
 - 🔧 Inline hot path (striped counters implemented; measurement pending): ~75 ns/hit is high for a mid-hook — 3 shared atomics per hit (hit count + in-flight); stripe/per-thread them, keep exact
-- ✅ Per-method, per-backend benchmark table (hit, get_reg/set_reg, get_mem, send_log, send_log_stack, call_func, control ops) -- `bench/BENCHMARKS.md` "Per-method cost" (bench2, 2026-11-08; `perf_ab.py --group methods`, `methods_table.py`; raw `bench/results/methods-2026-11-08/`; harness checked by regress `hitcost-methods-*`). x64 hit: breakpoint 78 us, hw 92 us, inline 65 ns; context ops without target memory ~0 on bp/hw, 1-16 ns inline; each bp/hw memory access +4..15 us; call_func / call_original on bp/hw +160..375 us (the target runs: extra debug events); control op (add_once, a one-shot return probe from the callback) ~120 us from bp/hw, ~228 us from inline (x64). Open findings from it: x86 bp/hw send_log_stack 0.77-1.1 ms per hit (StackWalk64 over WOW64); inline call_func ~2.7 us (symbol resolved + VirtualQuery per call); inline call_original ~0.9/1.4 us
+- ✅ Per-method, per-backend benchmark table (hit, get_reg/set_reg, get_mem, send_log, send_log_stack, call_func, control ops) -- `bench/BENCHMARKS.md` "Per-method cost" (bench2, 2026-11-08; `perf_ab.py --group methods`, `methods_table.py`; raw `bench/results/methods-2026-11-08/`; harness checked by regress `hitcost-methods-*`). x64 hit: breakpoint 78 us, hw 92 us, inline 65 ns; context ops without target memory ~0 on bp/hw, 1-16 ns inline; each bp/hw memory access +4..15 us; call_func / call_original on bp/hw +160..375 us (the target runs: extra debug events); control op (add_once, a one-shot return probe from the callback) ~120 us from bp/hw, ~228 us from inline (x64). Open findings from it: ~~x86 bp/hw send_log_stack 0.77-1.1 ms per hit (StackWalk64 over WOW64); inline call_func ~2.7 us (symbol resolved + VirtualQuery per call)~~ (fixed by perf6: 0.20/0.23 ms, 69-86 ns; "perf6 findings"); inline call_original ~0.9/1.4 us
 - ✅ main (f9f3436) vs merge-frida (034b245) vs agentscope (7f09697), per probe type x arch, 2026-11-07 --
   `bench/results/main-vs-merge-frida-2026-11-07.md` (harness `bench/perfab`: interleaved rounds, shared targets,
   quiet gate; `sampler.py` profiler). Breakpoint -22..-28% per hit (one event per hit); hw and hw data watch
@@ -2403,6 +2403,41 @@ windows-2022, and cet-hw).
   work=240/0/0, `hunt-twin-inline` hung). Residual, documented in limitations.md: UHH's threads
   run the program's thread-attach/detach callouts like any thread (launch: before the entry
   point; attach/detach: while the program runs).
+
+## perf6 findings (2026-11-08, branch `perf6`: the per-method table's outliers; regress `cdx-cfreuse-*`)
+
+Profiled with temporary QPC scopes (controller), then fixed; before/after in bench/BENCHMARKS.md "Update: perf6".
+1. **x86 bp/hw send_log_stack 0.77-1.13 ms** -- StackWalk64 read the target in ~170-280 ReadProcessMemory calls per
+   4-frame walk (~14 bytes each), ~50 of them failing (byte-wise probes of unmapped candidate return addresses), 2-8 us
+   each under WOW64. symbols.cpp `walk_read`: per-walk page copies (16 pages), a read inside an unreadable page fails
+   like ReadProcessMemory did there (0 bytes, same error) without a call; a read over a readable and an unreadable page
+   goes to ReadProcessMemory as asked. Not kept across walks. x86 0.20/0.23 ms, x64 159 -> 86 us. hw > bp on x86 was
+   one more walked frame (at a hw hit the walker decodes the real prologue, not our INT3, and finds the caller that
+   the bp path re-inserts from [esp]); same frames reported.
+2. **Log writer symbolization** (found on the way): every frame of every stack log through SymFromAddr + line lookup,
+   the same addresses each time; through the queue's backpressure the program waited on it. `uhh_sym::symbolize`
+   caches answers by address per session, cleared at every register/unregister (the only inputs). Inline
+   send_log_stack x64 6.9 -> 1.3 us.
+3. **Inline call_func 2.7 us** -- GetModuleHandleA + GetProcAddress + VirtualQuery per call. agent.cpp
+   `resolve_callee`: 64 seqlock slots keyed by the symbol string ("0x..." not cached), an entry valid while
+   `g_unload_gen` is what it was BEFORE the resolution; the loader's DLL notification (LdrRegisterDllNotification,
+   once per process at agent init; unregistered on a real unload of the agent) bumps it on every unload, before the
+   image is unmapped. 69 ns x64 / 86 ns x86. The executable check is cached with the entry (code that loses execute
+   rights while its module stays loaded is not re-checked -- the same trust as the get_mem read-region cache).
+   regress `cdx-cfreuse-<b>` (ctrlreview): cfr.dll A called, unloaded, cfr.dll B mapped at the same fixed base:
+   1 / refused / 2 on every backend; with the invalidation disabled it fails (99 = A's address in B).
+4. **x86 inline send_log_stack ~10 us** -- walk_x86 did a VirtualQuery (a WOW64 system call) per region per capture:
+   the thread's own stack and each module's code. Stack values are now classified from the TEB bounds; executable
+   IMAGE regions are kept across captures (16 seqlock slots) until `g_unload_gen` changes. ~2.9 us. Residual risk,
+   accepted as for the read-region cache: image code made NOACCESS/GUARD by the program while loaded.
+5. **Add from an inline callback ~100 us more than from bp/hw** -- one more debug event (the raised IPC exception):
+   inherent while the debug thread alone owns the session and the add must be armed when it returns. Trimmed: one
+   read of the IPC request instead of two; the "probe: ipc op=... -> 1" stderr line only on failure / PROBE_TRACE.
+   No measurable change in the table. Not touched: the add itself (~25-35 us: 4 syscalls in `patch()`, the
+   "probe: active" line).
+Checks: VM `--only stacks,hunt_stack,check_symbols,conformance,ctrl_review,cdx_review,callfunc,dynwatch,ret_probe,
+hitcost_methods,logs_format` x64 89/89, x86 89/89; after (4) x86 `stack,conformance,ctrl_review,logs_format,edgehunt,
+sidefx,transparency,detours_traceapi,dynwatch,cdx_review,callfunc` 149/149, x64 59/59. Agent protocol unchanged (v28).
 
 ## Real-world cases
 - ✅ Microsoft Detours samples replicated (`examples/famous/detours_*`: simple, traceapi, withdll/attach, retval) -- findings above
