@@ -555,13 +555,17 @@ def stream_volume_once(backend, calls, timeout):
 
 
 def check_stream_volume():
-    """The controller's peak must be independent of total streamed-log volume."""
+    """The controller's peak must be independent of total streamed-log volume. inline: two 2M runs
+    and one 20M run; flat = the 20M peak <= max(1.2 x, +8 MB over) the larger 2M peak. (A single 2M
+    run does not always reach the pipeline's plateau: 0fb6cee on the VM, x64, peaked 14 MB at 2M
+    and 22 MB at 20M in one of four runs, 22 -> 22 in the others; CI x86 18 -> 24. A leak of half a
+    byte per record still shows: +8 MB over the 18M extra records.)"""
     if not exe("hitcost_driver.exe") or not exe("hitcost_target.exe"):
         return missing_bin("stream-volume", "hitcost driver/target")
     for backend in ("inline", "hw", "breakpoint"):
         name = f"stream-volume-{backend}"
         try:
-            sizes = (2_000_000, 20_000_000) if backend == "inline" else (200_000,)
+            sizes = (2_000_000, 2_000_000, 20_000_000) if backend == "inline" else (200_000,)
             runs = [stream_volume_once(backend, n, 1800) for n in sizes]
             exact = all(not x["timeout"] and x["rc"] == 0 and x["logs"] == n and
                         x["hits"] == n and x["report"].get("logs_written") == n and
@@ -570,7 +574,7 @@ def check_stream_volume():
             peaks = [x["peak"] for x in runs]
             small = all(isinstance(p, (int, float)) and 0 < p <= 256 for p in peaks)
             flat = (backend != "inline" or
-                    (peaks[0] is not None and peaks[1] is not None and peaks[1] <= peaks[0] * 1.20))
+                    (small and peaks[2] <= max(max(peaks[:2]) * 1.20, max(peaks[:2]) + 8)))
             record(name, exact and small and flat,
                    " ".join(f"N={n:,} logs={x['logs']:,} hits={x['hits']} written={x['report'].get('logs_written')} "
                             f"drop={x['report'].get('log_dropped')} peak={x['peak']}MB rc={x['rc']}"
@@ -813,11 +817,11 @@ class _NoiseSampler:
         return worst
 
 
-def _trace_logstream_staged(backend, consume, file_seen, env=None, timeout=120):
+def _trace_logstream_staged(backend, consume, file_seen, env=None, timeout=120, tracer_name="uhh_trace.exe"):
     """trace_logstream, plus the session log file watched as it grows: file_seen[i] = QPC when
     LogSite(i)'s record was in the FILE (UHH writes each batch to the file, then to stdout), so a
     late record shows which stage held it: before the file (queue / writer) or after (stdout)."""
-    tracer, target = exe("uhh_trace.exe"), exe("logstream_target.exe")
+    tracer, target = exe(tracer_name), exe("logstream_target.exe")
     proc = subprocess.Popen([str(tracer), "--backend", backend, "-p", "logstream_target.exe!LogSite:d", "--",
                              str(target)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
                             env=env)
@@ -898,10 +902,12 @@ def check_stream_latency():
     -> stdout; disk_run_max = the longest 120-byte append the sampler saw in that temp dir.
     The controller's %TEMP% (where UHH puts its session file) is <build dir>/uhh-latency-tmp,
     next to the binaries: a local, AV-excluded directory on the test machines (the VM's
-    C:/work, the CI workspace). UHH writes every batch to that file BEFORE stdout, so a
-    stalling file write holds live records: in the user's %TEMP% a real-time AV scan of the
-    new file (VM: 180-430 ms at records #8-#10) or a slow disk (CI runners' C:: 50 ms-2.5 s)
-    -- a UHH design finding (docs/ROADMAP.md, CI section), not this check's subject."""
+    C:/work, the CI workspace). UHH wrote every batch to that file before (or beside) stdout on
+    one thread, so a stalling file write held live records: a real-time AV scan of the new file
+    in %TEMP% (VM: 180-430 ms at records #8-#10), a slow disk (CI runners' C:: 50 ms-2.5 s), the
+    cache manager flushing the new file ~1 s in (VM: 16 ms-1.5 s at record #8; the 327 ms FAIL
+    on 0fb6cee). Since codex3 #5 stdout comes first and the file has a thread of its own
+    (regress stream-filestall-*; docs/ROADMAP.md "Codex review 3")."""
     tracer, target = exe("uhh_trace.exe"), exe("logstream_target.exe")
     if not tracer or not target:
         return missing_bin("stream-latency", "uhh_trace/logstream_target")
@@ -986,6 +992,67 @@ def check_stream_latency():
         except Exception as e:
             if sampler and sampler.p.poll() is None:
                 sampler.p.kill()
+            record(name, False, repr(e))
+
+
+def check_stream_filestall():
+    """codex3 #5: a session-file write that stalls must not hold live records. The writer wrote
+    every batch to the session file before (forwarded target stdout) or beside (stdout_mu held)
+    stdout, on one thread: a WriteFile that blocked -- the cache manager flushing the new file
+    ~1 s after its creation, 16 ms to 1.5 s on the VM; an AV scan -- held every record queued
+    meanwhile, then released them together (stream-latency-breakpoint: records #8-#10 at
+    327/216/107 ms). Forced deterministically: uhh_trace_th (test-hook controller library),
+    UHH_TEST_FILE_STALL_MS=400 on the session file's 8th append, the logstream run of
+    stream-latency (LogSite every 100 ms, 50 calls). Per backend (breakpoint, inline): all 50
+    records, in order, nothing dropped; the stall is visible in the FILE (a record reached it
+    >= 300 ms late) but no record reached stdout more than 150 ms after its event."""
+    if not exe("uhh_trace_th.exe") or not exe("logstream_target.exe"):
+        return missing_bin("stream-filestall", "uhh_trace_th/logstream_target")
+    freq = _qpc_freq()
+    ms = lambda ticks: ticks * 1000.0 / freq
+    tmp = Path(BIN).resolve().parent / "uhh-latency-tmp"
+    tmp.mkdir(exist_ok=True)
+    env = dict(os.environ, TEMP=str(tmp), TMP=str(tmp), UHH_TEST_FILE_STALL_MS="400", UHH_TEST_FILE_STALL_AT="8")
+    n = 50
+    for backend in ("breakpoint", "inline"):
+        name = f"stream-filestall-{backend}"
+        ticks, logs, log_seq, objects, in_file = {}, {}, [], [], {}
+        try:
+            def consume(line, _arrival):
+                arrival = _qpc_now()
+                if not line.startswith("{"):
+                    return
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    return
+                if obj.get("kind") == "tick":
+                    ticks.setdefault(obj.get("i"), (arrival, obj.get("w"), obj.get("t")))
+                elif obj.get("kind") == "probe_log":
+                    m = re.fullmatch(r"LogSite\((-?\d+)\)", str(obj.get("message", "")))
+                    if m:
+                        log_seq.append(int(m.group(1))); logs.setdefault(int(m.group(1)), arrival)
+                else:
+                    objects.append(obj)
+
+            rc, timed_out = _trace_logstream_staged(backend, consume, in_file, env, tracer_name="uhh_trace_th.exe")
+            events = {i: ticks[i + 1][2] for i in range(n) if i + 1 in ticks and (ticks[i + 1][2] or 0) > 0}
+            lat = {i: ms(logs[i] - events[i]) for i in range(n) if i in logs and i in events}
+            to_file = {i: ms(in_file[i] - events[i]) for i in lat if i in in_file}
+            rep = report(objects)
+            worst = max(lat, key=lat.get) if lat else None
+            worst_file = max(to_file, key=to_file.get) if to_file else None
+            bad = []
+            if timed_out or rc != 0: bad.append(f"rc={rc} timeout={timed_out}")
+            if len(lat) != n or log_seq != list(range(n)): bad.append(f"pairs={len(lat)}/{n} in_order={log_seq == list(range(n))}")
+            if rep.get("logs_written") != n or rep.get("log_dropped") != 0:
+                bad.append(f"written={rep.get('logs_written')} dropped={rep.get('log_dropped')}")
+            if worst_file is None or to_file[worst_file] < 300: bad.append(f"stall not seen in the file (max to_file={to_file.get(worst_file)})")
+            if worst is None or lat[worst] >= 150: bad.append(f"stdout held: #{worst} {lat.get(worst, 0):.1f} ms")
+            record(name, not bad, " ".join(bad) or
+                   f"file stalled (#{worst_file} reached the file {to_file[worst_file]:.0f} ms late), stdout not: "
+                   f"worst #{worst} {lat[worst]:.1f} ms; 50/50 in order")
+        except Exception as e:
             record(name, False, repr(e))
 
 
@@ -6897,6 +6964,168 @@ def check_ctrl_review():
     except Exception as e:
         record("ctrl-headclamp", False, repr(e))
 
+def _agent_stamp(path):
+    """The warm-copy name of an agent file, exactly as session.cpp's agent_signature computes it:
+    volume serial, file index, size, write time, change time (hex)."""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                                wintypes.DWORD, wintypes.HANDLE]
+
+    class BHFI(ctypes.Structure):
+        _fields_ = [("attr", wintypes.DWORD), ("c", wintypes.FILETIME), ("a", wintypes.FILETIME), ("w", wintypes.FILETIME),
+                    ("vol", wintypes.DWORD), ("sizeh", wintypes.DWORD), ("sizel", wintypes.DWORD), ("links", wintypes.DWORD),
+                    ("idxh", wintypes.DWORD), ("idxl", wintypes.DWORD)]
+
+    class FBI(ctypes.Structure):
+        _fields_ = [("ct", ctypes.c_longlong), ("la", ctypes.c_longlong), ("lw", ctypes.c_longlong), ("chg", ctypes.c_longlong),
+                    ("attr", wintypes.DWORD)]
+
+    h = k32.CreateFileW(str(path), 0x80000000, 1 | 4, None, 3, 0, None)
+    if h in (None, wintypes.HANDLE(-1).value):
+        raise OSError(f"open {path}: {ctypes.get_last_error()}")
+    try:
+        bi, fb = BHFI(), FBI()
+        if not k32.GetFileInformationByHandle(h, ctypes.byref(bi)) or \
+           not k32.GetFileInformationByHandleEx(h, 0, ctypes.byref(fb), ctypes.sizeof(fb)):
+            raise OSError(f"query {path}: {ctypes.get_last_error()}")
+    finally:
+        k32.CloseHandle(h)
+    return (f"{bi.vol:08x}{bi.idxh:08x}{bi.idxl:08x}{bi.sizeh:08x}{bi.sizel:08x}{bi.w.dwHighDateTime:08x}"
+            f"{bi.w.dwLowDateTime:08x}{fb.chg & 0xffffffffffffffff:016x}")
+
+
+def check_ctrl_warm():
+    """codex3 #2: perf5's warm agent copies (%TEMP%\\uhh\\warm\\<sig>-*) were taken on the name alone (sig =
+    the agent file's size and write time) and loaded into controller and target.
+      ctrl-warm-identity: (a) a copy named for this agent's size and write time but made from another
+        build (the agent with one DOS-stub byte changed) must not be used; (b) a copy under this
+        agent's full version stamp (volume, file id, size, write time, change time) that is not a
+        complete trimmed image of it (here: the untrimmed agent with that byte changed) is rejected
+        and deleted; the first session makes a new copy (agent_copy_kind new) and works; a later
+        session takes the genuine warm copy the first one left (agent_copy_kind warm: perf5's gain).
+      ctrl-warm-acl: under a %TEMP% whose ACL lets Everyone write, no warm copy is made or taken
+        (three sessions: all new, no ready copy left), the sessions work.
+    Each session: lifecycle_driver attaches to a lifecycle_target with an inline read probe for
+    ~1.5 s (long enough for the warm copy it starts), then detaches; TMP/TEMP point at the check's
+    own directory."""
+    agent = exe("probe_api_agent.dll")
+    if not exe("lifecycle_driver.exe") or not exe("lifecycle_target.exe") or not agent:
+        return missing_bin("ctrl-warm", "lifecycle_driver / lifecycle_target / probe_api_agent")
+    import tempfile
+    st = os.stat(agent)
+    ft = st.st_mtime_ns // 100 + 116444736000000000
+    old_sig = f"{st.st_size >> 32:08x}{st.st_size & 0xffffffff:08x}{ft >> 32:08x}{ft & 0xffffffff:08x}"
+    sig = _agent_stamp(agent)
+
+    def session(tmp):
+        tg = d = None
+        bad = []
+        try:
+            tg = LcTarget("--threads", 1)
+            d = LcDriver(tg.pid, dict(read="inline"), "--detach-on-stdin",
+                         env={"TMP": str(tmp), "TEMP": str(tmp), "UHH_BENCH_PHASES": "1"})
+            if not d.wait_attached() or not d.wait_active():
+                bad.append(f"not active: {d.errors()}")
+            time.sleep(1.5)
+            try:
+                d.detach()
+            except OSError:
+                pass
+            fin_ok = d.finish(timeout=60)
+            ok_logs, fin = lc_logs_ok(d)
+            a = tg.quit()
+            if not fin_ok or d.p.returncode != 0: bad.append(f"driver rc={d.p.returncode} finished={fin_ok}")
+            if not ok_logs or not fin or not fin[1]: bad.append(f"logs={d.logs} final={fin}")
+            if not lc_clean(a) or a.get("rc") != 0: bad.append(f"quit rc={a.get('rc')} {lc_brief(a)}")
+            kinds = [l.split()[3] for l in d.err.lines if l.split()[2:3] == ["agent_copy_kind"] and len(l.split()) > 3]
+            rejected = sum(1 for l in d.err.lines if " agent_warm_rejected" in l)
+            return (kinds[0] if kinds else None), rejected, bad
+        finally:
+            if d: d.kill()
+            if tg: tg.kill()
+
+    def ready(warm):
+        return [p for p in warm.glob(sig + "-*") if p.is_dir()] if warm.is_dir() else []
+
+    base = Path(tempfile.mkdtemp(prefix="uhhwarm-"))
+    try:
+        try:
+            tmp = base / "id"; warm = tmp / "uhh" / "warm"
+            img = bytearray(Path(agent).read_bytes()); img[0x50] ^= 0x01
+            stale, corrupt = warm / f"{old_sig}-1-1-1", warm / f"{sig}-1-1-2"
+            for d in (stale, corrupt):
+                d.mkdir(parents=True)
+                (d / "probe_api_agent.dll").write_bytes(bytes(img))
+            kind1, rej1, bad = session(tmp)
+            if kind1 != "new": bad.append(f"first session took kind={kind1} (a planted copy)")
+            if rej1 < 1: bad.append("the corrupt copy under this build's stamp was not rejected")
+            if corrupt.exists(): bad.append("the rejected copy is still there")
+            kinds = []
+            for _ in range(3):                       # the genuine copy an earlier session left behind
+                for _w in range(40):
+                    if ready(warm): break
+                    time.sleep(0.25)
+                k, rej, b2 = session(tmp)
+                bad += b2; kinds.append((k, rej))
+                if k == "warm": break
+            if not kinds or kinds[-1] != ("warm", 0): bad.append(f"later sessions={kinds} (want a verified warm take)")
+            record("ctrl-warm-identity", not bad, " ".join(bad) or
+                   f"stale-build copy not taken, corrupt copy rejected and deleted (first: {kind1}, rejected={rej1}); "
+                   f"later sessions {kinds}")
+        except Exception as e:
+            record("ctrl-warm-identity", False, repr(e))
+        try:
+            tmp = base / "acl"; tmp.mkdir()
+            g = subprocess.run(["icacls", str(tmp), "/grant", "*S-1-1-0:(OI)(CI)F"], capture_output=True, text=True)
+            kinds, bad = [], []
+            if g.returncode != 0: bad.append(f"icacls rc={g.returncode} {g.stdout.strip()[:120]}")
+            for _ in range(3):
+                k, rej, b2 = session(tmp)
+                bad += b2; kinds.append(k)
+            if kinds != ["new"] * 3: bad.append(f"kinds={kinds} (want new x3: no warm copies in a shared directory)")
+            if ready(tmp / "uhh" / "warm"): bad.append("a warm copy was made in the shared directory")
+            record("ctrl-warm-acl", not bad, " ".join(bad) or f"Everyone-writable %TEMP%: kinds={kinds}, no warm copy")
+        except Exception as e:
+            record("ctrl-warm-acl", False, repr(e))
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def check_ctrl_symload():
+    """codex3 #4 (claim: not a bug, kept as a guard): probe_session_create starts a detached thread
+    that locates and loads dbghelp (symbols.cpp preload); the review claimed a host DLL that links
+    UHH statically, creates and closes an unlaunched session and is unloaded at once would unmap
+    the code that thread runs. It does not: std::thread starts it through the CRT's
+    _beginthreadex, which holds a reference to the module of the thread procedure until the thread
+    exits. ctrl-symload-unload: symhost_loop loads symhost.dll (UHH linked in), runs create+close,
+    unloads it -- 40 times as is, then 3 times with the preload held 300 ms (test hook
+    UHH_TEST_PRELOAD_DELAY_MS: certainly still running at the unload): no crash, every run ok; with
+    the delay the DLL is still mapped right after each FreeLibrary (held == runs: the thread's
+    reference) and really unmapped once the thread is done (gone)."""
+    name = "ctrl-symload-unload"
+    loop, dll = exe("symhost_loop.exe"), exe("symhost.dll")
+    if not loop or not dll:
+        return missing_bin(name, "symhost_loop / symhost")
+    bad, got = [], []
+    try:
+        for n, delay in ((40, None), (3, "300")):
+            env = dict(os.environ)
+            if delay: env["UHH_TEST_PRELOAD_DELAY_MS"] = delay
+            r = subprocess.run([str(loop), str(dll), str(n)], capture_output=True, text=True, timeout=120, env=env)
+            res = next((json.loads(l) for l in r.stdout.splitlines() if l.startswith('{"kind":"symhost"')), {})
+            crash = next((l for l in r.stdout.splitlines() if '"unhandled"' in l), None)
+            got.append((n, delay, r.returncode, res.get("ok"), res.get("held"), res.get("gone")))
+            if r.returncode != 0 or crash: bad.append(f"n={n} delay={delay}: exit=0x{r.returncode & 0xffffffff:x} {crash or ''}")
+            elif res.get("ok") != n or res.get("gone") != 1 or (delay and res.get("held") != n):
+                bad.append(f"n={n} delay={delay}: {res}")
+        record(name, not bad, " ".join(bad) or f"(n, delay, rc, ok, held, gone)={got}")
+    except Exception as e:
+        record(name, False, repr(e))
+
+
 def check_cdx_review():
     """Codex review of the controller (docs/ROADMAP.md "Codex controller review"), fixture
     examples/ctrlreview, ONE callback source per check, every backend:
@@ -7643,7 +7872,7 @@ def lc_brief(c):
 class LcDriver:
     """lifecycle_driver: stdout probe_log lines are only COUNTED (never kept)."""
 
-    def __init__(self, pid, cfg, *extra, group=False, driver="lifecycle_driver.exe", env=None):
+    def __init__(self, pid, cfg, *extra, group=False, driver="lifecycle_driver.exe", env=None, keep=False):
         args = [str(exe(driver)), str(pid)]
         for k in ("open", "close", "read", "flag", "slow", "work"):
             args += [f"--{k}", cfg.get(k, "none")]
@@ -7653,6 +7882,7 @@ class LcDriver:
                                   creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if group else 0,
                                   env=dict(os.environ, **env) if env else None)
         self.logs, self.other, self.cv = 0, [], threading.Condition()
+        self.keep, self.loglines = keep, []                 # keep: the probe_log lines too (short runs only)
         self.t = threading.Thread(target=self._pump, daemon=True); self.t.start()
         self.err = Lines(self.p.stderr)
 
@@ -7661,6 +7891,7 @@ class LcDriver:
             with self.cv:
                 if line.startswith('{"kind":"probe_log"'):
                     self.logs += 1
+                    if self.keep: self.loglines.append(line)
                 else:
                     self.other.append(line.rstrip("\r\n"))
                 self.cv.notify_all()
@@ -8134,6 +8365,60 @@ def lc_unload_unseen(cfgname, cfg):
         if tg: tg.kill()
 
 
+def lc_unload_reused(cfgname, cfg):
+    """codex3 #1: a detach while a hooked DLL's unload has not been processed AND other
+    executable code now occupies its old address (JIT-style memory committed over the freed
+    range; equally a different image mapped at the same base). The agent's final unhook only
+    checked "mapped executable and not the original bytes", so it wrote hunt_dll's original
+    bytes over the NEW code -- program corruption. Forced deterministically as in
+    lifecycle-unload-unseen (UHH_TEST_DEFER_UNLOAD=hunt_dll.dll) plus the target's dllreuse
+    (0x90 code over the whole old range). After the detach every byte of that range must still
+    be 0x90, the target alive and clean, every log delivered. Every config (breakpoint: the
+    INT3 restore only writes over our own 0xCC; hw: nothing to write)."""
+    name = f"lifecycle-unload-reused-{cfgname}"
+    if not exe("lifecycle_driver_th.exe"):
+        return missing_bin(name, "lifecycle_driver_th")
+    tg = d = None
+    try:
+        tg = LcTarget("--threads", 2)
+        dcfg = dict(cfg, work="breakpoint" if cfg["read"] == "hw" else cfg["read"])   # hw: keep a DR free
+        d = LcDriver(tg.pid, dcfg, "--detach-on-stdin", driver="lifecycle_driver_th.exe",
+                     env={"UHH_TEST_DEFER_UNLOAD": "hunt_dll.dll"})
+        if not d.wait_attached() or not d.wait_active(n=d.probes - 1):        # HuntWork: pending (not loaded)
+            raise RuntimeError(f"not active: {d.errors()}")
+        once = tg._cmd("dllreuse", "dllreuse")
+        active = d.err.wait_for(lambda l: l.startswith("probe: active hunt_dll.dll!HuntWork"), 10)
+        deferred = d.err.wait_for(lambda l: l.startswith("probe: test: unload of hunt_dll.dll left unprocessed"), 10)
+        before = tg._cmd("reusecheck", "reusecheck")
+        time.sleep(0.3)
+        d.detach()
+        fin_ok = d.finish(timeout=120)
+        ok_logs, fin = lc_logs_ok(d)
+        after = tg._cmd("reusecheck", "reusecheck")
+        c = tg.check()
+        a = tg.quit()
+        work_logs = fin is not None and fin[0] > 0
+        bad = []
+        if once.get("mapped") != 0 or not once.get("work") or not once.get("reused"): bad.append(f"dllreuse={once}")
+        if before.get("diff") != 0 or not before.get("len"): bad.append(f"before detach={before}")
+        if after.get("diff") != 0: bad.append(f"NEW CODE OVERWRITTEN at detach: {after}")
+        if not active: bad.append("HuntWork never went active")
+        if not deferred: bad.append("the unload was not deferred (test hook)")
+        if not fin_ok or d.p.returncode != 0: bad.append(f"driver rc={d.p.returncode} finished={fin_ok}")
+        if not ok_logs or not work_logs: bad.append(f"logs={d.logs} final={fin}")
+        if not lc_clean(c): bad.append(lc_brief(c))
+        if not lc_clean(a) or a.get("rc") != 0: bad.append(f"quit rc={a.get('rc')} {lc_brief(a)}")
+        record(name, not bad, " ".join(bad) + ("" if not bad else f" unhandled={tg.unhandled()} stderr_tail="
+                                               f"{[l[:200] for l in d.err.lines if not l.startswith('probe: active')][-10:]}")
+               or f"HuntWork hooked, hit (work={once.get('work')}), unloaded unseen, {after.get('len')} bytes of new "
+                  f"code over its range untouched by the detach; logs={d.logs} final={fin} target alive, exit 0")
+    except Exception as e:
+        record(name, False, repr(e))
+    finally:
+        if d: d.kill()
+        if tg: tg.kill()
+
+
 def lc_install_stuck(cfgname, cfg):
     """Detach while the agent's remote work cannot run: the target holds its loader lock, so the
     agent init thread a re-attach starts cannot even begin before the detach gives up waiting
@@ -8214,6 +8499,64 @@ def lc_killed_in_freeze(cfgname, cfg, repeats=5):
     record(f"lifecycle-killed-in-freeze-{cfgname}", not bad, f"cases={n}" + (f" bad={bad[:3]}" if bad else ""))
 
 
+def check_ctrl_pack_oom():
+    """codex3 #3: an allocation failure while the drainer packs an agent-ring record (header
+    appended, text/frames throw) left the partial record in the pack: every later entry of that
+    pack misparsed (garbage / foreign text, lengths read past the pack). Test hook
+    UHH_TEST_PACK_FAIL=n (probe_api_testhooks) throws std::bad_alloc after every n-th record's
+    header. lifecycle_driver_th, inline open/close/read/flag on a 4-thread lifecycle_target,
+    ~4 s: every log line must be valid JSON whose message is one this driver's callbacks write
+    (printable, known prefix), log_dropped == the number of injected failures (> 0), logs written
+    == lines received, the target clean."""
+    name = "ctrl-pack-oom"
+    if not exe("lifecycle_driver_th.exe") or not exe("lifecycle_target.exe"):
+        return missing_bin(name, "lifecycle_driver_th / lifecycle_target")
+    tg = d = None
+    try:
+        tg = LcTarget("--threads", 4)
+        cfg = dict(open="inline", close="inline", read="inline", flag="inline")
+        d = LcDriver(tg.pid, cfg, "--detach-on-stdin", driver="lifecycle_driver_th.exe",
+                     env={"UHH_TEST_PACK_FAIL": "37"}, keep=True)
+        if not d.wait_attached() or not d.wait_active():
+            raise RuntimeError(f"not active: {d.errors()}")
+        time.sleep(4.0)
+        try:
+            d.detach()
+        except OSError:
+            pass                                      # the driver died already (reported below)
+        fin_ok = d.finish(timeout=120)
+        acc = d.accounting() or {}
+        c = tg.check()
+        a = tg.quit()
+        injected = sum(1 for l in d.err.lines if l.startswith("probe: test: pack append failed"))
+        known = re.compile(r"^(flag flipped in memory at 0x[0-9a-f]+|open pid=\d+ |map handle=0x[0-9a-f]+ -> pid=\d+ |"
+                           r"read handle=0x[0-9a-f]+ pid=\d+ |callfunc ok=|recurse ok=)[ -~]*$")
+        badlines, msgs = [], 0
+        for l in d.loglines:
+            try:
+                m = json.loads(l).get("message")
+            except json.JSONDecodeError:
+                badlines.append(l[:120]); continue
+            msgs += 1
+            if not isinstance(m, str) or not known.match(m): badlines.append(repr(m)[:120])
+        bad = []
+        if not fin_ok or d.p.returncode != 0:
+            bad.append(f"driver rc=0x{(d.p.returncode or 0) & 0xffffffff:x} finished={fin_ok} "
+                       f"stderr_tail={[l[:160] for l in d.err.lines if 'pack append' not in l][-4:]}")
+        if injected < 3: bad.append(f"injected={injected} (want several)")
+        if badlines: bad.append(f"malformed_logs={len(badlines)} e.g. {badlines[:3]}")
+        if acc.get("log_dropped") != injected: bad.append(f"log_dropped={acc.get('log_dropped')} want {injected}")
+        if acc.get("logs_written") != d.logs: bad.append(f"logs_written={acc.get('logs_written')} lines={d.logs}")
+        if not lc_clean(c) or not lc_clean(a) or a.get("rc") != 0: bad.append(f"target {lc_brief(c)} quit={a.get('rc')}")
+        record(name, not bad, " ".join(bad) or
+               f"{d.logs} logs all well-formed, {injected} injected pack failures = log_dropped, target clean")
+    except Exception as e:
+        record(name, False, repr(e))
+    finally:
+        if d: d.kill()
+        if tg: tg.kill()
+
+
 def check_lifecycle():
     """Lifecycle edge cases (examples/lifecycle) under every backend and mixed: repeated
     attach/detach/re-attach, detach at awkward moments, the target dying under the controller,
@@ -8223,7 +8566,7 @@ def check_lifecycle():
         return missing_bin("lifecycle", "lifecycle_driver / lifecycle_target / hunt_dll")
     for cfgname, cfg in LC_CONFIGS.items():
         for fn in (lc_reattach, lc_detach_cases, lc_target_dies, lc_two_controllers, lc_interrupt, lc_controller_killed,
-                   lc_killed_in_freeze, lc_agent_refused, lc_install_stuck, lc_unload_unseen):
+                   lc_killed_in_freeze, lc_agent_refused, lc_install_stuck, lc_unload_unseen, lc_unload_reused):
             tag = fn.__name__[3:].replace("_", "-")
             if fn is lc_detach_cases or lc_selected(f"lifecycle-{tag}-{cfgname}"):
                 fn(cfgname, cfg)
@@ -11223,6 +11566,9 @@ def main():
     if args.soak_minutes > 0:
         if want(check_soak): check_soak(args.soak_minutes)
     if want(check_ctrl_review): check_ctrl_review()
+    if want(check_ctrl_warm): check_ctrl_warm()
+    if want(check_stream_filestall): check_stream_filestall()
+    if want(check_ctrl_symload): check_ctrl_symload()
     if want(check_cdx_review): check_cdx_review()
     if want(check_newapp_files): check_newapp_files()
     if want(check_newapp_flag): check_newapp_flag()
@@ -11235,6 +11581,7 @@ def main():
     if want(check_logs_stdout_closed): check_logs_stdout_closed()
     if want(check_inplace_shapes): check_inplace_shapes()
     if want(check_lifecycle): check_lifecycle()
+    if want(check_ctrl_pack_oom): check_ctrl_pack_oom()
     if want(check_cet_sde): check_cet_sde()
     if want(check_cxlib): check_cxlib()
     if want(check_cx2_review): check_cx2_review()

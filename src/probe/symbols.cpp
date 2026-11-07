@@ -563,11 +563,20 @@ BOOL CALLBACK collect_symbol(PSYMBOL_INFOW symbol, ULONG size, PVOID user) noexc
 // dbghelp is located and loaded (~40 ms: registry and file probing, the DLL's own load) on a
 // background thread as soon as a session is created, so that overlaps the session's other
 // setup; init waits for it (g_mutex). Once per process.
+// Detached, yet it cannot outlive the module UHH is linked into (codex3 #4, checked: regress
+// ctrl-symload-unload): std::thread starts it with the CRT's _beginthreadex, which takes a
+// reference to the module holding the thread procedure (GetModuleHandleExW FROM_ADDRESS) and
+// drops it as the thread exits (FreeLibraryAndExitThread). A host DLL that links UHH, closes an
+// unlaunched session and is unloaded at once stays mapped until this thread is done.
 void preload() {
     static std::once_flag once;
     std::call_once(once, [] {
         try {
             std::thread([] {
+#if defined(UHH_TEST_HOOKS)
+                // Test-only (probe_api_testhooks): still running when its host DLL is unloaded.
+                if (const char *v = std::getenv("UHH_TEST_PRELOAD_DELAY_MS")) Sleep((DWORD)std::strtoul(v, nullptr, 10));
+#endif
                 std::lock_guard<std::mutex> lock(g_mutex);
                 load_dbghelp();
             }).detach();

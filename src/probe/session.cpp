@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <charconv>
 #include <vector>
+#include <array>
 #include <Zydis/Zydis.h>
 #include "symbols.hpp"   // dbghelp+symsrv loaded dynamically; honours _NT_SYMBOL_PATH
 #include <tlhelp32.h>
@@ -43,6 +44,8 @@ static BOOL uhh_set_thread_context(HANDLE h, const CONTEXT *c) {
 }
 #define SetThreadContext uhh_set_thread_context
 #pragma comment(lib, "psapi.lib")
+#include <aclapi.h>
+#pragma comment(lib, "advapi32.lib")
 
 struct Probe {
     std::string location, module, callback_export;
@@ -236,6 +239,17 @@ struct probe_session {
     std::mutex stdout_mu;                      // whole-line stdout writes: log batches vs report lines
     std::condition_variable tail_changed, tail_caught_up;
     uint64_t log_bytes_written = 0, log_bytes_tailed = 0;
+    uint64_t log_bytes_produced = 0;           // tail_mu: bytes handed to the session file (>= log_bytes_written)
+    // The session file's appender (live tail only, see write_log_batch): the writer hands it each
+    // batch after stdout, so a stalled file write never holds live records.
+    std::thread log_filer;
+    std::mutex file_mu;                        // never held while taking another lock
+    std::condition_variable file_cv, file_idle;
+    std::deque<std::string> file_queue;
+    std::vector<std::string> file_spare;       // appended chunks, emptied, for the writer to reuse (no allocation churn)
+    size_t file_queued = 0;                    // bytes in file_queue
+    bool file_stop = false, file_busy = false, file_failed = false;
+    std::string file_error;
     bool tail_stop = false, tail_failed = false, console_warning = false;
     bool live_output_closed = false;           // stdout's reader went away: a warning, not an error
     std::string tail_error;
@@ -639,6 +653,7 @@ struct AgentMapCache;
 static void enqueue_agent_record(probe_session *s, const probe_agent_log &rec);
 static void flush_log_writer(probe_session *s, bool up_to_now = false);
 static void stop_log_output(probe_session *s);
+static void stop_log_filer(probe_session *s);
 static void forward_finish(probe_session *s);
 static void forward_stop(probe_session *s);
 static void release_hw(probe_session *s, Probe &p);
@@ -770,6 +785,92 @@ static void writer_failed(probe_session *s, const std::string &message, uint64_t
 static bool write_stdout_chunk(probe_session *s, const char *bytes, size_t size, uint64_t records);
 static void tail_catch_up_locked(probe_session *s, const char *fresh, size_t fresh_size, uint64_t fresh_end);
 static bool write_stdout_locked(probe_session *s, const char *bytes, size_t size, uint64_t records);
+#if defined(UHH_TEST_HOOKS)
+// Test-only (probe_api_testhooks): UHH_TEST_FILE_STALL_MS=<ms> stalls the session file's
+// UHH_TEST_FILE_STALL_AT-th append (default 8) that long, as a cache-manager flush or an AV scan
+// of the file does (regress stream-filestall-*).
+static void test_file_stall() {
+    static const long ms = [] { const char *v = std::getenv("UHH_TEST_FILE_STALL_MS"); return v ? std::atol(v) : 0L; }();
+    static const long at = [] { const char *v = std::getenv("UHH_TEST_FILE_STALL_AT"); return v ? std::atol(v) : 8L; }();
+    static std::atomic<long> n{0};
+    if (ms > 0 && ++n == at) Sleep((DWORD)ms);
+}
+#endif
+// A batch into the session file, here and now. tail_mu not held.
+static bool append_log_file(probe_session *s, const char *bytes, size_t size, std::string *error) {
+#if defined(UHH_TEST_HOOKS)
+    test_file_stall();
+#endif
+    DWORD wrote = 0;
+    if (s->log_file == nullptr || s->log_file == INVALID_HANDLE_VALUE || size > MAXDWORD ||
+        !WriteFile(s->log_file, bytes, (DWORD)size, &wrote, nullptr) || (size_t)wrote != size) {
+        if (error) *error = win_error("write probe log file");
+        return false;
+    }
+    g_diag_file_writes++; g_diag_file_bytes += size;
+    return true;
+}
+
+// Live tail: the session file's appender thread. Appends the batches the writer handed over, in
+// order; then, if stdout is behind the file (records deferred while the target was inside one of
+// its lines), replays them as the forwarder would (tail_catch_up_locked reads the file).
+// Bytes handed over and not appended yet; beyond, the writer waits (stdout with it). 1 MB: thousands of
+// live records ride out a stalled file, and a full-speed stream keeps a flat footprint -- the chunks
+// are recycled (file_spare), never allocated per batch (regress stream-volume-inline: peak <= 1.2x
+// from 2M to 20M records; a 16 MB, then a 2 MB queue of fresh copies grew x86 18 -> 24 MB on CI).
+static constexpr size_t FILE_QUEUE_CAP = 1u << 20;
+static constexpr size_t FILE_SPARE_MAX = 24;
+static void log_filer_main(probe_session *s) {
+    for (;;) {
+        std::string chunk;
+        {
+            std::unique_lock<std::mutex> lock(s->file_mu);
+            s->file_cv.wait(lock, [s] { return s->file_stop || !s->file_queue.empty(); });
+            if (s->file_queue.empty()) break;
+            chunk = std::move(s->file_queue.front());
+            s->file_queue.pop_front();
+            s->file_busy = true;
+        }
+        std::string error;
+        bool ok;
+        {
+            std::lock_guard<std::mutex> lock(s->file_mu);
+            ok = !s->file_failed;                        // after a failure: discarded, never half a file
+        }
+        if (ok) ok = append_log_file(s, chunk.data(), chunk.size(), &error);
+        bool behind = false;
+        if (ok) {
+            std::lock_guard<std::mutex> lock(s->tail_mu);
+            s->log_bytes_written += chunk.size();
+            behind = s->log_bytes_tailed < s->log_bytes_written && s->tail_enabled && !s->tail_failed;
+        }
+        if (behind && s->fwd_out_active) {
+            std::lock_guard<std::mutex> out_lock(s->stdout_mu);
+            tail_catch_up_locked(s, nullptr, 0, 0);
+        }
+        {
+            std::lock_guard<std::mutex> lock(s->file_mu);
+            s->file_queued -= chunk.size();
+            s->file_busy = false;
+            if (!ok && !s->file_failed) { s->file_failed = true; s->file_error = error; }
+            chunk.clear();                                // keeps its capacity
+            if (s->file_spare.size() < FILE_SPARE_MAX) s->file_spare.push_back(std::move(chunk));
+        }
+        s->file_idle.notify_all();
+        { std::lock_guard<std::mutex> lock(s->tail_mu); }  // no lost wakeup for flush_log_writer
+        s->tail_caught_up.notify_all();
+    }
+}
+
+// Wait until the appender has appended everything handed to it (the file is complete up to now).
+// False: an append failed (file_error says why).
+static bool wait_log_file(probe_session *s) {
+    if (!s->log_filer.joinable()) return true;
+    std::unique_lock<std::mutex> lock(s->file_mu);
+    s->file_idle.wait(lock, [s] { return s->file_queue.empty() && !s->file_busy; });
+    return !s->file_failed;
+}
+
 static bool write_log_batch(probe_session *s, const std::string &bytes, uint64_t records) {
     if (bytes.empty()) return true;
     // Live output: the SAME batch goes to stdout right away, from this thread (the
@@ -778,46 +879,89 @@ static bool write_log_batch(probe_session *s, const std::string &bytes, uint64_t
     // A stdout that stops taking data (the reader closed the pipe: `| head`) ends the live
     // tail only -- reported once -- never the file: the file stays the complete record and
     // no log is counted lost for a reader that went away.
-    // stdout BEFORE the file: a file write held up (real-time AV scanning the growing file in
-    // %TEMP%) held live output 0.1-2.5 s and released it in bursts (CI and VM, reproduced);
-    // stdout no longer waits for the file. stdout_mu is held across both writes, so a report
-    // (which holds stdout_mu) sees a batch on stdout and in logs_written, or in neither.
+    // stdout BEFORE the file, and the file NOT on this thread: a session-file WriteFile that
+    // extends the file can block for as long as the cache manager is flushing it -- 16 ms to
+    // 1.5 s seen on the VM, mostly ~1 s after the file was created (the lazy writer's first
+    // pass; real-time AV scanning a file in %TEMP% did the same, 0.1-2.5 s) -- and every record
+    // queued meanwhile waited behind it, then all went out at once (regress
+    // stream-latency-breakpoint: records #8-#10 held 110-330 ms, codex3 #5). The writer now
+    // writes stdout and hands the batch to the appender thread (log_filer_main), so a stalled
+    // file holds only the file. Also through a forwarded target stdout: the batch goes out at
+    // once when stdout is at a line boundary of the target and nothing is deferred; otherwise
+    // it waits in the file and the appender (or the forwarder, at the target's newline) replays
+    // it. stdout_mu is held from the stdout write to logs_written, so a report (which holds
+    // stdout_mu) sees a batch on stdout and in logs_written, or in neither. Without a live tail
+    // (stdout is NUL) the file is the output and is written here, as before.
     bool tail;
     {
         std::lock_guard<std::mutex> lock(s->tail_mu);
         tail = s->tail_enabled && !s->tail_failed;
     }
-    const bool direct = tail && !s->fwd_out_active;
-    std::unique_lock<std::mutex> out_lock(s->stdout_mu, std::defer_lock);
-    if (direct) {
-        out_lock.lock();
-        if (!write_stdout_locked(s, bytes.data(), bytes.size(), records)) tail = false;   // tail_failed() said why
+    if (!tail || !s->log_filer.joinable()) {
+        if (!wait_log_file(s)) { writer_failed(s, s->file_error, records); return false; }   // in order behind the appender
+        std::string error;
+        if (!append_log_file(s, bytes.data(), bytes.size(), &error)) { writer_failed(s, error, records); return false; }
+        s->logs_written.fetch_add(records, std::memory_order_relaxed);
+        { std::lock_guard<std::mutex> lock(s->queue_mu); }   // no lost wakeup: a live probe_report waits for a mark
+        s->queue_flushed.notify_all();
+        uint64_t end = 0;
+        bool direct = false;
+        {
+            std::lock_guard<std::mutex> lock(s->tail_mu);
+            end = s->log_bytes_produced = s->log_bytes_written += bytes.size();
+            direct = tail && !s->tail_failed;
+        }
+        if (direct && s->fwd_out_active) {               // (no appender thread: the old path)
+            std::lock_guard<std::mutex> fwd_lock(s->stdout_mu);
+            tail_catch_up_locked(s, bytes.data(), bytes.size(), end);
+        } else if (direct) {
+            std::lock_guard<std::mutex> out_lock(s->stdout_mu);
+            if (write_stdout_locked(s, bytes.data(), bytes.size(), records)) {
+                std::lock_guard<std::mutex> lock(s->tail_mu);
+                s->log_bytes_tailed = s->log_bytes_written;
+            }
+        }
+        s->tail_changed.notify_one();
+        s->tail_caught_up.notify_all();
+        return true;
     }
-    DWORD wrote = 0;
-    if (s->log_file == nullptr || s->log_file == INVALID_HANDLE_VALUE ||
-        bytes.size() > MAXDWORD ||
-        !WriteFile(s->log_file, bytes.data(), (DWORD)bytes.size(), &wrote, nullptr) ||
-        (size_t)wrote != bytes.size()) {
-        writer_failed(s, win_error("write probe log file"), records);
-        return false;
+    std::string copy;
+    {   // room in the appender's queue (never waited for under stdout_mu: the appender takes it)
+        std::unique_lock<std::mutex> lock(s->file_mu);
+        s->file_idle.wait(lock, [s] { return s->file_queued < FILE_QUEUE_CAP || s->file_failed; });
+        if (s->file_failed) {
+            const std::string error = s->file_error;
+            lock.unlock();
+            writer_failed(s, error, records);
+            return false;
+        }
+        if (!s->file_spare.empty()) { copy = std::move(s->file_spare.back()); s->file_spare.pop_back(); }
     }
-    g_diag_file_writes++; g_diag_file_bytes += bytes.size();
-    s->logs_written.fetch_add(records, std::memory_order_relaxed);
-    { std::lock_guard<std::mutex> lock(s->queue_mu); }   // no lost wakeup: a live probe_report waits for a mark
-    s->queue_flushed.notify_all();
-    uint64_t end = 0;
+    try { copy.assign(bytes); }
+    catch (...) { writer_failed(s, "probe log writer: out of memory", records); return false; }
+    std::unique_lock<std::mutex> out_lock(s->stdout_mu);
+    bool now;
     {
         std::lock_guard<std::mutex> lock(s->tail_mu);
-        end = s->log_bytes_written += bytes.size();
-        if (direct && tail) s->log_bytes_tailed = s->log_bytes_written;
+        now = s->log_bytes_tailed == s->log_bytes_produced && !s->tail_failed;
     }
-    if (direct) out_lock.unlock();
-    if (tail && s->fwd_out_active) {
-        // The target's stdout is forwarded: the batch goes out only at a line boundary of it
-        // (records deferred behind an unfinished target line are replayed from the file).
-        std::lock_guard<std::mutex> fwd_lock(s->stdout_mu);
-        tail_catch_up_locked(s, bytes.data(), bytes.size(), end);
+    if (now && s->fwd_out_active && s->out_midline.load()) now = false;   // deferred: replayed at the target's newline
+    if (now && !write_stdout_locked(s, bytes.data(), bytes.size(), records)) now = false;   // tail_failed() said why
+    {
+        std::lock_guard<std::mutex> lock(s->tail_mu);
+        s->log_bytes_produced += bytes.size();
+        if (now) s->log_bytes_tailed = s->log_bytes_produced;
     }
+    {
+        std::lock_guard<std::mutex> lock(s->file_mu);
+        s->file_queued += copy.size();
+        s->file_queue.push_back(std::move(copy));
+    }
+    s->file_cv.notify_one();
+    s->logs_written.fetch_add(records, std::memory_order_relaxed);
+    out_lock.unlock();
+    { std::lock_guard<std::mutex> lock(s->queue_mu); }   // no lost wakeup: a live probe_report waits for a mark
+    s->queue_flushed.notify_all();
     s->tail_changed.notify_one();
     s->tail_caught_up.notify_all();
     return true;
@@ -941,12 +1085,24 @@ static void log_writer_main(probe_session *s) {
                 }
                 const auto *p = reinterpret_cast<const unsigned char *>(record.text.data());
                 const auto *end = p + record.text.size();
-                for (uint32_t k = 0; k < record.packed && p + sizeof(LogPackHdr) <= end; ++k) {
+                for (uint32_t k = 0; k < record.packed; ++k) {
+                    // Every entry is bounds-checked against the pack (pack_agent_record rolls a
+                    // failed append back, so this never trips; if it did, the rest of the pack is
+                    // counted as dropped instead of being read past its end).
                     LogPackHdr h;
-                    std::memcpy(&h, p, sizeof(h)); p += sizeof(h);
+                    size_t body = 0;
+                    const bool fits = (size_t)(end - p) >= sizeof(h) && (std::memcpy(&h, p, sizeof(h)), true) &&
+                                      h.len < PROBE_AGENT_LOG_TEXT_CAP && h.nframes <= PROBE_STACK_MAX_FRAMES &&
+                                      (body = (size_t)h.len + (size_t)h.nframes * sizeof(uint64_t)) <= (size_t)(end - p) - sizeof(h);
+                    if (!fits) {
+                        s->controller_dropped.fetch_add(record.packed - k, std::memory_order_relaxed);
+                        unwritten -= record.packed - k;
+                        break;
+                    }
+                    p += sizeof(h);
                     const LogView v{h.probe, h.tid, std::string_view(reinterpret_cast<const char *>(p), h.len),
                                     h.has_stack != 0, p + h.len, h.nframes};
-                    p += h.len + (size_t)h.nframes * sizeof(uint64_t);
+                    p += body;
                     if (!put(v)) return;
                 }
             }
@@ -1415,6 +1571,11 @@ static bool start_log_output(probe_session *s) {
     }
 
     try {
+        // The session file's own appender, with a live tail (write_log_batch). None (no thread):
+        // the writer appends itself, as before.
+        if (s->tail_enabled) {
+            try { s->log_filer = std::thread(log_filer_main, s); } catch (...) {}
+        }
         s->log_writer = std::thread(log_writer_main, s);
         (void)log_tailer_main;               // kept for reference; the writer writes stdout directly
     } catch (...) {
@@ -1424,6 +1585,7 @@ static bool start_log_output(probe_session *s) {
         s->queue_readable.notify_one();
         s->writer_hold.notify_all();
         if (s->log_writer.joinable()) s->log_writer.join();
+        stop_log_filer(s);
         if (s->log_reader != INVALID_HANDLE_VALUE) { CloseHandle(s->log_reader); s->log_reader = INVALID_HANDLE_VALUE; }
         CloseHandle(s->log_file); s->log_file = INVALID_HANDLE_VALUE;
         set_error(s, "probe log thread creation failed"); return false;
@@ -1515,12 +1677,16 @@ static void flush_log_writer(probe_session *s, bool up_to_now) {
         error = s->writer_error;
     }
     if (!error.empty()) set_error(s, error);
+    if (!wait_log_file(s)) {                   // the session file complete up to here (log_filer_main)
+        std::lock_guard<std::mutex> lock(s->file_mu);
+        set_error(s, s->file_error);
+    }
     if (s->exited) forward_finish(s);          // the target's last bytes, then the waiting records
 
     std::string tail_error;
     if (s->tail_enabled) {
         std::unique_lock<std::mutex> lock(s->tail_mu);
-        uint64_t target = s->log_bytes_written;
+        uint64_t target = s->log_bytes_produced;
         // While the (running) target is inside a line, records wait for its newline.
         s->tail_caught_up.wait(lock, [s, target] {
             return s->log_bytes_tailed >= target || s->tail_failed || s->out_midline.load();
@@ -1572,6 +1738,15 @@ static void wait_sym_unloads(probe_session *s, uint64_t base, uint64_t size) {
     });
 }
 
+static void stop_log_filer(probe_session *s) {
+    if (!s->log_filer.joinable()) return;
+    {
+        std::lock_guard<std::mutex> lock(s->file_mu); s->file_stop = true;
+    }
+    s->file_cv.notify_one();
+    s->log_filer.join();
+}
+
 static void stop_log_output(probe_session *s) {
     if (s->log_writer.joinable()) {
         {
@@ -1582,6 +1757,7 @@ static void stop_log_output(probe_session *s) {
         s->log_writer.join();
         flush_log_writer(s);
     }
+    stop_log_filer(s);                          // after the flush: the file is complete
     if (s->log_tailer.joinable()) {
         {
             std::lock_guard<std::mutex> lock(s->tail_mu); s->tail_stop = true;
@@ -1812,19 +1988,31 @@ static bool file_has_section(const std::wstring &path, const char *name) {
 // file size (VM, Defender: ~90 ms for the full copy). Same bytes otherwise; anything this does
 // not expect (a signed image, a section's data inside the dropped range) falls back to a plain
 // copy (false).
+static bool read_whole_file(HANDLE f, std::vector<unsigned char> &img) {
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(f, &size) || size.QuadPart <= 4096 || size.QuadPart >= (1ll << 30)) return false;
+    img.resize((size_t)size.QuadPart);
+    DWORD got = 0;
+    return ReadFile(f, img.data(), (DWORD)img.size(), &got, nullptr) && got == img.size();
+}
+// The trimming, in place. False (img untouched): not an image this expects -- a plain copy then.
+static bool trim_agent_image(std::vector<unsigned char> &img);
 static bool write_trimmed_agent(const std::wstring &src, const std::wstring &dst) {
     HANDLE f = CreateFileW(src.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) return false;
-    LARGE_INTEGER size{};
     std::vector<unsigned char> img;
-    bool ok = GetFileSizeEx(f, &size) && size.QuadPart > 4096 && size.QuadPart < (1ll << 30);
-    if (ok) {
-        img.resize((size_t)size.QuadPart);
-        DWORD got = 0;
-        ok = ReadFile(f, img.data(), (DWORD)img.size(), &got, nullptr) && got == img.size();
-    }
+    const bool ok = read_whole_file(f, img);
     CloseHandle(f);
-    if (!ok) return false;
+    if (!ok || !trim_agent_image(img)) return false;
+    HANDLE o = CreateFileW(dst.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (o == INVALID_HANDLE_VALUE) return false;
+    DWORD wrote = 0;
+    const bool written = WriteFile(o, img.data(), (DWORD)img.size(), &wrote, nullptr) && wrote == img.size();
+    CloseHandle(o);
+    if (!written) DeleteFileW(dst.c_str());
+    return written;
+}
+static bool trim_agent_image(std::vector<unsigned char> &img) {
     auto in = [&](uint64_t off, uint64_t n) { return off <= img.size() && n <= img.size() - off; };
     auto dos = reinterpret_cast<IMAGE_DOS_HEADER *>(img.data());
     if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || !in((uint64_t)dos->e_lfanew, sizeof(IMAGE_NT_HEADERS))) return false;
@@ -1890,13 +2078,7 @@ static bool write_trimmed_agent(const std::wstring &src, const std::wstring &dst
         sum = (sum & 0xFFFF) + (sum >> 16);
         reinterpret_cast<IMAGE_NT_HEADERS *>(img.data() + dos->e_lfanew)->OptionalHeader.CheckSum = (DWORD)(sum + img.size());
     }
-    HANDLE o = CreateFileW(dst.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (o == INVALID_HANDLE_VALUE) return false;
-    DWORD wrote = 0;
-    const bool written = WriteFile(o, img.data(), (DWORD)img.size(), &wrote, nullptr) && wrote == img.size();
-    CloseHandle(o);
-    if (!written) DeleteFileW(dst.c_str());
-    return written;
+    return true;
 }
 
 // ---- Warm agent copies (perf5) -------------------------------------------------------
@@ -1913,13 +2095,121 @@ static bool write_trimmed_agent(const std::wstring &src, const std::wstring &dst
 // what the scanner inspects), and NEVER loaded or run: its shared section is exactly the file's
 // bytes, as a fresh copy's is. Taking one is an atomic directory rename into the session's own
 // directory (two sessions cannot take the same one). At most WARM_KEEP ready copies per build.
+// Identity (codex3 #2): <sig> is the SOURCE file's version stamp -- volume serial, file id, size,
+// write time and change time (NTFS moves the change time on every change to the file, and a
+// rebuilt file is a new file id; the old sig, size + write time, matched a different build with the
+// same size and time: regress ctrl-warm-identity). A taken copy must also be a complete, unaltered
+// trimmed image of that build: its PE header fields (TimeDateStamp, SizeOfImage, entry point,
+// sections) equal the source's and its PE checksum (written by write_trimmed_agent) matches its
+// bytes; anything else is deleted and a fresh copy made. Warm copies are made and taken only while
+// the uhh directory and its warm\ are private to this user (owner and DACL: nobody else can write
+// there -- e.g. a SYSTEM controller's C:\Windows\Temp, where Users may create directories, gets
+// none: regress ctrl-warm-acl). The verified copy stays open, deny-write, until the controller's
+// LoadLibrary of it is done. Cost (VM x64): ~1 ms per launch on top of perf5's take.
 static constexpr unsigned WARM_KEEP = 2;
-static std::wstring agent_signature(const std::wstring &path) {
-    WIN32_FILE_ATTRIBUTE_DATA a{};
-    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a)) return {};
-    wchar_t sig[48];
-    _snwprintf_s(sig, _countof(sig), _TRUNCATE, L"%08lx%08lx%08lx%08lx", a.nFileSizeHigh, a.nFileSizeLow,
-                 a.ftLastWriteTime.dwHighDateTime, a.ftLastWriteTime.dwLowDateTime);
+struct AgentId { DWORD stamp = 0, size_of_image = 0, entry = 0; WORD sections = 0; };
+static bool image_id(const unsigned char *img, size_t n, AgentId &id, DWORD *checksum = nullptr, size_t *checksum_at = nullptr) {
+    if (n < sizeof(IMAGE_DOS_HEADER)) return false;
+    auto dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(img);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || (uint64_t)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS) > n) return false;
+    auto nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(img + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR_MAGIC) return false;
+    id.stamp = nt->FileHeader.TimeDateStamp; id.size_of_image = nt->OptionalHeader.SizeOfImage;
+    id.entry = nt->OptionalHeader.AddressOfEntryPoint; id.sections = nt->FileHeader.NumberOfSections;
+    if (checksum) *checksum = nt->OptionalHeader.CheckSum;
+    if (checksum_at) *checksum_at = (size_t)((const unsigned char *)&nt->OptionalHeader.CheckSum - img);
+    return true;
+}
+static bool same_id(const AgentId &a, const AgentId &b) {
+    return a.stamp == b.stamp && a.size_of_image == b.size_of_image && a.entry == b.entry && a.sections == b.sections;
+}
+// The PE checksum (as CheckSumMappedFile, and as write_trimmed_agent computes it) of img; its
+// CheckSum field is zeroed first. A ones'-complement sum: folding once at the end gives the same
+// value as folding after every word.
+static DWORD pe_checksum(std::vector<unsigned char> &img, size_t checksum_at) {
+    const size_t n = img.size();
+    if (checksum_at + 4 > n) return 0;
+    std::memset(img.data() + checksum_at, 0, 4);
+    uint64_t sum = 0;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t v; std::memcpy(&v, img.data() + i, 8);
+        sum += (v & 0xFFFF) + ((v >> 16) & 0xFFFF) + ((v >> 32) & 0xFFFF) + (v >> 48);
+    }
+    for (; i + 2 <= n; i += 2) { uint16_t w; std::memcpy(&w, img.data() + i, 2); sum += w; }
+    if (n & 1) sum += img[n - 1];
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    return (DWORD)(sum + n);
+}
+// A directory nobody but this user (and SYSTEM / Administrators, who can do anything anyway) can
+// write to: owned by one of them, a real directory (no reparse point), and no ACE -- inheritable
+// ones included, which every copy made inside would get -- grants anyone else a right to add,
+// change, delete or re-permission anything there.
+static bool dir_private(const std::wstring &path) {
+    const DWORD attr = GetFileAttributesW(path.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY) || (attr & FILE_ATTRIBUTE_REPARSE_POINT)) return false;
+    static const std::vector<unsigned char> me = [] {          // TokenUser's SID, then TokenOwner's
+        std::vector<unsigned char> out;
+        HANDLE tok = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return out;
+        for (TOKEN_INFORMATION_CLASS c : {TokenUser, TokenOwner}) {
+            DWORD n = 0;
+            GetTokenInformation(tok, c, nullptr, 0, &n);
+            std::vector<unsigned char> buf(n ? n : 1);
+            if (!n || !GetTokenInformation(tok, c, buf.data(), n, &n)) continue;
+            PSID sid = c == TokenUser ? reinterpret_cast<TOKEN_USER *>(buf.data())->User.Sid
+                                      : reinterpret_cast<TOKEN_OWNER *>(buf.data())->Owner;
+            const DWORD len = GetLengthSid(sid);
+            const size_t at = out.size();
+            out.resize(at + sizeof(DWORD) + len);
+            std::memcpy(out.data() + at, &len, sizeof(DWORD));
+            CopySid(len, out.data() + at + sizeof(DWORD), sid);
+        }
+        CloseHandle(tok);
+        return out;
+    }();
+    auto trusted = [](PSID sid) {
+        if (!sid || !IsValidSid(sid)) return false;
+        for (size_t at = 0; at + sizeof(DWORD) <= me.size(); ) {
+            DWORD len; std::memcpy(&len, me.data() + at, sizeof(DWORD));
+            if (EqualSid(sid, (PSID)(me.data() + at + sizeof(DWORD)))) return true;
+            at += sizeof(DWORD) + len;
+        }
+        return IsWellKnownSid(sid, WinLocalSystemSid) || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) ||
+               IsWellKnownSid(sid, WinCreatorOwnerSid) || IsWellKnownSid(sid, WinCreatorOwnerRightsSid);
+    };
+    PSID owner = nullptr; PACL dacl = nullptr; PSECURITY_DESCRIPTOR sd = nullptr;
+    if (GetNamedSecurityInfoW(path.c_str(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                              &owner, nullptr, &dacl, nullptr, &sd) != ERROR_SUCCESS)
+        return false;
+    bool ok = !me.empty() && dacl && trusted(owner);              // a NULL DACL grants everyone everything
+    constexpr ACCESS_MASK write_rights = FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD | DELETE | WRITE_DAC |
+                                         WRITE_OWNER | GENERIC_WRITE | GENERIC_ALL;
+    for (DWORD i = 0; ok && i < dacl->AceCount; ++i) {
+        ACE_HEADER *ace = nullptr;
+        if (!GetAce(dacl, i, reinterpret_cast<void **>(&ace))) { ok = false; break; }
+        if (ace->AceType == ACCESS_DENIED_ACE_TYPE || ace->AceType == SYSTEM_MANDATORY_LABEL_ACE_TYPE) continue;
+        if (ace->AceType != ACCESS_ALLOWED_ACE_TYPE) { ok = false; break; }   // conditional/object/...: not ours
+        auto *a = reinterpret_cast<ACCESS_ALLOWED_ACE *>(ace);
+        if ((a->Mask & write_rights) && !trusted(reinterpret_cast<PSID>(&a->SidStart))) ok = false;
+    }
+    LocalFree(sd);
+    return ok;
+}
+// The source agent's version stamp (the warm copies' name) and its build identity (headers).
+static std::wstring agent_signature(const std::wstring &path, AgentId *id = nullptr) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return {};
+    BY_HANDLE_FILE_INFORMATION bi{}; FILE_BASIC_INFO basic{};
+    unsigned char head[4096]; DWORD got = 0;
+    const bool ok = GetFileInformationByHandle(f, &bi) && GetFileInformationByHandleEx(f, FileBasicInfo, &basic, sizeof(basic)) &&
+                    (!id || (ReadFile(f, head, sizeof(head), &got, nullptr) && image_id(head, got, *id)));
+    CloseHandle(f);
+    if (!ok) return {};
+    wchar_t sig[96];
+    _snwprintf_s(sig, _countof(sig), _TRUNCATE, L"%08lx%08lx%08lx%08lx%08lx%08lx%08lx%016llx", bi.dwVolumeSerialNumber,
+                 bi.nFileIndexHigh, bi.nFileIndexLow, bi.nFileSizeHigh, bi.nFileSizeLow,
+                 bi.ftLastWriteTime.dwHighDateTime, bi.ftLastWriteTime.dwLowDateTime, (unsigned long long)basic.ChangeTime.QuadPart);
     return sig;
 }
 static bool pid_alive(DWORD pid) {
@@ -1932,18 +2222,39 @@ static bool pid_alive(DWORD pid) {
 static void remove_copy_dir(const std::wstring &d) {
     if (DeleteFileW((d + L"\\probe_api_agent.dll").c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND) RemoveDirectoryW(d.c_str());
 }
-// Moves a ready warm copy of this build to `dir` (the session's own directory). False: none.
-static bool take_warm_copy(const std::wstring &root, const std::wstring &sig, const std::wstring &dir) {
+// Moves a ready warm copy of this build to `dir` (the session's own directory) and verifies its
+// content against `want`; `hold` is then the file, open deny-write (close it once loaded). A copy
+// that is not exactly ours is deleted (it is in our own directory by then). False: none.
+static bool take_warm_copy(const std::wstring &root, const std::wstring &sig, const std::wstring &dir,
+                           const AgentId &want, HANDLE &hold) {
     const std::wstring warm = root + L"\\warm";
+    hold = INVALID_HANDLE_VALUE;
+    if (!dir_private(warm)) return false;
     WIN32_FIND_DATAW fd{};
     HANDLE h = FindFirstFileW((warm + L"\\" + sig + L"-*").c_str(), &fd);
     if (h == INVALID_HANDLE_VALUE) return false;
     bool got = false;
     do {
-        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-        if (MoveFileExW((warm + L"\\" + fd.cFileName).c_str(), dir.c_str(), 0)) {
-            if (GetFileAttributesW((dir + L"\\probe_api_agent.dll").c_str()) != INVALID_FILE_ATTRIBUTES) { got = true; break; }
-            remove_copy_dir(dir);                          // (an empty leftover: not a copy)
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+        if (!MoveFileExW((warm + L"\\" + fd.cFileName).c_str(), dir.c_str(), 0)) continue;
+        HANDLE f = CreateFileW((dir + L"\\probe_api_agent.dll").c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                               OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (f != INVALID_HANDLE_VALUE) {
+            std::vector<unsigned char> img; AgentId have; DWORD sum = 0; size_t sum_at = 0;
+            BY_HANDLE_FILE_INFORMATION bi{};
+            // One link only: a hard link to a file elsewhere could be changed through its other name.
+            if (GetFileInformationByHandle(f, &bi) && bi.nNumberOfLinks == 1 && !(bi.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+                read_whole_file(f, img) && image_id(img.data(), img.size(), have, &sum, &sum_at) && same_id(have, want) &&
+                sum != 0 && pe_checksum(img, sum_at) == sum) {
+                hold = f; got = true; break;
+            }
+            CloseHandle(f);
+        }
+        bench_phase("agent_warm_rejected", nullptr);
+        remove_copy_dir(dir);                              // not exactly ours (or an empty leftover)
+        if (GetFileAttributesW(dir.c_str()) != INVALID_FILE_ATTRIBUTES) {   // could not delete it: out of the way
+            MoveFileExW(dir.c_str(), (warm + L"\\x-" + fd.cFileName).c_str(), 0);
+            if (GetFileAttributesW(dir.c_str()) != INVALID_FILE_ATTRIBUTES) break;
         }
     } while (FindNextFileW(h, &fd));
     FindClose(h);
@@ -1954,6 +2265,7 @@ static bool take_warm_copy(const std::wstring &root, const std::wstring &sig, co
 static void make_warm_copy(std::wstring root, std::wstring sig, std::wstring src) {
     const std::wstring warm = root + L"\\warm";
     CreateDirectoryW(warm.c_str(), nullptr);
+    if (!dir_private(warm)) return;
     unsigned ready = 0;
     WIN32_FIND_DATAW fd{};
     HANDLE h = FindFirstFileW((warm + L"\\*").c_str(), &fd);
@@ -1988,6 +2300,8 @@ static void make_warm_copy(std::wstring root, std::wstring sig, std::wstring src
         if (m) CloseHandle(m);
         if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
     }
+    // The source unchanged meanwhile (else this copy may be of a newer build than its name says).
+    if (ok && agent_signature(src) != sig) ok = false;
     if (!ok || !MoveFileExW(tmp.c_str(), (warm + L"\\" + sig + L"-" + tail).c_str(), 0)) remove_copy_dir(tmp);
 }
 static void start_warm_copy(const std::wstring &root, const std::wstring &sig, const std::wstring &src) {
@@ -2014,6 +2328,7 @@ static void start_warm_copy(const std::wstring &root, const std::wstring &sig, c
 static void prepare_local_agent(probe_session *s) {
     bench_phase("agent_begin", nullptr);
     std::wstring warm_sig, warm_root, warm_src;
+    HANDLE warm_hold = INVALID_HANDLE_VALUE;              // the verified warm copy, deny-write until loaded
     if (s->agent_path.empty()) {
         s->agent_path = sibling_agent_path();
         if (file_has_section(s->agent_path, "uhhshr")) {
@@ -2047,9 +2362,11 @@ static void prepare_local_agent(probe_session *s) {
                 std::wstring copy = dir + L"\\probe_api_agent.dll";
                 bench_phase("agent_copy", nullptr);
                 static const bool no_warm = std::getenv("UHH_BENCH_NO_WARM") != nullptr;   // bench knob, not API
-                if (!no_warm) warm_sig = agent_signature(s->agent_path);
+                AgentId want;
+                if (!no_warm && dir_private(root)) warm_sig = agent_signature(s->agent_path, &want);
+                bench_phase("agent_copy_checked", nullptr);
                 warm_root = root; warm_src = s->agent_path;
-                const bool warm = !warm_sig.empty() && take_warm_copy(root, warm_sig, dir);
+                const bool warm = !warm_sig.empty() && take_warm_copy(root, warm_sig, dir, want, warm_hold);
                 bench_phase("agent_copy_kind", warm ? "warm" : "new");
                 if (warm || (CreateDirectoryW(dir.c_str(), nullptr) &&
                              (write_trimmed_agent(s->agent_path, copy) || CopyFileW(s->agent_path.c_str(), copy.c_str(), TRUE)))) {
@@ -2064,6 +2381,7 @@ static void prepare_local_agent(probe_session *s) {
     bench_phase("agent_load", nullptr);
     s->agent_prep_module = LoadLibraryW(s->agent_path.c_str());
     s->agent_prep_error = s->agent_prep_module ? 0 : GetLastError();
+    if (warm_hold != INVALID_HANDLE_VALUE) CloseHandle(warm_hold);
     bench_phase("agent_loaded", nullptr);
     // The next session's warm copy, once this one's agent is loaded (measured: started before
     // this load, its scan queued in front of it and the launch took 128 ms instead of 53).
@@ -8429,11 +8747,29 @@ static void enqueue_agent_record(probe_session *s, const probe_agent_log &rec) {
 
 // A ring record appended to the drain pass's pack (LogRecord::packed): the same fields and
 // bounds as enqueue_agent_record, without a string and a queue entry per record.
+#if defined(UHH_TEST_HOOKS)
+// Test-only (probe_api_testhooks): UHH_TEST_PACK_FAIL=n makes every n-th record's pack append
+// throw std::bad_alloc after its header is in the pack (regress ctrl-pack-oom).
+static bool test_pack_fail() {
+    static const long n = [] { const char *v = std::getenv("UHH_TEST_PACK_FAIL"); return v ? std::atol(v) : 0L; }();
+    static std::atomic<long> k{0};
+    if (n <= 0 || ++k % n) return false;
+    std::fprintf(stderr, "probe: test: pack append failed\n");
+    return true;
+}
+#endif
+// A record whose append fails (out of memory) leaves the pack exactly as it was: the bytes it
+// appended so far are cut off again (a header without its text and frames made every later entry
+// of the pack misparse -- regress ctrl-pack-oom), and a pack it had just started is removed (an
+// empty pack counted as one record and was written as an empty log line).
 static void pack_agent_record(probe_session *s, const probe_agent_log &rec, std::vector<LogRecord> &batch,
                               AgentMapCache &map) {
     if (s->shared) probe_agent_retire_carry(s->shared, rec);
+    const size_t packs = batch.size();
+    const bool fresh = batch.empty() || batch.back().packed >= LOG_PACK;     // this record starts a pack
+    const size_t mark = fresh ? 0 : batch.back().text.size();
     try {
-        if (batch.empty() || batch.back().packed >= LOG_PACK) {
+        if (fresh) {
             batch.emplace_back();
             batch.back().text.reserve(LOG_PACK * 96);
         }
@@ -8445,10 +8781,15 @@ static void pack_agent_record(probe_session *s, const probe_agent_log &rec, std:
         h.has_stack = rec.has_stack != 0;
         h.nframes = !h.has_stack ? 0 : rec.frame_count > PROBE_STACK_MAX_FRAMES ? PROBE_STACK_MAX_FRAMES : rec.frame_count;
         pack.text.append(reinterpret_cast<const char *>(&h), sizeof(h));
+#if defined(UHH_TEST_HOOKS)
+        if (test_pack_fail()) throw std::bad_alloc();
+#endif
         pack.text.append(rec.text, h.len);
         if (h.nframes) pack.text.append(reinterpret_cast<const char *>(rec.frames), (size_t)h.nframes * sizeof(uint64_t));
         ++pack.packed;
     } catch (...) {
+        if (fresh) { if (batch.size() > packs) batch.pop_back(); }     // the pack this record started
+        else batch.back().text.resize(mark);                            // never throws (shrinks)
         s->controller_dropped.fetch_add(1, std::memory_order_relaxed);   // out of memory: count it, keep going
     }
 }

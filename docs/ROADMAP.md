@@ -2190,6 +2190,85 @@ x64 46/46, x86 46/46, x86 agent_review 3 more times 5/5 each. CI full suite on e
 x86 1005/1005, all shards green. Earlier pushes: 9e61170 only the sweep race (and the known patch-race-unsafe); 038d74d
 x86 agent-unwind failed once (0xC0000096) -- not reproduced on the VM (4 runs) nor in the e01ba59 CI run.
 
+## Codex review 3 findings (2026-11-08, read-only Codex review of main 0fb6cee -- library diff since 55a1ffb; branch `codex3-fixes`)
+
+Five items: four high-confidence claims of the review and the stream-latency failure of the final VM suite on 0fb6cee.
+Each claim was checked with a regress check that FAILED on 0fb6cee (same tests, test hooks added) before the fix.
+
+1. **Detach could overwrite replacement code (agent `disable_hook`) -- real, fixed.** The final unhook restored a site that
+   was mapped executable and did not hold the original bytes, without checking it still held UHH's patch. A hooked DLL
+   unloaded (its unload not processed yet: the early-detach race of L5 / ciresid, or an unload event still queued) and
+   other executable code at its old address got the old DLL's original bytes. Forced by `lifecycle-unload-reused-<cfg>`
+   (`UHH_TEST_DEFER_UNLOAD=hunt_dll.dll` + lifecycle_target `dllreuse`: JIT-style RWX memory, all 0x90, committed over the
+   whole freed range; `reusecheck` after the detach): on 0fb6cee inline and mixed FAILED, `diff=6 first=4160` -- HuntWork's
+   6 original bytes written into the new code at +0x1040; breakpoint and hw passed (the INT3 restore writes only over its own
+   0xCC, hw writes nothing). Fix: `enable_hook` reads back the exact patch bytes SafetyHook wrote (E9/FF jump + NOP pad,
+   `g_patch`); `disable_hook` restores only while the site holds exactly them, else abandons the hook in place (trampoline
+   and stub leak, as every hook does at stop). Also covers a fresh copy of the DLL at the same base (its original bytes)
+   and another tool's jump written over ours (no longer torn out). x64 + x86 PASS.
+2. **Warm agent copies taken on the name alone (session.cpp perf5) -- real, fixed.** The name was the source's size +
+   write time; any directory with that prefix and a `probe_api_agent.dll` was loaded into controller and target.
+   `ctrl-warm-identity` (a copy named for this agent's size/time made from another build -- one DOS-stub byte changed):
+   0fb6cee took it (`agent_copy_kind warm`). `ctrl-warm-acl` (a %TEMP% where Everyone may write): 0fb6cee made and took
+   warm copies there (`new, warm, warm`). The VM's %TEMP% (`C:\Users\admin\AppData\Local\Temp`) is private (owner
+   admin; SYSTEM, Administrators, admin): the exposure is a controller whose %TEMP% is shared -- SYSTEM on Windows 10
+   (`C:\Windows\Temp`: Users may create directories there) -- or a stale build. Fix: the name is the source's full version
+   stamp (volume serial, file id, size, write time, change time -- a rebuild is a new id or a new change time); the maker
+   re-checks the stamp after writing; a taken copy must carry the source's PE identity (TimeDateStamp, SizeOfImage, entry,
+   sections) and its own valid PE checksum (written by the trim), else it is deleted and a new copy made; warm copies are
+   made and taken only while `uhh` and `uhh\warm` are private (owner = this user / its token owner / SYSTEM /
+   Administrators, no reparse point, no ACE -- inheritable ones included -- granting anyone else add/write/delete/
+   WRITE_DAC/WRITE_OWNER); the verified copy is held open deny-write until the controller's LoadLibrary is done. A first
+   version hashed the trimmed source with SHA-256 (BCrypt) once per controller process: 13.4 ms per launch on the VM
+   (controllers are one session per process: read 8.3 MB, trim, hash), so it was replaced by the stamp + PE checks.
+   Cost (VM, 12 attach sessions in a row, UHH_BENCH_PHASES agent_begin -> agent_loaded, median): warm take x64 3.8 ms on
+   0fb6cee -> 5.2 ms (x86 5.9 ms); a new copy still costs 70 ms x64 / 239 ms x86 (the AV scan perf5 avoids), so the
+   gain is kept. x64 + x86 PASS.
+3. **A failed allocation left half a record in a log pack (`pack_agent_record`) -- real, fixed.** The header was in the
+   pack when the text/frames append threw; later entries misparsed, the writer read lengths past the pack.
+   `ctrl-pack-oom` (test hook `UHH_TEST_PACK_FAIL=37`: every 37th record throws std::bad_alloc after its header):
+   0fb6cee's controller died 0xC0000005. Fix: the record is rolled back (the pack cut to its size before the record, a
+   pack the record started removed -- an empty pack counted as one record and wrote an empty line); the writer
+   bounds-checks every entry (len < text cap, frames <= 32, inside the pack; else the rest is counted dropped). After:
+   ~3060 logs all well-formed, log_dropped == injected (84/85), x64 + x86.
+4. **The dbghelp preload thread could outlive a host DLL (symbols.cpp) -- not a bug.** `std::thread` starts it with the
+   CRT's `_beginthreadex`, which takes a reference on the module holding the thread procedure (GetModuleHandleExW
+   FROM_ADDRESS) and releases it as the thread exits (FreeLibraryAndExitThread) -- UHH builds only with MSVC, static or
+   dynamic CRT alike. `ctrl-symload-unload` (symhost.dll links UHH statically; symhost_loop loads it, creates + closes an
+   unlaunched session, unloads it; 40 times, then 3 times with the preload held 300 ms by `UHH_TEST_PRELOAD_DELAY_MS`)
+   PASSED on 0fb6cee: no crash, the DLL still mapped right after every FreeLibrary (`held` 40/40 and 3/3: the thread's
+   reference) and unmapped once the thread was done. Kept as a guard (comment in `preload`).
+5. **stream-latency-breakpoint p99 327 ms (final suite on 0fb6cee) -- root-caused, fixed; not a perf4/perf5
+   regression.** Records #8-#10 held 327/216/107 ms before even reaching the FILE, then released together. Phase stamps
+   in the writer (diag build) showed the debug loop's callbacks enqueue at once and the writer wake at once, then the
+   session file's `WriteFile` itself block: 16-161 ms in 10 of 40 runs, 0.5-1.5 s in 5 (records #8-#22 held), mostly at
+   record #8 (~1 s after the file was created: the cache manager's first lazy-write pass over the new file; real-time AV
+   on a %TEMP% file did the same earlier). Every record queued meanwhile waited behind it (one writer thread; with a
+   forwarded target stdout -- every uhh_trace launch -- the file was even written BEFORE stdout). The same write order and
+   thread existed at 55a1ffb; the "disk stalls" of the perf5 stream-live / stream-latency failures and the earlier citune
+   x86 failure (records #25/#26 at 221/112 ms) are this. Fix: the writer writes stdout first in every mode (through a
+   forwarded stdout too, when it is at a target line boundary and nothing is deferred) and hands the batch to a session
+   file appender thread (`log_filer_main`; its queue capped at 1 MB and its chunks recycled -- a 16 MB, then a 2 MB queue of fresh 64 KB copies failed stream-volume-inline x86 on CI: peak 18 -> 24 MB); records deferred behind an unfinished target line are
+   replayed from the file by the appender once appended (or by the forwarder at the newline); every flush waits for the
+   appender (the file is complete at report/close). `stream-filestall-<bk>` (uhh_trace_th, test hook
+   `UHH_TEST_FILE_STALL_MS=400` on the 8th append): 0fb6cee FAILED (`stdout held: #7 404 ms`, both backends); after,
+   the file shows the 400 ms stall and stdout does not (worst 0.5-12 ms), x64 + x86. Proof on the real stall, both builds
+   side by side at the same time (VM, uhh_trace breakpoint on logstream_target, 40 runs each, event -> stdout): 0fb6cee
+   2 runs over 100 ms (records #8-#11 at 430/320/211/102 ms; #8-#10 at 321/212/102 ms) and 10 more at 7-43 ms; the fix:
+   worst 1.2 ms over all 40 runs. `--only stream_latency` 20 times per arch on the fix (light pool): x64 80/80, x86
+   80/80 PASS, worst p99 13.4 / 15.4 ms. Throughput kept (bench/perfab/perf_ab.py, x64 VM, 0fb6cee vs the fix,
+   3 interleaved rounds on a shared VM): sink/inline nul 3.84M -> 3.89M logs/s, file 3.39M -> 3.52M, pipe 1.77M ->
+   1.85M (all ~); latency/{inline,hw,breakpoint}/idle p99 0.97/1.03/1.00 -> 0.36/0.61/0.41 ms (gain); live/*/load,
+   launch, gated ns/read ~. Two rows flagged (attach/hw/idle detach_ms +5.8%, gated/inline wall_ms +10.9% -- gated/base,
+   which UHH does not touch, moved +10.3% in the same rounds) did not reproduce in a 6-round re-run (-2.8%, -33.5%).
+   The appender's queue holds at most 1 MB and recycles its chunks: with fresh 64 KB copies (16 MB, then 2 MB cap) CI
+   x86 stream-volume-inline peaked 18-19 MB at 2M and 24 MB at 20M (flat=False) -- but 0fb6cee itself flakes there on
+   the VM (x64: 14 -> 22 MB in one of four runs; x86 22-23 -> 23): one 2M run does not always reach the pipeline's
+   plateau. The check now takes the larger of two 2M runs and allows max(1.2x, +8 MB) (a leak of 0.5 B/record still
+   fails it).
+
+CI full suite on 9efd83c (run 42388653548): 2109/2109, all shards green (x64 + x86, windows-2022, and cet-hw).
+
 ## Real-world cases
 - ✅ Microsoft Detours samples replicated (`examples/famous/detours_*`: simple, traceapi, withdll/attach, retval) -- findings above
 - ✅ (1) Real binaries via `uhh_trace`: curl `CreateFileW` + `connect` (all backends); ✅ findstr via `ntdll!NtCreateFile`

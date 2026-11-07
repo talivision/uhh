@@ -2121,9 +2121,23 @@ static void build_hook(void *p) {
     hooks[op->index] = safetyhook::create_mid((void *)(uintptr_t)op->site, mid_callbacks[op->index],
                                               safetyhook::MidHook::StartDisabled);
 }
+// The exact bytes each enabled hook wrote at its site (the jump SafetyHook emitted, padded with
+// NOPs over the instructions it displaced): the final unhook restores a site only while it
+// still holds THESE bytes (see disable_hook). Longest patch: a 14-byte FF jump over a
+// displaced instruction of up to 15 bytes.
+struct PatchBytes { uint8_t b[32]; uint32_t len; };
+static PatchBytes g_patch[PROBE_AGENT_MAX_PROBES];
 static void enable_hook(void *p) {
     auto *op = static_cast<HookOp *>(p);
-    op->ok = hooks[op->index].enable().has_value();
+    auto &h = hooks[op->index];
+    auto &pb = g_patch[op->index];
+    pb.len = 0;
+    op->ok = h.enable().has_value();
+    const size_t n = h.original_bytes().size();
+    if (op->ok && n && n <= sizeof(pb.b)) {
+        std::memcpy(pb.b, (const void *)h.target_address(), n);    // read back what was written (SEH-guarded by seh_run)
+        pb.len = (uint32_t)n;
+    }
 }
 // The final unhook (probe_agent_stop) of a site whose DLL another thread unloaded before the
 // controller processed that unload (its status is not UNLOADED yet -- e.g. during an early
@@ -2134,6 +2148,12 @@ static void enable_hook(void *p) {
 // copy, at the same base): nothing to restore either. The write itself is SEH-guarded
 // (seh_run) against an unmap completing meanwhile (a thread suspended inside its unmap
 // system call still finishes it).
+// More generally the site is restored ONLY while it still holds exactly the patch this hook
+// wrote (g_patch). Anything else there is not ours: a different image or JIT/executable
+// allocation mapped at the old DLL's address before its unload was processed (the old DLL's
+// original bytes written over it corrupted the program: regress lifecycle-unload-reused-*),
+// a fresh copy of the DLL (its original bytes), or another hooking tool's jump written over
+// ours. Such a hook is abandoned in place (its trampoline and stub leak, never reached).
 static bool site_mapped(uint64_t site);
 static bool bytes_equal(const void *a, const uint8_t *b, size_t n) {
     __try { return std::memcmp(a, b, n) == 0; }
@@ -2142,9 +2162,9 @@ static bool bytes_equal(const void *a, const uint8_t *b, size_t n) {
 static void disable_hook(void *p) {
     auto *op = static_cast<HookOp *>(p);
     auto &h = hooks[op->index];
-    const auto &orig = h.original_bytes();
+    const auto &pb = g_patch[op->index];
     if (!site_mapped(h.target_address())) return;
-    if (!orig.empty() && bytes_equal((const void *)h.target_address(), orig.data(), orig.size())) return;
+    if (!pb.len || pb.len != h.original_bytes().size() || !bytes_equal((const void *)h.target_address(), pb.b, pb.len)) return;
     op->ok = h.disable().has_value();
 }
 
