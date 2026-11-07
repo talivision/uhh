@@ -105,7 +105,12 @@ static void forget_region() { if (RegionCache *cache = region_cache()) *cache = 
 struct PatchShadow { volatile uintptr_t lo; uint32_t len; uint8_t bytes[32]; };
 static PatchShadow g_shadow[PROBE_AGENT_MAX_PROBES];
 static volatile LONG g_shadow_count;
+// Every shadow published lies in [g_shadow_min, g_shadow_max) (it only widens): a read outside
+// it -- the hit's own stack, a heap buffer: get_func_arg on x86 on every hit -- skips the scan of
+// the 128 slots (x86 hit with two stack arguments read: measured ~360 ns, most of it here).
+static volatile uintptr_t g_shadow_min = ~(uintptr_t)0, g_shadow_max = 0;
 static void overlay_original(uintptr_t a, void *buffer, size_t n) {
+    if (a >= g_shadow_max || a + n <= g_shadow_min) return;
     for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i) {
         const uintptr_t lo = g_shadow[i].lo;
         if (!lo || !shared || shared->requests[i].status != PROBE_AGENT_INSTALLED) continue;
@@ -2256,6 +2261,11 @@ static void install_pending_locked() {
             if (ok && !g_shadow[i].lo && orig.size() <= sizeof(g_shadow[i].bytes)) {
                 std::memcpy(g_shadow[i].bytes, orig.data(), orig.size());
                 g_shadow[i].len = (uint32_t)orig.size();
+                {                                            // widen the bounds BEFORE the shadow is visible
+                    const uintptr_t lo = hooks[i].target_address(), hi = lo + orig.size();
+                    if (lo < g_shadow_min) g_shadow_min = lo;
+                    if (hi > g_shadow_max) g_shadow_max = hi;
+                }
                 MemoryBarrier();
                 g_shadow[i].lo = hooks[i].target_address();
                 InterlockedIncrement(&g_shadow_count);
