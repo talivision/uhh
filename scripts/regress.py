@@ -67,6 +67,7 @@ does not ship (skip_external(); a FAIL when --only named the check).
 import argparse
 import collections
 from collections import Counter
+import io
 import json
 import math
 import os
@@ -2435,8 +2436,9 @@ def check_ntdll_churn(cycles=8, round_reads=1000000):
     uhh_trace attaches, hooks the stub, logs every call, detaches -- `cycles` times -- for
     every backend. Inline hooks are written with the target frozen and threads caught inside
     the overwritten bytes moved to the trampoline. The target reads until told to stop
-    (probe_app --until-key: rounds of 4 x round_reads, the same pattern each round), so every
-    cycle runs while it reads, whatever the machine's speed. Every cycle must detach cleanly
+    (probe_app --until-key: rounds of 4 x round_reads, the same pattern each round, read by the
+    same 4 threads with a blocking barrier between rounds), so every cycle runs while it reads,
+    whatever the machine's speed. Every cycle must detach cleanly
     with hits (all but the first: it may load the agent) and deliver every hit as a log
     (stdout logs == the detach line's hits == logs_written, none dropped); the target must
     exit 0 with every read done and the checksum exactly rounds x an uninstrumented round's.
@@ -2460,7 +2462,16 @@ def check_ntdll_churn(cycles=8, round_reads=1000000):
     to cycle 2 (runfix1: 3 of ~58 runner runs, always cycle 2 right after a short cycle 1). The
     remote agent threads now run above normal priority (0 zero-hit cycles in 511 runner cycles
     after the first), and cycle 1 gets the time to finish the setup, so every later cycle tests
-    install/remove churn with the agent ready."""
+    install/remove churn with the agent ready.
+
+    Why the rounds keep their threads (ROADMAP H4). The target used to start 4 fresh threads per
+    round, and they and main SPUN until all had started: with every CPU taken by spinners, a
+    thread not yet started waited for a scheduling quantum (Windows Server: ~190 ms), so every
+    round began with 200-600 ms without a single read (measured on runners), and a 300 ms cycle
+    inside one saw zero hits that the tool had nothing to do with (x86 ntdll-churn-breakpoint,
+    CI 42357172927; the probe is armed before the attach resumes any thread). Now some thread
+    reads at every moment (longest idle stretch measured: 6 ms), and a zero-hit cycle is the
+    tool's fault again."""
     t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
     if not t or not a:
         return missing_bin("ntdll-churn", "uhh_trace/probe_app")
@@ -10771,13 +10782,30 @@ def check_stdout_powershell():
                 record(name, False, repr(e))
             finally:
                 shutil.rmtree(work, ignore_errors=True)
+
+
+def check_powershell_detach():
+    """An attach reported BEFORE its detach (uhh_trace --detach-after-ms) on a target that keeps
+    logging at full speed into a slow PowerShell pipeline (split from check_stdout_powershell).
+    UHH_PSDETACH_REPS (default 1) repeats each backend; UHH_PSDETACH_BACKENDS narrows them.
+    The whole run must also end within 120 s (attach, 4 s, report, a detach bounded to ~15 s
+    for running callbacks, the backlog; the starved detach of check_slowreader_detach took
+    37-203 s here, and once never ended)."""
+    tracer, target = exe("uhh_trace.exe"), exe("logstream_target.exe")
+    if not tracer or not target:
+        return missing_bin("stdout-powershell-detach", "uhh_trace/logstream_target")
+    ps = SYS32 / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    if not ps.exists():
+        return skip_external("stdout-powershell-detach", "Windows PowerShell 5.1 (powershell.exe)")
+    reps = int(os.environ.get("UHH_PSDETACH_REPS", "1"))
+    backends = [x for x in os.environ.get("UHH_PSDETACH_BACKENDS", "").split(",") if x] or ["inline", "breakpoint"]
     # An attach reported BEFORE its detach (uhh_trace --detach-after-ms) on a target that keeps
     # logging at full speed into a slow PowerShell pipeline. The report's counts must be
     # causally consistent (stdout_logs <= logs_written <= hits: the hits were read before a
     # long flush and came out far BELOW logs_written), and the records after the report must
     # end in a probe_final whose counts close the books: hits == logs_written + log_dropped +
     # in_flight, and the capture holds exactly its stdout_logs records, seq without a gap.
-    for backend in ("inline", "breakpoint"):
+    for k, backend in ((r, b) for r in range(reps) for b in backends):
         name = f"stdout-powershell-detach-{backend}"
         work = Path(tempfile.mkdtemp(prefix="uhh-pslog-"))
         tgt = None
@@ -10792,6 +10820,7 @@ def check_stdout_powershell():
             script = (f"$ErrorActionPreference='Continue'; $tr='{tracer}'; $o='{out}'; $a=@({lit}); "
                       "& $tr @a | Out-File -FilePath $o -Encoding utf8")
             env = dict(os.environ, TEMP=str(work), TMP=str(work))
+            t0 = time.time()
             p = subprocess.Popen([str(ps), "-NoProfile", "-NonInteractive", "-Command", script],
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", env=env)
             try:
@@ -10800,9 +10829,12 @@ def check_stdout_powershell():
                 tgt.kill()                                   # ends the attached session too
                 _, err = p.communicate(timeout=120)
                 partial = verify_capture(out)
-                record(name, False, f"no end within 240 s: captured so far={partial['logs']} "
-                                    f"report={'yes' if partial['report'] else 'no'} stderr={err.strip().splitlines()[-4:]}")
+                lines = err.strip().splitlines()
+                waits = [l for l in lines if "still waiting for probe_run" in l][:1]
+                record(name, False, f"rep={k} no end within 240 s: captured so far={partial['logs']} "
+                                    f"report={'yes' if partial['report'] else 'no'} stderr={waits + lines[-4:]}")
                 continue
+            took = time.time() - t0
             r = subprocess.CompletedProcess(p.args, p.returncode, "", err)
             alive = tgt.poll() is None
             cap = verify_capture(out)
@@ -10830,9 +10862,9 @@ def check_stdout_powershell():
                 closed = (dh == rep.get("hits") and dw == rep.get("logs_written") == rep.get("stdout_logs") == cap["logs"]
                           and dh == dw + dd + di)
                 fin = {"hits": dh, "logs_written": dw, "log_dropped": dd, "in_flight": di, "stdout_logs": cap["logs"]}
-            ok = (alive and finals <= 1 and after_final == 0 and consistent and closed and cap["bad"] == 0 and cap["gaps"] == 0 and
+            ok = (took <= 120 and alive and finals <= 1 and after_final == 0 and consistent and closed and cap["bad"] == 0 and cap["gaps"] == 0 and
                   fin.get("log_dropped") == 0 and rep.get("error") is None and cap["logs"] > 0)
-            record(name, ok, f"report: hits={hits} written={rep.get('logs_written')} stdout_logs={rep.get('stdout_logs')} "
+            record(name, ok, f"rep={k} took={took:.0f}s report: hits={hits} written={rep.get('logs_written')} stdout_logs={rep.get('stdout_logs')} "
                              f"consistent={consistent} final={ {k: fin.get(k) for k in ('hits', 'logs_written', 'log_dropped', 'in_flight', 'stdout_logs')} } "
                              f"captured={cap['logs']} bad={cap['bad']} seq_gaps={cap['gaps']} target_alive={alive} "
                              f"finals={finals} json_after_final={after_final}"
@@ -10843,6 +10875,113 @@ def check_stdout_powershell():
             if tgt and tgt.poll() is None:
                 tgt.kill()
                 tgt.wait()
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def check_slowreader_detach():
+    """A live detach must END while the attached target keeps the log ring full (CI 42364458533:
+    x86 stdout-powershell-detach-inline, probe_close "still waiting for probe_run to stop (180s)"
+    with 8.7M records streamed; the detach ran only once the test killed the target). The
+    drainer thread took drain_mu again nanoseconds after each pass; the debug loop, waiting for
+    it in its per-turn drain, starved and never got back to the stop request. Every trigger of
+    a live detach goes through that loop: --detach-after-ms (timed), --detach-on-stdin, and
+    Ctrl+Break (a plain --attach). uhh_trace --attach of logstream_target (4 threads, full
+    speed, inline + --stack) with its stdout read SLOWLY by this script (the ring stays full):
+    the trigger at ~3 s; the tool must exit within DETACH_END_S of it (the detach waits at most
+    15 s for running callbacks), the target alive, the detach line's books closed (hits ==
+    logs_written + log_dropped + in_flight, nothing dropped), and every record written to
+    stdout read here (stdout_logs of probe_final / the report == probe_log lines read)."""
+    import signal
+    tracer, target = exe("uhh_trace.exe"), exe("logstream_target.exe")
+    if not tracer or not target:
+        return missing_bin("detach-slowreader", "uhh_trace/logstream_target")
+    DETACH_END_S = 45     # bounded detach: ~15 s callback wait + agent stop/drain; starved, it was 58 s to forever
+    reps = int(os.environ.get("UHH_SLOWREADER_REPS", "1"))
+    for rep, how in ((r, h) for r in range(reps) for h in ("timed", "stdin", "ctrlbreak")):
+        name = f"detach-slowreader-{how}-inline"
+        procs = []
+        work = Path(tempfile.mkdtemp(prefix="uhh-slowrd-"))
+        try:
+            tgt = subprocess.Popen([str(target), "--count", "2000000000", "--threads", "4", "--delay", "0", "--no-ticks"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            procs.append(tgt)
+            time.sleep(1)
+            a = [str(tracer), "--backend", "inline", "--stack", "-p", "logstream_target.exe!LogSite:d",
+                 "--attach", str(tgt.pid)]
+            a += {"timed": ["--detach-after-ms", "3000"], "stdin": ["--detach-on-stdin"], "ctrlbreak": []}[how]
+            att = subprocess.Popen(a, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   env=dict(os.environ, TEMP=str(work), TMP=str(work)),
+                                   creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+            procs.append(att)
+            aerr = Lines(io.TextIOWrapper(att.stderr, errors="replace"))
+            st = {"logs": 0, "final": None, "report": None, "first": None}
+
+            def slow_read():                          # ~1 MB/s: far below what 4 logging threads produce
+                carry = b""
+                while True:
+                    chunk = att.stdout.read1(16384) if hasattr(att.stdout, "read1") else att.stdout.read(16384)
+                    if not chunk:
+                        break
+                    lines = (carry + chunk).split(b"\n")
+                    carry = lines.pop()
+                    for l in lines:
+                        if l.startswith(b'{"kind":"probe_log"'):
+                            st["logs"] += 1
+                            if st["first"] is None: st["first"] = time.time()
+                        elif l.startswith(b'{"kind":"probe_final"'): st["final"] = json.loads(l)
+                        elif l.startswith(b'{"kind":"probe_report"'): st["report"] = json.loads(l)
+                    time.sleep(0.016)
+            rd = threading.Thread(target=slow_read, daemon=True)
+            rd.start()
+            t_att = time.time()
+            if not aerr.wait_for(lambda l: l.startswith("probe: active logstream_target.exe!LogSite"), 90):
+                raise RuntimeError("LogSite never became active: " + " | ".join(aerr.lines[-3:])[:300])
+            if how == "timed":
+                trig = time.time() + 3.0              # --detach-after-ms 3000 counts from the attach
+            else:
+                time.sleep(3)
+                trig = time.time()
+                if how == "stdin":
+                    att.stdin.write(b"\n"); att.stdin.flush()
+                else:
+                    att.send_signal(signal.CTRL_BREAK_EVENT)
+            try:
+                att.wait(timeout=trig - time.time() + DETACH_END_S + 30)
+            except subprocess.TimeoutExpired:
+                pass
+            took = time.time() - trig
+            if att.poll() is None:
+                waits = [l for l in aerr.lines if "still waiting for probe_run" in l][:1]
+                att.kill(); att.wait()
+                record(name, False, f"rep={rep} no end {took:.0f} s after the {how} trigger: read={st['logs']} "
+                                    f"stderr={waits + aerr.lines[-3:]}")
+                continue
+            rd.join(timeout=120)
+            aerr.t.join(timeout=30)
+            alive = tgt.poll() is None
+            sm = cx_detach_summary(aerr.lines)
+            last = st["final"] or st["report"] or {}
+            bad = []
+            if took > DETACH_END_S: bad.append(f"ended {took:.0f}s after the trigger (> {DETACH_END_S}s)")
+            if not alive: bad.append("target died")
+            if att.returncode != 0: bad.append(f"rc={att.returncode}")
+            if not sm or sm.get("hits") != sm.get("logs_written", 0) + sm.get("log_dropped", 0) + sm.get("in_flight", 0) \
+                    or sm.get("log_dropped") != 0:
+                bad.append(f"summary={sm}")
+            if st["logs"] == 0 or last.get("stdout_logs") != st["logs"]:
+                bad.append(f"read={st['logs']} stdout_logs={last.get('stdout_logs')}")
+            if how == "ctrlbreak" and not any("interrupted" in l for l in aerr.lines):
+                bad.append("no 'interrupted' line")
+            record(name, not bad, f"rep={rep} " + (" ".join(bad) or
+                   f"ended {took:.1f}s after the {how} trigger; read={st['logs']} summary={sm}") +
+                   ("" if not bad else f" stderr={aerr.lines[-3:]}"))
+        except Exception as e:
+            record(name, False, repr(e))
+        finally:
+            for q in procs:
+                if q.poll() is None:
+                    q.kill()
+                    q.wait()
             shutil.rmtree(work, ignore_errors=True)
 
 
@@ -11068,6 +11207,8 @@ def main():
     if want(check_gated_e2e): check_gated_e2e()
     if want(check_realbig): check_realbig("" if args.bigapps else REALBIG_DEFAULT)
     if want(check_stdout_powershell): check_stdout_powershell()
+    if want(check_powershell_detach): check_powershell_detach()
+    if want(check_slowreader_detach): check_slowreader_detach()
     if want(check_stdout_console): check_stdout_console(args.console_records)
     if only and not RESULTS:
         print(f"regress.py: --only {','.join(only)} selected only opt-in tiers that were not enabled "

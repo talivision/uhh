@@ -200,7 +200,8 @@ struct EventFiber {
 struct probe_session {
     std::vector<std::unique_ptr<Probe>> probes;
     std::mutex agent_mu;
-    std::mutex drain_mu;                       // shared ring has exactly one consumer at a time
+    std::mutex drain_mu;                       // shared ring has exactly one consumer at a time (lock_drain)
+    std::atomic<int> drain_waiters{0};         // threads blocked taking drain_mu: the drainer lets them in
     uint32_t agent_map[PROBE_AGENT_MAX_PROBES] = {};   // agent request index -> probes[] index (under agent_mu)
     std::thread drainer;                       // empties the agent's log ring continuously
     std::atomic<uint64_t> controller_dropped{0}; // only broken file I/O/allocation can lose controller logs
@@ -376,6 +377,7 @@ struct probe_session {
     bool attached = false;                     // probe_attach: detach (not kill) on close
     std::atomic<bool> stop_requested{false};   // probe_close from another thread while probe_run runs
     std::atomic<bool> running{false};          // probe_run is executing (on some thread)
+    std::atomic<const char *> run_phase{""};   // what probe_run is doing (a slow close says it)
     bool detached = false;
     bool detaching = false;                    // detach() running: no new holds, arming, gates or agent work
     bool detached_hooks = false;               // detach removed the inline hooks (stop_drainer may settle)
@@ -8428,6 +8430,22 @@ static void pack_agent_record(probe_session *s, const probe_agent_log &rec, std:
     }
 }
 
+// drain_mu, taken FAIRLY. The drainer thread releases it between passes and takes it again
+// nanoseconds later; a std::mutex (an SRW lock) has no handoff, so another thread waiting for
+// it -- the debug loop's per-turn drain, a report, a module unload -- could lose that race for
+// minutes while the target kept the ring full (CI: a live detach not even started 240 s after
+// its request, probe_run starved in its drain while 8.7M records streamed). A thread that
+// finds it taken says so here; the drainer does not start another pass while one waits.
+static std::unique_lock<std::mutex> lock_drain(probe_session *s) {
+    std::unique_lock<std::mutex> lock(s->drain_mu, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        s->drain_waiters.fetch_add(1);
+        lock.lock();
+        s->drain_waiters.fetch_sub(1);
+    }
+    return lock;
+}
+
 // Move published inline-log records out of the shared ring (single consumer). Called
 // every debug-loop turn, on idle timeouts, and at report, so the ring never fills
 // just because the run is long.
@@ -8439,7 +8457,7 @@ static size_t drain_agent_logs(probe_session *s) {
     if (!s->shared) return 0;
     auto *sh = s->shared;
     size_t moved = 0;
-    std::lock_guard<std::mutex> consume(s->drain_mu);
+    auto consume = lock_drain(s);
     // Records go to the writer in packs (enqueue_logs), each before drain_mu is released: a
     // flush that drains first (report, unload, detach) still finds every record queued.
     // log_tail is written once per pack and at the end of the pass, not per record: producers find
@@ -8491,7 +8509,7 @@ static bool ring_owner_gone(probe_session *s, DWORD tid) {
 // the same producer as a later one published during the scan (per-thread order).
 static void deliver_past_stall(probe_session *s) {
     auto *sh = s->shared;
-    std::lock_guard<std::mutex> consume(s->drain_mu);
+    auto consume = lock_drain(s);
     LONG64 tail = sh->log_tail, head = sh->log_head;
     if (head <= tail || sh->logs[(uint64_t)tail % PROBE_AGENT_LOG_CAP].seq != tail) return;
     for (LONG64 pos = tail + 1; pos < head; ++pos) {
@@ -8528,7 +8546,7 @@ static void check_ring_stall(probe_session *s, RingStall &st) {
     }
     if (now - st.since < 20) return;
     if (ring_owner_gone(s, owner)) {
-        std::lock_guard<std::mutex> consume(s->drain_mu);
+        auto consume = lock_drain(s);
         if (sh->log_tail != tail || rec.seq != tail || (DWORD)rec.owner != owner) return;
         if (sh->log_head == tail) {                       // died between the owner and head CAS
             InterlockedCompareExchange(&rec.owner, 0, (LONG)owner);
@@ -8554,7 +8572,7 @@ static void start_drainer(probe_session *s) {
     if (s->drainer.joinable() || !s->shared) return;
     s->drain_stop = false;
     s->drainer = std::thread([s] {
-        unsigned idle = 0;
+        unsigned idle = 0, yields = 0;
         RingStall stall;
         // Idle waits of 0.5 ms (a high-resolution timer) while records came recently: Sleep(1)
         // lasts a whole timer tick (15.6 ms unless something raised the resolution), and a ring
@@ -8577,6 +8595,13 @@ static void start_drainer(probe_session *s) {
             // "Controller alive". This thread is its only writer: a plain store (on x86 a LOCKed
             // 64-bit increment is a CMPXCHG8B loop, once per loop).
             probe_agent_store64(&sh->drain_beat, ++beat);
+            if (s->drain_waiters.load()) {           // another consumer goes first (lock_drain)
+                // (It may wait behind a third holder that is itself held up by a slow stdout:
+                // after a few yields, sleep rather than spin.)
+                if (++yields < 64) SwitchToThread(); else Sleep(1);
+                continue;
+            }
+            yields = 0;
             if (drain_agent_logs(s)) { idle = 0; last_record = GetTickCount64(); continue; }
             check_ring_stall(s, stall);
             if (++idle < 64) { SwitchToThread(); continue; }
@@ -8616,7 +8641,7 @@ static void drain_final(probe_session *s) {
         for (ULONGLONG until = GetTickCount64() + 500; sh->log_head != sh->log_tail && GetTickCount64() < until; ) {
             if (!drain_agent_logs(s)) Sleep(1);
         }
-    std::lock_guard<std::mutex> consume(s->drain_mu);
+    auto consume = lock_drain(s);
     // head and tail live in memory the TARGET can write: never trust them for the loop
     // bound. At most one ring's worth of slots can hold unread records.
     const LONG64 tail = sh->log_tail;
@@ -9193,11 +9218,14 @@ extern "C" int probe_run(probe_session *s) {
         if (s->stop_requested) {
             // probe_close was called on another thread. The debug API binds the debug object
             // to THIS thread, so the detach (or termination) happens here.
+            s->run_phase = "detaching";
             if (s->attached) { detach(s); s->detached = true; }
             else if (s->pi.hProcess) { TerminateProcess(s->pi.hProcess, 3); s->stop_requested = false; continue; }
             break;
         }
+        s->run_phase = "draining the log ring";
         drain_agent_logs(s);
+        s->run_phase = "in the debug loop";
         if (guard_pending(s) && s->guard_since && GetTickCount64() - s->guard_since > 5000 &&
             !guard_set_ready(s, "agent not ready within 5 s")) break;
         if (!s->held.empty() && GetTickCount64() - s->held_since > 5000) {
@@ -9230,6 +9258,7 @@ extern "C" int probe_run(probe_session *s) {
         if (!ok) break;
     }
     bench_phase("run_loop_end");
+    s->run_phase = "ending the session";
     finish_calls(s);                                      // callbacks still parked in call_func
     // An attached target is still running and the loop is leaving for some other reason
     // than a detach (an error: agent load/init failure, a failed context get/set or debug
@@ -9400,7 +9429,11 @@ extern "C" void probe_close(probe_session *s) {
         // be a use-after-free. A slow detach is reported, never cut short.
         for (ULONGLONG start = GetTickCount64(), warned = 0; s->running || !s->ran; Sleep(10)) {
             ULONGLONG waited = (GetTickCount64() - start) / 15000;
-            if (waited > warned) { warned = waited; std::fprintf(stderr, "probe: close: still waiting for probe_run to stop (%llus)\n", waited * 15); }
+            if (waited > warned) {
+                warned = waited;
+                std::fprintf(stderr, "probe: close: still waiting for probe_run to stop (%llus; it is %s)\n",
+                             waited * 15, s->run_phase.load());
+            }
         }
     }
     ctrl_leave(s);                         // closed without probe_wait_for_exit

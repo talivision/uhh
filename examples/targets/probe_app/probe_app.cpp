@@ -25,7 +25,8 @@
 // --until-key repeats the read phase (W x R reads, the same pattern each round) until a second
 // byte/keystroke arrives on stdin after the gate, so a test can keep the threads reading for
 // as long as it needs regardless of machine speed. The app line reports "rounds"; the reads
-// and the checksum are exactly rounds x one round's.
+// and the checksum are exactly rounds x one round's. The same W threads read every round (a
+// blocking barrier between rounds): some thread is reading at every moment (run_read_rounds).
 //
 // Read pattern (deterministic, so a filter on one pid + one address range selects an
 // exactly predictable count): global read i = t*R + k (thread t, its k-th read) reads
@@ -55,6 +56,7 @@
 #include <tlhelp32.h>
 #include <algorithm>
 #include <atomic>
+#include <barrier>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -370,6 +372,44 @@ static double run_reads(std::vector<Helper> &helpers, size_t threads, uint64_t r
     return (double)(end.QuadPart - begin.QuadPart) * 1e9 / (double)f.QuadPart;
 }
 
+// --until-key: the SAME W threads read round after round until `stop` is set, with a blocking
+// barrier between rounds (its last arriver decides, for all, whether another round follows),
+// so every thread does the same number of whole rounds. No thread is created and nobody spins
+// between rounds: while some threads wait at the barrier the last one is still reading, so the
+// process calls NtReadVirtualMemory at every moment of the phase. (Running run_reads again per
+// round did not: its 4 fresh threads and main SPIN until all of them have started, and with
+// every CPU taken by spinners a thread that has not started waits for a scheduling quantum --
+// Windows Server: ~190 ms -- so a round's start left the process without a single read for a
+// few hundred ms now and then: a short attach (regress ntdll-churn, 300 ms) saw no call at
+// all.) Returns the phase's elapsed time; `results` holds each thread's sums over all rounds.
+static double run_read_rounds(std::vector<Helper> &helpers, size_t threads, uint64_t reads,
+                              const std::atomic<bool> &stop, uint64_t &rounds, std::vector<ThreadResult> &results) {
+    results.assign(threads, {});
+    std::atomic<bool> failed{false};
+    bool more = true;
+    uint64_t done = 0;
+    std::barrier sync((std::ptrdiff_t)threads, [&]() noexcept {
+        ++done;
+        more = !stop.load() && !failed.load();
+    });
+    const uint64_t begin = qpc_now();
+    std::vector<std::thread> pool;
+    for (size_t t = 0; t < threads; ++t) pool.emplace_back([&, t] {
+        for (;;) {
+            ThreadResult r;
+            read_worker(helpers, t, reads, r);
+            results[t].success += r.success; results[t].checksum += r.checksum;
+            if (!r.error.empty()) { if (results[t].error.empty()) results[t].error = r.error; failed.store(true); }
+            sync.arrive_and_wait();
+            if (!more) break;
+        }
+    });
+    for (auto &th : pool) th.join();
+    LARGE_INTEGER f{}; QueryPerformanceFrequency(&f);
+    rounds = done;
+    return (double)(qpc_now() - begin) * 1e9 / (double)f.QuadPart;
+}
+
 // Diagnostics for instrumentation tests: if anything ever reaches this process as an
 // unhandled exception (e.g. a debug trap left behind by a detaching tool), say exactly
 // what and where before the process dies.
@@ -493,11 +533,9 @@ int main(int argc, char **argv) try {
         std::fflush(stdout);
         static std::atomic<bool> key_pressed{false};
         if (until_key) std::thread([] { wait_for_key(); key_pressed.store(true); }).detach();   // EOF stops too
-        do {
-            elapsed_ns += run_reads(helpers, threads, reads, results);
-            ++rounds;
-            for (auto &r : results) { require(r.error.empty(), r.error); success += r.success; checksum += r.checksum; }
-        } while (until_key && !key_pressed.load());
+        if (until_key) elapsed_ns = run_read_rounds(helpers, threads, reads, key_pressed, rounds, results);
+        else { elapsed_ns = run_reads(helpers, threads, reads, results); rounds = 1; }
+        for (auto &r : results) { require(r.error.empty(), r.error); success += r.success; checksum += r.checksum; }
     }
     uint64_t hook_calls = prehook_calls.load();
     prehook.reset();

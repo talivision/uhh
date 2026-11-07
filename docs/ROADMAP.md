@@ -1490,6 +1490,35 @@ INT3"); nothing shipped links it. `--only cxlib`.
   exactly rounds x an uninstrumented round's. Log lines are counted as they stream (the old check held
   millions of parsed lines in Python memory). With the streaming reader, inline cycles took 1.0-2.9 s on
   x64 and 1.2-8.0 s on x86 (hw/breakpoint 0.9-3.3 s): 3/3 PASS per arch, 8 cycles each, rounds 2-5.
+- ✅ (H4) **x86 `ntdll-churn-breakpoint` cycle 2 with zero hits** (CI 42357172927, branch flakes; the last
+  intermittent row on main). Not the tool: the TARGET made no call in that window. probe_app `--until-key` ran
+  each round through run_reads -- 4 fresh threads that, with main, SPIN (`YieldProcessor`) until all of them
+  have started. With every CPU taken by spinners, a thread that has not started waits for a scheduling
+  quantum (Windows Server: ~190 ms), so every round began with 200-600 ms in which no thread read; a 300 ms
+  cycle that fell inside one could see nothing. Evidence (branch `churn-diag`, since deleted: the target
+  logged each thread-round's read interval in epoch ms, the check each cycle's attach time; 20 x86 + 10 x64
+  runner jobs per run):
+  - the attach is not late: UHH_DIAG_EVLOG event order on attach is `P L * T...T L...L T X` -- the probe
+    is armed at ntdll's LOAD_DLL, the 2nd event, before any existing thread's CREATE_THREAD is continued
+    (attach -> `probe: active` 0-16 ms in 2,016 cycles; an above-normal debug loop during the attach
+    changed nothing and was dropped);
+  - round-start barriers on runners: p50 200-390 ms, max 642 ms, quantized in ~195 ms steps; 3 zero-hit
+    cycles in 2,520 (x86 2 of 1,680, x64 1 of 840), and in each the attach landed 1-7 ms before a round's
+    end and the next round's last thread started 389-422 ms after it (its `go` at +410..+609 ms, after the
+    detach at ~+300 ms);
+  - A/B on the same runners (old loop vs the fix, 3 targets x 2 backends x 7 short cycles per job):
+    old 1,260 cycles: 1 zero-hit, 1 with < 50 hits, 35 with less than 300 ms of reading in the 300 ms after
+    the attach, idle stretches up to 607 ms; new 1,260 cycles: 0 zero-hit, 0 under 50, longest stretch with
+    no thread reading 6 ms.
+  Fix (target, not the check's assertion): `--until-key` now keeps the same W threads for every round with
+  a blocking `std::barrier` between rounds (its last arriver decides for all whether another round follows,
+  so rounds stay whole and reads/checksum exactly rounds x one round's). Waiting threads block; the last one
+  is still reading, so the process calls NtReadVirtualMemory at every moment and a zero-hit cycle is again a
+  tool failure. The check's assertions are unchanged. Validation (churn 50ad410, the real check): 20 runner
+  repetitions per arch (CI 42364469942 x86, 42364472166 x64: 60/60 rows each) plus the full push suite
+  (42364458533: every ntdll-churn row PASS; its one failure, x86 `stdout-powershell-detach-inline` "no end
+  within 240 s" with 4 inline callbacks still running at the detach, does not involve probe_app -- open, not
+  investigated here).
 
 ## E2E gated_config evaluator findings (2026-11-06, regress `gated-e2e-*`)
 The flagship use case end to end against ground truth written by the TARGET itself.
@@ -1816,9 +1845,50 @@ the report (count, valid JSON per line, CRC multiset of the lines, `seq` coverag
   `-{outfile,merged}-{breakpoint,hw}` (100k / 10k stack records through `powershell -Command`):
   captured == stdout_logs == logs_written == hits == logs + dropped + interrupted, every line
   valid JSON, seq contiguous, nothing after the report, session file equally complete;
-  `stdout-powershell-detach-{inline,breakpoint}` (live report consistent, `probe_final` last,
-  target alive); `stdout-console-{inline,breakpoint,hw}` (into a pseudo console: every seq
+  `stdout-powershell-detach-{inline,breakpoint}` (now `check_powershell_detach`: live report
+  consistent, `probe_final` last, target alive, the run ends within 120 s); `stdout-console-{inline,breakpoint,hw}` (into a pseudo console: every seq
   rendered, report complete; `--console-records 2000000` adds the 2M tier).
+
+## psdetach: a live detach that never ended (2026-11-07, branch `psdetach`, regress `detach-slowreader-*`, `stdout-powershell-detach-*`)
+
+CI 42364458533 (churn, x86): `stdout-powershell-detach-inline` "no end within 240 s", stderr
+`probe: close: still waiting for probe_run to stop (180s)` and, only after the test killed the
+target, `detach: 0 thread(s) frozen` / `detached: ... in_flight=4 running=4`: the detach had not
+even STARTED in 240 s (its freeze found the target already dead). Not the 15 s callback bound
+(stop_drainer, agent-scope section): that bound is only reached once probe_run gets to the
+stop request.
+- ✅ **Cause: the debug loop starved on `drain_mu`.** The drainer thread releases `drain_mu`
+  between passes and takes it again nanoseconds later; while the attached target keeps the ring
+  full (stdout slower than the producers), every pass finds records. `std::mutex` is an SRW lock
+  with no handoff, so the debug loop, blocked in its per-turn `drain_agent_logs`, lost that race
+  for minutes and never returned to the top of its loop, where `stop_requested` (probe_close from
+  `--detach-after-ms` / `--detach-on-stdin`) and Ctrl+C are seen. (The earlier fix in the
+  PowerShell section, one bounded pass per drain, removed the unbounded pass but not this race:
+  the pass ends, the drainer simply takes the lock again.) Evidence: a new diagnostic (probe_close's
+  wait now names probe_run's phase) on the unfixed library, x86 VM: `still waiting for probe_run
+  to stop (15s; it is draining the log ring)`, `(30s; ...)`; `stdout-powershell-detach-inline` took
+  15 / 203 / 60 / 37 s per run (the report and detach themselves need ~7 s).
+- Fix: `lock_drain()` -- a thread that finds `drain_mu` taken counts itself in `drain_waiters`;
+  the drainer starts no pass while one waits (yields, then `Sleep(1)` if the wait is long: the
+  holder may itself wait for a slow stdout). Every `drain_mu` user goes through it (the debug
+  loop, probe_report, module unloads, the IPC-log path, stall recovery, the final drain).
+- Regress `check_slowreader_detach` (`detach-slowreader-{timed,stdin,ctrlbreak}-inline`):
+  `uhh_trace --attach` of logstream_target (4 threads, full speed, inline, `--stack`) with its
+  stdout read by the script at ~1 MB/s, so the ring stays full; the trigger at ~3 s
+  (`--detach-after-ms 3000`, a line on stdin, Ctrl+Break); the tool must exit within 45 s of it,
+  target alive, `hits == logs_written + log_dropped + in_flight`, nothing dropped, every record
+  written to stdout read. `UHH_SLOWREADER_REPS` repeats it. `check_powershell_detach`
+  (`UHH_PSDETACH_REPS`, `UHH_PSDETACH_BACKENDS`) carries the old rows, now also bounded in time.
+- Before/after on the VM (2 rounds of the 3 triggers before, x86; 4 rounds after, each arch): unfixed 5 of 6
+  slowreader rows failed (no end 90 s after the trigger x3, 61 s, 62 s; the one pass took 58.7 s);
+  fixed 12/12 x86 + 12/12 x64, ended 4.2-17.7 s after the trigger; `stdout-powershell-detach-inline`
+  7-9 s per run (5/5 per arch).
+- CI (windows-2022, the same regress code): unfixed library (psdetach-before 03f4a24, run 42368530837)
+  8 of 18 slowreader rows failed (x86 6/9, x64 2/9: ended 65-74 s after the trigger, one no end);
+  the unfixed `stdout-powershell-detach-inline` passed 48/48 there (42366977386, 42366979332,
+  42366981506 -- the CI failure is rare on runners, the slow-reader check is not). Fixed library
+  (d48a421, runs 42368524885, 42368526867, 42368528744): 54/54 slowreader rows and 48/48
+  `stdout-powershell-detach-inline` rows, both arches, 0 failures.
 
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`
