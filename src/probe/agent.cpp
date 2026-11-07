@@ -289,6 +289,11 @@ extern "C" uint64_t get_func_arg(probe_context *c, size_t index) {
 #endif
 }
 
+// Module-unload generation (the loader's DLL notification, registered at init: watch_unloads)
+// and its registration cookie: caches of module-derived facts are valid while it is unchanged.
+static volatile LONG g_unload_gen;
+static void *g_dll_cookie;
+
 #if !defined(_WIN64)
 // True when addr follows a call instruction: E8 rel32, or FF /2 (call r/m32) in its
 // 2/3/6/7-byte forms. Caller holds an SEH guard (addr may be unmapped).
@@ -322,15 +327,56 @@ static bool looks_like_return(uint32_t addr) {
 // return slot) as a bound and tie-break only.
 // No-fault rule: every stack read is inside the hit thread's TEB stack bounds, and every
 // code/data read is inside a region VirtualQuery reported committed and readable -- a
-// per-capture cache, never trusted across hits. Nothing here can raise an exception the
-// target's vectored handlers would see. Scans are bounded (16 KiB per frame, 128 queries).
+// per-capture cache, never trusted across hits -- with one exception: executable IMAGE
+// regions (module code) are remembered across captures until a module unloads (the loader's
+// notification bumps g_unload_gen before the image is unmapped; see the call_func cache),
+// like the read-region cache does for get_mem. A value inside the thread's own stack is
+// classified from the TEB bounds (committed read/write, never image code) without a query.
+// (perf6: the per-capture VirtualQuery of the stack and of each module's code -- a WOW64
+// system call each -- was most of an x86 inline send_log_stack, ~10 us.)
+// Nothing here can raise an exception the target's vectored handlers would see. Scans are
+// bounded (16 KiB per frame, 128 queries).
+struct X86Code { volatile LONG seq; volatile LONG gen; volatile uint32_t lo, hi; };
+static X86Code g_x86_code[16];
+static bool x86_code_known(uint32_t a, uint32_t &lo, uint32_t &hi) {
+    if (!g_dll_cookie) return false;
+    const LONG gen = g_unload_gen;
+    for (X86Code &e : g_x86_code) {
+        const LONG s1 = e.seq;
+        if (s1 & 1) continue;
+        const uint32_t l = e.lo, h = e.hi; const LONG g = e.gen;
+        _ReadWriteBarrier();
+        if (e.seq == s1 && g == gen && a >= l && a < h) { lo = l; hi = h; return true; }
+    }
+    return false;
+}
+static void x86_code_learn(uint32_t lo, uint32_t hi, LONG gen) {
+    if (!g_dll_cookie) return;
+    static volatile LONG next;
+    X86Code &e = g_x86_code[(uint32_t)InterlockedIncrement(&next) & 15];
+    const LONG s1 = e.seq;
+    if ((s1 & 1) || InterlockedCompareExchange(&e.seq, s1 + 1, s1) != s1) return;
+    e.lo = lo; e.hi = hi; e.gen = gen;
+    InterlockedExchange(&e.seq, s1 + 2);
+}
 struct X86Mem {
     struct Region { uint32_t lo, hi; bool read, exec; };
     Region r[16]{}; uint32_t used = 0, next = 0; int budget = 128;
+    const Region *keep(const Region &g) {
+        const uint32_t slot = used < 16 ? used++ : (next++ & 15);
+        r[slot] = g;
+        return &r[slot];
+    }
     const Region *find(uint32_t a) {
         for (uint32_t i = 0; i < used; ++i) if (a >= r[i].lo && a < r[i].hi) return &r[i];
+        const NT_TIB *tib = reinterpret_cast<const NT_TIB *>(NtCurrentTeb());
+        const uint32_t slo = (uint32_t)(uintptr_t)tib->StackLimit, shi = (uint32_t)(uintptr_t)tib->StackBase;
+        if (a >= slo && a < shi) return keep(Region{slo, shi, true, false});
+        uint32_t clo = 0, chi = 0;
+        if (x86_code_known(a, clo, chi)) return keep(Region{clo, chi, true, true});
         if (budget <= 0) return nullptr;
         --budget;
+        const LONG gen = g_unload_gen;                       // before the query (see x86_code_learn)
         MEMORY_BASIC_INFORMATION mbi{};
         if (!VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof(mbi))) return nullptr;
         Region g{};
@@ -343,9 +389,8 @@ struct X86Mem {
                   prot == PAGE_EXECUTE_READ || prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY);
         g.exec = g.read && mbi.Type == MEM_IMAGE &&
                  (prot == PAGE_EXECUTE_READ || prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY);
-        const uint32_t slot = used < 16 ? used++ : (next++ & 15);
-        r[slot] = g;
-        return &r[slot];
+        if (g.exec) x86_code_learn(g.lo, g.hi, gen);
+        return keep(g);
     }
     // [a, a+n) lies in ONE readable region (and in executable image code when exec).
     bool ok(uint32_t a, uint32_t n, bool exec) {
@@ -915,8 +960,6 @@ static bool executable(uint64_t a) {
 // The executable verdict is cached with the entry, like the per-thread read-region cache:
 // image code that loses execute rights while its module stays loaded is not re-checked.
 // Entries are per-slot seqlocks (odd = being written): lock-free, any thread, no allocation.
-static volatile LONG g_unload_gen;
-static void *g_dll_cookie;
 struct CfEntry { volatile LONG seq; volatile LONG gen; volatile uint64_t fn; volatile uint32_t len; char sym[116]; };
 static CfEntry g_cf_cache[64];
 static uint32_t cf_hash(const char *s, size_t n) {
