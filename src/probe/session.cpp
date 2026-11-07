@@ -5527,8 +5527,12 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
         // the process is not frozen (measured: a 10 ms WaitForSingleObject loop beside a hot hw
         // probe completed 13 times in 1.75 s with no rounds, 9 in 2.1 s when one sighting reset
         // the period for a single round): one sighting keeps it served for the next ones.
-        if (s->parking && s->round_demand >= 0) {
-            if (s->round_demand) { s->fair_period_ms = 20; s->quiet_rounds = 0; }
+        // A round that never went quiet (a yielder was not parked, or events kept coming: no
+        // verdict) counts as one without demand too: it gave nobody anything either, and leaving
+        // the period as it was made the back-off -- so a run's speed -- depend on luck (CI x86
+        // log-throughput-hw: two identical gated runs 1.6 s apart).
+        if (s->parking) {
+            if (s->round_demand > 0) { s->fair_period_ms = 20; s->quiet_rounds = 0; }
             else if (++s->quiet_rounds >= 8) s->fair_period_ms = std::min<uint32_t>(80, s->fair_period_ms * 2);
         }
         s->round_demand = -1; s->quiet_sampled = false; s->runnable_prev.clear();   // cs_prev carries over
