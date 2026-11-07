@@ -226,7 +226,7 @@ struct probe_session {
     bool writer_stop = false, writer_busy = false, writer_failed = false;
     // Write coalescing (log_writer_main): the writer may hold a short batch briefly while records
     // stream in. writer_holding (queue_mu) says it is; a flush (flush_waiters), a stop or a
-    // full pack queued ends the hold at once through writer_hold.
+    // half-full queue ends the hold at once through writer_hold.
     bool writer_holding = false;
     int flush_waiters = 0;
     std::condition_variable writer_hold;
@@ -833,8 +833,9 @@ static void log_writer_main(probe_session *s) {
     // controller's main per-record cost. Now a batch that comes less than HOLD after the
     // previous write waits until HOLD has passed since it (more records join it), so a stream
     // costs at most one write pair per HOLD; the first record after a quiet spell is written at
-    // once (live latency unchanged). Ended early by a flush, a stop, or a full pack queued (a fast
-    // stream fills batches by itself: holding it would only let the bounded queue fill up).
+    // once (live latency unchanged). Ended early by a flush, a stop, or a half-full queue (a fast
+    // stream must not fill the bounded queue: the drainer would wait). Measured: ending it at one
+    // pack (256 records) instead cost a single fast producer ~25% of its logs/s (sink/inline/file).
     // Bench knob, not API: UHH_BENCH_WRITE_HOLD_US (0 = off).
     static const auto HOLD = [] {
         char v[16] = {};
@@ -898,7 +899,8 @@ static void log_writer_main(probe_session *s) {
                         if (std::chrono::steady_clock::now() < until) {
                             s->writer_holding = true;
                             s->writer_hold.wait_until(lock, until, [s] {
-                                return s->writer_stop || s->flush_waiters || s->log_queue_records >= LOG_PACK;
+                                return s->writer_stop || s->flush_waiters ||
+                                       s->log_queue_records >= probe_session::LOG_QUEUE_CAP / 2;
                             });
                             s->writer_holding = false;
                         }
@@ -1479,7 +1481,7 @@ static void enqueue_logs(probe_session *s, std::vector<LogRecord> &records) {
             try { s->log_queue.push_back(std::move(records[i])); s->logs_enqueued += n; s->log_queue_records += n; }
             catch (...) { s->controller_dropped.fetch_add(n, std::memory_order_relaxed); }
         }
-        const bool end_hold = s->writer_holding && s->log_queue_records >= LOG_PACK;
+        const bool end_hold = s->writer_holding && s->log_queue_records >= probe_session::LOG_QUEUE_CAP / 2;
         lock.unlock();
         if (end_hold) s->writer_hold.notify_all();
         if (warned) warn_console_once(s);
@@ -2055,14 +2057,13 @@ static void prepare_local_agent(probe_session *s) {
             }
         }
     }
-    // The next session's warm copy is made now, while this one is still being set up: its scan
-    // then overlaps the launch rather than the target's run (measured: made after the load, the
-    // scan ran during the gated reads).
-    if (!warm_sig.empty() && !s->agent_copy.empty()) start_warm_copy(warm_root, warm_sig, warm_src);
     bench_phase("agent_load", nullptr);
     s->agent_prep_module = LoadLibraryW(s->agent_path.c_str());
     s->agent_prep_error = s->agent_prep_module ? 0 : GetLastError();
     bench_phase("agent_loaded", nullptr);
+    // The next session's warm copy, once this one's agent is loaded (measured: started before
+    // this load, its scan queued in front of it and the launch took 128 ms instead of 53).
+    if (s->agent_prep_module && !warm_sig.empty()) start_warm_copy(warm_root, warm_sig, warm_src);
 }
 
 static void start_agent_prep(probe_session *s) {
