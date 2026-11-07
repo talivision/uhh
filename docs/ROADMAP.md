@@ -2248,7 +2248,7 @@ Each claim was checked with a regress check that FAILED on 0fb6cee (same tests, 
    thread existed at 55a1ffb; the "disk stalls" of the perf5 stream-live / stream-latency failures and the earlier citune
    x86 failure (records #25/#26 at 221/112 ms) are this. Fix: the writer writes stdout first in every mode (through a
    forwarded stdout too, when it is at a target line boundary and nothing is deferred) and hands the batch to a session
-   file appender thread (`log_filer_main`, queue capped at 2 MB -- 16 MB failed stream-volume-inline x86 on CI: peak 19 -> 24 MB); records deferred behind an unfinished target line are
+   file appender thread (`log_filer_main`; its queue capped at 1 MB and its chunks recycled -- a 16 MB, then a 2 MB queue of fresh 64 KB copies failed stream-volume-inline x86 on CI: peak 18 -> 24 MB); records deferred behind an unfinished target line are
    replayed from the file by the appender once appended (or by the forwarder at the newline); every flush waits for the
    appender (the file is complete at report/close). `stream-filestall-<bk>` (uhh_trace_th, test hook
    `UHH_TEST_FILE_STALL_MS=400` on the 8th append): 0fb6cee FAILED (`stdout held: #7 404 ms`, both backends); after,

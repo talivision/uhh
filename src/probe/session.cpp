@@ -246,6 +246,7 @@ struct probe_session {
     std::mutex file_mu;                        // never held while taking another lock
     std::condition_variable file_cv, file_idle;
     std::deque<std::string> file_queue;
+    std::vector<std::string> file_spare;       // appended chunks, emptied, for the writer to reuse (no allocation churn)
     size_t file_queued = 0;                    // bytes in file_queue
     bool file_stop = false, file_busy = false, file_failed = false;
     std::string file_error;
@@ -808,10 +809,12 @@ static bool append_log_file(probe_session *s, const char *bytes, size_t size, st
 // Live tail: the session file's appender thread. Appends the batches the writer handed over, in
 // order; then, if stdout is behind the file (records deferred while the target was inside one of
 // its lines), replays them as the forwarder would (tail_catch_up_locked reads the file).
-// Bytes handed over and not appended yet; beyond, the writer waits (stdout with it). 2 MB: thousands of
-// live records ride out a stalled file; a full-speed stream keeps a flat footprint (regress
-// stream-volume-inline: peak <= 1.2x from 2M to 20M records -- 16 MB grew x86 19 -> 24 MB on CI).
-static constexpr size_t FILE_QUEUE_CAP = 2u << 20;
+// Bytes handed over and not appended yet; beyond, the writer waits (stdout with it). 1 MB: thousands of
+// live records ride out a stalled file, and a full-speed stream keeps a flat footprint -- the chunks
+// are recycled (file_spare), never allocated per batch (regress stream-volume-inline: peak <= 1.2x
+// from 2M to 20M records; a 16 MB, then a 2 MB queue of fresh copies grew x86 18 -> 24 MB on CI).
+static constexpr size_t FILE_QUEUE_CAP = 1u << 20;
+static constexpr size_t FILE_SPARE_MAX = 24;
 static void log_filer_main(probe_session *s) {
     for (;;) {
         std::string chunk;
@@ -845,6 +848,8 @@ static void log_filer_main(probe_session *s) {
             s->file_queued -= chunk.size();
             s->file_busy = false;
             if (!ok && !s->file_failed) { s->file_failed = true; s->file_error = error; }
+            chunk.clear();                                // keeps its capacity
+            if (s->file_spare.size() < FILE_SPARE_MAX) s->file_spare.push_back(std::move(chunk));
         }
         s->file_idle.notify_all();
         { std::lock_guard<std::mutex> lock(s->tail_mu); }  // no lost wakeup for flush_log_writer
@@ -915,6 +920,7 @@ static bool write_log_batch(probe_session *s, const std::string &bytes, uint64_t
         s->tail_caught_up.notify_all();
         return true;
     }
+    std::string copy;
     {   // room in the appender's queue (never waited for under stdout_mu: the appender takes it)
         std::unique_lock<std::mutex> lock(s->file_mu);
         s->file_idle.wait(lock, [s] { return s->file_queued < FILE_QUEUE_CAP || s->file_failed; });
@@ -924,8 +930,8 @@ static bool write_log_batch(probe_session *s, const std::string &bytes, uint64_t
             writer_failed(s, error, records);
             return false;
         }
+        if (!s->file_spare.empty()) { copy = std::move(s->file_spare.back()); s->file_spare.pop_back(); }
     }
-    std::string copy;
     try { copy.assign(bytes); }
     catch (...) { writer_failed(s, "probe log writer: out of memory", records); return false; }
     std::unique_lock<std::mutex> out_lock(s->stdout_mu);
