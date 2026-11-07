@@ -3474,6 +3474,45 @@ def check_crash_logs(n=5000, threads=4):
                 record(name, False, repr(e))
 
 
+def check_carry_exact(calls=400_000, threads=4, runs=3):
+    """A clean exit accounts every hit with no callback "interrupted": inline, 4 threads, every
+    other call logs (hitcost --method log_alt), so the controller retires carried first records
+    while the same threads keep counting hits that end unlogged. Regression for CI 42325381514
+    (gated-e2e-launch-fhw-oin-cin-rin: logs 646/646 delivered, interrupted=1): the retire summed a
+    block's hits then read its `done` while the owner counted on, came out one short and skipped
+    the retire. Bar, every run: hits == calls x threads, logs == half of them, dropped == 0,
+    callbacks_interrupted == 0."""
+    d, t = exe("hitcost_driver.exe"), exe("hitcost_target.exe")
+    if not d or not t:
+        return missing_bin("carry-exact", "hitcost driver/target")
+    total = calls * threads
+    results, ok = [], True
+    for i in range(runs):
+        state = {"logs": 0, "objects": []}
+
+        def consume(line, _arrival):
+            if line.startswith('{"kind":"probe_log",'):
+                state["logs"] += 1
+            elif line.startswith("{"):
+                try:
+                    state["objects"].append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+        try:
+            rc, timed_out = stream_run([d, "--backend", "inline", "--method", "log_alt", "--", t, "--no-wait",
+                                        "--calls", calls, "--threads", threads], 600, consume)
+            rep = report(state["objects"])
+            hits = next(iter(probes(state["objects"])), {}).get("hits")
+            good = (not timed_out and rc == 0 and hits == total and state["logs"] == total // 2 and
+                    rep.get("log_dropped") == 0 and rep.get("callbacks_interrupted") == 0)
+            ok = ok and good
+            results.append(f"hits={hits} logs={state['logs']} intr={rep.get('callbacks_interrupted')} "
+                           f"drop={rep.get('log_dropped')} rc={rc}")
+        except Exception as e:
+            ok = False; results.append(repr(e))
+    record("carry-exact-inline", ok, f"want hits={total} logs={total // 2}: " + " | ".join(results))
+
+
 def check_attach_agent_scope():
     """Owner decision 2026-11-07: the agent DLL is injected into the target only when the session
     needs it (an inline probe).
@@ -10791,6 +10830,7 @@ def main():
     if want(check_gated_mem): check_gated_mem()
     if want(check_forwarded_probe): check_forwarded_probe()
     if want(check_crash_logs): check_crash_logs()
+    if want(check_carry_exact): check_carry_exact()
     if want(check_attach_new): check_attach_new()
     if want(check_attach_agent_scope): check_attach_agent_scope()
     if want(check_refusals): check_refusals()
