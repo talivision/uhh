@@ -2317,6 +2317,20 @@ keeping the full output, a ring of hardware-breakpoint events and a full minidum
   (`modules_moved_during_run=N[...]`); every other stable row must still be identical. It caught the control
   triple's pid. A process the observer cannot open is never excluded. The failure detail now diffs module lists
   split on `,` too (tasklist) and says when only the order differs.
+- ✅ (FL4) **x86 `hw-once-slots-{breakpoint,inline}`: target killed by STATUS_SINGLE_STEP** (CI 42194952645,
+  agentscope 42317542060; "run ended after 75 of 4000 calls"). Reproduced on runners: 32 failures in 2,836 rows (1,418 runs of the check)
+  (diag loops, x86 windows-2022; 0 in 120 on the VM), always the same: a worker's `lock inc g_w1` raised the data
+  watch #DB (slots 2 RW|ONCE and 3 WRITE) while another thread's event was being handled; that event retired the
+  RW|ONCE probe, whose release writes every thread's debug registers -- zeroing the QUEUED #DB's DR6 (H2). H2
+  keeps the status read just before the write (`keep_queued_dr6`) and carries it into the queued event when the
+  thread's registers show it has not run since -- and on x86 that test never passed: a hardware-event ring
+  (diag) showed the status read correctly (`dr6=0xffff0ffc`, bits 0xc kept) and then not carried, because the
+  WOW64 thread reports EFLAGS with the reserved bit 1 SET while its #DB is queued (`efl=0x202`) and CLEAR at the
+  event's report (`efl=0x200`), every other register equal. The watch hit arrived with no status, matched no
+  probe by address (a data trap reports the next instruction) and was passed on: the target died at
+  p2edge_target+0x1140 (after the `lock inc`). Every x86 all-thread DR write (arm, release, gates) had the same
+  exposure. Fix: `same_thread_regs` ignores EFLAGS bit 1 (architecturally always 1). After: see the
+  verification line below.
 
 ## Later
 - ✅ x86 cumulative-session flakiness (possibly the same handle double-close; recheck) -- CLOSED with evidence (cfnest). The note dates from the first checkpoint (c617de4); its suspected cause, review finding I6 (handles closed twice on the launch failure path), was fixed long since. Rechecked with `ar_driver --repeat`: 60 sessions in ONE controller process, backends in turn (breakpoint, hw, inline), each a call_func + runtime data watch whose callback call_funcs during another thread's call: every session exact, nothing dropped, the controller's handle count flat (x64 73 -> 73, x86 89 -> 89). Regress `sessions-repeat` keeps it covered (also exercises the per-run callback-fiber host). (Separately: `callfunc-kill-reuse` -- inline, needs the OS to hand a killed thread's id to a new thread of the same process within 3000 creations -- failed on the shared VM in Nov-06 evening runs on the cfnest build AND on an unmodified baseline build (2/2): system-wide thread-id reuse under other agents' load, not a UHH regression.)
