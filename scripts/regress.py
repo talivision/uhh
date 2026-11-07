@@ -2456,11 +2456,12 @@ def check_ntdll_churn(cycles=8, round_reads=1000000):
 
     Why the rounds keep their threads (ROADMAP H4). The target used to start 4 fresh threads per
     round, and they and main SPUN until all had started: with every CPU taken by spinners, a
-    thread not yet started waited for a scheduling quantum (Windows Server: ~190 ms), so now and
-    then a round's start left the process with no read at all for longer than a 300 ms cycle --
-    a cycle with zero hits that the tool had nothing to do with (x86 ntdll-churn-breakpoint,
-    CI 42357172927: probe active at once, no call to see). Now some thread reads at every
-    moment, and a zero-hit cycle is the tool's fault again."""
+    thread not yet started waited for a scheduling quantum (Windows Server: ~190 ms), so every
+    round began with 200-600 ms without a single read (measured on runners), and a 300 ms cycle
+    inside one saw zero hits that the tool had nothing to do with (x86 ntdll-churn-breakpoint,
+    CI 42357172927; the probe is armed before the attach resumes any thread). Now some thread
+    reads at every moment (longest idle stretch measured: 6 ms), and a zero-hit cycle is the
+    tool's fault again."""
     t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
     if not t or not a:
         return missing_bin("ntdll-churn", "uhh_trace/probe_app")
