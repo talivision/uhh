@@ -2186,8 +2186,9 @@ cxlib,cx2,hunt,lifecycle,slowreader,ctrl_review,shared_mix` on 9e61170 (merged w
 (the 3 failures stream-live-{hw,breakpoint} / stream-latency-inline "noisy": disk stalls of 0.4-0.7 s while another build
 ran on the VM; `--only stream` re-run quiet: 12/12), x86 582/583 (detach-slowreader-ctrlbreak-inline: the sweep race
 above, fixed in 038d74d); on the final build e01ba59: `ctrl_review,slowreader,stream,shared_mix,gated_map,agent_review`
-x64 46/46, x86 46/46, x86 agent_review 3 more times 5/5 each. CI: see the branch's runs (9e61170: only the sweep race
-and the known patch-race-unsafe; 038d74d: x86 agent-unwind failed once, 0xC0000096 -- not reproduced on the VM in 4 runs).
+x64 46/46, x86 46/46, x86 agent_review 3 more times 5/5 each. CI full suite on e01ba59 (run 42377639661): x64 1035/1035,
+x86 1005/1005, all shards green. Earlier pushes: 9e61170 only the sweep race (and the known patch-race-unsafe); 038d74d
+x86 agent-unwind failed once (0xC0000096) -- not reproduced on the VM (4 runs) nor in the e01ba59 CI run.
 
 ## Real-world cases
 - ✅ Microsoft Detours samples replicated (`examples/famous/detours_*`: simple, traceapi, withdll/attach, retval) -- findings above
