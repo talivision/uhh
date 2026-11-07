@@ -5300,7 +5300,9 @@ static void park_thread(probe_session *s, DWORD tid, DWORD disposition) {
         // Sleep (the target's own timer: ~15.6 ms, off the CPU -- what a starved thread needs)
         // while rounds find demand or have not yet found 8 in a row without; spin-yield ~4 ms
         // once they backed off (nobody to give the CPU to: keep the round short).
-        const bool sleep = s->quiet_rounds < 8;
+        // Several hot threads: always sleep -- spinning yielders hold CPUs the debugger needs for the
+        // events of those not yet parked (measured: t4 hw ~660 us/hit spinning vs ~560 sleeping).
+        const bool sleep = s->quiet_rounds < 8 || s->hot_prev.size() > 1 || s->hot_now.size() > 1;
         // The sleep ends at the round's absolute system-time deadline -- in the target's own
         // timer resolution, so at the first clock tick after it (0-15.6 ms, as before phase 3;
         // a relative sleep always took the full 15.6 ms and starved the hot threads).
