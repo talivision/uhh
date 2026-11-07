@@ -1872,7 +1872,7 @@ stop request.
   the drainer starts no pass while one waits (yields, then `Sleep(1)` if the wait is long: the
   holder may itself wait for a slow stdout). Every `drain_mu` user goes through it (the debug
   loop, probe_report, module unloads, the IPC-log path, stall recovery, the final drain).
-- Regress `check_detach_slow_reader` (`detach-slowreader-{timed,stdin,ctrlbreak}-inline`):
+- Regress `check_slowreader_detach` (`detach-slowreader-{timed,stdin,ctrlbreak}-inline`):
   `uhh_trace --attach` of logstream_target (4 threads, full speed, inline, `--stack`) with its
   stdout read by the script at ~1 MB/s, so the ring stays full; the trigger at ~3 s
   (`--detach-after-ms 3000`, a line on stdin, Ctrl+Break); the tool must exit within 45 s of it,
@@ -1882,7 +1882,13 @@ stop request.
 - Before/after on the VM (2 rounds of the 3 triggers before, x86; 4 rounds after, each arch): unfixed 5 of 6
   slowreader rows failed (no end 90 s after the trigger x3, 61 s, 62 s; the one pass took 58.7 s);
   fixed 12/12 x86 + 12/12 x64, ended 4.2-17.7 s after the trigger; `stdout-powershell-detach-inline`
-  7-9 s per run (5/5 per arch). CI: see below.
+  7-9 s per run (5/5 per arch).
+- CI (windows-2022, the same regress code): unfixed library (psdetach-before 03f4a24, run 42368530837)
+  8 of 18 slowreader rows failed (x86 6/9, x64 2/9: ended 65-74 s after the trigger, one no end);
+  the unfixed `stdout-powershell-detach-inline` passed 48/48 there (42366977386, 42366979332,
+  42366981506 -- the CI failure is rare on runners, the slow-reader check is not). Fixed library
+  (d48a421, runs 42368524885, 42368526867, 42368528744): 54/54 slowreader rows and 48/48
+  `stdout-powershell-detach-inline` rows, both arches, 0 failures.
 
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`

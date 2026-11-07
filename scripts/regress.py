@@ -10774,7 +10774,7 @@ def check_powershell_detach():
     logging at full speed into a slow PowerShell pipeline (split from check_stdout_powershell).
     UHH_PSDETACH_REPS (default 1) repeats each backend; UHH_PSDETACH_BACKENDS narrows them.
     The whole run must also end within 120 s (attach, 4 s, report, a detach bounded to ~15 s
-    for running callbacks, the backlog; the starved detach of check_detach_slow_reader took
+    for running callbacks, the backlog; the starved detach of check_slowreader_detach took
     37-203 s here, and once never ended)."""
     tracer, target = exe("uhh_trace.exe"), exe("logstream_target.exe")
     if not tracer or not target:
@@ -10863,7 +10863,7 @@ def check_powershell_detach():
             shutil.rmtree(work, ignore_errors=True)
 
 
-def check_detach_slow_reader():
+def check_slowreader_detach():
     """A live detach must END while the attached target keeps the log ring full (CI 42364458533:
     x86 stdout-powershell-detach-inline, probe_close "still waiting for probe_run to stop (180s)"
     with 8.7M records streamed; the detach ran only once the test killed the target). The
@@ -11193,7 +11193,7 @@ def main():
     if want(check_realbig): check_realbig("" if args.bigapps else REALBIG_DEFAULT)
     if want(check_stdout_powershell): check_stdout_powershell()
     if want(check_powershell_detach): check_powershell_detach()
-    if want(check_detach_slow_reader): check_detach_slow_reader()
+    if want(check_slowreader_detach): check_slowreader_detach()
     if want(check_stdout_console): check_stdout_console(args.console_records)
     if only and not RESULTS:
         print(f"regress.py: --only {','.join(only)} selected only opt-in tiers that were not enabled "
