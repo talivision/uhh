@@ -412,7 +412,7 @@ struct probe_session {
     bool parking = false;
     bool fine_timer = false;
     uint32_t fair_events = 0;                   // debug events in the current fairness window
-    LONGLONG round_wake = 0;                    // the current yield round ends (system time, 100 ns)
+    LONGLONG round_wake = 0;                    // the current yield round ends (interrupt time, 100 ns: KUSER_SHARED_DATA)
     std::unordered_set<DWORD> yielded_round;    // threads that yielded in the current round (once each)
     // Demand-driven rounds (fair_tick): a round is also a probe. While its hot threads sleep the
     // target runs with no debug event at all, and the loop's idle ticks then ask the kernel
@@ -428,14 +428,15 @@ struct probe_session {
     std::unordered_set<DWORD> runnable_prev;    // others_runnable: runnable at the previous idle tick
     std::unordered_map<DWORD, ULONG> cs_prev;   // ... and context-switch counts then
     int round_demand = -1;                      // this round: -1 no idle tick compared yet, 0 none ran, 1 one ran
-    uint32_t quiet_rounds = 0;                  // rounds in a row that found no demand (fair_tick's hysteresis)
+    uint32_t quiet_rounds = 0, fair_events_last = 0;
     uint64_t rounds_by_demand[3] = {};          // PROBE_TRACE statistics: rounds ending with demand -1 / 0 / 1
-    std::chrono::steady_clock::time_point round_fine_until{};   // the 1 ms timer only until then (fair_tick)
+    std::chrono::steady_clock::time_point round_quiet_until{};  // the round's yielders sleep until then (round_quiet_tick)
+    std::chrono::steady_clock::time_point next_quiet_sample{};  // round_quiet_tick's next query (~1 ms apart)
     uint64_t park_rounds = 0, parked_total = 0;   // fairness statistics (PROBE_TRACE: printed at the end)
     // Yield stubs (see yield_thread): per thread, `resume address; code`, carved from blocks that
     // are never freed (a thread may sleep inside one across a detach).
     std::unordered_map<DWORD, uint64_t> yield_stubs;
-    uint64_t yield_next = 0, yield_end = 0, yield_fn = 0;
+    uint64_t yield_next = 0, yield_end = 0, yield_fn = 0, yield_spin_fn = 0;
     bool yield_unusable = false;
     ULONGLONG rekick_at = 0;
     std::unordered_set<uint64_t> early_unloaded;   // instances torn down at a newer LOAD (their late UNLOAD skipped)
@@ -5165,12 +5166,21 @@ static void park_release(probe_session *s) {
 // event resumes the frozen process only when it runs again -- suspending hot threads kept the
 // whole target frozen (main's Sleep(10) took 1-2.5 s); a thread asleep in its own code leaves it
 // running, so the threads that hit nothing get the CPU.
+// KUSER_SHARED_DATA.InterruptTime (100 ns): the same page, the same value, in every process.
+static uint64_t interrupt_time_now() {
+    const volatile ULONG *k = reinterpret_cast<const volatile ULONG *>(0x7FFE0008);
+    for (;;) {
+        const ULONG hi = k[1], lo = k[0];
+        if ((LONG)hi == (LONG)k[2]) return ((uint64_t)hi << 32) | lo;
+    }
+}
 static uint64_t yield_stub(probe_session *s, DWORD tid) {
     if (auto it = s->yield_stubs.find(tid); it != s->yield_stubs.end()) return it->second;
     if (s->yield_unusable) return 0;
     if (!s->yield_fn) {
         s->yield_fn = resolve_symbol(s, "ntdll.dll!NtDelayExecution");
-        if (!s->yield_fn) { s->yield_unusable = true; return 0; }
+        s->yield_spin_fn = resolve_symbol(s, "ntdll.dll!NtYieldExecution");
+        if (!s->yield_fn || !s->yield_spin_fn) { s->yield_unusable = true; return 0; }
     }
     if (s->yield_next + 256 > s->yield_end) {
         void *m = VirtualAllocEx(s->pi.hProcess, nullptr, 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
@@ -5178,7 +5188,9 @@ static uint64_t yield_stub(probe_session *s, DWORD tid) {
         s->yield_next = (uint64_t)(uintptr_t)m; s->yield_end = s->yield_next + 0x10000;
     }
     const uint64_t at = s->yield_next;
-    std::vector<unsigned char> c(16, 0);                       // [0]: resume address, [8]: wake-up (absolute)
+    // [0]: resume address, [8]: deadline (interrupt time), [16]: mode (0 sleep, 1 spin),
+    // [24]: the sleep (relative, negative 100 ns units, for NtDelayExecution); code at +32.
+    std::vector<unsigned char> c(32, 0);
     auto put = [&](std::initializer_list<unsigned char> b) { c.insert(c.end(), b); };
     auto put_u = [&](uint64_t v, int n) { for (int i = 0; i < n; ++i) c.push_back((unsigned char)(v >> (8 * i))); };
 #if defined(_WIN64)
@@ -5189,11 +5201,30 @@ static uint64_t yield_stub(probe_session *s, DWORD tid) {
     put({0xF3, 0x0F, 0x7F, 0x44, 0x24, 0x30, 0xF3, 0x0F, 0x7F, 0x4C, 0x24, 0x40, 0xF3, 0x0F, 0x7F, 0x54, 0x24, 0x50,
          0xF3, 0x0F, 0x7F, 0x5C, 0x24, 0x60, 0xF3, 0x0F, 0x7F, 0x64, 0x24, 0x70,
          0xF3, 0x0F, 0x7F, 0xAC, 0x24, 0x80, 0, 0, 0});        // movdqu [rsp+0x30..0x80], xmm0..xmm5
-    put({0x31, 0xC9});                                         // xor ecx, ecx (not alertable)
-    put({0x48, 0x8D, 0x15});                                   // lea rdx, [rip+rel32] -> [8]: the wake-up time
+    // Mode 0 (the 1 ms timer is on: something may be starved): sleep until the deadline, off the
+    // CPU. Mode 1 (rounds have backed off, the timer is off): NtYieldExecution in a loop until the
+    // interrupt time (KUSER_SHARED_DATA) passes the deadline -- no timer: a sleep would need the
+    // 1 ms timer, whose cost is what the back-off saves (a sleep begun under the 15.6 ms timer
+    // lasted up to 15.6 ms).
+    put({0x80, 0x3D});                                         // cmp byte [rip+rel32], 0 -> [16]: mode
+    { const int32_t r = (int32_t)(16 - (int64_t)(c.size() + 5)); put_u((uint32_t)r, 4); }
+    c.push_back(0);
+    put({0x74, 0x00}); const size_t to_sleep = c.size() - 1;   // je sleep
+    const size_t loop = c.size();
+    put({0x48, 0xB8}); put_u(s->yield_spin_fn, 8);             // mov rax, NtYieldExecution
+    put({0xFF, 0xD0});                                         // call rax
+    put({0x48, 0xA1}); put_u(0x7FFE0008ull, 8);                // mov rax, [KUSER_SHARED_DATA.InterruptTime]
+    put({0x48, 0x2B, 0x05});                                   // sub rax, [rip+rel32] -> [8]: the deadline
     { const int32_t r = (int32_t)(8 - (int64_t)(c.size() + 4)); put_u((uint32_t)r, 4); }
+    put({0x78}); c.push_back((unsigned char)(int8_t)((int64_t)loop - (int64_t)(c.size() + 1)));   // js loop
+    put({0xEB, 0x00}); const size_t to_done = c.size() - 1;    // jmp done
+    c[to_sleep] = (unsigned char)(c.size() - (to_sleep + 1));
+    put({0x31, 0xC9});                                         // sleep: xor ecx, ecx (not alertable)
+    put({0x48, 0x8D, 0x15});                                   // lea rdx, [rip+rel32] -> [24]: the deadline
+    { const int32_t r = (int32_t)(24 - (int64_t)(c.size() + 4)); put_u((uint32_t)r, 4); }
     put({0x48, 0xB8}); put_u(s->yield_fn, 8);                  // mov rax, NtDelayExecution
     put({0xFF, 0xD0});                                         // call rax
+    c[to_done] = (unsigned char)(c.size() - (to_done + 1));    // done:
     put({0xF3, 0x0F, 0x6F, 0x44, 0x24, 0x30, 0xF3, 0x0F, 0x6F, 0x4C, 0x24, 0x40, 0xF3, 0x0F, 0x6F, 0x54, 0x24, 0x50,
          0xF3, 0x0F, 0x6F, 0x5C, 0x24, 0x60, 0xF3, 0x0F, 0x6F, 0x64, 0x24, 0x70,
          0xF3, 0x0F, 0x6F, 0xAC, 0x24, 0x80, 0, 0, 0});        // movdqu xmm0..xmm5, [...]
@@ -5209,10 +5240,21 @@ static uint64_t yield_stub(probe_session *s, DWORD tid) {
     put({0xF3, 0x0F, 0x7F, 0x44, 0x24, 0x10, 0xF3, 0x0F, 0x7F, 0x4C, 0x24, 0x20, 0xF3, 0x0F, 0x7F, 0x54, 0x24, 0x30,
          0xF3, 0x0F, 0x7F, 0x5C, 0x24, 0x40, 0xF3, 0x0F, 0x7F, 0x64, 0x24, 0x50, 0xF3, 0x0F, 0x7F, 0x6C, 0x24, 0x60,
          0xF3, 0x0F, 0x7F, 0x74, 0x24, 0x70, 0xF3, 0x0F, 0x7F, 0xBC, 0x24, 0x80, 0, 0, 0});   // movdqu [esp+0x10..0x80], xmm0..7
-    put({0xB8}); put_u(at + 8, 4);                             // mov eax, &[8]: the wake-up time
+    put({0x80, 0x3D}); put_u(at + 16, 4); c.push_back(0);      // cmp byte [mode], 0 (see x64)
+    put({0x74, 0x00}); const size_t to_sleep = c.size() - 1;   // je sleep
+    const size_t loop = c.size();
+    put({0xB8}); put_u(s->yield_spin_fn, 4);                   // mov eax, NtYieldExecution
+    put({0xFF, 0xD0});                                         // call eax (stdcall, no arguments)
+    put({0xA1}); put_u(0x7FFE0008ull, 4);                      // mov eax, [InterruptTime.LowPart]
+    put({0x2B, 0x05}); put_u(at + 8, 4);                       // sub eax, [deadline low part]
+    put({0x78}); c.push_back((unsigned char)(int8_t)((int64_t)loop - (int64_t)(c.size() + 1)));   // js loop (signed: 214 s of range)
+    put({0xEB, 0x00}); const size_t to_done = c.size() - 1;    // jmp done
+    c[to_sleep] = (unsigned char)(c.size() - (to_sleep + 1));
+    put({0xB8}); put_u(at + 24, 4);                            // sleep: mov eax, &[24]: the deadline
     put({0x50, 0x6A, 0x00});                                   // push eax; push FALSE
     put({0xB8}); put_u(s->yield_fn, 4);                        // mov eax, NtDelayExecution
     put({0xFF, 0xD0});                                         // call eax (stdcall: pops its 2 args)
+    c[to_done] = (unsigned char)(c.size() - (to_done + 1));    // done:
     put({0xF3, 0x0F, 0x6F, 0x44, 0x24, 0x10, 0xF3, 0x0F, 0x6F, 0x4C, 0x24, 0x20, 0xF3, 0x0F, 0x6F, 0x54, 0x24, 0x30,
          0xF3, 0x0F, 0x6F, 0x5C, 0x24, 0x40, 0xF3, 0x0F, 0x6F, 0x64, 0x24, 0x50, 0xF3, 0x0F, 0x6F, 0x6C, 0x24, 0x60,
          0xF3, 0x0F, 0x6F, 0x74, 0x24, 0x70, 0xF3, 0x0F, 0x6F, 0xBC, 0x24, 0x80, 0, 0, 0});
@@ -5235,8 +5277,11 @@ static void park_thread(probe_session *s, DWORD tid, DWORD disposition) {
     if (disposition != DBG_CONTINUE || s->detaching || s->exited || thread_in_call(s, tid) || tid == s->inplace_owner ||
         s->stepping.count(tid) || inplace_exempt(s, tid) || target_has_shadow_stack(s))
         return;
-    // Not when the program probes NtDelayExecution itself (the stub's call would be its hit).
-    if (s->yield_fn) for (const auto &p : s->probes) if (p->active && p->address == s->yield_fn) return;
+    // Not when the program probes NtDelayExecution / NtYieldExecution itself (the stub's call
+    // would be its hit).
+    if (s->yield_fn)
+        for (const auto &p : s->probes)
+            if (p->active && (p->address == s->yield_fn || p->address == s->yield_spin_fn)) return;
     if (!s->yielded_round.insert(tid).second) return;          // once per round
     HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
     if (!t) return;
@@ -5246,15 +5291,23 @@ static void park_thread(probe_session *s, DWORD tid, DWORD disposition) {
     const uint64_t stub = GetThreadContext(t, &c) && !(c.EFlags & 0x10100u) && !in_yield_stub(s, (uint64_t)EMU_IP(c))
                           ? yield_stub(s, tid) : 0;
     if (stub) {
-        const uint64_t resume = (uint64_t)EMU_IP(c);
-        size_t w = 0, w2 = 0;
-        // Every thread of a round sleeps until the SAME moment (absolute system time): they
-        // are off the CPU together from the last one's yield to then -- staggered 2 ms sleeps
-        // barely overlapped (the yields come one event apart).
-        const LONGLONG wake = s->round_wake;
-        if (remote_write(s->pi.hProcess, stub, &resume, sizeof(void *), &w) && w == sizeof(void *) &&
-            remote_write(s->pi.hProcess, stub + 8, &wake, sizeof(wake), &w2) && w2 == sizeof(wake)) {
-            EMU_IP(c) = (decltype(EMU_IP(c)))(stub + 16);
+        // Every thread of a round yields until the SAME moment (absolute): they are off the CPU
+        // (or yielding it) together from the last one's yield to then -- staggered 2 ms sleeps
+        // barely overlapped (the yields come one event apart). Sleep while the 1 ms timer is on
+        // (something may be starved: free the CPU), spin-yield once rounds backed off (see stub).
+        // Sleep (the target's own timer: ~15.6 ms, off the CPU -- what a starved thread needs)
+        // while rounds find demand or have not yet found 8 in a row without; spin-yield ~4 ms
+        // once they backed off (nobody to give the CPU to: keep the round short).
+        const bool sleep = s->quiet_rounds < 8;
+        // The sleep is RELATIVE (what is left of the round, at least 1 ms): an absolute
+        // system-time deadline slept 8-17 ms for a 4 ms round (measured, 1 ms timer on).
+        const LONGLONG left = s->round_wake - (LONGLONG)interrupt_time_now();
+        uint64_t head[4] = {(uint64_t)EMU_IP(c), (uint64_t)s->round_wake, sleep ? 0u : 1u,
+                            (uint64_t)(LONGLONG)-(left > 10000 ? left : 10000)};
+        // (x86: the stub reads [0] and [8] as dwords -- the low halves; [16] as a byte.)
+        size_t w = 0;
+        if (remote_write(s->pi.hProcess, stub, head, sizeof(head), &w) && w == sizeof(head)) {
+            EMU_IP(c) = (decltype(EMU_IP(c)))(stub + 32);
             c.ContextFlags = CONTEXT_CONTROL;
             if (SetThreadContext(t, &c)) ++s->parked_total;
         }
@@ -5443,7 +5496,14 @@ static int others_runnable(probe_session *s) {
 // asks whether anything else wants the CPU. The round's verdict needs two ticks (see
 // others_runnable); with fewer it stays unknown and the period is left as it is.
 static void round_quiet_tick(probe_session *s) {
-    if (!s->parking || s->yielded_round.empty() || s->round_demand == 1) return;
+    // At most two queries a round, and only in its quiet time: a query takes milliseconds on a
+    // busy machine, and a hot thread that wakes and hits meanwhile waits for it (measured: one
+    // query per idle tick through the round made windows with a single event, hw ~180 us/hit).
+    const auto now = std::chrono::steady_clock::now();
+    if (!s->parking || s->yielded_round.empty() || s->round_demand >= 0 || now >= s->round_quiet_until ||
+        now < s->next_quiet_sample)
+        return;
+    s->next_quiet_sample = now + std::chrono::microseconds(1000);
     const int r = others_runnable(s);
     if (r == -1 || r > 0) { s->round_demand = 1; return; }         // runnable, or unknown: as before (20 ms rounds)
     if (s->quiet_sampled) s->round_demand = 0;                     // a second tick compared: nobody
@@ -5479,14 +5539,17 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
         // and a thread that hits nothing runs. (Measured: with the unfrozen-time rule alone, a
         // fast session kept >10% unfrozen yet main's Sleep(300) returned 3-20 s late: whenever
         // unfrozen, the hot threads had the CPU and trapped again before main was scheduled.)
-        const bool dense = s->fair_events >= 40 || s->fair_gaps * 10 < now - s->fair_window;
+        // (A window holding a round of ~15.6 ms sleep has few events by construction: still dense
+        // if the yielders kept hitting around it -- else the back-off never accumulated.)
+        const bool dense = s->fair_events >= (s->parking ? 5u : 40u) || s->fair_gaps * 10 < now - s->fair_window;
         s->parking = got && dense;
+        s->fair_events_last = s->fair_events;
         s->fair_events = 0;
         if (s->parking) {
             ++s->park_rounds; s->yielded_round.clear();
-            FILETIME ft; GetSystemTimeAsFileTime(&ft);
-            s->round_wake = (LONGLONG)(((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime) + 40000;   // now + 4 ms
-            s->round_fine_until = now + milliseconds(10);
+            s->round_wake = (LONGLONG)interrupt_time_now() + 40000;   // now + 4 ms (the stubs' clock)
+            s->next_quiet_sample = now + microseconds(800);
+            s->round_quiet_until = now + milliseconds(4);
         }
         if (s->parking && !was) {
             if (trace_enabled())
@@ -5496,6 +5559,11 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
         // Dense events stopped: the next dense phase starts afresh (noticed within 20 ms). A window
         // that merely ended on an idle tick (a round's quiet time) keeps the back-off state.
         if (!dense) { s->fair_period_ms = 20; s->quiet_rounds = 0; }
+        if (trace_enabled() && s->park_rounds < 40)
+            std::fprintf(stderr, "  fair-window events=%u gaps_us=%lld window_us=%lld dense=%d got=%d parking=%d period=%u quiet_rounds=%u\n",
+                         s->fair_events_last, (long long)duration_cast<microseconds>(s->fair_gaps).count(),
+                         (long long)duration_cast<microseconds>(now - s->fair_window).count(), (int)dense, (int)got,
+                         (int)s->parking, s->fair_period_ms, s->quiet_rounds);
         s->fair_window = now; s->fair_gaps = {};
     }
     // 1 ms timer resolution only while a parked thread or a context watch waits on this loop:
@@ -5507,15 +5575,17 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
         if (agent_has_pending(s)) retarget_pending(s);
         if (agent_has_pending(s) && !kick_agent(s)) std::fprintf(stderr, "probe: %s\n", s->error.c_str());
     }
-    // While parking: always while rounds still find (or recently found) demand -- a thread in a
-    // timed wait needs it (hunt-starve: with a 15.6 ms timer between rounds main's Sleep(300) did
-    // not end within 60 s; its timeout is re-armed at every freeze and thaw) -- but once rounds
-    // have backed off (nobody else wants the CPU), only around a round: measured on the VM, a
-    // 1 ms system timer kept on through the dense events cost a lone hot thread ~30% (hw 144 ->
-    // 110 us/hit, breakpoint 90 -> 72; rounds switched off entirely: 109 / 71).
-    const bool fine = (s->parking && (s->quiet_rounds < 8 || now < s->round_fine_until)) || !s->ctx_watch.empty() ||
-                      s->rekick_at;
+    // Not for the yield rounds: since Windows 10 2004 a process's timeBeginPeriod sets the timer
+    // resolution of THAT process only -- the controller's 1 ms never shortened a stub's sleep in
+    // the target (a "4 ms" round slept ~15.6 ms: windows of 4-28 events and 15-17 ms idle,
+    // measured), it only made this loop's own waits finer, and kept on through the dense events
+    // it cost a lone hot thread ~30% on the VM (hw 144 -> 110 us/hit, breakpoint 90 -> 72). The
+    // quiet time is sampled by polling (below); the stubs time themselves.
+    const bool fine = !s->ctx_watch.empty() || s->rekick_at;
     if (fine != s->fine_timer) { if (fine) timeBeginPeriod(1); else timeEndPeriod(1); s->fine_timer = fine; }
+    // A round's quiet time (its yielders spin until round_wake, no timer involved) is sampled
+    // without the 1 ms timer: the loop polls (no wait) until it ends -- ~4 ms per round.
+    if (s->parking && now < s->round_quiet_until && s->round_demand < 0) return 0;
     return fine ? 1 : 20;
 }
 
