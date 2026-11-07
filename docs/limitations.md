@@ -138,6 +138,12 @@ data) prints on all backends.
   the callee also abandons it. Owner decision: no further hardening.
   *Workaround:* call only non-blocking, non-throwing callees; cache results; prefer
   `call_original` for the probed function.
+- **`call_func` on breakpoint/hw on a nearly exhausted stack** (✅ XH3). The callee's frame
+  goes 512+ bytes below the hit's SP; where that stack is not committed yet the thread grows it
+  itself first (as the callee would inline). Within the last pages of the thread's stack
+  reservation (DeallocationStack + max(guarantee, 1 page) + 4 pages), or on a stack the TEB
+  does not describe, the stack is not grown: `call_func` returns 0 and one stderr line per
+  probe says why (inline the callee would run there and may overflow the program's stack).
 - **Concurrent `call_func` on breakpoint/hw** (✅ Detours D3, Frida F5, Hunter A2): calls from
   several threads' callbacks all succeed, one after the other: other threads' hits wait while
   a call is in flight -- code probes are rewound and hit again, a data watch's thread is held

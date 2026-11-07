@@ -98,6 +98,7 @@ struct Probe {
     bool warned_double_run = false;   // call_original without return_from (warn once)
     bool warned_pop = false;          // x86 return_from nargs contradicted call_original (warn once)
     bool warned_log = false;          // a "uhh warning: ..." log record was emitted (once per probe, as inline)
+    bool warned_call = false;         // a breakpoint/hw call_func was refused (warn once)
 };
 
 struct CallbackState {
@@ -9600,6 +9601,18 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
     }
     case EXIT_PROCESS_DEBUG_EVENT:
         bench_phase("ev_exit_process");
+        // An agent init thread still pending when the target ends gets no EXIT_THREAD of its own
+        // when it is the process's LAST thread to exit (the kernel reports that exit as this
+        // event, from that thread: dwThreadId) -- or when it was killed before it first ran (no
+        // CREATE/EXIT_THREAD at all). Seen on x86 with TerminateProcess(self): the other
+        // threads were gone first. Reported like the EXIT_THREAD case (complete_remote_thread).
+        if (trace_enabled())
+            std::fprintf(stderr, "  exit-process reported by tid=%lu (remote work=%d tid=%lu)\n", (unsigned long)event.dwThreadId,
+                         (int)s->remote_work, (unsigned long)s->remote_tid);
+        if (s->remote_work == probe_session::REMOTE_INIT_AGENT && s->shared && s->shared->init_returns == s->init_returns_at)
+            std::fprintf(stderr, "probe: agent init thread ended by the target before it returned (%s, exit code 0x%lx)\n",
+                         event.dwThreadId == s->remote_tid ? "the process's last thread" : "with the process",
+                         (unsigned long)event.u.ExitProcess.dwExitCode);
         ipc_thaw(s);
         s->exit_code = event.u.ExitProcess.dwExitCode; s->exited = true; break;
     default: break;
@@ -10239,10 +10252,36 @@ static bool thread_ssp(HANDLE thread, uint64_t *get, const uint64_t *set) {
 // CPU pushes the return address = call_trap -- on the CET shadow stack too: the callee's `ret`
 // matches, comes back to the INT3, and SSP is where it was at the hit. (Entering the callee by
 // SetThreadContext with a hand-written return address made its `ret` a #CP under CET.)
+// After the INT3 (call_trap + 1): the stack probe (see call_in_target). Entered with SP = the
+// hit's and R10 / ECX = the lowest address the call frame needs, it reads one byte per page
+// from SP down to that address -- __chkstk's walk: the thread touches its own stack page after
+// page, each touch of the guard page makes Windows commit it and move the guard (and the TEB's
+// StackLimit) one page down -- then jumps to the INT3. No call, no ret: the shadow stack is
+// untouched.
 static bool ensure_call_trap(probe_session *s) {
     if (s->call_trap) return true;
-    static const unsigned char kStub[3] = {0xFF, 0xD0, 0xCC};          // call rax|eax; int3
-    void *mem = VirtualAllocEx(s->pi.hProcess, nullptr, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+#if defined(_WIN64)
+    static const unsigned char kStub[] = {
+        0xFF, 0xD0, 0xCC,                                   // call rax; int3 (call_trap)
+        0x49, 0x89, 0xE3,                                   // mov r11, rsp
+        0x41, 0x84, 0x03,                                   // 1: test [r11], al
+        0x49, 0x81, 0xEB, 0x00, 0x10, 0x00, 0x00,           //    sub r11, 0x1000
+        0x4D, 0x39, 0xD3,                                   //    cmp r11, r10
+        0x77, 0xF1,                                         //    ja 1b
+        0x41, 0x84, 0x02,                                   // test [r10], al
+        0xEB, 0xE8};                                        // jmp call_trap
+#else
+    static const unsigned char kStub[] = {
+        0xFF, 0xD0, 0xCC,                                   // call eax; int3 (call_trap)
+        0x89, 0xE2,                                         // mov edx, esp
+        0x84, 0x02,                                         // 1: test [edx], al
+        0x81, 0xEA, 0x00, 0x10, 0x00, 0x00,                 //    sub edx, 0x1000
+        0x39, 0xCA,                                         //    cmp edx, ecx
+        0x77, 0xF4,                                         //    ja 1b
+        0x84, 0x01,                                         // test [ecx], al
+        0xEB, 0xED};                                        // jmp call_trap
+#endif
+    void *mem = VirtualAllocEx(s->pi.hProcess, nullptr, sizeof(kStub), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     size_t w = 0;
     if (!mem || !remote_write(s->pi.hProcess, (uint64_t)(uintptr_t)mem, kStub, sizeof(kStub), &w) || w != sizeof(kStub))
         return false;
@@ -10250,8 +10289,81 @@ static bool ensure_call_trap(probe_session *s) {
     return true;
 }
 
+// The thread's stack as its TEB describes it: NT_TIB StackBase, DeallocationStack (the low end
+// of the reservation) and GuaranteedStackBytes (SetThreadStackGuarantee). Fibers: the TEB holds
+// the running fiber's stack.
+#if defined(_WIN64)
+static const uint64_t TEB_STACK_BASE = 0x08, TEB_DEALLOCATION_STACK = 0x1478, TEB_GUARANTEED_STACK = 0x1748;
+#else
+static const uint64_t TEB_STACK_BASE = 0x04, TEB_DEALLOCATION_STACK = 0xE0C, TEB_GUARANTEED_STACK = 0xF78;
+#endif
+// May the thread grow its own stack from sp down to `low` (call_func's frame)? Only inside its
+// stack reservation, and short of its last pages: Windows raises STATUS_STACK_OVERFLOW when the
+// guard page comes within the guarantee (at least a page) of the reservation's end, and that
+// overflow is spent for good (the program's own next overflow would be an access violation).
+// The bound, kept well clear of it: low >= DeallocationStack + max(guarantee, 1 page) + 4 pages
+// (regress hunt-stackend positions a hit just past it the same way).
+static bool stack_can_grow(HANDLE process, HANDLE thread, const CONTEXT &ctx, uint64_t sp, uint64_t low, std::string &why) {
+    const uint64_t page = 0x1000, teb = thread_teb(thread, ctx);
+    uintptr_t base = 0, dealloc = 0; ULONG guarantee = 0; size_t n1 = 0, n2 = 0, n3 = 0;
+    if (!teb || !remote_read(process, teb + TEB_STACK_BASE, &base, sizeof(base), &n1) || n1 != sizeof(base) ||
+        !remote_read(process, teb + TEB_DEALLOCATION_STACK, &dealloc, sizeof(dealloc), &n2) || n2 != sizeof(dealloc) ||
+        !remote_read(process, teb + TEB_GUARANTEED_STACK, &guarantee, sizeof(guarantee), &n3) || n3 != sizeof(guarantee)) {
+        why = "the call frame's stack memory is not committed and the thread's stack bounds (TEB) are unreadable";
+        return false;
+    }
+    char text[256];
+    if (!dealloc || sp >= base || low < dealloc || low >= sp) {
+        std::snprintf(text, sizeof(text), "the call frame at 0x%llx is not committed memory of the thread's stack "
+                      "(0x%llx..0x%llx, SP 0x%llx)", (unsigned long long)low, (unsigned long long)dealloc,
+                      (unsigned long long)base, (unsigned long long)sp);
+        why = text; return false;
+    }
+    const uint64_t floor = dealloc + std::max<uint64_t>((guarantee + page - 1) & ~(page - 1), page) + 4 * page;
+    if (low < floor) {
+        std::snprintf(text, sizeof(text), "the thread's stack is nearly exhausted (the call frame at 0x%llx would "
+                      "come within %llu bytes of the end of its reservation at 0x%llx)", (unsigned long long)low,
+                      (unsigned long long)(low - dealloc), (unsigned long long)dealloc);
+        why = text; return false;
+    }
+    return true;
+}
+// A call_func the session cannot make: 0 for the callback, and one stderr line per probe.
+static void call_refused(Probe *probe, const std::string &why) {
+    if (probe && probe->warned_call) return;
+    if (probe) probe->warned_call = true;
+    std::fprintf(stderr, "probe: warning: %s: call_func refused: %s.%s\n", probe ? probe->location.c_str() : "<agent load>",
+                 why.c_str(), probe ? " Further cases are not reported." : "");
+}
+
+// call_func on breakpoint/hw (and the early agent load): the callee runs on the stopped thread
+// (run_call). Its frame goes 512+ bytes below the hit's SP; where that memory is not committed
+// yet (a fresh thread, a caller that reserved a big frame without touching it: the frame would
+// land in the guard page or beyond), the thread first grows its own stack down to it -- the
+// probe after call_trap, run on the thread like a callee -- exactly as the callee would on
+// inline. Writing there from outside instead failed (call_func 0, nothing said), and a
+// WriteProcessMemory into the guard page spends the guard (ROADMAP XH3).
+static int run_call(probe_session *s, CallbackState *st, uint64_t fn, uint64_t *ret, int nargs, const uint64_t *args,
+                    DWORD timeout_ms, uint64_t probe_to, uint64_t *grow_to);
 static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint64_t *ret, int nargs, const uint64_t *args,
                           DWORD timeout_ms = 5000) {
+    uint64_t low = 0;
+    const int r = run_call(s, st, fn, ret, nargs, args, timeout_ms, 0, &low);
+    if (r != -1) return r;
+    if (trace_enabled()) std::fprintf(stderr, "  call_func: thread %lu grows its stack to 0x%llx\n", (unsigned long)st->tid,
+                                      (unsigned long long)low);
+    if (run_call(s, st, 0, nullptr, 0, nullptr, timeout_ms, low, nullptr) != 1) {
+        if (!st->released && !s->exited) call_refused(st->probe, "the thread could not grow its stack down to the call frame");
+        return 0;
+    }
+    return run_call(s, st, fn, ret, nargs, args, timeout_ms, 0, nullptr);     // committed now (else refused, loudly)
+}
+
+// Runs fn (or, with probe_to, the stack probe down to probe_to) on the stopped thread and puts
+// the thread back exactly as it was. -1 (grow_to set): the call frame's memory is not committed
+// but the thread can grow its stack down to *grow_to; nothing was done.
+static int run_call(probe_session *s, CallbackState *st, uint64_t fn, uint64_t *ret, int nargs, const uint64_t *args,
+                    DWORD timeout_ms, uint64_t probe_to, uint64_t *grow_to) {
     if (nargs < 0 || nargs > 8 || st->released || s->exited || s->calls_closing) return 0;
     park_release(s);                     // the callee may need a lock a parked thread owns
     // The callback must run on its own event's fiber, stopped at that event (see "Callback
@@ -10276,6 +10388,23 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
         if (trace_enabled()) std::fprintf(stderr, "  call_func: GetThreadContext(%lu) failed %lu\n", (unsigned long)st->tid, GetLastError());
         CloseHandle(thread); return 0;
     }
+    // The call frame: [sp, sp + frame_size), its return-address slot at sp. Checked before
+    // anything is written: a WriteProcessMemory into the stack's guard page would spend it.
+#if defined(_WIN64)
+    const uint64_t hit_sp = saved.Rsp, sp = ((hit_sp - 512) & ~(uint64_t)0xF) - 8;     // entry rsp == 8 mod 16
+    const size_t frame_size = 13 * sizeof(uint64_t);
+#else
+    const uint64_t hit_sp = saved.Esp, sp = (uint32_t)(hit_sp - 512) & ~0xFu;
+    const size_t frame_size = 9 * sizeof(uint32_t);
+#endif
+    if (!probe_to && !remote_range_ok(s->pi.hProcess, sp, frame_size, true)) {
+        std::string why = "the call frame's stack memory is still not committed after the thread grew its stack";
+        const bool grow = grow_to && stack_can_grow(s->pi.hProcess, thread, saved, hit_sp, sp, why);
+        CloseHandle(thread);
+        if (grow) { *grow_to = sp; return -1; }
+        call_refused(st->probe, why);
+        return 0;
+    }
     TebErrors teb_errors; teb_errors.save(s->pi.hProcess, thread, saved);
     // CET: a callee abandoned midway (it faulted, or timed out) leaves its frames on the
     // shadow stack; the restore below puts SSP back too (a completed call leaves it as it was).
@@ -10291,19 +10420,27 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
     };
     CONTEXT w = saved; size_t wrote = 0; bool ok = true;
 #if defined(_WIN64)
-    uint64_t sp = ((saved.Rsp - 512) & ~(uint64_t)0xF) - 8;           // entry rsp == 8 mod 16
     uint64_t frame[13] = {s->call_trap};                               // ret (the CALL writes it too), shadow x4, stack args
+    static_assert(sizeof(frame) == 13 * sizeof(uint64_t));
     for (int i = 4; i < nargs; ++i) frame[5 + (i - 4)] = args[i];
-    ok = remote_write(s->pi.hProcess, sp, frame, sizeof(frame), &wrote) && wrote == sizeof(frame);
-    w.Rsp = sp + 8; w.Rip = s->call_trap - 2; w.Rax = fn;              // the stub's CALL pushes call_trap at sp
-    w.Rcx = nargs > 0 ? args[0] : 0; w.Rdx = nargs > 1 ? args[1] : 0;
-    w.R8 = nargs > 2 ? args[2] : 0;  w.R9 = nargs > 3 ? args[3] : 0;
+    if (probe_to) {
+        w.Rip = s->call_trap + 1; w.R10 = probe_to;                    // the stack probe, from the hit's SP
+    } else {
+        ok = remote_write(s->pi.hProcess, sp, frame, sizeof(frame), &wrote) && wrote == sizeof(frame);
+        w.Rsp = sp + 8; w.Rip = s->call_trap - 2; w.Rax = fn;          // the stub's CALL pushes call_trap at sp
+        w.Rcx = nargs > 0 ? args[0] : 0; w.Rdx = nargs > 1 ? args[1] : 0;
+        w.R8 = nargs > 2 ? args[2] : 0;  w.R9 = nargs > 3 ? args[3] : 0;
+    }
 #else
-    uint32_t sp = ((uint32_t)saved.Esp - 512) & ~0xFu;
     uint32_t frame[9] = {(uint32_t)s->call_trap};                      // ret, then args (stdcall/cdecl both
+    static_assert(sizeof(frame) == 9 * sizeof(uint32_t));
     for (int i = 0; i < nargs; ++i) frame[1 + i] = (uint32_t)args[i];  // fine: esp is restored after)
-    ok = remote_write(s->pi.hProcess, sp, frame, sizeof(frame), &wrote) && wrote == sizeof(frame);
-    w.Esp = sp + 4; w.Eip = (DWORD)s->call_trap - 2; w.Eax = (DWORD)fn; // the stub's CALL pushes call_trap at sp
+    if (probe_to) {
+        w.Eip = (DWORD)s->call_trap + 1; w.Ecx = (DWORD)probe_to;      // the stack probe, from the hit's SP
+    } else {
+        ok = remote_write(s->pi.hProcess, sp, frame, sizeof(frame), &wrote) && wrote == sizeof(frame);
+        w.Esp = (DWORD)sp + 4; w.Eip = (DWORD)s->call_trap - 2; w.Eax = (DWORD)fn; // the stub's CALL pushes call_trap at sp
+    }
 #endif
     // The callee gets what the ABI promises at a call: TF and DF clear. A hit can stop the
     // thread anywhere (a mid-function site may sit inside a `std` ... `cld` span): entered with
@@ -10313,8 +10450,10 @@ static int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
     w.EFlags &= ~0x500u;
     w.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
     if (!ok || !SetThreadContext(thread, &w)) {
-        if (trace_enabled()) std::fprintf(stderr, "  call_func: frame write ok=%d / SetThreadContext(%lu) failed %lu\n", (int)ok,
-                                          (unsigned long)st->tid, GetLastError());
+        char why[128];
+        std::snprintf(why, sizeof(why), "%s failed (error %lu)", ok ? "SetThreadContext" : "writing the call frame",
+                      GetLastError());
+        call_refused(st->probe, why);
         CloseHandle(thread); return 0;
     }
     try { s->calls.emplace(st->tid, f); } catch (...) { SetThreadContext(thread, &saved); CloseHandle(thread); return 0; }

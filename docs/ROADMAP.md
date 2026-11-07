@@ -2298,17 +2298,56 @@ CI full suite on 9efd83c (run 42388653548): 2109/2109, all shards green (x64 + x
   returned"), not as a failure. Test: `init-cutoff-{exit-terminate,exit-process}-inline` (attach:
   the init runs on its own thread; agent test knob `UHH_TEST_INIT_STALL_MS` in the target's
   environment keeps it from returning; the target ends mid-init: app_exit 7 / 6, no error).
-- ⬜ (XH3, open, found on the way) **breakpoint/hw `call_func` returns 0 silently when the hit's
-  stack is barely committed.** call_in_target writes the callee's frame with WriteProcessMemory
+- ✅ (XH3, found on the way) **breakpoint/hw `call_func` returned 0 silently when the hit's
+  stack was barely committed.** call_in_target wrote the callee's frame with WriteProcessMemory
   512+ bytes below the hit's SP; on a NEW thread in its loader callouts whose caller reserved a
-  large frame without touching it, that lands in the stack guard page / reserved range: the write
-  fails, `call_func` is refused (no stderr line; PROBE_TRACE: "frame write ok=0"). Seen with a
-  first version of the alien counter inlined into hunt_target's TLS callback (~800 bytes of
-  untouched buffers): `hunt-threads-{tid,recurse}-{hw,breakpoint}` 2-11 of 704 calls ok=0, both
-  arches; HUNT_TRACE_TLS=1 (which touches the buffers, committing the pages) made it vanish;
-  inline unaffected (the callee runs on the thread itself). The test target keeps its TLS frame
-  small now; the library is unchanged. Fix idea: let the thread grow its own stack (a stub that
-  probes the pages, or the CALL pushing the frame) instead of writing below an uncommitted SP.
+  large frame without touching it, that landed in the stack guard page / reserved range: the
+  write failed, `call_func` was refused (no stderr line; PROBE_TRACE: "frame write ok=0"). Seen
+  with a first version of the alien counter inlined into hunt_target's TLS callback (~800 bytes
+  of untouched buffers): `hunt-threads-{tid,recurse}-{hw,breakpoint}` 2-11 of 704 calls ok=0,
+  both arches; inline unaffected (the callee runs on the thread itself). **Repro** (hunt_target
+  `stackedge`: fresh threads bring SP with `_alloca` to StackLimit + 0x200, then read; `stackend`:
+  the same just above the last pages of a 256 KB reservation), on 8f16a65 = merge-frida + the
+  checks, CI run 42397474406: every edge call failed silently, both arches, hw and breakpoint
+  (`tid_ok=40 tid_bad=20 refused=0`; recurse `recurse_ok=40 other=20`; stackend the same, no
+  stderr line); inline rows passed. The failed write did NOT spend the guard page
+  (`guard_lost=0`: the page below StackLimit was still PAGE_GUARD after it, and the threads then
+  grew 64 KB fine) on windows-2022. **Fix**: the frame range is checked (remote_range_ok) before
+  anything is written. Uncommitted but inside the thread's stack reservation (TEB StackBase /
+  DeallocationStack / GuaranteedStackBytes): the thread first grows its own stack -- a
+  __chkstk-style probe placed after call_trap's INT3 (one read per page from the hit's SP down
+  to the frame, then a jump to the INT3; no call/ret, so the CET shadow stack is untouched) runs
+  on the thread through the call machinery, Windows commits page after page and moves the guard
+  and StackLimit as for any growth -- then the call runs as before. Within the last pages of
+  the reservation (frame below DeallocationStack + max(guarantee, 1 page) + 4 pages) or outside
+  the TEB's stack: refused, `call_func` 0 and ONE stderr line per probe ("probe: warning: <probe>:
+  call_func refused: the thread's stack is nearly exhausted ..."); a frame-write or
+  SetThreadContext failure is reported the same way (it was trace-only). Test:
+  `hunt-stackedge-{tid,recurse}-{inline,hw,breakpoint}` (every call works, guard intact, no
+  refusal), `hunt-stackend-tid-{hw,breakpoint}` (20 refused, one line, guard intact, program
+  unaffected). After (1858659): CI 42397410484 (windows-2022) and 42397412572 (windows-2025,
+  CET enforced, with every call* check) green.
+  Audit of the other controller-side Read/WriteProcessMemory paths on target stacks without a
+  committed/non-guard check (none writes below SP): all read AT or ABOVE the hit's SP, so they
+  can meet a guard page only when the hit's SP itself is in it (a mid-function probe right
+  after a `sub rsp, N < 4096` that nothing has touched yet): apply_return_from's CET return
+  address read at hit_sp, the StackWalk64 walks of send_log_stack / call_original unwinding
+  (dbghelp's own ReadProcessMemory, upwards from SP), co_slot_gone's low end, the x86
+  capture_stack read of [esp]; deeper, committed: restore_fixup's CONTEXT record read/write,
+  co_unwound's SEH records, the PUSHF scrub at SP. Left as is: not seen, and the failed
+  frame write above did not spend the guard on Server 2022 (whether a cross-process READ of
+  a guard page spends it was not measured).
+- ✅ (XH3 side note) **x86 `init-cutoff-exit-terminate-inline` now and then without the
+  "agent init thread ended by the target before it returned" line** (exit code and no error
+  right; the check had stopped requiring the line in a37911d). Cause: with TerminateProcess(self)
+  every thread is killed and the LAST one to exit reports its exit as EXIT_PROCESS_DEBUG_EVENT
+  (dwThreadId = that thread), with no EXIT_THREAD of its own; when that was the stalled init
+  thread, complete_remote_thread never ran. (ExitProcess kills the other threads first and the
+  caller exits last, so exit-process always had the line.) Evidence, VM x86, 30 runs with
+  PROBE_TRACE ("exit-process reported by tid=..."): 26 ended the init thread first (EXIT_THREAD,
+  the usual line), 4 had EXIT_PROCESS reported by the init thread itself. **Fix**: EXIT_PROCESS
+  with an init still pending (not returned) reports the same line ("the process's last thread" /
+  "with the process" when it never ran); the check requires the line again on both.
 - ❌ Tried and rejected: creating UHH's threads with `THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH` (no
   program DllMain/TLS callouts at all). Such threads get no static TLS for the dynamically loaded
   agent: its magic-static guards (`_Init_thread_epoch`) fault -- an attach crashed the target
