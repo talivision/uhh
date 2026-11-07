@@ -83,8 +83,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--waiter") && i + 1 < argc) g_waiter_ms = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--sleeper") && i + 1 < argc) { g_waiter_ms = atoi(argv[++i]); g_waiter_sleep = 1; }
         else if (!strcmp(argv[i], "--print-rva")) {   /* g_sink's RVA: hit_site writes it on every call */
-            printf("{\"kind\":\"rva\",\"sink\":%llu}\n",
-                   (unsigned long long)((uintptr_t)&g_sink - (uintptr_t)GetModuleHandleA(NULL)));
+            printf("{\"kind\":\"rva\",\"sink\":%llu,\"hit_site\":%llu}\n",
+                   (unsigned long long)((uintptr_t)&g_sink - (uintptr_t)GetModuleHandleA(NULL)),
+                   (unsigned long long)((uintptr_t)&hit_site - (uintptr_t)GetModuleHandleA(NULL)));
             return 0;
         }
     }

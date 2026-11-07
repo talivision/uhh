@@ -1842,6 +1842,24 @@ static __declspec(noinline) bool mid_entry_fx(safetyhook::Context &native, uint3
     return x87;
 }
 
+#if !defined(_WIN64)
+// x86 bench knob (xstate_mode 5, UHH_BENCH_XSTATE=fnsave): the x87 state by FNSAVE / FRSTOR
+// (108 bytes, x87 only; FNSAVE leaves the FPU initialised, so the program's control word is put
+// back for the callback), MXCSR by hand; AVX state, when live, by XSAVE as usual.
+static __declspec(noinline) bool mid_entry_fnsave(safetyhook::Context &native, uint32_t index, unsigned char *x87_post) {
+    unsigned char st[108]; unsigned char *p = st;
+    __asm { mov eax, p
+            fnsave [eax]
+            fldcw word ptr [eax] }                          // the program's CW (first word of the image)
+    unsigned int mxcsr = _mm_getcsr();
+    const bool x87 = call_mid(native, index, x87_post);
+    _mm_setcsr(mxcsr);
+    __asm { mov eax, p
+            frstor [eax] }
+    return x87;
+}
+#endif
+
 // Regress knob (xstate_mode 3, UHH_BENCH_XSTATE=noxsave): the no-XSAVE fallback on a CPU that
 // HAS AVX. A CPU without OSXSAVE has no AVX state at all; this one does, so the AVX components
 // alone are kept by XSAVE around the fallback, which is then tested for what it is responsible
@@ -1879,6 +1897,14 @@ static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
         else if (g_xs.xinuse) mask = _xgetbv(1) & g_xs.avx_mask;  // only components actually live
         else mask = g_xs.avx_mask;                         // liveness unknown: keep AVX state
     }
+#if !defined(_WIN64)
+    // Bench knobs, x86: 4 = x87 + MXCSR by FXSAVE, 5 = by FNSAVE (when no AVX state is live).
+    if ((xmode == 4 || xmode == 5) && !(mask & ~1ull)) {
+        x87 = xmode == 4 ? mid_entry_fx(native, index, x87_post) : mid_entry_fnsave(native, index, x87_post);
+        if (x87) x87_restore(x87_post);
+        return;
+    }
+#endif
     if (xmode == 1) x87 = call_mid(native, index, x87_post);
     else if (xmode == 3 && g_xs.ok && (g_xs.mask & 0xE4ull))
         x87 = mid_entry_noxsave_sim(native, index, g_xs.mask & 0xE4ull, x87_post);

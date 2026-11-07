@@ -3965,7 +3965,8 @@ static bool open_agent_section(probe_session *s, uint32_t count) {
     // Benchmark-only knob (not API): compare inline extended-state handling strategies.
     if (const char *m = std::getenv("UHH_BENCH_XSTATE"))
         s->shared->xstate_mode = !std::strcmp(m, "none") ? 1 : !std::strcmp(m, "full") ? 2 :
-                                 !std::strcmp(m, "noxsave") ? 3 : 0;   // 3: regress, a CPU without OSXSAVE
+                                 !std::strcmp(m, "noxsave") ? 3 : !std::strcmp(m, "fx") ? 4 :
+                                 !std::strcmp(m, "fnsave") ? 5 : 0;   // 3: regress, a CPU without OSXSAVE; 4/5: x86 bench
     if (s->attached) {          // the agent's guard waits on this handle (closes it itself)
         HANDLE dup = nullptr;
         if (DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), s->pi.hProcess, &dup, SYNCHRONIZE, FALSE, 0))
