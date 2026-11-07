@@ -116,6 +116,17 @@ release notes) and checked against the frida-gum source where the docs are silen
   not how anyone counts or logs calls of one function, and 17.26's Stalker changes (register
   spills off the target stack) do not change that.
 
+## Pitfalls found while writing the agents (details in BENCHMARKS.md, "Frida findings")
+
+- Under the V8 runtime, an Interceptor JS hook on `ntdll!NtClose` (even an empty `onEnter`)
+  crashes the target (VM and CI, x64 and x86); QuickJS is fine. vs_frida keeps `frida-js-v8` in
+  the gated/churn plans so the crash stays visible; `--skip frida-js-v8` leaves it out.
+- Frida's own module registry reads the process's memory through `NtReadVirtualMemory` on every
+  DLL load (~150 calls); a hook on it sees them. `prelude.js` `isFridaSelfRead` skips self-reads
+  with a cloaked return address nearby (`Cloak.hasRangeContaining`).
+- A `NativeFunction` call releases the JS lock (default `scheduling: 'cooperative'`): buffers
+  used around it must be per call, not shared.
+
 ## The Frida 17 failure on the VM (root cause)
 
 `frida 17.25.2` aborted with `Unable to locate the ntdll loader TLS routines` on this VM, for
