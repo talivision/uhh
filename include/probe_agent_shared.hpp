@@ -75,11 +75,11 @@ struct probe_agent_int3 { uint64_t address; uint8_t original; uint8_t pad[7]; };
      the controller synchronously (PROBE_IPC_LOG) instead of waiting or dropping.
    A record is dropped (counted in log_dropped) only when the controller is gone: it
    stopped consuming (controller_gone: detach/close) or its process died. */
-/* Layout (v27): a slot is cache-line aligned and every field a plain record uses -- seq, owner,
+/* Layout (v27): a slot is a whole number of cache lines (the ring starts on one) and every field a plain record uses -- seq, owner,
    the header and the text's start -- is on its first line; a typical ~90-byte line of text ends
    on the second. (The header used to sit after the 1 KB text: every record touched three lines on
    the producer's side and three again on the controller's, each a transfer between the two cores.) */
-struct alignas(64) probe_agent_log {
+struct probe_agent_log {
     volatile LONG64 seq;
     volatile LONG owner;           /* tid of the producer that claimed the slot; 0 = free/unknown */
     uint32_t probe;
@@ -93,6 +93,8 @@ struct alignas(64) probe_agent_log {
     uint32_t has_stack;
     char text[PROBE_AGENT_LOG_TEXT_CAP];
     uint64_t frames[32];           /* == PROBE_STACK_MAX_FRAMES */
+    char pad[24];                  /* to a whole number of cache lines (no alignas: a producer builds a record
+                                      on its stack, and an over-aligned local re-aligns the x86 frame) */
 };
 
 /* Agent -> controller control-plane call from an INLINE callback (which runs inside the

@@ -575,7 +575,7 @@ void preload() {
     });
 }
 
-static void sym_phase(const char *what) {   // DIAG (perf5)
+static void sym_phase(const char *what) {   // UHH_BENCH_PHASES (session.cpp bench_phase)
     static const bool on = std::getenv("UHH_BENCH_PHASES") != nullptr;
     if (!on) return;
     LARGE_INTEGER f, t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t);

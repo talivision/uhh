@@ -612,7 +612,9 @@ static bool resolve_inline(probe_session *s, Probe &p, uint64_t base);
 static Probe *probe_at(probe_session *s, uint64_t address);
 static bool trace_enabled() { static const bool on = std::getenv("PROBE_TRACE") != nullptr; return on; }
 static void bench_phase(const char *what, const char *arg = nullptr);
-// DIAG (perf5): UHH_BENCH_PHASES=1 stamps lifecycle phases (QPC ms) on stderr.
+// Bench knob, not API: UHH_BENCH_PHASES=1 stamps the session's lifecycle phases on stderr
+// ("  phase <QPC ms> <name> [arg]"; bench/perfab/phases.py turns them into a timeline) and, at
+// probe_close, the writer/drainer counters below. Off: one cached getenv per stamp.
 static std::atomic<uint64_t> g_diag_file_writes{0}, g_diag_file_bytes{0}, g_diag_enqueues{0}, g_diag_passes{0}, g_diag_moved{0};
 static void bench_phase(const char *what, const char *arg) {
     static const bool on = std::getenv("UHH_BENCH_PHASES") != nullptr;
@@ -2053,11 +2055,14 @@ static void prepare_local_agent(probe_session *s) {
             }
         }
     }
+    // The next session's warm copy is made now, while this one is still being set up: its scan
+    // then overlaps the launch rather than the target's run (measured: made after the load, the
+    // scan ran during the gated reads).
+    if (!warm_sig.empty() && !s->agent_copy.empty()) start_warm_copy(warm_root, warm_sig, warm_src);
     bench_phase("agent_load", nullptr);
     s->agent_prep_module = LoadLibraryW(s->agent_path.c_str());
     s->agent_prep_error = s->agent_prep_module ? 0 : GetLastError();
     bench_phase("agent_loaded", nullptr);
-    if (s->agent_prep_module && !warm_sig.empty()) start_warm_copy(warm_root, warm_sig, warm_src);   // for the next session
 }
 
 static void start_agent_prep(probe_session *s) {
@@ -8466,11 +8471,13 @@ static size_t drain_agent_logs(probe_session *s) {
     // waits for it to reach the head.
     std::vector<LogRecord> batch;
     AgentMapCache map;
-    // The pass is bounded by one ring's worth of positions, not by log_head: reading the head
-    // (the line every producer CASes per record) on every pass pulled it to this core between
-    // two claims. A slot is consumed only when its seq says it was published for this position.
+    // The pass ends at the head read once here (bounded by one ring: memory the target can write).
+    // (Measured: bounding it by the ring alone, without reading the head, made an idle drainer
+    // poll the next slot's line -- the one the next producer claims and writes -- and a single
+    // producer's send_log took ~20% longer on x86.)
     LONG64 tail = sh->log_tail;
-    const LONG64 stop = tail + PROBE_AGENT_LOG_CAP;
+    LONG64 stop = sh->log_head;
+    if ((uint64_t)stop - (uint64_t)tail > PROBE_AGENT_LOG_CAP) stop = tail + PROBE_AGENT_LOG_CAP;
     for (;;) {
         if (tail >= stop) break;
         auto &rec = sh->logs[(uint64_t)tail % PROBE_AGENT_LOG_CAP];
