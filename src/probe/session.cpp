@@ -8599,6 +8599,12 @@ static void start_drainer(probe_session *s) {
         auto *sh = s->shared;
         ULONGLONG last_record = GetTickCount64();
         LONG64 beat = probe_agent_load64(&sh->drain_beat);
+        static const unsigned DRAIN_PAUSE = [] {
+            char v[16] = {};
+            const DWORD n = GetEnvironmentVariableA("UHH_BENCH_DRAIN_PAUSE", v, sizeof(v));
+            const unsigned long p = n && n < sizeof(v) ? std::strtoul(v, nullptr, 10) : 64;
+            return (unsigned)(p <= 100000 ? p : 64);
+        }();
         while (!s->drain_stop.load(std::memory_order_relaxed)) {
             // "Controller alive". This thread is its only writer: a plain store (on x86 a LOCKed
             // 64-bit increment is a CMPXCHG8B loop, once per loop).
@@ -8610,7 +8616,15 @@ static void start_drainer(probe_session *s) {
                 continue;
             }
             yields = 0;
-            if (drain_agent_logs(s)) { idle = 0; last_record = GetTickCount64(); continue; }
+            if (const size_t moved = drain_agent_logs(s)) {
+                idle = 0; last_record = GetTickCount64();
+                // A pass that found only a few records: wait a moment before the next one. A drainer
+                // that comes straight back reads the head and the next slot -- the lines the producers
+                // are writing -- several times per record (x86 single producer: see ROADMAP perf5).
+                // Bench knob, not API: UHH_BENCH_DRAIN_PAUSE (PAUSE instructions, 0 = off).
+                if (moved < 32) for (unsigned k = 0; k < DRAIN_PAUSE; ++k) YieldProcessor();
+                continue;
+            }
             check_ring_stall(s, stall);
             if (++idle < 64) { SwitchToThread(); continue; }
             LARGE_INTEGER due; due.QuadPart = -5000;                   // 0.5 ms, relative
