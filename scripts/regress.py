@@ -555,13 +555,17 @@ def stream_volume_once(backend, calls, timeout):
 
 
 def check_stream_volume():
-    """The controller's peak must be independent of total streamed-log volume."""
+    """The controller's peak must be independent of total streamed-log volume. inline: two 2M runs
+    and one 20M run; flat = the 20M peak <= max(1.2 x, +8 MB over) the larger 2M peak. (A single 2M
+    run does not always reach the pipeline's plateau: 0fb6cee on the VM, x64, peaked 14 MB at 2M
+    and 22 MB at 20M in one of four runs, 22 -> 22 in the others; CI x86 18 -> 24. A leak of half a
+    byte per record still shows: +8 MB over the 18M extra records.)"""
     if not exe("hitcost_driver.exe") or not exe("hitcost_target.exe"):
         return missing_bin("stream-volume", "hitcost driver/target")
     for backend in ("inline", "hw", "breakpoint"):
         name = f"stream-volume-{backend}"
         try:
-            sizes = (2_000_000, 20_000_000) if backend == "inline" else (200_000,)
+            sizes = (2_000_000, 2_000_000, 20_000_000) if backend == "inline" else (200_000,)
             runs = [stream_volume_once(backend, n, 1800) for n in sizes]
             exact = all(not x["timeout"] and x["rc"] == 0 and x["logs"] == n and
                         x["hits"] == n and x["report"].get("logs_written") == n and
@@ -570,7 +574,7 @@ def check_stream_volume():
             peaks = [x["peak"] for x in runs]
             small = all(isinstance(p, (int, float)) and 0 < p <= 256 for p in peaks)
             flat = (backend != "inline" or
-                    (peaks[0] is not None and peaks[1] is not None and peaks[1] <= peaks[0] * 1.20))
+                    (small and peaks[2] <= max(max(peaks[:2]) * 1.20, max(peaks[:2]) + 8)))
             record(name, exact and small and flat,
                    " ".join(f"N={n:,} logs={x['logs']:,} hits={x['hits']} written={x['report'].get('logs_written')} "
                             f"drop={x['report'].get('log_dropped')} peak={x['peak']}MB rc={x['rc']}"
