@@ -3426,7 +3426,7 @@ def check_cet_policy(threads=4, reads=200):
     mismatch is fatal, also in non-image code the kernel would fix up in compatibility mode --
     the transparency fixture (call_func, call_original + return_from) and gated_config on every
     backend. BlockNonCetBinaries (cet-block-*): only /CETCOMPAT images may load; breakpoint/hw
-    need nothing in the target; inline needs the agent (and the callback module) loaded.
+    need nothing in the target; inline needs the agent (which holds the callbacks) loaded.
     The detail says whether the machine enforced the policy (cet_probe of the same policy);
     on a machine without CET the rows prove only that the policy copies run."""
     pr_exe, tpd, gc = exe("cet_probe.exe"), exe("tp_driver.exe"), exe("gated_config.exe")
@@ -3461,12 +3461,12 @@ def check_cet_policy(threads=4, reads=200):
                     try:
                         bad, rows = tp_runs(tpd, copies["tp_target_cet"], bk, mode, 5, skip=TP_CET_SKIP)
                         if policy == "block" and bk == "inline" and on:
-                            # The agent / callback module must be /CETCOMPAT to load; until then
-                            # the refusal must be clean (the error names the agent load).
+                            # The agent (it holds the inline callbacks) must be /CETCOMPAT to load;
+                            # until then the refusal must be clean (the error names the agent load).
                             r2, o2 = run([tpd, "--backend", bk, "--mode", mode, "--probes", "add", "--",
                                           copies["tp_target_cet"], "--iters", 2], timeout=120)
                             err = (report(o2).get("error") or "")
-                            # until the agent AND the callback module are /CETCOMPAT
+                            # until the agent is /CETCOMPAT
                             if bad and "LoadLibrary" in err:
                                 record(name, True, f"policy IN EFFECT: inline refused cleanly: {err[:100]}")
                                 continue
