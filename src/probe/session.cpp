@@ -356,6 +356,7 @@ struct probe_session {
     bool attached = false;                     // probe_attach: detach (not kill) on close
     std::atomic<bool> stop_requested{false};   // probe_close from another thread while probe_run runs
     std::atomic<bool> running{false};          // probe_run is executing (on some thread)
+    std::atomic<const char *> run_phase{""};   // what probe_run is doing (a slow close says it)
     bool detached = false;
     bool detaching = false;                    // detach() running: no new holds, arming, gates or agent work
     bool detached_hooks = false;               // detach removed the inline hooks (stop_drainer may settle)
@@ -8776,11 +8777,14 @@ extern "C" int probe_run(probe_session *s) {
         if (s->stop_requested) {
             // probe_close was called on another thread. The debug API binds the debug object
             // to THIS thread, so the detach (or termination) happens here.
+            s->run_phase = "detaching";
             if (s->attached) { detach(s); s->detached = true; }
             else if (s->pi.hProcess) { TerminateProcess(s->pi.hProcess, 3); s->stop_requested = false; continue; }
             break;
         }
+        s->run_phase = "draining the log ring";
         drain_agent_logs(s);
+        s->run_phase = "in the debug loop";
         if (guard_pending(s) && s->guard_since && GetTickCount64() - s->guard_since > 5000 &&
             !guard_set_ready(s, "agent not ready within 5 s")) break;
         if (!s->held.empty() && GetTickCount64() - s->held_since > 5000) {
@@ -8812,6 +8816,7 @@ extern "C" int probe_run(probe_session *s) {
 #endif
         if (!ok) break;
     }
+    s->run_phase = "ending the session";
     finish_calls(s);                                      // callbacks still parked in call_func
     // An attached target is still running and the loop is leaving for some other reason
     // than a detach (an error: agent load/init failure, a failed context get/set or debug
@@ -8977,7 +8982,11 @@ extern "C" void probe_close(probe_session *s) {
         // be a use-after-free. A slow detach is reported, never cut short.
         for (ULONGLONG start = GetTickCount64(), warned = 0; s->running || !s->ran; Sleep(10)) {
             ULONGLONG waited = (GetTickCount64() - start) / 15000;
-            if (waited > warned) { warned = waited; std::fprintf(stderr, "probe: close: still waiting for probe_run to stop (%llus)\n", waited * 15); }
+            if (waited > warned) {
+                warned = waited;
+                std::fprintf(stderr, "probe: close: still waiting for probe_run to stop (%llus; it is %s)\n",
+                             waited * 15, s->run_phase.load());
+            }
         }
     }
     ctrl_leave(s);                         // closed without probe_wait_for_exit

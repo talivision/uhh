@@ -10766,13 +10766,29 @@ def check_stdout_powershell():
                 record(name, False, repr(e))
             finally:
                 shutil.rmtree(work, ignore_errors=True)
+
+
+def check_powershell_detach():
+    """An attach reported BEFORE its detach (uhh_trace --detach-after-ms) on a target that keeps
+    logging at full speed into a slow PowerShell pipeline (split from check_stdout_powershell).
+    UHH_PSDETACH_REPS (default 1) repeats each backend; UHH_PSDETACH_BACKENDS narrows them.
+    The detach must also END: probe_close returns within DETACH_END_S of the request (the
+    detach waits at most 15 s for running callbacks)."""
+    tracer, target = exe("uhh_trace.exe"), exe("logstream_target.exe")
+    if not tracer or not target:
+        return missing_bin("stdout-powershell-detach", "uhh_trace/logstream_target")
+    ps = SYS32 / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    if not ps.exists():
+        return skip_external("stdout-powershell-detach", "Windows PowerShell 5.1 (powershell.exe)")
+    reps = int(os.environ.get("UHH_PSDETACH_REPS", "1"))
+    backends = [x for x in os.environ.get("UHH_PSDETACH_BACKENDS", "").split(",") if x] or ["inline", "breakpoint"]
     # An attach reported BEFORE its detach (uhh_trace --detach-after-ms) on a target that keeps
     # logging at full speed into a slow PowerShell pipeline. The report's counts must be
     # causally consistent (stdout_logs <= logs_written <= hits: the hits were read before a
     # long flush and came out far BELOW logs_written), and the records after the report must
     # end in a probe_final whose counts close the books: hits == logs_written + log_dropped +
     # in_flight, and the capture holds exactly its stdout_logs records, seq without a gap.
-    for backend in ("inline", "breakpoint"):
+    for rep, backend in ((r, b) for r in range(reps) for b in backends):
         name = f"stdout-powershell-detach-{backend}"
         work = Path(tempfile.mkdtemp(prefix="uhh-pslog-"))
         tgt = None
@@ -10787,6 +10803,7 @@ def check_stdout_powershell():
             script = (f"$ErrorActionPreference='Continue'; $tr='{tracer}'; $o='{out}'; $a=@({lit}); "
                       "& $tr @a | Out-File -FilePath $o -Encoding utf8")
             env = dict(os.environ, TEMP=str(work), TMP=str(work))
+            t0 = time.time()
             p = subprocess.Popen([str(ps), "-NoProfile", "-NonInteractive", "-Command", script],
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", env=env)
             try:
@@ -10795,9 +10812,12 @@ def check_stdout_powershell():
                 tgt.kill()                                   # ends the attached session too
                 _, err = p.communicate(timeout=120)
                 partial = verify_capture(out)
-                record(name, False, f"no end within 240 s: captured so far={partial['logs']} "
-                                    f"report={'yes' if partial['report'] else 'no'} stderr={err.strip().splitlines()[-4:]}")
+                lines = err.strip().splitlines()
+                waits = [l for l in lines if "still waiting for probe_run" in l][:1]
+                record(name, False, f"rep={rep} no end within 240 s: captured so far={partial['logs']} "
+                                    f"report={'yes' if partial['report'] else 'no'} stderr={waits + lines[-4:]}")
                 continue
+            took = time.time() - t0
             r = subprocess.CompletedProcess(p.args, p.returncode, "", err)
             alive = tgt.poll() is None
             cap = verify_capture(out)
@@ -10827,7 +10847,7 @@ def check_stdout_powershell():
                 fin = {"hits": dh, "logs_written": dw, "log_dropped": dd, "in_flight": di, "stdout_logs": cap["logs"]}
             ok = (alive and finals <= 1 and after_final == 0 and consistent and closed and cap["bad"] == 0 and cap["gaps"] == 0 and
                   fin.get("log_dropped") == 0 and rep.get("error") is None and cap["logs"] > 0)
-            record(name, ok, f"report: hits={hits} written={rep.get('logs_written')} stdout_logs={rep.get('stdout_logs')} "
+            record(name, ok, f"rep={rep} took={took:.0f}s report: hits={hits} written={rep.get('logs_written')} stdout_logs={rep.get('stdout_logs')} "
                              f"consistent={consistent} final={ {k: fin.get(k) for k in ('hits', 'logs_written', 'log_dropped', 'in_flight', 'stdout_logs')} } "
                              f"captured={cap['logs']} bad={cap['bad']} seq_gaps={cap['gaps']} target_alive={alive} "
                              f"finals={finals} json_after_final={after_final}"
@@ -11063,6 +11083,7 @@ def main():
     if want(check_gated_e2e): check_gated_e2e()
     if want(check_realbig): check_realbig("" if args.bigapps else REALBIG_DEFAULT)
     if want(check_stdout_powershell): check_stdout_powershell()
+    if want(check_powershell_detach): check_powershell_detach()
     if want(check_stdout_console): check_stdout_console(args.console_records)
     if only and not RESULTS:
         print(f"regress.py: --only {','.join(only)} selected only opt-in tiers that were not enabled "
