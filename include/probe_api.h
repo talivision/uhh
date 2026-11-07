@@ -224,7 +224,9 @@ const void *get_config(probe_context *);
    (a directory part is ignored; a name without extension means "<name>.dll", so
    "kernel32!X" == "kernel32.dll!X"), offsets are "+0x"
    hex only; an unknown module/export, nargs outside 0..8 or an address that is no committed
-   executable memory returns 0 without calling anything. One difference: a callee that raises
+   executable memory returns 0 without calling anything. Breakpoint/hw also refuse (0, one
+   stderr line per probe) a call on a thread whose stack is within its last pages (the
+   callee's frame is not grown into them; docs/limitations.md). One difference: a callee that raises
    an exception -- even one it handles itself -- is abandoned at that exception on
    breakpoint/hw (returns 0, *ret untouched, the target never sees it), while inline it is
    dispatched in the target as usual (handled inside: returns 1; unhandled: 0) and the
