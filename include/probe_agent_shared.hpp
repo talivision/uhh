@@ -315,8 +315,13 @@ inline void probe_agent_retire_carry(probe_agent_shared *sh, const probe_agent_l
     if (rec.carry != 1 || rec.probe >= PROBE_AGENT_MAX_PROBES) return;
     if (rec.reserved) {                         /* the owner's block (v25): the controller's own counter */
         if (rec.reserved > PROBE_AGENT_TBLOCKS) return;
-        probe_agent_tblock &t = sh->tblocks[rec.reserved - 1];
-        if (probe_agent_tblock_unaccounted(t)) InterlockedIncrement64(&t.retired);
+        /* No bound check: it summed the block's hits, then read `done` -- while the owner kept
+           counting (a hit = hits[p]++ ... done++ at its return), a sum that read hits[p] before
+           one hit and `done` after it came out one short, read 0 with this record's unit still
+           pending, and skipped the retire: one hit reported interrupted forever (CI 42325381514,
+           gated-e2e-launch-fhw-oin-cin-rin: logs 646/646 delivered, interrupted=1). The sums
+           clamp a block's unaccounted at zero, so a bogus carry cannot borrow anyway. */
+        InterlockedIncrement64(&sh->tblocks[rec.reserved - 1].retired);
         return;
     }
     volatile LONG64 &cell = sh->hit_stripes[rec.probe][(rec.tid >> 2) & (PROBE_AGENT_STRIPES - 1)].value;
