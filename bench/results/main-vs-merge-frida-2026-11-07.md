@@ -511,3 +511,82 @@ agentscope branch alone fixes it (45 ms, = main; first table).
 | attach/breakpoint/idle | detach_ms (ms) | 297 (11%) | 314 (0%) | 314 (0%) | +5.5% **REGRESSION** | +5.6% **REGRESSION** | 3/3/3 |
 | attach/breakpoint/busy | attach_ms (ms) | 47.2 (2%) | 214 (228%) | 116 (91%) | +353.3% **REGRESSION** | +146.6% **REGRESSION** | 3/3/3 |
 | attach/breakpoint/busy | detach_ms (ms) | 266 (0%) | 321 (8%) | 320 (14%) | +20.6% **REGRESSION** | +20.3% **REGRESSION** | 3/3/3 |
+
+## Phase 3 (2026-11-07, branch `perf`): hw rounds, x86 send_log, the carry-retire fix
+
+**Urgent fix first (branch `perf-fix` on merge-frida 4aeef77, CI green on 4e0263e):** CI
+42325381514 had one `gated-e2e-launch-fhw-oin-cin-rin` with every log delivered yet
+`interrupted=1`. Cause: `probe_agent_retire_carry` checked the producer block's unaccounted count
+before retiring a carried record -- it summed the block's 128 hit counters, then read `done`,
+while the owner thread kept counting; a sum that read a probe's hits before one hit and `done`
+after it came out one short (0 with the record's own unit pending) and the retire was skipped.
+Fix: no bound check (the sums clamp a block at zero anyway). New regress `carry-exact-inline`
+(4 threads, every other hit logs, 3 runs): on 4aeef77 it failed 2 of 3 invocations (intr=1, 2);
+fixed 9/9; families crash_logs, carry_exact, hunt, logs, gated_e2e: x64 320/320, x86 320/320.
+Merged into `perf` (which also brings agentscope).
+
+**hw / hw-watch / breakpoint rounds -- what the measurements showed:**
+- The rounds' sleep never was 4 ms: since Windows 10 2004 `timeBeginPeriod` is per process, so the
+  controller's 1 ms timer never reached the target -- every "4 ms" yield slept ~15.6 ms, and the
+  1 ms timer only cost the controller's own loop (~30% on the VM: hw 144 -> 110 us/hit with it off).
+- A thread in a TIMED wait (Sleep, WaitFor... with a timeout) has its timeout elapse only while the
+  process is not frozen (a 10 ms WaitForSingleObject loop beside a hot hw thread completed 7% of
+  its due timeouts with no rounds) -- it starves like a runnable thread, and cannot be told from an
+  unbounded wait until it completes.
+- Thread states read during a debug event's freeze are useless (every thread Waiting/Suspended;
+  pool workers gain cycles from each freeze/thaw); read in a round's quiet time they are real.
+
+**Design now:** a round is also a probe. In its quiet time the controller polls (no timer) and
+asks the kernel twice whether another thread is runnable, ran since the last sample (not a pool
+worker back on its queue), or sits in a Sleep. Demand (or fewer than 8 demand-free rounds in a
+row) -> rounds every 20 ms whose yielders SLEEP (~15.6 ms, off the CPU: what a starved thread
+needs); otherwise the period doubles to 80 ms and the yielders spin ~4 ms on NtYieldExecution
+against the interrupt time (no timer). No 1 ms timer for the rounds at all.
+- Per hw hit beyond that floor (measured with bench-only toggles, x64, one hot thread, 120 us/hit
+  at 72ffb73): the post-callback re-read of the thread's debug registers ~27 us (now only when a
+  DR write happened since the hit's own read: an epoch bumped by every context write carrying
+  debug registers), the yield rounds ~20 us, ctx_watch ~3 us; with all three off 75 us. The hit
+  thread's handle is now opened once per thread, not per hit. Counted syscalls per hw hit:
+  GetThreadContext 2 -> 1, OpenThread/CloseHandle 1/1 -> 0.
+- **The floor**: `bench/perfab/mindbg` -- the smallest debugger counting the same debug-register
+  hit (WaitForDebugEvent, Get/SetThreadContext with RF, ContinueDebugEvent) -- **66-68 us/hit x64,
+  112-117 us/hit x86** on this VM. An external (debugger) hw probe cannot go below that;
+  Frida's in-process hardware breakpoint (+23 us x64, merge-frida BENCHMARKS) is not external.
+
+**x86 send_log** was bound by the controller's log writer (the ring applies backpressure): one
+lock + wake-up and two snprintf per record. Records are now taken in chunks of 256 and formatted
+without printf or temporaries: x86 3.2 -> 0.85 us/log, x64 1.3 -> 0.45 us/log (4 threads: 7.6 ->
+1.9 us x64, 12.4 -> 2.2 us x86). **x86 inline**: the x87 save is kept (a correctness fix) but done
+by FXSAVE when only the x87 state is live (measured: XSAVEC 174, FXSAVE 154, FNSAVE 218, none 107
+ns); no per-hit zero-fill of the probe context / hit scope.
+
+### Phase 3 numbers (9f44166, x64 / x86, us or ns per call; main and merge-frida from the same day's interleaved A/B)
+
+| probe | arch | thr | main | merge-frida | **perf** | perf vs main |
+|---|---|---|---:|---:|---:|---|
+| hw | x64 | 1 | 100 us | 166 us | **93 us** | **-7%** |
+| hw data watch | x64 | 1 | 95 us | 161 us | **90 us** | -5% |
+| breakpoint | x64 | 1 | 150 us | 111 us | **78 us** | **-48%** |
+| hw / watch / bp | x64 | 4 | 334 / 327 / 508 us | 567 / 554 / 402 us | **466 / 449 / 435 us** | +40% / +37% / -14% |
+| inline empty | x64 | 1 | 82 ns | 108 ns | **93 ns** | +13% |
+| inline send_log | x64 | 1 | 1.15 us | 1.48 us | **0.47 us** | **-60%** |
+| hw | x86 | 1 | 154 us | 242 us | **145 us** | **-6%** |
+| hw data watch | x86 | 1 | 154 us | 234 us | **140 us** | -9% |
+| breakpoint | x86 | 1 | 246 us | 181 us | **130 us** | **-47%** |
+| hw / watch / bp | x86 | 4 | 586 / 581 / 931 us | 887 / 887 / 683 us | **810 / 794 / 755 us** | +38% / +37% / -19% |
+| inline empty | x86 | 1 | 96 ns | 209 ns | **162 ns** | +69% (x87 save; 107 without) |
+| inline send_log | x86 | 1 | 2.12 us | 3.24 us | **0.85 us** | **-60%** |
+| floor (mindbg, hw) | x64 / x86 | 1 | | | 67 / 113 us | |
+
+perf rows: 3 back-to-back runs each on a quiet VM (hw/bp/watch) and 5 (inline), median; main /
+merge-frida rows: the interleaved 2-round A/B of the same afternoon (p8). Fairness kept: a
+thread that never hits gets ~500-680 spins/us beside one hot hw thread (main: 45-60), a 10 ms
+timed-wait loop completes 50-60% of its due timeouts (main: 4-8%), hunt-starve late reads
+60-8,300 (bar 20,000). Several hot threads keep merge-frida's 20 ms sleeping rounds (the probing
+cost them ~15%), so t4 hw stays ~+40% over main (main never yields: it starves the others).
+
+Regress (VM): families hunt, check_detach, crash_logs, carry_exact, log_throughput, lifecycle,
+transparency, agent_scope (+ cxlib, cx2, watch, conformance, callorig, famous on 9f44166): see
+the phase 3 report; one-off flakes seen once each and not reproduced in 64 reruns:
+lifecycle-detach-early-5-mixed (a DR left after an early detach), lifecycle-interrupt-mixed
+ctrl@0.0.

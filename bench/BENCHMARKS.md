@@ -5,6 +5,30 @@ is kept for history and is SUPERSEDED (see "Why the earlier comparison was super
 Reproduce with `bench/frida/vs_frida.py` (how: `bench/frida/README.md`); raw rows in
 `bench/results/frida17-2026-11-07/`.
 
+## Update: branch `perf` (2026-11-07 evening) against the same Frida 17.26.1 rows
+
+Same VM, same `vs_frida.py`, lean sizes (8 x 12,500 reads = 100,000 events, hit 50,000 calls),
+3 repeats, every run exact. UHH = `perf` c086163 (x86 uhh-inline / frida-cmodule rows: f1d011f, the
+hook-shadow fast path, re-run together), Frida rows re-measured in the same session. Raw rows: `bench/results/frida17-perf-2026-11-07/`. Added ns per event (median):
+
+| workload | arch | uhh-inline | frida-cmodule | uhh-hw | frida-hw | uhh-breakpoint |
+|---|---|---:|---:|---:|---:|---:|
+| count | x64 | **+42** | +307 | +120,350 | +23,047 | +99,508 |
+| gated (every read logged + delivered) | x64 | **+763** | +793 | +132,796 | -- | +110,064 |
+| hit | x64 | **+100** | +252 | +93,479 | +23,027 | +77,745 |
+| count | x86 | +300 | **+214** | +217,134 | +20,151 | +205,144 |
+| gated | x86 | +1,179 | **+287** | +238,642 | -- | +220,769 |
+| hit | x86 | **+225** | +301 | +154,223 | +47,641 | +142,139 |
+
+- UHH inline now beats CModule on x64 in all three workloads (gated was +2,145 before: the
+  controller's log writer, see bench/results/main-vs-merge-frida-2026-11-07.md "Phase 3") and on
+  x86 in `hit`; x86 `count` and `gated` are still behind (open: the x86 log path and per-hit
+  costs beyond the x87 save).
+- hw: UHH's hardware breakpoints are EXTERNAL (a debugger; the owner kept them so) and cannot go
+  below the debug-event round trip: the smallest debugger counting the same debug-register hit
+  (`bench/perfab/mindbg`) costs 67 us (x64) / 113 us (x86) per hit on this VM; Frida's in-process
+  exception handler is ~3x below that floor by construction. UHH hw single-thread is 93 us (x64).
+
 ## UHH vs Frida 17.26.1 (2026-11-07, branch frida-real; supersedes everything below)
 
 ### Why the earlier comparison was superseded

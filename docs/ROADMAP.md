@@ -1839,9 +1839,13 @@ the report (count, valid JSON per line, CRC multiset of the lines, `seq` coverag
     Regress (hunt, detach, crash_logs, logs, cxlib, cx2, lifecycle, ret_probe, transparency) x64 262/262, x86 259/259.
     Per hit vs main: breakpoint -38..-43%; hw / hw-watch +23..+48% (was +50..+77%); inline x64 +15% (was +33%);
     inline x86 +75% (was +108%: the rest is the x87 save, 116 ns with it off vs main 103); x86 send_log +58% open
-  - ⬜ hw within ~5% of main: per-round cost (shorter probe rounds once no demand), cheaper quiet-time probe;
-    a timed wait starves exactly like a Sleep but cannot be seen (why the back-off stops at 80 ms)
-  - ⬜ x86 send_log +1.2 us per log (profile: not the stack VirtualQuery alone); x86 x87 save (~70 ns) -- cheaper form?
+  - ✅ Phase 3 (perf 9f44166, results file "Phase 3"): per hit vs main -- hw -7% x64 / -6% x86, hw watch -5% / -9%,
+    breakpoint -48% / -47%, inline send_log -60% (log writer chunked, no printf), x86 inline 162 ns (x87 by FXSAVE).
+    The controller's 1 ms timer never reached the target (per-process resolution since Win10 2004): rounds time
+    themselves; the post-callback DR re-read only after a DR write (~27 us); hit-thread handles cached.
+    Floor of an external hw probe (bench/perfab/mindbg): 67 us x64, 113 us x86.
+  - ⬜ Several hot threads: hw t4 still ~+40% over main (merge-frida's sleeping rounds, kept: they are the fairness)
+  - ⬜ x86 inline: the x87 save (~55 ns with FXSAVE) is the rest of the gap to main; vs Frida CModule see BENCHMARKS
   - ✅ UHH vs Frida re-run 2026-11-07 x64 + x86 (bench/BENCHMARKS.md): matrix + the full gated_config in both tools
     (both exact; UHH 4.3-4.8x faster); inline matrix row now includes delivering every log (no drops)
 

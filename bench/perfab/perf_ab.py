@@ -172,6 +172,22 @@ def case_spin(side, bk):
             "ns_per_call": t.get("ns_per_call"), "spin_per_us": t.get("spin_per_us"), "wall_s": round(wall, 3)}
 
 
+def case_waiter(side, bk):
+    """Fairness for a timed wait: one thread hits the probe while another loops on a 10 ms
+    WaitForSingleObject (hitcost_target --waiter 10): the share of its timeouts that completed
+    (waits / wall-clock-due; uninstrumented ~0.6 at the 15.6 ms timer)."""
+    n = calls_for(bk, "empty")
+    cmd = ([tgt("hitcost_target.exe"), "--no-wait", "--calls", 300_000_000, "--threads", 1, "--waiter", 10] if bk == "base" else
+           [side.exe("hitcost_driver.exe"), "--backend", bk, "--method", "empty",
+            *(["--watch-rva", sink_rva()] if bk == "watch" else []), "--",
+            tgt("hitcost_target.exe"), "--no-wait", "--calls", n, "--threads", 1, "--waiter", 10])
+    rc, wall, logs, objs = run_to_file(side, cmd, 900)
+    t = first(objs, "target")
+    due = t.get("waits_due") or 0
+    return {"rc": rc, "ok": rc == 0 and t.get("ns_per_call") is not None, "ns_per_call": t.get("ns_per_call"),
+            "wait_share": (t.get("waits") or 0) / due if due else None, "wall_s": round(wall, 3)}
+
+
 def case_hit(side, bk, m, threads=1):
     """ns_per_call = in-target loop wall / calls per thread: what one call costs a thread
     (with T threads running at once). hits_per_s = all threads' calls / wall."""
@@ -363,6 +379,7 @@ def all_cases(group):
             c += [(f"hit/{bk}/{m}/t{t}", (lambda bk, m, t: lambda s: case_hit(s, bk, m, t))(bk, m, t))
                   for bk in HIT_BACKENDS for m in ("empty", "send_log")]
         c += [(f"spin/{bk}/t1", (lambda bk: lambda s: case_spin(s, bk))(bk)) for bk in ["base"] + HIT_BACKENDS]
+        c += [(f"waiter/{bk}/t1", (lambda bk: lambda s: case_waiter(s, bk))(bk)) for bk in ["base", "hw", "breakpoint"]]
         c += [(f"attach/{bk}/{m}", (lambda bk, m: lambda s: case_attach(s, bk, m))(bk, m))
               for bk in BACKENDS for m in ("idle", "busy")]
     if group in ("extra", "all"):
