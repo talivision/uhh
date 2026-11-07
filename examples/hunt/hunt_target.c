@@ -36,6 +36,14 @@
  *           -- the same base, different code at the same RVA (probe twin.dll!TwinWork)
  *   early   the handle is opened and one read made in a TLS callback at process attach
  *           (before the entry point); then N reads from main
+ *   stackedge  N fresh threads (4 at a time), each reads with its SP brought (_alloca, never
+ *           touched below) to just above its committed stack: the hit has less than a page of
+ *           committed stack below it (a breakpoint/hw call_func frame lands in the guard page).
+ *           Then the guard page must still be there (else guard_lost) and the thread grows its
+ *           stack 64 KB (ROADMAP XH3)
+ *   stackend   N threads (256 KB reservation), each reads with its SP just above the last pages
+ *           of its reservation: a breakpoint/hw call_func there must be refused, loudly, and the
+ *           guard page left in place (guard_lost)
  * Output: {"kind":"target","scenario":...,"reads":R,"bad":B,"foreign":F,...}
  */
 #define WIN32_LEAN_AND_MEAN
@@ -43,6 +51,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <malloc.h>
 
 typedef LONG(NTAPI *NtReadFn)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
 typedef struct { ULONG Length; HANDLE Root; PVOID Name; ULONG Attributes; PVOID Sd, Qos; } OBJATTR;
@@ -328,6 +337,73 @@ static DWORD WINAPI reader_until_stop(void *p) {
     return 0;
 }
 
+/* ---- stackedge / stackend (ROADMAP XH3) ---- */
+#ifdef _WIN64
+#define TEB_DEALLOCATION_STACK 0x1478
+#define TEB_GUARANTEED_STACK 0x1748
+#else
+#define TEB_DEALLOCATION_STACK 0xE0C
+#define TEB_GUARANTEED_STACK 0xF78
+#endif
+static volatile LONG g_edge, g_guard_lost, g_grown;
+static ULONG_PTR stack_limit(void) { return (ULONG_PTR)((NT_TIB *)NtCurrentTeb())->StackLimit; }
+/* The page right below the committed stack is the guard page: Windows grows the stack when the
+   thread touches it. A guard spent from outside (WriteProcessMemory / ReadProcessMemory into it)
+   leaves a plain page and no guard: the thread's next growth past it is an access violation. */
+static int guard_intact(void) {
+    MEMORY_BASIC_INFORMATION m;
+    return VirtualQuery((void *)(stack_limit() - 1), &m, sizeof(m)) && m.State == MEM_COMMIT && (m.Protect & PAGE_GUARD);
+}
+static __declspec(noinline) void grow_stack(size_t n) {
+    volatile char *p = (volatile char *)_alloca(n);     /* __chkstk touches every page, top down */
+    p[0] = 1;
+    InterlockedIncrement(&g_grown);
+}
+/* SP down to goal (an _alloca of the distance: its probe touches only pages above goal, all
+   committed), then one read: its hit sits a few hundred bytes above goal. */
+static __declspec(noinline) void read_at(ULONG_PTR goal) {
+    char here;
+    const ULONG_PTR top = (ULONG_PTR)&here;
+    if (top <= goal + 0x400 || top - goal > (1u << 20)) { InterlockedIncrement(&g_bad); return; }
+    volatile char *pad = (volatile char *)_alloca(top - goal);
+    pad[0] = 0;
+    hunt_read();
+    InterlockedIncrement(&g_edge);
+}
+static void after_edge(void) {
+    if (!guard_intact()) InterlockedIncrement(&g_guard_lost);
+    else grow_stack(64 * 1024);
+}
+static DWORD WINAPI edge_thread(void *p) {
+    (void)p;
+    grow_stack(3 * 4096);                   /* room below this frame; StackLimit is now ~3 pages down */
+    read_at(stack_limit() + 0x200);
+    after_edge();
+    return 0;
+}
+static DWORD WINAPI end_thread(void *p) {
+    (void)p;
+    const char *teb = (const char *)NtCurrentTeb();
+    const ULONG_PTR dealloc = *(const ULONG_PTR *)(teb + TEB_DEALLOCATION_STACK);
+    ULONG_PTR guarantee = (*(const ULONG *)(teb + TEB_GUARANTEED_STACK) + 4095) & ~(ULONG_PTR)4095;
+    if (guarantee < 4096) guarantee = 4096;
+    /* UHH's bound (session.cpp stack_can_grow): a call frame below dealloc + guarantee + 4 pages
+       is refused. The hit sits just above it, so the frame 512+ bytes below crosses it. */
+    read_at(dealloc + guarantee + 4 * 4096 + 0x200);
+    if (!guard_intact()) InterlockedIncrement(&g_guard_lost);
+    return 0;
+}
+static void run_edge_threads(LPTHREAD_START_ROUTINE fn, SIZE_T reserve) {
+    for (DWORD i = 0; i < g_n; i += 4) {
+        HANDLE t[4]; DWORD k = 0;
+        for (; k < 4 && i + k < g_n; ++k) {
+            t[k] = CreateThread(NULL, reserve, fn, NULL, reserve ? STACK_SIZE_PARAM_IS_A_RESERVATION : 0, NULL);
+            if (!t[k]) { fprintf(stderr, "CreateThread failed %lu\n", GetLastError()); ExitProcess(90); }
+        }
+        join(t, k);
+    }
+}
+
 /* ---- generic ---- */
 static DWORD WINAPI reader_n(void *p) { (void)p; for (DWORD i = 0; i < g_n; ++i) hunt_read(); return 0; }
 
@@ -486,6 +562,12 @@ int main(int argc, char **argv) {
         }
     } else if (!strcmp(sc, "early")) {
         for (DWORD i = 0; i < g_n; ++i) hunt_read();
+    } else if (!strcmp(sc, "stackedge")) {
+        run_edge_threads(edge_thread, 0);
+        if ((DWORD)g_edge != g_n || (DWORD)(g_grown - g_n) != g_n - (DWORD)g_guard_lost) InterlockedIncrement(&g_bad);
+    } else if (!strcmp(sc, "stackend")) {
+        run_edge_threads(end_thread, 256 * 1024);
+        if ((DWORD)g_edge != g_n) InterlockedIncrement(&g_bad);
     } else if (!strcmp(sc, "threads")) {
         HANDLE t[32]; for (int i = 0; i < 32; ++i) t[i] = spawn(reader_n, NULL); join(t, 32);
     } else {
@@ -494,9 +576,10 @@ int main(int argc, char **argv) {
     g_tls_on = 0;
     if (veh) RemoveVectoredExceptionHandler(veh);
     printf("{\"kind\":\"target\",\"scenario\":\"%s\",\"n\":%lu,\"reads\":%ld,\"bad\":%ld,\"foreign\":%ld,"
-           "\"early\":%ld,\"work\":%ld,\"owndr\":%ld,\"guards\":%ld,\"twin\":%ld,\"ctx_rounds\":%ld,\"ctx_ms\":%ld,\"ctx_max_round_ms\":%ld,\"alien\":%ld,\"checksum\":\"%llx\",\"pid\":%lu}\n",
+           "\"early\":%ld,\"work\":%ld,\"owndr\":%ld,\"guards\":%ld,\"twin\":%ld,\"ctx_rounds\":%ld,\"ctx_ms\":%ld,\"ctx_max_round_ms\":%ld,\"alien\":%ld,"
+           "\"edge\":%ld,\"guard_lost\":%ld,\"checksum\":\"%llx\",\"pid\":%lu}\n",
            sc, g_n, g_reads, g_bad, g_foreign, g_early, g_work, g_owndr, g_guards, g_twin, g_ctx_rounds, g_ctx_ms, g_ctx_max_ms, g_alien,
-           checksum(), GetCurrentProcessId());
+           g_edge, g_guard_lost, checksum(), GetCurrentProcessId());
     fflush(stdout);
     return 0;
 }

@@ -100,14 +100,17 @@ def run(args, timeout=180, feed=None):
     return r, objs
 
 
-def stream_run(args, timeout, on_line):
-    """Drain stdout incrementally so volume checks never retain probe_log records."""
+def stream_run(args, timeout, on_line, on_err=None):
+    """Drain stdout incrementally so volume checks never retain probe_log records. on_err(line):
+    every stderr line (else stderr is drained and dropped)."""
     proc = subprocess.Popen([str(a) for a in args], stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, bufsize=1)
     timed_out = threading.Event()
 
     def drain_stderr():
         for line in proc.stderr:
+            if on_err:
+                on_err(line.rstrip("\r\n"))
             marker = "probe: logs -> "
             if line.startswith(marker):
                 try:
@@ -4822,8 +4825,12 @@ def hunt_run(backend, scenario, n, extra=(), timeout=600, readers=None):
     import os
     d, t = exe("hunt_driver.exe"), exe("hunt_target.exe")
     st = {"read": 0, "unmapped": 0, "pids": set(), "work": 0, "tid_ok": 0, "tid_bad": 0,
-          "recurse_ok": 0, "other": 0}
+          "recurse_ok": 0, "other": 0, "refused": []}
     keep = []
+
+    def on_err(line):
+        if "call_func refused" in line and len(st["refused"]) < 20:
+            st["refused"].append(line)
 
     def on_line(line, _t):
         if not line.startswith("{"):
@@ -4856,7 +4863,7 @@ def hunt_run(backend, scenario, n, extra=(), timeout=600, readers=None):
     if readers:
         os.environ["HUNT_READERS"] = str(readers)
     try:
-        rc, timed_out = stream_run([d, "--backend", backend, *extra, "--", t, scenario, "--n", n], timeout, on_line)
+        rc, timed_out = stream_run([d, "--backend", backend, *extra, "--", t, scenario, "--n", n], timeout, on_line, on_err)
     finally:
         os.environ.pop("HUNT_READERS", None)
     tg = next((o for o in keep if o.get("kind") == "target"), {})
@@ -4873,6 +4880,54 @@ def hunt_selected(name):
     import os
     flt = [x for x in os.environ.get("UHH_HUNT", "").split(",") if x]
     return not flt or any(x in name for x in flt)
+
+
+def check_hunt_stack():
+    """breakpoint/hw call_func on a hit with barely any committed stack below it (ROADMAP XH3).
+    The controller runs the callee on the stopped thread with its frame 512+ bytes below the
+    hit's SP. Was: where that memory was not committed yet (a fresh thread, a caller's big
+    untouched frame) the frame write failed and call_func returned 0, nothing said.
+    hunt-stackedge-*: every backend, fresh threads whose read hits with less than a page of
+    committed stack below (hunt_target stackedge); every call_func must work as inline (--tid:
+    the target's tid; --recurse: NtReadVirtualMemory again, x64 with a stack argument), the
+    thread's guard page must still be in place after it (guard_lost=0) and the thread grows its
+    stack 64 KB afterwards; no refusal on stderr.
+    hunt-stackend-*: breakpoint/hw, threads whose read hits just above the last pages of their
+    stack reservation: there the stack must not grow (UHH's bound: DeallocationStack +
+    max(guarantee, 1 page) + 4 pages) -- each such call_func returns 0 (the TLS reads' calls work),
+    ONE stderr line names the probe and the reason, the guard page stays, the program is
+    unaffected."""
+    d, t = exe("hunt_driver.exe"), exe("hunt_target.exe")
+    if not d or not t:
+        return missing_bin("hunt-stack", "hunt_driver / hunt_target")
+    n = 20
+    rows = [(sc, bk, extra) for sc, bks in (("stackedge", ("inline", "hw", "breakpoint")), ("stackend", ("hw", "breakpoint")))
+            for bk in bks for extra in ((("--tid",), ("--recurse",)) if sc == "stackedge" else (("--tid",),))]
+    for sc, bk, extra in rows:
+        name = f"hunt-{sc}-{extra[0].lstrip('-')}-{bk}"
+        try:
+            rc, tmo, tg, rd, wk, rep, st = hunt_run(bk, sc, n, extra, timeout=600)
+            reads = tg.get("reads") or 0
+            calls = st["tid_ok"] + st["tid_bad"] if "--tid" in extra else st["recurse_ok"]
+            want_hits = reads * 2 if "--recurse" in extra else reads
+            ok = (not tmo and rc == 0 and reads and tg.get("bad") == 0 and tg.get("edge") == n and
+                  tg.get("guard_lost") == 0 and rd.get("hits") == want_hits and st["read"] == reads and
+                  st["unmapped"] == 0 and rep.get("log_dropped") == 0 and rep.get("app_exit") == 0 and st["other"] == 0)
+            if sc == "stackedge":
+                ok = ok and not st["refused"] and (st["tid_ok"] == reads and st["tid_bad"] == 0 if "--tid" in extra
+                                                   else st["recurse_ok"] == reads)
+            else:
+                ok = (ok and st["tid_bad"] == n and st["tid_ok"] == reads - n and len(st["refused"]) == 1 and
+                      "NtReadVirtualMemory" in st["refused"][0] and "nearly exhausted" in st["refused"][0])
+            record(name, ok, f"reads={reads} edge={tg.get('edge')} hits={rd.get('hits')} logs={st['read']} bad={tg.get('bad')} "
+                             f"guard_lost={tg.get('guard_lost')} tid_ok={st['tid_ok']} tid_bad={st['tid_bad']} "
+                             f"recurse_ok={st['recurse_ok']} calls={calls} refused={len(st['refused'])} "
+                             f"dropped={rep.get('log_dropped')} exit={rep.get('app_exit')} rc={rc} timeout={tmo}"
+                             + (f" other={st['other']}" if st["other"] else "")
+                             + (f" first_refusal={st['refused'][0][:200]!r}" if st["refused"] else "")
+                             + ("" if ok else f" err={(rep.get('error') or '')[:160]}"))
+        except Exception as e:
+            record(name, False, repr(e))
 
 
 def check_init_cutoff():
@@ -4898,7 +4953,8 @@ def check_init_cutoff():
                        timeout=120)
             target.communicate(timeout=60)
             rep = report(o)
-            cut = "agent init thread ended by the target before it returned" in r.stderr
+            cut_line = next((l for l in r.stderr.splitlines() if "agent init thread ended by the target" in l), "")
+            cut = bool(cut_line)
             # exit-process: the cut-off must be seen. exit-terminate: on x86 the cut-off line was
             # missing now and then (CI 1 of 1 row, VM 1 of 14; cause not established -- the thread's
             # exit not reported before the process's, or the init not started yet) with the right
@@ -4906,6 +4962,7 @@ def check_init_cutoff():
             ok = (target.returncode == code and rep.get("app_exit") == code and not rep.get("error") and
                   (cut or sc == "exit-terminate"))
             record(name, ok, f"app_exit={rep.get('app_exit')} target_rc={target.returncode} cut_said={cut} "
+                             f"cut_line={cut_line[len('probe: '):][:120]!r} "
                              f"error={(rep.get('error') or '')[:160]}")
         except Exception as e:
             if target and target.poll() is None:
@@ -11556,6 +11613,7 @@ def main():
     if want(check_detours_retval): check_detours_retval()
     if want(check_detours_stdin): check_detours_stdin()
     if want(check_hunt): check_hunt()
+    if want(check_hunt_stack): check_hunt_stack()
     if want(check_init_cutoff): check_init_cutoff()
     if want(check_stdout_forward): check_stdout_forward()
     if want(check_blog_replicas): check_blog_replicas()
