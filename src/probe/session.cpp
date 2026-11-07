@@ -31,6 +31,17 @@
 #include <mutex>
 #include <thread>
 #include <psapi.h>
+
+// Every thread-context write of this file goes through here: one that carries debug registers
+// bumps g_dr_epoch, so a hw hit re-reads its thread's DR image after the callbacks only when
+// something (a callback arming / releasing a hw probe, call_original's return catch) may have
+// rewritten it -- the re-read was ~27 us of a ~120 us hw hit (x64 VM), every hit.
+static std::atomic<uint64_t> g_dr_epoch{0};
+static BOOL uhh_set_thread_context(HANDLE h, const CONTEXT *c) {
+    if (c && (c->ContextFlags & CONTEXT_DEBUG_REGISTERS & ~CONTEXT_CONTROL & 0xFFu) != 0) g_dr_epoch.fetch_add(1, std::memory_order_relaxed);
+    return ::SetThreadContext(h, c);
+}
+#define SetThreadContext uhh_set_thread_context
 #pragma comment(lib, "psapi.lib")
 
 struct Probe {
@@ -263,6 +274,7 @@ struct probe_session {
     // until the thread's EXIT_THREAD event is continued; the debug subsystem closes them, never us.
     // Per-event checks use them instead of an OpenThread + CloseHandle each (ctx_watch_begin).
     std::unordered_map<DWORD, HANDLE> thread_handle;
+    std::unordered_map<DWORD, HANDLE> own_thread_handle;   // event_thread: OUR handles (closed at EXIT_THREAD / end)
     uint8_t dr_used = 0;
     std::vector<std::pair<uint64_t, int>> gates; // (inline site, DR slot): hw gates until its hook is confirmed
     uint8_t dr_ever = 0;
@@ -5505,9 +5517,9 @@ static void round_quiet_tick(probe_session *s) {
     // query per idle tick through the round made windows with a single event, hw ~180 us/hit).
     const auto now = std::chrono::steady_clock::now();
     if (!s->parking || s->yielded_round.empty() || s->round_demand >= 0 || now >= s->round_quiet_until ||
-        now < s->next_quiet_sample)
+        now < s->next_quiet_sample || s->hot_prev.size() > 1 || s->hot_now.size() > 1)
         return;
-    s->next_quiet_sample = now + std::chrono::microseconds(1000);
+    s->next_quiet_sample = now + std::chrono::microseconds(700);
     const int r = others_runnable(s);
     if (r == -1 || r > 0) { s->round_demand = 1; return; }         // runnable, or unknown: as before (20 ms rounds)
     if (s->quiet_sampled) s->round_demand = 0;                     // a second tick compared: nobody
@@ -5535,7 +5547,13 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
         // verdict) counts as one without demand too: it gave nobody anything either, and leaving
         // the period as it was made the back-off -- so a run's speed -- depend on luck (CI x86
         // log-throughput-hw: two identical gated runs 1.6 s apart).
-        if (s->parking) {
+        // Several hot threads: the rounds of before (20 ms, sleeping yielders, no probing) -- the
+        // probing's queries and quiet-time polling slowed the hot threads' own events there
+        // (t4 hw ~660 us/hit vs ~560 without), and with several hot threads a starved one is the
+        // common case (hunt-starve).
+        const bool multi_hot = s->hot_prev.size() > 1 || s->hot_now.size() > 1;
+        if (s->parking && multi_hot) { s->fair_period_ms = 20; s->quiet_rounds = 0; }
+        else if (s->parking) {
             if (s->round_demand > 0) { s->fair_period_ms = 20; s->quiet_rounds = 0; }
             else if (++s->quiet_rounds >= 8) s->fair_period_ms = std::min<uint32_t>(80, s->fair_period_ms * 2);
         }
@@ -5556,11 +5574,13 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
         s->fair_events = 0;
         if (s->parking) {
             ++s->park_rounds; s->yielded_round.clear();
-            s->round_wake = (LONGLONG)interrupt_time_now() + 40000;   // now + 4 ms (the stubs' clock)
+            // 4 ms -- 2 ms once backed off (spinning yielders, nobody seen wanting the CPU).
+            const bool backed_off = s->quiet_rounds >= 8 && s->hot_prev.size() <= 1;
+            s->round_wake = (LONGLONG)interrupt_time_now() + (backed_off ? 20000 : 40000);   // (the stubs' clock)
             FILETIME ft; GetSystemTimeAsFileTime(&ft);                // ... and as system time, for a sleep
             s->round_wake_ft = (LONGLONG)(((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime) + 40000;
-            s->next_quiet_sample = now + microseconds(800);
-            s->round_quiet_until = now + milliseconds(4);
+            s->next_quiet_sample = now + microseconds(backed_off ? 400 : 800);
+            s->round_quiet_until = now + microseconds(backed_off ? 2000 : 4000);
         }
         if (s->parking && !was) {
             if (trace_enabled())
@@ -5596,7 +5616,9 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
     if (fine != s->fine_timer) { if (fine) timeBeginPeriod(1); else timeEndPeriod(1); s->fine_timer = fine; }
     // A round's quiet time (its yielders spin until round_wake, no timer involved) is sampled
     // without the 1 ms timer: the loop polls (no wait) until it ends -- ~4 ms per round.
-    if (s->parking && now < s->round_quiet_until && s->round_demand < 0) return 0;
+    if (s->parking && now < s->round_quiet_until && s->round_demand < 0 && s->hot_prev.size() <= 1 &&
+        s->hot_now.size() <= 1)
+        return 0;
     return fine ? 1 : 20;
 }
 
@@ -6432,12 +6454,34 @@ static bool apply_return_from(probe_session *s, Probe *probe, const probe_contex
 // Service a hardware-breakpoint #DB (a single-step exception carrying a DR status
 // bit, not one of our software single-steps). Returns false on error; sets handled
 // when a DR we own fired. RF lets the flagged instruction run once without re-trapping.
+// The event thread's handle for a breakpoint / hw hit: opened once per thread (context, suspend,
+// query rights) and kept until its EXIT_THREAD (refreshed at a CREATE_THREAD: a reused id), not
+// an OpenThread + CloseHandle per hit.
+static HANDLE event_thread(probe_session *s, DWORD tid) {
+    if (auto it = s->own_thread_handle.find(tid); it != s->own_thread_handle.end()) return it->second;
+    HANDLE h = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION,
+                          FALSE, tid);
+    if (h) {
+        try { s->own_thread_handle[tid] = h; } catch (...) { CloseHandle(h); return nullptr; }
+    }
+    return h;
+}
+static void forget_event_thread(probe_session *s, DWORD tid) {
+    if (auto it = s->own_thread_handle.find(tid); it != s->own_thread_handle.end()) {
+        CloseHandle(it->second); s->own_thread_handle.erase(it);
+    }
+}
 static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
     handled = false;
-    HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
+    HANDLE thread = event_thread(s, event.dwThreadId);      // cached: see event_thread
     if (!thread) { set_error(s, win_error("open hw event thread")); return false; }
     CONTEXT native{}; native.ContextFlags = CONTEXT_ALL;
-    if (!GetThreadContext(thread, &native)) { CloseHandle(thread); set_error(s, win_error("get hw context")); return false; }
+    if (!GetThreadContext(thread, &native)) {                 // a stale cached handle (a missed EXIT_THREAD): reopen once
+        forget_event_thread(s, event.dwThreadId);
+        thread = event_thread(s, event.dwThreadId);
+        if (!thread || !GetThreadContext(thread, &native)) { set_error(s, win_error("get hw context")); return false; }
+    }
+    const uint64_t dr_epoch_at_get = g_dr_epoch.load(std::memory_order_relaxed);
     native.Dr6 |= dr6_carried(s, event.dwThreadId);           // a status our own DR write zeroed
     // The program armed a slot of ours itself on this thread (its own hardware breakpoint): move
     // ours away first (hw_yield_to_target), so this #DB, if it is the program's, goes to it.
@@ -6489,11 +6533,11 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
         }
         if (exec_only && s->stepping.find(event.dwThreadId) == s->stepping.end() &&
             defer_hit_during_call(s, event.dwThreadId, pc, false)) {
-            CloseHandle(thread); handled = true; return true;
+            handled = true; return true;
         }
         if (!exec_only && s->stepping.find(event.dwThreadId) == s->stepping.end() &&
             hold_watch_hit(s, event, native, theirs)) {
-            CloseHandle(thread); handled = true; return true;
+            handled = true; return true;
         }
     }
     // Service EVERY debug-status bit that fired, not just the lowest: two probes can
@@ -6582,7 +6626,7 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
 #endif
                 if ((sp >= s->co_sp || co_slot_gone(s, sp) || co_unwound(s, event.dwThreadId, native, hit_pc)) &&
                     defer_hit_during_call(s, event.dwThreadId, hit_pc, false)) {
-                    s->co_left = true; CloseHandle(thread); handled = true; return true;   // left the call (see breakpoint)
+                    s->co_left = true; handled = true; return true;   // left the call (see breakpoint)
                 }
             }
             if (event.dwThreadId != s->quiet_tid) count_hit(probe);
@@ -6590,10 +6634,10 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
         }
         s->cb_tid = event.dwThreadId;
         try { run_callback(s, probe, &context); s->cb_tid = 0; }
-        catch (const std::exception &e) { CloseHandle(thread); set_error(s, std::string("probe callback: ") + e.what()); return false; }
-        catch (...) { CloseHandle(thread); set_error(s, "probe callback threw an unknown exception"); return false; }
+        catch (const std::exception &e) { set_error(s, std::string("probe callback: ") + e.what()); return false; }
+        catch (...) { set_error(s, "probe callback threw an unknown exception"); return false; }
         count_hit(probe);
-        if (state.released) { CloseHandle(thread); s->skip_continue = true; handled = true; return true; }
+        if (state.released) { s->skip_continue = true; handled = true; return true; }
         if (probe->flags & PROBE_ONCE) release_hw(s, *probe);
         to_context(context, native);                                 // fold each callback's changes forward
 #if defined(_WIN64)
@@ -6610,7 +6654,7 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
                          (unsigned long long)native.Dr6, (unsigned long long)native.Dr7, (unsigned long long)native.Dr0,
                          (unsigned long long)native.Dr1, (unsigned long long)native.Dr2, (unsigned long long)native.Dr3,
                          s->dr_used, s->dr_ever, (unsigned long)native.EFlags);
-        CloseHandle(thread); return true;
+        return true;
     }
     // RF only for EXECUTE breakpoints (fault-type: the instruction has not run yet). Data
     // watchpoints are trap-type -- the access already happened -- and RF would wrongly
@@ -6633,7 +6677,7 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
     // Callbacks may have armed/released hardware probes (probe_watch, PROBE_ONCE), which
     // rewrote THIS thread's debug registers. Take the live DR image, not the stale one
     // captured before the callbacks, so the write-back below does not undo them.
-    {
+    if (g_dr_epoch.load(std::memory_order_relaxed) != dr_epoch_at_get) {   // only if a DR write happened since
         CONTEXT dr{}; dr.ContextFlags = CONTEXT_DEBUG_REGISTERS;
         if (GetThreadContext(thread, &dr)) {
             native.Dr0 = dr.Dr0; native.Dr1 = dr.Dr1; native.Dr2 = dr.Dr2; native.Dr3 = dr.Dr3; native.Dr7 = dr.Dr7;
@@ -6647,8 +6691,8 @@ static bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled)
                          (unsigned long)event.dwThreadId, (unsigned long long)d7, (unsigned long long)native.Dr7);
     }
     native.Dr6 &= ~consumed;     // clear only the status bits of slots we own
-    if (!SetThreadContext(thread, &native)) { CloseHandle(thread); set_error(s, win_error("resume hw breakpoint")); return false; }
-    CloseHandle(thread);
+    if (!SetThreadContext(thread, &native)) { set_error(s, win_error("resume hw breakpoint")); return false; }
+   
     // The same #DB also reports one of the target's OWN debug registers: it is the target's
     // exception too -- pass it on (our callbacks ran; their changes are applied above).
     handled = !(native.Dr6 & 0xF & theirs);
@@ -7240,7 +7284,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         if (step->second.windowed) inplace_begin(s, event.dwThreadId);
         disposition = DBG_CONTINUE; return true;
     }
-    HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
+    HANDLE thread = event_thread(s, event.dwThreadId);      // cached: see event_thread
     if (!thread) { set_error(s, win_error("open event thread")); return false; }
     CONTEXT native{}; native.ContextFlags = CONTEXT_ALL;
     if (code == EXCEPTION_SINGLE_STEP && step != stepping.end()) {
@@ -7252,14 +7296,14 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             CONTEXT dr{}; dr.ContextFlags = CONTEXT_DEBUG_REGISTERS;
             if (GetThreadContext(thread, &dr) && (dr.Dr6 & 0xF)) {
                 bool handled = false;
-                if (!handle_hw(s, event, handled)) { CloseHandle(thread); return false; }
+                if (!handle_hw(s, event, handled)) { return false; }
                 hw_hit = handled;
             }
         }
         if (step->second.tail_int3) {
             // No trap flag is set for a string instruction running out-of-line: this #DB is a
             // watchpoint it touched (serviced above) -- the copy keeps running to its INT3.
-            CloseHandle(thread);
+           
             if (hw_hit) { disposition = DBG_CONTINUE; return true; }
             return true;                                   // not ours: pass it through
         }
@@ -7271,7 +7315,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             // runs once per execution, as on every other backend.
             native.EFlags |= 0x100u;
             ok = !!SetThreadContext(thread, &native);
-            CloseHandle(thread);
+           
             if (!ok) { set_error(s, win_error("continue string instruction step")); return false; }
             disposition = DBG_CONTINUE; return true;
         }
@@ -7305,19 +7349,21 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         if (!step->second.displaced && step->second.syscall_insn) native.R11 &= ~(DWORD64)0x100;
 #endif
         if (ok) ok = !!SetThreadContext(thread, &native);
-        CloseHandle(thread);
+       
         if (!ok) { set_error(s, win_error("complete breakpoint single-step")); return false; }
         if (trace_enabled())
             std::fprintf(stderr, "  step-done tid=%lu displaced=%d\n",
                          (unsigned long)event.dwThreadId, step->second.displaced);
         stepping.erase(step); disposition = DBG_CONTINUE; return true;
     }
-    if (!GetThreadContext(thread, &native)) {
-        CloseHandle(thread); set_error(s, win_error("get breakpoint context")); return false;
+    if (!GetThreadContext(thread, &native)) {                 // a stale cached handle (a missed EXIT_THREAD): reopen once
+        forget_event_thread(s, event.dwThreadId);
+        thread = event_thread(s, event.dwThreadId);
+        if (!thread || !GetThreadContext(thread, &native)) { set_error(s, win_error("get breakpoint context")); return false; }
     }
     if (defer_hits_now(s, event.dwThreadId) && !probe->internal &&
         defer_hit_during_call(s, event.dwThreadId, address, true)) {
-        CloseHandle(thread); disposition = DBG_CONTINUE; return true;
+        disposition = DBG_CONTINUE; return true;
     }
     bool co_pass = false;                            // call_original's own entry pass: not a hit
     if (s->co_addr && event.dwThreadId == s->in_call_tid && !probe->internal) {
@@ -7334,7 +7380,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             // returned, or deeper with the original's frame gone (co_slot_gone): the original
             // was left by an exception or longjmp. This hit is a NEW one -- rewind it; it is
             // serviced normally once the call is released.
-            s->co_left = true; CloseHandle(thread); disposition = DBG_CONTINUE; return true;
+            s->co_left = true; disposition = DBG_CONTINUE; return true;
         }
     }
     if (s->entry_reapply && address == s->entry_reapply && !probe->internal) reapply_all_hw(s);
@@ -7351,13 +7397,13 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     if ((probe->internal || !thread_in_call(s, event.dwThreadId)) && !restart)
     try { run_callback(s, probe, &context); s->cb_tid = 0; }
     catch (const std::exception &e) {
-        CloseHandle(thread); set_error(s, std::string("probe callback: ") + e.what()); return false;
+        set_error(s, std::string("probe callback: ") + e.what()); return false;
     } catch (...) {
-        CloseHandle(thread); set_error(s, "probe callback threw an unknown exception"); return false;
+        set_error(s, "probe callback threw an unknown exception"); return false;
     }
     if (!co_pass && !restart && !(s->quiet_tid && event.dwThreadId == s->quiet_tid && !probe->internal)) count_hit(probe);
     if (state.released) {        // call_original released the thread: it runs on, nothing to write back
-        CloseHandle(thread); s->skip_continue = true; return true;
+        s->skip_continue = true; return true;
     }
     to_context(context, native);
 #if defined(_WIN64)
@@ -7373,7 +7419,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         }
         native.ContextFlags = CONTEXT_FULL | UHH_CONTEXT_FP;      // FP: the original's result (see apply_return_from)
         bool ok = !!SetThreadContext(thread, &native);
-        CloseHandle(thread);
+       
         if (!ok) { set_error(s, win_error("resume at return_from")); return false; }
         if (at_entry && inline_hold_needed(s)) { hold_thread(s, event.dwThreadId); if (!kick_agent(s)) return false; }
         disposition = DBG_CONTINUE; return true;
@@ -7383,7 +7429,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         // real instruction runs in place, no single-step needed. Stale hits from other
         // threads are rewound via retired_bps above.
         if (!patch(s->pi.hProcess, probe->address, probe->original)) {
-            CloseHandle(thread); set_error(s, win_error("retire one-shot breakpoint")); return false;
+            set_error(s, win_error("retire one-shot breakpoint")); return false;
         }
         probe->active = false; probe->retired = true; s->retired_bps.insert(probe->address); sync_int3_table(s);
 #if defined(_WIN64)
@@ -7393,7 +7439,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
 #endif
         native.ContextFlags = CONTEXT_FULL;   // keep any DRs the callback armed
         bool ok = !!SetThreadContext(thread, &native);
-        CloseHandle(thread);
+       
         if (!ok) { set_error(s, win_error("resume after one-shot")); return false; }
         if (at_entry && inline_hold_needed(s)) { hold_thread(s, event.dwThreadId); if (!kick_agent(s)) return false; }
         disposition = DBG_CONTINUE; return true;
@@ -7406,7 +7452,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         native.Rip = tr;
         native.ContextFlags = CONTEXT_FULL;
         bool ok = !!SetThreadContext(thread, &native);
-        CloseHandle(thread);
+       
         if (!ok) { set_error(s, win_error("enter syscall trampoline")); return false; }
         if (at_entry && inline_hold_needed(s)) { hold_thread(s, event.dwThreadId); if (!kick_agent(s)) return false; }
         disposition = DBG_CONTINUE; return true;
@@ -7417,7 +7463,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     if (!probe->displaced_ok && emulate_site(s, *probe, native)) {
         native.ContextFlags = CONTEXT_FULL;               // keep any DRs the callback armed
         bool ok = !!SetThreadContext(thread, &native);
-        CloseHandle(thread);
+       
         if (!ok) { set_error(s, win_error("apply emulated instruction")); return false; }
         if (at_entry && inline_hold_needed(s)) { hold_thread(s, event.dwThreadId); if (!kick_agent(s)) return false; }
         disposition = DBG_CONTINUE; return true;
@@ -7433,7 +7479,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             EMU_IP(native) = (decltype(EMU_IP(native)))tr;
             native.ContextFlags = CONTEXT_FULL;               // keep any DRs the callback armed
             const bool ok = !!SetThreadContext(thread, &native);
-            CloseHandle(thread);
+           
             if (!ok) { set_error(s, win_error("enter displaced trampoline")); return false; }
 #if defined(UHH_TEST_HOOKS)
             if (probe->rep_string && !probe->internal) test_note_repcopy();   // a thread now in the string copy
@@ -7477,7 +7523,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         size_t wrote = 0;
         if (displaced && (!remote_write(s->pi.hProcess, scratch_addr, code.data(), code.size(), &wrote) ||
                           wrote != code.size())) {
-            CloseHandle(thread); set_error(s, win_error("stage displaced instruction")); return false;
+            set_error(s, win_error("stage displaced instruction")); return false;
         }
         if (displaced) FlushInstructionCache(s->pi.hProcess, (void *)(uintptr_t)scratch_addr, code.size());
     } else {
@@ -7494,7 +7540,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         // lift the byte, step over it at the real address, re-arm on the single-step. Every
         // other thread is held meanwhile (in-place window, inplace_begin below).
         if (!patch(s->pi.hProcess, probe->address, probe->original)) {
-            CloseHandle(thread); set_error(s, win_error("restore probed instruction")); return false;
+            set_error(s, win_error("restore probed instruction")); return false;
         }
 #if defined(_WIN64)
         native.Rip = probe->address;
@@ -7510,9 +7556,9 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     // image would clobber it. CONTEXT_FULL writes control/integer/segment only.
     native.ContextFlags = CONTEXT_FULL;
     if (!SetThreadContext(thread, &native)) {
-        CloseHandle(thread); set_error(s, win_error("apply callback context")); return false;
+        set_error(s, win_error("apply callback context")); return false;
     }
-    CloseHandle(thread);
+   
     if (trace_enabled())
         std::fprintf(stderr, "  setup tid=%lu displaced=%d scratch=0x%llx rip=0x%llx\n",
                      (unsigned long)event.dwThreadId, displaced,
@@ -8195,6 +8241,7 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
     case CREATE_THREAD_DEBUG_EVENT:
         s->threads.insert(event.dwThreadId);
         if (event.u.CreateThread.hThread) s->thread_handle[event.dwThreadId] = event.u.CreateThread.hThread;
+        forget_event_thread(s, event.dwThreadId);                // a reused id: the old handle is another thread's
         if (s->ipc_freezer) ipc_freeze_thread(s, event.dwThreadId);   // born during a hook write: hold it too
         // A debug register the program set on the thread before it ran (created suspended) is
         // its own: our probes move out of its way first (hw_yield_to_target).
@@ -8228,6 +8275,7 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
         if (event.dwThreadId == s->ipc_freezer) ipc_thaw(s);       // agent thread died mid-write: never strand the rest
         s->threads.erase(event.dwThreadId);
         s->thread_handle.erase(event.dwThreadId);
+        forget_event_thread(s, event.dwThreadId);
         s->refault.erase(event.dwThreadId);
         s->hw_unsettled.erase(event.dwThreadId);
         forget_thread_holds(s, event.dwThreadId);
@@ -8562,6 +8610,8 @@ extern "C" int probe_run(probe_session *s) {
         if (!why.empty()) s->error = why;
     }
     park_release(s);
+    for (auto &kv : s->own_thread_handle) CloseHandle(kv.second);
+    s->own_thread_handle.clear();
     if (trace_enabled())
         std::fprintf(stderr, "  fairness: %llu park rounds, %llu threads parked; rounds by demand: unknown %llu, none %llu, "
                              "some %llu; period %u ms\n", (unsigned long long)s->park_rounds, (unsigned long long)s->parked_total,

@@ -1905,6 +1905,17 @@ static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
         return;
     }
 #endif
+#if !defined(_WIN64)
+    // x86, only the x87 state live (the usual case: Windows' x87 control word is not the INIT
+    // one, so XINUSE always reports it): FXSAVE / FXRSTOR keeps exactly what XSAVE's x87
+    // component would (plus MXCSR and XMM0-7, which the hook stub reloads anyway) -- measured
+    // ~20 ns a hit cheaper than XSAVEC / XRSTOR into the save area (154 vs 174 ns).
+    if (xmode == 0 && mask == 1) {
+        x87 = mid_entry_fx(native, index, x87_post);
+        if (x87) x87_restore(x87_post);
+        return;
+    }
+#endif
     if (xmode == 1) x87 = call_mid(native, index, x87_post);
     else if (xmode == 3 && g_xs.ok && (g_xs.mask & 0xE4ull))
         x87 = mid_entry_noxsave_sim(native, index, g_xs.mask & 0xE4ull, x87_post);
