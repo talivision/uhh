@@ -903,6 +903,76 @@ static bool executable(uint64_t a) {
     return p == PAGE_EXECUTE || p == PAGE_EXECUTE_READ || p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
 }
 
+// call_func resolution cache (inline): symbol string -> callee, for names that resolve through
+// a module ("module!Export[+0xOFF]", "module+0xRVA"). Resolving every call (GetModuleHandleA +
+// GetProcAddress + a VirtualQuery for the executable check) was ~2.7 us for a ~1 ns callee.
+// Correctness rests on invalidation: a module unload -- the loader's DLL notification,
+// sent BEFORE the image is unmapped -- bumps g_unload_gen, and an entry is used only while
+// the generation it was resolved in is current. So a DLL unloaded and another (or nothing)
+// mapped at its address is never called through a stale entry (regress cdx-cfreuse-*). The
+// generation is sampled BEFORE resolving: an unload racing the resolution leaves the entry
+// stale at once. Without the notification (registration failed) nothing is cached.
+// The executable verdict is cached with the entry, like the per-thread read-region cache:
+// image code that loses execute rights while its module stays loaded is not re-checked.
+// Entries are per-slot seqlocks (odd = being written): lock-free, any thread, no allocation.
+static volatile LONG g_unload_gen;
+static void *g_dll_cookie;
+struct CfEntry { volatile LONG seq; volatile LONG gen; volatile uint64_t fn; volatile uint32_t len; char sym[116]; };
+static CfEntry g_cf_cache[64];
+static uint32_t cf_hash(const char *s, size_t n) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < n; ++i) h = (h ^ (uint8_t)s[i]) * 16777619u;
+    return h;
+}
+static uint64_t cf_lookup(const char *sym, size_t len, uint32_t h) {
+    CfEntry &e = g_cf_cache[h & 63];
+    const LONG s1 = e.seq;
+    if ((s1 & 1) || e.len != len || e.gen != g_unload_gen) return 0;
+    _ReadWriteBarrier();
+    const bool same = memcmp(e.sym, sym, len) == 0;
+    const uint64_t fn = e.fn;
+    _ReadWriteBarrier();
+    return same && e.seq == s1 ? fn : 0;
+}
+static void cf_store(const char *sym, size_t len, uint32_t h, uint64_t fn, LONG gen) {
+    CfEntry &e = g_cf_cache[h & 63];
+    const LONG s1 = e.seq;
+    if ((s1 & 1) || InterlockedCompareExchange(&e.seq, s1 + 1, s1) != s1) return;   // another writer: skip
+    e.len = (uint32_t)len; memcpy(e.sym, sym, len); e.fn = fn; e.gen = gen;
+    InterlockedExchange(&e.seq, s1 + 2);
+}
+using ldr_notify_fn = VOID(CALLBACK *)(ULONG reason, const void *data, void *context);
+static VOID CALLBACK on_dll_notification(ULONG reason, const void *, void *) {
+    if (reason == 2) InterlockedIncrement(&g_unload_gen);    // LDR_DLL_NOTIFICATION_REASON_UNLOADED
+}
+static void watch_unloads() {
+    if (g_dll_cookie) return;
+    using reg_fn = LONG(NTAPI *)(ULONG, ldr_notify_fn, void *, void **);
+    auto reg = reinterpret_cast<reg_fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "LdrRegisterDllNotification"));
+    void *cookie = nullptr;
+    if (reg && reg(0, on_dll_notification, nullptr, &cookie) >= 0) g_dll_cookie = cookie;
+}
+static void unwatch_unloads() {
+    if (!g_dll_cookie) return;
+    using unreg_fn = LONG(NTAPI *)(void *);
+    if (auto unreg = reinterpret_cast<unreg_fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "LdrUnregisterDllNotification")))
+        unreg(g_dll_cookie);
+    g_dll_cookie = nullptr;
+}
+static uint64_t resolve_callee(const char *symbol) {
+    if (!symbol || !*symbol) return 0;
+    const bool absolute = symbol[0] == '0' && (symbol[1] == 'x' || symbol[1] == 'X');
+    const size_t len = absolute || !g_dll_cookie ? 0 : strnlen(symbol, sizeof(CfEntry::sym) + 1);
+    const bool cacheable = len && len <= sizeof(CfEntry::sym);
+    const uint32_t h = cacheable ? cf_hash(symbol, len) : 0;
+    if (cacheable) if (const uint64_t fn = cf_lookup(symbol, len, h)) return fn;
+    const LONG gen = g_unload_gen;                          // before resolving (see above)
+    const uint64_t fn = agent_resolve(symbol);
+    if (!fn || !executable(fn)) return 0;
+    if (cacheable) cf_store(symbol, len, h, fn, gen);
+    return fn;
+}
+
 // A fixed set of thread ids (not TLS: it must work on a thread that is still in its loader
 // initialisation). A scope registers the current thread for its lifetime.
 template <size_t N> struct TidSet {
@@ -944,8 +1014,8 @@ extern "C" int call_func(probe_context *c, const char *symbol, uint64_t *ret, in
     va_end(ap);
     if (g_ctrl) return g_ctrl->call_func_args(c, symbol, ret, nargs, a);
     if (!call_func_guarded(c)) return 0;
-    uint64_t fn = agent_resolve(symbol);
-    if (!fn || !executable(fn)) return 0;
+    const uint64_t fn = resolve_callee(symbol);
+    if (!fn) return 0;
 #if defined(_WIN64)
     return call_raw(fn, a, ret) ? 1 : 0;
 #else
@@ -2768,6 +2838,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
     if (g_drain_event) InterlockedExchange(&shared->drain_wait.agent_ready, 1);
     if (!g_cb_guarantee) probe_stack_guarantee_offset();   // this remote thread is ours (see run_callback)
     make_ret_thunks();
+    watch_unloads();                       // call_func's resolution cache (once per process)
     static PVOID veh = nullptr;
     if (!veh) {
         // Under CET shadow stacks a call in a hook's range is relocated verbatim (a return
@@ -2893,5 +2964,6 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, void *) {
 extern "C" BOOL WINAPI _DllMainCRTStartup(HINSTANCE, DWORD, void *);
 extern "C" BOOL WINAPI uhh_agent_entry(HINSTANCE module, DWORD reason, void *reserved) {
     if (reason == DLL_PROCESS_DETACH && reserved) return TRUE;
+    if (reason == DLL_PROCESS_DETACH) unwatch_unloads();   // a real unload: the callback goes with us
     return _DllMainCRTStartup(module, reason, reserved);
 }

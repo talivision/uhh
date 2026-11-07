@@ -7358,6 +7358,10 @@ def check_cdx_review():
       cdx-absreuse-<b>: an absolute software breakpoint in a DLL that unloads; the address is
         reused by new memory holding a real 0xCC: get_mem must read 0xCC (the agent's INT3
         table kept the stale entry and showed the old original byte inline).
+      cdx-cfreuse-<b>: call_func("cfr.dll!CfrValue") while cfr.dll (A) is loaded, after it is
+        unloaded, and after another cfr.dll (B) is mapped at the same fixed base: 1 / refused /
+        2 on every backend (perf6: inline caches call_func resolutions; a stale entry would
+        call A's address in B -- CfrDecoy, 99 -- or the unmapped image).
       cdx-int3cap-<b>: 1200 armed software breakpoints, all read back with ONE get_mem: the
         program's bytes on every backend, no 0xCC (inline saw 0xCC past the 1024th, and one
         inline read masked at most 64).
@@ -7423,6 +7427,22 @@ def check_cdx_review():
             peek = [m for m in logs if m.startswith("op peek")]
             if peek != ["op peek r=1 cc=16 n=16 first=cc"]: bad.append(f"peek={peek} (want 16 x 0xCC)")
             record(name, not bad, " ".join(bad) or peek[0])
+        except Exception as e:
+            record(name, False, repr(e))
+
+    cfr = exe("ctrl_cfr_a.dll") and exe("ctrl_cfr_b.dll")
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"cdx-cfreuse-{bk}"
+        if not cfr:
+            record(name, False, "missing ctrl_cfr_a.dll / ctrl_cfr_b.dll"); continue
+        try:
+            res, logs, rows, bad = go("cfreuse", bk, [])
+            if res.get("loaded") != 1 or res.get("gone") != 1: bad.append(f"result={res}")
+            if res.get("same_base") != 1: bad.append(f"same_base={res.get('same_base')} (B not mapped at A's base)")
+            cf = [m for m in logs if m.startswith("cf ")]
+            want = ["cf phase=1 ok=1 r=1"] * 3 + ["cf phase=2 ok=0 r=-1"] + ["cf phase=3 ok=1 r=2"] * 3
+            if cf != want: bad.append(f"calls={cf} (want {want})")
+            record(name, not bad, " ".join(bad) or "A=1 x3, unloaded refused, B at A's base=2 x3")
         except Exception as e:
             record(name, False, repr(e))
 

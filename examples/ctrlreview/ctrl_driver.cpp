@@ -1,4 +1,4 @@
-// ctrl_driver --scenario fault|faultreg|faultmix|inplace|absunload|symunload|owndr|owndrx|absreuse|int3cap|
+// ctrl_driver --scenario fault|faultreg|faultmix|inplace|absunload|symunload|owndr|owndrx|absreuse|cfreuse|int3cap|
 //                        bigcfg|headcorrupt|shape [--shape S] --backend b
 //             -- <ctrl_target.exe> <scenario> [opts]
 // Instruments ctrl_target for one controller-review finding (see ctrl_target.cpp) with
@@ -21,6 +21,7 @@ void ctrl_on_op(probe_context *);
 void ctrl_on_wonce(probe_context *);
 void ctrl_on_bigcfg(probe_context *);
 void ctrl_on_shape(probe_context *);
+void ctrl_on_cfcall(probe_context *);
 }
 struct ctrl_cfg { uint32_t backend; uint32_t pad; };
 
@@ -83,6 +84,8 @@ int main(int argc, char **argv) {
             ok = probe_add_symbol(s, "ctrl_target.exe!CtrlTick", ctrl_on_tick, backend);
         else if (sc == "absreuse" || sc == "int3cap")
             ok = probe_add_symbol(s, "ctrl_target.exe!CtrlOp", ctrl_on_op, backend);
+        else if (sc == "cfreuse")
+            ok = probe_add_symbol(s, "ctrl_target.exe!CtrlCall", ctrl_on_cfcall, backend);
         else if (sc == "owndrx")
             ok = probe_add_symbol(s, "ctrl_target.exe!CtrlWatchOnce", ctrl_on_wonce, backend);
         else if (sc == "bigcfg")

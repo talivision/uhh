@@ -22,6 +22,8 @@
 //   ctrl_target owndrx [--n N]          the target's own watch on an address UHH watched once and
 //                                       released, from a thread that existed then (cdx-owndrx)
 //   ctrl_target absreuse                absolute INT3 in an unloaded DLL; its address reused (cdx-absreuse)
+//   ctrl_target cfreuse                 call_func into a DLL that unloads and whose name and base
+//                                       another DLL then takes (cdx-cfreuse)
 //   ctrl_target int3cap [--n N]         N armed INT3s read back with get_mem (cdx-int3cap)
 //   ctrl_target bigcfg                  a dynamic add with a > 64 MiB config (cdx-bigcfg)
 //   ctrl_target shape --shape S [--threads T] [--n N]
@@ -50,6 +52,10 @@ extern "C" void CtrlSled(void);
 extern "C" __declspec(dllexport) __declspec(noinline) void CtrlOp(const void *addr, uintptr_t n, uintptr_t mode) {
     static volatile uintptr_t sink[3];
     sink[0] = (uintptr_t)addr; sink[1] = n; sink[2] = mode;
+}
+// The probe's callback call_funcs "cfr.dll!CfrValue" and logs phase / result (cdx-cfreuse).
+extern "C" __declspec(dllexport) __declspec(noinline) void CtrlCall(uintptr_t phase) {
+    static volatile uintptr_t sink; sink = phase;
 }
 extern "C" __declspec(dllexport) __declspec(noinline) void CtrlWatchOnce(volatile LONG *var) {
     static volatile void *sink; sink = (void *)var;
@@ -422,6 +428,41 @@ static int run_absreuse() {
     return 0;
 }
 
+// ---- cdx-cfreuse: call_func into a DLL that unloads; another takes its name and base -------
+// ctrl_cfr_a.dll and ctrl_cfr_b.dll are copied to <temp>\uhh-cfr-<pid>\{a,b}\cfr.dll (one
+// name, one fixed base). Phase 1: A loaded (CfrValue = 1, three calls: the second and third
+// may come from a cache); phase 2: nothing named cfr.dll loaded (call_func must fail, not call
+// into the unmapped image); phase 3: B loaded at A's base (CfrValue = 2; A's address in B is
+// CfrDecoy = 99).
+static int run_cfreuse() {
+    wchar_t self[MAX_PATH], tmp[MAX_PATH];
+    if (!GetModuleFileNameW(nullptr, self, MAX_PATH) || !GetTempPathW(MAX_PATH, tmp)) return 1;
+    std::wstring dir(self); dir.resize(dir.find_last_of(L'\\') + 1);
+    const std::wstring root = std::wstring(tmp) + L"uhh-cfr-" + std::to_wstring(GetCurrentProcessId());
+    const std::wstring a = root + L"\\a\\cfr.dll", b = root + L"\\b\\cfr.dll";
+    CreateDirectoryW(root.c_str(), nullptr);
+    CreateDirectoryW((root + L"\\a").c_str(), nullptr); CreateDirectoryW((root + L"\\b").c_str(), nullptr);
+    if (!CopyFileW((dir + L"ctrl_cfr_a.dll").c_str(), a.c_str(), FALSE) ||
+        !CopyFileW((dir + L"ctrl_cfr_b.dll").c_str(), b.c_str(), FALSE)) {
+        std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"cfreuse\",\"error\":\"copy\"}\n"); return 1;
+    }
+    HMODULE ma = LoadLibraryW(a.c_str());
+    const uintptr_t base_a = (uintptr_t)ma;
+    for (int i = 0; i < 3 && ma; ++i) CtrlCall(1);
+    if (ma) FreeLibrary(ma);
+    const bool gone = GetModuleHandleW(L"cfr.dll") == nullptr;
+    CtrlCall(2);
+    HMODULE mb = LoadLibraryW(b.c_str());
+    const uintptr_t base_b = (uintptr_t)mb;
+    for (int i = 0; i < 3 && mb; ++i) CtrlCall(3);
+    if (mb) FreeLibrary(mb);
+    DeleteFileW(a.c_str()); DeleteFileW(b.c_str());
+    RemoveDirectoryW((root + L"\\a").c_str()); RemoveDirectoryW((root + L"\\b").c_str()); RemoveDirectoryW(root.c_str());
+    std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"cfreuse\",\"loaded\":%d,\"gone\":%d,\"same_base\":%d}\n",
+                ma && mb ? 1 : 0, gone ? 1 : 0, ma && base_a == base_b ? 1 : 0);
+    return 0;
+}
+
 // ---- cdx-int3cap: more armed software breakpoints than the agent's INT3 table used to hold --
 static int run_int3cap(int n) {
     CtrlOp((const void *)&CtrlSled, (uintptr_t)n, 0);  // UHH: a breakpoint on each sled byte
@@ -547,6 +588,7 @@ int main(int argc, char **argv) {
     else if (sc == "faultmix") rc = run_faultmix(arg_int(argc, argv, "--n", 300));
     else if (sc == "owndrx") rc = run_owndrx(arg_int(argc, argv, "--n", 50));
     else if (sc == "absreuse") rc = run_absreuse();
+    else if (sc == "cfreuse") rc = run_cfreuse();
     else if (sc == "int3cap") rc = run_int3cap(arg_int(argc, argv, "--n", 1200));
     else if (sc == "bigcfg") rc = run_bigcfg();
     else if (sc == "shape") rc = run_shape(arg_str(argc, argv, "--shape", ""), arg_int(argc, argv, "--threads", 8),

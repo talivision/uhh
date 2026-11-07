@@ -66,6 +66,12 @@ CTRL_EXPORT void ctrl_on_op(probe_context *c) {
     for (size_t i = 0; i < len; ++i) cc += buf[i] == 0xCC;
     send_log(c, "op peek r=%d cc=%d n=%d first=%02x", r, cc, (int)len, buf[0]);
 }
+// CtrlCall(phase): call_func of a function in a DLL that comes and goes under one name (cdx-cfreuse).
+CTRL_EXPORT void ctrl_on_cfcall(probe_context *c) {
+    uint64_t r = 0;
+    const int ok = call_func(c, "cfr.dll!CfrValue", &r, 0);
+    send_log(c, "cf phase=%d ok=%d r=%d", (int)get_func_arg(c, 0), ok, ok ? (int)r : -1);
+}
 // CtrlWatchOnce(var): a one-shot data watch on var (released when it fires).
 CTRL_EXPORT void ctrl_on_wonce(probe_context *c) {
     const int r = probe_watch(get_session(c), get_func_arg(c, 0), ctrl_on_watch, PROBE_WATCH_WRITE | PROBE_ONCE);

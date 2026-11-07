@@ -650,10 +650,20 @@ target_link_options(ctrl_target PRIVATE /EXPORT:CtrlLoadInsn /EXPORT:CtrlLoopIns
 add_library(ctrl_dll SHARED examples/ctrlreview/ctrl_dll.c)
 target_compile_options(ctrl_dll PRIVATE /Zi)
 target_link_options(ctrl_dll PRIVATE /DEBUG /INCREMENTAL:NO)
+# cdx-cfreuse: one DLL name (cfr.dll), two builds at one fixed base, loaded in turn.
+foreach(v a b)
+    add_library(ctrl_cfr_${v} SHARED examples/ctrlreview/ctrl_cfr.c)
+    if(v STREQUAL "b")
+        target_compile_definitions(ctrl_cfr_${v} PRIVATE CFR_B)
+    endif()
+    target_compile_options(ctrl_cfr_${v} PRIVATE /GS- /Gy-)
+    target_link_options(ctrl_cfr_${v} PRIVATE /NOENTRY /NODEFAULTLIB /DYNAMICBASE:NO /FIXED:NO /BASE:0x6F000000
+                        /INCREMENTAL:NO /OPT:NOICF)
+endforeach()
 add_executable(ctrl_driver examples/ctrlreview/ctrl_driver.cpp examples/ctrlreview/ctrl_callbacks.cpp)
 target_include_directories(ctrl_driver PRIVATE include)
 target_link_libraries(ctrl_driver PRIVATE probe_api)
-add_dependencies(ctrl_driver ctrl_target ctrl_dll probe_api_agent)
+add_dependencies(ctrl_driver ctrl_target ctrl_dll ctrl_cfr_a ctrl_cfr_b probe_api_agent)
 # A host DLL linking UHH statically, loaded/unloaded in a loop (regress ctrl-symload-unload).
 add_library(symhost SHARED examples/ctrlreview/symhost_dll.cpp)
 target_include_directories(symhost PRIVATE include)
