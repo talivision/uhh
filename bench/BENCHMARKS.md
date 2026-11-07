@@ -8,8 +8,8 @@ Reproduce with `bench/frida/vs_frida.py` (how: `bench/frida/README.md`); raw row
 ## Update: branch `perf` (2026-11-07 evening) against the same Frida 17.26.1 rows
 
 Same VM, same `vs_frida.py`, lean sizes (8 x 12,500 reads = 100,000 events, hit 50,000 calls),
-3 repeats, every run exact. UHH = `perf` (c086163 + f1d011f), Frida rows re-measured in the same
-session. Raw rows: `bench/results/frida17-perf-2026-11-07/`. Added ns per event (median):
+3 repeats, every run exact. UHH = `perf` c086163 (x86 uhh-inline / frida-cmodule rows: f1d011f, the
+hook-shadow fast path, re-run together), Frida rows re-measured in the same session. Raw rows: `bench/results/frida17-perf-2026-11-07/`. Added ns per event (median):
 
 | workload | arch | uhh-inline | frida-cmodule | uhh-hw | frida-hw | uhh-breakpoint |
 |---|---|---:|---:|---:|---:|---:|
