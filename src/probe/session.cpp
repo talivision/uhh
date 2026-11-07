@@ -7857,12 +7857,27 @@ static void start_drainer(probe_session *s) {
     s->drainer = std::thread([s] {
         unsigned idle = 0;
         RingStall stall;
+        // Idle waits of 0.5 ms (a high-resolution timer) while records came recently: Sleep(1)
+        // lasts a whole timer tick (15.6 ms unless something raised the resolution), and a ring
+        // of PROBE_AGENT_LOG_CAP records fills in a few ms at full speed -- every logging thread
+        // then waited out the rest of the tick (profiles: producers yielding in agent_log behind
+        // a sleeping drainer). After 50 ms without a record, back to Sleep(1) (no 2 kHz wakeups
+        // on an idle target). No such timer (before Windows 10 1803): Sleep(1) throughout.
+        HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+                                              TIMER_ALL_ACCESS);
+        ULONGLONG last_record = GetTickCount64();
         while (!s->drain_stop.load(std::memory_order_relaxed)) {
             InterlockedIncrement64(&s->shared->drain_beat);           // "controller alive"
-            if (drain_agent_logs(s)) { idle = 0; continue; }
+            if (drain_agent_logs(s)) { idle = 0; last_record = GetTickCount64(); continue; }
             check_ring_stall(s, stall);
-            if (++idle < 64) SwitchToThread(); else Sleep(1);
+            if (++idle < 64) { SwitchToThread(); continue; }
+            LARGE_INTEGER due; due.QuadPart = -5000;                   // 0.5 ms, relative
+            if (timer && GetTickCount64() - last_record < 50 && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
+                WaitForSingleObject(timer, INFINITE);
+            else
+                Sleep(1);
         }
+        if (timer) CloseHandle(timer);
     });
 }
 
