@@ -130,3 +130,31 @@ inline std::string exe_directory() {
     require(n && n < MAX_PATH,"executable path");
     std::string s(p); return s.substr(0,s.find_last_of("\\/")+1);
 }
+
+// A thread of OURS in the target (the agent's service thread; the controller's agent load /
+// init / stop threads), created suspended and WITHOUT the loader's thread-attach callouts
+// (THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH): a plain CreateThread / CreateRemoteThread runs the
+// PROGRAM's DllMain(DLL_THREAD_ATTACH / DLL_THREAD_DETACH) and TLS callbacks on our thread --
+// program code running for a thread the program never made, at a moment it does not expect
+// (seen: hunt_target's TLS callback counts every thread attach/detach; the agent init thread
+// started while main ran and its attach/detach made reads the program never meant, and a hit
+// that raced the program's own count -- hunt-early-inline x86, reads=11 hits=12). The loader
+// still allocates the thread's static TLS (the agent's thread_locals). Falls back to
+// CreateRemoteThread (callouts and all) only if ntdll lacks NtCreateThreadEx.
+inline HANDLE create_quiet_thread(HANDLE process, LPTHREAD_START_ROUTINE entry, void *argument, DWORD *tid) {
+    using NtCreateThreadExFn = LONG(NTAPI *)(PHANDLE, ACCESS_MASK, void *, HANDLE, void *, void *, ULONG, SIZE_T, SIZE_T,
+                                             SIZE_T, void *);
+    static const auto create = reinterpret_cast<NtCreateThreadExFn>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateThreadEx"));
+    constexpr ULONG CREATE_SUSPENDED_FLAG = 0x1, SKIP_THREAD_ATTACH = 0x2;
+    if (!create) return CreateRemoteThread(process, nullptr, 0, entry, argument, CREATE_SUSPENDED, tid);
+    HANDLE t = nullptr;
+    const LONG st = create(&t, THREAD_ALL_ACCESS, nullptr, process, reinterpret_cast<void *>(entry), argument,
+                           CREATE_SUSPENDED_FLAG | SKIP_THREAD_ATTACH, 0, 0, 0, nullptr);
+    if (st < 0 || !t) {
+        SetLastError(st == (LONG)0xC0000022 ? ERROR_ACCESS_DENIED : ERROR_GEN_FAILURE);
+        return nullptr;
+    }
+    if (tid) *tid = GetThreadId(t);
+    return t;
+}

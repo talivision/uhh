@@ -384,6 +384,11 @@ struct probe_session {
     bool guard_ready = false;                  // attach: breakpoint/hw probes may arm (no agent, or its guard is up / given up)
     ULONGLONG guard_since = 0;
     bool agent_init_started = false;           // this session started the agent's init
+    // The early init (on the main thread at the loader breakpoint) ran to completion: the agent
+    // made its service thread then, and it reports itself (INSTALL_DONE) once process init lets it
+    // run. Another init with nothing to install would only repeat that, on a thread of its own.
+    bool early_inited = false;
+    LONG init_returns_at = 0;                  // shared->init_returns when the remote init started
     std::vector<DWORD> detach_frozen;          // detach's own freeze of every thread (mirrored for the guard)
     // Threads whose debug event is being handled (nested: call_original). `running`: the handling
     // let its thread run again before it ended (call_func / call_original continued the event,
@@ -8131,7 +8136,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
 // program nothing but those milliseconds. (CREATE_SUSPENDED: the priority is in place before
 // the thread's first instruction.)
 static HANDLE create_remote_thread_boosted(HANDLE process, LPTHREAD_START_ROUTINE entry, void *argument, DWORD *tid) {
-    HANDLE t = CreateRemoteThread(process, nullptr, 0, entry, argument, CREATE_SUSPENDED, tid);
+    HANDLE t = create_quiet_thread(process, entry, argument, tid);   // no program DllMain/TLS on it
     if (!t) return t;
     SetThreadPriority(t, THREAD_PRIORITY_HIGHEST);
     ResumeThread(t);
@@ -8141,6 +8146,7 @@ static HANDLE create_remote_thread_boosted(HANDLE process, LPTHREAD_START_ROUTIN
 static bool start_remote(probe_session *s, LPTHREAD_START_ROUTINE entry,
                          void *argument, probe_session::RemoteWork work) {
     s->remote_fault.clear();
+    if (s->shared) s->init_returns_at = s->shared->init_returns;
     s->remote_thread = create_remote_thread_boosted(s->pi.hProcess, entry, argument, &s->remote_tid);
     if (!s->remote_thread) { set_error(s, win_error("create agent thread")); return false; }
     if (trace_enabled()) std::fprintf(stderr, "  remote work=%d tid=%lu\n", (int)work, (unsigned long)s->remote_tid);
@@ -8234,8 +8240,10 @@ static bool start_agent_init(probe_session *s) {
     s->agent_init_started = true;
     // Nothing to install yet: still run init once if the agent's service thread is not up --
     // it is what installs hooks in modules that load later (whose loading thread holds the
-    // loader lock, so no new thread could do it then).
-    if (!agent_has_pending(s) && s->shared && s->shared->service_ready) return accept_agent_install(s);
+    // loader lock, so no new thread could do it then). Not after an early init: it made the
+    // service thread, which reports itself; a second init thread only repeated that while the
+    // program already ran (hunt-early-inline, hunt-exit-terminate-inline).
+    if (!agent_has_pending(s) && s->shared && (s->shared->service_ready || s->early_inited)) return accept_agent_install(s);
     auto local_init = reinterpret_cast<uintptr_t>(GetProcAddress(s->local_agent, "probe_agent_init"));
     uint64_t remote_init = s->remote_agent + local_init - reinterpret_cast<uintptr_t>(s->local_agent);
     return start_remote(s, reinterpret_cast<LPTHREAD_START_ROUTINE>((uintptr_t)remote_init), nullptr,
@@ -8295,6 +8303,7 @@ static bool early_agent(probe_session *s, const DEBUG_EVENT &event, bool &ok) {
         std::fprintf(stderr, "  early agent init ok=%d code=%llu ms=%llu\n", inited, (unsigned long long)code,
                      (unsigned long long)(GetTickCount64() - t0));
     done();
+    s->early_inited = inited && (uint32_t)code == 0;
     if (!inited || (uint32_t)code != 0) {
         // Not initialised here: the usual init thread (it repeats init safely).
         ok = start_agent_init(s); return true;
@@ -8353,6 +8362,14 @@ static bool complete_remote_thread(probe_session *s, DWORD result) {
         return start_agent_init(s);
     }
     if (work == probe_session::REMOTE_INIT_AGENT) {
+        // Killed before it returned (the target is ending: ExitProcess / TerminateProcess while it
+        // ran -- its exit code is then the program's): no init failure, the target's end is the
+        // outcome. 1 and 2 are init's own codes from before its channel was usable.
+        if (s->shared && result != 1 && result != 2 && s->shared->init_returns == s->init_returns_at) {
+            std::fprintf(stderr, "probe: agent init thread ended by the target before it returned (exit code 0x%lx)\n",
+                         (unsigned long)result);
+            return true;
+        }
         if (result != 0) {
             char code[16]; std::snprintf(code, sizeof(code), "0x%lx", (unsigned long)result);
             const std::string why = std::string("probe_agent_init failed (code=") + code + ")" +

@@ -4808,6 +4808,39 @@ def hunt_selected(name):
     return not flt or any(x in name for x in flt)
 
 
+def check_init_cutoff():
+    """An agent init running on a thread of its own (attach) that the target's end kills before
+    it returns is no init failure: the session reports the target's own exit code and no error.
+    Was: the killed thread's exit code (the PROGRAM's, e.g. TerminateProcess(self, 7)) read as
+    "probe_agent_init failed (code=0x7)", the debug loop abandoned, app_exit lost (seen on a
+    launch: hunt-exit-terminate-inline, a redundant init thread still running at the exit).
+    UHH_TEST_INIT_STALL_MS (agent test knob, the target's environment) keeps the init from
+    returning; the target ends 4 s after its start, mid-init."""
+    import os
+    tr, t = exe("uhh_trace.exe"), exe("hunt_target.exe")
+    if not tr or not t:
+        return missing_bin("init-cutoff", "uhh_trace / hunt_target")
+    for sc, code in (("exit-terminate", 7), ("exit-process", 6)):
+        name = f"init-cutoff-{sc}-inline"
+        target = None
+        try:
+            env = dict(os.environ, UHH_TEST_INIT_STALL_MS="30000", HUNT_READERS="2")
+            target = subprocess.Popen([str(t), sc, "--n", "4000"], env=env, stdout=subprocess.PIPE,
+                                      stderr=subprocess.DEVNULL, text=True)
+            r, o = run([tr, "--backend", "inline", "--attach", target.pid, "-p", "ntdll.dll!NtReadVirtualMemory:-"],
+                       timeout=120)
+            target.communicate(timeout=60)
+            rep = report(o)
+            cut = "agent init thread ended by the target before it returned" in r.stderr
+            ok = target.returncode == code and rep.get("app_exit") == code and not rep.get("error") and cut
+            record(name, ok, f"app_exit={rep.get('app_exit')} target_rc={target.returncode} cut_said={cut} "
+                             f"error={(rep.get('error') or '')[:160]}")
+        except Exception as e:
+            if target and target.poll() is None:
+                target.kill()
+            record(name, False, repr(e))
+
+
 HUNT_CASES = [  # (scenario, n, extra driver args ("@" = the backend under test), timeout)
     ("churn", 100, (), 900), ("pool", 100, (), 600), ("fiber", 50, (), 600), ("apc", 100, (), 600),
     ("veh", 150, (), 600), ("dll", 60, ("--work-backend", "@"), 900), ("ctx", 3000, (), 600),
@@ -4821,7 +4854,9 @@ def check_hunt():
     """Edge-case hunter (examples/hunt): gated_config's NtOpenProcess map + per-read pid log
     under concurrency / lifecycle stress, every backend. Every read the target makes must be
     one hit and one log carrying the target's pid; nothing dropped; the program's own result
-    (reads, verify failures, foreign debug exceptions, checksum) equals an uninstrumented run."""
+    (reads, verify failures, foreign debug exceptions, checksum) equals an uninstrumented run.
+    alien == 0: no thread the program did not make ran its TLS callback (UHH's own threads in
+    the target are created without the loader's thread-attach callouts: create_quiet_thread)."""
     d, t = exe("hunt_driver.exe"), exe("hunt_target.exe")
     if not d or not t or not exe("hunt_dll.dll"):
         return missing_bin("hunt", "hunt_driver / hunt_target / hunt_dll")
@@ -4839,7 +4874,7 @@ def check_hunt():
                 reads = tg.get("reads")
                 want_hits = reads * 2 if (reads and "--recurse" in extra) else reads
                 ok = (not tmo and rc == 0 and reads and tg.get("bad") == 0 and tg.get("foreign") == 0 and
-                      tg.get("checksum") == checksum and rd.get("hits") == want_hits and st["read"] == reads and
+                      tg.get("alien") == 0 and tg.get("checksum") == checksum and rd.get("hits") == want_hits and st["read"] == reads and
                       st["unmapped"] == 0 and st["pids"] == {tg.get("pid")} and rep.get("log_dropped") == 0 and
                       rep.get("app_exit") == 0 and st["other"] == 0)
                 if sc == "ctx":
@@ -4853,7 +4888,7 @@ def check_hunt():
                 if "--recurse" in extra:
                     ok = ok and st["recurse_ok"] == reads
                 record(name, ok, f"reads={reads} hits={rd.get('hits')} logs={st['read']} unmapped={st['unmapped']} "
-                                 f"bad={tg.get('bad')} foreign={tg.get('foreign')} early={tg.get('early')} "
+                                 f"bad={tg.get('bad')} foreign={tg.get('foreign')} alien={tg.get('alien')} early={tg.get('early')} "
                                  f"dropped={rep.get('log_dropped')} exit={rep.get('app_exit')} rc={rc} timeout={tmo}"
                                  + (f" work={tg.get('work')}/{wk.get('hits')}/{st['work']}" if wk or tg.get("work") else "")
                                  + (f" tid_ok={st['tid_ok']} tid_bad={st['tid_bad']}" if "--tid" in extra else "")
@@ -4877,12 +4912,14 @@ def check_hunt():
                 rc, tmo, tg, rd, wk, rep, st = hunt_run(bk, sc, 300, (), timeout=180, readers=8)
                 hits = rd.get("hits") or 0
                 cut = rep.get("callbacks_interrupted")
-                ok = (not tmo and rep.get("app_exit") == code and hits > 0 and tg.get("bad") == 0 and cut is not None and
+                ok = (not tmo and rep.get("app_exit") == code and hits > 0 and tg.get("bad") == 0 and tg.get("alien") == 0 and
+                      cut is not None and
                       st["read"] + (rep.get("log_dropped") or 0) + cut == hits and st["unmapped"] == 0 and
                       (bk == "inline" or cut == 0))
                 record(name, ok, f"exit={rep.get('app_exit')} hits={hits} logs={st['read']} dropped={rep.get('log_dropped')} "
-                                 f"interrupted={cut} "
-                                 f"reads_at_print={tg.get('reads_at_exit')} rc={rc} timeout={tmo}")
+                                 f"interrupted={cut} alien={tg.get('alien')} "
+                                 f"reads_at_print={tg.get('reads_at_exit')} rc={rc} timeout={tmo}"
+                                 + ("" if ok else f" err={(rep.get('error') or '')[:160]}"))
             except Exception as e:
                 record(name, False, repr(e))
         # A displaced copy that faults (guard page: the program must still see its guard
@@ -11170,6 +11207,7 @@ def main():
     if want(check_detours_retval): check_detours_retval()
     if want(check_detours_stdin): check_detours_stdin()
     if want(check_hunt): check_hunt()
+    if want(check_init_cutoff): check_init_cutoff()
     if want(check_stdout_forward): check_stdout_forward()
     if want(check_blog_replicas): check_blog_replicas()
     if want(check_blog_pwsh_attach): check_blog_pwsh_attach()

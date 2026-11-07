@@ -57,7 +57,7 @@ EST = {
     "check_famous_tls": (2, 2), "check_forwarded_probe": (1, 1), "check_frida_coexist": (4, 9),
     "check_frida_parity": (1, 1), "check_gated_e2e": (343, 364), "check_gated_filter": (5, 6), "check_gated_map": (3, 3),
     "check_gated_mem": (8, 7), "check_gated_off": (1, 1), "check_handle_map": (20, 21),
-    "check_hotpatch_prologue": (1, 1), "check_hunt": (85, 420), "check_hw_once_slots": (6, 6),
+    "check_hotpatch_prologue": (1, 1), "check_hunt": (85, 420), "check_init_cutoff": (10, 10), "check_hw_once_slots": (6, 6),
     "check_inplace_shapes": (30, 27), "check_interrupt": (2, 2), "check_late_dll_worker": (1, 1),
     "check_latedll": (70, 64), "check_lifecycle": (380, 372), "check_log_throughput": (18, 23),
     "check_logs_controller_killed": (1, 1), "check_logs_format": (1, 1), "check_logs_order": (4, 9),

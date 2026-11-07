@@ -80,6 +80,37 @@ static void init_reads(void) {
     if (!open || open(&g_proc, PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION, &oa, &cid) < 0) g_proc = NULL;
 }
 
+/* Threads the program never made must not run its code: a thread whose start address is not
+   in this exe or the system's thread starters (ntdll: thread-pool / timer-queue workers;
+   kernel32 / kernelbase) running the TLS callback is an ALIEN attach/detach (an instrumenter's
+   injected thread without THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH) -- counted always (whatever
+   g_tls_on), reported as "alien". HUNT_TRACE_TLS=1 also names every counted attach/detach. */
+static volatile LONG g_alien;
+typedef LONG(NTAPI *NtQitFn)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+static int thread_start_module(PVOID *start, HMODULE *hm) {
+    static NtQitFn qit;
+    if (!qit) qit = (NtQitFn)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
+    *start = NULL; *hm = NULL;
+    if (!qit || qit(GetCurrentThread(), 9 /* ThreadQuerySetWin32StartAddress */, start, sizeof(*start), NULL) < 0 || !*start)
+        return 0;
+    return GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                              (LPCSTR)*start, hm) != 0;
+}
+static void note_thread(DWORD reason, int counted) {
+    PVOID start; HMODULE hm;
+    const int known = thread_start_module(&start, &hm);
+    const int alien = !known || !(hm == GetModuleHandleA(NULL) || hm == GetModuleHandleA("ntdll.dll") ||
+                                  hm == GetModuleHandleA("kernel32.dll") || hm == GetModuleHandleA("kernelbase.dll"));
+    if (alien) InterlockedIncrement(&g_alien);
+    if ((alien || counted) && getenv("HUNT_TRACE_TLS")) {
+        char mod[MAX_PATH] = "?", line[512]; DWORD w;
+        if (hm) GetModuleFileNameA(hm, mod, sizeof(mod));
+        int n = _snprintf_s(line, sizeof(line), _TRUNCATE, "[tls %s tid=%lu start=%p mod=%s alien=%d reads=%ld]\n",
+                            reason == DLL_THREAD_ATTACH ? "attach" : "detach", GetCurrentThreadId(), start, mod, alien, g_reads);
+        if (n > 0) WriteFile(GetStdHandle(STD_ERROR_HANDLE), line, (DWORD)n, &w, NULL);
+    }
+}
+
 /* ---- TLS callback: reads on every thread attach/detach (and process attach: early). ---- */
 static volatile LONG g_tls_on;
 static void NTAPI hunt_tls(PVOID mod, DWORD reason, PVOID r) {
@@ -89,8 +120,11 @@ static void NTAPI hunt_tls(PVOID mod, DWORD reason, PVOID r) {
     }
     if (reason == DLL_PROCESS_ATTACH) {
         if (strstr(GetCommandLineA(), " early")) { init_reads(); hunt_read(); InterlockedIncrement(&g_early); }
+    } else if (reason == DLL_THREAD_ATTACH || reason == DLL_THREAD_DETACH) {
+        const int on = g_tls_on != 0;
+        note_thread(reason, on);
+        if (on) hunt_read();
     }
-    else if (g_tls_on && (reason == DLL_THREAD_ATTACH || reason == DLL_THREAD_DETACH)) hunt_read();
 }
 #ifdef _WIN64
 #pragma comment(linker, "/INCLUDE:_tls_used")
@@ -379,8 +413,8 @@ int main(int argc, char **argv) {
         Sleep(g_n);
         QueryPerformanceCounter(&t1);
         const LONG at_wake = g_reads, due = g_due_reads;
-        printf("{\"kind\":\"target\",\"scenario\":\"%s\",\"reads_at_exit\":%ld,\"bad\":%ld,\"sleep_ms\":%lld,\"late_reads\":%ld}\n",
-               sc, at_wake, g_bad, (long long)((t1.QuadPart - t0.QuadPart) * 1000 / f.QuadPart), due < 0 ? 0L : at_wake - due);
+        printf("{\"kind\":\"target\",\"scenario\":\"%s\",\"reads_at_exit\":%ld,\"bad\":%ld,\"alien\":%ld,\"sleep_ms\":%lld,\"late_reads\":%ld}\n",
+               sc, at_wake, g_bad, g_alien, (long long)((t1.QuadPart - t0.QuadPart) * 1000 / f.QuadPart), due < 0 ? 0L : at_wake - due);
         fflush(stdout);
         QueryPerformanceCounter(&t2);
         printf("{\"kind\":\"main_exit\",\"print_ms\":%lld}\n", (long long)((t2.QuadPart - t1.QuadPart) * 1000 / f.QuadPart));
@@ -448,8 +482,8 @@ int main(int argc, char **argv) {
     g_tls_on = 0;
     if (veh) RemoveVectoredExceptionHandler(veh);
     printf("{\"kind\":\"target\",\"scenario\":\"%s\",\"n\":%lu,\"reads\":%ld,\"bad\":%ld,\"foreign\":%ld,"
-           "\"early\":%ld,\"work\":%ld,\"owndr\":%ld,\"guards\":%ld,\"twin\":%ld,\"ctx_rounds\":%ld,\"ctx_ms\":%ld,\"ctx_max_round_ms\":%ld,\"checksum\":\"%llx\",\"pid\":%lu}\n",
-           sc, g_n, g_reads, g_bad, g_foreign, g_early, g_work, g_owndr, g_guards, g_twin, g_ctx_rounds, g_ctx_ms, g_ctx_max_ms,
+           "\"early\":%ld,\"work\":%ld,\"owndr\":%ld,\"guards\":%ld,\"twin\":%ld,\"ctx_rounds\":%ld,\"ctx_ms\":%ld,\"ctx_max_round_ms\":%ld,\"alien\":%ld,\"checksum\":\"%llx\",\"pid\":%lu}\n",
+           sc, g_n, g_reads, g_bad, g_foreign, g_early, g_work, g_owndr, g_guards, g_twin, g_ctx_rounds, g_ctx_ms, g_ctx_max_ms, g_alien,
            checksum(), GetCurrentProcessId());
     fflush(stdout);
     return 0;

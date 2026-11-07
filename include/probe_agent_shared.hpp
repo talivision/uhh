@@ -12,7 +12,7 @@
 #include <intrin.h>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 27;   /* 27: ring record's header and text start on one cache line, log_head on a line of its own (perf5); 26: tblock retired on a line of its own, drain wake-up (drain_wait); 25: per-thread hit blocks (tblocks); 24: huntaudit early_init (on top of 23: runfix1 log carry + running count; 21: held_floor) */
+constexpr uint32_t PROBE_AGENT_VERSION = 28;   /* 28: init_returns (x86hunt); 27: ring record's header and text start on one cache line, log_head on a line of its own (perf5); 26: tblock retired on a line of its own, drain wake-up (drain_wait); 25: per-thread hit blocks (tblocks); 24: huntaudit early_init (on top of 23: runfix1 log carry + running count; 21: held_floor) */
 constexpr uint32_t PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH = 1u << 9;   /* agent side only needs this one */   /* == PROBE_UNSAFE_FAST_PATCH (asserted in session.cpp) */
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 128;   /* inline probes per session; the 129th is refused */
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
@@ -285,6 +285,11 @@ struct probe_agent_shared {
        No new thread can start before process initialisation ends, so init must not wait for
        its service thread (it reports itself ready once it runs). */
     volatile LONG early_init;
+    /* v28: probe_agent_init calls that RETURNED (any result). An init thread the target's end
+       kills (ExitProcess / TerminateProcess while it runs) exits with the PROGRAM's exit code:
+       without this count the controller read that as an init failure and abandoned the session
+       (hunt-exit-terminate-inline: "probe_agent_init failed (code=0x7)", app_exit lost). */
+    volatile LONG init_returns;
     probe_agent_tblock tblocks[PROBE_AGENT_TBLOCKS];   /* v25: per-thread hit accounting (see probe_agent_tblock) */
     probe_agent_drain_wait drain_wait;                 /* v26: wake an idle drainer (see probe_agent_drain_wait) */
 };

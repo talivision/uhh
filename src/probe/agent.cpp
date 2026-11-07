@@ -2709,9 +2709,26 @@ static DWORD WINAPI service_main(void *) {
     }
 }
 
+// Test knob (regress init-cutoff-*): UHH_TEST_INIT_STALL_MS=N in the TARGET's environment keeps
+// an init on a thread of its own (not the early one) from returning for N ms, so the target's
+// end kills it mid-init.
+static void test_init_stall() {
+    char v[16];
+    if (shared->early_init || !GetEnvironmentVariableA("UHH_TEST_INIT_STALL_MS", v, sizeof(v))) return;
+    Sleep(strtoul(v, nullptr, 10));
+}
+
 extern "C" volatile long uhh_safetyhook_keep_calls;
 extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
     TidScope<8> own(g_agent_threads);
+    // Counted on every return through a usable channel (see init_returns): the controller tells
+    // a returned init from one cut off by the target's end.
+    struct Returned {
+        ~Returned() {
+            if (shared && shared->magic == PROBE_AGENT_MAGIC && shared->version == PROBE_AGENT_VERSION)
+                InterlockedIncrement(&shared->init_returns);
+        }
+    } returned;
     if (!shared) {
         wchar_t name[64]; probe_agent_mapping_name(GetCurrentProcessId(), name);
         mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, name);
@@ -2777,7 +2794,8 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
             service_up = CreateEventW(nullptr, TRUE, FALSE, nullptr);
             // Above normal priority, like the controller's threads in the target (see session.cpp
             // create_remote_thread_boosted): a busy program must not delay installs and arming.
-            HANDLE t = CreateThread(nullptr, 0, service_main, nullptr, CREATE_SUSPENDED, nullptr);
+            // No program DllMain / TLS callouts on it (see create_quiet_thread).
+            HANDLE t = create_quiet_thread(GetCurrentProcess(), service_main, nullptr, nullptr);
             if (t) { SetThreadPriority(t, THREAD_PRIORITY_HIGHEST); ResumeThread(t); }
             // service_ready is set by the thread itself, once running. Init does not finish
             // (so the controller reports nothing "active" and releases nothing) before then:
@@ -2803,6 +2821,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
     if (!service_event && shared->guard.enabled)
         for (const ULONGLONG t0 = GetTickCount64(); !no_debug_port() && GetTickCount64() - t0 < 5000; ) Sleep(10);
     if (!g_orphan_cleaned && guard_orphaned()) guard_cleanup();
+    test_init_stall();
     return 0;
 }
 
