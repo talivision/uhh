@@ -2154,6 +2154,10 @@ log_tail and drain_beat (now a plain store: the drainer is its only writer -- an
 before) on the next. Tried and reverted: bounding the drain pass by the ring instead of reading log_head (the idle
 drainer then polled the line the next producer claims: x86 send_log/t1 +20%); `alignas(64)` on the record (a
 producer builds one on its stack: an over-aligned local re-aligns the x86 frame; now padding).
+Found on the way (CI x86 `detach-slowreader-ctrlbreak-inline`, "create probe log file (Win32=3)"): the dead-copy sweep,
+now on the agent-prep thread and so concurrent with the launch, removed any EMPTY directory under %TEMP%\uhh whose name
+was not a live pid -- an empty `logs\` between its creation and the session file's. It now touches only `<pid>-*` copy
+directories of dead controllers (`ctrl-agentprep-*` also check that another empty directory there survives).
 Not done, and why: per-thread claim batching (a thread's reserved but unused slots stall every later record behind
 them, and per-thread rings lose the global claim order that makes cross-thread records causal) and binary records
 (formatting moves from the target to the controller: on this 4-core VM, where 8 target threads already saturate the
@@ -2162,10 +2166,14 @@ shared head, owner CAS, the copy) plus the controller's two writes per batch.
 
 Against the current merge-frida (535ebec, session E): x64 no regression (empty hit 68.2 -> 67.4, send_log/t1 211 -> 207,
 logs/s to a file +3%, gated -11%, launch -29%); x86 gated -10%, logs/s to a file +18%, launch -61%.
-Open / measured residual: perf_ab x86 `hit/inline/send_log/t1` (one thread logging flat out, the target's ns per call)
-measured 309-331 vs base 262-266 ns in five of six comparisons (C's no-warm side 250; E vs merge-frida 264 -> 319,
-x86 only: x64 207 vs 211); a producer that outruns the controller waits on a full ring, so this case measures the
-pipeline's throughput as seen by the target; sink/inline/file (the same
+**x86 single producer (send_log/t1) and the drainer's spin.** perf_ab x86 `hit/inline/send_log/t1` (one thread logging
+flat out, the target's ns per call) measured 309-331 vs base 262-266 ns in five of six comparisons (E vs merge-frida
+264 -> 319; x64 207 vs 211). Cause: the drainer's loop got cheaper (drain_beat no longer a LOCK CMPXCHG8B per loop on
+x86), so a drainer that found a record came straight back and read the head and the next slot -- the lines the producer
+is writing -- several times per record. Now a pass that moved fewer than 32 records is followed by 64 PAUSEs
+(`UHH_BENCH_DRAIN_PAUSE`; session F, 6 rounds, vs merge-frida): x86 send_log/t1 no pause 358 (+35%), 64: 285 (+7.6%,
+spread 190%), 512: 240 (-9%) but gated +13% -- 64 kept (gated -7%, logs/s to a file +13%); x64 send_log/t1 -0.4%,
+gated -10%, logs/s to a file +24%. Earlier notes on this case: sink/inline/file (the same
 producer, end-to-end logs/s) moved -26..+33% between sessions; neither is explained yet (not the hold: session A's
 hold-off side showed the same; not the drain bound: reverted). Each perf_ab case runs a fresh controller, so the
 warm-copy scan (MsMpEng) runs during these 50-100 ms windows.
