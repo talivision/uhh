@@ -104,7 +104,7 @@ First steps for any problem:
 | The target behaves differently under UHH | it is debugged under every backend (anti-debug checks, no unhandled-exception filter), or checks its code against disk | expected; see [limitations.md](limitations.md#visibility-to-the-target-anti-debug) |
 | The tool exits 1 but `"error":null` | `probe_wait_for_exit` returns 0 when the target's exit code is not 0 | check `app_exit` in the report |
 | `log_dropped` > 0 | the controller stopped consuming (it died, or the log file failed: `probe: error: write probe log file ...`) | check disk space in `%TEMP%\uhh\logs` |
-| `callbacks_interrupted` > 0 | the target died (ExitProcess / TerminateProcess) while inline callbacks ran | expected at process exit; their hits are counted |
+| `callbacks_interrupted` > 0 | the target died (ExitProcess / TerminateProcess) while inline callbacks ran | expected at process exit; their hits are counted. stderr names each one: `probe: callbacks interrupted by the target's end: N cut off while running: <probe> (tid T); unexplained=0` (`unexplained` > 0 would be an accounting fault: report it) |
 
 Informational lines (no action needed): `probe: <loc> -> hardware fallback (...)`,
 `probe: <loc> is forwarded -> ...`, `probe: <loc> resolved from symbols -> ...`,

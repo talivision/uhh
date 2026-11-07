@@ -344,6 +344,7 @@ struct probe_session {
     DWORD ipc_freezer = 0;                     // the agent thread doing that write (0 = no freeze)
     int hw_active = 0;
     bool launched = false, exited = false, inline_ready = false;
+    bool cut_off_said = false;                        // probe_report named the interrupted callbacks
     bool interrupted = false, ctrl_counted = false;   // Ctrl+C ended this session / counted in g_ctrl_sessions
     std::atomic<bool> ran{false};              // probe_run has started (read by probe_close on any thread)
     int shadow_stack = -1;                     // target has hardware shadow stacks (CET): -1 unknown, 0/1
@@ -2320,14 +2321,20 @@ static uint8_t target_slots_any(const probe_session *s) {
     return m;
 }
 // The integer registers, IP, SP and flags: equal -> the thread has not run in between.
+// EFLAGS bit 1 is reserved (always 1 in the hardware register) and is not compared: a WOW64
+// thread whose #DB is QUEUED reads EFlags with it set (0x206), the same thread at that event's
+// report with it clear (0x204) -- nothing ran. Compared, "has not run" failed on every x86
+// target, so the debug status our DR write zeroed was never carried into the queued #DB
+// (dr6_lost) and a data-watch hit arrived with no status: passed to the target as an
+// unhandled single step (hw-once-slots x86, ~1% of runs on CI runners).
 static bool same_thread_regs(const CONTEXT &a, const CONTEXT &b) {
 #if defined(_WIN64)
-    return a.Rip == b.Rip && a.Rsp == b.Rsp && a.EFlags == b.EFlags && a.Rax == b.Rax && a.Rbx == b.Rbx &&
+    return a.Rip == b.Rip && a.Rsp == b.Rsp && ((a.EFlags ^ b.EFlags) & ~0x2u) == 0 && a.Rax == b.Rax && a.Rbx == b.Rbx &&
            a.Rcx == b.Rcx && a.Rdx == b.Rdx && a.Rsi == b.Rsi && a.Rdi == b.Rdi && a.Rbp == b.Rbp && a.R8 == b.R8 &&
            a.R9 == b.R9 && a.R10 == b.R10 && a.R11 == b.R11 && a.R12 == b.R12 && a.R13 == b.R13 && a.R14 == b.R14 &&
            a.R15 == b.R15;
 #else
-    return a.Eip == b.Eip && a.Esp == b.Esp && a.EFlags == b.EFlags && a.Eax == b.Eax && a.Ebx == b.Ebx &&
+    return a.Eip == b.Eip && a.Esp == b.Esp && ((a.EFlags ^ b.EFlags) & ~0x2u) == 0 && a.Eax == b.Eax && a.Ebx == b.Ebx &&
            a.Ecx == b.Ecx && a.Edx == b.Edx && a.Esi == b.Esi && a.Edi == b.Edi && a.Ebp == b.Ebp;
 #endif
 }
@@ -8916,6 +8923,21 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
     uint64_t interrupted = 0;
     if (s->exited && s->shared)
         interrupted = probe_agent_inflight(s->shared);
+    if (interrupted && !s->cut_off_said) {
+        // Say which callbacks the target's end cut off (the thread died inside them) and
+        // whether every interrupted hit is one of those (unexplained=0), once per session.
+        s->cut_off_said = true;
+        std::string where;
+        uint64_t unexplained = 0;
+        const uint64_t cut = probe_agent_cut_off(s->shared, unexplained, [&](uint32_t index, uint32_t tid, uint64_t n) {
+            std::string loc = "probe #" + std::to_string(index);
+            for (const auto &p : s->probes)
+                if ((p->flags & PROBE_INLINE) && p->agent_index == index) { loc = p->location; break; }
+            where += " " + loc + (tid ? " (tid " + std::to_string(tid) + ")" : "") + (n > 1 ? " x" + std::to_string(n) : "");
+        });
+        std::fprintf(stderr, "probe: callbacks interrupted by the target's end: %llu cut off while running:%s; "
+                             "unexplained=%llu\n", (unsigned long long)cut, where.c_str(), (unsigned long long)unexplained);
+    }
     std::fprintf(out, "{\"kind\":\"probe_report\",\"probes\":%llu,\"active\":%llu,"
                  "\"hits\":%llu,\"overrides\":%llu,\"log_dropped\":%llu,\"callbacks_interrupted\":%llu,"
                  "\"logs_written\":%llu,\"controller_peak_ws_mb\":%llu,\"app_exit\":%lu,"

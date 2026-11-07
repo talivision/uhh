@@ -2368,6 +2368,77 @@ Three residuals of merge-frida's CI run 42256070700 (e186402). Diagnostics ran o
   page and dies) on every host. UHH needs no change; inline's callback-time lift (g_cb_guarantee) is a no-op
   under the program's equal guarantee.
 
+## Intermittent CI rows (2026-11-07, branch `flakes`, regress `realapps-ps-cim-*`, `realbig-robocopy-detach-*`, `realapps-tasklist-m-*`, `hw-once-slots-*`)
+Diagnostics ran on scratch branches `flakes-diag*` (never merged; deleted after): a loop runner
+(`ci-diag/flakes_loop.py`) repeating one case per job for 25-55 min on many windows-2022 / windows-2025 runners,
+keeping the full output, a ring of hardware-breakpoint events and a full minidump of every failure.
+- ✅ (FL1) **x86 `realapps-ps-cim-inline` `intr=1`** (CI 42333666071 and 3 earlier runs, x86 only). Not a UHH fault:
+  PowerShell's own exit (ExitProcess kills every other thread wherever it is) killed a thread INSIDE an inline
+  NtClose callback (`forget_closed_handle`: a few loads and one store, no lock, no wait, no log). The hit is
+  counted, the callback never finished, nothing was dropped -- the documented A3 accounting
+  (`callbacks_interrupted`, docs/limitations.md). UHH cannot let such a callback finish without hooking the
+  process's exit path (a code change in a function nobody probed -- a side effect) or delaying the program's
+  own exit; breakpoint/hw never see it only because the whole process is stopped while their callback runs.
+  Evidence: the library now names, at the target's end, every interrupted hit whose callback was still RUNNING
+  when its thread died (per-thread block `running` + the probe it was running, `probe_agent_cut_off`; stderr
+  `probe: callbacks interrupted by the target's end: N cut off while running: <probe> (tid T); unexplained=K`).
+  Diag loop (x86 windows-2022, 2 jobs, 2425 runs of the row): 68 runs with `intr=1`, every one `cut off while
+  running: ntdll.dll!NtClose`, `unexplained=0`; reads exact in all 2425. Check: `intr` > 0 is accepted for inline
+  only, only when the library accounts for every interrupted hit as a callback cut off while running
+  (`unexplained=0`, cut == intr), and the read probe's hits must equal its logs plus exactly its own cut-off
+  callbacks; breakpoint/hw still need 0. (An accounting leak -- an unaccounted unit with no callback running, as
+  CI 42325381514's -- still fails: `unexplained` > 0.)
+- ✅ (FL2) **x86 `realbig-robocopy-detach-breakpoint` `no hits on NtClose`** (CI 42333666071, 2 of the ~10 x86
+  runs since the followups gate). The gate (last file held open) kept robocopy alive past the detach, but a
+  runner copies the other 9999 files in ~1 s -- before the attach finished: `files_at_detach=9999/10000`, and
+  robocopy's only activity while attached was its 1 s retry of the gated file, an NtCreateFile failing with a
+  sharing violation (no handle, so no NtClose). The check asserted activity the workload no longer had. Fix
+  (check): a second gate, the next-to-last file, held until the attach is reported and then opened -- robocopy
+  copies it at its next retry (within 1 s: opened, written, CLOSED) while the probes are live; the detach comes
+  3 s after the attach (the gates keep robocopy running whatever the speed) and the check also requires files
+  copied while attached (`files_at_detach > files_at_attach`). After: 2 x 94 loops of every robocopy-detach row
+  (breakpoint, hw, inline) on x86 windows-2022, 564/564 PASS.
+- ✅ (FL3) **x86 `realapps-tasklist-m-breakpoint` `missing=1`** (VM full suite; also CI x86-04 twice): an
+  environment race, not a program-visible difference. 32-bit `tasklist /m` opens nothing itself (opens=0,
+  reads=0: the module lists come from WMI, i.e. WmiPrvSE.exe, a process UHH is not attached to), and the row that
+  differed was a service host (CryptSvc's svchost in all three) whose module LIST changed during the
+  instrumented run (the VM row: the same pid listed with other modules -- cryptnet/winhttp/mswsock/... loaded on
+  demand -- and in another order). A plain control with no UHH anywhere (three uninstrumented x86 `tasklist /m`
+  back to back, the check's exact failure condition on the middle one) failed 1 of 91 triples on runners: a
+  svchost whose wintypes.dll / staterepository modules came and went during the middle run. Fix (check): an
+  independent observer (`_ModPoller`: every process's module list every 0.5 s, EnumProcessModulesEx) runs during
+  the instrumented run of the module-listing scenarios (tasklist-m, ps-modules); a process whose module list
+  changed DURING the run is not comparable (like a process that did not live through it) and is reported
+  (`modules_moved_during_run=N[...]`); every other stable row must still be identical. It caught the control
+  triple's pid. A process the observer cannot open is never excluded. The failure detail now diffs module lists
+  split on `,` too (tasklist) and says when only the order differs. After (diag loops, windows-2022): x86
+  tasklist-m 54/54 PASS (every one `modules_moved_during_run=0`), x64 tasklist-m 459/459 rows PASS, one of them
+  with `modules_moved_during_run=1['"TiWorker.exe",...']` (a servicing worker loading modules mid-run: before, a
+  FAIL).
+- ✅ (FL4) **x86 `hw-once-slots-{breakpoint,inline}`: target killed by STATUS_SINGLE_STEP** (CI 42194952645,
+  agentscope 42317542060; "run ended after 75 of 4000 calls"). Reproduced on runners: 32 failures in 2,836 rows (1,418 runs of the check)
+  (diag loops, x86 windows-2022; 0 in 120 on the VM), always the same: a worker's `lock inc g_w1` raised the data
+  watch #DB (slots 2 RW|ONCE and 3 WRITE) while another thread's event was being handled; that event retired the
+  RW|ONCE probe, whose release writes every thread's debug registers -- zeroing the QUEUED #DB's DR6 (H2). H2
+  keeps the status read just before the write (`keep_queued_dr6`) and carries it into the queued event when the
+  thread's registers show it has not run since -- and on x86 that test never passed: a hardware-event ring
+  (diag) showed the status read correctly (`dr6=0xffff0ffc`, bits 0xc kept) and then not carried, because the
+  WOW64 thread reports EFLAGS with the reserved bit 1 SET while its #DB is queued (`efl=0x202`) and CLEAR at the
+  event's report (`efl=0x200`), every other register equal. The watch hit arrived with no status, matched no
+  probe by address (a data trap reports the next instruction) and was passed on: the target died at
+  p2edge_target+0x1140 (after the `lock inc`). Every x86 all-thread DR write (arm, release, gates) had the same
+  exposure. Fix: `same_thread_regs` ignores EFLAGS bit 1 (architecturally always 1). After (same loops, 4 x86
+  windows-2022 jobs): 0 failures in 1,282 rows (641 runs; at the old rate ~14 were expected, P(0) ~ 5e-7).
+- 🔍 (FL5) **x86 `lifecycle-detach-early-30-inline` crash** (the "CI residuals" R3 open note: a worker executing a
+  non-executable private page, `in_flight=1 running=1` at the detach, EPYC 9V74, 1 in 5,448 x86 inline rows then).
+  NOT reproduced: 11,781 loops of `lifecycle-detach-early-{30,120}-inline` (23,562 inline rows; 5,830 + 652 loops on
+  windows-2022, 5,302 on windows-2025, runner CPUs as allocated) plus 2,071 of `-30-mixed`, all x86, on merge-frida
+  5f13966 + this branch: 0 failures (at the old rate ~4.3 were expected; P(0) ~ 1.3%). The loop runner writes a
+  full minidump of a crashed target (`UHH_DIAG_DUMPDIR`, flakes-diag) for the next occurrence. Left open.
+- 🔍 (FL6) **`lifecycle-detach-early-5-mixed` (a DR left set after an early detach) and `lifecycle-interrupt-mixed`
+  (no exit after a Ctrl+Break at 0 s)** -- once each on the perf branch. NOT reproduced on merge-frida 5f13966 +
+  this branch: 1,017 loops on x64 and 1,012 on x86 (windows-2022) of both rows, 0 failures. Left open.
+
 ## Later
 - ✅ x86 cumulative-session flakiness (possibly the same handle double-close; recheck) -- CLOSED with evidence (cfnest). The note dates from the first checkpoint (c617de4); its suspected cause, review finding I6 (handles closed twice on the launch failure path), was fixed long since. Rechecked with `ar_driver --repeat`: 60 sessions in ONE controller process, backends in turn (breakpoint, hw, inline), each a call_func + runtime data watch whose callback call_funcs during another thread's call: every session exact, nothing dropped, the controller's handle count flat (x64 73 -> 73, x86 89 -> 89). Regress `sessions-repeat` keeps it covered (also exercises the per-run callback-fiber host). (Separately: `callfunc-kill-reuse` -- inline, needs the OS to hand a killed thread's id to a new thread of the same process within 3000 creations -- failed on the shared VM in Nov-06 evening runs on the cfnest build AND on an unmodified baseline build (2/2): system-wide thread-id reuse under other agents' load, not a UHH regression.)
 - ✅ PDB-only symbols (`module!InternalFunc`), Microsoft symbol server via dbghelp+symsrv and `_NT_SYMBOL_PATH`, export/function enumeration (`uhh_trace --list`) — engine by Codex, wired into the library; suite checks added

@@ -6172,6 +6172,70 @@ class _ProcPoller:
         return self.seen
 
 
+class _ModPoller:
+    """An independent observer of other processes' module lists while a run goes on: every
+    0.5 s, each process's loaded modules (EnumProcessModulesEx, LIST_MODULES_ALL; the base
+    addresses, in load order). A process whose module list changed between two samples (a
+    service loading / unloading DLLs) can legitimately be listed differently by a program
+    that enumerates modules at some instant of the run; `moved` names those pids. A process
+    this observer cannot open is never `moved` (no evidence, no exclusion)."""
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+        self.ct, self.wt = ctypes, wintypes
+        self.k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        self.k32.OpenProcess.restype = wintypes.HANDLE
+        self.k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        self.k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        self.psapi.EnumProcessModulesEx.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                                                    ctypes.POINTER(wintypes.DWORD), wintypes.DWORD]
+        self.psapi.GetModuleBaseNameW.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.LPWSTR, wintypes.DWORD]
+        self.lists, self.samples, self.stop = {}, 0, threading.Event()
+        self.sample()
+        self.t = threading.Thread(target=self._loop, daemon=True)
+        self.t.start()
+
+    def modules(self, pid, names=False):
+        ct = self.ct
+        h = self.k32.OpenProcess(0x1000 | 0x10, False, pid)      # QUERY_LIMITED_INFORMATION | VM_READ
+        if not h:
+            return None
+        try:
+            arr, need = (ct.c_void_p * 1024)(), self.wt.DWORD(0)
+            if not self.psapi.EnumProcessModulesEx(h, arr, ct.sizeof(arr), ct.byref(need), 3):
+                return None
+            mods = tuple(arr[i] or 0 for i in range(min(need.value // ct.sizeof(ct.c_void_p), 1024)))
+            if not names:
+                return mods
+            buf = ct.create_unicode_buffer(260)
+            return tuple(buf.value.lower() if self.psapi.GetModuleBaseNameW(h, m, buf, 260) else hex(m) for m in mods)
+        finally:
+            self.k32.CloseHandle(h)
+
+    def sample(self):
+        for pid in _snapshot_processes():
+            m = self.modules(pid) if pid > 4 else None
+            if m is None:
+                continue
+            seen = self.lists.setdefault(pid, [])
+            if not seen or set(seen[-1]) != set(m):
+                seen.append(m)
+        self.samples += 1
+
+    def _loop(self):
+        while not self.stop.wait(0.5):
+            try:
+                self.sample()
+            except Exception:
+                pass
+
+    def finish(self):
+        self.stop.set(); self.t.join(timeout=30)
+        self.sample()
+        return {pid for pid, v in self.lists.items() if len(v) > 1}
+
+
 _JSON_LINE = re.compile(rb'\{"kind":"[a-z_]+"[^\n]*\n')
 
 
@@ -6209,6 +6273,10 @@ def _realapps_rows(text, kind, cols):
     return rows
 
 
+def _row_key(row, cols):
+    return ",".join(row.split(",")[:2])[:60]
+
+
 def _row_alive(row, cols, alive_pids, alive_names):
     """Only rows about processes that existed for the WHOLE instrumented run can be compared
     (other agents' build/test processes come and go): key = the row's pid (csv field) or,
@@ -6234,6 +6302,19 @@ def _run_plain(argv, outp, timeout=900, stdin=None):
 _RX_OPEN = re.compile(r"open pid=(\d+) name=(\S+)$")
 _RX_MAP = re.compile(r"map handle=0x([0-9a-f]+) -> pid=(\d+) name=(\S+)$")
 _RX_READ = re.compile(r"read handle=0x([0-9a-f]+) pid=(\d+) name=(\S+) addr=0x([0-9a-f]+) size=(\d+)$")
+
+
+_RX_CUT = re.compile(r"^probe: callbacks interrupted by the target's end: (\d+) cut off while running:(.*); unexplained=(\d+)$")
+_RX_CUT_ONE = re.compile(r" (\S+)(?: \(tid \d+\))?(?: x(\d+))?")
+
+
+def _cut_off(err_lines):
+    """The library's account of interrupted inline callbacks (probe_report, on stderr):
+    (cut off while running, unexplained, [(location, n), ...]) or None if it printed none."""
+    for l in err_lines:
+        if (m := _RX_CUT.match(l.strip())):
+            return int(m[1]), int(m[3]), [(g[0], int(g[1] or 1)) for g in _RX_CUT_ONE.findall(m[2])]
+    return None
 
 
 def _realapps_verify_logs(objs, seen):
@@ -6333,15 +6414,18 @@ def _realapps_scenario(scen, argv, kind, cols, x86, env_bks, drv, work, own):
             if kind in ("csv", "lines") or (kind == "truth" and base is None):
                 base = [_run_plain(argv, work / f"{scen}-{bk}-plain0.txt")]
             _realapps_one(name, drv, argv, kind, cols, bk, base, work / f"{scen}-{bk}", x86,
+                          modwatch=scen in ("tasklist-m", "ps-modules"),
                           after=(lambda: _run_plain(argv, work / f"{scen}-{bk}-plain1.txt"))
                           if kind in ("csv", "lines") else None, own=own)
         except Exception as e:
             record(name, False, repr(e))
 
 
-def _realapps_one(name, drv, argv, kind, cols, bk, base, stem, x86, after=None, own=None):
+def _realapps_one(name, drv, argv, kind, cols, bk, base, stem, x86, after=None, own=None, modwatch=False):
     t0 = time.perf_counter()
     poll = _ProcPoller()
+    mpoll = _ModPoller() if modwatch else None
+    moved = set()
     target = None
     try:
         if kind == "truth-attach":
@@ -6379,6 +6463,8 @@ def _realapps_one(name, drv, argv, kind, cols, bk, base, stem, x86, after=None, 
             prc = report(objs).get("app_exit")
     finally:
         seen = poll.finish()
+        if mpoll:
+            moved = mpoll.finish()
         alive_pids = {p for p, _ in poll.always}
         alive_names = {n for _, n in poll.always}
         alive_always = list(poll.always)
@@ -6396,19 +6482,33 @@ def _realapps_one(name, drv, argv, kind, cols, bk, base, stem, x86, after=None, 
     warn = [l for l in errs if "refus" in l.lower() or "warning" in l.lower() or "error" in l.lower()]
     # The driver exits 1 when the program does (probe_wait_for_exit): compare with the plain run.
     plain_rc = base[0][0] if base else 0
-    ok = ((drc == 0 or (drc == 1 and prc == plain_rc != 0)) and rep.get("error") is None and rep.get("log_dropped") == 0 and rep.get("callbacks_interrupted") == 0
-          and read_hits == len(reads) and len(other) == 0 and not bad
+    # Inline callbacks run on the program's own threads: the program's exit (ExitProcess kills
+    # every other thread wherever it is) can cut one off mid-callback -- the thread dies inside
+    # it, its hit counted, its log never written (callbacks_interrupted; docs/limitations.md).
+    # Accepted only for inline, only when the library names every interrupted hit as a callback
+    # still RUNNING when its thread died (unexplained=0: no accounting leak), and a read probe's
+    # hits must still equal its logs plus exactly its own cut-off callbacks.
+    intr, cut = rep.get("callbacks_interrupted"), _cut_off(errs)
+    intr_ok = intr == 0 or (bk == "inline" and cut is not None and cut[1] == 0 and cut[0] == intr)
+    read_cut = sum(n for loc, n in (cut[2] if cut else []) if loc == READ_LOCATION)
+    ok = ((drc == 0 or (drc == 1 and prc == plain_rc != 0)) and rep.get("error") is None and rep.get("log_dropped") == 0 and intr_ok
+          and read_hits == len(reads) + read_cut and len(other) == 0 and not bad
           and all(p.get("active") for p in pr.values()) and len(pr) == 3)
     plain_s = f"(plain {base[0][2]:.1f}s) " if base else ""
     detail = (f"{secs:.1f}s {plain_s}rc={drc} app_exit={prc} opens={len(opens)} reads={len(reads)}/{read_hits} unmapped={unmapped} "
               f"pids={len(pids)} unverified={sorted(unverified)[:4]} dropped={rep.get('log_dropped')} "
-              f"intr={rep.get('callbacks_interrupted')}")
+              f"intr={rep.get('callbacks_interrupted')}" + (f" cut_off={cut[0]}{cut[2]} unexplained={cut[1]}" if cut else ""))
     if kind in ("csv", "lines"):
         # Multisets, not sets: identical rows (e.g. several processes with the same image path)
         # must all still be there -- losing one of two equal rows is lost output.
         stable = Counter({r: n for r, n in (Counter(_realapps_rows(base[0][1], kind, cols)) &
                                             Counter(_realapps_rows(base[1][1], kind, cols))).items()
                           if _row_alive(r, cols, alive_pids, alive_names)})
+        # A process whose module list the independent observer saw change DURING the
+        # instrumented run is listed as of whatever instant the program enumerated it: its row
+        # is not comparable (like a process that did not live through the run). Reported.
+        moved_rows = Counter({r: n for r, n in stable.items() if moved and _row_alive(r, cols, moved, set())})
+        stable -= moved_rows
         if cols and cols[1] == "path":
             # A bare image path stands for every process of that image: only as many as were
             # alive for the WHOLE run must be listed (another agent's conhost/powershell that
@@ -6421,6 +6521,10 @@ def _realapps_one(name, drv, argv, kind, cols, bk, base, stem, x86, after=None, 
         # A 32-bit Get-Process -FileVersionInfo lists only the few 32-bit processes: >= 1 row.
         ok = ok and not missing and prc == plain_rc and sum(stable.values()) >= 1
         detail += f" stable_rows={sum(stable.values())} missing={len(missing)} exit={prc}/{base[0][0]}"
+        if mpoll:
+            detail += (f" modules_moved_during_run={sum(moved_rows.values())}"
+                       + (f"{sorted(_row_key(r, cols) for r in moved_rows)[:4]}" if moved_rows else "")
+                       + f" (observer samples={mpoll.samples})")
         if own:
             # The check's own helpers: each listed in both plain runs and the instrumented one,
             # and each read by the instrumented program through a handle mapped to its pid/name.
@@ -6441,9 +6545,19 @@ def _realapps_one(name, drv, argv, kind, cols, bk, base, stem, x86, after=None, 
                 except (ValueError, IndexError):
                     pass
             twin = next((r for r in mine if r.startswith(key)), None)
-            if twin:   # show only where the row differs
-                ma, tb = m0.split(";"), twin.split(";")
-                detail += f" e.g. {key}: only_plain={sorted(set(ma) - set(tb))[:5]} only_instr={sorted(set(tb) - set(ma))[:5]}"
+            if twin:   # show only where the row differs (module lists: ';' ps-modules, ',' tasklist)
+                ma, tb = re.split(r"[;,]", m0), re.split(r"[;,]", twin)
+                same_set = sorted(ma) == sorted(tb)
+                detail += (f" e.g. {key}: only_plain={sorted(set(ma) - set(tb))[:8]} only_instr={sorted(set(tb) - set(ma))[:8]}"
+                           + (" (same entries, other order)" if same_set else ""))
+                if mpoll:
+                    try:
+                        kp = int(m0.split(",")[cols[1]].strip('"'))
+                        hist = mpoll.lists.get(kp)
+                        detail += f" observer[{kp}]: " + ("not openable" if hist is None else
+                                                          f"{len(hist)} distinct module list(s), {len(hist[0])} modules")
+                    except (ValueError, IndexError):
+                        pass
             else:
                 detail += f" e.g.={m0[:200]!r} (row absent)"
     else:
@@ -9777,7 +9891,15 @@ def realbig_robocopy(bk, mode, arch, work, base):
     robocopy retries it (/R:600 /W:1: a sharing violation is retried, the file then copied,
     exit 1) and finishes after the gate opens. (Ungated, a fast runner finished the whole copy
     during the attach: CI 42213960508 x86, "robocopy ended during the attach".) How far the copy
-    had got at the detach is reported (files_at_detach)."""
+    had got at the detach is reported (files_at_detach).
+    A second gate (the next-to-last file, held until the attach is done) guarantees real copy
+    work while attached: a runner copies the other 9998 files in ~1 s, often before the attach
+    completes, and robocopy's only activity left was the 1 s retry of the gated file -- an
+    NtCreateFile failing with a sharing violation, no handle, no NtClose (CI 42333666071 x86:
+    files_at_detach=9999, NtClose 0 hits). Opened at the attach, that file is copied (opened,
+    written, CLOSED) at robocopy's next retry, within 1 s, while the probes are live (a slower
+    machine is still copying the rest then): the check requires files copied while attached
+    (files_at_detach > files_at_attach)."""
     robo = realbig_sysprog("robocopy.exe", arch)
     src = work / ("src" if mode == "launch" else "many")
     dst = work / f"dst-{bk}-{mode}"
@@ -9792,8 +9914,14 @@ def realbig_robocopy(bk, mode, arch, work, base):
         if rep.get("app_exit") != 1: bad.append(f"robocopy exit={rep.get('app_exit')} (want 1: files copied)")
         extra = f"secs={s['secs']:.1f} base={base['robo_secs']:.1f} x{s['secs'] / max(base['robo_secs'], 0.1):.1f}"
     else:
-        gate_file = sorted(src.rglob("*.dat"))[-1]
-        gate = _share_lock(gate_file)
+        gate_file, mid_file = sorted(src.rglob("*.dat"))[-1], sorted(src.rglob("*.dat"))[-2]
+        gate, mid = _share_lock(gate_file), _share_lock(mid_file)
+        mid_opened = {}
+
+        def open_mid():                                       # the attach is done: copy work while attached
+            nonlocal mid
+            mid_opened["files"] = sum(1 for _ in dst.rglob("*.dat")) if dst.exists() else 0
+            _close_share_lock(mid); mid = None
         argv = [a if a != "/R:0" else "/R:600" for a in argv]
         argv = [a if a != "/W:0" else "/W:1" for a in argv]
         tgt = subprocess.Popen([str(a) for a in argv], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -9807,10 +9935,14 @@ def realbig_robocopy(bk, mode, arch, work, base):
             snap = realbig_snapshot(tgt.pid, REALBIG_ROBO_PROBES)
             # Detach soon: a warm copy of many/ takes only ~4 s under inline (the plain base copy,
             # of freshly written files, 15-55 s: the first read of a new file is the slow one).
-            dms = 1500
-            s = realbig_session(bk, REALBIG_ROBO_PROBES, ["--attach", tgt.pid, "--detach-after-ms", dms], 900)
+            # (The gates keep robocopy running past the detach whatever the machine's speed; the
+            # window covers realbig_session's 0.5 s poll for "attached" plus robocopy's 1 s retry.)
+            dms = 3000
+            s = realbig_session(bk, REALBIG_ROBO_PROBES, ["--attach", tgt.pid, "--detach-after-ms", dms], 900,
+                                on_attached=open_mid)
             alive = tgt.poll() is None
             at_detach = sum(1 for _ in dst.rglob("*.dat")) if dst.exists() else 0
+            at_attach = mid_opened.get("files")
             bad, detail = realbig_judge(s, bk, REALBIG_ROBO_PROBES, [REALBIG_ROBO_PROBES[i].rsplit(":", 1)[0] for i in (0, 2, 3)], False)
             if not alive:
                 bad.append(f"robocopy ended during the attach (rc={tgt.returncode}): detach not mid-run")
@@ -9819,14 +9951,18 @@ def realbig_robocopy(bk, mode, arch, work, base):
                 bad += rbad
                 detail += " " + rdet
             if '"kind":"detached"' not in s["out"]: bad.append("not detached")
+            if at_attach is None: bad.append("the attach never reported (second gate not opened)")
+            elif at_detach <= at_attach: bad.append(f"no file copied while attached ({at_attach} -> {at_detach})")
             _close_share_lock(gate); gate = None                  # the gate opens: robocopy finishes
             rc = tgt.wait(timeout=900)
             if rc != 1: bad.append(f"robocopy exit={rc} (want 1)")
-            extra = (f"files_at_detach={at_detach}/{nfiles} plain_first_copy={base['robo_many_secs']:.1f}s "
-                     f"total={time.time() - t0:.1f}s")
+            extra = (f"files_at_attach={at_attach} files_at_detach={at_detach}/{nfiles} "
+                     f"plain_first_copy={base['robo_many_secs']:.1f}s total={time.time() - t0:.1f}s")
         finally:
             if gate is not None:
                 _close_share_lock(gate)
+            if mid is not None:
+                _close_share_lock(mid)
             if tgt.poll() is None:
                 tgt.kill()
     got, n = realbig_tree_digest(dst) if dst.exists() else (None, 0)
