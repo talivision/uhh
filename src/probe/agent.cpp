@@ -2814,8 +2814,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
             service_up = CreateEventW(nullptr, TRUE, FALSE, nullptr);
             // Above normal priority, like the controller's threads in the target (see session.cpp
             // create_remote_thread_boosted): a busy program must not delay installs and arming.
-            // No program DllMain / TLS callouts on it (see create_quiet_thread).
-            HANDLE t = create_quiet_thread(GetCurrentProcess(), service_main, nullptr, nullptr);
+            HANDLE t = CreateThread(nullptr, 0, service_main, nullptr, CREATE_SUSPENDED, nullptr);
             if (t) { SetThreadPriority(t, THREAD_PRIORITY_HIGHEST); ResumeThread(t); }
             // service_ready is set by the thread itself, once running. Init does not finish
             // (so the controller reports nothing "active" and releases nothing) before then:

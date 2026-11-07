@@ -80,35 +80,47 @@ static void init_reads(void) {
     if (!open || open(&g_proc, PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION, &oa, &cid) < 0) g_proc = NULL;
 }
 
-/* Threads the program never made must not run its code: a thread whose start address is not
-   in this exe or the system's thread starters (ntdll: thread-pool / timer-queue workers;
-   kernel32 / kernelbase) running the TLS callback is an ALIEN attach/detach (an instrumenter's
-   injected thread without THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH) -- counted always (whatever
-   g_tls_on), reported as "alien". HUNT_TRACE_TLS=1 also names every counted attach/detach. */
+/* A thread the program never made running its TLS callback WHILE THE PROGRAM RUNS (between
+   main's start and its report) is an ALIEN attach/detach: a thread whose start address is not
+   in this exe or a system thread starter (ntdll: thread-pool / timer-queue workers; kernel32 /
+   kernelbase) -- e.g. an instrumenter's thread started while the program ran, whose callouts
+   run the program's code mid-run and race its own accounting. Reported as "alien".
+   HUNT_TRACE_TLS=1 also names every counted attach/detach. */
 static volatile LONG g_alien;
 typedef LONG(NTAPI *NtQitFn)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-static int thread_start_module(PVOID *start, HMODULE *hm) {
-    static NtQitFn qit;
-    if (!qit) qit = (NtQitFn)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
-    *start = NULL; *hm = NULL;
-    if (!qit || qit(GetCurrentThread(), 9 /* ThreadQuerySetWin32StartAddress */, start, sizeof(*start), NULL) < 0 || !*start)
-        return 0;
-    return GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                              (LPCSTR)*start, hm) != 0;
-}
-static void note_thread(DWORD reason, int counted) {
-    PVOID start; HMODULE hm;
-    const int known = thread_start_module(&start, &hm);
-    const int alien = !known || !(hm == GetModuleHandleA(NULL) || hm == GetModuleHandleA("ntdll.dll") ||
-                                  hm == GetModuleHandleA("kernel32.dll") || hm == GetModuleHandleA("kernelbase.dll"));
-    if (alien) InterlockedIncrement(&g_alien);
-    if ((alien || counted) && getenv("HUNT_TRACE_TLS")) {
-        char mod[MAX_PATH] = "?", line[512]; DWORD w;
-        if (hm) GetModuleFileNameA(hm, mod, sizeof(mod));
-        int n = _snprintf_s(line, sizeof(line), _TRUNCATE, "[tls %s tid=%lu start=%p mod=%s alien=%d reads=%ld]\n",
-                            reason == DLL_THREAD_ATTACH ? "attach" : "detach", GetCurrentThreadId(), start, mod, alien, g_reads);
-        if (n > 0) WriteFile(GetStdHandle(STD_ERROR_HANDLE), line, (DWORD)n, &w, NULL);
+static NtQitFn g_qit;
+static int g_trace_tls;
+static ULONG_PTR g_own_lo[4], g_own_hi[4];   /* exe, ntdll, kernel32, kernelbase: [lo, hi) */
+static void own_ranges(void) {           /* once, from main: no loader call in the callout */
+    const char *names[4] = {NULL, "ntdll.dll", "kernel32.dll", "kernelbase.dll"};
+    g_qit = (NtQitFn)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
+    g_trace_tls = getenv("HUNT_TRACE_TLS") != NULL;
+    for (int i = 0; i < 4; ++i) {
+        const unsigned char *base = (const unsigned char *)GetModuleHandleA(names[i]);
+        if (!base) continue;
+        const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)(base + ((const IMAGE_DOS_HEADER *)base)->e_lfanew);
+        g_own_lo[i] = (ULONG_PTR)base; g_own_hi[i] = (ULONG_PTR)base + nt->OptionalHeader.SizeOfImage;
     }
+}
+/* Out of line, with its buffers: inlined into the TLS callback they made its frame ~800 bytes
+   bigger WITHOUT touching it, so the read's hit sat below the new thread's committed stack --
+   which broke breakpoint/hw call_func there (ROADMAP x86hunt XH3). */
+static __declspec(noinline) void trace_thread(DWORD reason, PVOID start, int alien) {
+    char mod[MAX_PATH] = "?", line[512]; DWORD w; HMODULE hm = NULL;
+    if (start && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                    (LPCSTR)start, &hm))
+        GetModuleFileNameA(hm, mod, sizeof(mod));
+    int n = _snprintf_s(line, sizeof(line), _TRUNCATE, "[tls %s tid=%lu start=%p mod=%s alien=%d reads=%ld]\n",
+                        reason == DLL_THREAD_ATTACH ? "attach" : "detach", GetCurrentThreadId(), start, mod, alien, g_reads);
+    if (n > 0) WriteFile(GetStdHandle(STD_ERROR_HANDLE), line, (DWORD)n, &w, NULL);
+}
+static __declspec(noinline) void note_thread(DWORD reason) {
+    PVOID start = NULL; int alien = 1;
+    if (g_qit && g_qit(GetCurrentThread(), 9 /* ThreadQuerySetWin32StartAddress */, &start, sizeof(start), NULL) >= 0)
+        for (int i = 0; i < 4; ++i)
+            if ((ULONG_PTR)start - g_own_lo[i] < g_own_hi[i] - g_own_lo[i]) alien = 0;
+    if (alien) InterlockedIncrement(&g_alien);
+    if (g_trace_tls) trace_thread(reason, start, alien);
 }
 
 /* ---- TLS callback: reads on every thread attach/detach (and process attach: early). ---- */
@@ -120,10 +132,9 @@ static void NTAPI hunt_tls(PVOID mod, DWORD reason, PVOID r) {
     }
     if (reason == DLL_PROCESS_ATTACH) {
         if (strstr(GetCommandLineA(), " early")) { init_reads(); hunt_read(); InterlockedIncrement(&g_early); }
-    } else if (reason == DLL_THREAD_ATTACH || reason == DLL_THREAD_DETACH) {
-        const int on = g_tls_on != 0;
-        note_thread(reason, on);
-        if (on) hunt_read();
+    } else if (g_tls_on && (reason == DLL_THREAD_ATTACH || reason == DLL_THREAD_DETACH)) {
+        note_thread(reason);
+        hunt_read();
     }
 }
 #ifdef _WIN64
@@ -331,6 +342,7 @@ int main(int argc, char **argv) {
     g_n = 100;
     for (int i = 2; i + 1 < argc; i += 2) if (!strcmp(argv[i], "--n")) g_n = (DWORD)strtoul(argv[i + 1], NULL, 0);
     init_reads();
+    own_ranges();
     g_tls_on = 1;
     PVOID veh = AddVectoredExceptionHandler(1, hunt_veh);
 

@@ -4882,7 +4882,7 @@ def check_init_cutoff():
     "probe_agent_init failed (code=0x7)", the debug loop abandoned, app_exit lost (seen on a
     launch: hunt-exit-terminate-inline, a redundant init thread still running at the exit).
     UHH_TEST_INIT_STALL_MS (agent test knob, the target's environment) keeps the init from
-    returning; the target ends 4 s after its start, mid-init."""
+    returning; the target ends 8 s after its start, mid-init."""
     import os
     tr, t = exe("uhh_trace.exe"), exe("hunt_target.exe")
     if not tr or not t:
@@ -4892,7 +4892,7 @@ def check_init_cutoff():
         target = None
         try:
             env = dict(os.environ, UHH_TEST_INIT_STALL_MS="30000", HUNT_READERS="2")
-            target = subprocess.Popen([str(t), sc, "--n", "4000"], env=env, stdout=subprocess.PIPE,
+            target = subprocess.Popen([str(t), sc, "--n", "8000"], env=env, stdout=subprocess.PIPE,
                                       stderr=subprocess.DEVNULL, text=True)
             r, o = run([tr, "--backend", "inline", "--attach", target.pid, "-p", "ntdll.dll!NtReadVirtualMemory:-"],
                        timeout=120)
@@ -4922,8 +4922,9 @@ def check_hunt():
     under concurrency / lifecycle stress, every backend. Every read the target makes must be
     one hit and one log carrying the target's pid; nothing dropped; the program's own result
     (reads, verify failures, foreign debug exceptions, checksum) equals an uninstrumented run.
-    alien == 0: no thread the program did not make ran its TLS callback (UHH's own threads in
-    the target are created without the loader's thread-attach callouts: create_quiet_thread)."""
+    alien == 0: no thread the program did not make ran its TLS callback while the program ran
+    (a launch starts UHH's threads in the target -- they run the loader's thread-attach callouts,
+    like any thread -- before the entry point is released, never mid-run)."""
     d, t = exe("hunt_driver.exe"), exe("hunt_target.exe")
     if not d or not t or not exe("hunt_dll.dll"):
         return missing_bin("hunt", "hunt_driver / hunt_target / hunt_dll")

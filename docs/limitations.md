@@ -229,11 +229,15 @@ data) prints on all backends.
   (correct unwinding). Under shadow stacks it is copied as is, so an exception thrown by
   that callee and caught in the hooked function or above may not unwind.
   *Workaround:* do not place inline probes directly on a `call` in CET processes.
+- **UHH's threads in the target run the program's thread callouts** (x86hunt): the agent's
+  service thread and the controller's agent load / init / stop threads are ordinary threads, so
+  the loader runs every module's `DllMain(DLL_THREAD_ATTACH/DETACH)` and TLS callbacks on them.
+  A launch starts them before the entry point is released; an attach or detach starts them while
+  the program runs. (`THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH` would avoid it but leaves such a
+  thread without the agent's static TLS.)
 - **Remaining agent limits** (Agent review, ⬜): a thread that dies inside a callback and
   whose id is reused before the next hit is not reported as interrupted; a `call_func` left
   by a non-unwinding `longjmp` keeps its thread marked as in a call.
-- **Not covered** (Calling-convention CC8): a probed site reached by the agent service
-  thread's own `DLL_THREAD_ATTACH` callouts before it runs.
 - **The agent stays loaded after a detach** (Lifecycle residual), quiescent: hooks removed,
   logging stopped. A later attach to the same process reuses it.
 - **x86 inline stack walks** are a verified return-address scan, not PDB-based; a frameless

@@ -8454,7 +8454,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
 // program nothing but those milliseconds. (CREATE_SUSPENDED: the priority is in place before
 // the thread's first instruction.)
 static HANDLE create_remote_thread_boosted(HANDLE process, LPTHREAD_START_ROUTINE entry, void *argument, DWORD *tid) {
-    HANDLE t = create_quiet_thread(process, entry, argument, tid);   // no program DllMain/TLS on it
+    HANDLE t = CreateRemoteThread(process, nullptr, 0, entry, argument, CREATE_SUSPENDED, tid);
     if (!t) return t;
     SetThreadPriority(t, THREAD_PRIORITY_HIGHEST);
     ResumeThread(t);

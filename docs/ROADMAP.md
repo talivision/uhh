@@ -742,8 +742,8 @@ x64 breakpoint/inline baseline was masked by identical-code folding of the fixtu
   sites, more than the debug registers, so the DR gates fall back to the LOAD_DLL hold; the
   dllmain case loads the probed DLL from a DllMain, calls every site under the loader lock and
   starts a thread there), 10 runs each, exact hits == body counts == logs, x64 + x86.
-  Not covered: a probed site reached by the service thread's own DLL_THREAD_ATTACH callouts
-  before it runs (a target DLL calling its probed function from DLL_THREAD_ATTACH).
+  (Was "not covered": a probed site reached by the service thread's own DLL_THREAD_ATTACH
+  callouts. Gone since x86hunt: UHH's threads in the target run no thread-attach callouts at all.)
 - ✅ Thunks and prologues need nothing special: a probe on an import thunk (FF 25), an
   incremental-link thunk (E9, next thunk directly after) and a tail-call target sees the
   caller's return address at [SP], so get_func_arg, call_original and return_from (`ret 12`)
@@ -2268,6 +2268,54 @@ Each claim was checked with a regress check that FAILED on 0fb6cee (same tests, 
    fails it).
 
 CI full suite on 9efd83c (run 42388653548): 2109/2109, all shards green (x64 + x86, windows-2022, and cet-hw).
+
+## x86hunt findings (2026-11-08, branch `x86hunt`: two new x86 inline failures in the full VM suite on main 0fb6cee; regress `hunt-*` alien, `init-cutoff-*`, agent protocol v28)
+
+- ✅ (XH1) **`hunt-early-inline` x86: `reads=11 hits=12 logs=12`** -- one hit and log the program
+  did not count. Not a double delivery: the extra read came from ANOTHER thread
+  (`tids={main: 11, other: 1}`) whose start address was `probe_api_agent.dll!probe_agent_init`
+  (RVA 0x9eb0, hunt_target `HUNT_TRACE_TLS`): an agent init thread of the controller's running
+  hunt_target's TLS callback (DLL_THREAD_ATTACH / DETACH -> one read) while main ran; when that
+  callout raced main's end the hit was logged after main had printed its count. 8/100 x86 runs
+  (x64 0/30: timing). **Root cause** (PROBE_TRACE, every launch, both arches: `early agent init
+  ok=1 code=0` -> entry hold -> `remote work=2`): at the entry hold, kick_agent saw the service
+  thread not yet ready (it cannot run before process initialisation ends) and started a SECOND
+  init on a thread of its own -- redundant (the early init had made the service thread; a later
+  init never makes another), and it ran on while the released program ran.
+  **Fix**: start_agent_init with nothing pending after a completed early init starts no thread
+  (the service thread reports itself with INSTALL_DONE, which releases the hold as before).
+  After it, a launch starts UHH's threads in the target only before the entry point is released.
+  Test: hunt_target counts "alien" TLS attach/detach (a thread whose start is not in the exe /
+  ntdll / kernel32 / kernelbase, while the program runs); every `hunt-*` row requires alien=0.
+- ✅ (XH2) **`hunt-exit-terminate-inline`: `exit=1 hits=6566 logs=6560 interrupted=0 rc=1`** (also
+  x64 once in huntaudit, 2026-11-06). The same redundant init thread was still running (x64,
+  4 parallel runs: 1/60) when the program called TerminateProcess(self, 7): the thread's exit
+  code -- the PROGRAM's 7 -- was read as `probe_agent_init failed (code=0x7)`, the debug loop
+  left without its EXIT_PROCESS (app_exit stayed at its default 1, interrupted callbacks
+  uncounted). **Fix**: besides XH1 (no such thread on a launch), the agent counts every init that
+  returns (`init_returns`, protocol v28); an init thread that ends without returning was killed by
+  the target's end and is reported as such ("agent init thread ended by the target before it
+  returned"), not as a failure. Test: `init-cutoff-{exit-terminate,exit-process}-inline` (attach:
+  the init runs on its own thread; agent test knob `UHH_TEST_INIT_STALL_MS` in the target's
+  environment keeps it from returning; the target ends mid-init: app_exit 7 / 6, no error).
+- ⬜ (XH3, open, found on the way) **breakpoint/hw `call_func` returns 0 silently when the hit's
+  stack is barely committed.** call_in_target writes the callee's frame with WriteProcessMemory
+  512+ bytes below the hit's SP; on a NEW thread in its loader callouts whose caller reserved a
+  large frame without touching it, that lands in the stack guard page / reserved range: the write
+  fails, `call_func` is refused (no stderr line; PROBE_TRACE: "frame write ok=0"). Seen with a
+  first version of the alien counter inlined into hunt_target's TLS callback (~800 bytes of
+  untouched buffers): `hunt-threads-{tid,recurse}-{hw,breakpoint}` 2-11 of 704 calls ok=0, both
+  arches; HUNT_TRACE_TLS=1 (which touches the buffers, committing the pages) made it vanish;
+  inline unaffected (the callee runs on the thread itself). The test target keeps its TLS frame
+  small now; the library is unchanged. Fix idea: let the thread grow its own stack (a stub that
+  probes the pages, or the CALL pushing the frame) instead of writing below an uncommitted SP.
+- ❌ Tried and rejected: creating UHH's threads with `THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH` (no
+  program DllMain/TLS callouts at all). Such threads get no static TLS for the dynamically loaded
+  agent: its magic-static guards (`_Init_thread_epoch`) fault -- an attach crashed the target
+  (0xC0000005), late-DLL installs failed silently under SEH (`hunt-dll-work-backend-inline`
+  work=240/0/0, `hunt-twin-inline` hung). Residual, documented in limitations.md: UHH's threads
+  run the program's thread-attach/detach callouts like any thread (launch: before the entry
+  point; attach/detach: while the program runs).
 
 ## Real-world cases
 - ✅ Microsoft Detours samples replicated (`examples/famous/detours_*`: simple, traceapi, withdll/attach, retval) -- findings above
