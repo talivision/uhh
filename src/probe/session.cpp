@@ -225,7 +225,7 @@ struct probe_session {
     bool writer_stop = false, writer_busy = false, writer_failed = false;
     // Write coalescing (log_writer_main): the writer may hold a short batch briefly while records
     // stream in. writer_holding (queue_mu) says it is; a flush (flush_waiters), a stop or a
-    // half-full queue ends the hold at once through writer_hold.
+    // full pack queued ends the hold at once through writer_hold.
     bool writer_holding = false;
     int flush_waiters = 0;
     std::condition_variable writer_hold;
@@ -829,7 +829,8 @@ static void log_writer_main(probe_session *s) {
     // controller's main per-record cost. Now a batch that comes less than HOLD after the
     // previous write waits until HOLD has passed since it (more records join it), so a stream
     // costs at most one write pair per HOLD; the first record after a quiet spell is written at
-    // once (live latency unchanged). Ended early by a flush, a stop, or a queue half full.
+    // once (live latency unchanged). Ended early by a flush, a stop, or a full pack queued (a fast
+    // stream fills batches by itself: holding it would only let the bounded queue fill up).
     // Bench knob, not API: UHH_BENCH_WRITE_HOLD_US (0 = off).
     static const auto HOLD = [] {
         char v[16] = {};
@@ -893,8 +894,7 @@ static void log_writer_main(probe_session *s) {
                         if (std::chrono::steady_clock::now() < until) {
                             s->writer_holding = true;
                             s->writer_hold.wait_until(lock, until, [s] {
-                                return s->writer_stop || s->flush_waiters ||
-                                       s->log_queue_records >= probe_session::LOG_QUEUE_CAP / 2;
+                                return s->writer_stop || s->flush_waiters || s->log_queue_records >= LOG_PACK;
                             });
                             s->writer_holding = false;
                         }
@@ -1475,7 +1475,7 @@ static void enqueue_logs(probe_session *s, std::vector<LogRecord> &records) {
             try { s->log_queue.push_back(std::move(records[i])); s->logs_enqueued += n; s->log_queue_records += n; }
             catch (...) { s->controller_dropped.fetch_add(n, std::memory_order_relaxed); }
         }
-        const bool end_hold = s->writer_holding && s->log_queue_records >= probe_session::LOG_QUEUE_CAP / 2;
+        const bool end_hold = s->writer_holding && s->log_queue_records >= LOG_PACK;
         lock.unlock();
         if (end_hold) s->writer_hold.notify_all();
         if (warned) warn_console_once(s);
@@ -1888,11 +1888,121 @@ static bool write_trimmed_agent(const std::wstring &src, const std::wstring &dst
     return written;
 }
 
+// ---- Warm agent copies (perf5) -------------------------------------------------------
+// Every session needs a copy of the agent DLL of its own (UHH_SHARED: a shared section is shared
+// by every process that maps the same FILE), and real-time antivirus scans each new copy when it
+// is first mapped as an image (VM, Defender: ~50-100 ms, on the session's critical path). A
+// scanned file is not scanned again, also after a rename. So a session takes a copy that an
+// earlier session prepared and had scanned, if one is there, and leaves one for the next:
+//   %TEMP%\uhh\warm\<sig>-<pid>-<tick>-<n>\probe_api_agent.dll   ready (sig: the source file's size
+//                                                               and write time, so only a copy of
+//                                                               the same agent build is taken)
+//   %TEMP%\uhh\warm\t-<pid>-<tick>-<n>                         being prepared (a dead owner's is swept)
+// A warm copy is created and its image section made once (CreateFileMapping SEC_IMAGE: that is
+// what the scanner inspects), and NEVER loaded or run: its shared section is exactly the file's
+// bytes, as a fresh copy's is. Taking one is an atomic directory rename into the session's own
+// directory (two sessions cannot take the same one). At most WARM_KEEP ready copies per build.
+static constexpr unsigned WARM_KEEP = 2;
+static std::wstring agent_signature(const std::wstring &path) {
+    WIN32_FILE_ATTRIBUTE_DATA a{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a)) return {};
+    wchar_t sig[48];
+    _snwprintf_s(sig, _countof(sig), _TRUNCATE, L"%08lx%08lx%08lx%08lx", a.nFileSizeHigh, a.nFileSizeLow,
+                 a.ftLastWriteTime.dwHighDateTime, a.ftLastWriteTime.dwLowDateTime);
+    return sig;
+}
+static bool pid_alive(DWORD pid) {
+    HANDLE ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    DWORD code = 0;
+    const bool alive = ph && GetExitCodeProcess(ph, &code) && code == STILL_ACTIVE;
+    if (ph) CloseHandle(ph);
+    return alive;
+}
+static void remove_copy_dir(const std::wstring &d) {
+    if (DeleteFileW((d + L"\\probe_api_agent.dll").c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND) RemoveDirectoryW(d.c_str());
+}
+// Moves a ready warm copy of this build to `dir` (the session's own directory). False: none.
+static bool take_warm_copy(const std::wstring &root, const std::wstring &sig, const std::wstring &dir) {
+    const std::wstring warm = root + L"\\warm";
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((warm + L"\\" + sig + L"-*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    bool got = false;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (MoveFileExW((warm + L"\\" + fd.cFileName).c_str(), dir.c_str(), 0)) {
+            if (GetFileAttributesW((dir + L"\\probe_api_agent.dll").c_str()) != INVALID_FILE_ATTRIBUTES) { got = true; break; }
+            remove_copy_dir(dir);                          // (an empty leftover: not a copy)
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return got;
+}
+// Prepares one warm copy for a later session (on a thread of its own: it never delays this
+// session; a controller that exits meanwhile leaves a t-* directory that the next one sweeps).
+static void make_warm_copy(std::wstring root, std::wstring sig, std::wstring src) {
+    const std::wstring warm = root + L"\\warm";
+    CreateDirectoryW(warm.c_str(), nullptr);
+    unsigned ready = 0;
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((warm + L"\\*").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        FILETIME now_ft; GetSystemTimeAsFileTime(&now_ft);
+        const ULONGLONG now = ((ULONGLONG)now_ft.dwHighDateTime << 32) | now_ft.dwLowDateTime;
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.') continue;
+            const std::wstring name = fd.cFileName, d = warm + L"\\" + name;
+            if (name.rfind(L"t-", 0) == 0) {                       // being prepared: by a live controller?
+                if (!pid_alive((DWORD)wcstoul(name.c_str() + 2, nullptr, 10))) remove_copy_dir(d);
+            } else if (name.rfind(sig + L"-", 0) == 0) {
+                ++ready;
+            } else {                                               // another build's: kept a day
+                const ULONGLONG t = ((ULONGLONG)fd.ftCreationTime.dwHighDateTime << 32) | fd.ftCreationTime.dwLowDateTime;
+                if (now > t && now - t > 864000000000ull) remove_copy_dir(d);
+            }
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    if (ready >= WARM_KEEP) return;
+    static std::atomic<unsigned> counter{0};
+    const std::wstring tail = std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) + L"-" +
+                              std::to_wstring(counter++);
+    const std::wstring tmp = warm + L"\\t-" + tail, file = tmp + L"\\probe_api_agent.dll";
+    if (!CreateDirectoryW(tmp.c_str(), nullptr)) return;
+    bool ok = write_trimmed_agent(src, file) || CopyFileW(src.c_str(), file.c_str(), TRUE);
+    if (ok) {                                                      // the image section: the scan
+        HANDLE f = CreateFileW(file.c_str(), GENERIC_READ | GENERIC_EXECUTE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        HANDLE m = f != INVALID_HANDLE_VALUE ? CreateFileMappingW(f, nullptr, PAGE_READONLY | SEC_IMAGE, 0, 0, nullptr) : nullptr;
+        ok = m != nullptr;
+        if (m) CloseHandle(m);
+        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    }
+    if (!ok || !MoveFileExW(tmp.c_str(), (warm + L"\\" + sig + L"-" + tail).c_str(), 0)) remove_copy_dir(tmp);
+}
+static void start_warm_copy(const std::wstring &root, const std::wstring &sig, const std::wstring &src) {
+    // The thread holds a reference to this library, so a host that unloads it meanwhile is safe.
+    HMODULE self = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(&start_warm_copy), &self)) return;
+    struct Job { std::wstring root, sig, src; HMODULE self; };
+    Job *job = nullptr;
+    try { job = new Job{root, sig, src, self}; } catch (...) { FreeLibrary(self); return; }
+    HANDLE t = CreateThread(nullptr, 0, [](void *p) -> DWORD {
+        Job *j = static_cast<Job *>(p);
+        const HMODULE m = j->self;
+        try { make_warm_copy(j->root, j->sig, j->src); } catch (...) {}
+        delete j;
+        FreeLibraryAndExitThread(m, 0);
+    }, job, 0, nullptr);
+    if (t) { SetThreadPriority(t, THREAD_PRIORITY_BELOW_NORMAL); CloseHandle(t); }
+    else { delete job; FreeLibrary(self); }
+}
+
 // The body of the agent preparation (agent_prep's thread, or inline): the per-session copy, then
 // the load. Touches only agent_path / agent_copy / agent_prep_*: nothing else reads them until
 // ensure_local_agent has joined.
 static void prepare_local_agent(probe_session *s) {
     bench_phase("agent_begin", nullptr);
+    std::wstring warm_sig, warm_root, warm_src;
     if (s->agent_path.empty()) {
         s->agent_path = sibling_agent_path();
         if (file_has_section(s->agent_path, "uhhshr")) {
@@ -1926,8 +2036,12 @@ static void prepare_local_agent(probe_session *s) {
                                    std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(counter++);
                 std::wstring copy = dir + L"\\probe_api_agent.dll";
                 bench_phase("agent_copy", nullptr);
-                if (CreateDirectoryW(dir.c_str(), nullptr) &&
-                    (write_trimmed_agent(s->agent_path, copy) || CopyFileW(s->agent_path.c_str(), copy.c_str(), TRUE))) {
+                warm_sig = agent_signature(s->agent_path);
+                warm_root = root; warm_src = s->agent_path;
+                const bool warm = !warm_sig.empty() && take_warm_copy(root, warm_sig, dir);
+                bench_phase("agent_copy_kind", warm ? "warm" : "new");
+                if (warm || (CreateDirectoryW(dir.c_str(), nullptr) &&
+                             (write_trimmed_agent(s->agent_path, copy) || CopyFileW(s->agent_path.c_str(), copy.c_str(), TRUE)))) {
                     s->agent_path = copy; s->agent_copy = copy;
                 } else {
                     std::fprintf(stderr, "probe: warning: could not make a per-session copy of the agent DLL; "
@@ -1940,6 +2054,7 @@ static void prepare_local_agent(probe_session *s) {
     s->agent_prep_module = LoadLibraryW(s->agent_path.c_str());
     s->agent_prep_error = s->agent_prep_module ? 0 : GetLastError();
     bench_phase("agent_loaded", nullptr);
+    if (s->agent_prep_module && !warm_sig.empty()) start_warm_copy(warm_root, warm_sig, warm_src);   // for the next session
 }
 
 static void start_agent_prep(probe_session *s) {
