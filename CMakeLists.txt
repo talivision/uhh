@@ -291,6 +291,12 @@ add_executable(uhh_trace examples/trace/uhh_trace.cpp examples/trace/trace_callb
 target_include_directories(uhh_trace PRIVATE include examples/trace)
 target_link_libraries(uhh_trace PRIVATE probe_api)
 add_dependencies(uhh_trace probe_api_agent)
+# The same CLI on the test-hook controller library (regress stream-filestall-*: a stalled session-file write).
+add_executable(uhh_trace_th examples/trace/uhh_trace.cpp examples/trace/trace_callback.cpp)
+target_include_directories(uhh_trace_th PRIVATE include examples/trace)
+target_link_libraries(uhh_trace_th PRIVATE probe_api_testhooks)
+target_compile_definitions(uhh_trace_th PRIVATE _CRT_SECURE_NO_WARNINGS)
+add_dependencies(uhh_trace_th probe_api_agent)
 
 # symfile_test: symbol names come from image files, never the target's memory (regress symbols-file-backed)
 add_executable(symfile_test examples/symbols/symfile_test.cpp)
@@ -648,6 +654,13 @@ add_executable(ctrl_driver examples/ctrlreview/ctrl_driver.cpp examples/ctrlrevi
 target_include_directories(ctrl_driver PRIVATE include)
 target_link_libraries(ctrl_driver PRIVATE probe_api)
 add_dependencies(ctrl_driver ctrl_target ctrl_dll probe_api_agent)
+# A host DLL linking UHH statically, loaded/unloaded in a loop (regress ctrl-symload-unload).
+add_library(symhost SHARED examples/ctrlreview/symhost_dll.cpp)
+target_include_directories(symhost PRIVATE include)
+target_link_libraries(symhost PRIVATE probe_api_testhooks)
+add_executable(symhost_loop examples/ctrlreview/symhost_loop.c)
+target_compile_definitions(symhost_loop PRIVATE _CRT_SECURE_NO_WARNINGS)
+add_dependencies(symhost_loop symhost)
 # --- Example: the quickstart's "your own tool" (docs/quickstart.md section 4, regress
 # `quickstart-*`). Its callbacks are also in probe_api_agent's source list above (inline).
 add_executable(my_tool examples/quickstart/main.cpp examples/quickstart/my_callbacks.cpp)

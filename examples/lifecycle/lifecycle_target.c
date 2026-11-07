@@ -24,6 +24,10 @@
  *             remote thread (agent load / init) cannot even start meanwhile
  *   dllonce -> load hunt_dll.dll, call HuntWork once, unload it (refcount 0: unmapped);
  *             {"kind":"dllonce","work":<HuntWork's count after>,"mapped":<still loaded: 0/1>}
+ *   dllreuse -> dllonce, then commit fresh EXECUTABLE memory over the whole range the DLL
+ *             occupied (JIT-style code: 0x90 bytes) -- "another executable mapping at the old
+ *             DLL's address"; {"kind":"dllreuse","work":..,"mapped":..,"reused":<1: got the range>}
+ *   reusecheck -> {"kind":"reusecheck","diff":<bytes of that range no longer 0x90>,"first":<offset>}
  *   quit   -> stop, join, final check, {"kind":"app",...}, exit 0 (1 on any error)
  * --pace-ms P: every worker (and the churner) sleeps P ms per iteration -- a bounded hit rate
  * (the shared test VM must not run hardware breakpoints flat out for long).
@@ -52,6 +56,8 @@ static NtReadFn g_ntread; static NtOpenFn g_ntopen; static NtCloseFn g_ntclose; 
 static unsigned char g_pattern[64];
 static volatile LONG g_dr_stale;
 static volatile LONG g_stop, g_errors, g_flips, g_slow_calls, g_churned, g_dll_cycles, g_work;
+static unsigned char *g_reuse;                 /* dllreuse: the executable range committed over the old DLL */
+static SIZE_T g_reuse_len;
 static volatile LONG64 g_iters;
 static char g_first_error[160];
 static LONG g_slow_every = 0, g_slow_ms = 50, g_pace_ms = 0;
@@ -447,6 +453,36 @@ int main(int argc, char **argv) {
         else if (!strncmp(line, "lock ", 5)) {
             HANDLE t = CreateThread(NULL, 0, hold_loader_lock, (void *)(ULONG_PTR)atol(line + 5), 0, NULL);
             if (t) CloseHandle(t);
+        }
+        else if (!strncmp(line, "dllreuse", 8)) {
+            char hp[MAX_PATH]; int mapped = -1, reused = 0;
+            _snprintf_s(hp, sizeof(hp), _TRUNCATE, "%shunt_dll.dll", g_dir);
+            HMODULE m = LoadLibraryA(hp);
+            MODULEINFO mi; memset(&mi, 0, sizeof(mi));
+            if (m) {
+                GetModuleInformation(GetCurrentProcess(), m, &mi, sizeof(mi));
+                HuntWorkFn work = (HuntWorkFn)GetProcAddress(m, "HuntWork");
+                if (work) work(hunt_read, &g_work); else error("HuntWork missing");
+                FreeLibrary(m);
+                mapped = GetModuleHandleA("hunt_dll.dll") != NULL;
+                if (!mapped && mi.lpBaseOfDll && mi.SizeOfImage) {
+                    unsigned char *r = (unsigned char *)VirtualAlloc(mi.lpBaseOfDll, mi.SizeOfImage, MEM_RESERVE | MEM_COMMIT,
+                                                                     PAGE_EXECUTE_READWRITE);
+                    if (r == (unsigned char *)mi.lpBaseOfDll) {
+                        memset(r, 0x90, mi.SizeOfImage);
+                        FlushInstructionCache(GetCurrentProcess(), r, mi.SizeOfImage);
+                        g_reuse = r; g_reuse_len = mi.SizeOfImage; reused = 1;
+                    } else if (r) VirtualFree(r, 0, MEM_RELEASE);
+                }
+            } else error("load hunt_dll failed");
+            printf("{\"kind\":\"dllreuse\",\"work\":%ld,\"mapped\":%d,\"reused\":%d}\n", g_work, mapped, reused); fflush(stdout);
+        }
+        else if (!strncmp(line, "reusecheck", 10)) {
+            long diff = 0, first = -1;
+            for (SIZE_T i = 0; i < g_reuse_len; ++i)
+                if (g_reuse[i] != 0x90) { if (first < 0) first = (long)i; ++diff; }
+            printf("{\"kind\":\"reusecheck\",\"diff\":%ld,\"first\":%ld,\"len\":%lu}\n", diff, first, (unsigned long)g_reuse_len);
+            fflush(stdout);
         }
         else if (!strncmp(line, "dllonce", 7)) {
             char hp[MAX_PATH]; int mapped = -1;
