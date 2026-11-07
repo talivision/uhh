@@ -460,6 +460,7 @@ def main():
     ap.add_argument("--arch", default="x64")
     ap.add_argument("--workloads", default="count,gated,churn,hit")
     ap.add_argument("--methods", default="", help="comma substrings of method names (empty = all)")
+    ap.add_argument("--skip", default="", help="comma list of exact method names to leave out")
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--reads", type=int, default=50000)
@@ -482,7 +483,7 @@ def main():
     plan = {"count": COUNT_METHODS, "gated": GATED_METHODS, "churn": CHURN_METHODS, "hit": HIT_METHODS}
     rows = []
     for w in a.workloads.split(","):
-        ms = [m for m in plan[w] if m == "baseline" or not sel or any(s in m for s in sel)]
+        ms = [m for m in plan[w] if (m == "baseline" or not sel or any(s in m for s in sel)) and m not in a.skip.split(",")]
         if fv is None:
             ms = [m for m in ms if not m.startswith("frida")]
         for i in range(a.repeats):

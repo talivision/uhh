@@ -58,9 +58,10 @@ const NtQuerySystemInformation = new NativeFunction(ntdll.getExportByName('NtQue
     'int', ['int', 'pointer', 'uint', 'pointer']);
 const SystemProcessIdInformation = 88;
 const infoSize = is64 ? 24 : 12;                // { HANDLE ProcessId; UNICODE_STRING ImageName; }
-const info = Memory.alloc(infoSize);
-const pathBuf = Memory.alloc(1024);
+// Buffers per call: a NativeFunction call releases the JS lock by default (scheduling
+// 'cooperative'), so another thread's callback can run meanwhile -- shared buffers would race.
 function imageNameOf(pid) {
+    const info = Memory.alloc(infoSize), pathBuf = Memory.alloc(1024);
     info.writePointer(ptr(pid));
     const us = info.add(Process.pointerSize);
     us.writeU16(0); us.add(2).writeU16(1024); us.add(is64 ? 8 : 4).writePointer(pathBuf);
