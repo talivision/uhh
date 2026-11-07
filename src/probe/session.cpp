@@ -416,17 +416,18 @@ struct probe_session {
     // Demand-driven rounds (fair_tick): a round is also a probe. While its hot threads sleep the
     // target runs with no debug event at all, and the loop's idle ticks then ask the kernel
     // whether any other thread of the target wants the CPU (others_runnable). Rounds come every
-    // 20 ms while one does; after each round in which none did, the period doubles, to 320 ms --
-    // a lone hot thread, or one whose siblings are all blocked, then yields ~4 ms in 324 instead
-    // of 4 in 24.
+    // 20 ms while one does; after each round in which none did, the period doubles, to 80 ms --
+    // a lone hot thread, or one whose siblings are all blocked, then yields ~4 ms in 84 instead
+    // of 4 in 24. Not further: a thread blocked with a TIMEOUT (a heartbeat's timed wait) reads
+    // "waiting", yet its timeout elapses only while the process runs -- it is starved too, and
+    // cannot be told from a thread blocked for good; 80 ms bounds what it loses.
     uint32_t fair_period_ms = 20;
     std::vector<unsigned char> sysproc_buf;     // others_runnable's NtQuerySystemInformation buffer
     bool quiet_sampled = false;                 // the round's first idle tick passed
     std::unordered_set<DWORD> runnable_prev;    // others_runnable: runnable at the previous idle tick
     std::unordered_map<DWORD, ULONG> cs_prev;   // ... and context-switch counts then
     int round_demand = -1;                      // this round: -1 no idle tick compared yet, 0 none ran, 1 one ran
-    uint64_t rounds_by_demand[3] = {};
-    std::chrono::steady_clock::time_point round_fine_until{};   // the 1 ms timer stays on until then (fair_tick)          // PROBE_TRACE statistics: rounds ending with demand -1 / 0 / 1
+    uint64_t rounds_by_demand[3] = {};          // PROBE_TRACE statistics: rounds ending with demand -1 / 0 / 1
     uint64_t park_rounds = 0, parked_total = 0;   // fairness statistics (PROBE_TRACE: printed at the end)
     // Yield stubs (see yield_thread): per thread, `resume address; code`, carved from blocks that
     // are never freed (a thread may sleep inside one across a detach).
@@ -5293,13 +5294,16 @@ struct SysProc {                         // SYSTEM_PROCESS_INFORMATION; SysThrea
                   WriteTransferCount, OtherTransferCount;
 };
 }
-// 1 = another thread wants the CPU, 0 = none does, -1 = unknown (query failed). Wanting it:
+// 1 = another thread wants the CPU, 0 = none does, -1 = unknown (query failed). A thread in a
+// Suspended wait cannot run now and is passed over (in quiet ticks the program's main thread
+// often reads so -- measured, hitcost_target -- while a starved Sleep, below, still reads its
+// own wait). Wanting it:
 // - runnable at two idle ticks in a row (>= 1 ms apart) -- a starved thread still is; a thread
 //   the last event's thaw made Ready for a moment (a thread-pool worker resuming only to wait
 //   again on its queue: measured) is not; or
 // - it RAN since the previous tick (its context-switch count moved) and is not now back in a
 //   thread-pool queue wait: a thread that wakes now and then (a Sleep(10) loop, a timer) needs
-//   the CPU every time it wakes, and with rounds 320 ms apart each wake would wait that long
+//   the CPU every time it wakes, and with rounds 80 ms apart each wake would wait that long
 //   (regress hunt-starve: main's Sleep steps). The thaw's own churn moves a queue-waiting
 //   worker's count, hence the exception for those.
 static int others_runnable(probe_session *s) {
@@ -5318,7 +5322,8 @@ static int others_runnable(probe_session *s) {
     if (st < 0) return -1;
     std::unordered_set<DWORD> now;
     std::unordered_map<DWORD, ULONG> cs_now;
-    const int r = [&]() -> int {
+    uint32_t others = 0, suspended = 0;
+    int r = [&]() -> int {
     for (size_t off = 0;;) {
         if (off + sizeof(SysProc) > buf.size()) return -1;
         const auto *p = reinterpret_cast<const SysProc *>(buf.data() + off);
@@ -5328,6 +5333,33 @@ static int others_runnable(probe_session *s) {
                 if ((const unsigned char *)(t + i + 1) > buf.data() + buf.size()) return -1;
                 const DWORD tid = (DWORD)(uintptr_t)t[i].UniqueThread;
                 const ULONG state = t[i].ThreadState;
+                if (inplace_exempt(s, tid)) continue;              // our agent's own threads (cached)
+                if (s->yielded_round.count(tid)) continue;
+                ++others;
+                if (state == 5 && t[i].WaitReason == 5) {
+                    if (trace_enabled() && !suspended && s->rounds_by_demand[0] < 8) {
+                        using QFn = LONG(NTAPI *)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+                        static auto qit2 = reinterpret_cast<QFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+                        PVOID start = nullptr;
+                        if (HANDLE h = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid)) { qit2(h, 9, &start, sizeof(start), nullptr); CloseHandle(h); }
+                        std::string where = "?"; uint64_t best = 0;
+                        for (const auto &m : s->module_bases)
+                            if (m.second <= (uint64_t)(uintptr_t)start && m.second > best) { best = m.second; where = m.first; }
+                        std::fprintf(stderr, "  fair-suspended tid=%lu start=%s+0x%llx ours=%d yielded=%zu\n", (unsigned long)tid,
+                                     where.c_str(), (unsigned long long)((uint64_t)(uintptr_t)start - best), our_suspends(s, tid),
+                                     s->yielded_round.size());
+                    }
+                    ++suspended;
+                    continue;                                   // a suspended thread cannot run now
+                }
+                if (!s->yielded_round.count(tid) && state == 5 && (t[i].WaitReason == 4 || t[i].WaitReason == 11)) {
+                    // In a Sleep (DelayExecution): its timeout elapses only while the process is
+                    // not frozen (measured: hunt-starve's main slept 300 ms for 4 s of rounds that
+                    // found nothing runnable) -- it needs the rounds as much as a runnable thread.
+                    if (trace_enabled() && s->rounds_by_demand[2] < 12)
+                        std::fprintf(stderr, "  fair-demand tid=%lu sleeping\n", (unsigned long)tid);
+                    return 1;
+                }
                 if (!s->yielded_round.count(tid)) {
                     cs_now[tid] = t[i].ContextSwitches;
                     const auto was = s->cs_prev.find(tid);
@@ -5367,6 +5399,7 @@ static int others_runnable(probe_session *s) {
     }();
     s->runnable_prev = std::move(now);
     s->cs_prev = std::move(cs_now);
+    (void)others;
     return r;
 }
 // An idle tick inside a yield round (no debug event pending: the round's hot threads sleep):
@@ -5375,8 +5408,7 @@ static int others_runnable(probe_session *s) {
 static void round_quiet_tick(probe_session *s) {
     if (!s->parking || s->yielded_round.empty() || s->round_demand == 1) return;
     const int r = others_runnable(s);
-    if (r < 0) { s->round_demand = 1; return; }                    // unknown: as before (20 ms rounds)
-    if (r > 0) { s->round_demand = 1; return; }
+    if (r == -1 || r > 0) { s->round_demand = 1; return; }         // runnable, or unknown: as before (20 ms rounds)
     if (s->quiet_sampled) s->round_demand = 0;                     // a second tick compared: nobody
     s->quiet_sampled = true;
 }
@@ -5390,11 +5422,11 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
     if (!got) round_quiet_tick(s);
     if (now - s->fair_window >= milliseconds(s->fair_period_ms)) {
         // The round that just ended: something else ran in its quiet time -> rounds every 20 ms
-        // (it may be starved); nothing did -> twice the period, to 320 ms; no quiet tick
+        // (it may be starved); nothing did -> twice the period, to 80 ms; no quiet tick
         // compared (the round never went quiet) -> unchanged.
         if (s->parking) ++s->rounds_by_demand[s->round_demand + 1];
         if (s->parking && s->round_demand >= 0)
-            s->fair_period_ms = s->round_demand ? 20 : std::min<uint32_t>(320, s->fair_period_ms * 2);
+            s->fair_period_ms = s->round_demand ? 20 : std::min<uint32_t>(80, s->fair_period_ms * 2);
         s->round_demand = -1; s->quiet_sampled = false; s->runnable_prev.clear(); s->cs_prev.clear();
         const bool was = s->parking;
         // Dense debug events (>= 2000/s: the target is mostly frozen) -- or little unfrozen
@@ -5409,7 +5441,6 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
             ++s->park_rounds; s->yielded_round.clear();
             FILETIME ft; GetSystemTimeAsFileTime(&ft);
             s->round_wake = (LONGLONG)(((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime) + 40000;   // now + 4 ms
-            s->round_fine_until = now + milliseconds(8);
         }
         if (s->parking && !was) {
             if (trace_enabled())
@@ -5428,10 +5459,7 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
         if (agent_has_pending(s)) retarget_pending(s);
         if (agent_has_pending(s) && !kick_agent(s)) std::fprintf(stderr, "probe: %s\n", s->error.c_str());
     }
-    // While parking: only around a round's sleep (its deadline and the quiet ticks need it), not
-    // through the up to 320 ms of dense events between rounds (a process-wide 1 ms timer raises
-    // the clock interrupt rate for the whole machine).
-    const bool fine = (s->parking && now < s->round_fine_until) || !s->ctx_watch.empty() || s->rekick_at;
+    const bool fine = s->parking || !s->ctx_watch.empty() || s->rekick_at;   // (yields sleep 2 ms, not a tick)
     if (fine != s->fine_timer) { if (fine) timeBeginPeriod(1); else timeEndPeriod(1); s->fine_timer = fine; }
     return fine ? 1 : 20;
 }
