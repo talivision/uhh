@@ -1845,7 +1845,8 @@ the report (count, valid JSON per line, CRC multiset of the lines, `seq` coverag
     themselves; the post-callback DR re-read only after a DR write (~27 us); hit-thread handles cached.
     Floor of an external hw probe (bench/perfab/mindbg): 67 us x64, 113 us x86.
   - ⬜ Several hot threads: hw t4 still ~+40% over main (merge-frida's sleeping rounds, kept: they are the fairness)
-  - ⬜ x86 inline: the x87 save (~55 ns with FXSAVE) is the rest of the gap to main; vs Frida CModule see BENCHMARKS
+  - ✅ x86 inline: the x87 save stays (FXSAVE/FXRSTOR, kept: Frida's interceptor does the same per hit); the rest
+    of the x86 gap went in branch `perf4` ("perf4 findings" below: no POPF per hit, TEB fields, cache-line slots)
   - ✅ x86 send_log +1.2 us per log: the controller's log pipeline, not the target ("Inline log cost findings", branch `binlog`)
   - ✅ UHH vs Frida re-run 2026-11-07 x64 + x86 (bench/BENCHMARKS.md): matrix + the full gated_config in both tools
     (both exact; UHH 4.3-4.8x faster); inline matrix row now includes delivering every log (no drops)
@@ -1943,6 +1944,56 @@ x64 392/392 (1 n/a skip), x86 388/388; CI full suite 2070/2071 on both pushes (o
 `patch-race-unsafe`). Every run above exact: hits == logs, log_dropped 0, interrupted 0.
 Residual: a long log-heavy run is now bound by the disk (two copies, stdout and the session file, ~80-150
 bytes per record each: 8M records wrote ~1.3 GB in profiling); idle latency is still one timer tick.
+
+## perf4 findings (2026-11-07, branch `perf4`: beat Frida 17.26.1 in every inline category, agent protocol v26)
+Goal: UHH inline ahead of Frida CModule in count, gated, hit and churn on x64 and x86, nothing dropped, every
+guarantee kept. Measured on the VM with `bench/perfab/perf_ab.py` (base = merge-frida 3f06c24 vs perf4, interleaved,
+quiet-VM placeholder holding the other heavy slot) and `bench/frida/vs_frida.py` (same sessions). Tables:
+bench/BENCHMARKS.md "Update: branch perf4"; raw rows `bench/results/perf4-2026-11-07/`.
+
+What changed and why (each measured; see the before/after table in BENCHMARKS):
+1. **Hit path (both arches).** `POPF` is microcoded (~20 cycles) and ran twice per hit to clear DF (mid_entry and
+   run_callback): now DF is written only when set (`clear_df`). GetLastError/SetLastError/GetCurrentThreadId are
+   the TEB fields themselves. `shared->xstate_mode` was read per hit from the shared header line that every
+   producer CASes (log_head) and the drainer writes: copied at init. `ThreadSlot` is one cache line
+   (`alignas(64)`): threads created together get neighbouring ids and slots, and the unaligned slots (x86 72 bytes,
+   x64 120) put two threads' per-hit stores on one line. Empty inline hit, 1 thread: x64 93 -> 68 ns, x86 153 -> 139.
+2. **x87 (x86).** Kept exact: FXSAVE/FXRSTOR when only x87 is live (Windows' x87 control word is never the INIT one,
+   so XINUSE always reports it; XSAVEC measured slower in phase 3). Tried and dropped: a second FXSAVE after the
+   callback and FXRSTOR only when the x87 image changed (any non-control x87 instruction moves FIP, so an equal
+   image is an untouched state -- exact, but measured 139 vs 135 ns: a second FXSAVE costs what FXRSTOR does).
+   New check: transparency mode `fpu` (x87 pushes onto the mid-site's FULL stack, a new CW, FCLEX; MXCSR set to
+   RZ+FTZ+DAZ with SSE math; 256-bit AVX math + VZEROUPPER; all left changed) on every backend, and the mid-function
+   site now also compares MXCSR (a non-default one, 0xFF80): `transparency-{breakpoint,hw,inline}-fpu`. (x64
+   callbacks: no x87 kept -- MSVC emits none on x64; unchanged.)
+3. **Log record, target side.** Publish is a plain release store of `seq` (x86/x64 are TSO) instead of
+   MemoryBarrier + InterlockedExchange64 (on x86 a fence plus a LOCK CMPXCHG8B loop per record); the carrier's
+   `active_logged` a plain store. `tblock.retired` (the controller's LOCK INC per carried record) moved to a cache
+   line of its own: beside `running` (two owner stores per hit) every record bounced the owner's hot line.
+4. **Log record, controller side.** Ring records go to the writer in PACKS (`LogRecord::packed`, one allocation and
+   one queue entry per 256 records, instead of a std::string + deque node per record; the queue cap counts
+   records); the agent map is read once per pass (`AgentMapCache`, exact: mapped entries never change); the
+   drainer frees slots without fences (TSO) and writes `log_tail` per pack; the JSON line is formatted in place
+   (`resize_and_overwrite`, one bounded write per non-stack line). Same text byte for byte (`logs-format-fast`,
+   `stream-*`, gated judges). Fix on the way: a failed write counted only its own batch as dropped -- the rest of
+   the chunk the writer had popped was lost from the accounting; now every popped record is counted.
+   Controller CPU per log (GetProcessTimes, 1 thread to a file): x64 477 -> 250 ns, x86 625 -> 461 ns.
+   Measured, no gain, not kept: 256 KB / 1 MB write batches (knob `UHH_BENCH_LOG_BATCH_KB`), and the session file
+   in an AV-scanned %TEMP% vs an excluded one -- within the noise. Profile (sampler, gated 8 x 400,000): the
+   writer thread is ~99% inside WriteFile (two copies, stdout and the session file): the per-byte kernel cost of
+   writing ~150-byte JSON lines twice is what is left of the controller's share.
+5. **Idle latency (protocol v26, `probe_agent_drain_wait`).** After 50 ms without records the drainer no longer polls
+   every timer tick: it sets `waiting`, re-checks the ring (a LOCKed store before each side reads the other's flag:
+   no lost wake-up) and sleeps on a named auto-reset event (`probe_agent_drain_name`) for up to 100 ms; the first
+   producer that publishes and sees `waiting` takes it (one SetEvent per sleep, made with ThreadSlot::busy so a probe
+   on NtSetEvent is not counted as a program hit). Only an EMPTY ring sleeps (one stuck behind an unpublished slot
+   keeps the 1 ms polling of check_ring_stall: regress `logs-wedge-suspend` caught a first version that spun there).
+   Event -> stdout p50 15.8 -> 0.3 ms (x64 and x86); idle controller CPU 3.5 -> 2.1 Mcycles/s (x64), 3.8 -> 2.6 (x86)
+   (`bench/perfab/idle_cpu.py`, QueryProcessCycleTime; GetProcessTimes charges such short wake-ups nothing).
+   New check `stream-latency-inline-wake` (p50 < 8 ms, half a tick).
+6. **Benchmark fairness (count/hit).** `uhh_count_call` did two 64-bit atomic RMWs per call (x86: two contended
+   LOCK CMPXCHG8B loops) where Frida's CModule agent does `sink ^= ...` and one `g_atomic_int_add`: now the same
+   operations. This is the benchmark's callback, not the library.
 
 ## Real-world cases
 - ✅ Microsoft Detours samples replicated (`examples/famous/detours_*`: simple, traceapi, withdll/attach, retval) -- findings above

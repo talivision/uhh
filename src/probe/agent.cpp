@@ -237,6 +237,35 @@ extern "C" int set_mem(probe_context *c, uint64_t address, const void *buffer, s
     if (!c || !c->ops || !c->ops->write || (!buffer && size)) return 0;
     size_t done{}; return c->ops->write(c->backend, address, buffer, size, &done) && done == size;
 }
+#if !defined(_WIN64)
+// x86 get_func_arg, every hit (the arguments are on the stack): what local_read does for the hit
+// thread's own stack -- range_ok trusts it above this frame -- without the indirect call, the
+// SEH frame and the overlay passes, which find nothing there: hook shadows and breakpoint INT3
+// bytes are code. Checked, not assumed: the address must lie outside every published shadow and
+// outside the INT3 table's address span (read under its seqlock); else the full path runs.
+static bool stack_arg(uint64_t address, uint32_t &value) {
+    if (address > 0xFFFFFFFBull) return false;
+    const uintptr_t a = (uintptr_t)address;
+    const NT_TIB *tib = reinterpret_cast<const NT_TIB *>(NtCurrentTeb());
+    const uintptr_t here = (uintptr_t)_AddressOfReturnAddress();
+    if (here < (uintptr_t)tib->StackLimit || here >= (uintptr_t)tib->StackBase || a < here ||
+        a + 4 > (uintptr_t)tib->StackBase)
+        return false;
+    if (g_shadow_count && a < g_shadow_max && a + 4 > g_shadow_min) return false;
+    if (shared && shared->int3_count) {
+        const LONG seq = shared->int3_seq;
+        if (seq & 1) return false;
+        MemoryBarrier();
+        LONG count = shared->int3_count;
+        if (count > (LONG)PROBE_AGENT_INT3_CAP) count = PROBE_AGENT_INT3_CAP;
+        const bool clear = count <= 0 || a + 4 <= shared->int3[0].address || a > shared->int3[count - 1].address;
+        MemoryBarrier();
+        if (!clear || shared->int3_seq != seq) return false;
+    }
+    value = *reinterpret_cast<const volatile uint32_t *>(a);
+    return true;
+}
+#endif
 extern "C" uint64_t get_func_arg(probe_context *c, size_t index) {
     if (g_ctrl) return g_ctrl->get_func_arg(c, index);
     if (!c) return 0;
@@ -255,6 +284,7 @@ extern "C" uint64_t get_func_arg(probe_context *c, size_t index) {
     /* x86 __stdcall: every arg on the stack at [esp+4+4*i], read exactly 4 bytes. */
     if (c->regs.rsp > UINT64_MAX - 4 || index > (UINT64_MAX - c->regs.rsp - 4) / 4) return 0;
     uint32_t value{}; uint64_t address = c->regs.rsp + 4 + 4 * index;
+    if (c->ops == &local_ops && stack_arg(address, value)) return value;
     return get_mem(c, address, &value, sizeof(value)) ? value : 0;
 #endif
 }
