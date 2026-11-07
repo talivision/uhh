@@ -114,7 +114,8 @@ def frida_run(argv, agent, params, runtime="qjs", timeout=900):
         pid = dev.spawn([str(a) for a in argv], stdio="pipe")
         pid_box[0] = pid
         sess = dev.attach(pid)
-        sess.on("detached", lambda reason, crash: (detach_reason.__setitem__(0, reason), detached.set()))
+        sess.on("detached", lambda reason, crash: (detach_reason.__setitem__(0, f"{reason} {crash}" if crash else reason),
+                                                   detached.set()))
         script[0] = sess.create_script(src, runtime=runtime)
         script[0].on("message", on_message)
         script[0].load()
@@ -122,8 +123,17 @@ def frida_run(argv, agent, params, runtime="qjs", timeout=900):
             raise RuntimeError(f"agent not ready: {errors[:2]}")
         t_resume = time.perf_counter()
         dev.resume(pid)
-        if not got_done.wait(timeout):
-            raise RuntimeError("no exit handshake within the timeout")
+        deadline = time.perf_counter() + timeout
+        while not got_done.wait(0.5):
+            if detached.is_set():                  # the target is gone without the exit handshake
+                time.sleep(2)
+                if got_done.is_set():
+                    break
+                tail = b"".join(out)[-400:].decode("utf-8", "replace")
+                raise RuntimeError(f"target ended without the exit handshake: detach={detach_reason[0]} "
+                                   f"errors={errors[:2]} stdout tail={tail!r}")
+            if time.perf_counter() > deadline:
+                raise RuntimeError(f"no exit handshake within {timeout} s (errors={errors[:2]})")
         detached.wait(30)
         for _ in range(100):                       # the target's last stdout lines arrive asynchronously
             if any(b'"kind":"app"' in c or b'"kind":"target"' in c for c in out):

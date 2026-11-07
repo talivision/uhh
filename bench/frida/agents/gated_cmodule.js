@@ -8,7 +8,8 @@
 // with its sequence number; when the ring is full it WAITS (yields) for the drain -- backpressure,
 // never a drop. JavaScript drains the ring on a timer (immediately again while it is busy) and
 // sends each chunk as ONE binary message: send(meta, ArrayBuffer). The flag flip stays an
-// instruction probe in JS: it fires once.
+// instruction probe in JS: it fires once. Frida's own self-reads are skipped (prelude.js,
+// isFridaSelfRead, reached from C through a NativeCallback only for handle -1).
 //
 // Record (80 bytes): u32 seq, u32 tid, u32 kind (1 read, 2 open+map), u32 0,
 //                    u64 handle, u64 pid, u64 addr, u64 size, char name[32].
@@ -42,6 +43,7 @@ extern volatile gint reads;
 extern volatile gint opens;
 extern volatile gint waits;
 extern Slot map[];
+extern int is_frida_self_read (gpointer sp);
 #if GLIB_SIZEOF_VOID_P == 4
 extern int __attribute__((stdcall)) NtQuerySystemInformation (int, void *, unsigned int, void *);
 #else
@@ -157,6 +159,13 @@ read_enter (GumInvocationContext * ic)
   int tries;
   Rec * r;
 
+#if GLIB_SIZEOF_VOID_P == 8
+  if (handle == 0xffffffffffffffffULL && is_frida_self_read (GSIZE_TO_POINTER (ic->cpu_context->rsp)))
+    return;
+#else
+  if (handle == 0xffffffff && is_frida_self_read (GSIZE_TO_POINTER (ic->cpu_context->esp)))
+    return;
+#endif
   name[0] = '?'; name[1] = 0;
   for (tries = 0; tries != 4 && handle != 0; tries++)
   {
@@ -214,6 +223,7 @@ drain (Rec * dst, guint max)
     waits: ctl.add(16),
     map,
     NtQuerySystemInformation: ntdll.getExportByName('NtQuerySystemInformation'),
+    is_frida_self_read: new NativeCallback(sp => isFridaSelfRead(sp) ? 1 : 0, 'int', ['pointer']),
 });
 
 const drain = new NativeFunction(cm.drain, 'uint', ['pointer', 'uint']);

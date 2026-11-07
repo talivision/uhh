@@ -95,6 +95,7 @@ Interceptor.attach(ntdll.getExportByName('NtClose'), {
 // --- 3. every read -------------------------------------------------------------------------
 Interceptor.attach(ntdll.getExportByName('NtReadVirtualMemory'), {
     onEnter(args) {
+        if (args[0].equals(SELF) && isFridaSelfRead(this.context.sp)) return;
         const handle = args[0].toString();
         const e = byHandle.get(handle);
         reads++;
