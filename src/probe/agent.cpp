@@ -643,6 +643,20 @@ static void test_wedge_point(const probe_agent_log &rec) {
     if (g) CloseHandle(g);
 }
 
+// The drainer sleeps (probe_agent_drain_wait): the first producer to take `waiting` wakes it.
+// A probe on the APIs SetEvent runs (NtSetEvent) passes straight through on this thread (busy,
+// as for thread_born): the agent's own call is not a program hit.
+static HANDLE g_drain_event;             // the controller's drain event (opened at init)
+struct ThreadSlot;
+static ThreadSlot *agent_call_begin();
+static void agent_call_end(ThreadSlot *ts);
+static void wake_drainer(probe_agent_shared *sh) {
+    if (!g_drain_event || !InterlockedExchange(&sh->drain_wait.waiting, 0)) return;
+    ThreadSlot *const ts = agent_call_begin();
+    SetEvent(g_drain_event);
+    agent_call_end(ts);
+}
+
 struct HitScope;
 static HitScope *log_carrier(probe_context *c);
 static void log_carried(HitScope *h, bool dropped);
@@ -723,9 +737,14 @@ static void agent_log(probe_context *c, bool stack, const char *format, va_list 
     rec->has_stack = local.has_stack; rec->frame_count = local.frame_count;
     rec->carry = local.carry; rec->reserved = local.reserved;
     if (local.frame_count) std::memcpy(rec->frames, local.frames, local.frame_count * sizeof(uint64_t));
-    MemoryBarrier();
-    InterlockedExchange64(&rec->seq, pos + 1);                    // publish (with carry: the unit goes with it)
+    // Publish (with carry: the unit goes with it). x86/x64 keep stores in program order (TSO), so
+    // one plain store of seq after the record's own stores is a release: no fence and no LOCKed
+    // exchange (on x86 a CMPXCHG8B loop) per record. The compiler barrier keeps MSVC from moving
+    // the record's stores past it; the 64-bit store is whole (one MOVQ on x86).
+    _ReadWriteBarrier();
+    probe_agent_store64(&rec->seq, pos + 1);
     log_carried(carrier, false);
+    if (sh->drain_wait.waiting) wake_drainer(sh);
 }
 
 // One warning per probe, delivered as a log record (the callback runs inside the target).
@@ -965,7 +984,11 @@ struct HitScope;
 // Where a hit is counted: the owner's per-thread block (blk, the common path: plain stores,
 // see probe_agent_tblock) or, for a thread without one, its hit_stripes line (interlocked).
 struct HitAcct { probe_agent_tblock *blk; probe_agent_stripe *line; uint32_t probe; };
-struct ThreadSlot {
+// One cache line per slot (alignas(64)): every hit writes its own slot (active, active_acct,
+// active_logged), and threads created together get neighbouring ids, i.e. neighbouring slots --
+// unaligned (x86 72 bytes, x64 120) two threads' hits wrote the same line and it moved between
+// their cores on every hit.
+struct alignas(64) ThreadSlot {
     volatile LONG tid;
     HitScope *active;                    // the hit whose callback this thread is running
     HitAcct active_acct;                 // where that hit is counted
@@ -1095,6 +1118,15 @@ static ThreadSlot *my_slot(DWORD tid) {
     if (!ts && (ts = own_thread_slot(tid)) != nullptr) cache_slot(ts);
     return ts;
 }
+// The agent calls an API on a program thread (inside a callback): a probe that call hits passes
+// straight through (ThreadSlot::busy), neither counted nor run.
+static ThreadSlot *agent_call_begin() {
+    ThreadSlot *ts = cached_slot();
+    if (!ts) ts = thread_slot(GetCurrentThreadId(), false);
+    if (ts) InterlockedExchange(&ts->busy, 1);
+    return ts;
+}
+static void agent_call_end(ThreadSlot *ts) { if (ts) InterlockedExchange(&ts->busy, 0); }
 
 // Hit blocks (probe_agent_tblock). A new shared block (init) starts a generation: every slot
 // claims a block again. Claim: a free block, else (at most every 100 ms) one held by a slot
@@ -1140,8 +1172,12 @@ static probe_agent_tblock *slot_block(ThreadSlot *ts, DWORD tid) {
 // The thread's last NT status (TEB LastStatusValue), beside GetLastError.
 #if defined(_WIN64)
 static inline volatile DWORD *teb_last_status() { return (volatile DWORD *)((unsigned char *)NtCurrentTeb() + 0x1250); }
+static inline volatile DWORD *teb_last_error() { return (volatile DWORD *)((unsigned char *)NtCurrentTeb() + 0x68); }
+static inline DWORD current_tid() { return __readgsdword(0x48); }   // TEB ClientId.UniqueThread
 #else
 static inline volatile DWORD *teb_last_status() { return (volatile DWORD *)((unsigned char *)NtCurrentTeb() + 0xBF4); }
+static inline volatile DWORD *teb_last_error() { return (volatile DWORD *)((unsigned char *)NtCurrentTeb() + 0x34); }
+static inline DWORD current_tid() { return __readfsdword(0x24); }
 #endif
 
 /* The volatile registers call_original's original left: with return_from the caller gets
@@ -1509,7 +1545,7 @@ static void log_carried(HitScope *h, bool dropped) {
         else if (h->acct.line) InterlockedExchangeAdd64(&h->acct.line->value, -PROBE_AGENT_INFLIGHT_ONE);
     }
     h->logged = true;
-    if (h->slot) InterlockedExchange(&h->slot->active_logged, 1);
+    if (h->slot) h->slot->active_logged = 1;     // the owner's own slot: a plain (volatile) store, in program order
 }
 // Callbacks still executing (an unhook waits for them).
 static bool any_inflight() {
@@ -1576,13 +1612,20 @@ static void probe_stack_guarantee_offset() {   // on an agent thread (its guaran
     g_cb_guarantee = need;
 }
 
+// DF=0 for C code. POPF is microcoded (~20 cycles), PUSHF is not: written only when DF is set.
+static __forceinline void clear_df() {
+    const uintptr_t f = __readeflags();
+    if (f & 0x400) __writeeflags(f & ~(uintptr_t)0x400);
+}
+
 // The callback runs on the target's own thread: any Win32 call it (or the library) makes
 // can change the thread's last-error / last-status, which the target may read right
 // after the probed instruction. Save and restore both (plain TEB fields: ~free) -- to what
 // the original left if call_original ran (see HitScope).
 static bool run_callback(probe_callback cb, probe_context *c) {
-    DWORD last_error = GetLastError(), last_status = *teb_last_status();
-    __writeeflags(__readeflags() & ~(uintptr_t)0x400);
+    // The TEB fields themselves (what GetLastError / SetLastError read and write): two calls less per hit.
+    DWORD last_error = *teb_last_error(), last_status = *teb_last_status();
+    clear_df();
     bool ok = true;
     DWORD code = 0;
     volatile ULONG *const guarantee = teb_stack_guarantee();
@@ -1599,7 +1642,7 @@ static bool run_callback(probe_callback cb, probe_context *c) {
         last_error = h->orig_error; last_status = h->orig_status;
     }
     *teb_last_status() = last_status;
-    SetLastError(last_error);
+    *teb_last_error() = last_error;
     return ok;
 }
 /* SafetyHook's Context is Context64 on x64 and Context32 on x86; fill the same gospel
@@ -1637,7 +1680,7 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     const auto &request = shared->requests[index];
     c.config = !request.config_len ? nullptr
              : request.config_len > PROBE_AGENT_CONFIG_CAP ? (void *)(uintptr_t)request.config_remote : (void *)request.config;
-    c.ops = &local_ops; c.tid = GetCurrentThreadId(); c.site = index; c.controller = &states[index];
+    c.ops = &local_ops; c.tid = current_tid(); c.site = index; c.controller = &states[index];
     // Count the hit before the call so a faulting callback is still accounted, and run
     // the callback under SEH so an access violation (or any exception) inside user code
     // cannot take down the target. On a fault we skip register write-back, leaving the
@@ -1885,8 +1928,11 @@ static __declspec(noinline) bool mid_entry_noxsave_sim(safetyhook::Context &nati
     return x87;
 }
 
+// shared->xstate_mode, copied at init (set by the controller before it): the hit path does not
+// read the shared header's cache line, which the ring's producers and the drainer write.
+static LONG g_xmode;
 static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
-    __writeeflags(__readeflags() & ~(uintptr_t)0x400);    // DF=0 before ANY C code
+    clear_df();                                            // DF=0 before ANY C code
 #if defined(_WIN64)
     unsigned char *x87_post = nullptr;                     // x64 returns floating point in XMM0 only
 #else
@@ -1894,7 +1940,7 @@ static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
 #endif
     bool x87 = false;
     // 0 gated (default), 1 none, 2 full (bench knobs), 3 as on a CPU without OSXSAVE (regress)
-    LONG xmode = shared->xstate_mode;
+    const LONG xmode = g_xmode;
     const bool xs_ok = g_xs.ok && xmode != 3;
     uint64_t mask = 0;
     if (xmode != 1 && xs_ok) {
@@ -2643,6 +2689,15 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
         if (!shared || shared->magic != PROBE_AGENT_MAGIC || shared->version != PROBE_AGENT_VERSION) return 2;
     }
     if (shared->request_count > PROBE_AGENT_MAX_PROBES) return 3;
+    g_xmode = shared->xstate_mode;
+    // The drain event, opened once and never closed (a producer may be signalling it): the handle
+    // keeps the named object alive, so a later controller (attach after a detach) creating the
+    // same name gets this same event.
+    if (!g_drain_event) {
+        wchar_t name[64]; probe_agent_drain_name(GetCurrentProcessId(), name);
+        g_drain_event = OpenEventW(EVENT_MODIFY_STATE, FALSE, name);
+    }
+    if (g_drain_event) InterlockedExchange(&shared->drain_wait.agent_ready, 1);
     if (!g_cb_guarantee) probe_stack_guarantee_offset();   // this remote thread is ours (see run_callback)
     make_ret_thunks();
     static PVOID veh = nullptr;

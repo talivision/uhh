@@ -29,7 +29,7 @@ struct TpOut {
 };
 static_assert(offsetof(TpOut, sp_delta) == 0x100 && offsetof(TpOut, st0) == 0x110 && offsetof(TpOut, fsw) == 0x118,
               "harness layout");
-struct TpMidOut { uint64_t gpr[15]; uint64_t flags; uint8_t xmm[16][16]; uint8_t fpu[108]; uint32_t pad; uint8_t ymmhi[16][16]; };
+struct TpMidOut { uint64_t gpr[15]; uint64_t flags; uint8_t xmm[16][16]; uint8_t fpu[108]; uint32_t mxcsr; uint8_t ymmhi[16][16]; };
 static_assert(offsetof(TpMidOut, xmm) == 0x80 && offsetof(TpMidOut, fpu) == 0x180 && offsetof(TpMidOut, ymmhi) == 0x1F0,
               "mid layout");
 
@@ -221,6 +221,7 @@ static void check_mid(int i, Result &r) {
                                                     *(uint16_t *)o1.fpu, *(uint16_t *)(o1.fpu + 4), *(uint16_t *)(o1.fpu + 8),
                                                     *(uint16_t *)o2.fpu, *(uint16_t *)(o2.fpu + 4), *(uint16_t *)(o2.fpu + 8));
     else if (memcmp(o1.fpu + 28, o2.fpu + 28, 80)) snprintf(why, sizeof(why), "x87 register stack differs");
+    else if (o1.mxcsr != o2.mxcsr) snprintf(why, sizeof(why), "MXCSR 0x%x, twin 0x%x", o1.mxcsr, o2.mxcsr);
     else if (le1 != le2) snprintf(why, sizeof(why), "GetLastError 0x%lx, twin 0x%lx", le1, le2);
     else if (ls1 != ls2) snprintf(why, sizeof(why), "LastStatusValue 0x%lx, twin 0x%lx", ls1, ls2);
     else teb_same(b1, a1, b2, a2, r, why, sizeof(why));

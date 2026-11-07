@@ -116,13 +116,30 @@ def first(objs, k):
     return x[0] if x else {}
 
 
+def proc_cpu_ms(handle):
+    """CPU time (kernel + user, ms) of a process by its handle (also after it exited)."""
+    c, e, k, u = (FT() for _ in range(4))
+    if not k32.GetProcessTimes(ctypes.c_void_p(int(handle)), ctypes.byref(c), ctypes.byref(e), ctypes.byref(k), ctypes.byref(u)):
+        return None
+    v = lambda f: (f.hi << 32) | f.lo
+    return (v(k) + v(u)) / 1e4
+
+
+LAST_CPU = {}
+
+
 def run_to_file(side, cmd, timeout, out_name="out.jsonl", stdin=subprocess.DEVNULL):
     out = side.tmp / out_name
     t0 = time.perf_counter()
     with open(out, "wb") as f:
-        p = subprocess.run([str(c) for c in cmd], stdout=f, stderr=subprocess.DEVNULL, stdin=stdin,
-                           env=side.env, timeout=timeout)
+        p = subprocess.Popen([str(c) for c in cmd], stdout=f, stderr=subprocess.DEVNULL, stdin=stdin, env=side.env)
+        try:
+            p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            p.kill(); p.wait()
+            raise
     wall = time.perf_counter() - t0
+    LAST_CPU["ctl_cpu_ms"] = proc_cpu_ms(p._handle)    # the CONTROLLER process (the driver)
     logs, objs = scan_file(out)
     out.unlink()
     return p.returncode, wall, logs, objs
@@ -226,6 +243,7 @@ def case_sink(side, bk, sink):
         p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=side.env, timeout=900)
         wall, logs, rc = time.perf_counter() - t0, None, p.returncode
     elif sink == "file":
+        LAST_CPU.clear()
         rc, wall, logs, objs = run_to_file(side, cmd, 900)
     else:
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=side.env)
@@ -239,8 +257,9 @@ def case_sink(side, bk, sink):
             buf = buf[buf.rfind(b"\n") + 1:]
         rc = p.wait(timeout=600)
         wall = time.perf_counter() - t0
+    cpu = LAST_CPU.get("ctl_cpu_ms") if sink == "file" else None
     return {"rc": rc, "ok": rc == 0 and logs in (None, n), "logs": logs, "wall_s": round(wall, 3),
-            "logs_per_s": n / wall}
+            "logs_per_s": n / wall, "ctl_cpu_ns_per_log": cpu * 1e6 / n if cpu else None}
 
 
 def pct(vals, q):
@@ -365,9 +384,11 @@ def case_gated(side, bk):
     ok = rc == 0 and a.get("successful_reads") == total
     if bk != "base":
         ok = ok and rd.get("hits", 0) >= total and logs >= total and dropped == 0
+    cpu = LAST_CPU.get("ctl_cpu_ms")
     return {"rc": rc, "ok": ok, "elapsed_ns": a.get("elapsed_ns"), "wall_s": round(wall, 3),
             "reads": a.get("successful_reads"), "hits": rd.get("hits"), "logs": logs, "dropped": dropped,
-            "ns_per_read": a.get("elapsed_ns") / total if a.get("elapsed_ns") else None}
+            "ns_per_read": a.get("elapsed_ns") / total if a.get("elapsed_ns") else None,
+            "ctl_cpu_ms": cpu, "ctl_cpu_ns_per_log": cpu * 1e6 / logs if cpu and logs and bk != "base" else None}
 
 
 def all_cases(group):
@@ -445,7 +466,7 @@ def main():
                     short = {k: (round(v, 2) if isinstance(v, float) else v) for k, v in res.items()
                              if k in ("ok", "ns_per_call", "spin_per_us", "hits_per_s", "logs_per_s", "p50_ms", "p99_ms",
                                       "lag_p50_ms", "lag_p99_ms", "attach_ms", "detach_ms", "launch_ms",
-                                      "total_ms", "elapsed_ns", "wall_s", "pre_busy", "error")}
+                                      "total_ms", "elapsed_ns", "wall_s", "pre_busy", "error", "ctl_cpu_ns_per_log")}
                     print(f"r{r} {name} {sn} {short}", flush=True)
 
 

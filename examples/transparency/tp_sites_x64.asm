@@ -7,7 +7,7 @@
 ;          (rbx rbp rsi rdi r12-r15), xmm6-15 +60h, sp_delta +100h, flags +108h
 ; TpMid(TpMidOut *out) / TpMidRef: identical bodies; only TpMid has the probe site TpMidHit.
 ;   TpMidOut: gpr[15] +0 (rax rbx rcx rdx rsi rdi rbp r8-r15), flags +78h, xmm[16] +80h,
-;             FNSAVE image +180h, YMM0-15 upper halves +1F0h
+;             FNSAVE image +180h, MXCSR +1ECh, YMM0-15 upper halves +1F0h
 PUBLIC TpHarness, TpMid, TpMidRef, TpMidHit
 
 .data
@@ -32,6 +32,9 @@ FpVals  dq 3FF0000000000000h, 4000000000000000h, 4008000000000000h, 401000000000
         dq 4014000000000000h, 4018000000000000h, 401C000000000000h, 4020000000000000h
 FpCw    dw 027Fh
 FpCwMid dw 0E7Fh
+ALIGN 4
+MxMid   dd 0FF80h                  ; MXCSR at the site: round toward zero, FTZ, DAZ
+g_mxsv  dd 0
 ALIGN 8
 g_fn    dq 0
 g_in    dq 0
@@ -176,6 +179,8 @@ TpHarness ENDP
 MIDBODY MACRO hit
     SAVENV
     mov [g_mout], rcx
+    stmxcsr dword ptr [g_mxsv]
+    ldmxcsr dword ptr [MxMid]
     fninit
     fldcw word ptr [FpCwMid]
     lea rax, FpVals
@@ -282,6 +287,8 @@ ENDIF
     vextractf128 xmmword ptr [rax+2D0h], ymm14, 1
     vextractf128 xmmword ptr [rax+2E0h], ymm15, 1
     vzeroupper
+    stmxcsr dword ptr [rax+1ECh]
+    ldmxcsr dword ptr [g_mxsv]
     fnsave [rax+180h]                   ; also re-initialises the FPU
     fldcw word ptr [FpCw]
     RESTNV

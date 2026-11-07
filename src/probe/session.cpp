@@ -153,6 +153,22 @@ struct LogRecord {
     // Not a log line: "the module at sym_unload unloaded" -- the writer unregisters it from
     // dbghelp once every record queued before it is symbolized (see sym_unload).
     uint64_t sym_unload = 0, sym_size = 0;
+    // > 0: a PACK of that many ring records, in order, in `text` (LogPackHdr + message bytes +
+    // frames, each). The agent-ring drainer moves records in packs: one allocation and one queue
+    // entry per up to LOG_PACK records instead of a string (and a queue node) per record.
+    uint32_t packed = 0;
+};
+struct LogPackHdr { uint32_t probe, tid, len, nframes, has_stack; };
+constexpr uint32_t LOG_PACK = 256;
+// Log records a queue entry stands for (an unload marker: none).
+static size_t records_of(const LogRecord &r) { return r.sym_unload ? 0 : r.packed ? r.packed : 1; }
+// One record as the writer formats it (a single LogRecord, or one entry of a pack).
+struct LogView {
+    uint32_t probe, tid;
+    std::string_view text;
+    bool has_stack;
+    const unsigned char *frames;     // nframes x uint64_t, unaligned
+    size_t nframes;
 };
 
 #if defined(_WIN64)
@@ -189,8 +205,9 @@ struct probe_session {
     // Both producer paths wait on this bounded queue. The writer never holds queue_mu
     // while symbolizing or writing, so a slow filesystem cannot invert locks with the
     // debugger or the agent-ring drainer.
-    static constexpr size_t LOG_QUEUE_CAP = 2048;
+    static constexpr size_t LOG_QUEUE_CAP = 2048;  // log RECORDS queued (a pack counts its records)
     std::deque<LogRecord> log_queue;
+    size_t log_queue_records = 0;              // records_of() summed over log_queue (queue_mu)
     std::mutex queue_mu;
     std::condition_variable queue_readable, queue_writable, queue_flushed;
     std::vector<std::pair<uint64_t, uint64_t>> sym_pending;   // (base, size) unloads queued for the writer (queue_mu)
@@ -287,6 +304,7 @@ struct probe_session {
     std::unordered_map<DWORD, uint64_t> restore_resume;   // x86: a WOW64 restore sent through call_trap -> its real EIP
     bool thread_start_due = false;             // a hw probe was released: arm it after this event
     HANDLE svc_event = nullptr;                // agent service: "install pending requests"
+    HANDLE drain_event = nullptr;              // a producer wakes the idle drainer (probe_agent_drain_wait)
     std::vector<HANDLE> held;                  // threads held until inline installs confirm
     ULONGLONG held_since = 0;                       // slots we have ever owned (stale-#DB filter)
     std::unordered_set<uint64_t> retired_bps;  // removed INT3 sites (stale-hit filter)
@@ -577,7 +595,8 @@ static bool start_log_output(probe_session *s);
 static bool enqueue_log(probe_session *s, LogRecord &&record);
 static size_t drain_agent_logs(probe_session *s);
 static void deliver_past_stall(probe_session *s);
-static void enqueue_agent_record(probe_session *s, const probe_agent_log &rec, std::vector<LogRecord> *batch = nullptr);
+struct AgentMapCache;
+static void enqueue_agent_record(probe_session *s, const probe_agent_log &rec);
 static void flush_log_writer(probe_session *s, bool up_to_now = false);
 static void stop_log_output(probe_session *s);
 static void forward_finish(probe_session *s);
@@ -615,48 +634,74 @@ static size_t utf8_sequence(const unsigned char *p, size_t n) {
 // A JSON string that is always valid JSON and valid UTF-8, and loses nothing: every control
 // character (NUL included) is escaped, and a byte that is not part of well-formed UTF-8 is
 // written as \u00XX (that byte's value) instead of being passed through raw.
-static void append_json_string(std::string &out, const std::string &value) {
+// Writes `value` as a quoted JSON string at p (room for 6 * size + 2 bytes); returns the end.
+static char *json_string_to(char *out, std::string_view value) {
     static const char hex[] = "0123456789abcdef";
-    out.push_back('"');
+    *out++ = '"';
     const auto *p = reinterpret_cast<const unsigned char *>(value.data());
     for (size_t i = 0, n = value.size(); i < n; ) {
-        size_t run = i;                                  // printable ASCII needing no escape: one append
+        size_t run = i;                                  // printable ASCII needing no escape: one copy
         while (run < n && p[run] >= 0x20 && p[run] < 0x80 && p[run] != '"' && p[run] != '\\') ++run;
-        if (run > i) { out.append(value, i, run - i); i = run; continue; }
+        if (run > i) { std::memcpy(out, p + i, run - i); out += run - i; i = run; continue; }
         unsigned char ch = p[i];
-        if (ch == '"' || ch == '\\') { out.push_back('\\'); out.push_back((char)ch); ++i; continue; }
-        if (ch >= 0x20 && ch < 0x80) { out.push_back((char)ch); ++i; continue; }
-        if (ch == '\n') { out += "\\n"; ++i; continue; }
-        if (ch == '\r') { out += "\\r"; ++i; continue; }
-        if (ch == '\t') { out += "\\t"; ++i; continue; }
+        if (ch == '"' || ch == '\\') { *out++ = '\\'; *out++ = (char)ch; ++i; continue; }
+        if (ch == '\n') { *out++ = '\\'; *out++ = 'n'; ++i; continue; }
+        if (ch == '\r') { *out++ = '\\'; *out++ = 'r'; ++i; continue; }
+        if (ch == '\t') { *out++ = '\\'; *out++ = 't'; ++i; continue; }
         if (ch >= 0x80) {
-            if (size_t len = utf8_sequence(p + i, n - i)) { out.append(value, i, len); i += len; continue; }
+            if (size_t len = utf8_sequence(p + i, n - i)) { std::memcpy(out, p + i, len); out += len; i += len; continue; }
         }
-        out += "\\u00"; out.push_back(hex[ch >> 4]); out.push_back(hex[ch & 15]); ++i;
+        *out++ = '\\'; *out++ = 'u'; *out++ = '0'; *out++ = '0';
+        *out++ = hex[ch >> 4]; *out++ = hex[ch & 15]; ++i;
     }
-    out.push_back('"');
+    *out++ = '"';
+    return out;
+}
+static void append_json_string(std::string &out, std::string_view value) {
+    const size_t at = out.size();
+    out.resize_and_overwrite(at + 6 * value.size() + 2, [&](char *buf, size_t) {
+        return (size_t)(json_string_to(buf + at, value) - buf);
+    });
+}
+
+template <size_t N> static char *put_lit(char *p, const char (&lit)[N]) {
+    std::memcpy(p, lit, N - 1);
+    return p + N - 1;
 }
 
 // Appends the record's JSON line to `line` (the writer's batch): no temporary string and no
 // printf per record -- the x86 (WOW64) controller's per-record formatting showed in profiles of
 // a log-bound inline target (send_log there waits on this pipeline: the ring's backpressure).
-static void append_log_line(std::string &line, probe_session *s, const LogRecord &r) {
-    char num[24];
-    line += "{\"kind\":\"probe_log\",\"probe\":";
-    line.append(num, (size_t)(std::to_chars(num, num + sizeof(num), r.probe).ptr - num));
-    line += ",\"tid\":";
-    line.append(num, (size_t)(std::to_chars(num, num + sizeof(num), r.tid).ptr - num));
-    line += ",\"message\":";
-    append_json_string(line, r.text);
-    if (r.has_stack) {
-        line += ",\"stack\":[";
-        for (size_t i = 0; i < r.frames.size(); ++i) {
-            if (i) line.push_back(',');
-            append_json_string(line, symbolize(s, r.frames[i]));
+// A line without a stack is written in place in one step (its size is bounded: 6 bytes per
+// message byte at most); a stack line appends its symbol names as they come.
+static void append_log_line(std::string &line, probe_session *s, const LogView &r) {
+    const size_t at = line.size();
+    line.resize_and_overwrite(at + 6 * r.text.size() + 160, [&](char *buf, size_t) {
+        char *p = buf + at;
+        p = put_lit(p, "{\"kind\":\"probe_log\",\"probe\":");
+        p = std::to_chars(p, p + 24, r.probe).ptr;
+        p = put_lit(p, ",\"tid\":");
+        p = std::to_chars(p, p + 24, r.tid).ptr;
+        p = put_lit(p, ",\"message\":");
+        p = json_string_to(p, r.text);
+        if (!r.has_stack) {
+            // Last, so every consumer matching the line's start keeps working (fields only added).
+            p = put_lit(p, ",\"seq\":");
+            p = std::to_chars(p, p + 24, (unsigned long long)s->log_seq++).ptr;
+            p = put_lit(p, "}\n");
         }
-        line.push_back(']');
+        return (size_t)(p - buf);
+    });
+    if (!r.has_stack) return;
+    line += ",\"stack\":[";
+    for (size_t i = 0; i < r.nframes; ++i) {
+        if (i) line.push_back(',');
+        uint64_t frame;
+        std::memcpy(&frame, r.frames + i * sizeof(frame), sizeof(frame));
+        append_json_string(line, symbolize(s, frame));
     }
-    // Last, so every consumer matching the line's start keeps working (fields only added).
+    line.push_back(']');
+    char num[24];
     line += ",\"seq\":";
     line.append(num, (size_t)(std::to_chars(num, num + sizeof(num), (unsigned long long)s->log_seq++).ptr - num));
     line += "}\n";
@@ -669,9 +714,10 @@ static void writer_failed(probe_session *s, const std::string &message, uint64_t
         s->writer_error = message;
         for (const LogRecord &r : s->log_queue) {
             if (r.sym_unload) uhh_sym::unregister_module(s->pi.hProcess, r.sym_unload);
-            else ++unwritten;
+            else unwritten += records_of(r);
         }
         s->log_queue.clear();
+        s->log_queue_records = 0;
         s->sym_pending.clear();
         s->controller_dropped.fetch_add(unwritten, std::memory_order_relaxed);
         std::fprintf(stderr, "probe: error: %s\n", message.c_str());
@@ -740,6 +786,8 @@ static void log_writer_main(probe_session *s) {
     constexpr size_t BATCH_BYTES = 64 * 1024;
     uint64_t unwritten = 0;
     try {
+        std::string batch;
+        batch.reserve(BATCH_BYTES + 2048);
         for (;;) {
             {
                 std::unique_lock<std::mutex> lock(s->queue_mu);
@@ -748,21 +796,48 @@ static void log_writer_main(probe_session *s) {
                 s->writer_busy = true;
             }
 
-            std::string batch;
+            batch.clear();
             uint64_t batch_records = 0;
             auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
+            // A failed write: write_log_batch counted the batch's records (writer_failed); the
+            // rest of what this thread popped and had not written yet is counted here.
+            auto failed = [&] {
+                s->controller_dropped.fetch_add(unwritten - batch_records, std::memory_order_relaxed);
+            };
+            // One record into the batch; false: a write failed (the writer stops).
+            auto put = [&](const LogView &v) -> bool {
+                const size_t before = batch.size();
+                append_log_line(batch, s, v);
+                if (before && batch.size() > BATCH_BYTES) {             // over: write what was there first
+                    std::string line = batch.substr(before);
+                    batch.resize(before);
+                    if (!write_log_batch(s, batch, batch_records)) { failed(); return false; }
+                    unwritten -= batch_records;
+                    batch.assign(line); batch_records = 0;
+                    deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
+                }
+                ++batch_records;
+                if (batch.size() >= BATCH_BYTES || std::chrono::steady_clock::now() >= deadline) {
+                    if (!write_log_batch(s, batch, batch_records)) { failed(); return false; }
+                    unwritten -= batch_records;
+                    batch.clear(); batch_records = 0;
+                    deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
+                }
+                return true;
+            };
             // Records are taken in chunks (one lock and one wake-up per chunk, not per record).
             // A popped record counts as unwritten until its batch is written, so a writer
-            // failure mid-chunk still accounts for every one of them (writer_failed).
+            // failure mid-chunk still accounts for every one of them.
             std::vector<LogRecord> chunk;
             for (;;) {
                 if (chunk.empty()) {
                     std::lock_guard<std::mutex> lock(s->queue_mu);
                     if (s->log_queue.empty()) break;
-                    const size_t n = std::min<size_t>(s->log_queue.size(), 256);
-                    chunk.reserve(n);
-                    for (size_t k = 0; k < n; ++k) {
-                        if (!s->log_queue.front().sym_unload) ++unwritten;
+                    size_t taken = 0;
+                    while (!s->log_queue.empty() && taken < LOG_PACK) {
+                        const size_t n = records_of(s->log_queue.front());
+                        unwritten += n; taken += n ? n : 1;
+                        s->log_queue_records -= n;
                         chunk.push_back(std::move(s->log_queue.front()));
                         s->log_queue.pop_front();
                     }
@@ -780,26 +855,25 @@ static void log_writer_main(probe_session *s) {
                     s->queue_flushed.notify_all();
                     continue;
                 }
-                const size_t before = batch.size();
-                append_log_line(batch, s, record);
-                if (before && batch.size() > BATCH_BYTES) {             // over: write what was there first
-                    std::string line = batch.substr(before);
-                    batch.resize(before);
-                    if (!write_log_batch(s, batch, batch_records)) return;
-                    unwritten -= batch_records;
-                    batch.swap(line); batch_records = 0;
-                    deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
+                if (!record.packed) {
+                    const LogView v{record.probe, record.tid, record.text, record.has_stack,
+                                    reinterpret_cast<const unsigned char *>(record.frames.data()), record.frames.size()};
+                    if (!put(v)) return;
+                    continue;
                 }
-                ++batch_records;
-                if (batch.size() >= BATCH_BYTES || std::chrono::steady_clock::now() >= deadline) {
-                    if (!write_log_batch(s, batch, batch_records)) return;
-                    unwritten -= batch_records;
-                    batch.clear(); batch_records = 0;
-                    deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
+                const auto *p = reinterpret_cast<const unsigned char *>(record.text.data());
+                const auto *end = p + record.text.size();
+                for (uint32_t k = 0; k < record.packed && p + sizeof(LogPackHdr) <= end; ++k) {
+                    LogPackHdr h;
+                    std::memcpy(&h, p, sizeof(h)); p += sizeof(h);
+                    const LogView v{h.probe, h.tid, std::string_view(reinterpret_cast<const char *>(p), h.len),
+                                    h.has_stack != 0, p + h.len, h.nframes};
+                    p += h.len + (size_t)h.nframes * sizeof(uint64_t);
+                    if (!put(v)) return;
                 }
             }
             // An empty queue is an idle boundary: do not hold a short batch for the timer.
-            if (!write_log_batch(s, batch, batch_records)) return;
+            if (!write_log_batch(s, batch, batch_records)) { failed(); return; }
             unwritten -= batch_records;
             {
                 std::lock_guard<std::mutex> lock(s->queue_mu);
@@ -1282,10 +1356,10 @@ static bool start_log_output(probe_session *s) {
 
 static bool enqueue_log(probe_session *s, LogRecord &&record) {
     std::unique_lock<std::mutex> lock(s->queue_mu);
-    bool blocked = s->log_queue.size() >= probe_session::LOG_QUEUE_CAP && !s->writer_failed;
+    bool blocked = s->log_queue_records >= probe_session::LOG_QUEUE_CAP && !s->writer_failed;
     auto blocked_at = std::chrono::steady_clock::now();
     s->queue_writable.wait(lock, [s] {
-        return s->log_queue.size() < probe_session::LOG_QUEUE_CAP || s->writer_failed;
+        return s->log_queue_records < probe_session::LOG_QUEUE_CAP || s->writer_failed;
     });
     if (s->writer_failed) {
         s->controller_dropped.fetch_add(1, std::memory_order_relaxed);
@@ -1297,7 +1371,7 @@ static bool enqueue_log(probe_session *s, LogRecord &&record) {
         s->controller_dropped.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    ++s->logs_enqueued;
+    ++s->logs_enqueued; ++s->log_queue_records;
     lock.unlock();
     if (warned) warn_console_once(s);
     s->queue_readable.notify_one();
@@ -1308,24 +1382,28 @@ static bool enqueue_log(probe_session *s, LogRecord &&record) {
 // wake-up per chunk instead of per record -- per record, the wake-up of a writer that had just
 // emptied the queue was most of the controller's cost per inline log (the producers in the target
 // wait on that pipeline: the ring's backpressure). Same backpressure and accounting as enqueue_log;
-// `records` is left empty.
+// `records` is left empty. Entries may be packs (LogRecord::packed): the cap counts records, and
+// a pack goes in whole while the queue holds fewer than the cap.
 static void enqueue_logs(probe_session *s, std::vector<LogRecord> &records) {
     size_t i = 0;
     while (i < records.size()) {
         std::unique_lock<std::mutex> lock(s->queue_mu);
-        bool blocked = s->log_queue.size() >= probe_session::LOG_QUEUE_CAP && !s->writer_failed;
+        bool blocked = s->log_queue_records >= probe_session::LOG_QUEUE_CAP && !s->writer_failed;
         auto blocked_at = std::chrono::steady_clock::now();
         s->queue_writable.wait(lock, [s] {
-            return s->log_queue.size() < probe_session::LOG_QUEUE_CAP || s->writer_failed;
+            return s->log_queue_records < probe_session::LOG_QUEUE_CAP || s->writer_failed;
         });
         if (s->writer_failed) {
-            s->controller_dropped.fetch_add(records.size() - i, std::memory_order_relaxed);
+            uint64_t n = 0;
+            for (; i < records.size(); ++i) n += records_of(records[i]);
+            s->controller_dropped.fetch_add(n, std::memory_order_relaxed);
             break;
         }
         bool warned = blocked && std::chrono::steady_clock::now() - blocked_at >= std::chrono::seconds(1);
-        for (; i < records.size() && s->log_queue.size() < probe_session::LOG_QUEUE_CAP; ++i) {
-            try { s->log_queue.push_back(std::move(records[i])); ++s->logs_enqueued; }
-            catch (...) { s->controller_dropped.fetch_add(1, std::memory_order_relaxed); }
+        for (; i < records.size() && s->log_queue_records < probe_session::LOG_QUEUE_CAP; ++i) {
+            const size_t n = records_of(records[i]);
+            try { s->log_queue.push_back(std::move(records[i])); s->logs_enqueued += n; s->log_queue_records += n; }
+            catch (...) { s->controller_dropped.fetch_add(n, std::memory_order_relaxed); }
         }
         lock.unlock();
         if (warned) warn_console_once(s);
@@ -1379,7 +1457,7 @@ static void sym_unload(probe_session *s, uint64_t base) {
         drain_agent_logs(s);                               // inline records captured before the unload
         std::unique_lock<std::mutex> lock(s->queue_mu);
         s->queue_writable.wait(lock, [s] {
-            return s->log_queue.size() < probe_session::LOG_QUEUE_CAP || s->writer_failed;
+            return s->log_queue_records < probe_session::LOG_QUEUE_CAP || s->writer_failed;
         });
         if (!s->writer_failed) {
             try {
@@ -4017,6 +4095,10 @@ static bool open_agent_section(probe_session *s, uint32_t count) {
         if (DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), s->pi.hProcess, &dup, SYNCHRONIZE, FALSE, 0))
             s->shared->guard.controller_process = (LONG64)(uintptr_t)dup;
         s->guard_since = GetTickCount64();
+    }
+    if (!s->drain_event) {
+        wchar_t dn[64]; probe_agent_drain_name(s->pi.dwProcessId, dn);
+        s->drain_event = CreateEventW(nullptr, FALSE, FALSE, dn);   // auto-reset; none: the drainer polls
     }
     start_drainer(s);
     wchar_t svc[64]; probe_agent_service_name(s->pi.dwProcessId, svc);
@@ -7862,10 +7944,26 @@ static bool complete_remote_thread(probe_session *s, DWORD result) {
     return true;
 }
 
+// The agent request index -> probes[] index map (agent_map) as one drain pass sees it: an entry is
+// read under agent_mu the first time the pass needs it. A mapped entry never changes during a
+// session (indices are only assigned), so the copy is exact; an unmapped one is read again.
+struct AgentMapCache {
+    uint32_t map[PROBE_AGENT_MAX_PROBES];
+    AgentMapCache() { std::fill(std::begin(map), std::end(map), UINT32_MAX); }
+    uint32_t probe_of(probe_session *s, uint32_t index) {
+        if (index >= PROBE_AGENT_MAX_PROBES) return index;
+        if (map[index] == UINT32_MAX) {
+            std::lock_guard<std::mutex> map_lock(s->agent_mu);
+            map[index] = s->agent_map[index];
+        }
+        return map[index] != UINT32_MAX ? map[index] : index;
+    }
+};
+
 // One ring record (or a PROBE_IPC_LOG copy of one) -> the writer's queue. Never touches
 // s->probes (the debug loop may be growing it); does not hold agent_mu while a full stdout
 // queue applies backpressure.
-static void enqueue_agent_record(probe_session *s, const probe_agent_log &rec, std::vector<LogRecord> *batch) {
+static void enqueue_agent_record(probe_session *s, const probe_agent_log &rec) {
     // A callback's first record carries its hit's unaccounted unit: taken now, the hit is
     // accounted by this record (logs_written, or controller_dropped below), not as interrupted.
     if (s->shared) probe_agent_retire_carry(s->shared, rec);
@@ -7874,15 +7972,37 @@ static void enqueue_agent_record(probe_session *s, const probe_agent_log &rec, s
         uint32_t len = rec.text_len < PROBE_AGENT_LOG_TEXT_CAP ? rec.text_len : PROBE_AGENT_LOG_TEXT_CAP - 1;
         r.text.assign(rec.text, len);
         r.tid = rec.tid; r.has_stack = rec.has_stack != 0;
-        {
-            std::lock_guard<std::mutex> map_lock(s->agent_mu);
-            r.probe = rec.probe < PROBE_AGENT_MAX_PROBES && s->agent_map[rec.probe] != UINT32_MAX
-                          ? s->agent_map[rec.probe] : rec.probe;
-        }
+        AgentMapCache map;
+        r.probe = map.probe_of(s, rec.probe);
         uint32_t n = rec.frame_count > PROBE_STACK_MAX_FRAMES ? PROBE_STACK_MAX_FRAMES : rec.frame_count;
         r.frames.assign(rec.frames, rec.frames + n);
-        if (batch) batch->push_back(std::move(r));      // the caller enqueues the batch (enqueue_logs)
-        else enqueue_log(s, std::move(r));
+        enqueue_log(s, std::move(r));
+    } catch (...) {
+        s->controller_dropped.fetch_add(1, std::memory_order_relaxed);   // out of memory: count it, keep going
+    }
+}
+
+// A ring record appended to the drain pass's pack (LogRecord::packed): the same fields and
+// bounds as enqueue_agent_record, without a string and a queue entry per record.
+static void pack_agent_record(probe_session *s, const probe_agent_log &rec, std::vector<LogRecord> &batch,
+                              AgentMapCache &map) {
+    if (s->shared) probe_agent_retire_carry(s->shared, rec);
+    try {
+        if (batch.empty() || batch.back().packed >= LOG_PACK) {
+            batch.emplace_back();
+            batch.back().text.reserve(LOG_PACK * 96);
+        }
+        LogRecord &pack = batch.back();
+        LogPackHdr h;
+        h.len = rec.text_len < PROBE_AGENT_LOG_TEXT_CAP ? rec.text_len : PROBE_AGENT_LOG_TEXT_CAP - 1;
+        h.probe = map.probe_of(s, rec.probe);
+        h.tid = rec.tid;
+        h.has_stack = rec.has_stack != 0;
+        h.nframes = !h.has_stack ? 0 : rec.frame_count > PROBE_STACK_MAX_FRAMES ? PROBE_STACK_MAX_FRAMES : rec.frame_count;
+        pack.text.append(reinterpret_cast<const char *>(&h), sizeof(h));
+        pack.text.append(rec.text, h.len);
+        if (h.nframes) pack.text.append(reinterpret_cast<const char *>(rec.frames), (size_t)h.nframes * sizeof(uint64_t));
+        ++pack.packed;
     } catch (...) {
         s->controller_dropped.fetch_add(1, std::memory_order_relaxed);   // out of memory: count it, keep going
     }
@@ -7901,24 +8021,29 @@ static size_t drain_agent_logs(probe_session *s) {
     size_t moved = 0;
     std::lock_guard<std::mutex> consume(s->drain_mu);
     const LONG64 stop = sh->log_head;
-    // Records go to the writer in chunks (enqueue_logs), each before drain_mu is released: a
+    // Records go to the writer in packs (enqueue_logs), each before drain_mu is released: a
     // flush that drains first (report, unload, detach) still finds every record queued.
+    // log_tail (the header line every producer's claim CASes) is written once per pack and at the
+    // end of the pass, not per record: producers find free slots by their seq, and every reader of
+    // log_tail is this thread, holds drain_mu, or only waits for it to reach the head.
     std::vector<LogRecord> batch;
+    AgentMapCache map;
+    LONG64 tail = sh->log_tail;
     for (;;) {
-        LONG64 tail = sh->log_tail;
         if (tail >= stop) break;
         auto &rec = sh->logs[(uint64_t)tail % PROBE_AGENT_LOG_CAP];
         LONG64 seq = rec.seq;
         if (seq != tail + 1 && seq != -(tail + 1)) break;
         MemoryBarrier();
-        if (seq == tail + 1) enqueue_agent_record(s, rec, &batch);    // -(tail + 1): delivered past a stall already
+        if (seq == tail + 1) pack_agent_record(s, rec, batch, map);    // -(tail + 1): delivered past a stall already
         rec.owner = 0;
         MemoryBarrier();
         InterlockedExchange64(&rec.seq, tail + PROBE_AGENT_LOG_CAP);    // slot free again
-        sh->log_tail = tail + 1;
+        ++tail;
         ++moved;
-        if (batch.size() >= 256) enqueue_logs(s, batch);
+        if (!batch.empty() && batch.back().packed >= LOG_PACK) { sh->log_tail = tail; enqueue_logs(s, batch); }
     }
+    sh->log_tail = tail;
     enqueue_logs(s, batch);
     return moved;
 }
@@ -8010,19 +8135,37 @@ static void start_drainer(probe_session *s) {
         // then waited out the rest of the tick (profiles: producers yielding in agent_log behind
         // a sleeping drainer). After 50 ms without a record, back to Sleep(1) (no 2 kHz wakeups
         // on an idle target). No such timer (before Windows 10 1803): Sleep(1) throughout.
+        // After those 50 ms, with the agent holding the drain event, the drainer SLEEPS until a
+        // producer publishes (probe_agent_drain_wait) instead of polling every timer tick: the
+        // first record after a quiet spell reached stdout one tick (15.6 ms) late, and the idle
+        // drainer woke 64 times a second. It still wakes every IDLE_WAKE_MS (the heartbeat; a
+        // wake-up lost to anything unforeseen costs at most that).
+        constexpr DWORD IDLE_WAKE_MS = 100;
         HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
                                               TIMER_ALL_ACCESS);
+        auto *sh = s->shared;
         ULONGLONG last_record = GetTickCount64();
         while (!s->drain_stop.load(std::memory_order_relaxed)) {
-            InterlockedIncrement64(&s->shared->drain_beat);           // "controller alive"
+            InterlockedIncrement64(&sh->drain_beat);                  // "controller alive"
             if (drain_agent_logs(s)) { idle = 0; last_record = GetTickCount64(); continue; }
             check_ring_stall(s, stall);
             if (++idle < 64) { SwitchToThread(); continue; }
             LARGE_INTEGER due; due.QuadPart = -5000;                   // 0.5 ms, relative
-            if (timer && GetTickCount64() - last_record < 50 && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
+            if (timer && GetTickCount64() - last_record < 50 && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
                 WaitForSingleObject(timer, 1);   // never longer than Sleep(1) would have been
-            else
+            } else if (s->drain_event && sh->drain_wait.agent_ready && sh->log_head == sh->log_tail) {
+                // (Only an EMPTY ring sleeps: one stuck behind an unpublished slot keeps the
+                // Sleep(1) polling of check_ring_stall below.)
+                InterlockedExchange(&sh->drain_wait.waiting, 1);
+                // The ring once more AFTER announcing the sleep (a LOCKed store first, see
+                // probe_agent_drain_wait): a record claimed before it is seen here, one claimed after
+                // finds `waiting` set and signals.
+                if (sh->log_head == sh->log_tail && !s->drain_stop.load())
+                    WaitForSingleObject(s->drain_event, IDLE_WAKE_MS);
+                InterlockedExchange(&sh->drain_wait.waiting, 0);
+            } else {
                 Sleep(1);
+            }
         }
         if (timer) CloseHandle(timer);
     });
@@ -8130,7 +8273,9 @@ static void stop_drainer(probe_session *s) {
         InterlockedExchange(&s->shared->controller_gone, 1);   // producers stop waiting
     }
     if (!s->drainer.joinable()) { drain_final(s); return; }
-    s->drain_stop = true; s->drainer.join();
+    s->drain_stop = true;
+    if (s->drain_event) SetEvent(s->drain_event);   // a sleeping drainer (probe_agent_drain_wait)
+    s->drainer.join();
     drain_final(s);
 }
 
@@ -8895,6 +9040,7 @@ extern "C" void probe_close(probe_session *s) {
     if (s->sym_ready) uhh_sym::cleanup(s->pi.hProcess);
     if (s->remote_thread) CloseHandle(s->remote_thread);
     if (s->svc_event) CloseHandle(s->svc_event);
+    if (s->drain_event) CloseHandle(s->drain_event);
     if (s->remote_path && s->pi.hProcess) VirtualFreeEx(s->pi.hProcess, s->remote_path, 0, MEM_RELEASE);
     if (s->shared) UnmapViewOfFile(s->shared);
     if (s->mapping) CloseHandle(s->mapping);

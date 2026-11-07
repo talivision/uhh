@@ -1,4 +1,4 @@
-// tp_driver --backend breakpoint|hw|inline --mode noop|log|mem|sys|callfn|co
+// tp_driver --backend breakpoint|hw|inline --mode noop|log|mem|sys|callfn|co|fpu
 //           [--probes add,i64,...] -- tp_target.exe [--iters N] [--spawn]
 // Transparency fixture (regress `transparency`): probes tp_target's functions and its
 // mid-function site with ONE callback (tp_callbacks.cpp) in the given mode, runs the target,
@@ -31,7 +31,7 @@ static const Site kSites[] = {
     {"align", "tp_align", 1, 0, 0}, {"fact", "tp_fact", 1, 0, 0}, {"mid", "TpMidHit", 0, 0, 0},
     {"spawn", "tp_spawn", 2, 0, 1}, {"thread", "tp_threadfn", 1, 1, 0}, {"peek", "tp_peek", 1, 0, 0}, {"ovf", "tp_ovf", 1, 0, 2}};
 #endif
-static const char *kModes[] = {"noop", "log", "mem", "sys", "callfn", "co"};
+static const char *kModes[] = {"noop", "log", "mem", "sys", "callfn", "co", "fpu"};
 
 int main(int argc, char **argv) {
     uint32_t bk = 0, mode = UINT32_MAX;

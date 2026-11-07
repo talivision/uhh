@@ -3,7 +3,7 @@
 ;   TpOut: rax +0, rdx +8, xmm0 +10h, nv +20h (ebx ebp esi edi as qwords), sp_delta +100h,
 ;          flags +108h, st0 +110h, fsw +118h, ftw +11Ch
 ;   TpMidOut: gpr[15] +0 (eax ebx ecx edx esi edi ebp as qwords), flags +78h, xmm[8] +80h,
-;             FNSAVE image +180h, YMM0-7 upper halves +1F0h
+;             FNSAVE image +180h, MXCSR +1ECh, YMM0-7 upper halves +1F0h
 .686
 .xmm
 .model flat
@@ -24,6 +24,9 @@ FpVals  dq 3FF0000000000000h, 4000000000000000h, 4008000000000000h, 401000000000
         dq 4014000000000000h, 4018000000000000h, 401C000000000000h, 4020000000000000h
 FpCw    dw 027Fh
 FpCwMid dw 0E7Fh
+ALIGN 4
+MxMid   dd 0FF80h                  ; MXCSR at the site: round toward zero, FTZ, DAZ
+g_mxsv  dd 0
 ALIGN 4
 g_fn    dd 0
 g_in    dd 0
@@ -116,6 +119,8 @@ MIDPRE MACRO
     push edi
     mov eax, [esp+20]
     mov [g_mout], eax
+    stmxcsr dword ptr [g_mxsv]
+    ldmxcsr dword ptr [MxMid]
     fninit
     fldcw word ptr [FpCwMid]
     fld qword ptr [FpVals+00h]
@@ -186,6 +191,8 @@ MIDPOST MACRO
     vextractf128 xmmword ptr [eax+250h], ymm6, 1
     vextractf128 xmmword ptr [eax+260h], ymm7, 1
     vzeroupper
+    stmxcsr dword ptr [eax+1ECh]
+    ldmxcsr dword ptr [g_mxsv]
     fnsave [eax+180h]
     fldcw word ptr [FpCw]
     pop edi

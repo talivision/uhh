@@ -1997,7 +1997,7 @@ def check_sidefx(iters=1000, threads=4):
             record(name, False, repr(e))
 
 
-TP_MODES = ("noop", "log", "mem", "sys", "callfn", "co")
+TP_MODES = ("noop", "log", "mem", "sys", "callfn", "co", "fpu")
 TP_PROBES = ("add", "i64", "dbl", "dblarg", "seterr", "std", "align", "fact", "mid", "spawn", "thread", "peek", "ovf")
 
 

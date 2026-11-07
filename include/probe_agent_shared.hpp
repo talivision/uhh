@@ -11,7 +11,7 @@
 #include <intrin.h>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 25;   /* 25: per-thread hit blocks (tblocks); 24: huntaudit early_init (on top of 23: runfix1 log carry + running count; 21: held_floor) */
+constexpr uint32_t PROBE_AGENT_VERSION = 26;   /* 26: tblock retired on a line of its own, drain wake-up (drain_wait); 25: per-thread hit blocks (tblocks); 24: huntaudit early_init (on top of 23: runfix1 log carry + running count; 21: held_floor) */
 constexpr uint32_t PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH = 1u << 9;   /* agent side only needs this one */   /* == PROBE_UNSAFE_FAST_PATCH (asserted in session.cpp) */
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 128;   /* inline probes per session; the 129th is refused */
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
@@ -185,7 +185,9 @@ struct alignas(64) probe_agent_stripe { volatile LONG64 value; volatile LONG64 r
             or their first record was dropped (one store, made when that happens);
    running  1 while the owner runs a callback (detach / unhook drains wait for 0);
    retired  written ONLY by the controller: carried first records it took (log_carry names
-            the block, probe_agent_log::reserved = index + 1).
+            the block, probe_agent_log::reserved = index + 1). On a cache line of its own (v26):
+            beside `running` (two owner stores per hit) every carried record the controller took
+            pulled the owner's hot line to the controller's core and back.
    Unaccounted hits of a block = sum(hits) - done - retired: a callback that has neither ended
    unlogged nor had its carried record taken -- exactly the stripes' high bits. A thread killed
    at any instant leaves hits == logs + dropped + unaccounted, as before. 64-bit fields are
@@ -195,9 +197,23 @@ struct alignas(64) probe_agent_tblock {
     volatile LONG owner;           /* agent bookkeeping: the owner's tid (0 free) */
     volatile LONG running;
     volatile LONG64 done;
+    char pad[48];
     volatile LONG64 retired;
-    char pad[40];
+    char pad2[56];
     volatile LONG64 hits[PROBE_AGENT_MAX_PROBES];
+};
+/* Waking an idle drainer (v26). After a quiet spell the controller's drainer stops polling the
+   ring and sleeps on an auto-reset event (probe_agent_drain_name): it sets `waiting`, looks at the
+   ring once more, and waits. A producer that published a record and sees `waiting` takes it
+   (exchange 1 -> 0: one wake-up per sleep, however many producers) and signals the event. Each
+   side writes its flag with a LOCKed instruction before reading the other's (the producer's is the
+   head CAS of its claim), so either the drainer sees the claimed record or the producer sees it
+   waiting. `agent_ready`: the agent holds the event (else the drainer keeps polling). On a line of
+   its own: producers read `waiting` with every record; it is written only around a sleep. */
+struct alignas(64) probe_agent_drain_wait {
+    volatile LONG waiting;
+    volatile LONG agent_ready;
+    char pad[56];
 };
 inline LONG64 probe_agent_load64(const volatile LONG64 *p) {
 #if defined(_WIN64)
@@ -256,6 +272,7 @@ struct probe_agent_shared {
        its service thread (it reports itself ready once it runs). */
     volatile LONG early_init;
     probe_agent_tblock tblocks[PROBE_AGENT_TBLOCKS];   /* v25: per-thread hit accounting (see probe_agent_tblock) */
+    probe_agent_drain_wait drain_wait;                 /* v26: wake an idle drainer (see probe_agent_drain_wait) */
 };
 
 constexpr LONG64 PROBE_AGENT_INFLIGHT_ONE = 1LL << 48;   /* one unaccounted hit in a hit_stripes cell */
@@ -354,4 +371,7 @@ inline void probe_agent_mapping_name(DWORD pid, wchar_t (&name)[64]) {
    another thread holds the loader lock (e.g. one stopped at a LOAD_DLL event). */
 inline void probe_agent_service_name(DWORD pid, wchar_t (&name)[64]) {
     _snwprintf_s(name, _countof(name), _TRUNCATE, L"Local\\probe_api_svc_%lu", pid);
+}
+inline void probe_agent_drain_name(DWORD pid, wchar_t (&name)[64]) {
+    _snwprintf_s(name, _countof(name), _TRUNCATE, L"Local\\probe_api_drain_%lu", pid);
 }

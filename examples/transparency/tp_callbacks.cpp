@@ -7,18 +7,67 @@
 #include <windows.h>
 #include "probe_api.h"
 #include <stdint.h>
+#include <intrin.h>
+#include <immintrin.h>
 
 #define TP_CB extern "C" __declspec(dllexport)
 
 // entry: 1 = the probe is at a function entry (call_original must work), 0 = the mid-function
 // site (call_original must be refused there: the one deliberately unsupported place).
 struct tp_cfg { uint32_t mode, nargs, pop, backend, entry; char module[48]; };   // module: the target's image (tp_target.exe / tp_target_cet.exe)
-enum { TP_NOOP, TP_LOG, TP_MEM, TP_SYS, TP_CALLFN, TP_CO };
+enum { TP_NOOP, TP_LOG, TP_MEM, TP_SYS, TP_CALLFN, TP_CO, TP_FPU };
 
 // x86: a double comes back in ST0 -- the callback's own x87 traffic.
 static __declspec(noinline) double tp_cb_math(double x) { return x * 1.5 + 0.125; }
 
 typedef LONG(NTAPI *NtQSI_t)(ULONG, void *, ULONG, ULONG *);
+
+// Mode fpu: floating-point work that changes every piece of extended state a callback can reach,
+// and leaves it changed -- a callback's FP code must not be visible to the program (at the
+// mid-function site: a FULL x87 stack, a pending FCOM result, a non-default x87 control word and
+// MXCSR, live YMM upper halves). x86: x87 pushes onto that full stack (overflow: IE/SF set, a NaN
+// pushed), a new control word, a compare, FCLEX. Both: MXCSR set to round-toward-zero + FTZ/DAZ
+// and SSE math; with AVX, 256-bit math (YMM upper halves written) and VZEROUPPER. (x64 code has
+// no x87 here: MSVC does not emit it on x64 and the agent does not keep x87 for x64 callbacks.)
+static bool tp_have_avx() {
+    int r[4];
+    __cpuid(r, 1);
+    return (r[2] & (1 << 28)) && (r[2] & (1 << 27)) && (_xgetbv(0) & 6) == 6;
+}
+static __declspec(noinline) double tp_fpu_work(double x) {
+    double out = x;
+#if !defined(_WIN64)
+    unsigned short cw = 0x0C7F;           // round toward zero, 64-bit precision, all masked
+    __asm {
+        fldcw cw
+        fld1
+        fldpi
+        fdivp st(1), st
+        fsqrt
+        fldz
+        fcomp st(1)
+        fstp out
+        fclex
+        fld1
+        fld1
+        faddp st(1), st
+        fstp st(0)
+    }
+#endif
+    _mm_setcsr((_mm_getcsr() & ~0x6000u) | 0x6000u | 0x8040u);   // RZ, FTZ, DAZ: left so
+    __m128d v = _mm_set_pd(out, 1e-310);
+    v = _mm_mul_pd(v, _mm_set1_pd(0.5));
+    out = _mm_cvtsd_f64(_mm_add_sd(v, _mm_unpackhi_pd(v, v)));
+    static const bool avx = tp_have_avx();
+    if (avx) {
+        __m256d a = _mm256_set_pd(out, 2.0, 3.0, 4.0);
+        a = _mm256_mul_pd(a, a);
+        __m256d b = _mm256_permute2f128_pd(a, a, 1);
+        out += _mm_cvtsd_f64(_mm256_castpd256_pd128(_mm256_add_pd(a, b)));
+        _mm256_zeroupper();
+    }
+    return out;
+}
 
 TP_CB void tp_on_hit(probe_context *c) {
     const tp_cfg *k = (const tp_cfg *)get_config(c);
@@ -84,6 +133,11 @@ TP_CB void tp_on_hit(probe_context *c) {
             send_log(c, "tp FAIL call_original refused at a function entry");
         }
         return;                          // refused at the mid-function site: falls through
+    }
+    case TP_FPU: {
+        volatile double v = tp_fpu_work((double)(get_reg(c, PROBE_REG_SP) & 0xFF));
+        (void)v;
+        return;
     }
     default:
         send_log(c, "tp FAIL mode %u", k->mode);
