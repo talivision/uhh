@@ -2256,7 +2256,18 @@ Each claim was checked with a regress check that FAILED on 0fb6cee (same tests, 
    side by side at the same time (VM, uhh_trace breakpoint on logstream_target, 40 runs each, event -> stdout): 0fb6cee
    2 runs over 100 ms (records #8-#11 at 430/320/211/102 ms; #8-#10 at 321/212/102 ms) and 10 more at 7-43 ms; the fix:
    worst 1.2 ms over all 40 runs. `--only stream_latency` 20 times per arch on the fix (light pool): x64 80/80, x86
-   80/80 PASS, worst p99 13.4 / 15.4 ms.
+   80/80 PASS, worst p99 13.4 / 15.4 ms. Throughput kept (bench/perfab/perf_ab.py, x64 VM, 0fb6cee vs the fix,
+   3 interleaved rounds on a shared VM): sink/inline nul 3.84M -> 3.89M logs/s, file 3.39M -> 3.52M, pipe 1.77M ->
+   1.85M (all ~); latency/{inline,hw,breakpoint}/idle p99 0.97/1.03/1.00 -> 0.36/0.61/0.41 ms (gain); live/*/load,
+   launch, gated ns/read ~. Two rows flagged (attach/hw/idle detach_ms +5.8%, gated/inline wall_ms +10.9% -- gated/base,
+   which UHH does not touch, moved +10.3% in the same rounds) did not reproduce in a 6-round re-run (-2.8%, -33.5%).
+   The appender's queue holds at most 1 MB and recycles its chunks: with fresh 64 KB copies (16 MB, then 2 MB cap) CI
+   x86 stream-volume-inline peaked 18-19 MB at 2M and 24 MB at 20M (flat=False) -- but 0fb6cee itself flakes there on
+   the VM (x64: 14 -> 22 MB in one of four runs; x86 22-23 -> 23): one 2M run does not always reach the pipeline's
+   plateau. The check now takes the larger of two 2M runs and allows max(1.2x, +8 MB) (a leak of 0.5 B/record still
+   fails it).
+
+CI full suite on 9efd83c (run 42388653548): 2109/2109, all shards green (x64 + x86, windows-2022, and cet-hw).
 
 ## Real-world cases
 - ✅ Microsoft Detours samples replicated (`examples/famous/detours_*`: simple, traceapi, withdll/attach, retval) -- findings above
