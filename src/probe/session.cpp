@@ -6785,13 +6785,19 @@ static int32_t ipc_freeze(probe_session *s, DWORD self, uint64_t mask) {
 static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
     auto &ex = event.u.Exception.ExceptionRecord;
     if (!s->shared || ex.NumberParameters < 1) return false;
+    // Every request the agent raises is a whole probe_ipc_request: one read for all of it (a
+    // read per field was a ReadProcessMemory each); the head alone only if that fails.
+    probe_ipc_request whole{}; size_t whole_n = 0;
+    const bool have_whole = remote_read(s->pi.hProcess, (uint64_t)ex.ExceptionInformation[0], &whole, sizeof(whole), &whole_n) &&
+                            whole_n == sizeof(whole);
     {
-        probe_ipc_request head{}; size_t n = 0;
-        if (remote_read(s->pi.hProcess, (uint64_t)ex.ExceptionInformation[0], &head, offsetof(probe_ipc_request, address), &n) &&
-            n == offsetof(probe_ipc_request, address) && (head.op == PROBE_IPC_FREEZE || head.op == PROBE_IPC_THAW)) {
+        probe_ipc_request head = whole; size_t n = have_whole ? offsetof(probe_ipc_request, address) : 0;
+        if (!have_whole) remote_read(s->pi.hProcess, (uint64_t)ex.ExceptionInformation[0], &head, offsetof(probe_ipc_request, address), &n);
+        if (n == offsetof(probe_ipc_request, address) && (head.op == PROBE_IPC_FREEZE || head.op == PROBE_IPC_THAW)) {
             if (trace_enabled()) std::fprintf(stderr, "  ipc op=%u tid=%lu (freeze/thaw) t=%llu\n", head.op, (unsigned long)event.dwThreadId, (unsigned long long)GetTickCount64());
-            uint64_t mask = 0; size_t m = 0;
-            remote_read(s->pi.hProcess, (uint64_t)ex.ExceptionInformation[0] + offsetof(probe_ipc_request, address), &mask, sizeof(mask), &m);
+            uint64_t mask = whole.address; size_t m = have_whole ? sizeof(mask) : 0;
+            if (!have_whole)
+                remote_read(s->pi.hProcess, (uint64_t)ex.ExceptionInformation[0] + offsetof(probe_ipc_request, address), &mask, sizeof(mask), &m);
             if (head.op == PROBE_IPC_THAW) { if (s->ipc_freezer == event.dwThreadId) ipc_thaw(s); return true; }
             int32_t result = ipc_freeze(s, event.dwThreadId, m == sizeof(mask) ? mask : 0);
             // Test hook (regress lifecycle-killed-in-freeze): stall with an install's FREEZE taken
@@ -6838,8 +6844,8 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
         }
     }
     uint64_t at = (uint64_t)ex.ExceptionInformation[0];
-    probe_ipc_request req{}; size_t got = 0;
-    if (!remote_read(s->pi.hProcess, at, &req, sizeof(req), &got) || got != sizeof(req)) return false;
+    if (!have_whole) return false;
+    const probe_ipc_request req = whole;
     // The name, symbol and config are read from the (stopped) calling thread's memory.
     auto fetch = [&](uint64_t from, uint64_t len, uint64_t cap, void *to) {
         size_t n = 0;
@@ -6890,7 +6896,10 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
     else if (req.op == PROBE_IPC_ADD_SYMBOL)
         result = probe_add_symbol_cfg(s, req.symbol ? symbol.c_str() : nullptr, cb, req.flags,
                                       config.empty() ? nullptr : config.data(), config.size());
-    std::fprintf(stderr, "probe: ipc op=%u from inline site %u cb=%s -> %d\n", req.op, req.origin_site, name.c_str(), result);
+    // Failures only (or traced): the added probe's own "probe: active"/"pending" line says the
+    // rest, and a line per successful add was a console write per dynamic add.
+    if (result != 1 || trace_enabled())
+        std::fprintf(stderr, "probe: ipc op=%u from inline site %u cb=%s -> %d\n", req.op, req.origin_site, name.c_str(), result);
     size_t wrote = 0;
     remote_write(s->pi.hProcess, at + offsetof(probe_ipc_request, result), &result, sizeof(result), &wrote);
     return true;
