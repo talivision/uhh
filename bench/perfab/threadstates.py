@@ -34,8 +34,8 @@ def threads_of(raw, pid):
             for i in range(nthr):
                 t = off + 0x100 + i * 0x50
                 tid = struct.unpack_from("<Q", raw, t + 0x30)[0]
-                state, reason = struct.unpack_from("<II", raw, t + 0x44)
-                out[tid] = (state, reason)
+                cs, state, reason = struct.unpack_from("<III", raw, t + 0x40)
+                out[tid] = (state, reason, cs)
             return out
         if not nxt:
             return {}
@@ -77,10 +77,15 @@ def main():
     grew = collections.Counter(); windows = collections.Counter(); dcyc = collections.Counter()
     dut = collections.Counter(); dkt = collections.Counter()
     prev = {}
+    cs_first, cs_last = {}, {}
     t_end = time.time() + a.seconds
     while time.time() < t_end:
-        for tid, (st, wr) in threads_of(sysproc(), pid).items():
+        for tid, (st, wr, cs) in threads_of(sysproc(), pid).items():
             states[tid][f"{STATES.get(st, st)}/{wr}"] += 1
+            if tid in cs_first:
+                cs_last[tid] = cs
+            else:
+                cs_first[tid] = cs; cs_last[tid] = cs
             c = cycles(tid)
             if c and tid in prev and c[0] is not None and prev[tid][0] is not None:
                 windows[tid] += 1
@@ -95,7 +100,8 @@ def main():
     for tid in sorted(states):
         n = windows[tid] or 1
         print(f"tid {tid}: windows={windows[tid]} cycles/window={dcyc[tid] / n:,.0f} grew={grew[tid]}/{windows[tid]} "
-              f"user_ms={dut[tid] / 1e4:.1f} kernel_ms={dkt[tid] / 1e4:.1f} states={dict(states[tid].most_common(4))}")
+              f"user_ms={dut[tid] / 1e4:.1f} kernel_ms={dkt[tid] / 1e4:.1f} cs+={cs_last.get(tid, 0) - cs_first.get(tid, 0)} "
+              f"states={dict(states[tid].most_common(4))}")
 
 
 if __name__ == "__main__":

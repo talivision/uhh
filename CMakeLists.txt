@@ -355,6 +355,8 @@ add_executable(lifecycle_bench bench/perfab/lifecycle_bench.cpp bench/hitcost/hi
 target_include_directories(lifecycle_bench PRIVATE include)
 target_link_libraries(lifecycle_bench PRIVATE probe_api)
 add_dependencies(lifecycle_bench hitcost_target probe_api_agent)
+add_executable(mindbg bench/perfab/mindbg.cpp)   # the external hw-probe floor (bench/perfab)
+add_dependencies(mindbg hitcost_target)
 
 # --- streaming logs: visible latency and per-thread ordering --------------------------
 add_executable(logstream_target examples/targets/logstream/logstream_target.c)

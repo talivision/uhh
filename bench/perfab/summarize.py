@@ -17,6 +17,7 @@ MATERIAL_PCT = 5.0    # a non-overlapping difference smaller than this is report
 METRICS = {
     "hit": [("ns_per_call", "lo", "ns/call"), ("hits_per_s", "hi", "hits/s")],
     "spin": [("ns_per_call", "lo", "ns/call"), ("spin_per_us", "hi", "spins/us")],
+    "waiter": [("ns_per_call", "lo", "ns/call"), ("wait_share", "hi", "timeouts done / due")],
     "mt": [("hits_per_s", "hi", "hits/s")],
     "sink": [("logs_per_s", "hi", "logs/s")],
     "latency": [("p50_ms", "lo", "ms"), ("p99_ms", "lo", "ms")],

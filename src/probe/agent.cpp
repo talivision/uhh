@@ -105,7 +105,12 @@ static void forget_region() { if (RegionCache *cache = region_cache()) *cache = 
 struct PatchShadow { volatile uintptr_t lo; uint32_t len; uint8_t bytes[32]; };
 static PatchShadow g_shadow[PROBE_AGENT_MAX_PROBES];
 static volatile LONG g_shadow_count;
+// Every shadow published lies in [g_shadow_min, g_shadow_max) (it only widens): a read outside
+// it -- the hit's own stack, a heap buffer: get_func_arg on x86 on every hit -- skips the scan of
+// the 128 slots (x86 hit with two stack arguments read: measured ~360 ns, most of it here).
+static volatile uintptr_t g_shadow_min = ~(uintptr_t)0, g_shadow_max = 0;
 static void overlay_original(uintptr_t a, void *buffer, size_t n) {
+    if (a >= g_shadow_max || a + n <= g_shadow_min) return;
     for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i) {
         const uintptr_t lo = g_shadow[i].lo;
         if (!lo || !shared || shared->requests[i].status != PROBE_AGENT_INSTALLED) continue;
@@ -1616,10 +1621,19 @@ static void load_regs(probe_regs &r, const safetyhook::Context &native) {
 // x87_post (x86): a 108-byte buffer owned by the caller; returns true when it holds the x87
 // state return_from must leave (an ST0 result of call_original), to reload after any
 // extended-state restore.
+// Every field set below, none zero-filled first (a memset of the whole context per hit showed
+// on x86): orig_pop must stay the last field, or a new one would be left uninitialised here.
+static_assert(sizeof(probe_context) - (offsetof(probe_context, orig_pop) + sizeof(int32_t)) < 8,
+              "call_mid initialises probe_context field by field: add the new field there");
 static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char *x87_post) {
-    probe_context c{};
+    probe_context c;
     load_regs(c.regs, native);
+#if !defined(_WIN64)
+    c.regs.r8 = c.regs.r9 = c.regs.r10 = c.regs.r11 = c.regs.r12 = c.regs.r13 = c.regs.r14 = c.regs.r15 = 0;
+#endif
     c.regs.pc = sites[index]; c.hit_sp = c.regs.rsp;
+    c.backend = nullptr; c.ret_pop = 0; c.called_original = 0; c.returned = 0; c.hit_scope = nullptr;
+    c.orig_edx = 0; c.orig_pop = 0;
     const auto &request = shared->requests[index];
     c.config = !request.config_len ? nullptr
              : request.config_len > PROBE_AGENT_CONFIG_CAP ? (void *)(uintptr_t)request.config_remote : (void *)request.config;
@@ -1833,6 +1847,24 @@ static __declspec(noinline) bool mid_entry_fx(safetyhook::Context &native, uint3
     return x87;
 }
 
+#if !defined(_WIN64)
+// x86 bench knob (xstate_mode 5, UHH_BENCH_XSTATE=fnsave): the x87 state by FNSAVE / FRSTOR
+// (108 bytes, x87 only; FNSAVE leaves the FPU initialised, so the program's control word is put
+// back for the callback), MXCSR by hand; AVX state, when live, by XSAVE as usual.
+static __declspec(noinline) bool mid_entry_fnsave(safetyhook::Context &native, uint32_t index, unsigned char *x87_post) {
+    unsigned char st[108]; unsigned char *p = st;
+    __asm { mov eax, p
+            fnsave [eax]
+            fldcw word ptr [eax] }                          // the program's CW (first word of the image)
+    unsigned int mxcsr = _mm_getcsr();
+    const bool x87 = call_mid(native, index, x87_post);
+    _mm_setcsr(mxcsr);
+    __asm { mov eax, p
+            frstor [eax] }
+    return x87;
+}
+#endif
+
 // Regress knob (xstate_mode 3, UHH_BENCH_XSTATE=noxsave): the no-XSAVE fallback on a CPU that
 // HAS AVX. A CPU without OSXSAVE has no AVX state at all; this one does, so the AVX components
 // alone are kept by XSAVE around the fallback, which is then tested for what it is responsible
@@ -1870,6 +1902,25 @@ static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
         else if (g_xs.xinuse) mask = _xgetbv(1) & g_xs.avx_mask;  // only components actually live
         else mask = g_xs.avx_mask;                         // liveness unknown: keep AVX state
     }
+#if !defined(_WIN64)
+    // Bench knobs, x86: 4 = x87 + MXCSR by FXSAVE, 5 = by FNSAVE (when no AVX state is live).
+    if ((xmode == 4 || xmode == 5) && !(mask & ~1ull)) {
+        x87 = xmode == 4 ? mid_entry_fx(native, index, x87_post) : mid_entry_fnsave(native, index, x87_post);
+        if (x87) x87_restore(x87_post);
+        return;
+    }
+#endif
+#if !defined(_WIN64)
+    // x86, only the x87 state live (the usual case: Windows' x87 control word is not the INIT
+    // one, so XINUSE always reports it): FXSAVE / FXRSTOR keeps exactly what XSAVE's x87
+    // component would (plus MXCSR and XMM0-7, which the hook stub reloads anyway) -- measured
+    // ~20 ns a hit cheaper than XSAVEC / XRSTOR into the save area (154 vs 174 ns).
+    if (xmode == 0 && mask == 1) {
+        x87 = mid_entry_fx(native, index, x87_post);
+        if (x87) x87_restore(x87_post);
+        return;
+    }
+#endif
     if (xmode == 1) x87 = call_mid(native, index, x87_post);
     else if (xmode == 3 && g_xs.ok && (g_xs.mask & 0xE4ull))
         x87 = mid_entry_noxsave_sim(native, index, g_xs.mask & 0xE4ull, x87_post);
@@ -2210,6 +2261,11 @@ static void install_pending_locked() {
             if (ok && !g_shadow[i].lo && orig.size() <= sizeof(g_shadow[i].bytes)) {
                 std::memcpy(g_shadow[i].bytes, orig.data(), orig.size());
                 g_shadow[i].len = (uint32_t)orig.size();
+                {                                            // widen the bounds BEFORE the shadow is visible
+                    const uintptr_t lo = hooks[i].target_address(), hi = lo + orig.size();
+                    if (lo < g_shadow_min) g_shadow_min = lo;
+                    if (hi > g_shadow_max) g_shadow_max = hi;
+                }
                 MemoryBarrier();
                 g_shadow[i].lo = hooks[i].target_address();
                 InterlockedIncrement(&g_shadow_count);
