@@ -93,21 +93,23 @@ probe: pending configparse.dll!ParseConfig+0x16
 probe: pending ntdll.dll!NtOpenProcess
 probe: pending ntdll.dll!NtClose
 probe: pending ntdll.dll!NtReadVirtualMemory
-probe: logs -> C:\Users\admin\AppData\Local\Temp\uhh\logs\uhh-10384-0.jsonl
+probe: logs -> C:\Users\admin\AppData\Local\Temp\uhh\logs\uhh-24300-0.jsonl
 probe: symbols via C:\Windows\system32\dbghelp.dll
-probe: resolved ntdll.dll!NtOpenProcess -> base=0x7ffe2e050000 addr=0x7ffe2e0eda50 (awaiting agent)
-probe: resolved ntdll.dll!NtClose -> base=0x7ffe2e050000 addr=0x7ffe2e0ed770 (awaiting agent)
-probe: resolved ntdll.dll!NtReadVirtualMemory -> base=0x7ffe2e050000 addr=0x7ffe2e0edd70 (awaiting agent)
-probe: holding thread 9732 until inline installs confirm
-probe: active ntdll.dll!NtOpenProcess -> addr=0x7ffe2e0eda50 (inline)
-probe: active ntdll.dll!NtClose -> addr=0x7ffe2e0ed770 (inline)
-probe: active ntdll.dll!NtReadVirtualMemory -> addr=0x7ffe2e0edd70 (inline)
+probe: resolved ntdll.dll!NtOpenProcess -> base=0x7ffce01f0000 addr=0x7ffce028da50 (awaiting agent)
+probe: resolved ntdll.dll!NtClose -> base=0x7ffce01f0000 addr=0x7ffce028d770 (awaiting agent)
+probe: resolved ntdll.dll!NtReadVirtualMemory -> base=0x7ffce01f0000 addr=0x7ffce028dd70 (awaiting agent)
+probe: active ntdll.dll!NtOpenProcess -> addr=0x7ffce028da50 (inline)
+probe: active ntdll.dll!NtClose -> addr=0x7ffce028d770 (inline)
+probe: active ntdll.dll!NtReadVirtualMemory -> addr=0x7ffce028dd70 (inline)
+probe: holding thread 21100 until inline installs confirm
 probe: released 1 held thread(s) (inline installs confirmed)
-probe: active configparse.dll!ParseConfig+0x16 -> base=0x7ffe28950000 addr=0x7ffe28951116 (was 0x89, len=2, displaced)
+probe: active configparse.dll!ParseConfig+0x16 -> base=0x7ffcd5990000 addr=0x7ffcd5991116 (was 0x89, len=2, displaced)
 ```
 
 The flag probe stays `pending` until `probe_app` loads `configparse.dll`; it arms at that
-load. Inline probes become `active` once the injected agent confirms each hook.
+load. Inline probes become `active` once the injected agent confirms each hook (on a launch
+at the loader breakpoint, before any DLL initialiser runs); the main thread is then held at
+the entry point until the agent's service thread is up.
 
 **stdout** (`run.jsonl`) holds the target's own lines and the `probe_log` records,
 interleaved as they reach UHH (inline records travel through a ring the controller drains,
@@ -115,24 +117,22 @@ so the target's `app` line can arrive before the last `read` logs), then the rep
 by `probe_report` (captured on x64, 823 lines, trimmed):
 
 ```text
-{"kind":"helper","index":0,"pid":10152,"base":140700647678496,"size":256}
+{"kind":"helper","index":0,"pid":18388,"base":140696029979200,"size":256}
 ...
-{"kind":"waiting","pid":8684,"helpers":4}
-{"kind":"opened","pid":10152,"handle":320}
+{"kind":"waiting","pid":12124,"helpers":4}
 ...
-{"kind":"probe_log","probe":1,"tid":9732,"message":"open pid=10152 name=probe_app.exe"}
-{"kind":"probe_log","probe":1,"tid":9732,"message":"map handle=0x140 -> pid=10152 name=probe_app.exe"}
+{"kind":"probe_log","probe":1,"tid":21100,"message":"open pid=18388 name=probe_app.exe","seq":0}
+{"kind":"probe_log","probe":1,"tid":21100,"message":"map handle=0xf0 -> pid=18388 name=probe_app.exe","seq":1}
 ...
-{"kind":"probe_log","probe":3,"tid":2012,"message":"read handle=0x140 pid=10152 name=probe_app.exe addr=0x7ff76c1fe220 size=16"}
+{"kind":"probe_log","probe":3,"tid":3744,"message":"read handle=0xf0 pid=18388 name=probe_app.exe addr=0x7ff658e362c0 size=16","seq":8}
 ...
-{"kind":"app","reads_enabled":1,"helpers":4,"opened":4,"threads":4,"reads_per_thread":200,"successful_reads":800,"checksum":76800,"elapsed_ns":3260700,"prehook":false,"prehook_calls":0,"configparse_base":140729579274240,"shadow_stack":false}
-{"kind":"probe_log","probe":3,"tid":2420,"message":"read handle=0x148 pid=10004 name=probe_app.exe addr=0x7ff76c1fe260 size=16"}
+{"kind":"app","reads_enabled":1,"helpers":4,"opened":4,"threads":4,"reads_per_thread":200,"successful_reads":800,"checksum":76800,"elapsed_ns":2015200,"prehook":false,"prehook_calls":0,"configparse_base":140723892060160,"shadow_stack":false,"rounds":1}
 ...
 {"kind":"probe","location":"configparse.dll!ParseConfig+0x16","backend":"breakpoint","active":true,"hits":1}
 {"kind":"probe","location":"ntdll.dll!NtOpenProcess","backend":"inline","active":true,"hits":4}
 {"kind":"probe","location":"ntdll.dll!NtClose","backend":"inline","active":true,"hits":77}
 {"kind":"probe","location":"ntdll.dll!NtReadVirtualMemory","backend":"inline","active":true,"hits":800}
-{"kind":"probe_report","probes":4,"active":4,"hits":882,"overrides":1,"log_dropped":0,"callbacks_interrupted":0,"logs_written":808,"controller_peak_ws_mb":14,"app_exit":0,"live_output_closed":false,"error":null}
+{"kind":"probe_report","probes":4,"active":4,"hits":882,"overrides":1,"log_dropped":0,"callbacks_interrupted":0,"logs_written":808,"controller_peak_ws_mb":23,"app_exit":0,"live_output_closed":false,"stdout_logs":808,"live_output_error":null,"error":null}
 ```
 
 What to check:
@@ -143,6 +143,8 @@ What to check:
   (`logs_written` 808 = 800 reads + 4 `open` + 4 `map` logs; `NtClose` hits vary from run
   to run: every handle the process closes is seen).
 - `"log_dropped":0` and `"error":null`.
+- `"stdout_logs"` equal to `logs_written`, and `"seq"` running 0..807 without a gap: the capture
+  is complete ([troubleshooting.md](troubleshooting.md#is-my-captured-output-complete)).
 - The `"probe"` field of a log is the probe's index in the order it was added
   (0 = the flag probe, 1 = NtOpenProcess, 2 = NtClose, 3 = NtReadVirtualMemory).
 
@@ -167,19 +169,19 @@ Use two consoles in the build directory.
 
    ```text
    > probe_app.exe --helpers 4 --threads 8 --reads 1000
-   {"kind":"helper","index":0,"pid":8828,"base":140700647678496,"size":256}
-   {"kind":"helper","index":1,"pid":5260,"base":140700647678496,"size":256}
-   {"kind":"helper","index":2,"pid":5064,"base":140700647678496,"size":256}
-   {"kind":"helper","index":3,"pid":8832,"base":140700647678496,"size":256}
-   {"kind":"waiting","pid":9964,"helpers":4}
+   {"kind":"helper","index":0,"pid":18896,"base":140696029979200,"size":256}
+   {"kind":"helper","index":1,"pid":8276,"base":140696029979200,"size":256}
+   {"kind":"helper","index":2,"pid":23884,"base":140696029979200,"size":256}
+   {"kind":"helper","index":3,"pid":7912,"base":140696029979200,"size":256}
+   {"kind":"waiting","pid":10932,"helpers":4}
    ```
 
 2. Console B: attach. This logs only the reads of helper 1 at offset 64 of its buffer
    (`base + 64`, 64 bytes long):
 
    ```text
-   > uhh_attach.exe 9964 --pid 5260 --range 140700647678560:64 --backend inline
-   {"kind":"attached","pid":9964}
+   > uhh_attach.exe 10932 --pid 8276 --range 140696029979264:64 --backend inline
+   {"kind":"attached","pid":10932}
    ```
 
    Wait for the `probe: active ntdll.dll!NtOpenProcess ...` and
@@ -193,16 +195,16 @@ Use two consoles in the build directory.
    and exits when the target exits (captured on x64, trimmed):
 
    ```text
-   {"kind":"probe_log","probe":1,"tid":7612,"message":"open pid=8828 name=probe_app.exe"}
-   {"kind":"probe_log","probe":1,"tid":7612,"message":"map handle=0xec -> pid=8828 name=probe_app.exe"}
+   {"kind":"probe_log","probe":1,"tid":17572,"message":"open pid=18896 name=probe_app.exe","seq":0}
+   {"kind":"probe_log","probe":1,"tid":17572,"message":"map handle=0x11c -> pid=18896 name=probe_app.exe","seq":1}
    ...
-   {"kind":"probe_log","probe":3,"tid":7756,"message":"read handle=0xf4 pid=5260 name=probe_app.exe addr=0x7ff76c1fe260 size=16"}
+   {"kind":"probe_log","probe":3,"tid":15936,"message":"read handle=0x110 pid=8276 name=probe_app.exe addr=0x7ff658e36280 size=16","seq":8}
    ...
    {"kind":"probe","location":"configparse.dll!ParseConfig+0x16","backend":"breakpoint","active":true,"hits":1}
    {"kind":"probe","location":"ntdll.dll!NtOpenProcess","backend":"inline","active":true,"hits":4}
    {"kind":"probe","location":"ntdll.dll!NtClose","backend":"inline","active":true,"hits":44}
    {"kind":"probe","location":"ntdll.dll!NtReadVirtualMemory","backend":"inline","active":true,"hits":8000}
-   {"kind":"probe_report","probes":4,"active":4,"hits":8049,"overrides":1,"log_dropped":0,"callbacks_interrupted":0,"logs_written":508,"controller_peak_ws_mb":14,"app_exit":0,"live_output_closed":false,"error":null}
+   {"kind":"probe_report","probes":4,"active":4,"hits":8049,"overrides":1,"log_dropped":0,"callbacks_interrupted":0,"logs_written":508,"controller_peak_ws_mb":22,"app_exit":0,"live_output_closed":false,"stdout_logs":508,"live_output_error":null,"error":null}
    ```
 
    Expected: `"overrides":1`, `NtReadVirtualMemory` `hits` = 8 x 1000 = 8000 (every
@@ -349,30 +351,30 @@ stderr (captured on x64):
 ```text
 probe: pending configparse.dll!ParseConfig+0x16
 probe: pending ntdll.dll!NtReadVirtualMemory
-probe: logs -> C:\Users\admin\AppData\Local\Temp\uhh\logs\uhh-6448-0.jsonl
+probe: logs -> C:\Users\admin\AppData\Local\Temp\uhh\logs\uhh-1108-0.jsonl
 probe: symbols via C:\Windows\system32\dbghelp.dll
-probe: resolved ntdll.dll!NtReadVirtualMemory -> base=0x7ffe2e050000 addr=0x7ffe2e0edd70 (awaiting agent)
-probe: holding thread 8636 until inline installs confirm
-probe: active ntdll.dll!NtReadVirtualMemory -> addr=0x7ffe2e0edd70 (inline)
+probe: resolved ntdll.dll!NtReadVirtualMemory -> base=0x7ffce01f0000 addr=0x7ffce028dd70 (awaiting agent)
+probe: active ntdll.dll!NtReadVirtualMemory -> addr=0x7ffce028dd70 (inline)
+probe: holding thread 23880 until inline installs confirm
 probe: released 1 held thread(s) (inline installs confirmed)
-probe: active configparse.dll!ParseConfig+0x16 -> base=0x7ffe28950000 addr=0x7ffe28951116 (was 0x89, len=2, displaced)
+probe: active configparse.dll!ParseConfig+0x16 -> base=0x7ffcd5990000 addr=0x7ffcd5991116 (was 0x89, len=2, displaced)
 ```
 
 stdout (813 lines, trimmed):
 
 ```text
-{"kind":"helper","index":0,"pid":1948,"base":140700647678496,"size":256}
+{"kind":"helper","index":0,"pid":9300,"base":140696029979200,"size":256}
 ...
-{"kind":"waiting","pid":8296,"helpers":4}
-{"kind":"opened","pid":1948,"handle":196}
+{"kind":"waiting","pid":8944,"helpers":4}
 ...
-{"kind":"app","reads_enabled":1,"helpers":4,"opened":4,"threads":4,"reads_per_thread":200,"successful_reads":800,"checksum":76800,"elapsed_ns":1672500,"prehook":false,"prehook_calls":0,"configparse_base":140729579274240,"shadow_stack":false}
-{"kind":"probe_log","probe":1,"tid":5244,"message":"read handle=0xc4 addr=0x7ff76c1fe220 size=16"}
-{"kind":"probe_log","probe":1,"tid":5928,"message":"read handle=0xc4 addr=0x7ff76c1fe2a0 size=16"}
+{"kind":"probe_log","probe":1,"tid":21980,"message":"read handle=0xbc addr=0x7ff658e362c0 size=16","seq":0}
+{"kind":"probe_log","probe":1,"tid":6752,"message":"read handle=0xbc addr=0x7ff658e362c0 size=16","seq":1}
+...
+{"kind":"app","reads_enabled":1,"helpers":4,"opened":4,"threads":4,"reads_per_thread":200,"successful_reads":800,"checksum":76800,"elapsed_ns":1609000,"prehook":false,"prehook_calls":0,"configparse_base":140723892060160,"shadow_stack":false,"rounds":1}
 ...
 {"kind":"probe","location":"configparse.dll!ParseConfig+0x16","backend":"breakpoint","active":true,"hits":1}
 {"kind":"probe","location":"ntdll.dll!NtReadVirtualMemory","backend":"inline","active":true,"hits":800}
-{"kind":"probe_report","probes":2,"active":2,"hits":801,"overrides":1,"log_dropped":0,"callbacks_interrupted":0,"logs_written":800,"controller_peak_ws_mb":14,"app_exit":0,"live_output_closed":false,"error":null}
+{"kind":"probe_report","probes":2,"active":2,"hits":801,"overrides":1,"log_dropped":0,"callbacks_interrupted":0,"logs_written":800,"controller_peak_ws_mb":23,"app_exit":0,"live_output_closed":false,"stdout_logs":800,"live_output_error":null,"error":null}
 ```
 
 Expected: `"reads_enabled":1` in the target's `app` line, one `read ...` log per read
