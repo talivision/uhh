@@ -114,3 +114,15 @@ CO_CB void co_on_late(probe_context *c) {
 
 // spin (cxlib-killarm): an ordinary logging probe.
 CO_CB void co_on_spin(probe_context *c) { send_log(c, "co spin"); }
+// lazy (regress attach-lazy-agent-*): a breakpoint/hw probe on co_outer whose first hit adds the
+// session's FIRST inline probe (co_inner): only then is the agent injected (owner decision
+// 2026-11-07). The add holds this thread until the hook is in, so this very call's co_inner is
+// seen. (Breakpoint/hw callbacks run one at a time in the controller: a plain flag is enough.)
+CO_CB void co_on_lazy(probe_context *c) {
+    static bool added = false;
+    int r = -1;
+    if (!added) { added = true; r = probe_add_symbol(get_session(c), "co_target.exe!co_inner", co_on_inner, PROBE_INLINE); }
+    send_log(c, "co lazy add=%d", r);
+}
+// --guard: the inline probe on co_idle (never called).
+CO_CB void co_on_idle(probe_context *c) { send_log(c, "co idle (unexpected)"); }

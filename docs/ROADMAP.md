@@ -1156,6 +1156,55 @@ Checks that now fail are left failing (library code is not changed here):
   before that merge: hits = logs = 1156 of 24000 calls (x64, breakpoint; round 3 #2: missed
   while lifted). After the merge: 24000/24000/24000 distinct.
 
+## Agent scope and bounded detach (owner decisions 2026-11-07, branch `agentscope`)
+Two decisions that reverse earlier work:
+- **The agent is injected only when the session needs it (inline).** Since L1 every ATTACHED session
+  injected `probe_api_agent.dll` -- breakpoint/hw-only ones too -- so its controller-death guard could undo
+  INT3s/DRs; bp/hw probes waited (up to 5 s) for it before arming, and a missing agent DLL failed the attach.
+  The owner rejected that: an injected DLL in a bp/hw-only target is itself a side effect (gospel), and
+  "controller-crash self-unhook: not worth the cost; the analyst sees the controller died and restarts the
+  target". Now (as on main f9f3436): the agent goes in at launch/attach if inline probes are registered, or
+  lazily when a callback/runtime add requests the first inline probe. bp/hw-only sessions inject nothing,
+  arm at once (no 5 s agent wait), and do not need the agent DLL.
+  Found on the way (CI + VM PROBE_TRACE, `lifecycle-{reattach,detach-early,interrupt}-hw`, x64 and x86): hw-only
+  targets died of an unhandled single step at a probed address during the detach drain. A worker's #DB was in
+  flight when the detach released the probes (its DRs cleared); delivering it restored the debug registers
+  captured at the raise (`dr7=0x415`, all three slots still ours), and by then the thread no longer counted as
+  unsettled (hw_unsettled: its registers had changed), so the #DB was taken for the program's own breakpoint
+  and passed on. Masked since L1: the agent's guard VEH swallowed such traps. Now, while detaching, a #DB from
+  a slot we have used holding an address we armed is ours (cleared on that thread, RF, continued). VM
+  PROBE_TRACE repro, 80 attach/detach cycles per arch: before, a crash within 3-7 cycles; after, none
+  (22 / 6 such #DBs taken as ours, x64 / x86).
+  Inline sessions keep the guard (it covers their bp/hw probes too; one that acquires the agent later is
+  guarded from then on). Controller death in a bp/hw-only attached session is main's behaviour: kill-on-exit
+  is off, so the target is not killed, but it keeps our INT3s/DRs and dies at its next hit -- documented in
+  limitations.md. Measured (VM Win10, x64 and x86, `lifecycle-controller-killed-{breakpoint,hw}`, controller
+  TerminateProcess'd): killed with probes live -> the target died at its next hit, 0x80000003 (breakpoint) /
+  0x80000004 (hw; also 0x80000003 when a breakpoint probe beside them was mid-step); killed 50 ms into the
+  attach (nothing armed yet) -> alive and clean; no probe_api_agent.dll in the target at any point.
+  Checks: `lifecycle-controller-killed-{breakpoint,hw}` now assert the new rule (no agent module while
+  attached; after the kill the target runs on or dies only with our trap code, never another fault or a
+  hang; outcomes listed); `lifecycle-reattach-{breakpoint,hw}` assert no agent module after every cycle;
+  `lifecycle-agent-refused-{breakpoint,hw}` (a target admitting only Microsoft-signed DLLs) assert a normal
+  session with no agent attempt; new `attach-lazy-agent-{breakpoint,hw}` (no agent module until a callback adds
+  the first inline probe, then it is injected and that very call is hooked) and `attach-no-agent-dll-*` (the
+  agent DLL missing next to the controller: bp/hw work, inline refuses cleanly). Note: breakpoint/hw callbacks
+  that use `UHH_SHARED` state still run from the controller's LOCAL copy of the agent DLL (nothing injected),
+  so such a controller still needs the file beside it. The guard checks that ran bp/hw-only sessions
+  (`cxlib-killarm-*`, `cxlib-reptail-breakpoint`, `cxlib-touchkill-hw`, `cx2-touchprog-hw`,
+  `cx2-evsusp-*`, `cx2-cosusp-*`) now add a never-called inline probe (`co_driver --guard`, `co_idle`) so
+  they keep testing the guard's coverage of bp/hw state in inline sessions (the test hook
+  UHH_TEST_DIE_IN_TOUCH now fires only while arming a user hw probe, as those checks intend).
+  `stdout-powershell-detach-*`: a detach with no record after the report (now that a breakpoint-only attach
+  has no agent to stop, it can be that fast) has no `probe_final` by design; the report then closes the books.
+- **Bounded detach wait.** Codex library review (4) made a live detach wait without a time limit for inline
+  callbacks that can still finish. Now it waits at most 15 s (logs delivered meanwhile), then completes:
+  stderr `probe: detach: N callback(s) still running after 15 s; not waiting longer`, the detach line and
+  `probe_final` carry `running=` (still executing) and `in_flight=` (of those, not logged yet: hits ==
+  logs_written + log_dropped + in_flight); any log they write later is lost. Their config blocks stay
+  allocated (the cfgfree keep-alive), so the program is unaffected. `cxlib-late-inline` asserts it (detach
+  ~17 s, late log not delivered, running=1, right program result).
+
 ## Lifecycle findings (2026-11-06, `examples/lifecycle`, regress `lifecycle-*`)
 Target `lifecycle_target` checks ITSELF on command: the code bytes of every probe-able site
 (ntdll!NtOpenProcess/NtReadVirtualMemory/NtClose, configparse!ParseConfig incl. the mid-function
@@ -1193,7 +1242,9 @@ by itself, nothing dropped), detach while callbacks run / block in call_original
   SafetyHook's own unfrozen path makes the ntdll stub page non-executable and faulted the
   installer, 0xC0000005). Breakpoint/hw probes of an attach arm only once the guard is up (agent
   init done, or given up after 5 s / on load failure, with a warning), so no unguarded trap ever
-  exists. `lifecycle-controller-killed-*`
+  exists. `lifecycle-controller-killed-*` **Narrowed by owner decision 2026-11-07: the agent (and the
+  guard) is only in sessions with an inline probe; breakpoint/hw-only targets get nothing injected and
+  are not guarded -- see "Agent scope and bounded detach".**
 - ✅ (L2) Ctrl+C (or any controller death) between DebugActiveProcess and
   DebugSetProcessKillOnExit(FALSE): the debug object is created kill-on-close, so the target was
   killed with it (exit 0xC0000354, seen twice in 7 Ctrl+Break timings on hw). Now the thread's
@@ -1364,6 +1415,10 @@ INT3"); nothing shipped links it. `--only cxlib`.
   `in_flight`), and a log it sends if the program resumes it after the detach is counted dropped in the
   target (nobody can receive it). Without an answer from the agent (no service thread) the old 15 s bound
   applies. A callback that never returns (deadlocked) now keeps the detach waiting.
+  **Bounded again by owner decision 2026-11-07** (see "Agent scope"): the wait is not needed for the
+  program's correctness and an unbounded detach is worse. The detach now waits at most 15 s for running
+  callbacks (still delivering their logs), then completes and accounts them (`running=`, `in_flight=`; any
+  later log is lost); `cxlib-late-inline` asserts that.
 - ✅ (5) **Real** (x86 only: x64 callbacks use no x87). Without OSXSAVE the inline hit saved MXCSR only; a
   callback's float work (x86 returns floats in ST0) changed a live x87 stack / status word at a
   mid-function site. Reproduced on the VM's OSXSAVE CPU with the knob `UHH_BENCH_XSTATE=noxsave` (xstate_mode
@@ -1838,7 +1893,7 @@ the report (count, valid JSON per line, CRC multiset of the lines, `seq` coverag
 - ⏸ Follow child processes: design written -- [docs/child-processes.md](child-processes.md) (strategies with VM measurements from `bench/child_follow`, API options A-D, recommendation: ProcessDebugFlags inheritance + `probe_follow_children` + `get_pid`); **deferred by the owner (2026-11-06)**: a session follows one process; a child it starts runs unprobed -- attach to it with its own session. Processes the target did not create are unaffected either way (attach separately)
 - ✅ CI on GitHub Actions: the full suite sharded on hosted windows-2022 runners, x64 + x86, ~19 min, plus enforced-CET checks on windows-2025 (`.github/workflows/windows.yml`, `scripts/ci_shards.py`) -- see "CI on GitHub Actions" below (runner findings open there); ⬜ (maybe) CMake package + versioned release zip
 - 🔧 (very last) Soak test: hours under load; handles/memory/threads flat -- `scripts/soak.py` (phases mixed / hw / breakpoint / attach-detach cycles, per-minute samples to CSV, exactness + checksum + growth verdict), opt-in `regress.py --soak-minutes N`; probe_app `--pace`. x64 mixed 30 min PASS (57.6M reads, all logged, controller/target flat); 1-min calibration of every phase PASS. **The VM froze twice during the 30-min all-hw phase** (at ~18 and ~22 min, ~12k hw hits/s; guest RAM exhausted while UHH's own processes stayed at ~2.5 MB private) -- suspected kernel-side memory growth per debug event / DR context switch (host logs a burst of `Unhandled WRMSR(0x1d9)` DEBUGCTL from the guest during hw runs). soak.py now samples available RAM, kernel paged/nonpaged pool and system handles and aborts below 1.5 GB. Next: a 3-minute hw run with 15 s samples to measure pool growth per hit before any long hw soak
-- ✅ Controller-crash self-unhook -- originally ✗ (user: the analyst sees the controller died and restarts the target; not worth the cost); superseded for ATTACHED targets by Lifecycle L1 (the agent's controller-death guard undoes INT3s/DRs/holds and removes inline hooks, so the target survives). A launched target still ends with its controller
+- ✅ Controller-crash self-unhook -- **inline sessions only, by owner decision 2026-11-07.** Originally ✗ (user: the analyst sees the controller died and restarts the target; not worth the cost); Lifecycle L1 then injected the agent into every ATTACHED target to guard it; the owner reversed that (an injected DLL in a breakpoint/hw-only target is itself a side effect): the agent -- and with it the controller-death guard -- is in a session only when it has an inline probe. A breakpoint/hw-only attached target keeps our INT3s/DRs when the controller dies and may fault at its next hit (see "Agent scope"). A launched target still ends with its controller
 - ✗ Named-object hardening (user: unlikely; a clash fails loudly)
 
 ## CI on GitHub Actions (2026-11-06, `.github/workflows/windows.yml`, `scripts/ci_shards.py`)

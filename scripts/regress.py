@@ -2444,9 +2444,9 @@ def check_ntdll_churn(cycles=8, round_reads=1000000):
     length instead of the machine. Log lines are counted as they stream (never held); with that,
     inline cycles took 1.0-2.9 s on x64 and 1.2-8.0 s on x86.
 
-    Cycle 1 runs 3 s (the others 300 ms). On attach, breakpoint/hw probes arm only once the agent's
-    controller-death guard is up, and the first cycle loads the agent and runs its first init (which
-    starts its service thread). On a 2-vCPU CI runner with 4 spinning threads that took longer than
+    Cycle 1 runs 3 s (the others 300 ms). Inline: the first cycle loads the agent and runs its
+    first init (which starts its service thread). (breakpoint/hw: since 2026-11-07 no agent is
+    injected without an inline probe, so they arm at once; the 3 s cycle 1 stays, harmless.) On a 2-vCPU CI runner with 4 spinning threads that took longer than
     300 ms; a detach between the load and the init left the first init -- and a zero-hit window --
     to cycle 2 (runfix1: 3 of ~58 runner runs, always cycle 2 right after a short cycle 1). The
     remote agent threads now run above normal priority (0 zero-hit cycles in 511 runner cycles
@@ -3472,6 +3472,164 @@ def check_crash_logs(n=5000, threads=4):
                                  f"threads_logging={len(tids)}/{nt} dropped={rep.get('log_dropped')}")
             except Exception as e:
                 record(name, False, repr(e))
+
+
+def check_carry_exact(calls=400_000, threads=4, runs=3):
+    """A clean exit accounts every hit with no callback "interrupted": inline, 4 threads, every
+    other call logs (hitcost --method log_alt), so the controller retires carried first records
+    while the same threads keep counting hits that end unlogged. Regression for CI 42325381514
+    (gated-e2e-launch-fhw-oin-cin-rin: logs 646/646 delivered, interrupted=1): the retire summed a
+    block's hits then read its `done` while the owner counted on, came out one short and skipped
+    the retire. Bar, every run: hits == calls x threads, logs == half of them, dropped == 0,
+    callbacks_interrupted == 0."""
+    d, t = exe("hitcost_driver.exe"), exe("hitcost_target.exe")
+    if not d or not t:
+        return missing_bin("carry-exact", "hitcost driver/target")
+    total = calls * threads
+    results, ok = [], True
+    for i in range(runs):
+        state = {"logs": 0, "objects": []}
+
+        def consume(line, _arrival):
+            if line.startswith('{"kind":"probe_log",'):
+                state["logs"] += 1
+            elif line.startswith("{"):
+                try:
+                    state["objects"].append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+        try:
+            rc, timed_out = stream_run([d, "--backend", "inline", "--method", "log_alt", "--", t, "--no-wait",
+                                        "--calls", calls, "--threads", threads], 600, consume)
+            rep = report(state["objects"])
+            hits = next(iter(probes(state["objects"])), {}).get("hits")
+            good = (not timed_out and rc == 0 and hits == total and state["logs"] == total // 2 and
+                    rep.get("log_dropped") == 0 and rep.get("callbacks_interrupted") == 0)
+            ok = ok and good
+            results.append(f"hits={hits} logs={state['logs']} intr={rep.get('callbacks_interrupted')} "
+                           f"drop={rep.get('log_dropped')} rc={rc}")
+        except Exception as e:
+            ok = False; results.append(repr(e))
+    record("carry-exact-inline", ok, f"want hits={total} logs={total // 2}: " + " | ".join(results))
+
+
+def check_attach_agent_scope():
+    """Owner decision 2026-11-07: the agent DLL is injected into the target only when the session
+    needs it (an inline probe).
+      attach-lazy-agent-<b>: an ATTACHED breakpoint/hw-only session (co_driver --case lazy: one
+        probe on co_outer) has no probe_api_agent.dll in the target while it has no inline probe;
+        the first hit's callback then adds the session's first inline probe (co_inner) -- the
+        agent is injected lazily, the calling thread is held until the hook is in, so that very
+        call's co_inner is seen: 6 outer hits, 6 inner logs, the program's result unchanged (sum
+        36, both bodies run 12 times).
+      attach-no-agent-dll-<b>: co_driver.exe copied ALONE into a temp dir (no probe_api_agent.dll
+        beside it). breakpoint/hw: the attach works as usual (nested: sum 36, 6+6 hits, no agent
+        module in the target); inline: the attach is refused with an error naming the agent DLL
+        and the target is untouched (it then runs to its normal result). (A controller whose
+        breakpoint/hw callbacks use UHH_SHARED state still loads the agent DLL LOCALLY -- the
+        shared callbacks run from it in the controller -- so such a driver needs the file
+        beside it; nothing is injected for that. co_callbacks use none.)"""
+    import shutil, tempfile
+    d, t = exe("co_driver.exe"), exe("co_target.exe")
+    if not d or not t:
+        return missing_bin("attach-agent-scope", "co_driver/co_target")
+    ts = _target_state()
+
+    def session(bk, case, driver, gate_check=None):
+        """co_target nested --wait attached by `driver` (--case case); returns (driver rc, stdout
+        objs, stderr lines, target row, target rc, agent-before-gate)."""
+        procs = []
+        try:
+            tgt = subprocess.Popen([str(t), "nested", "--wait"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, text=True)
+            procs.append(tgt)
+            tout = Lines(tgt.stdout)
+            w = tout.wait_for(lambda l: '"kind":"waiting"' in l, 30)
+            if not w:
+                raise RuntimeError("target never reached its gate")
+            pid = json.loads(w)["pid"]
+            att = subprocess.Popen([str(driver), "--backend", bk, "--case", case, "--attach", str(pid)],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            procs.append(att)
+            aout, aerr = Lines(att.stdout), Lines(att.stderr)
+            if bk == "inline" and gate_check == "refused":
+                att.wait(timeout=60)
+            elif not aerr.wait_for(lambda l: l.startswith("probe: active co_target.exe!co_outer"), 60):
+                raise RuntimeError("co_outer never became active: " + " | ".join(aerr.lines[-4:])[:300])
+            time.sleep(0.3)
+            before = ts.module_loaded(pid, "probe_api_agent.dll")
+            tgt.stdin.write("x"); tgt.stdin.flush()
+            att.wait(timeout=120); tgt.wait(timeout=60)
+            o = aout.objs(); aerr.t.join(timeout=30)
+            row = next((x for x in tout.objs() if x.get("kind") == "co"), {})
+            return att.returncode, o, aerr.lines, row, tgt.returncode, before
+        finally:
+            for q in procs:
+                if q.poll() is None:
+                    q.kill()
+
+    for bk in ("breakpoint", "hw"):
+        name = f"attach-lazy-agent-{bk}"
+        try:
+            rc, o, err, row, trc, before = session(bk, "lazy", d)
+            msgs = [str(x.get("message", "")) for x in o if x.get("kind") == "probe_log"]
+            inner = next((p for p in probes(o) if str(p.get("location", "")).endswith("!co_inner")), {})
+            rep, bad = report(o), []
+            if before is not False: bad.append(f"agent loaded before any inline probe: {before}")
+            if msgs.count("co lazy add=1") != 1 or msgs.count("co lazy add=-1") != 5:
+                bad.append(f"lazy logs={[m for m in msgs if 'lazy' in m]}")
+            if msgs.count("co inner") != 6 or inner.get("backend") != "inline" or inner.get("hits") != 6:
+                bad.append(f"inner logs={msgs.count('co inner')} probe={inner} (want 6 inline hits)")
+            if row.get("sum") != 36 or row.get("body") != 12 or trc != 0: bad.append(f"target row={row} rc={trc}")
+            if rc != 0 or rep.get("log_dropped") != 0 or rep.get("error") is not None:
+                bad.append(f"rc={rc} dropped={rep.get('log_dropped')} err={rep.get('error')}")
+            record(name, not bad, " ".join(bad) + ("" if not bad else f" stderr={[l[:140] for l in err[-6:]]}")
+                   or f"agent_before_first_inline={before} lazy_add=1 inner=6/6 inline sum={row.get('sum')}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    # The lone copy goes next to the build first: Windows Defender on the VM quarantined an x64
+    # co_driver.exe copied into %TEMP% (OSError winerror 225, "contains a virus or potentially
+    # unwanted software" -- a debugger binary in a temp dir), never the original.
+    tmp, lone = None, None
+    for root in (BIN.parent, None):
+        tmp = Path(tempfile.mkdtemp(prefix="uhh-noagent-", dir=str(root) if root else None))
+        try:
+            shutil.copy2(d, tmp / "co_driver.exe")
+            lone = tmp / "co_driver.exe"
+            break
+        except OSError as e:
+            shutil.rmtree(tmp, ignore_errors=True)
+            if getattr(e, "winerror", None) != 225:
+                raise
+    if lone is None:
+        for bk in ("breakpoint", "hw", "inline"):
+            skip(f"attach-no-agent-dll-{bk}", "the antivirus quarantines a copy of co_driver.exe on this machine")
+        return
+    try:
+        for bk in ("breakpoint", "hw", "inline"):
+            name = f"attach-no-agent-dll-{bk}"
+            try:
+                rc, o, err, row, trc, before = session(bk, "nested", lone, "refused" if bk == "inline" else None)
+                hits = {str(p.get("location", "")).split("!")[-1]: p.get("hits") for p in probes(o)}
+                rep, bad = report(o), []
+                if row.get("sum") != 36 or trc != 0: bad.append(f"target row={row} rc={trc}")
+                if bk == "inline":
+                    named = any("probe_api_agent" in l for l in err) or "probe_api_agent" in str(rep.get("error"))
+                    if rc != 1 or not named: bad.append(f"rc={rc} error_names_agent={named} err={rep.get('error')}")
+                    if before is not False: bad.append(f"agent module in the target: {before}")
+                    if row.get("body") != 12: bad.append(f"body={row.get('body')} (want 12: untouched)")
+                else:
+                    if before is not False: bad.append(f"agent module in a breakpoint/hw-only target: {before}")
+                    if rc != 0 or rep.get("error") is not None or hits != {"co_outer": 6, "co_inner": 6}:
+                        bad.append(f"rc={rc} err={rep.get('error')} hits={hits}")
+                record(name, not bad, " ".join(bad) + ("" if not bad else f" stderr={[l[:140] for l in err[-6:]]}")
+                       or f"no agent DLL beside the controller: rc={rc} hits={hits} agent_in_target={before} "
+                          f"sum={row.get('sum')}" + (f" error={str(rep.get('error'))[:100]}" if bk == "inline" else ""))
+            except Exception as e:
+                record(name, False, repr(e))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def check_attach_new(threads=2, reads=500):
@@ -7347,7 +7505,8 @@ class LcDriver:
         return any('"kind":"attached"' in l for l in self.other)
 
     def errors(self):
-        return [l[:160] for l in self.err.lines if "error" in l.lower() or "warning" in l.lower() or "failed" in l][:4]
+        return [l[:200] for l in self.err.lines
+                if "error" in l.lower() or "warning" in l.lower() or "failed" in l or "crashed" in l][:4]
 
     def kill(self):
         if self.p.poll() is None:
@@ -7365,7 +7524,9 @@ def lc_reattach(cfgname, cfg, cycles=20):
     thread-churner: threads are born while attached). After EVERY detach: the code bytes of
     every probed site equal the pre-attach snapshot, no thread (incl. those created while
     attached) has a debug register or the trap flag set, no debugger, no flip after the detach,
-    no program error; every log written reached stdout and none was dropped."""
+    no program error; every log written reached stdout and none was dropped. breakpoint/hw-only
+    (owner decision 2026-11-07: the agent goes only into sessions with an inline probe): no
+    probe_api_agent.dll in the target after any cycle."""
     name = f"lifecycle-reattach-{cfgname}"
     tg, bad, logs_total = None, [], 0
     try:
@@ -7387,8 +7548,11 @@ def lc_reattach(cfgname, cfg, cycles=20):
             logs_total += d.logs
             c = tg.check()
             tg.reset(); time.sleep(0.2); c2 = tg.check()
+            if not lc_has_inline(cfg) and c.get("dead") is None and c.get("agent_loaded") != 0:
+                bad.append(f"c{k}: agent module in a breakpoint/hw-only target {lc_brief(c)}")
             if not ok_logs or not lc_clean(c) or c2.get("flips") != 0 or d.p.returncode != 0:
-                bad.append(f"c{k}: rc={d.p.returncode} logs={d.logs} final={fin} {lc_brief(c)} flips_after={c2.get('flips')}")
+                bad.append(f"c{k}: rc={d.p.returncode} logs={d.logs} final={fin} {lc_brief(c)} flips_after={c2.get('flips')}"
+                           + (f" err={d.errors()}" if d.errors() else ""))
                 if c.get("dead") is not None or c.get("hung"):
                     break
         a = tg.quit()
@@ -7576,12 +7740,30 @@ def lc_interrupt(cfgname, cfg):
     record(f"lifecycle-interrupt-{cfgname}", not bad, f"cases={n}" + (f" bad={bad[:3]}" if bad else ""))
 
 
+# An INT3 / single step (DR or trap flag) of ours left in the target; a 32-bit (WOW64) target can
+# also end with their WOW64 forms as its exit code, its unhandled-exception filter never called.
+LC_TRAP_CODES = {"0x80000003", "0x80000004", "0x4000001f", "0x4000001e"}
+
+
+def lc_has_inline(cfg):
+    return "inline" in cfg.values()
+
+
 def lc_controller_killed(cfgname, cfg):
     """The controller is killed (TerminateProcess) while attached, mid-run with every probe live
-    and logging: the TARGET must survive -- keep running, never fault, never hang, make no
+    and logging.
+    Sessions with an inline probe (inline, mixed) carry the agent and its controller-death guard
+    (Lifecycle L1): the TARGET must survive -- keep running, never fault, never hang, make no
     error -- and, once the controller is gone, be left with no live hook / INT3 / debug register
-    (it would die or misbehave at its next hit otherwise)."""
-    bad, n, took = [], 0, []
+    (it would die or misbehave at its next hit otherwise).
+    breakpoint/hw-only sessions (owner decision 2026-11-07: the agent is injected only for inline
+    probes; "controller-crash self-unhook: not worth the cost") inject nothing: while attached the
+    target must have NO probe_api_agent.dll loaded, and a killed controller leaves its INT3s/DRs
+    behind (kill-on-exit off: the target is not killed with it). Asserted: the target either runs
+    on or dies at its next hit with OUR trap -- 0x80000003 (INT3) / 0x80000004 (DR or trap
+    flag) -- never another fault and never a hang. The outcomes are listed in the detail."""
+    guarded = lc_has_inline(cfg)
+    bad, n, took, outcomes = [], 0, [], []
     for when in ("active", "active+0.5", "early-0.05", "early-0.3"):
         n += 1
         tg = d = None
@@ -7596,6 +7778,10 @@ def lc_controller_killed(cfgname, cfg):
                 d.wait_attached(); d.wait_active(timeout=30)
                 d.wait_logs(200, timeout=10)
                 time.sleep(float(when.split("+")[1]) if "+" in when else 0.0)
+                if not guarded:
+                    c0 = tg.check()                            # attached, every probe live
+                    if c0.get("agent_loaded") != 0:
+                        bad.append(f"kill@{when}: agent module in a breakpoint/hw-only target: {lc_brief(c0)}")
             else:
                 time.sleep(float(when.split("-")[1]))
             d.kill(); d.finish(timeout=30)
@@ -7603,6 +7789,22 @@ def lc_controller_killed(cfgname, cfg):
             time.sleep(3.0)                                    # the target runs on, alone
             c = tg.check()
             steps.append(f"chk={time.time() - t0:.0f}{'!' if c.get('hung') else ''}")
+            if not guarded:
+                if c.get("hung"):
+                    bad.append(f"kill@{when}: target hung {lc_brief(c)}")
+                elif c.get("dead") is not None:
+                    codes = {str(json.loads(l).get("code")).lower() for l in tg.unhandled() if '"kind":"unhandled"' in l}
+                    if not codes and isinstance(c.get("dead"), int):
+                        codes = {f"0x{c['dead'] & 0xFFFFFFFF:08x}"}         # exit code only (no filter report)
+                    outcomes.append(f"{when}:died{'/'.join(sorted(x for x in codes if x))}")
+                    if not codes or not codes <= LC_TRAP_CODES:
+                        bad.append(f"kill@{when}: died rc={c.get('dead')} unhandled={tg.unhandled()} (want only our trap)")
+                else:
+                    outcomes.append(f"{when}:alive(code_diff={c.get('code_diff')},dr_dirty={c.get('dr_dirty')},"
+                                    f"agent={c.get('agent_loaded')})")
+                    if c.get("agent_loaded") != 0:
+                        bad.append(f"kill@{when}: agent module in a breakpoint/hw-only target: {lc_brief(c)}")
+                continue
             time.sleep(1.0)
             c2 = tg.check()
             progressed = (c2.get("iterations") or 0) > (c.get("iterations") or 0)
@@ -7621,7 +7823,8 @@ def lc_controller_killed(cfgname, cfg):
             if tg: tg.kill()
             took.append(f"{when}={time.time() - t0:.0f}s" + (f"({','.join(steps)})" if steps else ""))
     record(f"lifecycle-controller-killed-{cfgname}", not bad,
-           f"cases={n} took=[{' '.join(took)}]" + (f" bad={bad[:3]}" if bad else ""))
+           f"cases={n} took=[{' '.join(took)}]" + (f" unguarded_outcomes=[{' '.join(outcomes)}]" if outcomes else "")
+           + (f" bad={bad[:3]}" if bad else ""))
 
 
 def lc_agent_refused(cfgname, cfg):
@@ -7629,13 +7832,30 @@ def lc_agent_refused(cfgname, cfg):
     signed DLLs, so the inline agent cannot load) while other probes are already armed: the
     controller must let go of the target ON ITS DEBUG THREAD before it returns (INT3s restored,
     DRs cleared, debugger detached) -- not leave live traps behind a dead event loop -- and
-    every log it wrote must be delivered. The target runs on, untouched, and exits cleanly."""
-    if "inline" not in cfg.values():
-        return
+    every log it wrote must be delivered. The target runs on, untouched, and exits cleanly.
+    breakpoint/hw-only (owner decision 2026-11-07: no agent without an inline probe): the policy
+    is irrelevant -- the session attaches, logs and detaches normally, with no agent load
+    attempted and no warning, and no agent module in the target."""
     name = f"lifecycle-agent-refused-{cfgname}"
     tg = d = None
     try:
         tg = LcTarget("--threads", 4, "--ms-signed-only")
+        if not lc_has_inline(cfg):
+            d = LcDriver(tg.pid, cfg, "--detach-on-stdin")
+            active = d.wait_attached() and d.wait_active(timeout=30) and d.wait_logs(50, timeout=30)
+            c0 = tg.check()
+            d.detach()
+            fin_ok = d.finish(timeout=60)
+            ok_logs, fin = lc_logs_ok(d)
+            c = tg.check()
+            a = tg.quit()
+            noise = [l[:120] for l in d.err.lines if "agent" in l.lower() or "guard" in l or "warning" in l]
+            ok = (bool(active) and fin_ok and d.p.returncode == 0 and ok_logs and c0.get("agent_loaded") == 0
+                  and not noise and lc_clean(c) and lc_clean(a) and a.get("rc") == 0)
+            record(name, ok, f"active={bool(active)} driver_rc={d.p.returncode} logs={d.logs} final={fin} "
+                             f"agent_while_attached={c0.get('agent_loaded')} {lc_brief(c)} exit={a.get('rc')}"
+                             + ("" if ok else f" noise={noise[:3]} err={d.errors()} unhandled={tg.unhandled()}"))
+            return
         d = LcDriver(tg.pid, cfg)
         fin_ok = d.finish(timeout=60)
         refused = any("LoadLibraryW failed" in l or "agent" in l.lower() and "fail" in l.lower() for l in d.err.lines)
@@ -8129,14 +8349,22 @@ def check_cxlib():
                   return_from (the caller gets return_from's value) and after a return_from
                   without call_original (dropped, the original runs once) -- every backend alike;
       late-inline an inline callback still running 19 s into a detach (past the agent's 2 s wait
-                  and the drain's old 15 s allowance): its log after that is delivered, nothing
-                  dropped, and its >256-byte config (a block in the target) is still readable;
+                  and the drain's 15 s bound). Owner decision 2026-11-07 (it used to be waited
+                  for without a time limit): the detach completes after ~15 s and accounts it --
+                  "still running after 15 s" on stderr, running=1, in_flight=0 (it logged
+                  before), hits == logs_written + log_dropped + in_flight, nothing dropped -- its
+                  later log is lost (not delivered), and its >256-byte config (a block in the
+                  target) is NOT freed under it: the program still gets the right result;
       cfgfree-inline the program suspends a thread inside an inline callback across the whole
                   detach and resumes it afterwards: the detach does not wait for it (running=1;
                   it logged before the suspension, so it is accounted by that log: in_flight=0,
                   agent v23), and the callback's config block is NOT freed under it;
       killarm-*   the controller dies right after writing an INT3 / arming a hw probe (test-hook
-                  build, co_driver_th): the agent's guard must undo it -- the target finishes;
+                  build, co_driver_th): the agent's guard must undo it -- the target finishes.
+                  co_driver --guard adds a never-called inline probe: only a session with an
+                  inline probe has the agent and its guard (owner decision 2026-11-07; a
+                  breakpoint/hw-only session's controller death: lifecycle-controller-killed-*).
+                  The same holds for reptail, touchkill, cx2-touchprog and cx2-evsusp/cosusp;
       noxsave-inline the x86 inline fallback without OSXSAVE (forced: UHH_BENCH_XSTATE=noxsave)
                   keeps the x87 state at a mid-function site with a full x87 stack (transparency
                   `mid`, a callback doing x87 float work)."""
@@ -8163,7 +8391,7 @@ def check_cxlib():
         except Exception as e:
             record(name, False, repr(e))
 
-    # -- (4)+(2) an inline callback outliving the detach's old allowances ------------------
+    # -- (4)+(2) an inline callback outliving the detach's 15 s bound ---------------------
     name = "cxlib-late-inline"
     try:
         def detach_now(tgt, att, tout):
@@ -8173,15 +8401,20 @@ def check_cxlib():
         row, aout, aerr, arc, trc, took = cx_attached_run("late", "inline", d, t, detach_now)
         sm = cx_detach_summary(aerr.lines)
         done = [l for l in aout.lines if '"message":"co late-done' in l]
+        cut = [l for l in aerr.lines if "still running after 15 s; not waiting longer" in l]
         bad = []
         if row.get("ret") != CX_LATE_SUM or row.get("body") != 0 or row.get("done") != 1:
-            bad.append(f"target ret={row.get('ret')} want {CX_LATE_SUM} body={row.get('body')} done={row.get('done')}")
-        if len(done) != 1 or f"sum={CX_LATE_SUM}" not in done[0]:
-            bad.append(f"late log delivered={len(done)}")
-        if sm.get("log_dropped") != 0 or sm.get("in_flight") != 0 or sm.get("hits") != 1 or sm.get("logs_written") != 2:
-            bad.append(f"summary={sm}")
+            bad.append(f"target ret={row.get('ret')} want {CX_LATE_SUM} body={row.get('body')} done={row.get('done')} "
+                       "(config freed under the callback?)")
+        if done: bad.append(f"late log delivered={len(done)} (the detach must not wait 19 s for it)")
+        if not cut: bad.append("no 'still running after 15 s' line")
+        if (sm.get("log_dropped") != 0 or sm.get("in_flight") != 0 or sm.get("running") != 1 or sm.get("hits") != 1
+                or sm.get("logs_written") != 1):
+            bad.append(f"summary={sm} (want hits=1 logs_written=1 log_dropped=0 in_flight=0 running=1)")
+        if not 14 <= took <= 30: bad.append(f"detach took {took:.1f}s (want ~15 s + the agent's 2 s unhook wait)")
         if arc != 0 or trc != 0: bad.append(f"driver_rc={arc} target_rc={trc}")
-        record(name, not bad, " ".join(bad) or f"detach_took={took:.1f}s summary={sm} ret={row.get('ret')}")
+        record(name, not bad, " ".join(bad) or f"detach_took={took:.1f}s summary={sm} ret={row.get('ret')} "
+                                                "(late log lost, accounted running=1)")
     except Exception as e:
         record(name, False, repr(e))
 
@@ -8209,7 +8442,8 @@ def check_cxlib():
     except Exception as e:
         record(name, False, repr(e))
 
-    # -- (3) the controller dies right after arming: the guard must cover it ---------------
+    # -- (3) the controller dies right after arming: the guard must cover it (--guard: an
+    # inline probe in the session, so the agent and its guard are there -- 2026-11-07) -----
     r0, o0 = run([t, "spin"], timeout=60)
     base = next((x for x in o0 if x.get("kind") == "co"), {})
     for bk in ("breakpoint", "hw"):
@@ -8224,7 +8458,7 @@ def check_cxlib():
             if not w:
                 raise RuntimeError("target never reached its gate")
             env = dict(os.environ, UHH_TEST_DIE_AFTER_ARM="1")
-            att = subprocess.Popen([str(dth), "--backend", bk, "--case", "spin", "--attach", str(json.loads(w)["pid"])],
+            att = subprocess.Popen([str(dth), "--backend", bk, "--guard", "--case", "spin", "--attach", str(json.loads(w)["pid"])],
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
             procs.append(att)
             aout, aerr = Lines(att.stdout), Lines(att.stderr)
@@ -8263,7 +8497,7 @@ def check_cxlib():
         if not w:
             raise RuntimeError("target never reached its gate")
         env = dict(os.environ, UHH_TEST_DIE_IN_REPCOPY="1")
-        att = subprocess.Popen([str(dth), "--backend", "breakpoint", "--case", "rep", "--attach", str(json.loads(w)["pid"])],
+        att = subprocess.Popen([str(dth), "--backend", "breakpoint", "--guard", "--case", "rep", "--attach", str(json.loads(w)["pid"])],
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
         procs.append(att)
         aout, aerr = Lines(att.stdout), Lines(att.stderr)
@@ -8310,7 +8544,7 @@ def check_cxlib():
                 env = dict(os.environ, UHH_TEST_DIE_IN_TOUCH=str(g["tid"]))
                 if control:
                     env["UHH_TEST_NO_TOUCH_GUARD"] = "1"
-                att = subprocess.Popen([str(dth), "--backend", "hw", "--case", "spin", "--attach", str(g["pid"])],
+                att = subprocess.Popen([str(dth), "--backend", "hw", "--guard", "--case", "spin", "--attach", str(g["pid"])],
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, env=env)
                 procs.append(att)
                 att.wait(timeout=90)
@@ -9063,7 +9297,10 @@ def check_cx2_review():
         test-hook build dies 1.5 s later with no event or guard sync in between) or inside its
         callback's call_original (cosusp; the controller killed while the original runs). The
         guard listed that thread as held until the next sync (evsusp) / for the whole call and
-        once per 20 ms poll (cosusp), so it released the PROGRAM's suspension: it must leave it."""
+        once per 20 ms poll (cosusp), so it released the PROGRAM's suspension: it must leave it.
+      touchprog / evsusp / cosusp run co_driver --guard (a never-called inline probe beside the
+        breakpoint/hw one): the agent and its guard exist only in sessions with an inline probe
+        (owner decision 2026-11-07)."""
     cd, ct = exe("ctrl_driver.exe"), exe("ctrl_target.exe")
     d, t, dth = exe("co_driver.exe"), exe("co_target.exe"), exe("co_driver_th.exe")
     if not cd or not ct or not d or not t or not dth:
@@ -9115,7 +9352,7 @@ def check_cx2_review():
                 env = dict(os.environ, UHH_TEST_DIE_IN_TOUCH=str(json.loads(sl)["tid"]))
                 if mode:
                     env["UHH_TEST_DIE_IN_TOUCH_MODE"] = mode
-                att = subprocess.Popen([str(dth), "--backend", "hw", "--case", "susp", "--attach", str(json.loads(w)["pid"])],
+                att = subprocess.Popen([str(dth), "--backend", "hw", "--guard", "--case", "susp", "--attach", str(json.loads(w)["pid"])],
                                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env)
                 procs.append(att)
                 aerr = Lines(att.stderr)
@@ -9135,7 +9372,7 @@ def check_cx2_review():
                                f"ran_while_suspended={row.get('ran_while_suspended')} (want 0)")
                 if row.get("done") != 1 or row.get("sum") != sum(i * 3 + 5 for i in range(20)):
                     bad.append(f"target row={row}")
-                return bad
+                return bad + ([f"died={died[:200]!r}"] if bad else [])
             finally:
                 for q in procs:
                     if q.poll() is None:
@@ -9167,12 +9404,12 @@ def check_cx2_review():
             env = dict(os.environ)
             if case == "evsusp":
                 env["UHH_TEST_DIE_AFTER_HIT_MS"] = "1500"
-            att = subprocess.Popen([str(dth), "--backend", bk, "--case", case, "--module", "susp_target.exe",
+            att = subprocess.Popen([str(dth), "--backend", bk, "--guard", "--case", case, "--module", "susp_target.exe",
                                     "--attach", str(json.loads(w)["pid"])],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env)
             procs.append(att)
             aerr = Lines(att.stderr)
-            if not aerr.wait_for(lambda l: l.startswith("probe: active "), 60):
+            if not aerr.wait_for(lambda l: l.startswith("probe: active ") and "co_idle" not in l, 60):
                 raise RuntimeError(f"probe never active: {aerr.lines[-4:]}")
             if any("guard unavailable" in l for l in aerr.lines):
                 bad.append("controller-death guard unavailable")
@@ -10404,7 +10641,16 @@ def check_stdout_powershell():
                           rep["stdout_logs"] <= rep["logs_written"] <= hits == rep.get("hits"))
             closed = bool(fin) and fin.get("hits") == (fin.get("logs_written") or 0) + (fin.get("log_dropped") or 0) \
                 + (fin.get("in_flight") or 0) and fin.get("stdout_logs") == fin.get("logs_written") == cap["logs"]
-            ok = (alive and finals == 1 and after_final == 0 and consistent and closed and cap["bad"] == 0 and cap["gaps"] == 0 and
+            # No record after the report (the detach came before the next hit -- breakpoint, now
+            # that a breakpoint-only attach has no agent to stop): no probe_final by design (api.md);
+            # the report itself then closes the books, equal to the detach's own final line.
+            det = re.search(r"probe: detached: hits=(\d+) logs_written=(\d+) log_dropped=(\d+) in_flight=(\d+)", r.stderr or "")
+            if not finals and det and consistent:
+                dh, dw, dd, di = (int(x) for x in det.groups())
+                closed = (dh == rep.get("hits") and dw == rep.get("logs_written") == rep.get("stdout_logs") == cap["logs"]
+                          and dh == dw + dd + di)
+                fin = {"hits": dh, "logs_written": dw, "log_dropped": dd, "in_flight": di, "stdout_logs": cap["logs"]}
+            ok = (alive and finals <= 1 and after_final == 0 and consistent and closed and cap["bad"] == 0 and cap["gaps"] == 0 and
                   fin.get("log_dropped") == 0 and rep.get("error") is None and cap["logs"] > 0)
             record(name, ok, f"report: hits={hits} written={rep.get('logs_written')} stdout_logs={rep.get('stdout_logs')} "
                              f"consistent={consistent} final={ {k: fin.get(k) for k in ('hits', 'logs_written', 'log_dropped', 'in_flight', 'stdout_logs')} } "
@@ -10584,7 +10830,9 @@ def main():
     if want(check_gated_mem): check_gated_mem()
     if want(check_forwarded_probe): check_forwarded_probe()
     if want(check_crash_logs): check_crash_logs()
+    if want(check_carry_exact): check_carry_exact()
     if want(check_attach_new): check_attach_new()
+    if want(check_attach_agent_scope): check_attach_agent_scope()
     if want(check_refusals): check_refusals()
     if want(check_hotpatch_prologue): check_hotpatch_prologue()
     if want(check_famous_heap): check_famous_heap()

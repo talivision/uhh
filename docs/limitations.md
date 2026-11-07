@@ -37,9 +37,7 @@ Contents: [scope](#scope) · [resource limits](#resource-limits) ·
   Chromium/Edge renderer, most of their utility processes) cannot load the agent** (Real large
   apps RB2). An inline session attached to one fails cleanly (`LoadLibraryW failed for
   probe_api_agent.dll (the target admits only Microsoft-signed DLLs ...)`, detached, target
-  untouched); breakpoint/hw sessions work, but without the agent there is no controller-death
-  guard (stderr: `controller-death guard unavailable`): a controller killed while attached
-  leaves its INT3s/DRs in the target.
+  untouched); breakpoint/hw-only sessions work as anywhere else (they inject nothing).
   *Workaround:* breakpoint or hw in such processes, and end the session with `probe_close`/Ctrl+C.
 - **The debugger is not hidden** (✗ Codex workaround audit C6; Controller static review).
   See [visibility](#visibility-to-the-target-anti-debug).
@@ -273,22 +271,30 @@ data) prints on all backends.
 
 ## Detach and close
 
-- **Detach waits for running inline callbacks** (📄 Codex library review (4); Lifecycle L9).
-  It keeps delivering logs for as long as any in-flight callback can still finish (thread
-  alive, not suspended, still inside its callback), with no time bound; stderr reports
-  progress every 15 s. A callback that never returns (deadlocked) keeps the detach waiting.
-  Not waited for: a callback whose thread is dead, suspended by the program, or left through
-  a non-unwinding `longjmp`; it stays counted (`running=` in the detach line, and `in_flight=`
-  if it had not logged yet), and a log it
-  sends if the program resumes it later is dropped in the target.
+- **Detach waits at most 15 s for running inline callbacks** (📄 Codex library review (4);
+  Lifecycle L9; bounded by owner decision 2026-11-07). It keeps delivering their logs while
+  any in-flight callback can still finish (thread alive, not suspended, still inside its
+  callback), for up to 15 s after the hooks are removed (plus the agent's own 2 s unhook
+  wait), then completes. Not waited for at all: a callback whose thread is dead, suspended by
+  the program, or left through a non-unwinding `longjmp`. Callbacks still running when the
+  detach completes are counted, never silent: `running=` in the detach line / `probe_final`,
+  and `in_flight=` for those that had not logged yet (hits = logs_written + log_dropped +
+  in_flight). **Any log they write after that is lost** (dropped in the target; nobody reads
+  it). Their config blocks stay allocated, so the program itself is unaffected.
   *Workaround:* keep inline callbacks short and lock-free.
 - **Config blocks can stay in a detached target** (📄 Codex library review (2)): an oversized
   inline config (over 256 bytes) is left allocated while a callback that may read it is
   still in flight. One block per such config; stderr says so.
-- **Controller death:** an **attached** target is protected by the agent's controller-death
-  guard (Lifecycle L1): if the controller is killed, the agent restores breakpoints, clears
-  debug registers, resumes held threads and removes inline hooks. A **launched** target dies
-  with its controller by design. Residual (Lifecycle): a breakpoint/hw `call_func` running
+- **Controller death:** an **attached** target with **inline probes** is protected by the
+  agent's controller-death guard (Lifecycle L1): if the controller is killed, the agent
+  restores breakpoints, clears debug registers, resumes held threads and removes inline hooks.
+  A **breakpoint/hw-only** attach injects nothing (owner decision 2026-11-07: no side effect
+  beyond deliberate writes; "controller-crash self-unhook is not worth the cost"), so it has no
+  guard: the kernel detaches the dead debugger without killing the target, but the target
+  keeps our INT3s / debug registers and dies at its next hit (`0x80000003` breakpoint /
+  `0x80000004` single step), or runs on if it never reaches one; regress
+  `lifecycle-controller-killed-{breakpoint,hw}`. A **launched** target dies with its
+  controller by design. Residual (Lifecycle): a breakpoint/hw `call_func` running
   when the controller dies leaves that thread redirected; after the controller is gone, any
   single-step on a thread without its own debug registers is taken as UHH's (a program
   single-stepping itself would lose those steps). 🔧 Lifecycle L11: one x64 kill timing on

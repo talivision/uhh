@@ -121,12 +121,13 @@ struct probe_ipc_request {
     uint64_t config, config_len;          /* probe_add_symbol_cfg */
 };
 
-/* Controller-death guard (ATTACH sessions). A debugger killed while attached (TerminateProcess,
+/* Controller-death guard (ATTACH sessions with an agent, i.e. with inline probes: a breakpoint/
+   hw-only session injects nothing -- owner decision 2026-11-07). A debugger killed while attached (TerminateProcess,
    crash) is detached by the kernel with its INT3s still in the code, its debug registers still
    armed and possibly threads it had suspended: the target would die at its next hit. The
    controller mirrors that state here after every debug event (the armed INT3s and their
    original bytes are the INT3 table, probe_agent_shared::int3, kept for every session with a
-   channel); the agent (loaded into every attached target) owns a vectored handler that takes
+   channel); the agent owns a vectored handler that takes
    each such trap as ours -- restores the byte / clears the DR / ends the step -- and its service
    thread, woken when the controller process ends, cleans everything up: original bytes back,
    our DR slots and steps cleared on every thread, held threads resumed, inline hooks removed. */
@@ -314,8 +315,12 @@ inline void probe_agent_retire_carry(probe_agent_shared *sh, const probe_agent_l
     if (rec.carry != 1 || rec.probe >= PROBE_AGENT_MAX_PROBES) return;
     if (rec.reserved) {                         /* the owner's block (v25): the controller's own counter */
         if (rec.reserved > PROBE_AGENT_TBLOCKS) return;
-        /* No bound check here (it summed the block's 128 counters per record): the sums clamp a
-           block's unaccounted at zero, so a bogus carry cannot borrow from another block. */
+        /* No bound check: it summed the block's hits, then read `done` -- while the owner kept
+           counting (a hit = hits[p]++ ... done++ at its return), a sum that read hits[p] before
+           one hit and `done` after it came out one short, read 0 with this record's unit still
+           pending, and skipped the retire: one hit reported interrupted forever (CI 42325381514,
+           gated-e2e-launch-fhw-oin-cin-rin: logs 646/646 delivered, interrupted=1). The sums
+           clamp a block's unaccounted at zero, so a bogus carry cannot borrow anyway. */
         InterlockedIncrement64(&sh->tblocks[rec.reserved - 1].retired);
         return;
     }

@@ -6,7 +6,7 @@
 
 struct hitcost_config { uint32_t method; uint32_t pad; };
 enum { M_EMPTY, M_GET_REG, M_GET_ARG, M_GET_MEM, M_SET_MEM, M_SEND_LOG, M_SEND_LOG_STACK, M_CALL_FUNC,
-       M_COUNTER_PLAIN, M_COUNTER_SHARED, M_CALL_ORIGINAL };
+       M_COUNTER_PLAIN, M_COUNTER_SHARED, M_CALL_ORIGINAL, M_LOG_ALT };
 
 static volatile uint64_t g_sink;
 // UHH_SHARED cost: the same atomic increment on a plain global and on a shared one. With
@@ -36,6 +36,9 @@ extern "C" __declspec(dllexport) void hitcost_empty(probe_context *c) {
     // Detours-style replacement: run the original now and return its result (hit_site is
     // cdecl with one argument: x86 caller pops, so return_from nargs = 0).
     case M_CALL_ORIGINAL: { uint64_t r = 0; if (call_original(c, 1, &r)) return_from(c, r, 0); break; }
+    // Every other call logs: the carried first records are retired by the controller while
+    // the same thread goes on counting hits that end without a log (regress carry-exact).
+    case M_LOG_ALT: { const uint64_t a = get_func_arg(c, 0); if (!(a & 1)) send_log(c, "hit %llu", (unsigned long long)a); break; }
     default: break;
     }
 }
