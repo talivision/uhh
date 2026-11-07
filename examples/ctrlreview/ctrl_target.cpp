@@ -521,11 +521,11 @@ static int run_headcorrupt() {
     wchar_t name[64];
     _snwprintf_s(name, _countof(name), _TRUNCATE, L"Local\\probe_api_%lu", GetCurrentProcessId());
     HANDLE m = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, name);
-    void *v = m ? MapViewOfFile(m, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 64) : nullptr;
+    void *v = m ? MapViewOfFile(m, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 192) : nullptr;
     if (v) {
-        // probe_agent_shared: magic, version, request_count, reserved, log_head @16, log_tail @24
-        volatile LONG64 *head = (volatile LONG64 *)((char *)v + 16);
-        volatile LONG64 *tail = (volatile LONG64 *)((char *)v + 24);
+        // probe_agent_shared (v27): log_head @64 (a cache line of its own), log_tail @128
+        volatile LONG64 *head = (volatile LONG64 *)((char *)v + 64);
+        volatile LONG64 *tail = (volatile LONG64 *)((char *)v + 128);
         *head = *tail + 0x7FFFFFFFFFFFll;
     }
     std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"headcorrupt\",\"mapped\":%d}\n", v != nullptr);

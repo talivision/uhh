@@ -4,6 +4,7 @@
 // Instruments ctrl_target for one controller-review finding (see ctrl_target.cpp) with
 // one backend, runs it and prints the target's result, the probe rows and the logs.
 #include "probe_api.h"
+#include <windows.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -22,6 +23,19 @@ void ctrl_on_bigcfg(probe_context *);
 void ctrl_on_shape(probe_context *);
 }
 struct ctrl_cfg { uint32_t backend; uint32_t pad; };
+
+// The per-session agent copies this process left in %TEMP%\uhh (directories "<pid>-...").
+static int agent_copies_left() {
+    wchar_t tmp[MAX_PATH]; DWORD n = GetTempPathW(MAX_PATH, tmp);
+    if (!n || n >= MAX_PATH - 16) return -1;
+    std::wstring pattern = std::wstring(tmp) + L"uhh\\" + std::to_wstring(GetCurrentProcessId()) + L"-*";
+    WIN32_FIND_DATAW fd{}; int left = 0;
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do { if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ++left; } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return left;
+}
 
 static uint32_t parse_backend(const char *b) {
     return !std::strcmp(b, "hw") ? PROBE_HW : !std::strcmp(b, "inline") ? PROBE_INLINE
@@ -54,7 +68,7 @@ int main(int argc, char **argv) {
             ok = probe_add_symbol_cfg(s, "ctrl_target.exe!CtrlAnnounce", ctrl_on_announce, backend, &k, sizeof(k));
         else if (sc == "symunload")
             ok = probe_add_symbol(s, "ctrl_dll.dll!CtrlDllLeaf", ctrl_on_leaf, backend);
-        else if (sc == "owndr" || sc == "headcorrupt")
+        else if (sc == "owndr" || sc == "headcorrupt" || sc == "unlaunched" || sc == "badlaunch")
             ok = probe_add_symbol(s, "ctrl_target.exe!CtrlTick", ctrl_on_tick, backend);
         else if (sc == "absreuse" || sc == "int3cap")
             ok = probe_add_symbol(s, "ctrl_target.exe!CtrlOp", ctrl_on_op, backend);
@@ -65,6 +79,18 @@ int main(int argc, char **argv) {
         else if (sc == "shape")
             ok = probe_add_symbol(s, ("ctrl_target.exe!Shape_" + shape + "_P_Insn").c_str(), ctrl_on_shape, backend);
         else { std::fprintf(stderr, "ctrl_driver: unknown scenario %s\n", sc.c_str()); ok = false; }
+    }
+    if (ok && (sc == "unlaunched" || sc == "badlaunch")) {
+        // perf5: the agent is prepared on its own thread from the first inline add. A session
+        // closed without a launch, or whose launch failed, must still end it cleanly: no crash
+        // (a joinable thread at the session's end), the per-session agent copy deleted.
+        char missing[] = "C:\\uhh-no-such-dir\\no_such_target.exe";
+        char *bad[] = {missing, nullptr};
+        const int launched = sc == "badlaunch" ? probe_launch(s, bad) : 0;
+        probe_close(s);
+        std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"%s\",\"launched\":%d,\"copies_left\":%d}\n",
+                    sc.c_str(), launched, agent_copies_left());
+        return launched == 0 ? 0 : 1;
     }
     ok = ok && probe_launch(s, child.data()) && probe_run(s) && probe_wait_for_exit(s);
     if (s) { probe_report(s, stdout); probe_close(s); }

@@ -46,6 +46,10 @@ static BOOL uhh_set_thread_context(HANDLE h, const CONTEXT *c) {
 
 struct Probe {
     std::string location, module, callback_export;
+    // A breakpoint/hw callback whose module has UHH_SHARED state, added before the session's
+    // agent DLL is loaded: its export name in the agent; `callback` is bound to the agent's copy
+    // once the agent is loaded (ensure_local_agent, before the target can run).
+    std::string shared_export;
     std::string export_name;   // "module!Export+0xOFF": resolved from the export table at load
     uint64_t sym_offset = 0;
     // The location named its module without an extension ("kernel32!X"): module is then
@@ -219,6 +223,12 @@ struct probe_session {
     DWORD stdout_type = FILE_TYPE_UNKNOWN;
     bool stdout_is_console = false, tail_enabled = false;
     bool writer_stop = false, writer_busy = false, writer_failed = false;
+    // Write coalescing (log_writer_main): the writer may hold a short batch briefly while records
+    // stream in. writer_holding (queue_mu) says it is; a flush (flush_waiters), a stop or a
+    // half-full queue ends the hold at once through writer_hold.
+    bool writer_holding = false;
+    int flush_waiters = 0;
+    std::condition_variable writer_hold;
     std::string writer_error;
     std::thread log_tailer;
     std::mutex tail_mu;
@@ -265,6 +275,16 @@ struct probe_session {
     HANDLE mapping = nullptr, remote_thread = nullptr;
     probe_agent_shared *shared = nullptr;
     HMODULE local_agent = nullptr;
+    // The controller's agent DLL is prepared (the per-session copy made, then loaded) on its own
+    // thread from the first probe that needs it: a freshly written DLL is scanned by real-time
+    // antivirus when it is first mapped (~100 ms on the test VM, every session), and that now
+    // overlaps the rest of the session setup (dbghelp, process creation). ensure_local_agent
+    // joins it. agent_prep_module / agent_prep_error: its result, read after the join.
+    std::thread agent_prep;
+    HMODULE agent_prep_module = nullptr;
+    DWORD agent_prep_error = 0;
+    std::unordered_set<std::string> agent_file_exports;   // the agent file's export names (read once)
+    bool agent_file_exports_read = false;
     void *remote_path = nullptr;
     uint64_t remote_agent = 0;
     DWORD remote_tid = 0;
@@ -589,6 +609,16 @@ static bool kick_agent(probe_session *s);
 static bool resolve_inline(probe_session *s, Probe &p, uint64_t base);
 static Probe *probe_at(probe_session *s, uint64_t address);
 static bool trace_enabled() { static const bool on = std::getenv("PROBE_TRACE") != nullptr; return on; }
+static void bench_phase(const char *what, const char *arg = nullptr);
+// DIAG (perf5): UHH_BENCH_PHASES=1 stamps lifecycle phases (QPC ms) on stderr.
+static std::atomic<uint64_t> g_diag_file_writes{0}, g_diag_file_bytes{0}, g_diag_enqueues{0}, g_diag_passes{0}, g_diag_moved{0};
+static void bench_phase(const char *what, const char *arg) {
+    static const bool on = std::getenv("UHH_BENCH_PHASES") != nullptr;
+    if (!on) return;
+    static const double f = [] { LARGE_INTEGER x; QueryPerformanceFrequency(&x); return (double)x.QuadPart; }();
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    std::fprintf(stderr, "  phase %.3f %s %s\n", (double)t.QuadPart * 1000.0 / f, what, arg ? arg : "");
+}
 static void start_drainer(probe_session *s);
 static void stop_drainer(probe_session *s);
 static std::string symbolize(probe_session *s, uint64_t addr);
@@ -762,6 +792,7 @@ static bool write_log_batch(probe_session *s, const std::string &bytes, uint64_t
         writer_failed(s, win_error("write probe log file"), records);
         return false;
     }
+    g_diag_file_writes++; g_diag_file_bytes += bytes.size();
     s->logs_written.fetch_add(records, std::memory_order_relaxed);
     { std::lock_guard<std::mutex> lock(s->queue_mu); }   // no lost wakeup: a live probe_report waits for a mark
     s->queue_flushed.notify_all();
@@ -792,6 +823,21 @@ static void log_writer_main(probe_session *s) {
         const unsigned long kb = n && n < sizeof(v) ? std::strtoul(v, nullptr, 10) : 0;
         return kb >= 4 && kb <= 16384 ? (size_t)kb * 1024 : (size_t)64 * 1024;
     }();
+    // Write coalescing. The drainer hands over whatever one ring pass found -- under a steady
+    // stream of records a few dozen at a time -- and an empty queue used to end the batch at
+    // once: two WriteFile calls (stdout and the session file) per small handful of records, the
+    // controller's main per-record cost. Now a batch that comes less than HOLD after the
+    // previous write waits until HOLD has passed since it (more records join it), so a stream
+    // costs at most one write pair per HOLD; the first record after a quiet spell is written at
+    // once (live latency unchanged). Ended early by a flush, a stop, or a queue half full.
+    // Bench knob, not API: UHH_BENCH_WRITE_HOLD_US (0 = off).
+    static const auto HOLD = [] {
+        char v[16] = {};
+        const DWORD n = GetEnvironmentVariableA("UHH_BENCH_WRITE_HOLD_US", v, sizeof(v));
+        const unsigned long us = n && n < sizeof(v) ? std::strtoul(v, nullptr, 10) : 500;
+        return std::chrono::microseconds(us <= 100000 ? us : 500);
+    }();
+    auto last_write = std::chrono::steady_clock::now() - std::chrono::seconds(1);
     uint64_t unwritten = 0;
     try {
         std::string batch;
@@ -819,6 +865,7 @@ static void log_writer_main(probe_session *s) {
                 if (before && batch.size() > BATCH_BYTES) {             // over: write what was there first
                     std::string line = batch.substr(before);
                     batch.resize(before);
+                    last_write = std::chrono::steady_clock::now();
                     if (!write_log_batch(s, batch, batch_records)) { failed(); return false; }
                     unwritten -= batch_records;
                     batch.assign(line); batch_records = 0;
@@ -826,6 +873,7 @@ static void log_writer_main(probe_session *s) {
                 }
                 ++batch_records;
                 if (batch.size() >= BATCH_BYTES || std::chrono::steady_clock::now() >= deadline) {
+                    last_write = std::chrono::steady_clock::now();
                     if (!write_log_batch(s, batch, batch_records)) { failed(); return false; }
                     unwritten -= batch_records;
                     batch.clear(); batch_records = 0;
@@ -839,7 +887,18 @@ static void log_writer_main(probe_session *s) {
             std::vector<LogRecord> chunk;
             for (;;) {
                 if (chunk.empty()) {
-                    std::lock_guard<std::mutex> lock(s->queue_mu);
+                    std::unique_lock<std::mutex> lock(s->queue_mu);
+                    if (s->log_queue.empty() && !batch.empty() && HOLD.count() && !s->writer_stop && !s->flush_waiters) {
+                        const auto until = last_write + HOLD;
+                        if (std::chrono::steady_clock::now() < until) {
+                            s->writer_holding = true;
+                            s->writer_hold.wait_until(lock, until, [s] {
+                                return s->writer_stop || s->flush_waiters ||
+                                       s->log_queue_records >= probe_session::LOG_QUEUE_CAP / 2;
+                            });
+                            s->writer_holding = false;
+                        }
+                    }
                     if (s->log_queue.empty()) break;
                     size_t taken = 0;
                     while (!s->log_queue.empty() && taken < LOG_PACK) {
@@ -881,6 +940,7 @@ static void log_writer_main(probe_session *s) {
                 }
             }
             // An empty queue is an idle boundary: do not hold a short batch for the timer.
+            if (!batch.empty()) last_write = std::chrono::steady_clock::now();
             if (!write_log_batch(s, batch, batch_records)) { failed(); return; }
             unwritten -= batch_records;
             {
@@ -1351,6 +1411,7 @@ static bool start_log_output(probe_session *s) {
             std::lock_guard<std::mutex> lock(s->queue_mu); s->writer_stop = true;
         }
         s->queue_readable.notify_one();
+        s->writer_hold.notify_all();
         if (s->log_writer.joinable()) s->log_writer.join();
         if (s->log_reader != INVALID_HANDLE_VALUE) { CloseHandle(s->log_reader); s->log_reader = INVALID_HANDLE_VALUE; }
         CloseHandle(s->log_file); s->log_file = INVALID_HANDLE_VALUE;
@@ -1393,6 +1454,7 @@ static bool enqueue_log(probe_session *s, LogRecord &&record) {
 // `records` is left empty. Entries may be packs (LogRecord::packed): the cap counts records, and
 // a pack goes in whole while the queue holds fewer than the cap.
 static void enqueue_logs(probe_session *s, std::vector<LogRecord> &records) {
+    if (!records.empty()) g_diag_enqueues++;
     size_t i = 0;
     while (i < records.size()) {
         std::unique_lock<std::mutex> lock(s->queue_mu);
@@ -1413,7 +1475,9 @@ static void enqueue_logs(probe_session *s, std::vector<LogRecord> &records) {
             try { s->log_queue.push_back(std::move(records[i])); s->logs_enqueued += n; s->log_queue_records += n; }
             catch (...) { s->controller_dropped.fetch_add(n, std::memory_order_relaxed); }
         }
+        const bool end_hold = s->writer_holding && s->log_queue_records >= probe_session::LOG_QUEUE_CAP / 2;
         lock.unlock();
+        if (end_hold) s->writer_hold.notify_all();
         if (warned) warn_console_once(s);
         s->queue_readable.notify_one();
     }
@@ -1430,10 +1494,13 @@ static void flush_log_writer(probe_session *s, bool up_to_now) {
     {
         std::unique_lock<std::mutex> lock(s->queue_mu);
         const uint64_t mark = s->logs_enqueued;
+        ++s->flush_waiters;                          // a held batch is written now (log_writer_main)
+        if (s->writer_holding) s->writer_hold.notify_all();
         s->queue_flushed.wait(lock, [s, up_to_now, mark] {
             return (s->log_queue.empty() && !s->writer_busy) || s->writer_failed ||
                    (up_to_now && s->logs_written.load() >= mark);
         });
+        --s->flush_waiters;
         error = s->writer_error;
     }
     if (!error.empty()) set_error(s, error);
@@ -1500,6 +1567,7 @@ static void stop_log_output(probe_session *s) {
             std::lock_guard<std::mutex> lock(s->queue_mu); s->writer_stop = true;
         }
         s->queue_readable.notify_one();
+        s->writer_hold.notify_all();
         s->log_writer.join();
         flush_log_writer(s);
     }
@@ -1724,11 +1792,111 @@ static bool file_has_section(const std::wstring &path, const char *name) {
 // every session gets its own copy of the file (a shared section is shared by everyone who
 // maps the same file): %TEMP%\uhh\<pid>-<n>\probe_api_agent.dll, deleted at close; stale
 // copies of dead sessions are swept here.
-static bool ensure_local_agent(probe_session *s) {
-    if (s->local_agent) return true;
+// The per-session copy of the agent DLL, written with its UHH_SHARED section's trailing zero bytes
+// left out of the file (SizeOfRawData < VirtualSize: the loader zero-fills the rest of the
+// section's pages, as for a .data section's .bss tail -- the section stays shared). That section
+// holds every UHH_SHARED global of every callback module linked into the agent, nearly all
+// zero: 7.5 MB of the 8.3 MB file. Real-time antivirus scans a new DLL file when it is first
+// mapped -- every session, since every session gets a new copy -- and the scan time follows the
+// file size (VM, Defender: ~90 ms for the full copy). Same bytes otherwise; anything this does
+// not expect (a signed image, a section's data inside the dropped range) falls back to a plain
+// copy (false).
+static bool write_trimmed_agent(const std::wstring &src, const std::wstring &dst) {
+    HANDLE f = CreateFileW(src.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size{};
+    std::vector<unsigned char> img;
+    bool ok = GetFileSizeEx(f, &size) && size.QuadPart > 4096 && size.QuadPart < (1ll << 30);
+    if (ok) {
+        img.resize((size_t)size.QuadPart);
+        DWORD got = 0;
+        ok = ReadFile(f, img.data(), (DWORD)img.size(), &got, nullptr) && got == img.size();
+    }
+    CloseHandle(f);
+    if (!ok) return false;
+    auto in = [&](uint64_t off, uint64_t n) { return off <= img.size() && n <= img.size() - off; };
+    auto dos = reinterpret_cast<IMAGE_DOS_HEADER *>(img.data());
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || !in((uint64_t)dos->e_lfanew, sizeof(IMAGE_NT_HEADERS))) return false;
+    auto nt = reinterpret_cast<IMAGE_NT_HEADERS *>(img.data() + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR_MAGIC) return false;
+    const DWORD align = nt->OptionalHeader.FileAlignment;
+    if (!align || (align & (align - 1))) return false;
+    const DWORD ndirs = nt->OptionalHeader.NumberOfRvaAndSizes;
+    if (ndirs > IMAGE_DIRECTORY_ENTRY_SECURITY && nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY].Size) return false;
+    auto sec = IMAGE_FIRST_SECTION(nt);
+    const WORD nsec = nt->FileHeader.NumberOfSections;
+    if (!in((uint64_t)((unsigned char *)sec - img.data()), (uint64_t)nsec * sizeof(IMAGE_SECTION_HEADER))) return false;
+    IMAGE_SECTION_HEADER *shr = nullptr;
+    for (WORD i = 0; i < nsec; ++i)
+        if (!strncmp(reinterpret_cast<const char *>(sec[i].Name), "uhhshr", 8)) shr = &sec[i];
+    if (!shr || !shr->SizeOfRawData || !in(shr->PointerToRawData, shr->SizeOfRawData)) return false;
+    uint64_t used = shr->SizeOfRawData;
+    while (used && img[shr->PointerToRawData + used - 1] == 0) --used;
+    const uint64_t keep = (used + align - 1) & ~(uint64_t)(align - 1);
+    if (keep >= shr->SizeOfRawData) return false;
+    const uint64_t cut_at = shr->PointerToRawData + keep, cut_end = (uint64_t)shr->PointerToRawData + shr->SizeOfRawData;
+    const DWORD delta = (DWORD)(cut_end - cut_at);
+    // Every other section's data must be entirely before or after the dropped range.
+    for (WORD i = 0; i < nsec; ++i) {
+        if (&sec[i] == shr || !sec[i].SizeOfRawData) continue;
+        const uint64_t a = sec[i].PointerToRawData, b = a + sec[i].SizeOfRawData;
+        if (!(b <= cut_at || a >= cut_end)) return false;
+    }
+    // Debug directory entries name their data by FILE offset.
+    std::vector<IMAGE_DEBUG_DIRECTORY *> dbg;
+    if (ndirs > IMAGE_DIRECTORY_ENTRY_DEBUG) {
+        const auto &d = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+        if (d.VirtualAddress && d.Size) {
+            uint64_t off = UINT64_MAX;
+            for (WORD i = 0; i < nsec; ++i)
+                if (d.VirtualAddress >= sec[i].VirtualAddress && d.VirtualAddress < (uint64_t)sec[i].VirtualAddress + sec[i].SizeOfRawData)
+                    off = (uint64_t)d.VirtualAddress - sec[i].VirtualAddress + sec[i].PointerToRawData;
+            if (off == UINT64_MAX || !in(off, d.Size)) return false;
+            for (DWORD k = 0; k + sizeof(IMAGE_DEBUG_DIRECTORY) <= d.Size; k += sizeof(IMAGE_DEBUG_DIRECTORY)) {
+                auto *e = reinterpret_cast<IMAGE_DEBUG_DIRECTORY *>(img.data() + off + k);
+                if (e->PointerToRawData && e->SizeOfData) {
+                    const uint64_t a = e->PointerToRawData, b = a + e->SizeOfData;
+                    if (!(b <= cut_at || a >= cut_end)) return false;
+                    if (a >= cut_end) dbg.push_back(e);
+                }
+            }
+        }
+    }
+    for (WORD i = 0; i < nsec; ++i)
+        if (&sec[i] != shr && sec[i].SizeOfRawData && sec[i].PointerToRawData >= cut_end) sec[i].PointerToRawData -= delta;
+    for (auto *e : dbg) e->PointerToRawData -= delta;
+    shr->SizeOfRawData = (DWORD)keep;
+    nt->OptionalHeader.CheckSum = 0;
+    img.erase(img.begin() + (ptrdiff_t)cut_at, img.begin() + (ptrdiff_t)cut_end);
+    {   // the PE checksum (as CheckSumMappedFile), for tools that look at it
+        uint64_t sum = 0;
+        const size_t words = img.size() / 2;
+        for (size_t i = 0; i < words; ++i) {
+            uint16_t w; std::memcpy(&w, img.data() + 2 * i, 2);
+            sum += w; sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        if (img.size() & 1) { sum += img.back(); sum = (sum & 0xFFFF) + (sum >> 16); }
+        sum = (sum & 0xFFFF) + (sum >> 16);
+        reinterpret_cast<IMAGE_NT_HEADERS *>(img.data() + dos->e_lfanew)->OptionalHeader.CheckSum = (DWORD)(sum + img.size());
+    }
+    HANDLE o = CreateFileW(dst.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (o == INVALID_HANDLE_VALUE) return false;
+    DWORD wrote = 0;
+    const bool written = WriteFile(o, img.data(), (DWORD)img.size(), &wrote, nullptr) && wrote == img.size();
+    CloseHandle(o);
+    if (!written) DeleteFileW(dst.c_str());
+    return written;
+}
+
+// The body of the agent preparation (agent_prep's thread, or inline): the per-session copy, then
+// the load. Touches only agent_path / agent_copy / agent_prep_*: nothing else reads them until
+// ensure_local_agent has joined.
+static void prepare_local_agent(probe_session *s) {
+    bench_phase("agent_begin", nullptr);
     if (s->agent_path.empty()) {
         s->agent_path = sibling_agent_path();
         if (file_has_section(s->agent_path, "uhhshr")) {
+            bench_phase("agent_sweep", nullptr);
             wchar_t tmp[MAX_PATH]; DWORD n = GetTempPathW(MAX_PATH, tmp);
             if (n && n < MAX_PATH - 64) {
                 std::wstring root = std::wstring(tmp) + L"uhh";
@@ -1757,7 +1925,9 @@ static bool ensure_local_agent(probe_session *s) {
                 std::wstring dir = root + L"\\" + std::to_wstring(GetCurrentProcessId()) + L"-" +
                                    std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(counter++);
                 std::wstring copy = dir + L"\\probe_api_agent.dll";
-                if (CreateDirectoryW(dir.c_str(), nullptr) && CopyFileW(s->agent_path.c_str(), copy.c_str(), TRUE)) {
+                bench_phase("agent_copy", nullptr);
+                if (CreateDirectoryW(dir.c_str(), nullptr) &&
+                    (write_trimmed_agent(s->agent_path, copy) || CopyFileW(s->agent_path.c_str(), copy.c_str(), TRUE))) {
                     s->agent_path = copy; s->agent_copy = copy;
                 } else {
                     std::fprintf(stderr, "probe: warning: could not make a per-session copy of the agent DLL; "
@@ -1766,20 +1936,95 @@ static bool ensure_local_agent(probe_session *s) {
             }
         }
     }
-    s->local_agent = LoadLibraryW(s->agent_path.c_str());
+    bench_phase("agent_load", nullptr);
+    s->agent_prep_module = LoadLibraryW(s->agent_path.c_str());
+    s->agent_prep_error = s->agent_prep_module ? 0 : GetLastError();
+    bench_phase("agent_loaded", nullptr);
+}
+
+static void start_agent_prep(probe_session *s) {
+    if (s->local_agent || s->agent_prep.joinable() || s->agent_prep_module || s->agent_prep_error) return;
+    try { s->agent_prep = std::thread(prepare_local_agent, s); }
+    catch (...) { prepare_local_agent(s); }                  // no thread: here and now
+}
+
+static bool ensure_local_agent(probe_session *s) {
+    if (s->local_agent) return true;
+    if (!s->agent_prep.joinable() && !s->agent_prep_module && !s->agent_prep_error) prepare_local_agent(s);
+    if (s->agent_prep.joinable()) s->agent_prep.join();
+    s->local_agent = s->agent_prep_module;
+    if (!s->local_agent) SetLastError(s->agent_prep_error);
     if (!s->local_agent || !GetProcAddress(s->local_agent, "probe_agent_init")) {
+        s->agent_prep_error = s->agent_prep_error ? s->agent_prep_error : GetLastError();
         set_error(s, win_error("map probe_api_agent.dll exports")); return false;
     }
     // Callbacks this process runs from its copy of the agent DLL must reach THIS library.
     using bind_fn = void (*)(const probe_controller_api *);
     if (auto bind = reinterpret_cast<bind_fn>(GetProcAddress(s->local_agent, "probe_agent_bind_controller")))
         bind(controller_api_table());
+    // UHH_SHARED callbacks added before the agent was loaded: bound to its copy now.
+    for (auto &p : s->probes) {
+        if (p->shared_export.empty()) continue;
+        auto shared_cb = reinterpret_cast<probe_callback>(GetProcAddress(s->local_agent, p->shared_export.c_str()));
+        if (!shared_cb) { set_error(s, "UHH_SHARED callback '" + p->shared_export + "' is not exported by the agent DLL"); return false; }
+        p->callback = shared_cb;
+        p->shared_export.clear();
+    }
+    return true;
+}
+
+// The export names of the agent DLL FILE (the per-session copy is the same bytes), read from the
+// file's export directory -- so a probe_add can refuse a UHH_SHARED callback the agent does not
+// export without waiting for the agent to load.
+static bool read_file_exports(const std::wstring &path, std::unordered_set<std::string> &out) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size{};
+    std::vector<unsigned char> img;
+    bool ok = GetFileSizeEx(f, &size) && size.QuadPart > 0 && size.QuadPart < (256ll << 20);
+    if (ok) {
+        img.resize((size_t)size.QuadPart);
+        DWORD got = 0;
+        ok = ReadFile(f, img.data(), (DWORD)img.size(), &got, nullptr) && got == img.size();
+    }
+    CloseHandle(f);
+    if (!ok || img.size() < sizeof(IMAGE_DOS_HEADER)) return false;
+    auto in = [&](uint64_t off, uint64_t n) { return off <= img.size() && n <= img.size() - off; };
+    auto dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(img.data());
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || !in((uint64_t)dos->e_lfanew, sizeof(IMAGE_NT_HEADERS))) return false;
+    auto nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(img.data() + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXPORT) return false;
+    auto sec = IMAGE_FIRST_SECTION(nt);
+    const WORD nsec = nt->FileHeader.NumberOfSections;
+    if (!in((uint64_t)((const unsigned char *)sec - img.data()), (uint64_t)nsec * sizeof(IMAGE_SECTION_HEADER))) return false;
+    auto offset_of = [&](uint64_t rva, uint64_t &off) {
+        for (WORD i = 0; i < nsec; ++i)
+            if (rva >= sec[i].VirtualAddress && rva < (uint64_t)sec[i].VirtualAddress + sec[i].SizeOfRawData) {
+                off = rva - sec[i].VirtualAddress + sec[i].PointerToRawData; return true;
+            }
+        return false;
+    };
+    const auto &dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    uint64_t eoff = 0;
+    if (!dir.VirtualAddress) return true;                       // no exports
+    if (!offset_of(dir.VirtualAddress, eoff) || !in(eoff, sizeof(IMAGE_EXPORT_DIRECTORY))) return false;
+    auto ed = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY *>(img.data() + eoff);
+    uint64_t noff = 0;
+    if (ed->NumberOfNames && (!offset_of(ed->AddressOfNames, noff) || !in(noff, (uint64_t)ed->NumberOfNames * 4))) return false;
+    for (DWORD i = 0; i < ed->NumberOfNames; ++i) {
+        DWORD rva; std::memcpy(&rva, img.data() + noff + 4ull * i, 4);
+        uint64_t off = 0;
+        if (!offset_of(rva, off) || !in(off, 1)) return false;
+        const char *name = reinterpret_cast<const char *>(img.data() + off);
+        const size_t len = strnlen(name, img.size() - off);
+        out.emplace(name, len);
+    }
     return true;
 }
 
 // A breakpoint/hw callback whose module uses UHH_SHARED runs from the controller's copy of
 // the agent DLL (found by export name), so it shares those globals with inline callbacks.
-static bool bind_shared_callback(probe_session *s, probe_callback &cb, uint32_t flags) {
+static bool bind_shared_callback(probe_session *s, probe_callback &cb, uint32_t flags, std::string &pending_export) {
     if (flags & PROBE_INLINE) return true;                   // runs in the target's copy anyway
     HMODULE m{};
     if (!module_of(reinterpret_cast<const void *>(cb), m) || m == s->local_agent ||
@@ -1788,6 +2033,22 @@ static bool bind_shared_callback(probe_session *s, probe_callback &cb, uint32_t 
     if (!callback_export_name(cb, name)) {
         set_error(s, "callback uses UHH_SHARED state but is not a named export (the controller runs it from the agent DLL)");
         return false;
+    }
+    if (!s->local_agent && !s->launched) {
+        // Before the launch/attach: checked against the agent file's exports now, bound once the
+        // agent is loaded (ensure_local_agent; the load runs meanwhile, start_agent_prep).
+        start_agent_prep(s);                     // first: the export check below reads the file too
+        if (!s->agent_file_exports_read) {
+            s->agent_file_exports_read = true;
+            if (!read_file_exports(sibling_agent_path(), s->agent_file_exports)) s->agent_file_exports.clear();
+        }
+        if (!s->agent_file_exports.empty()) {
+            if (!s->agent_file_exports.count(name)) {
+                set_error(s, "UHH_SHARED callback '" + name + "' is not exported by the agent DLL"); return false;
+            }
+            pending_export = name;
+            return true;
+        }
     }
     if (!ensure_local_agent(s)) return false;
     auto shared_cb = reinterpret_cast<probe_callback>(GetProcAddress(s->local_agent, name.c_str()));
@@ -3908,6 +4169,8 @@ static void arm_thread_start_fixup(probe_session *s) {
 }
 
 extern "C" probe_session *probe_session_create(void) {
+    bench_phase("session_create");
+    uhh_sym::preload();
     try { return new probe_session; }
     catch (...) { std::fprintf(stderr, "probe: error: session allocation failed\n"); return nullptr; }
 }
@@ -3999,11 +4262,15 @@ extern "C" int probe_add_symbol_cfg(probe_session *s, const char *location, prob
     if (config_len && !config) { set_error(s, "non-empty probe config is null"); return scope.done(0); }
     if ((uint64_t)config_len > UINT32_MAX) { set_error(s, "probe config is larger than 4 GB"); return scope.done(0); }
     try {
+        bench_phase("add_begin", location);
         auto p = std::make_unique<Probe>();
         if (!parse_location(s, location, *p)) return scope.done(0);
+        bench_phase("add_parsed", location);
         p->callback = callback; p->flags = flags; p->runtime = s->launched;
-        if (!bind_shared_callback(s, p->callback, flags)) return scope.done(0);
+        if (!bind_shared_callback(s, p->callback, flags, p->shared_export)) return scope.done(0);
+        bench_phase("add_bound", location);
         if (type == PROBE_INLINE && !inline_callback_names(s, callback, p->callback_export)) return scope.done(0);
+        if (type == PROBE_INLINE && !s->launched) start_agent_prep(s);   // the session will load the agent
         if (config_len) {
             auto first = static_cast<const unsigned char *>(config);
             p->config.assign(first, first + config_len);
@@ -4044,7 +4311,8 @@ static int add_absolute(probe_session *s, uint64_t address, probe_callback cb, u
         auto p = std::make_unique<Probe>();
         char loc[40]; std::snprintf(loc, sizeof(loc), "0x%llx", (unsigned long long)address);
         p->location = loc; p->flags = flags; p->callback = cb; p->rva = address; p->runtime = true;
-        if (!bind_shared_callback(s, p->callback, flags)) return scope.done(0);
+        std::string pending;                         // runtime add: bound at once (agent loaded)
+        if (!bind_shared_callback(s, p->callback, flags, pending)) return scope.done(0);
         if ((flags & PROBE_INLINE) && !inline_callback_names(s, cb, p->callback_export)) return scope.done(0);
         Probe *raw = p.get();
         s->probes.push_back(std::move(p));
@@ -4095,7 +4363,9 @@ static bool open_agent_section(probe_session *s, uint32_t count) {
     std::memset(s->shared, 0, sizeof(*s->shared));
     s->shared->magic = PROBE_AGENT_MAGIC; s->shared->version = PROBE_AGENT_VERSION;
     s->shared->request_count = count;
+    bench_phase("section_mapped");
     for (uint32_t i = 0; i < PROBE_AGENT_LOG_CAP; ++i) s->shared->logs[i].seq = i;   // ring: all free
+    bench_phase("section_ring");
     sync_int3_table(s);                                 // breakpoints armed before the channel existed
     s->shared->controller_pid = GetCurrentProcessId();
     s->shared->log_ipc = 1;                     // this debugger services PROBE_IPC_LOG (cleared before it leaves)
@@ -4117,7 +4387,10 @@ static bool open_agent_section(probe_session *s, uint32_t count) {
     start_drainer(s);
     wchar_t svc[64]; probe_agent_service_name(s->pi.dwProcessId, svc);
     s->svc_event = CreateEventW(nullptr, FALSE, FALSE, svc);
-    return ensure_local_agent(s);
+    bench_phase("section_drainer");
+    const bool la = ensure_local_agent(s);
+    bench_phase("local_agent");
+    return la;
 }
 
 // A config larger than the request's inline buffer goes to a block allocated in the target
@@ -4372,6 +4645,7 @@ static void release_held(probe_session *s, const char *why) {
         CloseHandle(t);
     }
     std::fprintf(stderr, "probe: released %zu held thread(s) (%s)\n", s->held.size(), why);
+    bench_phase("released_held", why);
     s->held.clear();
     guard_resync(s);                                         // our suspensions are over: off the list
 }
@@ -4394,6 +4668,12 @@ static bool kick_agent(probe_session *s) {
 }
 
 static bool same_bitness(probe_session *s, HANDLE process);
+// UHH_SHARED callbacks still waiting for the agent (a session without inline probes opens no
+// channel, which is where the agent is otherwise loaded): load it and bind them now.
+static bool bind_pending_shared(probe_session *s) {
+    for (const auto &p : s->probes) if (!p->shared_export.empty()) return ensure_local_agent(s);
+    return true;
+}
 extern "C" int probe_launch(probe_session *s, char *const argv[]) {
     if (!s || !argv || !argv[0]) { if (s) set_error(s, "launch argv is empty"); return 0; }
     if (s->launched) { set_error(s, "session already launched"); return 0; }
@@ -4411,6 +4691,8 @@ extern "C" int probe_launch(probe_session *s, char *const argv[]) {
         si.hStdInput = GetStdHandle(STD_INPUT_HANDLE); si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
         si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
         HANDLE client_out = INVALID_HANDLE_VALUE, client_err = INVALID_HANDLE_VALUE;
+        // From the target's inheritable pipe ends to their close below (see uhh_sym::inherit_lock).
+        std::unique_lock<std::mutex> inherit(uhh_sym::inherit_lock());
         const bool fwd_out = forwardable(si.hStdOutput), fwd_err = forwardable(si.hStdError);
         const bool one_stream = fwd_out && fwd_err && same_object(si.hStdOutput, si.hStdError);
         if (fwd_out) {
@@ -4433,14 +4715,17 @@ extern "C" int probe_launch(probe_session *s, char *const argv[]) {
         char prev_ndh[16] = {0};
         DWORD had_ndh = GetEnvironmentVariableA("_NO_DEBUG_HEAP", prev_ndh, sizeof(prev_ndh));
         SetEnvironmentVariableA("_NO_DEBUG_HEAP", "1");
+        bench_phase("launch_createprocess");
         BOOL ok = CreateProcessA(argv[0], command.data(), nullptr, nullptr, TRUE,
                                  DEBUG_ONLY_THIS_PROCESS, nullptr, nullptr, &si, &s->pi);
+        bench_phase("launch_created");
         SetEnvironmentVariableA("_NO_DEBUG_HEAP", had_ndh && had_ndh < sizeof(prev_ndh) ? prev_ndh : nullptr);
         DWORD launch_error = GetLastError();
         // Only the target (and what it hands them to) holds the write ends: end of file
         // arrives when its tree closes them.
         if (client_out != INVALID_HANDLE_VALUE) CloseHandle(client_out);
         if (client_err != INVALID_HANDLE_VALUE) CloseHandle(client_err);
+        inherit.unlock();
         if (!ok) {
             forward_stop(s); s->fwd_out_active = false;
             SetLastError(launch_error); set_error(s, win_error("debug launch")); return 0;
@@ -4453,12 +4738,15 @@ extern "C" int probe_launch(probe_session *s, char *const argv[]) {
         s->launched = true;
         s->debug_tid = GetCurrentThreadId();
         if (!start_log_output(s)) { TerminateProcess(s->pi.hProcess, 3); return 0; }
+        bench_phase("launch_logout");
         if (!forward_start(s, &s->fwd_out) || !forward_start(s, &s->fwd_err)) {
             set_error(s, "target output forwarder creation failed"); TerminateProcess(s->pi.hProcess, 3); return 0;
         }
         { std::string which; s->sym_ready = uhh_sym::init(s->pi.hProcess, which);
           std::fprintf(stderr, "probe: symbols via %s%s\n", which.c_str(), uhh_sym::has_symbol_server() ? " (symbol server capable)" : ""); }
-        if (!create_agent_channel(s)) { TerminateProcess(s->pi.hProcess, 3); return 0; }
+        bench_phase("launch_syminit");
+        if (!create_agent_channel(s) || !bind_pending_shared(s)) { TerminateProcess(s->pi.hProcess, 3); return 0; }
+        bench_phase("launch_channel");
         if (!has_inline(s)) s->inline_ready = true;
         return 1;
     } catch (const std::exception &e) { set_error(s, e.what()); return 0; }
@@ -4507,7 +4795,7 @@ extern "C" int probe_attach(probe_session *s, uint32_t pid) {
     };
     if (!start_log_output(s)) return fail();
     { std::string which; s->sym_ready = uhh_sym::init(s->pi.hProcess, which); }
-    if (!create_agent_channel(s)) return fail();
+    if (!create_agent_channel(s) || !bind_pending_shared(s)) return fail();
     if (!s->shared) s->guard_ready = true;     // breakpoint/hw only: arm at once, no agent to wait for
     return 1;
 }
@@ -7854,7 +8142,9 @@ static bool early_agent(probe_session *s, const DEBUG_EVENT &event, bool &ok) {
     s->remote_work = probe_session::REMOTE_EARLY; s->quiet_tid = event.dwThreadId;
     uint64_t module = 0; const uint64_t path = (uint64_t)(uintptr_t)s->remote_path;
     const ULONGLONG t0 = GetTickCount64();
+    bench_phase("early_load_begin");
     const int loaded = call_in_target(s, &st, load, &module, 1, &path, 60000);
+    bench_phase("early_load_end");
     if (trace_enabled())
         std::fprintf(stderr, "  early agent load ok=%d module=0x%llx agent=0x%llx ms=%llu\n", loaded, (unsigned long long)module,
                      (unsigned long long)s->remote_agent, (unsigned long long)(GetTickCount64() - t0));
@@ -7877,6 +8167,7 @@ static bool early_agent(probe_session *s, const DEBUG_EVENT &event, bool &ok) {
     InterlockedExchange(&s->shared->early_init, 1);
     const int inited = local_init ? call_in_target(s, &st, init, &code, 1, &zero, 60000) : 0;
     InterlockedExchange(&s->shared->early_init, 0);
+    bench_phase("early_init_end");
     if (trace_enabled())
         std::fprintf(stderr, "  early agent init ok=%d code=%llu ms=%llu\n", inited, (unsigned long long)code,
                      (unsigned long long)(GetTickCount64() - t0));
@@ -8034,15 +8325,18 @@ static size_t drain_agent_logs(probe_session *s) {
     auto *sh = s->shared;
     size_t moved = 0;
     std::lock_guard<std::mutex> consume(s->drain_mu);
-    const LONG64 stop = sh->log_head;
     // Records go to the writer in packs (enqueue_logs), each before drain_mu is released: a
     // flush that drains first (report, unload, detach) still finds every record queued.
-    // log_tail (the header line every producer's claim CASes) is written once per pack and at the
-    // end of the pass, not per record: producers find free slots by their seq, and every reader of
-    // log_tail is this thread, holds drain_mu, or only waits for it to reach the head.
+    // log_tail is written once per pack and at the end of the pass, not per record: producers find
+    // free slots by their seq, and every reader of log_tail is this thread, holds drain_mu, or only
+    // waits for it to reach the head.
     std::vector<LogRecord> batch;
     AgentMapCache map;
+    // The pass is bounded by one ring's worth of positions, not by log_head: reading the head
+    // (the line every producer CASes per record) on every pass pulled it to this core between
+    // two claims. A slot is consumed only when its seq says it was published for this position.
     LONG64 tail = sh->log_tail;
+    const LONG64 stop = tail + PROBE_AGENT_LOG_CAP;
     for (;;) {
         if (tail >= stop) break;
         auto &rec = sh->logs[(uint64_t)tail % PROBE_AGENT_LOG_CAP];
@@ -8062,6 +8356,7 @@ static size_t drain_agent_logs(probe_session *s) {
     }
     sh->log_tail = tail;
     enqueue_logs(s, batch);
+    if (moved) { g_diag_passes++; g_diag_moved += moved; }
     return moved;
 }
 
@@ -8162,8 +8457,11 @@ static void start_drainer(probe_session *s) {
                                               TIMER_ALL_ACCESS);
         auto *sh = s->shared;
         ULONGLONG last_record = GetTickCount64();
+        LONG64 beat = probe_agent_load64(&sh->drain_beat);
         while (!s->drain_stop.load(std::memory_order_relaxed)) {
-            InterlockedIncrement64(&sh->drain_beat);                  // "controller alive"
+            // "Controller alive". This thread is its only writer: a plain store (on x86 a LOCKed
+            // 64-bit increment is a CMPXCHG8B loop, once per loop).
+            probe_agent_store64(&sh->drain_beat, ++beat);
             if (drain_agent_logs(s)) { idle = 0; last_record = GetTickCount64(); continue; }
             check_ring_stall(s, stall);
             if (++idle < 64) { SwitchToThread(); continue; }
@@ -8443,6 +8741,7 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
     settle_hw_thread(s, event.dwThreadId);           // released hardware probes: still ours on it?
     switch (event.dwDebugEventCode) {
     case CREATE_PROCESS_DEBUG_EVENT: {
+        bench_phase("ev_create_process");
         s->threads.insert(event.dwThreadId);                 // initial thread (for HW DRs)
         if (event.u.CreateProcessInfo.hThread) s->thread_handle[event.dwThreadId] = event.u.CreateProcessInfo.hThread;
         uint64_t base = (uint64_t)(uintptr_t)event.u.CreateProcessInfo.lpBaseOfImage;
@@ -8645,6 +8944,7 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
         const bool before_initial = !s->initial_break;
         ok = handle_exception(s, event, s->stepping, s->initial_break, disposition);
         const bool loader_break = before_initial && s->initial_break && ok;   // this event IS the loader breakpoint
+        if (loader_break) bench_phase("ev_loader_break");
         s->cb_tid = 0;
         for (DWORD tid : s->pending_hold) hold_thread(s, tid);
         s->pending_hold.clear();
@@ -8663,6 +8963,7 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
         break;
     }
     case EXIT_PROCESS_DEBUG_EVENT:
+        bench_phase("ev_exit_process");
         ipc_thaw(s);
         s->exit_code = event.u.ExitProcess.dwExitCode; s->exited = true; break;
     default: break;
@@ -8757,6 +9058,7 @@ extern "C" int probe_run(probe_session *s) {
         set_error(s, "probe_run must be called on the thread that called probe_launch/probe_attach");
         return 0;
     }
+    bench_phase("run_begin");
     s->running = true;                     // before `ran`: probe_close waits on (ran && !running)
     s->ran = true;
     ctrl_enter(s);
@@ -8812,6 +9114,7 @@ extern "C" int probe_run(probe_session *s) {
 #endif
         if (!ok) break;
     }
+    bench_phase("run_loop_end");
     finish_calls(s);                                      // callbacks still parked in call_func
     // An attached target is still running and the loop is leaving for some other reason
     // than a detach (an error: agent load/init failure, a failed context get/set or debug
@@ -8849,9 +9152,11 @@ extern "C" int probe_run(probe_session *s) {
 
 extern "C" int probe_wait_for_exit(probe_session *s) {
     if (!s || !s->ran) { if (s) set_error(s, "session has not been run"); return 0; }
+    bench_phase("wait_begin");
     if (s->exited) stop_drainer(s);             // includes recovery past a dead producer's ring slot
     flush_log_writer(s);
     ctrl_leave(s);
+    bench_phase("wait_end");
     return s->error.empty() && (s->interrupted || (s->exited && s->exit_code == 0));
 }
 
@@ -8863,6 +9168,7 @@ static void json_string(FILE *out, const std::string &value) {
 
 extern "C" void probe_report(probe_session *s, FILE *out) {
     if (!s || !out) return;
+    bench_phase("report_begin");
     if (s->exited) stop_drainer(s); else drain_agent_logs(s);
     // All probe_log lines precede report records -- on a target still running (not exited,
     // not detached), the ones logged up to now: it may keep logging during the report.
@@ -8959,10 +9265,12 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
     std::fputs(",\"error\":", out);
     if (s->error.empty()) std::fputs("null", out); else json_string(out, s->error);
     std::fputs("}\n", out); std::fflush(out);
+    bench_phase("report_end");
 }
 
 extern "C" void probe_close(probe_session *s) {
     if (!s) return;
+    bench_phase("close_begin");
     // probe_run is executing on another thread -- or is about to: the session was launched
     // or attached there and its probe_run has not started yet (e.g. Ctrl+C right after the
     // attach). Either way that thread owns the debug object: ask it to detach/stop and wait
@@ -9004,7 +9312,9 @@ extern "C" void probe_close(probe_session *s) {
         }
     }
     stop_drainer(s);
+    bench_phase("close_drainer");
     stop_log_output(s);                         // symbolization needs dbghelp and the process handle
+    bench_phase("close_logout");
     // The close asked probe_run to detach, but the target ended first (killed or exited between
     // the request and the detach: probe_run left on its EXIT_PROCESS): the caller still gets
     // the final accounting, which it cannot take itself any more -- the session ended inside
@@ -9069,7 +9379,11 @@ extern "C" void probe_close(probe_session *s) {
         else
             for (uint64_t b : s->config_blocks) VirtualFreeEx(s->pi.hProcess, (void *)(uintptr_t)b, 0, MEM_RELEASE);
     }
+    bench_phase("close_freed");
+    if (s->agent_prep.joinable()) s->agent_prep.join();      // closed before the launch needed it
+    if (!s->local_agent) s->local_agent = s->agent_prep_module;
     if (s->sym_ready) uhh_sym::cleanup(s->pi.hProcess);
+    bench_phase("close_symcleanup");
     if (s->remote_thread) CloseHandle(s->remote_thread);
     if (s->svc_event) CloseHandle(s->svc_event);
     if (s->drain_event) CloseHandle(s->drain_event);
@@ -9084,6 +9398,12 @@ extern "C" void probe_close(probe_session *s) {
     if (s->pi.hThread) CloseHandle(s->pi.hThread);
     if (s->pi.hProcess) CloseHandle(s->pi.hProcess);
     delete s;
+    bench_phase("close_end");
+    if (std::getenv("UHH_BENCH_PHASES"))
+        std::fprintf(stderr, "  diag file_writes=%llu file_bytes=%llu enqueues=%llu passes=%llu moved=%llu\n",
+                     (unsigned long long)g_diag_file_writes.load(), (unsigned long long)g_diag_file_bytes.load(),
+                     (unsigned long long)g_diag_enqueues.load(), (unsigned long long)g_diag_passes.load(),
+                     (unsigned long long)g_diag_moved.load());
 }
 
 static uint64_t *register_slot(probe_context *c, enum probe_register reg) {

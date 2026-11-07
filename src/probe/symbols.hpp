@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -21,6 +22,13 @@ struct symbol_entry {
 };
 
 bool init(HANDLE process, std::string &which_dbghelp_or_error);
+// Starts loading dbghelp in the background (once per process); init waits for it.
+void preload();
+// Held by every creation of a child process that inherits handles, from the moment its
+// inheritable handles exist until they are closed: vswhere (dbghelp lookup, possibly on the
+// preload thread) and a launched target. Otherwise one child inherits the other's pipe ends --
+// a target holding vswhere's output pipe kept that read from ever ending (deadlock at launch).
+std::mutex &inherit_lock();
 void register_module(HANDLE process, const std::wstring &image_path,
                      std::uint64_t base, std::uint32_t size_of_image);
 void unregister_module(HANDLE process, std::uint64_t base);

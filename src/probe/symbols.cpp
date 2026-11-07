@@ -4,13 +4,19 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cwchar>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <utility>
 
 namespace uhh_sym {
+std::mutex &inherit_lock() {
+    static std::mutex m;
+    return m;
+}
 namespace {
 
 struct dbghelp_api {
@@ -205,6 +211,7 @@ bool run_vswhere(const std::wstring &program, std::wstring &install_path) {
     SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
     HANDLE read_pipe = nullptr;
     HANDLE write_pipe = nullptr;
+    std::unique_lock<std::mutex> inherit(inherit_lock());     // until write_pipe is closed here
     if (!CreatePipe(&read_pipe, &write_pipe, &security, 0)) return false;
     if (!SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0)) {
         CloseHandle(read_pipe);
@@ -225,6 +232,7 @@ bool run_vswhere(const std::wstring &program, std::wstring &install_path) {
     const BOOL created = CreateProcessW(program.c_str(), mutable_command.data(), nullptr, nullptr, TRUE,
                                         CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process);
     CloseHandle(write_pipe);
+    inherit.unlock();
     if (!created) {
         CloseHandle(read_pipe);
         return false;
@@ -502,8 +510,30 @@ BOOL CALLBACK collect_symbol(PSYMBOL_INFOW symbol, ULONG size, PVOID user) noexc
 
 } // namespace
 
+// dbghelp is located and loaded (~40 ms: registry and file probing, the DLL's own load) on a
+// background thread as soon as a session is created, so that overlaps the session's other
+// setup; init waits for it (g_mutex). Once per process.
+void preload() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        try {
+            std::thread([] {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                load_dbghelp();
+            }).detach();
+        } catch (...) {}                        // no thread: init loads it when needed
+    });
+}
+
+static void sym_phase(const char *what) {   // DIAG (perf5)
+    static const bool on = std::getenv("UHH_BENCH_PHASES") != nullptr;
+    if (!on) return;
+    LARGE_INTEGER f, t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t);
+    std::fprintf(stderr, "  phase %.3f %s \n", (double)t.QuadPart * 1000.0 / (double)f.QuadPart, what);
+}
 bool init(HANDLE process, std::string &which_dbghelp_or_error) {
     try {
+        sym_phase("sym_begin");
         std::lock_guard<std::mutex> lock(g_mutex);
         if (!process) {
             which_dbghelp_or_error = "invalid symbol-session handle";
@@ -517,6 +547,7 @@ bool init(HANDLE process, std::string &which_dbghelp_or_error) {
             try { which_dbghelp_or_error = narrow(g_dbghelp_path); } catch (...) {}
             return true;
         }
+        sym_phase("sym_dbghelp_loaded");
         g_api.set_options(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_FAIL_CRITICAL_ERRORS |
                           SYMOPT_NO_PROMPTS | SYMOPT_LOAD_LINES);
         session_state state;

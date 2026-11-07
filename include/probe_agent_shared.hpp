@@ -6,12 +6,13 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <intrin.h>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 26;   /* 26: tblock retired on a line of its own, drain wake-up (drain_wait); 25: per-thread hit blocks (tblocks); 24: huntaudit early_init (on top of 23: runfix1 log carry + running count; 21: held_floor) */
+constexpr uint32_t PROBE_AGENT_VERSION = 27;   /* 27: ring record's header and text start on one cache line, log_head on a line of its own (perf5); 26: tblock retired on a line of its own, drain wake-up (drain_wait); 25: per-thread hit blocks (tblocks); 24: huntaudit early_init (on top of 23: runfix1 log carry + running count; 21: held_floor) */
 constexpr uint32_t PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH = 1u << 9;   /* agent side only needs this one */   /* == PROBE_UNSAFE_FAST_PATCH (asserted in session.cpp) */
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 128;   /* inline probes per session; the 129th is refused */
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
@@ -74,19 +75,23 @@ struct probe_agent_int3 { uint64_t address; uint8_t original; uint8_t pad[7]; };
      the controller synchronously (PROBE_IPC_LOG) instead of waiting or dropping.
    A record is dropped (counted in log_dropped) only when the controller is gone: it
    stopped consuming (controller_gone: detach/close) or its process died. */
-struct probe_agent_log {
+/* Layout (v27): a slot is cache-line aligned and every field a plain record uses -- seq, owner,
+   the header and the text's start -- is on its first line; a typical ~90-byte line of text ends
+   on the second. (The header used to sit after the 1 KB text: every record touched three lines on
+   the producer's side and three again on the controller's, each a transfer between the two cores.) */
+struct alignas(64) probe_agent_log {
     volatile LONG64 seq;
+    volatile LONG owner;           /* tid of the producer that claimed the slot; 0 = free/unknown */
     uint32_t probe;
     uint32_t tid;
-    char text[PROBE_AGENT_LOG_TEXT_CAP];
-    uint32_t frame_count;          /* 0 = plain log; else frames[] is a stack snapshot */
-    uint32_t has_stack;
     uint32_t text_len;             /* text may contain NULs (%c of 0): this is its length */
-    volatile LONG owner;           /* tid of the producer that claimed the slot; 0 = free/unknown */
     uint32_t carry;                /* 1: the FIRST record of a running callback -- it carries that hit's
                                       unaccounted unit (hit_stripes[probe][stripe of tid]); the controller
                                       retires the unit when it takes the record (v23, see hit_stripes) */
     uint32_t reserved;             /* v25: with carry, the producer's hit block + 1 (0: the stripes) */
+    uint32_t frame_count;          /* 0 = plain log; else frames[] is a stack snapshot */
+    uint32_t has_stack;
+    char text[PROBE_AGENT_LOG_TEXT_CAP];
     uint64_t frames[32];           /* == PROBE_STACK_MAX_FRAMES */
 };
 
@@ -233,22 +238,26 @@ inline void probe_agent_store64(volatile LONG64 *p, LONG64 v) {
 #endif
 }
 
+/* The header's lines (v27). Producers CAS log_head with every record: it shares its line only with
+   flags they read per record and that are written once or rarely. What the controller writes while
+   draining (log_tail per pack, drain_beat every drainer loop) is on the next line: beside log_head
+   every one of those writes took the line away from the producers between two claims. */
 struct probe_agent_shared {
     uint32_t magic;
     uint32_t version;
     uint32_t request_count;
     uint32_t reserved;
-    volatile LONG64 log_head;      /* next position producers claim */
-    volatile LONG64 log_tail;      /* next position the controller consumes */
-    volatile LONG log_dropped;
     volatile LONG service_ready;   /* agent's persistent install thread is waiting on the svc event */
-    volatile LONG64 overrides;     /* set_reg calls that changed a register, inline side */
-    volatile LONG64 drain_beat;    /* bumped by the controller's drainer every loop: liveness */
     volatile LONG xstate_mode;     /* bench/test knob: 0 = default (gated), 1 = none, 2 = full, 3 = as without OSXSAVE */
+    uint32_t controller_pid;       /* lets producers tell a dead controller from a busy one */
+    volatile LONG64 overrides;     /* set_reg calls that changed a register, inline side */
+    alignas(64) volatile LONG64 log_head;   /* next position producers claim */
     volatile LONG controller_gone; /* set when the controller stops consuming (detach/close): log calls return at once */
     volatile LONG ring_stalled;    /* controller: the ring is stuck behind a live producer's slot -- use PROBE_IPC_LOG */
     volatile LONG log_ipc;         /* controller: 1 while it is the debugger and services PROBE_IPC_LOG */
-    uint32_t controller_pid;       /* lets producers tell a dead controller from a busy one */
+    volatile LONG log_dropped;
+    alignas(64) volatile LONG64 log_tail;   /* next position the controller consumes */
+    volatile LONG64 drain_beat;    /* advanced by the controller's drainer every loop (its only writer): liveness */
     /* Per probe, striped by thread: hits + unaccounted units, and running callbacks (see
        probe_agent_stripe). Non-zero unaccounted after the target exited and the ring was
        drained = callbacks cut off by the process dying before their first log. */
@@ -277,6 +286,9 @@ struct probe_agent_shared {
     probe_agent_tblock tblocks[PROBE_AGENT_TBLOCKS];   /* v25: per-thread hit accounting (see probe_agent_tblock) */
     probe_agent_drain_wait drain_wait;                 /* v26: wake an idle drainer (see probe_agent_drain_wait) */
 };
+static_assert(offsetof(probe_agent_shared, log_head) == 64 && offsetof(probe_agent_shared, log_tail) == 128,
+              "examples/ctrlreview/ctrl_target.cpp (headcorrupt) writes these offsets");
+static_assert(sizeof(probe_agent_log) % 64 == 0 && offsetof(probe_agent_shared, logs) % 64 == 0, "ring slots are line-aligned");
 
 constexpr LONG64 PROBE_AGENT_INFLIGHT_ONE = 1LL << 48;   /* one unaccounted hit in a hit_stripes cell */
 

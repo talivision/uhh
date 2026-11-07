@@ -6682,7 +6682,10 @@ def check_ctrl_review():
       ctrl-owndr-<b>: the target's OWN hardware watchpoints (SetThreadContext on itself + VEH)
         keep working while UHH arms a hardware probe at runtime and releases a one-shot one.
       ctrl-headclamp: a target that corrupts the agent ring's log_head cannot hang the
-        controller at exit."""
+        controller at exit.
+      ctrl-agentprep-<unlaunched|badlaunch>: the controller's agent DLL is prepared on a
+        background thread from the first inline add (perf5); a session closed without a launch,
+        or whose launch failed, ends cleanly (exit 0, no crash) and deletes its agent copy."""
     d, t, dll = exe("ctrl_driver.exe"), exe("ctrl_target.exe"), exe("ctrl_dll.dll")
     if not d or not t or not dll:
         return missing_bin("ctrl-review", "ctrl_driver/ctrl_target/ctrl_dll")
@@ -6814,6 +6817,18 @@ def check_ctrl_review():
             tock = [x for x in rows if str(x.get("location", "")).startswith("0x")]
             if len(tock) != 1 or tock[0].get("hits") != 1: bad.append(f"tock_rows={tock}")
             record(name, not bad, " ".join(bad) or f"w1(slot {res.get('w1_slot')})={res.get('w1')} w2={w2}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    for sc in ("unlaunched", "badlaunch"):
+        name = f"ctrl-agentprep-{sc}"
+        try:
+            r, o, res, logs, rows = go(sc, "inline", [], timeout=60)
+            bad = []
+            if r.returncode != 0: bad.append(f"exit={r.returncode}")
+            if res.get("launched") != 0: bad.append(f"launched={res.get('launched')}")
+            if res.get("copies_left") != 0: bad.append(f"copies_left={res.get('copies_left')}")
+            record(name, not bad, " ".join(bad) or f"closed cleanly, copies_left={res.get('copies_left')}")
         except Exception as e:
             record(name, False, repr(e))
 

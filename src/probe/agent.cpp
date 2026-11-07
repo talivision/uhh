@@ -743,7 +743,7 @@ static void agent_log(probe_context *c, bool stack, const char *format, va_list 
                 ipc_failed = true;
             }
             ULONGLONG now = GetTickCount64();
-            LONG64 beat = sh->drain_beat;
+            LONG64 beat = probe_agent_load64(&sh->drain_beat);
             if (beat != seen_beat) { seen_beat = beat; idle = 0; }
             else if (last_tick) idle += (now - last_tick) < 50 ? (now - last_tick) : 50;
             last_tick = now;
