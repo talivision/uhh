@@ -2178,6 +2178,17 @@ producer, end-to-end logs/s) moved -26..+33% between sessions; neither is explai
 hold-off side showed the same; not the drain bound: reverted). Each perf_ab case runs a fresh controller, so the
 warm-copy scan (MsMpEng) runs during these 50-100 ms windows.
 
+Status vs Frida CModule (BENCHMARKS "Update: branch perf5", session G on e01ba59, and pooled over five sessions): ahead
+in every inline cell on both arches -- x86 gated +402 vs +454 ns/read (pooled +344 vs +401; ahead in four of five
+sessions; UHH has a rare slow run, one in six, unexplained), x86 churn -0.02 vs +0.38 s (pooled +0.146 vs +0.311).
+Correctness (perf5): VM `--only logs,stdout,crash_logs,carry,stream,gated,conformance,portability,transparency,edgehunt,
+cxlib,cx2,hunt,lifecycle,slowreader,ctrl_review,shared_mix` on 9e61170 (merged with merge-frida 535ebec): x64 583/586
+(the 3 failures stream-live-{hw,breakpoint} / stream-latency-inline "noisy": disk stalls of 0.4-0.7 s while another build
+ran on the VM; `--only stream` re-run quiet: 12/12), x86 582/583 (detach-slowreader-ctrlbreak-inline: the sweep race
+above, fixed in 038d74d); on the final build e01ba59: `ctrl_review,slowreader,stream,shared_mix,gated_map,agent_review`
+x64 46/46, x86 46/46, x86 agent_review 3 more times 5/5 each. CI: see the branch's runs (9e61170: only the sweep race
+and the known patch-race-unsafe; 038d74d: x86 agent-unwind failed once, 0xC0000096 -- not reproduced on the VM in 4 runs).
+
 ## Real-world cases
 - ✅ Microsoft Detours samples replicated (`examples/famous/detours_*`: simple, traceapi, withdll/attach, retval) -- findings above
 - ✅ (1) Real binaries via `uhh_trace`: curl `CreateFileW` + `connect` (all backends); ✅ findstr via `ntdll!NtCreateFile`
