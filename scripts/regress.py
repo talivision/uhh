@@ -3719,6 +3719,48 @@ def check_carry_exact(calls=400_000, threads=4, runs=3):
     record("carry-exact-inline", ok, f"want hits={total} logs={total // 2}: " + " | ".join(results))
 
 
+def check_hitcost_methods():
+    """The per-method benchmark's harness (bench/perfab/perf_ab.py --group methods) measures what
+    it says: every hitcost method on every backend, small runs. hitcost-methods-<b>: per method,
+    exit 0, the target's timing line, hits == calls, logs == calls for send_log/send_log_stack
+    (else 0), nothing dropped, and for add_once (a one-shot breakpoint probe added from the
+    callback at each hit's return address) the one-shot probes' hits sum to calls -- each fired
+    exactly once. hitcost-shared-<b>: the same for empty/counter_plain/counter_shared with
+    hitcost_driver_shared (the callbacks module opted in to UHH_SHARED: breakpoint/hw callbacks run
+    from the controller's copy of the agent DLL). An unknown --method is refused (exit 2)."""
+    d, ds, t = exe("hitcost_driver.exe"), exe("hitcost_driver_shared.exe"), exe("hitcost_target.exe")
+    if not d or not ds or not t:
+        return missing_bin("hitcost-methods", "hitcost_driver/hitcost_driver_shared/hitcost_target")
+    methods = ["get_reg", "set_reg", "get_func_arg", "get_mem", "set_mem", "send_log", "send_log_stack",
+               "call_func", "call_original", "add_once", "counter_plain", "counter_shared"]
+    for drv, name, ms in ((d, "hitcost-methods", methods), (ds, "hitcost-shared", ["empty", "counter_plain", "counter_shared"])):
+        for bk in ("inline", "hw", "breakpoint"):
+            n = 2000 if bk == "inline" else 200
+            bad, seen = [], 0
+            for m in ms:
+                try:
+                    r, o = run([drv, "--backend", bk, "--method", m, "--", t, "--no-wait", "--calls", n], timeout=180)
+                    ps = probes(o)
+                    hits = ps[0].get("hits") if ps else None
+                    once = sum(p.get("hits") or 0 for p in ps[1:])
+                    logs = sum(1 for x in o if x.get("kind") == "probe_log")
+                    tl = next((x for x in o if x.get("kind") == "target"), {})
+                    want_logs = n if m.startswith("send_log") else 0
+                    if not (r.returncode == 0 and tl.get("ns_per_call") is not None and hits == n and logs == want_logs
+                            and report(o).get("log_dropped") == 0 and once == (n if m == "add_once" else 0)):
+                        bad.append(f"{m}: rc={r.returncode} hits={hits} logs={logs} once={once} "
+                                   f"dropped={report(o).get('log_dropped')} timing={tl.get('ns_per_call')}")
+                    else:
+                        seen += 1
+                except Exception as e:
+                    bad.append(f"{m}: {e!r}")
+            if name == "hitcost-methods" and bk == "inline":
+                r, _ = run([drv, "--method", "no_such_method", "--", t, "--no-wait", "--calls", 1], timeout=60)
+                if r.returncode != 2:
+                    bad.append(f"unknown method: rc={r.returncode} (want 2)")
+            record(f"{name}-{bk}", not bad, f"{seen}/{len(ms)} methods exact (calls={n})" + ("; " + " | ".join(bad) if bad else ""))
+
+
 def check_attach_agent_scope():
     """Owner decision 2026-11-07: the agent DLL is injected into the target only when the session
     needs it (an inline probe).
@@ -11712,6 +11754,7 @@ def main():
     if want(check_forwarded_probe): check_forwarded_probe()
     if want(check_crash_logs): check_crash_logs()
     if want(check_carry_exact): check_carry_exact()
+    if want(check_hitcost_methods): check_hitcost_methods()
     if want(check_attach_new): check_attach_new()
     if want(check_attach_agent_scope): check_attach_agent_scope()
     if want(check_refusals): check_refusals()
