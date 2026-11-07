@@ -1845,9 +1845,44 @@ the report (count, valid JSON per line, CRC multiset of the lines, `seq` coverag
   `-{outfile,merged}-{breakpoint,hw}` (100k / 10k stack records through `powershell -Command`):
   captured == stdout_logs == logs_written == hits == logs + dropped + interrupted, every line
   valid JSON, seq contiguous, nothing after the report, session file equally complete;
-  `stdout-powershell-detach-{inline,breakpoint}` (live report consistent, `probe_final` last,
-  target alive); `stdout-console-{inline,breakpoint,hw}` (into a pseudo console: every seq
+  `stdout-powershell-detach-{inline,breakpoint}` (now `check_powershell_detach`: live report
+  consistent, `probe_final` last, target alive, the run ends within 120 s); `stdout-console-{inline,breakpoint,hw}` (into a pseudo console: every seq
   rendered, report complete; `--console-records 2000000` adds the 2M tier).
+
+## psdetach: a live detach that never ended (2026-11-07, branch `psdetach`, regress `detach-slowreader-*`, `stdout-powershell-detach-*`)
+
+CI 42364458533 (churn, x86): `stdout-powershell-detach-inline` "no end within 240 s", stderr
+`probe: close: still waiting for probe_run to stop (180s)` and, only after the test killed the
+target, `detach: 0 thread(s) frozen` / `detached: ... in_flight=4 running=4`: the detach had not
+even STARTED in 240 s (its freeze found the target already dead). Not the 15 s callback bound
+(stop_drainer, agent-scope section): that bound is only reached once probe_run gets to the
+stop request.
+- ✅ **Cause: the debug loop starved on `drain_mu`.** The drainer thread releases `drain_mu`
+  between passes and takes it again nanoseconds later; while the attached target keeps the ring
+  full (stdout slower than the producers), every pass finds records. `std::mutex` is an SRW lock
+  with no handoff, so the debug loop, blocked in its per-turn `drain_agent_logs`, lost that race
+  for minutes and never returned to the top of its loop, where `stop_requested` (probe_close from
+  `--detach-after-ms` / `--detach-on-stdin`) and Ctrl+C are seen. (The earlier fix in the
+  PowerShell section, one bounded pass per drain, removed the unbounded pass but not this race:
+  the pass ends, the drainer simply takes the lock again.) Evidence: a new diagnostic (probe_close's
+  wait now names probe_run's phase) on the unfixed library, x86 VM: `still waiting for probe_run
+  to stop (15s; it is draining the log ring)`, `(30s; ...)`; `stdout-powershell-detach-inline` took
+  15 / 203 / 60 / 37 s per run (the report and detach themselves need ~7 s).
+- Fix: `lock_drain()` -- a thread that finds `drain_mu` taken counts itself in `drain_waiters`;
+  the drainer starts no pass while one waits (yields, then `Sleep(1)` if the wait is long: the
+  holder may itself wait for a slow stdout). Every `drain_mu` user goes through it (the debug
+  loop, probe_report, module unloads, the IPC-log path, stall recovery, the final drain).
+- Regress `check_detach_slow_reader` (`detach-slowreader-{timed,stdin,ctrlbreak}-inline`):
+  `uhh_trace --attach` of logstream_target (4 threads, full speed, inline, `--stack`) with its
+  stdout read by the script at ~1 MB/s, so the ring stays full; the trigger at ~3 s
+  (`--detach-after-ms 3000`, a line on stdin, Ctrl+Break); the tool must exit within 45 s of it,
+  target alive, `hits == logs_written + log_dropped + in_flight`, nothing dropped, every record
+  written to stdout read. `UHH_SLOWREADER_REPS` repeats it. `check_powershell_detach`
+  (`UHH_PSDETACH_REPS`, `UHH_PSDETACH_BACKENDS`) carries the old rows, now also bounded in time.
+- Before/after on the VM (2 rounds of the 3 triggers before, x86; 4 rounds after, each arch): unfixed 5 of 6
+  slowreader rows failed (no end 90 s after the trigger x3, 61 s, 62 s; the one pass took 58.7 s);
+  fixed 12/12 x86 + 12/12 x64, ended 4.2-17.7 s after the trigger; `stdout-powershell-detach-inline`
+  7-9 s per run (5/5 per arch). CI: see below.
 
 ## Benchmarks
 - ✅ UHH vs Frida (Interceptor / CModule / Stalker / HW) — `bench/BENCHMARKS.md`
