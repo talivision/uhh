@@ -61,7 +61,7 @@ def main():
     ap.add_argument("--bin", required=True); ap.add_argument("--targets")
     ap.add_argument("--modes", default="plain,smp-ctl,smp-tgt")
     ap.add_argument("--cases", default="hit1,hit4,gated")
-    ap.add_argument("--calls", type=int, default=2_000_000); ap.add_argument("--reads", type=int, default=50_000)
+    ap.add_argument("--threads", type=int, default=8); ap.add_argument("--calls", type=int, default=2_000_000); ap.add_argument("--reads", type=int, default=50_000)
     ap.add_argument("--secs", type=float, default=1.5); ap.add_argument("--delay", type=float, default=0.5)
     a = ap.parse_args()
     b = Path(a.bin).resolve(); t = Path(a.targets).resolve() if a.targets else b
@@ -74,7 +74,7 @@ def main():
                   "--calls", a.calls // 4, "--threads", 4, "--no-wait"], "hitcost_target.exe"),
         "gated": ([b / "gated_config.exe", "--flag-backend", "breakpoint", "--read-backend", "inline",
                    "configparse.dll!ParseConfig+0x16", "ntdll.dll!NtReadVirtualMemory", "--", t / "probe_app.exe",
-                   "--no-wait", "--helpers", 4, "--threads", 8, "--reads", a.reads], "probe_app.exe"),
+                   "--no-wait", "--helpers", 4, "--threads", a.threads, "--reads", a.reads], "probe_app.exe"),
     }
     for c in a.cases.split(","):
         cmd, tn = cases[c]
@@ -84,6 +84,8 @@ def main():
             rep = next((o for o in objs if o.get("kind") == "probe_report"), {})
             n = tg.get("calls") or tg.get("successful_reads") or 0
             ns = tg.get("ns_per_call") or (tg.get("elapsed_ns", 0) / n if n else None)
+            if c == "gated" and tg.get("elapsed_ns") and tg.get("reads_per_thread"):
+                ns = f"{ns:.0f} (per read per thread {tg['elapsed_ns'] / tg['reads_per_thread']:.0f})"
             print(f"== {c} {m}: rc={rc} wall={wall:.2f}s logs={logs} ns_per_event={ns} dropped={rep.get('log_dropped')} "
                   f"interrupted={rep.get('callbacks_interrupted')} hits={rep.get('hits')}", flush=True)
             for l in lp:
