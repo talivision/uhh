@@ -334,6 +334,12 @@ add_executable(hitcost_driver bench/hitcost/hitcost_driver.cpp bench/hitcost/hit
 target_include_directories(hitcost_driver PRIVATE include)
 target_link_libraries(hitcost_driver PRIVATE probe_api)
 add_dependencies(hitcost_driver hitcost_target probe_api_agent)
+# Linker maps: bench/perfab/sampler.py --maps resolves the controller and agent internals.
+if(MSVC)
+    target_link_options(hitcost_driver PRIVATE "/MAP:$<TARGET_FILE_DIR:hitcost_driver>/hitcost_driver.map")
+    target_link_options(gated_config PRIVATE "/MAP:$<TARGET_FILE_DIR:gated_config>/gated_config.map")
+    target_link_options(probe_api_agent PRIVATE "/MAP:$<TARGET_FILE_DIR:probe_api_agent>/probe_api_agent.map")
+endif()
 add_executable(hitcost_driver_shared bench/hitcost/hitcost_driver.cpp bench/hitcost/hitcost_callbacks.cpp)
 target_include_directories(hitcost_driver_shared PRIVATE include)
 target_compile_definitions(hitcost_driver_shared PRIVATE HITCOST_SHARED)
@@ -714,3 +720,6 @@ add_executable(logs_driver examples/logs_eval/logs_driver.cpp examples/logs_eval
 target_include_directories(logs_driver PRIVATE include)
 target_link_libraries(logs_driver PRIVATE probe_api)
 add_dependencies(logs_driver logs_target probe_api_agent)
+# The send_log fast formatter vs the CRT (regress logs-format-fast).
+add_executable(log_format_selftest examples/logs_eval/log_format_selftest.cpp)
+target_include_directories(log_format_selftest PRIVATE include)

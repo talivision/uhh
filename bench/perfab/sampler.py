@@ -194,6 +194,7 @@ def main():
     ap.add_argument("--ms", type=float, default=1.0); ap.add_argument("--seconds", type=float, default=3.0)
     ap.add_argument("--delay", type=float, default=0.3, help="seconds to wait after the process appears")
     ap.add_argument("--top", type=int, default=30); ap.add_argument("--maps")
+    ap.add_argument("--per-thread", type=int, default=0, help="also print the top N leaves of each busy thread")
     a = ap.parse_args()
     pid = a.pid or find_pid(a.exe_name, 60)
     if not pid:
@@ -203,6 +204,7 @@ def main():
     time.sleep(a.delay)
     res = Resolver(h, a.maps)
     leaf, pair, nsamp = collections.Counter(), collections.Counter(), 0
+    per = collections.defaultdict(collections.Counter)
     psz = 4 if wow else 8
     t_end = time.time() + a.seconds
     while time.time() < t_end:
@@ -224,6 +226,7 @@ def main():
                 res = Resolver(h, a.maps)          # a module loaded since
             ln = res.name(ip) or f"?0x{ip:x}"
             leaf[ln] += 1
+            per[tid][ln] += 1
             caller = None
             if stack:
                 for k in range(len(stack) // psz):
@@ -240,6 +243,15 @@ def main():
     print("-- leaf <- first non-system caller on the stack (scan)")
     for k, v in pair.most_common(a.top):
         print(f"{v * 100.0 / max(1, nsamp):6.1f}%  {k}")
+    if a.per_thread:
+        idle = ("ZwWaitForWorkViaWorkerFactory", "ZwWaitForMultipleObjects", "ZwRemoveIoCompletion", "ZwDelayExecution")
+        for tid, c in sorted(per.items(), key=lambda kv: -sum(kv[1].values())):
+            tot = sum(c.values())
+            if all(any(i in k for i in idle) for k in c):
+                continue
+            print(f"-- thread {tid}: {tot} samples")
+            for k, v in c.most_common(a.per_thread):
+                print(f"{v * 100.0 / tot:6.1f}%  {k}")
 
 
 if __name__ == "__main__":

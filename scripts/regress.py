@@ -7004,6 +7004,26 @@ def check_logs_format():
         record("logs-format-same-everywhere", False, repr(e))
 
 
+def check_logs_format_fast():
+    """send_log's fast formatter (probe_log_format.hpp uhh_format_fast: the common conversions
+    without the CRT's printf engine) produces exactly what the CRT's vsnprintf does on every
+    format it accepts -- lengths, bytes, truncation -- and declines (hands to vsnprintf) every
+    format it does not handle; the hot formats (gated's read line, %llu, %s, %p...) are taken."""
+    if not exe("log_format_selftest.exe"):
+        return missing_bin("logs-format-fast", "log_format_selftest")
+    try:
+        r, objs = run([exe("log_format_selftest.exe")], timeout=60)
+        o = next((x for x in objs if x.get("kind") == "log_format_selftest"), {})
+        ok = (r.returncode == 0 and o.get("mismatch") == 0 and o.get("unexpected_decline") == 0 and
+              o.get("fast", 0) > 1000 and o.get("declined", 0) > 0)
+        record("logs-format-fast", ok, f"bits={o.get('bits')} cases={o.get('cases')} fast={o.get('fast')} "
+                                       f"declined={o.get('declined')} mismatch={o.get('mismatch')} "
+                                       f"unexpected_decline={o.get('unexpected_decline')}" +
+                                       ("" if ok else f" rc={r.returncode} first={o.get('first')!r} out={r.stdout[-300:]!r}"))
+    except Exception as e:
+        record("logs-format-fast", False, repr(e))
+
+
 def check_logs_order(threads=4, count=2000):
     """Per-thread order across MIXED backends: each thread alternates an inline-probed call
     and a breakpoint/hw-probed call (seq 0,1,2,...; the second logs with a stack). Inline
@@ -11003,6 +11023,7 @@ def main():
     if want(check_newapp_flag): check_newapp_flag()
     if want(check_newapp_reg): check_newapp_reg()
     if want(check_logs_format): check_logs_format()
+    if want(check_logs_format_fast): check_logs_format_fast()
     if want(check_logs_order): check_logs_order()
     if want(check_logs_wedge): check_logs_wedge()
     if want(check_logs_controller_killed): check_logs_controller_killed()

@@ -68,10 +68,10 @@ def cycles(tid):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--exe-name", required=True); ap.add_argument("--ms", type=float, default=20)
+    ap.add_argument("--exe-name"); ap.add_argument("--pid", type=int); ap.add_argument("--ms", type=float, default=20)
     ap.add_argument("--seconds", type=float, default=3); ap.add_argument("--delay", type=float, default=0.5)
     a = ap.parse_args()
-    pid = find_pid(a.exe_name)
+    pid = a.pid or find_pid(a.exe_name)
     time.sleep(a.delay)
     states = collections.defaultdict(collections.Counter)
     grew = collections.Counter(); windows = collections.Counter(); dcyc = collections.Counter()

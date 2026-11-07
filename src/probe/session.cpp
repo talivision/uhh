@@ -578,7 +578,7 @@ static bool start_log_output(probe_session *s);
 static bool enqueue_log(probe_session *s, LogRecord &&record);
 static size_t drain_agent_logs(probe_session *s);
 static void deliver_past_stall(probe_session *s);
-static void enqueue_agent_record(probe_session *s, const probe_agent_log &rec);
+static void enqueue_agent_record(probe_session *s, const probe_agent_log &rec, std::vector<LogRecord> *batch = nullptr);
 static void flush_log_writer(probe_session *s, bool up_to_now = false);
 static void stop_log_output(probe_session *s);
 static void forward_finish(probe_session *s);
@@ -621,6 +621,9 @@ static void append_json_string(std::string &out, const std::string &value) {
     out.push_back('"');
     const auto *p = reinterpret_cast<const unsigned char *>(value.data());
     for (size_t i = 0, n = value.size(); i < n; ) {
+        size_t run = i;                                  // printable ASCII needing no escape: one append
+        while (run < n && p[run] >= 0x20 && p[run] < 0x80 && p[run] != '"' && p[run] != '\\') ++run;
+        if (run > i) { out.append(value, i, run - i); i = run; continue; }
         unsigned char ch = p[i];
         if (ch == '"' || ch == '\\') { out.push_back('\\'); out.push_back((char)ch); ++i; continue; }
         if (ch >= 0x20 && ch < 0x80) { out.push_back((char)ch); ++i; continue; }
@@ -1300,6 +1303,36 @@ static bool enqueue_log(probe_session *s, LogRecord &&record) {
     if (warned) warn_console_once(s);
     s->queue_readable.notify_one();
     return true;
+}
+
+// enqueue_log for many records at once (the agent-ring drainer): one queue lock and one writer
+// wake-up per chunk instead of per record -- per record, the wake-up of a writer that had just
+// emptied the queue was most of the controller's cost per inline log (the producers in the target
+// wait on that pipeline: the ring's backpressure). Same backpressure and accounting as enqueue_log;
+// `records` is left empty.
+static void enqueue_logs(probe_session *s, std::vector<LogRecord> &records) {
+    size_t i = 0;
+    while (i < records.size()) {
+        std::unique_lock<std::mutex> lock(s->queue_mu);
+        bool blocked = s->log_queue.size() >= probe_session::LOG_QUEUE_CAP && !s->writer_failed;
+        auto blocked_at = std::chrono::steady_clock::now();
+        s->queue_writable.wait(lock, [s] {
+            return s->log_queue.size() < probe_session::LOG_QUEUE_CAP || s->writer_failed;
+        });
+        if (s->writer_failed) {
+            s->controller_dropped.fetch_add(records.size() - i, std::memory_order_relaxed);
+            break;
+        }
+        bool warned = blocked && std::chrono::steady_clock::now() - blocked_at >= std::chrono::seconds(1);
+        for (; i < records.size() && s->log_queue.size() < probe_session::LOG_QUEUE_CAP; ++i) {
+            try { s->log_queue.push_back(std::move(records[i])); ++s->logs_enqueued; }
+            catch (...) { s->controller_dropped.fetch_add(1, std::memory_order_relaxed); }
+        }
+        lock.unlock();
+        if (warned) warn_console_once(s);
+        s->queue_readable.notify_one();
+    }
+    records.clear();
 }
 
 // up_to_now: wait only for the records queued when the call started, not for an empty queue
@@ -7839,7 +7872,7 @@ static bool complete_remote_thread(probe_session *s, DWORD result) {
 // One ring record (or a PROBE_IPC_LOG copy of one) -> the writer's queue. Never touches
 // s->probes (the debug loop may be growing it); does not hold agent_mu while a full stdout
 // queue applies backpressure.
-static void enqueue_agent_record(probe_session *s, const probe_agent_log &rec) {
+static void enqueue_agent_record(probe_session *s, const probe_agent_log &rec, std::vector<LogRecord> *batch) {
     // A callback's first record carries its hit's unaccounted unit: taken now, the hit is
     // accounted by this record (logs_written, or controller_dropped below), not as interrupted.
     if (s->shared) probe_agent_retire_carry(s->shared, rec);
@@ -7855,7 +7888,8 @@ static void enqueue_agent_record(probe_session *s, const probe_agent_log &rec) {
         }
         uint32_t n = rec.frame_count > PROBE_STACK_MAX_FRAMES ? PROBE_STACK_MAX_FRAMES : rec.frame_count;
         r.frames.assign(rec.frames, rec.frames + n);
-        enqueue_log(s, std::move(r));
+        if (batch) batch->push_back(std::move(r));      // the caller enqueues the batch (enqueue_logs)
+        else enqueue_log(s, std::move(r));
     } catch (...) {
         s->controller_dropped.fetch_add(1, std::memory_order_relaxed);   // out of memory: count it, keep going
     }
@@ -7874,6 +7908,9 @@ static size_t drain_agent_logs(probe_session *s) {
     size_t moved = 0;
     std::lock_guard<std::mutex> consume(s->drain_mu);
     const LONG64 stop = sh->log_head;
+    // Records go to the writer in chunks (enqueue_logs), each before drain_mu is released: a
+    // flush that drains first (report, unload, detach) still finds every record queued.
+    std::vector<LogRecord> batch;
     for (;;) {
         LONG64 tail = sh->log_tail;
         if (tail >= stop) break;
@@ -7881,13 +7918,15 @@ static size_t drain_agent_logs(probe_session *s) {
         LONG64 seq = rec.seq;
         if (seq != tail + 1 && seq != -(tail + 1)) break;
         MemoryBarrier();
-        if (seq == tail + 1) enqueue_agent_record(s, rec);    // -(tail + 1): delivered past a stall already
+        if (seq == tail + 1) enqueue_agent_record(s, rec, &batch);    // -(tail + 1): delivered past a stall already
         rec.owner = 0;
         MemoryBarrier();
         InterlockedExchange64(&rec.seq, tail + PROBE_AGENT_LOG_CAP);    // slot free again
         sh->log_tail = tail + 1;
         ++moved;
+        if (batch.size() >= 256) enqueue_logs(s, batch);
     }
+    enqueue_logs(s, batch);
     return moved;
 }
 
@@ -7972,12 +8011,27 @@ static void start_drainer(probe_session *s) {
     s->drainer = std::thread([s] {
         unsigned idle = 0;
         RingStall stall;
+        // Idle waits of 0.5 ms (a high-resolution timer) while records came recently: Sleep(1)
+        // lasts a whole timer tick (15.6 ms unless something raised the resolution), and a ring
+        // of PROBE_AGENT_LOG_CAP records fills in a few ms at full speed -- every logging thread
+        // then waited out the rest of the tick (profiles: producers yielding in agent_log behind
+        // a sleeping drainer). After 50 ms without a record, back to Sleep(1) (no 2 kHz wakeups
+        // on an idle target). No such timer (before Windows 10 1803): Sleep(1) throughout.
+        HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+                                              TIMER_ALL_ACCESS);
+        ULONGLONG last_record = GetTickCount64();
         while (!s->drain_stop.load(std::memory_order_relaxed)) {
             InterlockedIncrement64(&s->shared->drain_beat);           // "controller alive"
-            if (drain_agent_logs(s)) { idle = 0; continue; }
+            if (drain_agent_logs(s)) { idle = 0; last_record = GetTickCount64(); continue; }
             check_ring_stall(s, stall);
-            if (++idle < 64) SwitchToThread(); else Sleep(1);
+            if (++idle < 64) { SwitchToThread(); continue; }
+            LARGE_INTEGER due; due.QuadPart = -5000;                   // 0.5 ms, relative
+            if (timer && GetTickCount64() - last_record < 50 && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
+                WaitForSingleObject(timer, 1);   // never longer than Sleep(1) would have been
+            else
+                Sleep(1);
         }
+        if (timer) CloseHandle(timer);
     });
 }
 
