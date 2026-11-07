@@ -253,6 +253,10 @@ Records now move in chunks, the writer formats without printf, an idle drainer n
 15.6 ms timer tick, and send_log formats the common conversions without the CRT (byte-identical, checked).
 Per-hit send_log: 1,312 -> 347 ns (x64), 3,357 -> 623 ns (x86). Profile, change and full table:
 docs/ROADMAP.md "Inline log cost findings"; raw rows `bench/results/binlog-2026-11-07/`.
+On top of merge-frida 5f13966 (perf phase 3, which took the same writer change), binlog still cuts the
+per-hit send_log 508 -> 338 ns (x64) and 759 -> 425 ns (x86), and gated_config inline 1,053 -> 821 / 1,532 ->
+1,048 ns/read (perf_ab); vs_frida gated in the same sessions: x64 uhh-inline 986 vs frida-cmodule 808-1,028,
+x86 1,232 vs 983-1,089 ns/read (baselines 423-556).
 
 
 - The log path costs about 2 us per record on top of a 0.15 us hook, and it dominates the
