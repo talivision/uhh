@@ -28,3 +28,6 @@ At a function entry the Windows ABI already treats YMM upper halves as volatile,
 compiler never has them live across the call: `XGETBV(1)` reports AVX unused and gated
 costs about the same as none. Gated pays the full save only at a mid-function site with
 live AVX state -- exactly where skipping it would corrupt the target. Gated is the default.
+
+Per-method cost (`hitcost_driver --method ...`, every backend, and UHH_SHARED vs plain globals with
+`hitcost_driver_shared`): `perf_ab.py --group methods`, tables in `bench/BENCHMARKS.md` "Per-method cost".

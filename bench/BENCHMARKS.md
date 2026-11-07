@@ -5,6 +5,98 @@ is kept for history and is SUPERSEDED (see "Why the earlier comparison was super
 Reproduce with `bench/frida/vs_frida.py` (how: `bench/frida/README.md`); raw rows in
 `bench/results/frida17-2026-11-07/`.
 
+## Per-method cost (branch `bench2`, 2026-11-08)
+
+What one callback operation costs on each backend. `hitcost_target` calls `hit_site` (exported, cdecl, one
+argument) in a tight loop and times the loop in-process (QPC); `hitcost_driver --method m` probes it with a callback
+doing exactly one operation, so **op = ns/hit(method) - ns/hit(empty)** on the same backend. Harness:
+`perf_ab.py --group methods --rounds 3` (each run waits for a quiet VM, < 12% busy; every run also checked exact:
+hits == calls, logs == calls for send_log*, nothing dropped, add_once's one-shot probes fired once each), tables by
+`bench/perfab/methods_table.py`; raw rows `bench/results/methods-2026-11-08/`. Machine: the Win10 test VM (4 vCPU on an
+i5-6600), quiet-VM placeholder held for the round, build 5f64c9b (merge-frida 607fe19 + the harness). 1 thread.
+Sizes per run: inline 200,000 calls (send_log_stack 50,000, add_once 5,000); breakpoint/hw 20,000 (send_log_stack,
+call_func, call_original 5,000; add_once 2,000). Cells: **median (spread = (max-min)/median over 3 rounds)**, then the
+op cost. Breakpoint/hw in **us**, inline in **ns**. Uninstrumented call: 2.5 ns (x64 and x86).
+
+| method (what the callback does) | breakpoint us | op us | hw us | op us | inline ns | op ns |
+|---|---:|---:|---:|---:|---:|---:|
+| **x64** empty = the hit itself | 77.8 (3%) | 77.8 | 91.5 (3%) | 91.5 | 67.5 (7%) | **65** |
+| get_reg (CX) | 79.5 (4%) | ~0 | 92.8 (1%) | ~0 | 71.3 (9%) | 3.8 |
+| set_reg (AX, a new value each hit) | 77.8 (5%) | ~0 | 91.7 (1%) | ~0 | 78.0 (5%) | 10.5 |
+| get_func_arg(0) | 79.4 (2%) | ~0 | 89.4 (5%) | ~0 | 68.4 (3%) | 0.9 |
+| get_mem 64 B at SP | 86.2 (2%) | 8.4 | 95.5 (3%) | 4.0 | 81.0 (3%) | 13.5 |
+| set_mem 8 B at SP (after an 8 B get_mem) | 86.0 (3%) | 8.2 | 100.8 (4%) | 9.3 | 90.4 (6%) | 22.9 |
+| send_log("hit %llu", arg0) | 81.3 (1%) | 3.5 | 91.2 (5%) | ~0 | 247 (34%) | 179 |
+| send_log_stack | 233.0 (0%) | 155 | 249.7 (2%) | 158 | 7,265 (77%) | 7,197 |
+| call_func(kernel32!GetCurrentProcessId) | 279.5 (1%) | 202 | 290.6 (4%) | 199 | 2,802 (6%) | 2,734 |
+| call_original + return_from | 300.4 (3%) | 223 | 250.2 (1%) | 159 | 935 (18%) | 867 |
+| control op: add_once (see below) | 274.1 (7%) | 196 | 285.5 (8%) | 194 | 305,962 (3%) | 305,895 |
+| **x86** empty = the hit itself | 124.4 (2%) | 124.4 | 138.2 (11%) | 138.2 | 136 (4%) | **134** |
+| get_reg (CX) | 123.1 (3%) | ~0 | 137.7 (3%) | ~0 | 139 (6%) | 3.2 |
+| set_reg (AX, a new value each hit) | 123.7 (2%) | ~0 | 138.7 (2%) | ~0 | 152 (3%) | 15.7 |
+| get_func_arg(0) | 134.8 (1%) | 10.4 | 146.9 (5%) | 8.7 | 140 (3%) | 4.1 |
+| get_mem 64 B at SP | 130.9 (2%) | 6.5 | 146.3 (9%) | 8.1 | 159 (2%) | 22.5 |
+| set_mem 8 B at SP (after an 8 B get_mem) | 139.2 (1%) | 14.8 | 152.4 (2%) | 14.2 | 174 (6%) | 37.3 |
+| send_log("hit %llu", arg0) | 135.0 (1%) | 10.6 | 148.7 (2%) | 10.5 | 269 (1%) | 133 |
+| send_log_stack | 894 (2%) | 770 | 1,275 (4%) | 1,136 | 10,822 (14%) | 10,686 |
+| call_func(kernel32!GetCurrentProcessId) | 412 (9%) | 288 | 426 (3%) | 288 | 2,881 (1%) | 2,744 |
+| call_original + return_from | 499 (5%) | 375 | 392 (4%) | 254 | 1,552 (3%) | 1,416 |
+| control op: add_once (see below) | 428 (17%) | 303 | 448 (7%) | 310 | 419,491 (4%) | 419,354 |
+
+Reading it:
+- **Breakpoint/hw: the debug event is the cost.** A hit is 78-92 us (x64) / 124-138 us (x86) on this VM; a context op
+  that touches no target memory (get_reg, set_reg, x64 get_func_arg, send_log's formatting and enqueue) is below the
+  resolution of the run (~2-5 us at these spreads), "~0". Each target memory access is one ReadProcessMemory /
+  WriteProcessMemory: +4..15 us. x86 get_func_arg and x86 send_log("%llu", arg0) are +9..11 us for that reason (x86
+  arguments are on the stack). Operations that make the TARGET run while the thread is stopped (call_func,
+  call_original) cost about two more debug-event round trips: +160..220 us x64, +250..375 us x86.
+- **Inline: tens of ns.** The hit is 65 ns (x64) / 134 ns (x86). get_reg/get_func_arg are a load (1-4 ns); set_reg
+  is ~10-16 ns because a changed value counts an override (one interlocked add on the shared header, the same metric
+  breakpoint/hw keep); get_mem/set_mem validate the range (the per-thread region cache; writes are re-checked every
+  time): 13-37 ns; send_log 133-179 ns (format + ring publish).
+- **Control op** = add_once: the documented return-hook idiom -- read the return address at the entry and
+  `probe_add_address(get_session(c), ret, cb, PROBE_BREAKPOINT | PROBE_ONCE)`; the one-shot probe fires on the return
+  and retires. The row includes that one-shot breakpoint hit (~one breakpoint hit, 78 / 124 us), so the add itself
+  is ~120 us from a breakpoint/hw callback (x64; x86 ~180 us) and ~228 us from an INLINE callback (x64; x86 ~295 us:
+  the request is forwarded to the controller synchronously and the thread waits for the INT3 to be armed).
+
+Surprises (measured, not changed here):
+- **x86 send_log_stack on breakpoint/hw is 0.77-1.1 ms per hit** (x64 155 us) for a 4-frame stack (hit_site, loop,
+  kernel32, ntdll): StackWalk64 over a WOW64 target from the 32-bit controller (each frame's FPO/unwind lookup reads
+  target memory through dbghelp). Symbolization is not part of it (deferred to the report). hw is 360 us slower than
+  breakpoint here on x86 only -- not explained.
+- **Inline call_func is ~2.7 us** for a callee that takes ~1 ns: the symbol string is resolved on every call
+  (GetModuleHandleA + GetProcAddress) and the address is checked with VirtualQuery (a syscall) before the call. A
+  per-symbol cache would need invalidation on module unload; not done.
+- **Inline call_original + return_from is 0.9 us (x64) / 1.4 us (x86)**, ~13x an empty hit: the x64 thunk saves the
+  hit's nonvolatile GPRs and XMM6-15 into an unwindable machine frame, x86 relinks the SEH chain (both needed so an
+  exception in the original reaches the program's handlers).
+- Inline send_log (34%) and send_log_stack (77% x64) have wide spreads at these sizes (3 rounds); the medians agree
+  with the earlier perf_ab sessions (send_log 1 thread 163-317 ns).
+
+### UHH_SHARED state vs plain globals (C7): equal on every backend
+
+The same atomic increment (`fetch_add`, relaxed) on a plain global and on a `UHH_SHARED` one, in the same run as the
+table above. "plain driver" = `hitcost_driver` (its callbacks module has no UHH_SHARED state: breakpoint/hw callbacks
+run from the driver itself and counter_shared is the plain counter there); "shared driver" = `hitcost_driver_shared`
+(opted in: breakpoint/hw callbacks run from the controller's per-session copy of the agent DLL, every API call through
+its controller table). Inline callbacks run from the injected agent in both, where counter_shared IS the shared section.
+
+| | breakpoint plain / shared driver (us) | hw plain / shared driver (us) | inline plain / shared driver (ns) |
+|---|---:|---:|---:|
+| x64 empty | 77.8 (3%) / 79.9 (3%) | 91.5 (3%) / 92.7 (4%) | 67.5 (7%) / 67.0 (7%) |
+| x64 counter_plain | 77.4 (1%) / 77.7 (3%) | 91.9 (2%) / 90.8 (4%) | 79.0 (5%) / 76.0 (4%) |
+| x64 counter_shared | 76.9 (3%) / 77.9 (4%) | 90.0 (3%) / 91.0 (2%) | 77.6 (12%) / 77.3 (3%) |
+| x86 empty | 124.4 (2%) / 124.9 (1%) | 138.2 (11%) / 140.2 (5%) | 136 (4%) / 137 (7%) |
+| x86 counter_plain | 125.2 (1%) / 125.4 (2%) | 137.6 (2%) / 138.5 (26%) | 148 (1%) / 146 (2%) |
+| x86 counter_shared | 122.9 (1%) / 125.2 (1%) | 138.7 (3%) / 138.6 (22%) | 145 (6%) / 147 (2%) |
+
+Every pair overlaps within its spread (largest median difference: x64 breakpoint empty +2.6% with 3% spreads); shared
+vs plain counter in the same run differs by <= 2% (breakpoint/hw) and <= 3 ns (inline). The shared page is plain
+memory to the code touching it, and the controller-copy indirection of a UHH_SHARED module (one predictable branch +
+an indirect call per API call) is invisible next to a debug event. The inline counter rows are +10-12 ns over empty:
+the lock-prefixed add itself, the same for both globals.
+
 ## Update: branch `perf5` (2026-11-07/08 night): UHH vs Frida 17.26.1, same sessions
 
 UHH = `perf5` e01ba59 (agent protocol v27; on merge-frida 535ebec), Frida 17.26.1, same VM, same `vs_frida.py`, every
