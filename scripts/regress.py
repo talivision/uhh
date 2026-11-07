@@ -2435,8 +2435,9 @@ def check_ntdll_churn(cycles=8, round_reads=1000000):
     uhh_trace attaches, hooks the stub, logs every call, detaches -- `cycles` times -- for
     every backend. Inline hooks are written with the target frozen and threads caught inside
     the overwritten bytes moved to the trampoline. The target reads until told to stop
-    (probe_app --until-key: rounds of 4 x round_reads, the same pattern each round), so every
-    cycle runs while it reads, whatever the machine's speed. Every cycle must detach cleanly
+    (probe_app --until-key: rounds of 4 x round_reads, the same pattern each round, read by the
+    same 4 threads with a blocking barrier between rounds), so every cycle runs while it reads,
+    whatever the machine's speed. Every cycle must detach cleanly
     with hits (all but the first: it may load the agent) and deliver every hit as a log
     (stdout logs == the detach line's hits == logs_written, none dropped); the target must
     exit 0 with every read done and the checksum exactly rounds x an uninstrumented round's.
@@ -2460,7 +2461,16 @@ def check_ntdll_churn(cycles=8, round_reads=1000000):
     to cycle 2 (runfix1: 3 of ~58 runner runs, always cycle 2 right after a short cycle 1). The
     remote agent threads now run above normal priority (0 zero-hit cycles in 511 runner cycles
     after the first), and cycle 1 gets the time to finish the setup, so every later cycle tests
-    install/remove churn with the agent ready."""
+    install/remove churn with the agent ready.
+
+    Why the rounds keep their threads (ROADMAP H4). The target used to start 4 fresh threads per
+    round, and they and main SPUN until all had started: with every CPU taken by spinners, a
+    thread not yet started waited for a scheduling quantum (Windows Server: ~190 ms), so every
+    round began with 200-600 ms without a single read (measured on runners), and a 300 ms cycle
+    inside one saw zero hits that the tool had nothing to do with (x86 ntdll-churn-breakpoint,
+    CI 42357172927; the probe is armed before the attach resumes any thread). Now some thread
+    reads at every moment (longest idle stretch measured: 6 ms), and a zero-hit cycle is the
+    tool's fault again."""
     t, a = exe("uhh_trace.exe"), exe("probe_app.exe")
     if not t or not a:
         return missing_bin("ntdll-churn", "uhh_trace/probe_app")

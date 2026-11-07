@@ -1490,6 +1490,35 @@ INT3"); nothing shipped links it. `--only cxlib`.
   exactly rounds x an uninstrumented round's. Log lines are counted as they stream (the old check held
   millions of parsed lines in Python memory). With the streaming reader, inline cycles took 1.0-2.9 s on
   x64 and 1.2-8.0 s on x86 (hw/breakpoint 0.9-3.3 s): 3/3 PASS per arch, 8 cycles each, rounds 2-5.
+- ✅ (H4) **x86 `ntdll-churn-breakpoint` cycle 2 with zero hits** (CI 42357172927, branch flakes; the last
+  intermittent row on main). Not the tool: the TARGET made no call in that window. probe_app `--until-key` ran
+  each round through run_reads -- 4 fresh threads that, with main, SPIN (`YieldProcessor`) until all of them
+  have started. With every CPU taken by spinners, a thread that has not started waits for a scheduling
+  quantum (Windows Server: ~190 ms), so every round began with 200-600 ms in which no thread read; a 300 ms
+  cycle that fell inside one could see nothing. Evidence (branch `churn-diag`, since deleted: the target
+  logged each thread-round's read interval in epoch ms, the check each cycle's attach time; 20 x86 + 10 x64
+  runner jobs per run):
+  - the attach is not late: UHH_DIAG_EVLOG event order on attach is `P L * T...T L...L T X` -- the probe
+    is armed at ntdll's LOAD_DLL, the 2nd event, before any existing thread's CREATE_THREAD is continued
+    (attach -> `probe: active` 0-16 ms in 2,016 cycles; an above-normal debug loop during the attach
+    changed nothing and was dropped);
+  - round-start barriers on runners: p50 200-390 ms, max 642 ms, quantized in ~195 ms steps; 3 zero-hit
+    cycles in 2,520 (x86 2 of 1,680, x64 1 of 840), and in each the attach landed 1-7 ms before a round's
+    end and the next round's last thread started 389-422 ms after it (its `go` at +410..+609 ms, after the
+    detach at ~+300 ms);
+  - A/B on the same runners (old loop vs the fix, 3 targets x 2 backends x 7 short cycles per job):
+    old 1,260 cycles: 1 zero-hit, 1 with < 50 hits, 35 with less than 300 ms of reading in the 300 ms after
+    the attach, idle stretches up to 607 ms; new 1,260 cycles: 0 zero-hit, 0 under 50, longest stretch with
+    no thread reading 6 ms.
+  Fix (target, not the check's assertion): `--until-key` now keeps the same W threads for every round with
+  a blocking `std::barrier` between rounds (its last arriver decides for all whether another round follows,
+  so rounds stay whole and reads/checksum exactly rounds x one round's). Waiting threads block; the last one
+  is still reading, so the process calls NtReadVirtualMemory at every moment and a zero-hit cycle is again a
+  tool failure. The check's assertions are unchanged. Validation (churn 50ad410, the real check): 20 runner
+  repetitions per arch (CI 42364469942 x86, 42364472166 x64: 60/60 rows each) plus the full push suite
+  (42364458533: every ntdll-churn row PASS; its one failure, x86 `stdout-powershell-detach-inline` "no end
+  within 240 s" with 4 inline callbacks still running at the detach, does not involve probe_app -- open, not
+  investigated here).
 
 ## E2E gated_config evaluator findings (2026-11-06, regress `gated-e2e-*`)
 The flagship use case end to end against ground truth written by the TARGET itself.
