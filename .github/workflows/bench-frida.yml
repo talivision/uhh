@@ -61,9 +61,15 @@ jobs:
       - name: vs_frida (count, gated, churn, hit)
         shell: pwsh
         run: |
+          # Lean sizes (per-event cost is a ratio; 100k events per run is plenty). frida-js-v8 is left
+          # out of gated/churn: an Interceptor JS hook on ntdll!NtClose crashes the target under V8
+          # (BENCHMARKS.md), shown on the VM.
           python -u bench/frida/vs_frida.py --rel build-${{ matrix.arch }}/Release --arch ${{ matrix.arch }} `
-            --repeats 3 --threads 8 --reads 50000 --rounds 2000 --calls 200000 `
+            --repeats 3 --threads 8 --reads 12500 --rounds 1000 --calls 50000 --workloads count,hit `
             --tag "${{ matrix.image }}" --out rows-${{ matrix.image }}-${{ matrix.arch }}.jsonl 2>&1 | Tee-Object -FilePath vs.log
+          python -u bench/frida/vs_frida.py --rel build-${{ matrix.arch }}/Release --arch ${{ matrix.arch }} `
+            --repeats 3 --threads 8 --reads 12500 --rounds 1000 --calls 50000 --workloads gated,churn --skip frida-js-v8 `
+            --tag "${{ matrix.image }}" --out rows-${{ matrix.image }}-${{ matrix.arch }}.jsonl 2>&1 | Tee-Object -Append -FilePath vs.log
           $sum = Get-Content vs.log | Select-String -Pattern '^  (count|gated|churn|hit) ' | % { "$_".Trim() }
           foreach ($w in 'count','gated','churn','hit') {
             $lines = $sum | Where-Object { $_ -like "$w *" }
