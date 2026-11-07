@@ -1500,7 +1500,7 @@ INT3"); nothing shipped links it. `--only cxlib`.
   runner jobs per run):
   - the attach is not late: UHH_DIAG_EVLOG event order on attach is `P L * T...T L...L T X` -- the probe
     is armed at ntdll's LOAD_DLL, the 2nd event, before any existing thread's CREATE_THREAD is continued
-    (attach -> `probe: active` 0-16 ms in 2,688 cycles; an above-normal debug loop during the attach
+    (attach -> `probe: active` 0-16 ms in 2,016 cycles; an above-normal debug loop during the attach
     changed nothing and was dropped);
   - round-start barriers on runners: p50 200-390 ms, max 642 ms, quantized in ~195 ms steps; 3 zero-hit
     cycles in 2,520 (x86 2 of 1,680, x64 1 of 840), and in each the attach landed 1-7 ms before a round's
