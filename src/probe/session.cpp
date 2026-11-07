@@ -428,6 +428,7 @@ struct probe_session {
     bool quiet_sampled = false;                 // the round's first idle tick passed
     std::unordered_set<DWORD> runnable_prev;    // others_runnable: runnable at the previous idle tick
     std::unordered_map<DWORD, ULONG> cs_prev;   // ... and context-switch counts then
+    std::unordered_set<DWORD> hot_now, hot_prev;   // threads with exception events this / the last window
     int round_demand = -1;                      // this round: -1 no idle tick compared yet, 0 none ran, 1 one ran
     uint32_t quiet_rounds = 0, fair_events_last = 0;
     uint64_t rounds_by_demand[3] = {};          // PROBE_TRACE statistics: rounds ending with demand -1 / 0 / 1
@@ -5424,7 +5425,7 @@ static int others_runnable(probe_session *s) {
                 const DWORD tid = (DWORD)(uintptr_t)t[i].UniqueThread;
                 const ULONG state = t[i].ThreadState;
                 if (inplace_exempt(s, tid)) continue;              // our agent's own threads (cached)
-                if (s->yielded_round.count(tid)) continue;
+                if (s->yielded_round.count(tid) || s->hot_now.count(tid) || s->hot_prev.count(tid)) continue;   // a hot thread
                 ++others;
                 if (state == 5 && t[i].WaitReason == 5) {
                     if (trace_enabled() && !suspended && s->rounds_by_demand[0] < 8) {
@@ -5536,6 +5537,7 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
             else if (++s->quiet_rounds >= 8) s->fair_period_ms = std::min<uint32_t>(80, s->fair_period_ms * 2);
         }
         s->round_demand = -1; s->quiet_sampled = false; s->runnable_prev.clear();   // cs_prev carries over
+        s->hot_prev.swap(s->hot_now); s->hot_now.clear();
         const bool was = s->parking;
         // Dense debug events (>= 2000/s: the target is mostly frozen) -- or little unfrozen
         // time -- start a yield round: every thread whose hit is continued in the next window
@@ -8048,6 +8050,9 @@ static bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposit
     if (event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) watch = ctx_watch_begin(s, event.dwThreadId);
     const bool ok = dispatch_event_impl(s, event, disposition);
     ctx_watch_end(s, std::move(watch));
+    // Threads that raise events are the HOT ones (fairness rounds are for the others; one not yet
+    // parked in this round is running, not starved: others_runnable passes over them).
+    if (event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT && s->parking) s->hot_now.insert(event.dwThreadId);
     // Fairness (see probe_session::parked): the thread of an exception event about to be
     // continued is parked while the target is starved of unfrozen time.
     if (ok && s->parking && event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT && !s->skip_continue)
