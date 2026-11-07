@@ -413,6 +413,7 @@ struct probe_session {
     bool fine_timer = false;
     uint32_t fair_events = 0;                   // debug events in the current fairness window
     LONGLONG round_wake = 0;                    // the current yield round ends (interrupt time, 100 ns: KUSER_SHARED_DATA)
+    LONGLONG round_wake_ft = 0;                 // ... the same moment as system time (a stub that sleeps)
     std::unordered_set<DWORD> yielded_round;    // threads that yielded in the current round (once each)
     // Demand-driven rounds (fair_tick): a round is also a probe. While its hot threads sleep the
     // target runs with no debug event at all, and the loop's idle ticks then ask the kernel
@@ -5189,7 +5190,7 @@ static uint64_t yield_stub(probe_session *s, DWORD tid) {
     }
     const uint64_t at = s->yield_next;
     // [0]: resume address, [8]: deadline (interrupt time), [16]: mode (0 sleep, 1 spin),
-    // [24]: the sleep (relative, negative 100 ns units, for NtDelayExecution); code at +32.
+    // [24]: deadline (system time, absolute, for NtDelayExecution); code at +32.
     std::vector<unsigned char> c(32, 0);
     auto put = [&](std::initializer_list<unsigned char> b) { c.insert(c.end(), b); };
     auto put_u = [&](uint64_t v, int n) { for (int i = 0; i < n; ++i) c.push_back((unsigned char)(v >> (8 * i))); };
@@ -5299,11 +5300,10 @@ static void park_thread(probe_session *s, DWORD tid, DWORD disposition) {
         // while rounds find demand or have not yet found 8 in a row without; spin-yield ~4 ms
         // once they backed off (nobody to give the CPU to: keep the round short).
         const bool sleep = s->quiet_rounds < 8;
-        // The sleep is RELATIVE (what is left of the round, at least 1 ms): an absolute
-        // system-time deadline slept 8-17 ms for a 4 ms round (measured, 1 ms timer on).
-        const LONGLONG left = s->round_wake - (LONGLONG)interrupt_time_now();
-        uint64_t head[4] = {(uint64_t)EMU_IP(c), (uint64_t)s->round_wake, sleep ? 0u : 1u,
-                            (uint64_t)(LONGLONG)-(left > 10000 ? left : 10000)};
+        // The sleep ends at the round's absolute system-time deadline -- in the target's own
+        // timer resolution, so at the first clock tick after it (0-15.6 ms, as before phase 3;
+        // a relative sleep always took the full 15.6 ms and starved the hot threads).
+        uint64_t head[4] = {(uint64_t)EMU_IP(c), (uint64_t)s->round_wake, sleep ? 0u : 1u, (uint64_t)s->round_wake_ft};
         // (x86: the stub reads [0] and [8] as dwords -- the low halves; [16] as a byte.)
         size_t w = 0;
         if (remote_write(s->pi.hProcess, stub, head, sizeof(head), &w) && w == sizeof(head)) {
@@ -5552,6 +5552,8 @@ static DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blo
         if (s->parking) {
             ++s->park_rounds; s->yielded_round.clear();
             s->round_wake = (LONGLONG)interrupt_time_now() + 40000;   // now + 4 ms (the stubs' clock)
+            FILETIME ft; GetSystemTimeAsFileTime(&ft);                // ... and as system time, for a sleep
+            s->round_wake_ft = (LONGLONG)(((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime) + 40000;
             s->next_quiet_sample = now + microseconds(800);
             s->round_quiet_until = now + milliseconds(4);
         }
