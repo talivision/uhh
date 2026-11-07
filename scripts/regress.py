@@ -10773,8 +10773,9 @@ def check_powershell_detach():
     """An attach reported BEFORE its detach (uhh_trace --detach-after-ms) on a target that keeps
     logging at full speed into a slow PowerShell pipeline (split from check_stdout_powershell).
     UHH_PSDETACH_REPS (default 1) repeats each backend; UHH_PSDETACH_BACKENDS narrows them.
-    The detach must also END: probe_close returns within DETACH_END_S of the request (the
-    detach waits at most 15 s for running callbacks)."""
+    The whole run must also end within 120 s (attach, 4 s, report, a detach bounded to ~15 s
+    for running callbacks, the backlog; the starved detach of check_detach_slow_reader took
+    37-203 s here, and once never ended)."""
     tracer, target = exe("uhh_trace.exe"), exe("logstream_target.exe")
     if not tracer or not target:
         return missing_bin("stdout-powershell-detach", "uhh_trace/logstream_target")
@@ -10846,7 +10847,7 @@ def check_powershell_detach():
                 closed = (dh == rep.get("hits") and dw == rep.get("logs_written") == rep.get("stdout_logs") == cap["logs"]
                           and dh == dw + dd + di)
                 fin = {"hits": dh, "logs_written": dw, "log_dropped": dd, "in_flight": di, "stdout_logs": cap["logs"]}
-            ok = (alive and finals <= 1 and after_final == 0 and consistent and closed and cap["bad"] == 0 and cap["gaps"] == 0 and
+            ok = (took <= 120 and alive and finals <= 1 and after_final == 0 and consistent and closed and cap["bad"] == 0 and cap["gaps"] == 0 and
                   fin.get("log_dropped") == 0 and rep.get("error") is None and cap["logs"] > 0)
             record(name, ok, f"rep={k} took={took:.0f}s report: hits={hits} written={rep.get('logs_written')} stdout_logs={rep.get('stdout_logs')} "
                              f"consistent={consistent} final={ {k: fin.get(k) for k in ('hits', 'logs_written', 'log_dropped', 'in_flight', 'stdout_logs')} } "
@@ -10879,7 +10880,7 @@ def check_detach_slow_reader():
     tracer, target = exe("uhh_trace.exe"), exe("logstream_target.exe")
     if not tracer or not target:
         return missing_bin("detach-slowreader", "uhh_trace/logstream_target")
-    DETACH_END_S = 60
+    DETACH_END_S = 45     # bounded detach: ~15 s callback wait + agent stop/drain; starved, it was 58 s to forever
     reps = int(os.environ.get("UHH_SLOWREADER_REPS", "1"))
     for rep, how in ((r, h) for r in range(reps) for h in ("timed", "stdin", "ctrlbreak")):
         name = f"detach-slowreader-{how}-inline"
