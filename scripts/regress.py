@@ -6696,7 +6696,10 @@ def check_ctrl_review():
         controller at exit.
       ctrl-agentprep-<unlaunched|badlaunch>: the controller's agent DLL is prepared on a
         background thread from the first inline add (perf5); a session closed without a launch,
-        or whose launch failed, ends cleanly (exit 0, no crash) and deletes its agent copy."""
+        or whose launch failed, ends cleanly (exit 0, no crash) and deletes its agent copy; the prep
+        thread's sweep of dead sessions' copies leaves every other directory alone (it removed an empty
+        logs\\ while the launch was about to create the session file in it: CI x86 "create probe log
+        file (Win32=3)")."""
     d, t, dll = exe("ctrl_driver.exe"), exe("ctrl_target.exe"), exe("ctrl_dll.dll")
     if not d or not t or not dll:
         return missing_bin("ctrl-review", "ctrl_driver/ctrl_target/ctrl_dll")
@@ -6839,7 +6842,8 @@ def check_ctrl_review():
             if r.returncode != 0: bad.append(f"exit={r.returncode}")
             if res.get("launched") != 0: bad.append(f"launched={res.get('launched')}")
             if res.get("copies_left") != 0: bad.append(f"copies_left={res.get('copies_left')}")
-            record(name, not bad, " ".join(bad) or f"closed cleanly, copies_left={res.get('copies_left')}")
+            if res.get("kept") != 1: bad.append(f"kept={res.get('kept')} (an empty non-copy dir in %TEMP%\\uhh was swept)")
+            record(name, not bad, " ".join(bad) or f"closed cleanly, copies_left={res.get('copies_left')}, other dirs kept")
         except Exception as e:
             record(name, False, repr(e))
 

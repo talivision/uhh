@@ -2023,14 +2023,13 @@ static void prepare_local_agent(probe_session *s) {
                         if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.') continue;
                         // Only copies of DEAD controllers: a live session may have just made its
                         // copy and not loaded it yet (it would look unused). Name: <pid>-<tick>-<n>.
-                        const DWORD owner = (DWORD)wcstoul(fd.cFileName, nullptr, 10);
-                        if (owner) {
-                            HANDLE ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, owner);
-                            DWORD code = 0;
-                            const bool alive = ph && GetExitCodeProcess(ph, &code) && code == STILL_ACTIVE;
-                            if (ph) CloseHandle(ph);
-                            if (alive) continue;
-                        }
+                        // Nothing else here is touched: this runs on the agent-prep thread while the
+                        // launch creates logs\ and its session file, and an empty logs\ removed between
+                        // the two failed the launch ("create probe log file (Win32=3)", CI x86).
+                        wchar_t *end = nullptr;
+                        const DWORD owner = (DWORD)wcstoul(fd.cFileName, &end, 10);
+                        if (!owner || !end || *end != L'-') continue;
+                        if (pid_alive(owner)) continue;
                         std::wstring d = root + L"\\" + fd.cFileName;
                         if (DeleteFileW((d + L"\\probe_api_agent.dll").c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND)
                             RemoveDirectoryW(d.c_str());          // in use by a live session: left alone

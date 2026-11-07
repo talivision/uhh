@@ -56,6 +56,17 @@ int main(int argc, char **argv) {
         return 2;
     }
     std::vector<char *> child(argv + i + 1, argv + argc); child.push_back(nullptr);
+    // unlaunched/badlaunch: an empty directory in %TEMP%\uhh that is not an agent copy (like an
+    // empty logs\) must survive the agent-prep thread's sweep of dead sessions' copies.
+    std::wstring keep;
+    if (sc == "unlaunched" || sc == "badlaunch") {
+        wchar_t tmp[MAX_PATH]; DWORD n = GetTempPathW(MAX_PATH, tmp);
+        if (n && n < MAX_PATH - 40) {
+            CreateDirectoryW((std::wstring(tmp) + L"uhh").c_str(), nullptr);
+            keep = std::wstring(tmp) + L"uhh\\keep-" + std::to_wstring(GetCurrentProcessId());
+            CreateDirectoryW(keep.c_str(), nullptr);
+        }
+    }
     probe_session *s = probe_session_create();
     ctrl_cfg k{backend, 0};
     bool ok = s != nullptr;
@@ -88,8 +99,10 @@ int main(int argc, char **argv) {
         char *bad[] = {missing, nullptr};
         const int launched = sc == "badlaunch" ? probe_launch(s, bad) : 0;
         probe_close(s);
-        std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"%s\",\"launched\":%d,\"copies_left\":%d}\n",
-                    sc.c_str(), launched, agent_copies_left());
+        const int kept = !keep.empty() && GetFileAttributesW(keep.c_str()) != INVALID_FILE_ATTRIBUTES;
+        if (!keep.empty()) RemoveDirectoryW(keep.c_str());
+        std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"%s\",\"launched\":%d,\"copies_left\":%d,\"kept\":%d}\n",
+                    sc.c_str(), launched, agent_copies_left(), kept);
         return launched == 0 ? 0 : 1;
     }
     ok = ok && probe_launch(s, child.data()) && probe_run(s) && probe_wait_for_exit(s);
