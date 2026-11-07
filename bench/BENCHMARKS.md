@@ -221,6 +221,16 @@ frida-cmodule 1.45 s / 0.78 s, uhh-inline 1.79 s / 1.12 s, frida-js 7.04 s / 2.2
 
 ### For UHH (from this comparison; no library code was changed)
 
+**Update (branch `binlog`, 2026-11-07): done, the gated example now costs UHH inline +397 ns/read on x64
+and +729 on x86 (was +2,358 / +2,886 in the same A/B; Frida CModule +521 / +555 in those sessions).** The
+2 us was not the text formatting in the target: the controller's log writer (two `snprintf` per JSON line,
+a lock and a wake-up per record) was the bottleneck and the ring's backpressure made the target wait for it.
+Records now move in chunks, the writer formats without printf, an idle drainer no longer sleeps a whole
+15.6 ms timer tick, and send_log formats the common conversions without the CRT (byte-identical, checked).
+Per-hit send_log: 1,312 -> 347 ns (x64), 3,357 -> 623 ns (x86). Profile, change and full table:
+docs/ROADMAP.md "Inline log cost findings"; raw rows `bench/results/binlog-2026-11-07/`.
+
+
 - The log path costs about 2 us per record on top of a 0.15 us hook, and it dominates the
   flagship example. Frida's CModule design suggests what would help: fixed-size binary records
   written straight into a shared ring with backpressure, text formatting moved to the

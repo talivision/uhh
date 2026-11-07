@@ -1841,9 +1841,73 @@ the report (count, valid JSON per line, CRC multiset of the lines, `seq` coverag
     inline x86 +75% (was +108%: the rest is the x87 save, 116 ns with it off vs main 103); x86 send_log +58% open
   - ⬜ hw within ~5% of main: per-round cost (shorter probe rounds once no demand), cheaper quiet-time probe;
     a timed wait starves exactly like a Sleep but cannot be seen (why the back-off stops at 80 ms)
-  - ⬜ x86 send_log +1.2 us per log (profile: not the stack VirtualQuery alone); x86 x87 save (~70 ns) -- cheaper form?
+  - ✅ x86 send_log +1.2 us per log: the controller's log pipeline, not the target ("Inline log cost findings"); ⬜ x86 x87 save (~70 ns) -- cheaper form?
   - ✅ UHH vs Frida re-run 2026-11-07 x64 + x86 (bench/BENCHMARKS.md): matrix + the full gated_config in both tools
     (both exact; UHH 4.3-4.8x faster); inline matrix row now includes delivering every log (no drops)
+  - ✅ Inline send_log cost (branch `binlog`, 2026-11-07): see "Inline log cost findings" below.
+
+## Inline log cost findings (2026-11-07, branch `binlog`, regress `logs-format-fast`)
+The Frida 17 comparison (bench/BENCHMARKS.md) showed the full gated_config costing +2,145 ns/read (x64) /
++2,885 (x86) with the inline backend while Frida CModule did the same job (log + deliver every read) at
++383 / +291, and the bare inline hook at +152 ns. Profiled on the VM (`bench/perfab/logprof.py`: the targets'
+own timing; `sampler.py --per-thread`; a temporary per-stage QPC count of the controller's log pipeline):
+- **Not the target.** The logging threads sat in `NtYieldExecution` inside `agent_log`, waiting for a free
+  ring slot (the ring's backpressure): an inline send_log was bound by the CONTROLLER's pipeline
+  (ring -> drainer thread -> queue -> writer thread -> stdout + session file).
+- **The writer thread was busy the whole run.** x64, one thread, 2M x `send_log("hit %llu")` (1.33-1.41
+  us/log): per record ~665 ns formatting the JSON line (two `snprintf` + temporary strings), ~450 ns taking
+  it off the queue (a lock + a notify per record), 50-100 ns WriteFile. gated (8 x 50,000): ~1.7 us of
+  writer time per record. The drainer: ~350 ns of its own per record (a lock + a writer wake-up per
+  record), the rest blocked on the full queue.
+- Once the controller kept up, the target's printf engine (`vsnprintf`, with the thread-local
+  invalid-parameter handler set and reset around it) was the largest target-side cost (~200-300 ns).
+- An idle drainer slept `Sleep(1)` = one timer tick (15.6 ms); a 4,096-record ring fills in 1-3 ms at full
+  rate, so every logging thread then waited out the rest of the tick.
+
+Fix (controller + the shared formatter; agent protocol unchanged, v25; no API change):
+1. Writer: records taken in chunks of up to 256 (one lock, one wake-up), the JSON line formatted without
+   printf or temporaries (the same text as `perf` 012f083, so that merge is a no-op).
+2. Drainer -> writer in chunks (`enqueue_logs`: one queue lock and one writer wake-up per <= 256 records),
+   each pass's chunk enqueued before `drain_mu` is released (a flush that drains first still finds every
+   record queued); same backpressure, same accounting (`controller_dropped` if the writer failed).
+3. JSON escaping appends runs of printable ASCII at once (same output).
+4. The drainer's idle wait is a 0.5 ms high-resolution waitable timer while records came in the last
+   50 ms; after that, `Sleep(1)` as before (no 2 kHz wake-ups on an idle target; idle event -> stdout
+   latency unchanged, 15.7 ms).
+5. send_log fast formatter (`probe_log_format.hpp` `uhh_format_fast`, used by the agent AND the
+   controller, so every backend still produces the same text): `%%`, `%d %i %u %x %X %o %c %s %p` with
+   the length modifiers `hh h l ll I I32 I64 z t j` and no flags/width/precision, without the CRT. Byte for
+   byte what the CRT's vsnprintf prints (`%s` of NULL "(null)", `%p` 2*sizeof(void*) upper-case digits,
+   `%c` of 0 a NUL, the full length returned for truncation): `log_format_selftest` compares the two over
+   1,830 format x value x buffer-size cases per arch (regress `logs-format-fast`: 1,713 taken, 0 mismatches,
+   every declined one declined). Anything else (flags, width, precision, floating point, wide, `%n`, unknown,
+   a lone `%`) is declined before the va_list is touched and goes to vsnprintf exactly as before; a fault
+   (`%s` of a bad pointer) is caught by the same `__try` -> "[unformattable] <format>".
+Not done, and not needed: fixed binary records with formatting moved to the controller (Frida's design). The
+remaining target-side cost is ~200 ns/log on x64, and a deferred format would have to capture `%s` of target
+memory at hit time anyway.
+
+Measured (VM, `bench/perfab/perf_ab.py` main-tip vs binlog interleaved, 3 rounds, quiet gate;
+`bench/frida/vs_frida.py` gated rows, both builds, 2 x 2 repeats; raw rows in
+`bench/results/binlog-2026-11-07/`; another agent's vs_frida job held the second VM slot during part of it):
+| | x64 main | x64 binlog | x86 main | x86 binlog |
+|---|---:|---:|---:|---:|
+| per-hit `send_log("hit %llu")`, 1 thread (empty hook: 91-94 / 183-184 ns) | 1,312 ns | **347 ns** | 3,357 ns | **623 ns** |
+| per-hit send_log, 4 threads (ns per call per thread) | 11,581 | **1,336** | 11,747 | **1,624** |
+| logs/s, one thread logging to a file (`sink/inline/file`) | 721,883 | **2,035,722** | 313,921 | **1,575,175** |
+| live lag under full load, p50 / p99 (`live/inline/load`) | 8.5 / 10.9 ms | **4.5 / 6.3 ms** | 20.7 / 24.7 ms | **4.4 / 6.2 ms** |
+| gated_config inline, 8 x 50,000 reads (perf_ab; uninstrumented 424 / 515) | 2,680 ns/read | **931** | 3,323 | **1,143** |
+| vs_frida gated: uhh-inline added per read (same-session baseline) | +2,358 | **+397** | +2,886 | **+729** |
+| vs_frida gated: frida-cmodule added per read, same sessions | +493 | +521 | +500 | +555 |
+| idle event -> stdout latency p50 (`latency/inline/idle`; unchanged) | 15.7 ms | 15.8 ms | 15.8 ms | 15.8 ms |
+
+Medians; perf_ab rounds 3/3 ok on every row, every vs_frida run exact (8/8 per method and arch).
+
+Correctness: VM `--only logs,stdout,crash_logs,stream,gated,conformance,portability,transparency,edgehunt,cxlib,carry`
+x64 392/392 (1 n/a skip), x86 388/388; CI full suite 2070/2071 on both pushes (only the known
+`patch-race-unsafe`). Every run above exact: hits == logs, log_dropped 0, interrupted 0.
+Residual: a long log-heavy run is now bound by the disk (two copies, stdout and the session file, ~80-150
+bytes per record each: 8M records wrote ~1.3 GB in profiling); idle latency is still one timer tick.
 
 ## Real-world cases
 - ✅ Microsoft Detours samples replicated (`examples/famous/detours_*`: simple, traceapi, withdll/attach, retval) -- findings above
