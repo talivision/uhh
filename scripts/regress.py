@@ -3549,10 +3549,25 @@ def check_attach_agent_scope():
         except Exception as e:
             record(name, False, repr(e))
 
-    tmp = Path(tempfile.mkdtemp(prefix="uhh-noagent-"))
+    # The lone copy goes next to the build first: Windows Defender on the VM quarantined an x64
+    # co_driver.exe copied into %TEMP% (OSError winerror 225, "contains a virus or potentially
+    # unwanted software" -- a debugger binary in a temp dir), never the original.
+    tmp, lone = None, None
+    for root in (BIN.parent, None):
+        tmp = Path(tempfile.mkdtemp(prefix="uhh-noagent-", dir=str(root) if root else None))
+        try:
+            shutil.copy2(d, tmp / "co_driver.exe")
+            lone = tmp / "co_driver.exe"
+            break
+        except OSError as e:
+            shutil.rmtree(tmp, ignore_errors=True)
+            if getattr(e, "winerror", None) != 225:
+                raise
+    if lone is None:
+        for bk in ("breakpoint", "hw", "inline"):
+            skip(f"attach-no-agent-dll-{bk}", "the antivirus quarantines a copy of co_driver.exe on this machine")
+        return
     try:
-        lone = tmp / "co_driver.exe"
-        shutil.copy2(d, lone)
         for bk in ("breakpoint", "hw", "inline"):
             name = f"attach-no-agent-dll-{bk}"
             try:
