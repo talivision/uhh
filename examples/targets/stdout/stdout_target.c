@@ -9,6 +9,9 @@
      stdout_target orphan           start a grandchild that keeps the stdout/stderr handles
                                     open for 10 s, print its pid, exit
      stdout_target sleep <ms>       (the grandchild)
+     stdout_target deferred         an unfinished line, then 5 probed calls (their records wait
+                                    for its newline), then the rest of the line (regress
+                                    stream-filefail-deferred-*)
    The output is deterministic: an uninstrumented run is the ground truth. */
 #include <windows.h>
 #include <fcntl.h>
@@ -98,12 +101,22 @@ static int orphan(void) {
     return 0;
 }
 
+static int deferred(void) {
+    bytewise(out, "partial line ");
+    Sleep(300);                                  /* the forwarder lets it out unfinished (50 ms) */
+    for (int i = 0; i < 5; ++i) { GetFileAttributesA("C:\\uhh-stdout-target-nonexistent"); Sleep(20); }
+    Sleep(500);                                  /* their records reach the session file (or fail to) */
+    bytewise(out, "continued\nEND deferred\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     out = GetStdHandle(STD_OUTPUT_HANDLE); err = GetStdHandle(STD_ERROR_HANDLE);
     if (argc >= 2 && !strcmp(argv[1], "run")) return run(argc >= 3 && !strcmp(argv[2], "--prompt"));
     if (argc >= 2 && !strcmp(argv[1], "mixed")) return mixed();
     if (argc >= 2 && !strcmp(argv[1], "orphan")) return orphan();
+    if (argc >= 2 && !strcmp(argv[1], "deferred")) return deferred();
     if (argc >= 3 && !strcmp(argv[1], "sleep")) { Sleep((DWORD)atoi(argv[2])); return 0; }
-    fprintf(stderr, "usage: stdout_target run [--prompt] | mixed | orphan | sleep <ms>\n");
+    fprintf(stderr, "usage: stdout_target run [--prompt] | mixed | orphan | deferred | sleep <ms>\n");
     return 2;
 }

@@ -1056,6 +1056,122 @@ def check_stream_filestall():
             record(name, False, repr(e))
 
 
+def _filefail_run(args, env, timeout):
+    """A test-hook controller run with binary pipes: (rc, timed_out, stdout records, target text,
+    report, session-file records, stderr). The session file (named on stderr) is read, then deleted."""
+    p = subprocess.Popen([str(a) for a in args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, env=env)
+    timed_out = False
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        subprocess.run(["taskkill", "/f", "/t", "/pid", str(p.pid)], capture_output=True)
+        out, err = p.communicate()
+    recs, text, _ = stdout_split(out)
+    errtext = err.decode("utf-8", "replace")
+    m = re.search(r"^probe: logs -> (.+?)\r?$", errtext, re.M)
+    file_recs = []
+    if m:
+        path = Path(m.group(1).strip())
+        try:
+            for line in path.read_bytes().split(b"\n"):
+                if line.startswith(b'{"kind":"probe_log"'):
+                    try:
+                        file_recs.append(json.loads(line))
+                    except ValueError:
+                        file_recs.append({})
+            path.unlink()
+        except OSError:
+            pass
+    logs = [r for r in recs if r.get("kind") == "probe_log"]
+    rep = next((r for r in recs if r.get("kind") == "probe_report"), {})
+    return p.returncode, timed_out, logs, text, rep, file_recs, errtext
+
+
+def check_stream_filefail():
+    """codex4 #1-#3: the session file's appender thread (log_filer_main, a37911d) failing. The
+    behaviour kept from 0fb6cee (the synchronous file write): a failed file write is an error
+    (stderr, report "error"), logs_written counts the records IN THE FILE (the file holds seq
+    0..logs_written-1, nothing missing in between), every later record is in log_dropped -- also
+    the ones stdout already had: stdout holds seq 0..stdout_logs-1 (stdout_logs >= logs_written)
+    -- the error says the file is incomplete, hits == logs_written + log_dropped + interrupted,
+    and nothing hangs or crashes. Forced with uhh_trace_th (test-hook controller):
+      - queued-<bk>: UHH_TEST_FILE_FAIL_AT=8 on the append stalled 400 ms (UHH_TEST_FILE_STALL_*),
+        the logstream run (a record every 100 ms): records queue up behind the failing append.
+        Before: the queued records were counted in logs_written but never reached the file.
+      - deferred-<bk>: stdout_target deferred (5 probed calls while the target's stdout is inside
+        an unfinished line: their records wait in the file for its newline), the first append
+        fails. Before: probe_report / probe_wait_for_exit waited forever for those records.
+      - throw-spare: the appender's recycling of its 3rd chunk throws bad_alloc (the
+        file_spare.push_back). Before: std::terminate. Now: harmless (the chunk is not
+        recycled): all 50 records, no error.
+      - throw-append: the appender throws before its 3rd append: a failed append, as above."""
+    tr, ls, so = exe("uhh_trace_th.exe"), exe("logstream_target.exe"), exe("stdout_target.exe")
+    if not tr or not ls or not so:
+        return missing_bin("stream-filefail", "uhh_trace_th/logstream_target/stdout_target")
+    seq_ok = lambda recs: [r.get("seq") for r in recs] == list(range(len(recs)))
+
+    def judge(name, res, expect_fail, need_more_on_stdout=False, extra=None):
+        rc, timed_out, logs, text, rep, file_recs, errtext = res
+        bad = []
+        if timed_out: bad.append("controller HUNG (killed)")
+        if not rep: bad.append(f"no probe_report (rc={rc:#x})")
+        written, dropped, stdout_logs = rep.get("logs_written"), rep.get("log_dropped"), rep.get("stdout_logs")
+        hits, intr = rep.get("hits"), rep.get("callbacks_interrupted") or 0
+        err = rep.get("error") or ""
+        if rep:
+            if written != len(file_recs) or not seq_ok(file_recs):
+                bad.append(f"file has {len(file_recs)} records (seq ok={seq_ok(file_recs)}), logs_written={written}")
+            if stdout_logs != len(logs) or not seq_ok(logs):
+                bad.append(f"stdout has {len(logs)} records (seq ok={seq_ok(logs)}), stdout_logs={stdout_logs}")
+            if None in (hits, written, dropped) or hits != written + dropped + intr:
+                bad.append(f"hits={hits} != logs_written={written} + log_dropped={dropped} + interrupted={intr}")
+            if expect_fail:
+                if not ("incomplete" in err and expect_fail in err): bad.append(f"error={err!r}")
+                if not dropped: bad.append("nothing counted dropped")
+                if "probe: error:" not in errtext: bad.append("no error on stderr")
+                if isinstance(stdout_logs, int) and isinstance(written, int):
+                    if stdout_logs < written: bad.append("stdout_logs < logs_written")
+                    if need_more_on_stdout and stdout_logs <= written: bad.append("scenario not hit: no record on stdout beyond the file")
+            else:
+                if err or dropped: bad.append(f"error={err!r} dropped={dropped}")
+        if extra: bad += extra(res)
+        record(name, not bad, "; ".join(bad) or
+               f"file={len(file_recs)}=logs_written stdout={len(logs)}=stdout_logs hits={hits}=written+dropped({dropped})+"
+               f"interrupted({intr}) rc={rc} error={err[:160]!r}")
+
+    base = dict(os.environ)
+    for bk in ("breakpoint", "inline"):
+        name = f"stream-filefail-queued-{bk}"
+        try:
+            env = dict(base, UHH_TEST_FILE_STALL_MS="400", UHH_TEST_FILE_STALL_AT="8", UHH_TEST_FILE_FAIL_AT="8")
+            res = _filefail_run([tr, "--backend", bk, "-p", "logstream_target.exe!LogSite:d", "--", ls], env, 120)
+            judge(name, res, "write probe log file", need_more_on_stdout=True)
+        except Exception as e:
+            record(name, False, repr(e))
+    for bk in ("breakpoint", "inline"):
+        name = f"stream-filefail-deferred-{bk}"
+        try:
+            env = dict(base, UHH_TEST_FILE_FAIL_AT="1")
+            res = _filefail_run([tr, "--backend", bk, "-p", "KernelBase.dll!GetFileAttributesA:s", "--", so, "deferred"],
+                                env, 60)
+            judge(name, res, "write probe log file", extra=lambda r: (
+                [] if r[3] == b"partial line continued\nEND deferred\n" else [f"target stdout {r[3]!r}"]) + (
+                [] if (r[4].get("hits") or 0) >= 5 else [f"hits={r[4].get('hits')} < 5"]))
+        except Exception as e:
+            record(name, False, repr(e))
+    for where, expect in (("spare", None), ("append", "probe log file appender failed")):
+        name = f"stream-filefail-throw-{where}"
+        try:
+            env = dict(base, UHH_TEST_FILE_THROW_AT="3", UHH_TEST_FILE_THROW_IN=where)
+            res = _filefail_run([tr, "--backend", "breakpoint", "-p", "logstream_target.exe!LogSite:d", "--", ls], env, 120)
+            judge(name, res, expect, extra=None if expect else lambda r: (
+                [] if r[4].get("logs_written") == 50 and r[0] == 0 else [f"logs_written={r[4].get('logs_written')}/50 rc={r[0]}"]))
+        except Exception as e:
+            record(name, False, repr(e))
+
+
 def check_stream_order():
     tracer, target = exe("uhh_trace.exe"), exe("logstream_target.exe")
     if not tracer or not target:
@@ -11574,6 +11690,7 @@ def main():
     if want(check_ctrl_review): check_ctrl_review()
     if want(check_ctrl_warm): check_ctrl_warm()
     if want(check_stream_filestall): check_stream_filestall()
+    if want(check_stream_filefail): check_stream_filefail()
     if want(check_ctrl_symload): check_ctrl_symload()
     if want(check_cdx_review): check_cdx_review()
     if want(check_newapp_files): check_newapp_files()

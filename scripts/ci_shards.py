@@ -72,7 +72,7 @@ EST = {
     "check_realapps:ps-fileversion-inline": (15, 190), "check_realapps:rest": (30, 33), "check_realworld": (14, 14), "check_realworld_targets": (0, 0),
     "check_refusals": (1, 1), "check_ret_probe": (5, 6), "check_shared_mix": (13, 14), "check_sidefx": (3, 10),
     "check_sites": (1, 1), "check_stacks": (1, 1), "check_stdout_forward": (18, 20),
-    "check_stream_latency": (17, 17), "check_stream_live": (21, 44), "check_stream_order": (1, 1), "check_stream_filestall": (12, 12),
+    "check_stream_latency": (17, 17), "check_stream_live": (21, 44), "check_stream_order": (1, 1), "check_stream_filestall": (12, 12), "check_stream_filefail": (45, 45),
     "check_stream_sink_speed": (3, 8), "check_stream_volume": (149, 196), "check_symbols": (1, 1),
     "check_symbols_grammar": (0, 0), "check_transparency": (6, 9), "check_watchpoint": (2, 3),
 }

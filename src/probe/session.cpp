@@ -795,11 +795,32 @@ static void test_file_stall() {
     static std::atomic<long> n{0};
     if (ms > 0 && ++n == at) Sleep((DWORD)ms);
 }
+// UHH_TEST_FILE_FAIL_AT=<n>: the session file's n-th append fails (ERROR_DISK_FULL), as on a
+// full disk or an exceeded quota (regress stream-filefail-*). After the stall above, if both hit
+// the same append: chunks queue up behind it meanwhile.
+static bool test_file_fail() {
+    static const long at = [] { const char *v = std::getenv("UHH_TEST_FILE_FAIL_AT"); return v ? std::atol(v) : 0L; }();
+    static std::atomic<long> n{0};
+    return at > 0 && ++n == at;
+}
+// UHH_TEST_FILE_THROW_AT=<n>: the appender thread throws std::bad_alloc at its n-th chunk, where
+// UHH_TEST_FILE_THROW_IN says: "spare" (default: recycling the appended chunk, codex4 #3) or
+// "append" (before appending it) (regress stream-filefail-throw-*).
+static void test_file_throw(uint64_t nth, bool append_site) {
+    static const long at = [] { const char *v = std::getenv("UHH_TEST_FILE_THROW_AT"); return v ? std::atol(v) : 0L; }();
+    static const bool in_append = [] { const char *v = std::getenv("UHH_TEST_FILE_THROW_IN"); return v && !std::strcmp(v, "append"); }();
+    if (at > 0 && nth == (uint64_t)at && append_site == in_append) throw std::bad_alloc();
+}
 #endif
 // A batch into the session file, here and now. tail_mu not held.
 static bool append_log_file(probe_session *s, const char *bytes, size_t size, std::string *error) {
 #if defined(UHH_TEST_HOOKS)
     test_file_stall();
+    if (test_file_fail()) {
+        SetLastError(ERROR_DISK_FULL);
+        if (error) *error = win_error("write probe log file");
+        return false;
+    }
 #endif
     DWORD wrote = 0;
     if (s->log_file == nullptr || s->log_file == INVALID_HANDLE_VALUE || size > MAXDWORD ||
@@ -821,6 +842,7 @@ static bool append_log_file(probe_session *s, const char *bytes, size_t size, st
 static constexpr size_t FILE_QUEUE_CAP = 1u << 20;
 static constexpr size_t FILE_SPARE_MAX = 24;
 static void log_filer_main(probe_session *s) {
+    uint64_t nth = 0;
     for (;;) {
         std::string chunk;
         {
@@ -833,6 +855,10 @@ static void log_filer_main(probe_session *s) {
         }
         std::string error;
         bool ok;
+        ++nth;
+#if defined(UHH_TEST_HOOKS)
+        test_file_throw(nth, true);
+#endif
         {
             std::lock_guard<std::mutex> lock(s->file_mu);
             ok = !s->file_failed;                        // after a failure: discarded, never half a file
@@ -854,6 +880,9 @@ static void log_filer_main(probe_session *s) {
             s->file_busy = false;
             if (!ok && !s->file_failed) { s->file_failed = true; s->file_error = error; }
             chunk.clear();                                // keeps its capacity
+#if defined(UHH_TEST_HOOKS)
+            test_file_throw(nth, false);
+#endif
             if (s->file_spare.size() < FILE_SPARE_MAX) s->file_spare.push_back(std::move(chunk));
         }
         s->file_idle.notify_all();
