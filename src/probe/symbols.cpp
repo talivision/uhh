@@ -3,6 +3,7 @@
 #include <dbghelp.h>
 
 #include <algorithm>
+#include <iterator>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 
 namespace uhh_sym {
@@ -61,6 +63,12 @@ struct session_state {
     bool walker = false;
     std::vector<std::wstring> image_directories;
     std::vector<module_state> modules;
+    // symbolize's answers by address. An answer depends only on the modules registered (and
+    // the search path, which changes only with them), so any register/unregister clears it.
+    // The log writer names every frame of every stack log: the same few return addresses,
+    // ~2-50 us each through dbghelp (x86 most), had made the writer -- and through the log
+    // queue's backpressure the program -- wait on symbolization.
+    std::unordered_map<std::uint64_t, std::string> names;
 };
 
 std::mutex g_mutex;
@@ -644,6 +652,7 @@ void register_module(HANDLE process, const std::wstring &image_path,
         append_image_directory(*session, image_path);
         const auto existing = std::find_if(session->modules.begin(), session->modules.end(),
             [base](const session_state::module_state &module) { return module.base == base; });
+        session->names.clear();
         if (existing == session->modules.end()) {
             session_state::module_state module;
             module.image_path = image_path;
@@ -671,6 +680,7 @@ void unregister_module(HANDLE process, std::uint64_t base) {
         if (!g_dbghelp) return;
         const auto session = find_session(process);
         if (session == g_sessions.end()) return;
+        session->names.clear();
         auto &mods = session->modules;
         for (auto it = mods.begin(); it != mods.end(); ) {
             if (it->base == base) it = mods.erase(it); else ++it;
@@ -729,12 +739,26 @@ bool containing_function(HANDLE process, std::uint64_t address, std::uint64_t &s
     }
 }
 
+static std::string symbolize_uncached(std::vector<session_state>::iterator session, std::uint64_t address);
 std::string symbolize(HANDLE process, std::uint64_t address) {
     try {
         std::lock_guard<std::mutex> lock(g_mutex);
-        const std::string numeric = hex_address(address);
         const auto session = find_session(process);
-        if (!g_dbghelp || session == g_sessions.end()) return numeric;
+        if (!g_dbghelp || session == g_sessions.end()) return hex_address(address);
+        if (const auto hit = session->names.find(address); hit != session->names.end()) return hit->second;
+        std::string name = symbolize_uncached(session, address);
+        if (session->names.size() >= 65536) session->names.clear();
+        session->names.emplace(address, name);
+        return name;
+    } catch (...) {
+        try { return hex_address(address); } catch (...) { return {}; }
+    }
+}
+
+// Caller holds g_mutex.
+static std::string symbolize_uncached(std::vector<session_state>::iterator session, std::uint64_t address) {
+    try {
+        const std::string numeric = hex_address(address);
 
         IMAGEHLP_MODULEW64 module{};
         module.SizeOfStruct = sizeof(module);
@@ -808,6 +832,76 @@ static bool ensure_walker(SessionIt session) {
     return true;
 }
 
+// The target memory one walk reads, by page. StackWalk64 reads in small pieces -- a WOW64
+// (x86) walk of a 4-frame stack made ~170-280 ReadProcessMemory calls of ~14 bytes, ~50 of
+// them FAILING (the x86 walker probes the bytes before candidate return addresses, unmapped
+// ones included, byte by byte), ~2-8 us apiece: 0.5-0.9 ms per walk, most of x86
+// send_log_stack on breakpoint/hw (x64: ~40 calls, ~70 us). Now a read is served from a copy of
+// the page(s) it lies in, read once per walk -- the same bytes, as the thread is stopped for
+// the walk, and only pages the walk reads anyway are touched -- and a read inside a page that
+// could not be read fails as ReadProcessMemory did there (protection is per page: nothing of
+// it is readable; 0 bytes, the same error). A read over a readable and an unreadable page, or
+// over more than two pages, goes to ReadProcessMemory exactly as asked. Never kept across
+// walks (the program, or our own breakpoints, change memory between hits).
+struct WalkMemory {
+    static constexpr std::uint64_t PAGE = 4096;
+    // ok: all of it read; none: nothing of it readable (error = ReadProcessMemory's error).
+    struct Page { std::uint64_t base; bool ok, none; DWORD error; unsigned char bytes[PAGE]; };
+    HANDLE process = nullptr;
+    Page pages[16];
+    std::size_t used = 0, next = 0;
+    // The page at base (read on first use); never evicts `keep` (a page the caller still uses).
+    const Page *page(std::uint64_t base, const Page *keep = nullptr) {
+        for (std::size_t i = 0; i < used; ++i) if (pages[i].base == base) return &pages[i];
+        Page *p = used < std::size(pages) ? &pages[used++] : &pages[next++ % std::size(pages)];
+        if (p == keep) p = &pages[next++ % std::size(pages)];
+        SIZE_T n = 0;
+        p->base = base;
+        p->ok = ReadProcessMemory(process, reinterpret_cast<LPCVOID>(static_cast<std::uintptr_t>(base)), p->bytes,
+                                  sizeof(p->bytes), &n) && n == sizeof(p->bytes);
+        p->error = p->ok ? ERROR_SUCCESS : GetLastError();
+        p->none = !p->ok && n == 0 && p->error != ERROR_SUCCESS;
+        return p;
+    }
+};
+static WalkMemory g_walk_buffer;                // walks hold g_mutex: one at a time
+static WalkMemory *g_walk_memory = nullptr;     // the walk in progress
+
+static BOOL CALLBACK walk_read(HANDLE process, DWORD64 base, PVOID buffer, DWORD size, LPDWORD read) {
+    WalkMemory *m = g_walk_memory;
+    const std::uint64_t first = base & ~(WalkMemory::PAGE - 1), last = size ? (base + size - 1) & ~(WalkMemory::PAGE - 1) : first;
+    if (m && m->process == process && size && base + size > base && last - first <= WalkMemory::PAGE) {
+        const WalkMemory::Page *a = m->page(first);
+        const WalkMemory::Page *b = last != first && a->ok ? m->page(last, a) : a;
+        if (a->ok && b->ok) {
+            const std::size_t off = static_cast<std::size_t>(base - first);
+            const std::size_t in_a = std::min<std::size_t>(size, WalkMemory::PAGE - off);
+            std::memcpy(buffer, a->bytes + off, in_a);
+            if (in_a < size) std::memcpy(static_cast<unsigned char *>(buffer) + in_a, b->bytes, size - in_a);
+            if (read) *read = size;
+            return TRUE;
+        }
+        if (a->none) {                                      // its first page is unreadable: so was the read
+            if (read) *read = 0;
+            SetLastError(a->error);
+            return FALSE;
+        }
+    }
+    SIZE_T n = 0;
+    const BOOL ok = ReadProcessMemory(process, reinterpret_cast<LPCVOID>(static_cast<std::uintptr_t>(base)), buffer, size, &n);
+    if (read) *read = static_cast<DWORD>(n);
+    return ok;
+}
+struct WalkScope {                        // a fresh per-walk page cache (caller holds g_mutex)
+    explicit WalkScope(HANDLE process) {
+        g_walk_buffer.process = process; g_walk_buffer.used = g_walk_buffer.next = 0;
+        g_walk_memory = &g_walk_buffer;
+    }
+    ~WalkScope() { g_walk_memory = nullptr; }
+    WalkScope(const WalkScope &) = delete;
+    WalkScope &operator=(const WalkScope &) = delete;
+};
+
 bool walk_stack(HANDLE process, HANDLE thread, CONTEXT ctx,
                 std::uint64_t pc, std::uint64_t sp, std::uint64_t fp,
                 std::vector<std::uint64_t> &frames, std::size_t max_frames) {
@@ -818,6 +912,7 @@ bool walk_stack(HANDLE process, HANDLE thread, CONTEXT ctx,
         if (!g_dbghelp || session == g_sessions.end() || !thread || max_frames == 0)
             return false;
         if (!ensure_walker(session)) return false;  // the walk session, on first use
+        WalkScope walk_memory(process);
         frames.push_back(pc);
 
         STACKFRAME64 frame{};
@@ -844,7 +939,7 @@ bool walk_stack(HANDLE process, HANDLE thread, CONTEXT ctx,
         while (frames.size() < max_frames && attempts++ < max_frames + 8) {
             const DWORD64 previous_pc = frame.AddrPC.Offset;
             const DWORD64 previous_sp = frame.AddrStack.Offset;
-            if (!g_api.stack_walk(machine, process, thread, &frame, &ctx, nullptr,
+            if (!g_api.stack_walk(machine, process, thread, &frame, &ctx, walk_read,
                                   g_api.function_table_access, g_api.get_module_base, nullptr))
                 break;
             const std::uint64_t next = static_cast<std::uint64_t>(frame.AddrPC.Offset);
@@ -872,6 +967,7 @@ bool unwind_frames(HANDLE process, HANDLE thread, CONTEXT ctx,
         pc_sp.clear();
         const auto session = find_session(process);
         if (!g_dbghelp || session == g_sessions.end() || !thread || !ensure_walker(session)) return false;
+        WalkScope walk_memory(process);
         STACKFRAME64 frame{};
         ctx.ContextFlags |= CONTEXT_FULL;
 #if defined(_WIN64)
@@ -883,7 +979,7 @@ bool unwind_frames(HANDLE process, HANDLE thread, CONTEXT ctx,
 #endif
         frame.AddrPC.Mode = frame.AddrStack.Mode = frame.AddrFrame.Mode = AddrModeFlat;
         for (std::size_t i = 0; i < max_frames + 1; ++i) {
-            if (!g_api.stack_walk(machine, process, thread, &frame, &ctx, nullptr,
+            if (!g_api.stack_walk(machine, process, thread, &frame, &ctx, walk_read,
                                   g_api.function_table_access, g_api.get_module_base, nullptr))
                 break;
             if (i == 0) continue;                  // the first call reports frame 0 itself
