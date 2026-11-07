@@ -1908,6 +1908,17 @@ Measured (VM, `bench/perfab/perf_ab.py` main-tip vs binlog interleaved, 3 rounds
 
 Medians; perf_ab rounds 3/3 ok on every row, every vs_frida run exact (8/8 per method and arch).
 
+x86 gated after merging merge-frida (perf phase 3, 5f13966: the same writer change, plus x86 hook and
+get_func_arg savings), investigated further (temporary per-stage QPC counters in the controller, x86 gated
+8 x 50,000): the controller now keeps up -- writer busy ~0.5 us/record (format 0.27, two WriteFile 0.18,
+pop 0.05), waiting the rest; drainer ~0.25 us/record, 47k-130k passes per run, almost never blocked. The
+remaining cost is CPU: the uninstrumented 8-thread workload already fills the VM's 4 CPUs (x86 WOW64
+NtReadVirtualMemory), so every ns of producer AND consumer work per record shows up as ~1/4 ns per read.
+Two hypotheses measured and dropped (A/B, 3 rounds, no gain, not kept): (a) drainer and writer at
+THREAD_PRIORITY_ABOVE_NORMAL (x86 gated median 1.10 -> 1.24 us/read: worse); (b) the ring's head, its tail +
+drainer heartbeat, and the flags each on a cache line of their own (agent protocol v26; x86 gated
+median 1.02 -> 1.04 us/read; x86 hit t4 1.46 -> 1.32 but x64 hit t4 0.93 -> 1.06: within the noise).
+
 Correctness: VM `--only logs,stdout,crash_logs,stream,gated,conformance,portability,transparency,edgehunt,cxlib,carry`
 x64 392/392 (1 n/a skip), x86 388/388; CI full suite 2070/2071 on both pushes (only the known
 `patch-race-unsafe`). Every run above exact: hits == logs, log_dropped 0, interrupted 0.

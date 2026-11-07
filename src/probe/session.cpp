@@ -8020,7 +8020,7 @@ static void start_drainer(probe_session *s) {
             if (++idle < 64) { SwitchToThread(); continue; }
             LARGE_INTEGER due; due.QuadPart = -5000;                   // 0.5 ms, relative
             if (timer && GetTickCount64() - last_record < 50 && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
-                WaitForSingleObject(timer, INFINITE);
+                WaitForSingleObject(timer, 1);   // never longer than Sleep(1) would have been
             else
                 Sleep(1);
         }
