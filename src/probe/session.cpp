@@ -808,7 +808,10 @@ static bool append_log_file(probe_session *s, const char *bytes, size_t size, st
 // Live tail: the session file's appender thread. Appends the batches the writer handed over, in
 // order; then, if stdout is behind the file (records deferred while the target was inside one of
 // its lines), replays them as the forwarder would (tail_catch_up_locked reads the file).
-static constexpr size_t FILE_QUEUE_CAP = 16u << 20;   // bytes handed over and not appended yet: the writer waits beyond
+// Bytes handed over and not appended yet; beyond, the writer waits (stdout with it). 2 MB: thousands of
+// live records ride out a stalled file; a full-speed stream keeps a flat footprint (regress
+// stream-volume-inline: peak <= 1.2x from 2M to 20M records -- 16 MB grew x86 19 -> 24 MB on CI).
+static constexpr size_t FILE_QUEUE_CAP = 2u << 20;
 static void log_filer_main(probe_session *s) {
     for (;;) {
         std::string chunk;

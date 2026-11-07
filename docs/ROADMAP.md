@@ -2221,7 +2221,9 @@ Each claim was checked with a regress check that FAILED on 0fb6cee (same tests, 
    WRITE_DAC/WRITE_OWNER); the verified copy is held open deny-write until the controller's LoadLibrary is done. A first
    version hashed the trimmed source with SHA-256 (BCrypt) once per controller process: 13.4 ms per launch on the VM
    (controllers are one session per process: read 8.3 MB, trim, hash), so it was replaced by the stamp + PE checks.
-   Cost: see the measurements below.
+   Cost (VM, 12 attach sessions in a row, UHH_BENCH_PHASES agent_begin -> agent_loaded, median): warm take x64 3.8 ms on
+   0fb6cee -> 5.2 ms (x86 5.9 ms); a new copy still costs 70 ms x64 / 239 ms x86 (the AV scan perf5 avoids), so the
+   gain is kept. x64 + x86 PASS.
 3. **A failed allocation left half a record in a log pack (`pack_agent_record`) -- real, fixed.** The header was in the
    pack when the text/frames append threw; later entries misparsed, the writer read lengths past the pack.
    `ctrl-pack-oom` (test hook `UHH_TEST_PACK_FAIL=37`: every 37th record throws std::bad_alloc after its header):
@@ -2246,11 +2248,15 @@ Each claim was checked with a regress check that FAILED on 0fb6cee (same tests, 
    thread existed at 55a1ffb; the "disk stalls" of the perf5 stream-live / stream-latency failures and the earlier citune
    x86 failure (records #25/#26 at 221/112 ms) are this. Fix: the writer writes stdout first in every mode (through a
    forwarded stdout too, when it is at a target line boundary and nothing is deferred) and hands the batch to a session
-   file appender thread (`log_filer_main`, queue capped at 16 MB); records deferred behind an unfinished target line are
+   file appender thread (`log_filer_main`, queue capped at 2 MB -- 16 MB failed stream-volume-inline x86 on CI: peak 19 -> 24 MB); records deferred behind an unfinished target line are
    replayed from the file by the appender once appended (or by the forwarder at the newline); every flush waits for the
    appender (the file is complete at report/close). `stream-filestall-<bk>` (uhh_trace_th, test hook
    `UHH_TEST_FILE_STALL_MS=400` on the 8th append): 0fb6cee FAILED (`stdout held: #7 404 ms`, both backends); after,
-   the file shows the 400 ms stall and stdout does not (worst 0.5-12 ms), x64 + x86.
+   the file shows the 400 ms stall and stdout does not (worst 0.5-12 ms), x64 + x86. Proof on the real stall, both builds
+   side by side at the same time (VM, uhh_trace breakpoint on logstream_target, 40 runs each, event -> stdout): 0fb6cee
+   2 runs over 100 ms (records #8-#11 at 430/320/211/102 ms; #8-#10 at 321/212/102 ms) and 10 more at 7-43 ms; the fix:
+   worst 1.2 ms over all 40 runs. `--only stream_latency` 20 times per arch on the fix (light pool): x64 80/80, x86
+   80/80 PASS, worst p99 13.4 / 15.4 ms.
 
 ## Real-world cases
 - ✅ Microsoft Detours samples replicated (`examples/famous/detours_*`: simple, traceapi, withdll/attach, retval) -- findings above
