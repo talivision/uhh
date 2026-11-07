@@ -1514,7 +1514,11 @@ INT3"); nothing shipped links it. `--only cxlib`.
   a blocking `std::barrier` between rounds (its last arriver decides for all whether another round follows,
   so rounds stay whole and reads/checksum exactly rounds x one round's). Waiting threads block; the last one
   is still reading, so the process calls NtReadVirtualMemory at every moment and a zero-hit cycle is again a
-  tool failure. The check's assertions are unchanged.
+  tool failure. The check's assertions are unchanged. Validation (churn 50ad410, the real check): 20 runner
+  repetitions per arch (CI 42364469942 x86, 42364472166 x64: 60/60 rows each) plus the full push suite
+  (42364458533: every ntdll-churn row PASS; its one failure, x86 `stdout-powershell-detach-inline` "no end
+  within 240 s" with 4 inline callbacks still running at the detach, does not involve probe_app -- open, not
+  investigated here).
 
 ## E2E gated_config evaluator findings (2026-11-06, regress `gated-e2e-*`)
 The flagship use case end to end against ground truth written by the TARGET itself.
