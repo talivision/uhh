@@ -2429,6 +2429,15 @@ keeping the full output, a ring of hardware-breakpoint events and a full minidum
   p2edge_target+0x1140 (after the `lock inc`). Every x86 all-thread DR write (arm, release, gates) had the same
   exposure. Fix: `same_thread_regs` ignores EFLAGS bit 1 (architecturally always 1). After (same loops, 4 x86
   windows-2022 jobs): 0 failures in 1,282 rows (641 runs; at the old rate ~14 were expected, P(0) ~ 5e-7).
+- 🔍 (FL5) **x86 `lifecycle-detach-early-30-inline` crash** (the "CI residuals" R3 open note: a worker executing a
+  non-executable private page, `in_flight=1 running=1` at the detach, EPYC 9V74, 1 in 5,448 x86 inline rows then).
+  NOT reproduced: 11,781 loops of `lifecycle-detach-early-{30,120}-inline` (23,562 inline rows; 5,830 + 652 loops on
+  windows-2022, 5,302 on windows-2025, runner CPUs as allocated) plus 2,071 of `-30-mixed`, all x86, on merge-frida
+  5f13966 + this branch: 0 failures (at the old rate ~4.3 were expected; P(0) ~ 1.3%). The loop runner writes a
+  full minidump of a crashed target (`UHH_DIAG_DUMPDIR`, flakes-diag) for the next occurrence. Left open.
+- 🔍 (FL6) **`lifecycle-detach-early-5-mixed` (a DR left set after an early detach) and `lifecycle-interrupt-mixed`
+  (no exit after a Ctrl+Break at 0 s)** -- once each on the perf branch. NOT reproduced on merge-frida 5f13966 +
+  this branch: 1,017 loops on x64 and 1,012 on x86 (windows-2022) of both rows, 0 failures. Left open.
 
 ## Later
 - ✅ x86 cumulative-session flakiness (possibly the same handle double-close; recheck) -- CLOSED with evidence (cfnest). The note dates from the first checkpoint (c617de4); its suspected cause, review finding I6 (handles closed twice on the launch failure path), was fixed long since. Rechecked with `ar_driver --repeat`: 60 sessions in ONE controller process, backends in turn (breakpoint, hw, inline), each a call_func + runtime data watch whose callback call_funcs during another thread's call: every session exact, nothing dropped, the controller's handle count flat (x64 73 -> 73, x86 89 -> 89). Regress `sessions-repeat` keeps it covered (also exercises the per-run callback-fiber host). (Separately: `callfunc-kill-reuse` -- inline, needs the OS to hand a killed thread's id to a new thread of the same process within 3000 creations -- failed on the shared VM in Nov-06 evening runs on the cfnest build AND on an unmodified baseline build (2/2): system-wide thread-id reuse under other agents' load, not a UHH regression.)
