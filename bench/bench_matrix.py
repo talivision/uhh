@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Unified UHH-vs-Frida benchmark matrix on the gated multithreaded read workload.
+"""SUPERSEDED by bench/frida/vs_frida.py (frida 17.26+, idiomatic agents, exact judges; see
+bench/BENCHMARKS.md). Kept for the record.
+
+Unified UHH-vs-Frida benchmark matrix on the gated multithreaded read workload.
 
 Measures per-read overhead for every backend on the SAME in-target clock
 (probe_app's QueryPerformanceCounter window, the "elapsed_ns" field), so all rows

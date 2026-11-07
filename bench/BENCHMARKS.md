@@ -1,15 +1,288 @@
 # UHH vs Frida — instrumentation benchmark
 
-Head-to-head of **every UHH read backend** against **multiple Frida methods** doing
-the *same* instrumentation (count each `ntdll!NtReadVirtualMemory` call), on the
-*same* workload, *same* machine, *same* clock. Performance is only one axis —
-**stability** (does the method complete the workload at all?) and **flexibility /
-coverage** (where can the method be applied?) are reported as first-class results,
-because UHH being more robust and more broadly applicable than a given Frida method
-is itself a positive result.
+The current comparison is the first section below ("UHH vs Frida 17.26.1"). Everything after it
+is kept for history and is SUPERSEDED (see "Why the earlier comparison was superseded").
+Reproduce with `bench/frida/vs_frida.py` (how: `bench/frida/README.md`); raw rows in
+`bench/results/frida17-2026-11-07/`.
 
-Reproduce with `bench/bench_matrix.py` (driver) and `bench/frida/*.js` (the four
-Frida methods). Raw per-run numbers in `bench/results/`.
+## UHH vs Frida 17.26.1 (2026-11-07, branch frida-real; supersedes everything below)
+
+### Why the earlier comparison was superseded
+
+1. It ran frida **16.5.9** because 17.25.2 "could not instrument this VM". Root cause, now
+   found: Frida 17.25.0 (2026-10-30) added a manual PE mapper that injects the agent without
+   touching the filesystem. To register the agent's static TLS it calls the loader's
+   unexported `LdrpHandleTlsData`/`LdrpReleaseTlsEntry`, which it locates by disassembling
+   ntdll, and those heuristics "only matched recent Windows 11 builds, so mapping any image with
+   static TLS aborted on older systems" (frida-gum commit 4576833, issue #1203). Fixed in
+   **17.26.0** (2026-11-05: "TLS routines are located by behavior instead of by signature").
+   Reproduced side by side on the VM: 17.25.2 aborts in the HOST process (python.exe,
+   `Frida-ERROR **: Unable to locate the ntdll loader TLS routines`), 17.26.1 and 16.5.9
+   attach. Nothing on the VM needed changing (no Windows Update): `pip install frida==17.26.1`
+   in its own venv `C:\work\frida17`; `C:\work\fv16` (16.5.9, used by regress) is untouched. The
+   VM's ntdll is 10.0.19041.6456 (the earlier "unpatched 10.0.19041.2788" was also wrong).
+2. Apples to oranges: UHH logged and delivered every event while Frida only counted; and UHH
+   hooked `probe_app!ReadThunk` while Frida hooked `ntdll!NtReadVirtualMemory`.
+3. Two of its Frida agents were broken, and their failures were reported as Frida's:
+   - "CModule hangs on load": `read_cmodule.js` incremented a CModule global. CModule data is
+     read-only (the docs say writable globals must be `extern`, allocated by JS and passed as
+     symbols), so the first hooked call faulted inside the hook. Re-run under 17.26.1, the target
+     still never completes its reads. Written as documented, CModule is the fastest Frida method.
+   - "Hardware breakpoints mis-count (8 of 16,000)": `read_hwbp.js` tried to step past the
+     breakpoint by setting TF through `context.rflags`, which Frida's context does not have, so
+     each thread counted one hit and never re-armed (8 threads, 8 hits). Done properly (set
+     EFLAGS.RF in the native CONTEXT, below), Frida's hardware breakpoints count exactly and cost
+     5-10x less than UHH's.
+4. "The flag site is a 2-byte `mov [rcx],eax` + ret, too short for any trampoline" was wrong
+   for the current `parse_x64.asm`/`parse_x86.asm` (`mov [rbx],eax; mov eax,1`, 7 bytes).
+   Frida's instruction probe (`Interceptor.attach(address, function)`, assigning
+   `this.context.rax`) hooks it directly. It is installed from `Process.attachModuleObserver`
+   when `configparse.dll` maps, which is Frida 17's equivalent of UHH's pending probe.
+5. "Frida hardware breakpoints are per-thread, with no future-thread arming" was true of 16.5.9
+   only. Frida 17 has `Process.attachThreadObserver` (each new thread is reported synchronously
+   on itself), so per-thread breakpoints cover every thread.
+
+### What was measured
+
+Same VM for both tools (Proxmox VM 103: i5-6600, 4 cores, Windows 10 19045, ntdll
+10.0.19041.6456), Python 3.12.10, frida 17.26.1 / frida-tools 14.13.0, UHH Release build of
+frida-real. 3 repeats per method, interleaved (alternating order), median [min..max]. Timing
+ran only when no other VM job was running (slot log beside the raw rows). x64: 8 threads x
+50,000 reads (400,000 events), churn 8 x 2,000 rounds, hit 200,000 calls. x86 was sized lean on
+the owner's request: 8 x 12,500 reads (100,000 events), churn 8 x 1,000 rounds, 50,000 calls.
+Per-event costs are ratios, so they compare across sizes; wall times do not.
+
+Every Frida method SPAWNS the target (spawn suspended, load the agent, resume), Frida's
+equivalent of UHH's launch. The same 64-bit Python and frida drive the 32-bit targets (frida
+injects its 32-bit agent through its helper). The agents follow the 17.x documentation
+(`bench/frida/README.md` has the details and what each API does):
+
+| method | what it is |
+|---|---|
+| uhh-inline / uhh-hw / uhh-breakpoint | UHH, the same callback source on each backend (hw/breakpoint callbacks run in the controller process, out of the target) |
+| uhh-watch | UHH hardware write watchpoint |
+| frida-js | `Interceptor.attach` with a JavaScript `onEnter`, QuickJS (the default runtime) |
+| frida-js-v8 | the same script under the V8 runtime |
+| frida-cmodule | `Interceptor.attach` with C callbacks (`CModule`, TinyCC) |
+| frida-hw / frida-watch | `Thread#setHardwareBreakpoint` / `setHardwareWatchpoint` on every thread (`Process.attachThreadObserver`) + `Process.setExceptionHandler`; an execute breakpoint is continued by setting EFLAGS.RF in `details.nativeContext` |
+| (no Frida equivalent) | software breakpoints: `Interceptor.breakpointKind` exists only in Frida's Barebone backend |
+
+Workloads (`vs_frida.py`):
+- **count**: `probe_app` (reads enabled by config); one probe at `ntdll!NtReadVirtualMemory`
+  whose callback reads argument 0 and argument 3 and bumps a counter. Exact = callback count ==
+  reads.
+- **gated**: the whole `examples/gated_config`, in each tool. The config ships disabled and the
+  flag is flipped at `configparse.dll!ParseConfig+0x16` by a probe set before the DLL loads.
+  `NtOpenProcess` maps handle -> pid -> name from the real returned handle (name by pid via
+  `NtQuerySystemInformation(SystemProcessIdInformation)`, as UHH does), `NtClose` forgets it,
+  and EVERY `NtReadVirtualMemory` is logged as `read handle=.. pid=.. name=.. addr=.. size=..`
+  with its thread id and delivered to the host process. Frida-js batches text records (4,096
+  per `send()`, plus a 20 ms timer flush). Frida-cmodule writes binary records into a lock-free
+  ring with backpressure (producers wait, nothing is dropped), drained by JS into one binary
+  `send(meta, ArrayBuffer)` per chunk. Both hold the process exit (`recv().wait()` at
+  `RtlExitUserProcess`) until the host has every record. Exact = every workload read has
+  exactly one record with the right pid and name (vs probe_app's own `opened` lines), one flag
+  flip, nothing dropped, nothing extra.
+- **churn**: the same tools on `probe_app --churn --truth` (regress gated-e2e's ground truth):
+  helpers are opened, read and closed over and over from 8 threads, handle values are reused
+  for different pids, and some reads go through duplicated handles the map never saw (these
+  must log pid 0). Exact = per thread, the delivered open/map/read sequence equals the target's
+  own record, in order. Timed by wall clock (the target has no in-process window in this mode).
+- **hit**: `hitcost_target`, one thread calling `hit_site()` N times: the bare per-hit cost of
+  each mechanism with the counting callback, plus write watchpoints on the global it updates.
+
+"Added" = median minus the uninstrumented baseline of the same arch, per event, from the
+target's own `QueryPerformanceCounter` window (the same field for every method).
+
+### Results (VM)
+
+**Correctness: every UHH run and every Frida run except frida-js-v8 was exact**: all
+400,000 / 100,000 calls counted, every record delivered with the right pid and name, per-thread
+churn sequences identical to the target's ground truth, checksums equal to the uninstrumented
+run. Frida-js-v8 crashes the target in gated/churn (see "Frida findings" below; on x86 it was
+left out of the timed gated/churn runs after crashing in the smoke run).
+
+**count**: one probe on `NtReadVirtualMemory`, counting callback (per read)
+
+| method | x64 ns/read | x64 added | x86 ns/read | x86 added | exact |
+|---|---:|---:|---:|---:|---|
+| baseline | 440 [435..442] | -- | 499 [496..541] | -- | 3/3, 3/3 |
+| **uhh-inline** | 592 [554..601] | **+152** (x1.3) | 799 [747..888] | **+300** (x1.6) | 3/3, 3/3 |
+| **frida-cmodule** | 666 [648..684] | **+226** (x1.5) | 856 [706..1,942] | **+357** (x1.7) | 3/3, 3/3 |
+| frida-js (QuickJS) | 7,744 [7,657..8,021] | +7,304 (x17.6) | 7,449 [6,833..8,200] | +6,950 (x14.9) | 3/3, 3/3 |
+| frida-js-v8 | 11,956 [11,143..12,030] | +11,516 (x27.2) | 13,252 [12,613..14,708] | +12,753 (x26.6) | 3/3, 3/3 |
+| **frida-hw** | 23,426 [23,158..23,505] | **+22,986** (x53) | 20,060 [19,654..20,682] | **+19,561** (x40) | 3/3, 3/3 |
+| uhh-hw | 117,861 [115,524..120,578] | +117,420 (x268) | 200,366 [198,912..201,378] | +199,867 (x401) | 3/3, 3/3 |
+| uhh-breakpoint | 76,818 [75,675..79,434] | +76,378 (x175) | 156,342 [149,700..159,626] | +155,842 (x313) | 3/3, 3/3 |
+
+**gated**: the whole example, every read logged and delivered (per read)
+
+| method | x64 ns/read | x64 added | x86 ns/read | x86 added | exact |
+|---|---:|---:|---:|---:|---|
+| baseline | 438 [427..442] | -- | 511 [506..633] | -- | 3/3, 3/3 |
+| **frida-cmodule** | 820 [767..972] | **+383** (x1.9) | 801 [784..966] | **+291** (x1.6) | 3/3, 3/3 |
+| **uhh-inline** | 2,583 [2,406..2,676] | **+2,145** (x5.9) | 3,396 [3,175..3,439] | **+2,885** (x6.7) | 3/3, 3/3 |
+| frida-js (QuickJS) | 15,622 [15,591..15,680] | +15,185 (x36) | 15,453 [15,395..16,055] | +14,942 (x30) | 3/3, 3/3 |
+| frida-js-v8 | -- | -- | -- | -- | 0/3 x64: target crashes; x86 not run (crashed in the smoke run) |
+| uhh-hw | 119,665 [117,644..121,295] | +119,228 (x273) | 216,836 [216,296..219,106] | +216,326 (x425) | 3/3, 3/3 |
+| uhh-breakpoint | 83,891 [83,032..85,039] | +83,453 (x192) | 169,536 [167,466..172,143] | +169,026 (x332) | 3/3, 3/3 |
+
+End-to-end wall time, launch -> last record in the host (median; x64 400,000 reads, x86 100,000):
+frida-cmodule 1.45 s / 0.78 s, uhh-inline 1.79 s / 1.12 s, frida-js 7.04 s / 2.27 s, uhh-breakpoint
+34.2 s / 18.1 s, uhh-hw 48.6 s / 22.4 s. Frida's spawn + inject + agent load took 0.18-0.19 s.
+
+**churn**: exact against the target's own record (wall seconds, launch -> exit)
+
+| method | x64 (8 x 2,000 rounds) | x86 (8 x 1,000 rounds) | exact |
+|---|---:|---:|---|
+| baseline | 0.61 [0.55..0.69] | 0.73 [0.46..0.77] | 3/3, 3/3 |
+| frida-cmodule | 0.93 [0.87..1.00] | 0.88 [0.87..0.89] | 3/3, 3/3 |
+| uhh-inline | 1.03 [1.02..1.10] | 0.86 [0.67..0.98] | 3/3, 3/3 |
+| frida-js | 2.35 [2.17..3.13] | 1.69 [1.60..1.75] | 3/3, 3/3 |
+| uhh-hw | 15.37 [15.33..15.58] | 13.93 [13.86..13.95] | 3/3, 3/3 |
+| uhh-breakpoint | 15.95 [15.71..16.65] | 15.25 [15.19..15.30] | 3/3, 3/3 |
+| frida-js-v8 | target crashes 3/3 | not run | 0/3 |
+
+**hit**: one thread, bare per-hit cost (ns per call)
+
+| method | x64 added | x86 added | exact |
+|---|---:|---:|---|
+| baseline (ns/call) | 3.3 | 6.2 | |
+| **uhh-inline** | **+94** | +396 | 3/3, 3/3 |
+| **frida-cmodule** | +250 | **+274** | 3/3, 3/3 |
+| frida-js (QuickJS) | +1,136 | +1,354 | 3/3, 3/3 |
+| frida-js-v8 | +1,791 | +2,427 | 3/3, 3/3 |
+| **frida-hw** (execute breakpoint) | **+22,901** | **+47,244** | 3/3, 3/3 |
+| uhh-hw | +143,772 | +216,645 | 3/3, 3/3 |
+| uhh-breakpoint | +88,640 | +164,915 | 3/3, 3/3 |
+| **frida-watch** (write watchpoint) | **+20,896** | **+43,090** | 3/3, 3/3 |
+| uhh-watch | +136,964 | +214,103 | 3/3, 3/3 |
+
+### Where each tool wins
+
+- **Raw inline hook, native callback (count, hit): UHH is ahead.** On x64 it adds 152 ns
+  per read vs 226 ns for Frida CModule, and 94 vs 250 ns per call in the single-thread loop.
+  On x86 it adds 300 vs 357 ns per read, but the single-thread x86 loop is the exception: UHH
+  adds 396 ns per call, Frida CModule 274 ns. Both are 30-80x cheaper than Frida's JavaScript
+  callbacks.
+- **The full gated example (log every read and deliver it): Frida CModule wins clearly.** It
+  adds 383 ns/read vs UHH inline's 2,145 (x64), and 291 vs 2,885 (x86): 5.6x and 9.9x less. It
+  is also faster end to end (1.45 s vs 1.79 s for 400,000 records). The difference is UHH's
+  per-record cost: the same inline hook costs +152 ns when counting and +2,145 ns when it logs,
+  so about 2 us per record goes into formatting the text record and delivering it through
+  UHH's log pipeline. Frida CModule writes a fixed-size binary record into a ring (with
+  backpressure: on x64 the producers waited 534-6,579 times per run, and nothing was dropped)
+  and ships 65,536 records per `send()`. **This is the main thing UHH can learn from Frida
+  here** (see "For UHH" below).
+- **Frida JavaScript callbacks are 5-7x slower than UHH inline on the gated example** (+15.2 us
+  vs +2.1 us per read) and 30-50x slower on raw hooks. All JS callbacks run under one runtime
+  lock, so 8 threads' hooks are serialized. V8 (JIT) is SLOWER than QuickJS here (+11.5 vs
+  +7.3 us): the cost is the native-to-JS transition, not the script's work.
+- **Hardware breakpoints and watchpoints: Frida is 4.6-10x cheaper than UHH.** x64 hit: +22.9
+  vs +143.8 us (execute) and +20.9 vs +137.0 us (write watch); count with 8 threads: +23.0 vs
+  +117.4 us (x64) and +19.6 vs +199.9 us (x86). Frida handles the trap in-process, in the target's own exception dispatch, on the
+  thread that hit it. UHH's hw and breakpoint callbacks run in the controller (an out-of-process
+  debugger): every hit is a debug event, two context switches and a serialized debugger
+  loop. That is UHH's design (the callback runs outside the target, sees the target stopped and
+  never runs on the target's stack). It is also the reason those backends cost what they do.
+- **Software breakpoints**: only UHH has them on a local Windows process (+76-88 us per hit on
+  x64). UHH's breakpoint backend is also faster than its own hw backend.
+- **Same callback, any backend**: UHH runs one callback source unchanged on inline / hw /
+  breakpoint. In Frida each mechanism is a different programming model: JS `onEnter`, C with
+  TinyCC's restrictions (read-only data, no `snprintf`, `extern` state passed in from JS), or a
+  process-wide exception handler that decodes registers itself and must set EFLAGS.RF in the raw
+  CONTEXT.
+
+### Frida findings (things a Frida user must know; all reproduced on the VM)
+
+1. **V8 + a JS hook on `ntdll!NtClose` crashes the target.** An EMPTY `onEnter` on `NtClose`
+   under `runtime='v8'` kills probe_app with an access violation in Frida's (manually mapped,
+   "unknown") module, 3/3 on the plain workload and 2/3 on churn. QuickJS is fine 3/3, and V8
+   with a hook on `NtOpenProcess` is fine 3/3. Probable cause: V8's own threads close handles
+   and re-enter the runtime through the hook. Bisected with `gated_js.js`: removing only the
+   NtClose hook makes V8 survive 3/3.
+2. **Frida's own memory reads show up in your hook.** Since 17.25 its module registry handles
+   every DLL load on the loading thread and reads the process's own memory through
+   `K32GetModuleInformation` / `GetModuleFileNameExW` -> `ReadProcessMemory(-1)` ->
+   `NtReadVirtualMemory`: about 150 calls per DLL load (148 on x64, 152 on x86, at the
+   `configparse.dll` load), all from cloaked (Frida) return addresses. A tracer that logs every
+   `NtReadVirtualMemory` records them as the program's reads unless it filters them. The
+   agents skip a self-read (handle -1) when a cloaked address (`Cloak.hasRangeContaining`) is
+   among the nearest stack words. UHH's agent does not show up this way (0 foreign records in
+   every run).
+3. **A `NativeFunction` call releases the JS lock** (default `scheduling: 'cooperative'`), so
+   another thread's JS callback can run during it. A first version of `gated_js.js` shared one
+   buffer for the image-name query, and under churn some opens got the name `?` (caught by the
+   exact judge, 0/3). Fixed with per-call buffers and re-run: 3/3. JS-callback state is not as
+   "single-threaded" as the runtime lock suggests.
+4. Defender blocks Frida 17's `idund` helper on the VM (`Unable to start idund: error 225`,
+   ERROR_VIRUS_INFECTED). It is the Apple-device daemon and is harmless for local
+   instrumentation.
+
+### For UHH (from this comparison; no library code was changed)
+
+- The log path costs about 2 us per record on top of a 0.15 us hook, and it dominates the
+  flagship example. Frida's CModule design suggests what would help: fixed-size binary records
+  written straight into a shared ring with backpressure, text formatting moved to the
+  controller/host, and large batches per transfer.
+- The hw/breakpoint per-hit cost (77-217 us) is the price of out-of-process callbacks. An
+  in-process (VEH) fast path for hw probes would be about 5x cheaper, as Frida shows, but it
+  would give up running the callback outside the target.
+
+### CI (GitHub-hosted windows-2022 / windows-2025, fresh patched images)
+
+`.github/workflows/bench-frida.yml` installs `frida==17.26.1` from PyPI and runs the same script
+(lean sizes) on windows-2022 and windows-2025, x64 and x86. Shared runners are noisy, so read
+those times as indicative only; the correctness columns are exact anywhere.
+
+Run 42334193289 (commit f4a2348, x64 and x86 at the full VM sizes: 400,000 reads, 2,000 churn
+rounds, 200,000 calls, 3 repeats). Runners have 2 cores / 4 logical processors (AMD EPYC):
+windows-2022 is Server 2022 10.0.20348 (ntdll 10.0.20348.5756), windows-2025 is Server 2025
+10.0.26100 (ntdll 10.0.26100.33648). frida 17.26.1 installed from PyPI and worked on all four.
+Added cost per event, median of 3:
+
+| | 2022 x64 | 2022 x86 | 2025 x64 | 2025 x86 |
+|---|---:|---:|---:|---:|
+| count uhh-inline | +55 | +250 | +114 | +263 |
+| count frida-cmodule | +129 | +166 | +159 | +182 |
+| count frida-js | +1,057 | +1,941 | +1,430 | +1,579 |
+| count frida-js-v8 | +6,334 | +13,267 | +9,218 | +11,178 |
+| count frida-hw | +22,113 | +46,903 | +22,721 | +36,132 |
+| count uhh-hw | +109,165 | +241,064 | +118,887 | +168,236 |
+| count uhh-breakpoint | +80,225 | +199,993 | +91,240 | +133,896 |
+| gated frida-cmodule | +385 | +508 | +433 | +322 |
+| gated uhh-inline | +786 | +3,139 | +984 | +2,563 |
+| gated frida-js | +4,767 | +13,991 | +6,330 | +6,173 |
+| hit uhh-inline (ns/call) | +57 | +552 | +68 | +493 |
+| hit frida-cmodule | +215 | +334 | +241 | +266 |
+| hit frida-hw / uhh-hw | +38,172 / +130,432 | +92,792 / +271,893 | +38,208 / +136,896 | +76,109 / +184,638 |
+| hit frida-watch / uhh-watch | +38,598 / +123,751 | +89,461 / +271,483 | +36,887 / +136,327 | +74,371 / +184,503 |
+
+Correctness on CI: every UHH run exact (count, gated, churn, hit; all four images/arches) and
+every frida-cmodule / frida-hw / frida-watch run exact. Frida-js-v8 crashed the target in
+gated and churn, 3/3 on all four, so the V8 + `NtClose` crash is not specific to the VM.
+Frida-js churn was 0/3 there because of the shared-buffer bug in my first `gated_js.js`
+(Frida finding 3; fixed in f7aa0ad). The CI ranking agrees with the VM's, with two
+differences. On these 2-core runners Frida's JS count is much cheaper (+1.1-1.9 us vs +7.3 us
+on the 4-core VM), probably because 8 threads contend less for the one JS runtime lock. And UHH
+inline's gated cost on x64 is lower (+0.8-1.0 us vs +2.1 us). Frida CModule still beats it
+2-2.6x on x64 and 5-8x on x86.
+
+### Files
+
+`bench/frida/vs_frida.py` (driver and judges), `bench/frida/agents/*.js` (Frida agents),
+`bench/frida/uhh_count.cpp` + `uhh_count_callbacks.cpp` (UHH count tool), `bench/frida/tables.py`
+(tables from the rows), `bench/results/frida17-2026-11-07/vm-x64.jsonl`, `vm-x86.jsonl` (every
+run), `vm-x64-superseded-churn-frida-js.jsonl` (the 3 churn runs of the buggy first gated_js,
+kept for the record), `slots-*.occ` (proof the VM was quiet).
+
+---
+
+# Superseded: earlier comparisons (frida 16.5.9, count-only Frida agents)
+
+The sections below are the earlier comparison, kept for history. Their Frida numbers come from
+frida 16.5.9 with count-only Frida agents, two of which were broken. Read the section above
+instead.
 
 ## 2026-11-07 re-run (merge-frida 034b245; full gated_config on branch `perf` 74d62a5)
 
@@ -208,6 +481,8 @@ correct under heavy multithreading at volume on all three backends.
   worker threads before they start their read loop without racing.
 
 ## Finding: Frida 17.25.2 cannot instrument this VM
+
+(Superseded: root-caused in the section at the top. It was a Frida 17.25 bug, fixed in 17.26.0.)
 
 Both `frida.spawn()` and `frida.attach()` abort with the fatal gum error **"Unable
 to locate the ntdll loader TLS routines"** on Windows 10 19045 (ntdll
