@@ -783,7 +783,14 @@ static bool write_log_batch(probe_session *s, const std::string &bytes, uint64_t
 }
 
 static void log_writer_main(probe_session *s) {
-    constexpr size_t BATCH_BYTES = 64 * 1024;
+    // Bytes per write (stdout and the session file get the same batch). Bench knob, not API:
+    // UHH_BENCH_LOG_BATCH_KB.
+    static const size_t BATCH_BYTES = [] {
+        char v[16] = {};
+        const DWORD n = GetEnvironmentVariableA("UHH_BENCH_LOG_BATCH_KB", v, sizeof(v));
+        const unsigned long kb = n && n < sizeof(v) ? std::strtoul(v, nullptr, 10) : 0;
+        return kb >= 4 && kb <= 16384 ? (size_t)kb * 1024 : (size_t)64 * 1024;
+    }();
     uint64_t unwritten = 0;
     try {
         std::string batch;
