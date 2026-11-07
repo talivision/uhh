@@ -10624,6 +10624,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
     s->dr_used |= (uint8_t)(1u << slot);                               // reserved: no probe arms it meanwhile
     s->dr_ever |= (uint8_t)(1u << slot);                               // ours: detach / the guard clear it too
     s->in_call_tid = st->tid; s->co_addr = probe->address; s->co_sp = c->hit_sp; s->co_ret = ret_addr; s->co_exc_sp = 0;
+        warn_record(c, probe, "call_original refused: needs one free debug register (all 4 in use)");
     s->co_borrowed_slot = borrowed ? slot : -1;
     s->co_entry_pending = !(probe->flags & PROBE_HW); s->co_left = false;
     // Mirrored BEFORE the thread runs with it (the slot) -- and the thread off the guard's list

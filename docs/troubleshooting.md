@@ -93,7 +93,7 @@ First steps for any problem:
 | `probe: warning: callback for <loc> raised 0x...; abandoned (hit counted, no register changes applied)` | the callback faulted or threw (often: dereferencing a target pointer on breakpoint/hw) | read target memory with `get_mem`; inline the program's vectored handlers saw the exception too |
 | Log text `[unformattable] <format>` | `%s` of a target pointer in a breakpoint/hw callback, `%n`, or a faulting argument | `get_mem` strings into a local buffer first ([limitations.md](limitations.md#formatting-target-strings)) |
 | `uhh warning: call_original refused: not at a function entry ([SP] is no return address)` | the probe is not on the function's first instruction (or after a `push`) | probe the entry; the original has not run, let the hit fall through |
-| `call_original refused: needs one free debug register (all 4 in use)` | breakpoint/hw `call_original` needs a debug register for the call | at most 3 hw probes, or put the probe itself on hw (it lends its own slot), or inline |
+| `uhh warning: call_original refused: needs one free debug register (all 4 in use)` | breakpoint/hw `call_original` needs a debug register for the call | at most 3 hw probes, or put the probe itself on hw (it lends its own slot), or inline |
 | `call_original refused: nargs must be 0..16` | `nargs` out of range | - |
 | `call_original without return_from -- the original runs again on fall-through` | the callback called the original but did not `return_from` | add `return_from(c, ret, nargs)` |
 | `return_from nargs=N but the original popped M bytes (ret M); the original's count is used` | wrong x86 `nargs` for the convention | pass the stack slots the callee pops ([api.md](api.md#callback-functions)) |

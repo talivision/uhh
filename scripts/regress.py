@@ -1617,8 +1617,9 @@ def co_expect(case, base, x86):
         hits = {"co_jump": 10, "co_after": 3}; logs = {"co jump": 10, "co jump-done": 5, "co after": 3}
     elif case == "threads":
         hits = {"co_add": 4800}; logs = {"co add": 4800, "co add-done": 4800}
-    elif case == "mid":
-        hits = {"CoMidPush+0x1": 5}; logs = {"co mid ok=0": 5}
+    elif case == "mid":   # call_original and return_from both refused: ONE warning record per probe
+        hits = {"CoMidPush+0x1": 5}
+        logs = {"co mid ok=0": 5, "uhh warning: call_original refused: not at a function entry ([SP] is no return address)": 1}
     elif case == "nargs":
         row["sum"] = base["sum"] + 20 * 1000
         hits = {"co_add": 20}; logs = {"co nargs": 20, "co nargs-done": 20}
@@ -1650,7 +1651,12 @@ def check_callorig_hunt():
     thiscall and x64 8 args; a probe at the return-to address; return_from over a callee-
     saved prologue; a probe inside the original (same backend: counted, no callback; another
     backend: fires); detach and Ctrl+Break while call_original is in flight. Each run's target
-    row is compared with the uninstrumented run; hits and "co" logs are exact; nothing dropped."""
+    row is compared with the uninstrumented run; hits, "co" logs and "uhh warning" records are
+    exact (a warning is one record per probe on every backend); nothing dropped.
+    callorig-hunt-warn-dr-breakpoint: four hw probes take every debug register, so call_original
+    from two breakpoint probes is refused ("needs one free debug register"): exactly one
+    "uhh warning" record per probe, like every other call_original warning (it used to be one
+    stderr line per session and no record)."""
     d, t = exe("co_driver.exe"), exe("co_target.exe")
     if not d or not t:
         return missing_bin("callorig-hunt", "co_driver/co_target")
@@ -1663,7 +1669,7 @@ def check_callorig_hunt():
         cnt = {}
         for x in objs:
             m = str(x.get("message", ""))
-            if x.get("kind") == "probe_log" and m.startswith("co "):
+            if x.get("kind") == "probe_log" and m.startswith(("co ", "uhh warning")):
                 cnt[m] = cnt.get(m, 0) + 1
         return cnt
 
@@ -1707,6 +1713,22 @@ def check_callorig_hunt():
         except Exception as e:
             record(name, False, repr(e))
     # Detach (probe_close from another thread) and Ctrl+Break while call_original is in flight:
+    name = "callorig-hunt-warn-dr-breakpoint"
+    try:
+        r, o = run([d, "--backend", "breakpoint", "--case", "drfull", "--", t, "nested"], timeout=300)
+        dr_warn = "uhh warning: call_original refused: needs one free debug register (all 4 in use)"
+        want_logs = {"co outer": 6, "co outer refused": 6, "co innerco": 6, "co innerco refused": 6, dr_warn: 2}
+        row, logs, hb, rep = co_row(o), co_logs(o), hits_by(o), report(o)
+        want = dict(bases["nested"])                # refused: the hits fall through, the program as uninstrumented
+        recs = [x for x in o if x.get("kind") == "probe_log" and x.get("message") == dr_warn]
+        per_probe = sorted(str(x.get("probe", x.get("location", x.get("site", "?")))) for x in recs)
+        ok = (bool(want) and row == want and logs == want_logs and hb.get("co_outer") == 6 and hb.get("co_inner") == 6
+              and len(set(per_probe)) == 2 and rep.get("log_dropped") == 0 and rep.get("error") is None
+              and rep.get("app_exit") == 0 and r.returncode == 0)
+        record(name, ok, f"row={row} want={want} logs={logs} hits={hb} warn_probes={per_probe} "
+                         f"dropped={rep.get('log_dropped')} err={rep.get('error')} rc={r.returncode}")
+    except Exception as e:
+        record(name, False, repr(e))
     # the attached target finishes every call correctly, unhooked from then on.
     import signal
     for bk in ("breakpoint", "hw", "inline"):

@@ -429,9 +429,9 @@ ran; `*ret` receives the integer return register (x64 RAX; x86 EAX zero-extended
 - **Breakpoint/hw:** the original runs in place on the hit's own stack; a debug register on
   that thread catches its return. That needs one of the 4 debug registers for the call: a
   free one, or, when the hit is itself a hw execute probe, its own slot (a recursive entry
-  on that thread during the call then goes uncounted). Otherwise it is refused
-  (`call_original refused: needs one free debug register (all 4 in use)`). Other threads'
-  hits wait until the call ends.
+  on that thread during the call then goes uncounted). Otherwise it is refused (0, warned
+  once per probe: `uhh warning: call_original refused: needs one free debug register (all 4
+  in use)`). Other threads' hits wait until the call ends.
 - Refused (returns 0, warned once per probe) when the hit is not at a function entry
   (`[SP]` is not a return address, e.g. a probe after a `push`). On 0 the original has
   **not** run: do not `return_from`; let the hit fall through.
@@ -479,9 +479,9 @@ return_from(c, status, 11);                    // the caller sees the real statu
 ```
 
 Warnings about `call_original` / `return_from` go into the log as a `uhh warning: ...`
-record, once per probe, on every backend; breakpoint/hw also print them on stderr
-(`probe: warning: <location>: ...`). The breakpoint/hw refusal for want of a debug register
-is a stderr line only.
+record, once per probe (the probe's first such warning), on every backend -- the
+breakpoint/hw refusal for want of a debug register included; breakpoint/hw also print them on
+stderr (`probe: warning: <location>: ...`, the first of each kind per session).
 
 ### `probe_session *get_session(probe_context *c)`
 

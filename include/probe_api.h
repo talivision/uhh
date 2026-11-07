@@ -254,7 +254,7 @@ int call_func(probe_context *, const char *symbol, uint64_t *ret, int nargs, ...
    and a debug register set on that thread only catches its return (needs one of the 4
    debug registers for the duration of the call: a free one, or -- when the hit is itself a
    hw execute probe -- its own, lent on that thread (a recursive entry on that thread during
-   the call then goes uncounted); refused -- 0, one warning -- otherwise). Probes hit INSIDE the original: those of the same kind (inline inside an
+   the call then goes uncounted); refused -- 0, warned once per probe -- otherwise). Probes hit INSIDE the original: those of the same kind (inline inside an
    inline call; breakpoint/hw inside a breakpoint/hw call) -- this one included, for a
    recursive function -- count their hits but run no callback; probes of the other kind fire
    normally. On breakpoint/hw other threads' hits wait until the call ends.
