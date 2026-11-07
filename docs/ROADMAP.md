@@ -2014,7 +2014,7 @@ claim batching or a binary record formatted by the controller -- both change the
 
 Correctness (perf4): VM `--only logs,stdout,crash_logs,stream,gated,conformance,portability,transparency,
 edgehunt,cxlib,carry,hunt` on 3f97146: x64 498/498 (1 n/a), x86 494/494; x86 `conformance,transparency,
-edgehunt,cxlib,gated,portability` on c2edf28 337/337; CI full suite 2079/2079 (7113233) and 2078/2079
+edgehunt,cxlib,gated,portability` on c2edf28 337/337; CI full suite 2079/2079 on c2edf28 and 7113233, 2078/2079
 (3f97146, only `patch-race-unsafe`). New checks: `transparency-*-fpu` (7 modes now), MXCSR at the
 mid-function site, `stream-latency-inline-wake`.
 
