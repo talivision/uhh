@@ -1,0 +1,85 @@
+# UHH vs current Frida (bench/frida/vs_frida.py) on fresh, patched GitHub-hosted Windows images.
+# A second data point next to the VM's: the images are noisy shared runners, so read the TIMES as
+# indicative only; the correctness columns (exact counts, every record delivered) are exact anywhere.
+# Results: one ::notice:: per workload (python3 ~/work/uhh-tools/fan/work/ci/gh.py notes <run> bench)
+# and the raw rows as an artifact.
+name: bench-frida
+
+on:
+  push:
+    branches: ['frida-real']
+    paths:
+      - 'bench/frida/**'
+      - '.github/workflows/bench-frida.yml'
+  workflow_dispatch:
+    inputs:
+      frida:
+        description: 'frida version from PyPI'
+        default: '17.26.1'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [windows-2022, windows-2025]
+        arch: [x64, x86]
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install frida
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "frida==${{ inputs.frida || '17.26.1' }}" frida-tools
+          python -c "import frida; print('frida', frida.__version__)"
+      - name: Build the bench targets
+        shell: pwsh
+        run: |
+          $platform = @{ x64 = 'x64'; x86 = 'Win32' }['${{ matrix.arch }}']
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -version '[17.0,18.0)' -property installationPath
+          if ($vs) { cmake -S . -B build-${{ matrix.arch }} -G "Visual Studio 17 2022" -A $platform }
+          else { cmake -S . -B build-${{ matrix.arch }} -A $platform }
+          cmake --build build-${{ matrix.arch }} --config Release --parallel --target probe_app configparse gated_config uhh_count hitcost_target probe_api_agent
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Runner facts
+        shell: pwsh
+        run: |
+          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+          $os = Get-CimInstance Win32_OperatingSystem
+          $nt = (Get-Item C:\Windows\System32\ntdll.dll).VersionInfo
+          $facts = "cpu=$($cpu.Name.Trim()) cores=$($cpu.NumberOfCores) lp=$($cpu.NumberOfLogicalProcessors) ram=$([math]::Round($os.TotalVisibleMemorySize/1MB,1))GB os=$($os.Caption) $($os.Version) ntdll=$($nt.FileMajorPart).$($nt.FileMinorPart).$($nt.FileBuildPart).$($nt.FilePrivatePart)"
+          Write-Output "::notice title=bench runner ${{ matrix.image }} ${{ matrix.arch }}::$facts"
+      - name: vs_frida (count, gated, churn, hit)
+        shell: pwsh
+        run: |
+          # Lean sizes (per-event cost is a ratio; 100k events per run is plenty). frida-js-v8 is left
+          # out of gated/churn: an Interceptor JS hook on ntdll!NtClose crashes the target under V8
+          # (BENCHMARKS.md), shown on the VM.
+          python -u bench/frida/vs_frida.py --rel build-${{ matrix.arch }}/Release --arch ${{ matrix.arch }} `
+            --repeats 3 --threads 8 --reads 12500 --rounds 1000 --calls 50000 --workloads count,hit `
+            --tag "${{ matrix.image }}" --out rows-${{ matrix.image }}-${{ matrix.arch }}.jsonl 2>&1 | Tee-Object -FilePath vs.log
+          python -u bench/frida/vs_frida.py --rel build-${{ matrix.arch }}/Release --arch ${{ matrix.arch }} `
+            --repeats 3 --threads 8 --reads 12500 --rounds 1000 --calls 50000 --workloads gated,churn --skip frida-js-v8 `
+            --tag "${{ matrix.image }}" --out rows-${{ matrix.image }}-${{ matrix.arch }}.jsonl 2>&1 | Tee-Object -Append -FilePath vs.log
+          $sum = Get-Content vs.log | Select-String -Pattern '^  (count|gated|churn|hit) ' | % { "$_".Trim() }
+          foreach ($w in 'count','gated','churn','hit') {
+            $lines = $sum | Where-Object { $_ -like "$w *" }
+            if ($lines) { Write-Output ("::notice title=bench ${{ matrix.image }} ${{ matrix.arch }} $w::" + ($lines -join ' %0A ')) }
+          }
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: bench-frida-${{ matrix.image }}-${{ matrix.arch }}
+          path: |
+            rows-*.jsonl
+            vs.log
+          retention-days: 14

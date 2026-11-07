@@ -11,6 +11,8 @@ on:
       - '!**.md'
       - 'docs/quickstart.md'          # check_quickstart compares it with examples/quickstart
       - '!measurements/**'
+      - '!bench/frida/**'                # Frida comparison scripts: workflow bench-frida.yml
+      - '!.github/workflows/bench-frida.yml'
   pull_request:
   workflow_dispatch:
     inputs:
