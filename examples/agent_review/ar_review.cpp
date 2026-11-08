@@ -164,6 +164,11 @@ int ar_review_case(const char *k) {
         int cp[4]; __cpuid(cp, 1);
         const uint64_t enabled = (cp[2] & (1 << 27)) ? _xgetbv(0) : 0;
         const uint64_t mask = (enabled & 6) == 6 ? (4ull | ((enabled & 0xE0) == 0xE0 ? 0xE0ull : 0)) : 0;
+#if defined(_WIN64)
+        const uint64_t state_mask = mask | 2ull;         // XMM/MXCSR are restored by the stub/agent
+#else
+        const uint64_t state_mask = mask | 3ull;         // also exercise newly activated x87
+#endif
         int clean = 1, bad_phase = -1;
 #if defined(_WIN64)
         const int checks = !mask ? 0 : (mask & 0x20) ? 5 : 2;
@@ -173,6 +178,7 @@ int ar_review_case(const char *k) {
         for (int phase = 0; phase < checks; ++phase) {
             alignas(64) unsigned char area[4096] = {}, before[4096] = {};
             *(unsigned int *)(area + 24) = _mm_getcsr();
+            if (phase == 1) *(unsigned int *)(area + 24) ^= 0x4000u; // non-INIT MXCSR must survive too
             // 0: all INIT (no-save/x86 FX path). 1: live YMM (ordinary save path).
             // 2: live opmasks, INIT YMM: adding component 2 before saved component 5
             // must NOT change the offsets of the XSAVEC image being restored.
@@ -187,15 +193,30 @@ int ar_review_case(const char *k) {
                 for (int j = 0; j < cp[0]; ++j) area[cp[1] + j] = (unsigned char)(0x50 + phase);
             }
 #if defined(_WIN64)
-            _xrstor64(area, mask);
-            _xsave64(before, mask);                       // canonical baseline, including INIT bits
+            _xrstor64(area, state_mask);
+            _xsave64(before, state_mask);                 // canonical baseline, including INIT bits
             ar_vector_site();
-            _xsave64(area, mask);
+            _xsave64(area, state_mask);
 #else
-            _xrstor(area, mask);
-            _xsave(before, mask);
+            _xrstor(area, state_mask);
+            _xsave(before, state_mask);
             ar_vector_site();
-            _xsave(area, mask);
+            _xsave(area, state_mask);
+#endif
+            if (memcmp(area + 24, before + 24, 4) ||
+                memcmp(area + 160, before + 160, sizeof(void *) == 8 ? 256 : 128)) {
+                clean = 0; bad_phase = phase;
+            }
+#if !defined(_WIN64)
+            // Ignore reserved FXSAVE padding; check FCW/FSW/FTW, pointers/opcode and
+            // all physical data registers, including those tagged empty after INIT.
+            if (memcmp(area, before, 5) || memcmp(area + 6, before + 6, 18)) {
+                clean = 0; bad_phase = phase;
+            }
+            for (int reg = 0; reg < 8; ++reg)
+                if (memcmp(area + 32 + reg * 16, before + 32 + reg * 16, 10)) {
+                    clean = 0; bad_phase = phase;
+                }
 #endif
             const uint64_t bv = *(uint64_t *)(area + 512), prior = *(uint64_t *)(before + 512);
             for (int i : {2, 5, 6, 7}) {

@@ -185,9 +185,26 @@ AR_CB void ar_on_vector(probe_context *c) {
     if (!(cp[2] & (1 << 27))) return;
     const uint64_t enabled = _xgetbv(0);
     if ((enabled & 6) != 6) return;
-    const uint64_t mask = 4ull | ((enabled & 0xE0) == 0xE0 ? 0x20ull : 0);
+    uint64_t mask = 6ull | ((enabled & 0xE0) == 0xE0 ? 0x20ull : 0);
     alignas(64) unsigned char area[4096] = {};
-    *(unsigned int *)(area + 24) = _mm_getcsr();
+#if defined(_WIN64)
+    _fxsave64(area);                                    // preserve ABI-nonvolatile XMM6..15
+#else
+    _fxsave(area);
+    mask |= 1ull;
+    *(unsigned short *)(area + 0) = 0x027F;
+    *(unsigned short *)(area + 2) = 0;
+    area[4] = 1;                                       // dirty ST0 as well as the control word
+    *(uint64_t *)(area + 32) = 0x8000000000000000ull;
+    *(unsigned short *)(area + 40) = 0x3FFF;
+#endif
+    *(unsigned int *)(area + 24) = _mm_getcsr() ^ 0x2000u;
+#if defined(_WIN64)
+    const int xmm_count = 6;
+#else
+    const int xmm_count = 8;
+#endif
+    for (int j = 0; j < xmm_count * 16; ++j) area[160 + j] = 0xA5;
     *(uint64_t *)(area + 512) = mask;
     for (int i : {2, 5}) {
         if (!(mask & (1ull << i))) continue;

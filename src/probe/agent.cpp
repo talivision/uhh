@@ -1717,7 +1717,7 @@ static volatile LONG g_stopping;
 // callbacks_interrupted (probe_agent_stripe).
 // A callback ended (returned, or was unwound past): it no longer runs, and its unaccounted
 // unit goes -- unless its first log already carried it (probe_agent_stripe).
-static void restore_hit_guarantee(HitScope *h);
+static __forceinline void restore_hit_guarantee(HitScope *h);
 static __forceinline void hit_settle(const HitAcct &a, bool logged) {
     // The controller reuses a channel only after running==0; live callbacks get a separate
     // channel on reattach. No epoch read is needed here, and running is the LAST store.
@@ -1835,7 +1835,7 @@ static inline volatile ULONG *teb_stack_guarantee() { return (volatile ULONG *)(
 #else
 static inline volatile ULONG *teb_stack_guarantee() { return (volatile ULONG *)((unsigned char *)NtCurrentTeb() + 0xF78); }
 #endif
-static void restore_hit_guarantee(HitScope *h) {
+static __forceinline void restore_hit_guarantee(HitScope *h) {
     if (h->guarantee_saved) {
         *teb_stack_guarantee() = h->program_guarantee;
         h->guarantee_saved = false;
@@ -2092,16 +2092,44 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
 // All-zero STANDARD image for components whose architectural initial state is requested.
 // It is immutable and shared by hits; no per-hit frame/header clear or XCOMP_BV modification.
 // AVX's MXCSR dependency is avoided by handling YMM/ZMM0..15 uppers with VZEROUPPER first.
+// SSE is deliberately absent from avx_mask: the hook stub restores every XMM register.
+// XINUSE[1] is not a portable test for MXCSR's value (SDM Vol. 1, 13.6/13.8);
+// MXCSR is saved/restored separately even when SSE reports INIT, never forced to 1F80.
 alignas(64) static const unsigned char g_init_xstate[4096] = {};
 static __declspec(noinline) void init_new_uppers() {
     // Isolate AVX code from callers that must also run on CPUs without AVX.
     _mm256_zeroupper();
 }
+#if !defined(_WIN64)
+static __declspec(noinline) void init_new_x87() {
+    // SDM Vol. 1, 13.6: INIT includes zero data registers, not just empty tags.
+    // FNINIT alone leaves their physical contents intact. Clear all eight, then
+    // reset TOP/tags/pointers and FCW=037F (not the Windows default of 027F).
+    __asm {
+        fninit
+        fldz
+        fldz
+        fldz
+        fldz
+        fldz
+        fldz
+        fldz
+        fldz
+        fninit
+    }
+}
+#endif
 static __forceinline void restore_new_xstate(uint64_t saved) {
     const uint64_t missing = g_xs.avx_mask & ~saved;
     if (!missing || !g_xs.xinuse) return;
     uint64_t added = _xgetbv(1) & missing;
     if (!added) return;
+#if !defined(_WIN64)
+    if (added & 1ull) {
+        init_new_x87();
+        added &= ~1ull;
+    }
+#endif
     if (added & 0x44ull) {
         // Collateral zeroing of an originally live ZMM upper is undone by the saved-image
         // restore immediately afterwards. An unsaved upper was INIT and must stay zero.

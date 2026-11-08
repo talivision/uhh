@@ -8209,6 +8209,7 @@ def check_agent_safety():
             if case == "guarantee" and row.get("before") != row.get("after"): bad.append(f"guarantee changed: {row}")
             detail = str(row)
             if case == "vector":
+                if row.get("avx"): detail += "; XMM + INIT/non-INIT MXCSR checked; " + ("x87 INIT checked" if pe_is_x86(t) else "x87 uses existing x64 policy")
                 detail += "; " + ("INIT + live YMM checked" if row.get("avx") else "AVX skipped: CPU/OS support absent")
                 detail += "; " + ("mixed INIT/live opmask + YMM/ZMM checked" if row.get("opmask") else "AVX-512 skipped: CPU/OS support absent")
             record(name, not bad, "; ".join(bad) or detail)
