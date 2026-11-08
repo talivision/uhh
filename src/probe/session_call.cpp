@@ -119,13 +119,23 @@ bool defer_hits_now(const probe_session *s, DWORD tid) {
 // The held data-watch hits (hold_watch_hit), once no call is in flight and no callback is
 // running (only from a loop on the debug thread's own fiber): each event is handled again,
 // on a fiber, with the thread stopped by our suspension instead of by the event.
+static void drop_held_watch(probe_session *s, const probe_session::WatchHeld &h) {
+    for (Probe *p : h.probes) if (p) { ++p->hits; s->controller_dropped.fetch_add(1, std::memory_order_relaxed); }
+}
 static void replay_held_watches(probe_session *s) {
     while (!s->watch_deferred.empty() && s->calls.empty() && !s->in_call_tid && !s->cur_fiber) {
         probe_session::WatchHeld h = s->watch_deferred.front();
-        s->watch_deferred.erase(s->watch_deferred.begin());
-        if (s->exited) { CloseHandle(h.thread); continue; }
+        if (s->exited) { drop_held_watch(s, h); s->watch_deferred.erase(s->watch_deferred.begin()); CloseHandle(h.thread); continue; }
+#if defined(UHH_TEST_HOOKS)
+        static bool failed = false;
+        const bool fail = !failed && std::getenv("UHH_TEST_WATCH_FIBER_FAIL");
+        if (fail) { failed = true; std::fprintf(stderr, "probe: test: watch fiber denied\n"); }
+        EventFiber *f = fail ? nullptr : fiber_get(s);
+#else
         EventFiber *f = fiber_get(s);
-        if (!f) { ResumeThread(h.thread); CloseHandle(h.thread); continue; }   // (no fiber: the hit is dropped)
+#endif
+        if (!f) break;                          // retain the hit and its suspension for the next poll
+        s->watch_deferred.erase(s->watch_deferred.begin());
         f->ev = h.ev; f->resume_after = h.thread; f->stop_suspended = true;
         fiber_step(s, f, nullptr);
     }
@@ -162,7 +172,7 @@ void finish_calls(probe_session *s) {
     s->calls_closing = false;
     if (!s->exited) release_deferred(s);
     replay_held_watches(s);
-    for (auto &h : s->watch_deferred) { ResumeThread(h.thread); CloseHandle(h.thread); }   // (not on the main fiber)
+    for (auto &h : s->watch_deferred) { drop_held_watch(s, h); ResumeThread(h.thread); CloseHandle(h.thread); }   // (not on the main fiber)
     s->watch_deferred.clear();
 }
 
@@ -374,12 +384,14 @@ static void resume_deferred_hits(probe_session *s) {
 // target's own slots, no execute probe sharing it).
 bool hold_watch_hit(probe_session *s, const DEBUG_EVENT &event, const CONTEXT &native, uint8_t theirs) {
     const DWORD64 fired = native.Dr6 & 0xF;
+    probe_session::WatchHeld held; held.ev = event;
     if (!fired || (fired & theirs)) return false;
     for (int slot = 0; slot < 4; ++slot) {
         if (!(fired & (1u << slot))) continue;
-        const Probe *p = nullptr;
+        Probe *p = nullptr;
         for (auto &q : s->probes) if (q->active && (q->flags & PROBE_HW) && q->dr_slot == slot) { p = q.get(); break; }
         if (!p || p->internal || !(p->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW))) return false;
+        held.probes[slot] = p;
     }
     HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
                           FALSE, event.dwThreadId);
@@ -389,7 +401,7 @@ bool hold_watch_hit(probe_session *s, const DEBUG_EVENT &event, const CONTEXT &n
     try {
         auto &l = s->dr6_lost[event.dwThreadId];
         l.regs = native; l.bits |= fired;
-        s->watch_deferred.push_back({t, event});
+        held.thread = t; s->watch_deferred.push_back(held);
     } catch (...) { ResumeThread(t); CloseHandle(t); return false; }
     if (trace_enabled()) std::fprintf(stderr, "  watch hit held during a call tid=%lu dr6=0x%llx\n",
                                       (unsigned long)event.dwThreadId, (unsigned long long)fired);
@@ -694,8 +706,21 @@ static bool ensure_call_trap(probe_session *s) {
 #endif
     void *mem = VirtualAllocEx(s->pi.hProcess, nullptr, sizeof(kStub), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     size_t w = 0;
-    if (!mem || !remote_write(s->pi.hProcess, (uint64_t)(uintptr_t)mem, kStub, sizeof(kStub), &w) || w != sizeof(kStub))
-        return false;
+    if (!mem) return false;
+#if defined(UHH_TEST_HOOKS)
+    if (std::getenv("UHH_TEST_CALL_STUB_TRACE"))
+        std::fprintf(stderr, "probe: test: call stub %llx\n", (unsigned long long)(uintptr_t)mem);
+    static bool write_failed = false;
+    const bool fail_write = !write_failed && std::getenv("UHH_TEST_CALL_STUB_FAIL");
+    if (fail_write) write_failed = true;
+#else
+    const bool fail_write = false;
+#endif
+    if (fail_write || !remote_write(s->pi.hProcess, (uint64_t)(uintptr_t)mem, kStub, sizeof(kStub), &w) || w != sizeof(kStub)) {
+        VirtualFreeEx(s->pi.hProcess, mem, 0, MEM_RELEASE); return false;
+    }
+    try { s->scratch_blocks.push_back((uint64_t)(uintptr_t)mem); }
+    catch (...) { VirtualFreeEx(s->pi.hProcess, mem, 0, MEM_RELEASE); return false; }
     s->call_trap = (uint64_t)(uintptr_t)mem + 2;
     return true;
 }
@@ -776,13 +801,61 @@ int run_call(probe_session *s, CallbackState *st, uint64_t fn, uint64_t *ret, in
     if (!ensure_call_trap(s)) return 0;
     HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, FALSE, st->tid);
     if (!thread) return 0;
-    CONTEXT saved{}; saved.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_FLOATING_POINT;
+    CONTEXT legacy{};
+    PCONTEXT saved_context = &legacy;
+    std::vector<unsigned char> state;
+    const DWORD flags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | CONTEXT_FLOATING_POINT
 #if !defined(_WIN64)
-    saved.ContextFlags |= CONTEXT_EXTENDED_REGISTERS;                  // x86: XMM0-7 live here, not in FloatSave
+        | CONTEXT_EXTENDED_REGISTERS
 #endif
-    if (!GetThreadContext(thread, &saved)) {
-        if (trace_enabled()) std::fprintf(stderr, "  call_func: GetThreadContext(%lu) failed %lu\n", (unsigned long)st->tid, GetLastError());
-        CloseHandle(thread); return 0;
+        ;
+    // System-enabled features also include supervisor state. Only XCR0 user
+    // components represent registers a callee can change; CET_U/SSP is handled below.
+    int cpu[4]; __cpuid(cpu, 1);
+    const DWORD64 features = (cpu[2] & (1 << 27))
+        ? GetEnabledXStateFeatures() & _xgetbv(0) & XSTATE_MASK_ALLOWED & ~XSTATE_MASK_LEGACY : 0;
+    auto context_failed = [&](const char *stage) {
+        const DWORD error = GetLastError();
+        char why[192];
+        std::snprintf(why, sizeof(why), "%s failed (error %lu, XSTATE mask 0x%llx)", stage,
+                      (unsigned long)error, (unsigned long long)features);
+        call_refused(st->probe, why);
+        CloseHandle(thread);
+        return 0;
+    };
+    if (features) {
+        DWORD len = 0;
+        if (InitializeContext(nullptr, flags | CONTEXT_XSTATE, nullptr, &len) ||
+            GetLastError() != ERROR_INSUFFICIENT_BUFFER || !len) return context_failed("size call context");
+        try { state.resize(len); } catch (...) { CloseHandle(thread); return 0; }
+        if (!InitializeContext(state.data(), flags | CONTEXT_XSTATE, &saved_context, &len))
+            return context_failed("initialize call context");
+        if ((saved_context->ContextFlags & CONTEXT_XSTATE) != CONTEXT_XSTATE) {
+            SetLastError(ERROR_NOT_SUPPORTED); return context_failed("initialize call XSTATE");
+        }
+        if (!SetXStateFeaturesMask(saved_context, features | XSTATE_MASK_LEGACY))
+            return context_failed("select call XSTATE");
+    } else legacy.ContextFlags = flags;
+    CONTEXT &saved = *saved_context;
+    const DWORD saved_flags = saved.ContextFlags;
+    if (!GetThreadContext(thread, &saved)) return context_failed("get call context");
+    if (features) {
+        DWORD64 present = 0;
+        if (!GetXStateFeaturesMask(saved_context, &present)) return context_failed("read call XSTATE mask");
+        // GetThreadContext may omit INIT components: their bytes are undefined.
+        // Explicitly materialize their zero INIT image before requesting their restore,
+        // so a callee that activates them cannot leak its values back into the target.
+        saved.ContextFlags = saved_flags;
+        for (DWORD bit = 2; bit < 64; ++bit) if ((features & ~present) & (1ull << bit)) {
+            DWORD bytes = 0;
+            void *component = LocateXStateFeature(saved_context, bit, &bytes);
+            if (!component || !bytes) {
+                SetLastError(ERROR_NOT_SUPPORTED); return context_failed("locate INIT call XSTATE");
+            }
+            std::memset(component, 0, bytes);
+        }
+        if (!SetXStateFeaturesMask(saved_context, features | XSTATE_MASK_LEGACY))
+            return context_failed("restore call XSTATE mask");
     }
     // The call frame: [sp, sp + frame_size), its return-address slot at sp. Checked before
     // anything is written: a WriteProcessMemory into the stack's guard page would spend it.

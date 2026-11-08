@@ -273,6 +273,7 @@ extern "C" int probe_attach(probe_session *s, uint32_t pid) {
     s->pi.hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
     if (!s->pi.hProcess) { set_error(s, win_error("open target process")); return 0; }
     if (!same_bitness(s, s->pi.hProcess)) { CloseHandle(s->pi.hProcess); s->pi.hProcess = nullptr; return 0; }
+    if (!reuse_target_agent(s)) { CloseHandle(s->pi.hProcess); s->pi.hProcess = nullptr; return 0; }
     // Kill-on-exit OFF before the attach exists: DebugActiveProcess creates the thread's debug
     // object with kill-on-close set, so a controller ended in between (Ctrl+C during the
     // attach) took the target down with it (exit 0xC0000354). Create the object first.
@@ -303,9 +304,14 @@ extern "C" int probe_attach(probe_session *s, uint32_t pid) {
     auto fail = [&] {
         release_unclaimed_agent_mapping(s);
         DebugActiveProcessStop(pid);
+        if (s->sym_ready) { uhh_sym::cleanup(s->pi.hProcess); s->sym_ready = false; }
+        CloseHandle(s->pi.hProcess); s->pi.hProcess = nullptr;
         s->attached = s->launched = false; s->debug_tid = 0;
         return 0;
     };
+#if defined(UHH_TEST_HOOKS)
+    if (std::getenv("UHH_TEST_ATTACH_FAIL")) return fail();
+#endif
     if (!start_log_output(s)) return fail();
     { std::string which; s->sym_ready = uhh_sym::init(s->pi.hProcess, which); }
     if (!create_agent_channel(s) || !bind_pending_shared(s)) return fail();
@@ -406,7 +412,11 @@ void detach(probe_session *s) {
         auto local_stop = reinterpret_cast<uintptr_t>(GetProcAddress(s->local_agent, "probe_agent_stop"));
         if (local_stop) {
             uint64_t remote_stop = s->remote_agent + local_stop - reinterpret_cast<uintptr_t>(s->local_agent);
-            HANDLE t = create_remote_thread_boosted(s->pi.hProcess,
+            HANDLE t = nullptr;
+#if defined(UHH_TEST_HOOKS)
+            if (!std::getenv("UHH_TEST_STOP_FAIL"))
+#endif
+            t = create_remote_thread_boosted(s->pi.hProcess,
                                                     reinterpret_cast<LPTHREAD_START_ROUTINE>((uintptr_t)remote_stop), nullptr, nullptr);
             if (t) {                                   // keep dispatching until it has run
                 ULONGLONG until = GetTickCount64() + 5000;

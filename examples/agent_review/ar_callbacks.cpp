@@ -218,3 +218,17 @@ AR_CB void ar_on_vector(probe_context *c) {
     _xrstor(area, mask);
 #endif
 }
+
+// Retained image sections must still be shared by mixed backends after reattach.
+UHH_SHARED static volatile LONG ar_shared_value = 0;
+AR_CB void ar_on_shared_write(probe_context *c) { ar_shared_value = (LONG)get_func_arg(c, 0); }
+AR_CB void ar_on_shared_read(probe_context *c) { send_log(c, "ar shared %ld", ar_shared_value); }
+AR_CB void ar_on_vector_call(probe_context *c) {
+    uint64_t r = 0;
+    const int ok = call_func(c, "ar_target.exe!ar_vector_clobber", &r, 0);
+    send_log(c, "ar vector call %d", ok);
+}
+AR_CB void ar_on_config_late(probe_context *c) {
+    const auto *cfg = (const unsigned char *)get_config(c);
+    return_from(c, cfg ? cfg[4095] : 0, 0);
+}
