@@ -155,13 +155,17 @@ static int our_suspends(const probe_session *s, DWORD tid) {
     for (const auto &w : s->ctx_watch) n += w->tid == tid;
     return n;
 }
-// The thread's suspend count (THREAD_SUSPEND_RESUME), -1 = unknown. (Not ThreadSuspendCount:
-// it reads one higher for a thread stopped at a debug event.)
-static long suspend_count(HANDLE t) {
-    const DWORD prev = SuspendThread(t);
-    if (prev == (DWORD)-1) return -1;
-    ResumeThread(t);
-    return (long)prev;
+// Read without adding an observable suspension. Even at a debug event a target syscall
+// already in the kernel can finish SuspendThread and see our temporary increment.
+// ThreadSuspendCount includes the process-wide debug freeze: subtract it explicitly.
+static long suspend_count(HANDLE t, bool debug_frozen) {
+    using QueryFn = LONG (NTAPI *)(HANDLE, ULONG, void *, ULONG, ULONG *);
+    static auto query = reinterpret_cast<QueryFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+    ULONG count = 0;
+    if (!query || query(t, 35 /* ThreadSuspendCount */, &count, sizeof(count), nullptr) < 0 ||
+        count < (ULONG)debug_frozen || count - (ULONG)debug_frozen > LONG_MAX)
+        return -1;
+    return (long)(count - (ULONG)debug_frozen);
 }
 
 void park_release(probe_session *s) {
@@ -626,16 +630,18 @@ static bool same_context(const CONTEXT &x, const CONTEXT &y) {
 // suspensions than ours)? Then the target may be in the middle of a context round-trip on it.
 static std::unique_ptr<probe_session::CtxWatch> ctx_watch_begin(probe_session *s, DWORD tid) {
     if (s->detaching || s->exited) return nullptr;
+    // A replayed data watch is stopped by our hold, without an outstanding debug event.
+    const bool debug_frozen = !(s->cur_fiber && s->cur_fiber->stop_suspended);
     // The common case, cheaply: the event's own thread handle (no OpenThread / CloseHandle per
     // event; ~4-8 us a breakpoint/hw hit before) says nobody but us has it suspended.
     if (auto h = s->thread_handle.find(tid); h != s->thread_handle.end()) {
-        const long n = suspend_count(h->second);
+        const long n = suspend_count(h->second, debug_frozen);
         if (n >= 0 && n <= our_suspends(s, tid)) return nullptr;
     }
     HANDLE t = OpenThread(THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT |
                           THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
     if (!t) return nullptr;
-    const long n = suspend_count(t);
+    const long n = suspend_count(t, debug_frozen);
     if (n <= our_suspends(s, tid)) { CloseHandle(t); return nullptr; }
     auto w = std::make_unique<probe_session::CtxWatch>();
     w->tid = tid; w->t = t;
@@ -656,11 +662,11 @@ static void ctx_watch_end(probe_session *s, std::unique_ptr<probe_session::CtxWa
     if (trace_enabled()) std::fprintf(stderr, "  ctx-watch tid=%lu\n", (unsigned long)w->tid);
     try { s->ctx_watch.push_back(std::move(w)); } catch (...) { ResumeThread(w->t); CloseHandle(w->t); }
 }
-void ctx_watch_poll(probe_session *s, bool all) {
+void ctx_watch_poll(probe_session *s, bool all, bool debug_frozen) {
     for (size_t i = 0; i < s->ctx_watch.size(); ) {
         auto &w = *s->ctx_watch[i];
-        const long n = suspend_count(w.t);
-        if (!all && n > our_suspends(s, w.tid)) { ++i; continue; }    // the target still holds it
+        const long n = suspend_count(w.t, debug_frozen);
+        if (!all && (n < 0 || n > our_suspends(s, w.tid))) { ++i; continue; } // unknown / target still holds it
         CONTEXT cur{}; cur.ContextFlags = CONTEXT_ALL;
         if (n >= 0 && GetThreadContext(w.t, &cur) && merge_context(cur, w.before, w.after)) {
             // The target wrote back the context it captured during our event: ours again.
@@ -672,7 +678,8 @@ void ctx_watch_poll(probe_session *s, bool all) {
         }
         // Suspended again by the target meanwhile: it may have captured the context before our
         // repair, to write it back later -- keep holding, look again after its resume.
-        if (!all && suspend_count(w.t) > our_suspends(s, w.tid)) { ++i; continue; }
+        const long after = suspend_count(w.t, debug_frozen);
+        if (!all && (after < 0 || after > our_suspends(s, w.tid))) { ++i; continue; }
         ResumeThread(w.t); CloseHandle(w.t);
         s->ctx_watch.erase(s->ctx_watch.begin() + (ptrdiff_t)i);
     }

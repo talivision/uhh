@@ -648,7 +648,7 @@ bool service_event(probe_session *s, DEBUG_EVENT &ev);
 void pump(probe_session *s, DWORD ms);
 void park_release(probe_session *s);
 DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blocked, bool got);
-void ctx_watch_poll(probe_session *s, bool all = false);
+void ctx_watch_poll(probe_session *s, bool all = false, bool debug_frozen = false);
 HANDLE event_thread(probe_session *s, DWORD tid);
 void forget_event_thread(probe_session *s, DWORD tid);
 void trace_thread_stacks(probe_session *s, const char *why);

@@ -150,6 +150,10 @@ int main(int argc, char **argv) {
         fflush(stdout);
         return 0;
     }
+    const LONG spun_before = g_spun;
+    BOOL debugger_before = FALSE;
+    CheckRemoteDebuggerPresent(GetCurrentProcess(), &debugger_before);
+    const ULONGLONG first_tick = GetTickCount64();
     const DWORD first = SuspendThread(w);
     printf("{\"kind\":\"susp\",\"tid\":%lu}\n", GetThreadId(w)); fflush(stdout);
     if (!read_gate()) return 3;                                  // gate 2: the controller is dead
@@ -163,8 +167,9 @@ int main(int argc, char **argv) {
     InterlockedExchange(&g_spin_stop, 1);
     const DWORD done = WaitForSingleObject(w, 30000);
     printf("{\"kind\":\"co\",\"case\":\"%s\",\"first\":%lu,\"prev\":%lu,\"ran_while_suspended\":%ld,"
-           "\"done\":%d,\"ret\":%lld,\"debugger\":%d}\n", k, first, prev, (long)(c2 - c1), done == WAIT_OBJECT_0,
-           (long long)g_worker_ret, (int)dbg);
+           "\"done\":%d,\"ret\":%lld,\"debugger\":%d,\"spun_before\":%ld,\"debugger_before\":%d,\"first_tick\":%llu}\n",
+           k, first, prev, (long)(c2 - c1), done == WAIT_OBJECT_0, (long long)g_worker_ret, (int)dbg,
+           (long)spun_before, (int)debugger_before, (unsigned long long)first_tick);
     fflush(stdout);
     return 0;
 }
