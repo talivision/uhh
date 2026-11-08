@@ -9,6 +9,7 @@
 //             only by an indirect jump: the call's fall-through decodes the data over that ret;
 //   BndSmc    returns the imm32 of its own `mov eax, imm32`, which --smc rewrites (a data
 //             watchpoint on that operand, inside an instruction in .text, is a valid site).
+//   BndOverlap jumps indirectly into a MOV immediate: hidden INC EAX returns 1 per call.
 // Prints ONE JSON row; the values never change under any probe (a refused probe included).
 //   boundary_target [--iters K]
 //   boundary_target --smc K      rewrite BndSmc's immediate to 1..K, calling it after each
@@ -24,6 +25,7 @@ unsigned BndHidden(void);
 unsigned BndHiddenReal(void);
 unsigned BndNoret(unsigned x);
 unsigned BndSmc(void);
+unsigned BndOverlap(void);
 __declspec(noreturn) void BndDie(void) { abort(); }
 
 static int run_smc(int k) {
@@ -52,21 +54,22 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--iters")) iters = atoi(argv[i + 1]);
         if (!strcmp(argv[i], "--smc")) return run_smc(atoi(argv[i + 1]));
     }
-    unsigned frame = 0, leaf = 0, hidden = 0, noret = 0;
+    unsigned frame = 0, leaf = 0, hidden = 0, noret = 0, overlap = 0;
     for (int i = 0; i < iters; ++i) {
         frame += BndFrame(0) + BndFrame((unsigned)i + 1);
         leaf += BndLeaf();
         hidden += BndHidden() + BndHiddenReal();
         noret += BndNoret(0);
+        overlap += BndOverlap();
     }
     // Expected: frame = sum((i+1)*0x12345678 + 0x9ABCDEF0), leaf = iters*0x11223344, hidden = iters*8,
-    // noret = iters*5 (mod 2^32).
+    // noret = iters*5, overlap = iters (mod 2^32).
     unsigned want_frame = 0;
     for (int i = 0; i < iters; ++i) want_frame += ((unsigned)i + 1) * 0x12345678u + 0x9ABCDEF0u;
     const int ok = frame == want_frame && leaf == (unsigned)iters * 0x11223344u && hidden == (unsigned)iters * 8u &&
-                   noret == (unsigned)iters * 5u;
+                   noret == (unsigned)iters * 5u && overlap == (unsigned)iters;
     printf("{\"kind\":\"target\",\"name\":\"boundary\",\"iters\":%d,\"frame\":%u,\"leaf\":%u,\"hidden\":%u,"
-           "\"noret\":%u,\"ok\":%s}\n", iters, frame, leaf, hidden, noret, ok ? "true" : "false");
+           "\"noret\":%u,\"overlap\":%u,\"ok\":%s}\n", iters, frame, leaf, hidden, noret, overlap, ok ? "true" : "false");
     fflush(stdout);
     return ok ? 0 : 3;
 }

@@ -278,7 +278,7 @@ static bool check_flags(probe_session *s, uint32_t flags, bool allow_inline) {
         ((flags & PROBE_ALLOW_PREHOOKED) && type != PROBE_INLINE) || // only meaningful for inline
         ((flags & PROBE_FALLBACK_HW) && type != PROBE_INLINE) ||     // fallback only modifies an inline probe
         ((flags & PROBE_UNSAFE_FAST_PATCH) && type != PROBE_INLINE) || // only inline hooks write code
-        ((flags & PROBE_ALLOW_UNSAFE_SITE) && type != PROBE_INLINE) || // only inline hooks overwrite >1 byte
+        ((flags & PROBE_ALLOW_UNSAFE_SITE) && watch) || // any execute backend, never data watches
         (watch && type != PROBE_HW) ||                               // a watchpoint uses the DR/HW backend
         watch == (PROBE_WATCH_WRITE | PROBE_WATCH_RW) ||             // pick one access mode, not both
         ((flags & PROBE_ONCE) && type == PROBE_INLINE)) {            // one-shot needs a controller backend

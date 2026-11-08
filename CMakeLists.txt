@@ -653,7 +653,7 @@ endif()
 add_executable(boundary_target examples/boundary/boundary_target.c ${BND_ASM})
 target_compile_options(boundary_target PRIVATE /Zi)
 target_compile_definitions(boundary_target PRIVATE _CRT_SECURE_NO_WARNINGS)
-target_link_options(boundary_target PRIVATE /DEBUG /INCREMENTAL:NO /EXPORT:BndFrame /EXPORT:BndLeaf /EXPORT:BndHidden /EXPORT:BndNoret /EXPORT:BndSmc)
+target_link_options(boundary_target PRIVATE /DEBUG /INCREMENTAL:NO /EXPORT:BndFrame /EXPORT:BndLeaf /EXPORT:BndHidden /EXPORT:BndNoret /EXPORT:BndSmc /EXPORT:BndOverlap)
 set_property(TARGET boundary_target PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
 # --- controller review fixtures (regress `ctrl-*`, examples/ctrlreview) ------------------

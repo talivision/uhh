@@ -2,7 +2,7 @@
 .686
 .model flat, C
 OPTION CASEMAP:NONE
-PUBLIC BndFrame, BndLeaf, BndHidden, BndHiddenReal, BndNoret, BndSmc
+PUBLIC BndFrame, BndLeaf, BndHidden, BndHiddenReal, BndNoret, BndSmc, BndOverlap
 EXTERN BndDie:PROC
 
 .data
@@ -62,4 +62,19 @@ BndSmc PROC
     mov eax, 0                      ; +0x3  B8 imm32 (imm at +0x4)
     ret                             ; +0x8
 BndSmc ENDP
+
+; Opaque jump enters MOV's immediate: FF C0 increments EAX; EB 01 skips the outer ret.
+ALIGN 16
+BndOverlap PROC
+    xor eax, eax
+    mov edx, OFFSET BndOverlapOuter + 1
+    test eax, eax
+    jnz short BndOverlapOuter
+    jmp edx
+BndOverlapOuter:                    ; +0xD: B8 FF C0 EB 01 = mov eax, 01EBC0FFh
+    DB 0B8h, 0FFh, 0C0h, 0EBh, 01h
+    ret                             ; never executed
+    ret                             ; hidden path returns 1
+    DB 8 DUP (0CCh)
+BndOverlap ENDP
 END

@@ -104,6 +104,7 @@ struct Probe {
     bool active = false;
     bool warned_double_run = false;   // call_original without return_from (warn once)
     bool warned_pop = false;          // x86 return_from nargs contradicted call_original (warn once)
+    bool warned_boundary = false;     // boundary override warning (once per probe)
     bool warned_log = false;          // a "uhh warning: ..." log record was emitted (once per probe, as inline)
     bool warned_call = false;         // a breakpoint/hw call_func was refused (warn once)
 };
@@ -732,6 +733,7 @@ void zydis_init(ZydisDecoder &dec);
 bool refuse_mid_instruction(probe_session *s, Probe &p, uint64_t site);
 bool vet_site(probe_session *s, Probe &p, bool &moved_to_hw);
 // session_call.cpp
+void warn_record(probe_context *c, Probe *probe, const char *text, bool *warned = nullptr);
 EventFiber *fiber_get(probe_session *s);
 bool fiber_step(probe_session *s, EventFiber *f, const DEBUG_EVENT *ev);
 bool call_resume(probe_session *s, DWORD tid, EventFiber::Outcome how, const DEBUG_EVENT *ev);

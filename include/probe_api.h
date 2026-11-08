@@ -82,13 +82,15 @@ enum probe_flags {
        thread executing those bytes at that moment resumes mid-jump and crashes or
        misbehaves. For measurement/testing; do not use on code other threads may run. */
     PROBE_UNSAFE_FAST_PATCH = 1u << 9,
-    /* PROBE_INLINE only. Install even where the site check refuses: an inline hook
+    /* Every execute backend: override the instruction-boundary refusal with a warning
+       (for overlapping/obfuscated code whose real entry lies inside the decoded stream).
+       Not valid for data watchpoints. PROBE_INLINE also installs where its site check refuses: an inline hook
        overwrites >= 5 bytes, and it is refused (with the reason) when code could arrive
        inside them -- a branch target, function start, return point or switch-table target,
        a ret/jmp followed by live code, an unresolvable indirect jump in the function, or the
        end of the code section. With this flag the reason is printed as a warning and the
-       hook is installed anyway: you assert that nothing reaches those bytes. It does not
-       override the instruction-boundary refusal (see probe_add_symbol), on any backend. */
+       hook is installed anyway: you assert that nothing reaches those bytes. Other inline
+       checks retain their existing meaning. */
     PROBE_ALLOW_UNSAFE_SITE = 1u << 10
 };
 
@@ -131,8 +133,8 @@ probe_session *probe_session_create(void);
    A site INSIDE an instruction (an offset or address that is not an instruction start) is
    refused on every backend -- "probe <loc> refused: site is inside an instruction: ...;
    nearest instruction boundaries A, B" -- wherever the function's code can be decoded
-   (its extent from .pdata on x64 or the PDB, else the symbol named before the offset); no
-   flag overrides it. Where it cannot be decoded (no extent and no symbol, code reached only
+   (its extent from .pdata on x64 or the PDB, else the symbol named before the offset); PROBE_ALLOW_UNSAFE_SITE overrides it with one stderr warning and one per-probe
+   "uhh warning" log record (for deliberately overlapping/obfuscated code). Where it cannot be decoded (no extent and no symbol, code reached only
    by indirect jumps) the site is taken as given. The same applies to probe_add_address.
    Limits, the same on every backend and from a callback: a config is at most 4 GB
    (UINT32_MAX bytes); in a session that also has inline probes at most 65536 software-

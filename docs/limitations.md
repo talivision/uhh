@@ -26,7 +26,7 @@ return the same values everywhere. What differs:
 | Added cost per hit, x64 / x86 (1 thread, test VM, `bench/BENCHMARKS.md`) | ~77 us / ~142 us | ~91 us / ~151 us | ~0.07 us / ~0.14 us, plus ~0.1 / ~0.15 us per `send_log` |
 | 1 kHz frame loop, x64 (Blog B7, 2026-11-05) | frame time p50 ~300 us, p99 ~660 us; a few frames over budget | p50 ~220 us, p99 ~520 us; a few frames over budget | p50 1 us, p99 10 us; no frame missed |
 | How many | unlimited (65536 armed at once in a session that also has inline probes) | 4 in total: execute probes and watchpoints | 128 per session |
-| Sites | any instruction start (a site inside an instruction is refused on every backend, [scope](#scope)); a site that already holds a foreign INT3 is refused | any instruction start | a site check refuses sites where code could arrive inside the overwritten bytes ([inline](#inline-backend)) |
+| Sites | any instruction start (a site inside an instruction is refused unless `PROBE_ALLOW_UNSAFE_SITE` is set, [scope](#scope)); a site that already holds a foreign INT3 is refused | any instruction start | a site check refuses sites where code could arrive inside the overwritten bytes ([inline](#inline-backend)) |
 | Live from, launch | the target's first instruction | the target's first instruction | the loader breakpoint: static imports mapped, before any DLL initialiser or TLS callback runs |
 | Live from, attach | each probe's `probe: active` line | same | same (once the agent confirms the hook) |
 | `probe_watch` (data) | - | yes | - |
@@ -63,7 +63,7 @@ Windows enforces no CET shadow stack for WOW64 processes. Details in [x86 / WOW6
   symbol before the site, code reached only by indirect jumps, overlapping instructions)
   the site is taken as given: a breakpoint there corrupts the instruction, an inline hook
   crashes the target, hw never fires. *Workaround:* probe instruction starts (map, PDB,
-  disassembly); name the function (`module!Func+0xOFF`) so the offset can be checked.
+  disassembly), or use `PROBE_ALLOW_UNSAFE_SITE` for known overlapping/obfuscated code (warning on stderr and in the per-probe log, every execute backend; never data watchpoints). Hardware fallback alone does not override this refusal; name the function (`module!Func+0xOFF`) so the offset can be checked.
 - **No accessor for XMM/x87 registers, the instruction pointer or flags** (📄 Calling-convention
   CC7). Float/double arguments in XMM cannot be read; a float result cannot be set.
   *Workaround:* pass float results through with `call_original` + `return_from`.

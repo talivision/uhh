@@ -720,7 +720,7 @@ static bool site_inside_instruction(probe_session *s, const Probe &p, uint64_t s
     // never passes a call's fall-through. A call may not return (ExitProcess, a throw helper,
     // a no-return routine of the program), and the bytes after it can be data that decodes
     // over a real block reached only through an indirect jump UHH cannot resolve -- a false
-    // refusal (never overridable). So an instruction known only through a fall-through
+    // refusal. So an instruction known only through a fall-through
     // refuses only when every indirect jump decoded in the region was resolved (a switch
     // table): then a real block there would have been decoded too, and shown as an overlap.
     std::map<uint64_t, ZydisDecodedInstruction> insns, direct;
@@ -834,7 +834,7 @@ static bool site_inside_instruction(probe_session *s, const Probe &p, uint64_t s
     return true;
 }
 
-// Refuse a probe whose site is inside an instruction (any backend; no flag overrides it).
+// Refuse a probe inside an instruction unless explicitly overridden (any backend).
 // A data watchpoint (PROBE_WATCH_*) watches bytes, not an instruction: any aligned dword is a
 // valid site, an operand byte in code included (self-modifying code, a variable in a code
 // section) -- never judged, on every path (absolute, module+RVA, symbol+offset).
@@ -844,7 +844,19 @@ bool refuse_mid_instruction(probe_session *s, Probe &p, uint64_t site) {
     const uint64_t anchor = !p.export_name.empty() && site >= p.sym_offset ? site - p.sym_offset : 0;
     std::string why;
     if (!site_inside_instruction(s, p, site, anchor, why)) return false;
-    const std::string msg = "probe " + p.location + " refused: " + why;
+    if (p.flags & PROBE_ALLOW_UNSAFE_SITE) {
+        if (!p.warned_boundary) {
+            const std::string warning = p.location + ": " + why + " (installed: PROBE_ALLOW_UNSAFE_SITE)";
+            std::fprintf(stderr, "probe: warning: %s\n", warning.c_str());
+            CallbackState state{s, &p};
+            probe_context context{};
+            context.controller = &state;
+            context.site = probe_index(s, &p);
+            warn_record(&context, &p, warning.c_str(), &p.warned_boundary);
+        }
+        return false;
+    }
+    const std::string msg = "probe " + p.location + " refused: " + why + ". Override with PROBE_ALLOW_UNSAFE_SITE.";
     std::fprintf(stderr, "probe: %s\n", msg.c_str());
     set_error(s, msg);
     p.retired = true;

@@ -511,9 +511,11 @@ static uint64_t ret_gadget(probe_session *s, uint32_t pop) {
 // The first call_original / return_from warning of a probe also goes to the LOG as one
 // "uhh warning: <text>" record -- the record the inline agent emits (it has no stderr), so
 // a log carries the same records on every backend.
-static void warn_record(probe_context *c, Probe *probe, const char *text) {
-    if (!c || !probe || probe->warned_log) return;
-    probe->warned_log = true;
+void warn_record(probe_context *c, Probe *probe, const char *text, bool *warned) {
+    if (!c || !probe) return;
+    bool &once = warned ? *warned : probe->warned_log;
+    if (once) return;
+    once = true;
     send_log(c, "uhh warning: %s", text);
 }
 // After a callback: apply return_from (resume at the gadget, SP = the hit's) and return
