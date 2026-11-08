@@ -1,0 +1,180 @@
+// Deterministic inline-agent review fixtures (regress cdx-agent-*).
+#include "probe_agent_shared.hpp"
+#include "ar_review.hpp"
+#include <immintrin.h>
+#include <cstring>
+#include <initializer_list>
+#include <vector>
+#define AR_EXPORT extern "C" __declspec(dllexport) __declspec(noinline)
+static volatile LONG review_sink;
+AR_EXPORT void ar_pressure_site() { InterlockedIncrement(&review_sink); }
+AR_EXPORT void ar_vector_site() { InterlockedIncrement(&review_sink); }
+AR_EXPORT void ar_epoch_site(ArEpochControl *) { InterlockedIncrement(&review_sink); }
+AR_EXPORT void ar_cache_site(void *) { InterlockedIncrement(&review_sink); }
+AR_EXPORT uint64_t ar_guard_buffer(void *p) {
+    DWORD old = 0;
+    return VirtualProtect(p, 4096, PAGE_READWRITE | PAGE_GUARD, &old) ? 1 : 0;
+}
+AR_EXPORT void ar_guarantee_throw() { RaiseException(0xE0A01234, 0, 0, nullptr); }
+static int guarantee_call() {
+    __try { ar_guarantee_throw(); }
+    __except (GetExceptionCode() == 0xE0A01234 ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) { return 1; }
+    return 0;
+}
+static probe_agent_shared *review_channel() {
+    wchar_t name[64]; probe_agent_mapping_name(GetCurrentProcessId(), name);
+    HANDLE h = OpenFileMappingW(FILE_MAP_READ, FALSE, name);
+    auto *p = h ? (probe_agent_shared *)MapViewOfFile(h, FILE_MAP_READ, 0, 0, sizeof(probe_agent_shared)) : nullptr;
+    if (h) CloseHandle(h);
+    return p;
+}
+static volatile LONG pressure_ready;
+static DWORD WINAPI pressure_thread(void *event) {
+    ar_pressure_site();
+    InterlockedIncrement(&pressure_ready);
+    if (event) WaitForSingleObject((HANDLE)event, 60000);
+    return 0;
+}
+static DWORD WINAPI epoch_thread(void *p) { ar_epoch_site((ArEpochControl *)p); return 0; }
+static int epoch_case() {
+    ArEpochControl control{CreateEventW(nullptr, TRUE, FALSE, nullptr), CreateEventW(nullptr, TRUE, FALSE, nullptr), 0};
+    printf("{\"kind\":\"ready\",\"pid\":%lu}\n", GetCurrentProcessId()); fflush(stdout);
+    if (getchar() == EOF) return 2;
+    HANDLE t = CreateThread(nullptr, 0, epoch_thread, &control, 0, nullptr);
+    if (!t || WaitForSingleObject(control.entered, 10000) != WAIT_OBJECT_0) return 3;
+    // Suspend the callback so bounded detach reports it as interrupted immediately.
+    if (SuspendThread(t) == (DWORD)-1) return 4;
+    printf("{\"kind\":\"parked\"}\n"); fflush(stdout);
+    if (getchar() == EOF) return 5;
+    SetEvent(control.release); ResumeThread(t);
+    if (WaitForSingleObject(t, 10000) != WAIT_OBJECT_0) return 6;
+    const LONG old_config = control.observed;
+    ar_epoch_site(&control);
+    printf("{\"kind\":\"ar\",\"old_config\":%ld,\"new_config\":%ld}\n", old_config, control.observed); fflush(stdout);
+    if (getchar() == EOF) return 7;
+    CloseHandle(t); CloseHandle(control.entered); CloseHandle(control.release);
+    return old_config == 1 && control.observed == 2 ? 0 : 8;
+}
+static int stop_guarded() {
+    using Stop = DWORD (WINAPI *)(void *);
+    auto fn = (Stop)GetProcAddress(GetModuleHandleW(L"probe_api_agent.dll"), "probe_agent_stop");
+    if (!fn) return 0;
+    __try { fn(nullptr); return 1; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+int ar_review_case(const char *k) {
+    if (!strcmp(k, "review-epoch")) return epoch_case();
+    if (!strcmp(k, "review-cache")) {
+        void *p = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!p) return 2;
+        ar_cache_site(p);
+        MEMORY_BASIC_INFORMATION mbi{}; VirtualQuery(p, &mbi, sizeof(mbi));
+        const int intact = (mbi.Protect & PAGE_GUARD) != 0;
+        DWORD old = 0; VirtualProtect(p, 4096, PAGE_READWRITE, &old); VirtualFree(p, 0, MEM_RELEASE);
+        printf("{\"kind\":\"ar\",\"guard_intact\":%d}\n", intact);
+        return intact ? 0 : 3;
+    }
+    if (!strcmp(k, "review-guarantee")) {
+        ULONG before = 0, after = 0;
+        SetThreadStackGuarantee(&before);
+        const int caught = guarantee_call();
+        SetThreadStackGuarantee(&after);
+        printf("{\"kind\":\"ar\",\"caught\":%d,\"before\":%lu,\"after\":%lu}\n", caught, before, after);
+        return caught && before == after ? 0 : 3;
+    }
+    if (!strcmp(k, "review-error") || !strcmp(k, "review-denied")) {
+        const bool denied = !strcmp(k, "review-denied");
+        HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        HANDLE victim_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        DWORD tid = 0;
+        HANDLE t = CreateThread(nullptr, 0, pressure_thread, victim_event, 0, &tid);
+        if (!t) return 2;
+        const ULONGLONG deadline = GetTickCount64() + 30000;
+        while (pressure_ready != 1 && GetTickCount64() < deadline) Sleep(1);
+        auto *sh = review_channel();
+        std::vector<HANDLE> fillers;
+        for (uint32_t i = 1; i < PROBE_AGENT_TBLOCKS; ++i) {
+            HANDLE h = CreateThread(nullptr, 0, pressure_thread, event, 0, nullptr);
+            if (h) fillers.push_back(h);
+        }
+        while (pressure_ready != (LONG)PROBE_AGENT_TBLOCKS && GetTickCount64() < deadline) Sleep(1);
+        const int filled = sh && pressure_ready == (LONG)PROBE_AGENT_TBLOCKS && sh->tblocks[0].owner == (LONG)tid;
+        int blocked = 0, gone = 0;
+        if (denied) {
+            SECURITY_DESCRIPTOR sd{}; ACL acl{};
+            InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+            InitializeAcl(&acl, sizeof(acl), ACL_REVISION); // empty DACL: no rights for OpenThread
+            SetSecurityDescriptorDacl(&sd, TRUE, &acl, FALSE);
+            if (SetKernelObjectSecurity(t, DACL_SECURITY_INFORMATION, &sd)) {
+                HANDLE h = OpenThread(SYNCHRONIZE | THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+                blocked = !h && GetLastError() == ERROR_ACCESS_DENIED;
+                if (h) CloseHandle(h);
+            }
+        } else {
+            SetEvent(victim_event); WaitForSingleObject(t, 10000);
+            CloseHandle(t); t = nullptr;                  // no handle keeps the dead thread id alive
+            const ULONGLONG until = GetTickCount64() + 5000;
+            do {
+                HANDLE h = OpenThread(SYNCHRONIZE | THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+                gone = !h && GetLastError() == ERROR_INVALID_PARAMETER;
+                if (h) CloseHandle(h);
+                if (gone) break;
+                Sleep(1);                               // let the debugger release its exit-event handle
+            } while (GetTickCount64() < until);
+        }
+        SetLastError(0x12345678);
+        ar_pressure_site();
+        const DWORD error = GetLastError();
+        const int kept = sh && sh->tblocks[0].owner == (LONG)tid;
+        SetEvent(event); SetEvent(victim_event);
+        if (t) { WaitForSingleObject(t, 10000); CloseHandle(t); }
+        for (HANDLE h : fillers) { WaitForSingleObject(h, 10000); CloseHandle(h); }
+        CloseHandle(event); CloseHandle(victim_event);
+        if (sh) UnmapViewOfFile(sh);
+        printf("{\"kind\":\"ar\",\"filled\":%d,\"blocked\":%d,\"gone\":%d,\"kept\":%d,\"error\":%lu}\n", filled, blocked, gone, kept, error);
+        return filled && (denied ? blocked && kept : gone && !kept && error == 0x12345678) ? 0 : 3;
+    }
+    if (!strcmp(k, "review-vector")) {
+        int cp[4]; __cpuid(cp, 1);
+        const uint64_t enabled = (cp[2] & (1 << 27)) ? _xgetbv(0) : 0;
+        const uint64_t mask = (enabled & 6) == 6 ? (4ull | ((enabled & 0xE0) == 0xE0 ? 0x20ull : 0)) : 0;
+        int clean = 1;
+        if (mask) {
+            alignas(64) unsigned char area[4096] = {};
+            *(unsigned int *)(area + 24) = _mm_getcsr();
+#if defined(_WIN64)
+            _xrstor64(area, mask);                         // upper YMM and opmasks start in INIT
+            ar_vector_site();
+            _xsave64(area, mask);
+#else
+            _xrstor(area, mask);
+            ar_vector_site();
+            _xsave(area, mask);
+#endif
+            const uint64_t bv = *(uint64_t *)(area + 512);
+            for (int i : {2, 5}) {
+                if (!(mask & (1ull << i)) || !(bv & (1ull << i))) continue;
+                __cpuidex(cp, 0xD, i);
+                for (int j = 0; j < cp[0]; ++j) if (area[cp[1] + j]) clean = 0;
+            }
+        }
+        printf("{\"kind\":\"ar\",\"avx\":%d,\"opmask\":%d,\"clean\":%d}\n", mask ? 1 : 0, (mask & 0x20) ? 1 : 0, clean);
+        return clean ? 0 : 3;
+    }
+    if (!strcmp(k, "review-guard")) {
+        // Separate DLL code: guarding it cannot fault this fixture's own instructions.
+        HMODULE dll = LoadLibraryW(L"ctrl_cfr_a.dll");
+        void *fn = dll ? (void *)GetProcAddress(dll, "CfrValue") : nullptr;
+        if (!fn) return 2;
+        DWORD old = 0;
+        const int armed = VirtualProtect(fn, 1, PAGE_EXECUTE_READ | PAGE_GUARD, &old) ? 1 : 0;
+        const int stopped = stop_guarded();
+        MEMORY_BASIC_INFORMATION mbi{}; VirtualQuery(fn, &mbi, sizeof(mbi));
+        const int intact = (mbi.Protect & PAGE_GUARD) != 0;
+        DWORD ignore = 0; VirtualProtect(fn, 1, old, &ignore);
+        // Abandoned hook remains in place: do not call or unload its module.
+        printf("{\"kind\":\"ar\",\"armed\":%d,\"stopped\":%d,\"guard_intact\":%d}\n", armed, stopped, intact);
+        return armed && stopped && intact ? 0 : 3;
+    }
+    return -1;
+}

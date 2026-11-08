@@ -270,6 +270,11 @@ data) prints on all backends.
   by a non-unwinding `longjmp` keeps its thread marked as in a call.
 - **The agent stays loaded after a detach** (Lifecycle), quiescent: hooks removed, logging
   stopped. A later attach to the same process reuses it.
+  Ordinary reattach reuses the named channel, its target view/handle and session proxies.
+  If the old channel still counts a possibly surviving callback (including a suspended one),
+  reattach uses a fresh channel instead; that rare fallback retains the old storage until
+  process exit so the callback's config and accounting pointers remain valid. Epoch checks
+  reject stale per-hit state after a channel reset.
 - **x86 inline stack walks** are a verified return-address scan, not PDB-based; a frameless
   function reached by an indirect call can lose its immediate caller
   ([symbols.md](symbols.md#stacks-per-backend-send_log_stack)).

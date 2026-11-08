@@ -294,6 +294,7 @@ struct probe_session {
     uint64_t overrides = 0;
     std::string error;
     HANDLE mapping = nullptr, remote_thread = nullptr;
+    HANDLE agent_mapping = nullptr;             // target handle, retained with the agent view
     probe_agent_shared *shared = nullptr;
     HMODULE local_agent = nullptr;
     // The controller's agent DLL is prepared (the per-session copy made, then loaded) on its own
@@ -5171,17 +5172,39 @@ static bool open_agent_section(probe_session *s, uint32_t count) {
     wchar_t name[64]; probe_agent_mapping_name(s->pi.dwProcessId, name);
     s->mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
                                     (DWORD)sizeof(probe_agent_shared), name);
-    // ALREADY_EXISTS on attach: an agent from an earlier, detached session is still loaded
-    // in the target and holds the section. It is quiescent (its hooks were removed and it
-    // stopped logging at that detach), so the channel is reset below and reused; the
-    // agent's init re-arms it. Anywhere else an existing section is not ours: refuse.
-    if (!s->mapping || (GetLastError() == ERROR_ALREADY_EXISTS && !s->attached)) {
+    const bool existing = s->mapping && GetLastError() == ERROR_ALREADY_EXISTS;
+    if (!s->mapping || (existing && !s->attached)) {
         set_error(s, win_error("create inline shared section")); return false;
     }
     s->shared = static_cast<probe_agent_shared *>(MapViewOfFile(
         s->mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(probe_agent_shared)));
     if (!s->shared) { set_error(s, win_error("map inline shared section")); return false; }
-    std::memset(s->shared, 0, sizeof(*s->shared));
+    if (existing && (s->shared->magic != PROBE_AGENT_MAGIC || s->shared->version != PROBE_AGENT_VERSION)) {
+        set_error(s, "incompatible existing inline shared section"); return false;
+    }
+    // Usually the detached agent is quiescent: reuse BOTH its section and target view/handle.
+    // A suspended (or otherwise possibly surviving) callback still owns the old storage;
+    // only that exceptional case retains it and uses an unnamed channel instead.
+    if (existing && !probe_agent_running(s->shared)) {
+        s->agent_mapping = (HANDLE)(uintptr_t)s->shared->agent_mapping;
+    } else if (existing) {
+        UnmapViewOfFile(s->shared); CloseHandle(s->mapping);
+        s->mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+                                        (DWORD)sizeof(probe_agent_shared), nullptr);
+        s->shared = s->mapping ? static_cast<probe_agent_shared *>(MapViewOfFile(
+            s->mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(probe_agent_shared))) : nullptr;
+        if (!s->shared) { set_error(s, win_error("map replacement inline shared section")); return false; }
+    }
+    if (!s->agent_mapping && !DuplicateHandle(GetCurrentProcess(), s->mapping, s->pi.hProcess,
+                                            &s->agent_mapping, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        set_error(s, win_error("duplicate inline shared section")); return false;
+    }
+    // Invalidate old per-hit snapshots before resetting counters; never clear the epoch itself.
+    InterlockedIncrement(&s->shared->session_epoch);
+    constexpr size_t epoch_end = offsetof(probe_agent_shared, session_epoch) + sizeof(LONG);
+    std::memset(s->shared, 0, offsetof(probe_agent_shared, session_epoch));
+    std::memset((char *)s->shared + epoch_end, 0, sizeof(*s->shared) - epoch_end);
+    s->shared->agent_mapping = (uint64_t)(uintptr_t)s->agent_mapping;
     s->shared->magic = PROBE_AGENT_MAGIC; s->shared->version = PROBE_AGENT_VERSION;
     s->shared->request_count = count;
     bench_phase("section_mapped");
@@ -8968,7 +8991,7 @@ static bool start_agent_init(probe_session *s) {
     if (!agent_has_pending(s) && s->shared && (s->shared->service_ready || s->early_inited)) return accept_agent_install(s);
     auto local_init = reinterpret_cast<uintptr_t>(GetProcAddress(s->local_agent, "probe_agent_init"));
     uint64_t remote_init = s->remote_agent + local_init - reinterpret_cast<uintptr_t>(s->local_agent);
-    return start_remote(s, reinterpret_cast<LPTHREAD_START_ROUTINE>((uintptr_t)remote_init), nullptr,
+    return start_remote(s, reinterpret_cast<LPTHREAD_START_ROUTINE>((uintptr_t)remote_init), s->agent_mapping,
                         probe_session::REMOTE_INIT_AGENT);
 }
 
@@ -9015,10 +9038,10 @@ static bool early_agent(probe_session *s, const DEBUG_EVENT &event, bool &ok) {
     if (!vet_pending_inline(s)) { done(); ok = false; return true; }
     s->agent_init_started = true;
     auto local_init = reinterpret_cast<uintptr_t>(GetProcAddress(s->local_agent, "probe_agent_init"));
-    const uint64_t init = s->remote_agent + local_init - reinterpret_cast<uintptr_t>(s->local_agent), zero = 0;
+    const uint64_t init = s->remote_agent + local_init - reinterpret_cast<uintptr_t>(s->local_agent), channel = (uint64_t)(uintptr_t)s->agent_mapping;
     uint64_t code = 1;
     InterlockedExchange(&s->shared->early_init, 1);
-    const int inited = local_init ? call_in_target(s, &st, init, &code, 1, &zero, 60000) : 0;
+    const int inited = local_init ? call_in_target(s, &st, init, &code, 1, &channel, 60000) : 0;
     InterlockedExchange(&s->shared->early_init, 0);
     bench_phase("early_init_end");
     if (trace_enabled())

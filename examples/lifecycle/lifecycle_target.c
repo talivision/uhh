@@ -249,6 +249,21 @@ static void find_agent_threads(void) {
    one that is still not gone after 2 s stays uninspected (not clean). */
 static int thread_exited(HANDLE t) { return t && WaitForSingleObject(t, 2000) == WAIT_OBJECT_0; }
 
+/* Shared channel views are MEM_MAPPED, unlike thread stacks/heaps/trampolines. Counting
+ * committed mapped bytes catches a retained multi-MB channel on every ordinary reattach. */
+static unsigned long long mapped_bytes(void) {
+    ULONG_PTR at = 0;
+    unsigned long long bytes = 0;
+    MEMORY_BASIC_INFORMATION mbi;
+    while (VirtualQuery((LPCVOID)at, &mbi, sizeof(mbi))) {
+        ULONG_PTR next = (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize;
+        if (mbi.State == MEM_COMMIT && mbi.Type == MEM_MAPPED) bytes += (unsigned long long)mbi.RegionSize;
+        if (next <= at) break;
+        at = next;
+    }
+    return bytes;
+}
+
 static void check(const char *kind) {
     char code_bad[256] = "", dr_bad[256] = "", dr_unknown_info[256] = "", why[96];
     int code_diff = 0, dr_dirty = 0, dr_unknown = 0, threads = 0;
@@ -311,10 +326,10 @@ static void check(const char *kind) {
     find_suspended(&susp, susp_info, sizeof(susp_info));
     printf("{\"kind\":\"%s\",\"susp\":%ld,\"susp_info\":\"%s\",\"code_diff\":%d,\"code_bad\":\"%s\",\"dr_dirty\":%d,\"dr_bad\":\"%s\","
            "\"dr_unknown\":%d,\"dr_unknown_info\":\"%s\",\"dr_stale\":%ld,\"threads\":%d,"
-           "\"debugger\":%d,\"agent_loaded\":%d,\"iterations\":%lld,\"errors\":%ld,\"first_error\":\"%s\","
+           "\"debugger\":%d,\"agent_loaded\":%d,\"mapped_bytes\":%llu,\"iterations\":%lld,\"errors\":%ld,\"first_error\":\"%s\","
            "\"flips\":%ld,\"slow_calls\":%ld,\"churned\":%ld,\"dll_cycles\":%ld,\"late\":%ld,\"stuck\":%ld,\"stuck_info\":\"%s\",\"agent_thr\":\"%s\"}\n",
            kind, susp, susp_info, code_diff, code_bad, dr_dirty, dr_bad, dr_unknown, dr_unknown_info, g_dr_stale, threads, IsDebuggerPresent() ? 1 : 0,
-           GetModuleHandleA("probe_api_agent.dll") != NULL, (long long)g_iters, g_errors, g_first_error,
+           GetModuleHandleA("probe_api_agent.dll") != NULL, mapped_bytes(), (long long)g_iters, g_errors, g_first_error,
            g_flips, g_slow_calls, g_churned, g_dll_cycles, g_late, g_stuck, g_stuck_info, g_agent_thr);
     fflush(stdout);
 }

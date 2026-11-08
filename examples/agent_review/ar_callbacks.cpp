@@ -148,3 +148,56 @@ AR_CB void ar_on_dr2_site(probe_context *c) { send_log(c, "ar dr2 hit"); }
 AR_CB void ar_on_dr2_arm(probe_context *c) {
     if (!probe_add_address(get_session(c), get_func_arg(c, 0), ar_on_dr2_site, PROBE_HW)) send_log(c, "ar dr2 refused");
 }
+
+// cdx-agent-*: callback effects deliberately left for the agent to restore.
+#include "ar_review.hpp"
+#include <initializer_list>
+#include <intrin.h>
+#include <immintrin.h>
+AR_CB void ar_on_empty(probe_context *) {}
+AR_CB void ar_on_cache(probe_context *c) {
+    const uint64_t p = get_func_arg(c, 0);
+    unsigned char byte = 0;
+    const int first = get_mem(c, p, &byte, 1);
+    uint64_t ret = 0;
+    const int called = call_func(c, "ar_target.exe!ar_guard_buffer", &ret, 1, p);
+    const int second = get_mem(c, p, &byte, 1);
+    send_log(c, "ar cache first=%d called=%d guarded=%llu second=%d", first, called, (unsigned long long)ret, second);
+}
+AR_CB void ar_on_guarantee(probe_context *c) {
+    send_log(c, "ar guarantee");
+    ULONG want = 128 * 1024;
+    SetThreadStackGuarantee(&want);
+    uint64_t r = 0;
+    call_original(c, 0, &r);                           // unwinds to the program's own handler
+}
+AR_CB void ar_on_epoch(probe_context *c) {
+    auto *control = (ArEpochControl *)(uintptr_t)get_func_arg(c, 0);
+    const auto *config = (const LONG *)get_config(c);
+    SetEvent(control->entered);
+    WaitForSingleObject(control->release, 30000);
+    control->observed = config ? *config : -1;
+    send_log(c, "ar epoch %ld", control->observed);
+}
+AR_CB void ar_on_vector(probe_context *c) {
+    send_log(c, "ar vector");
+    int cp[4]; __cpuid(cp, 1);
+    if (!(cp[2] & (1 << 27))) return;
+    const uint64_t enabled = _xgetbv(0);
+    if ((enabled & 6) != 6) return;
+    const uint64_t mask = 4ull | ((enabled & 0xE0) == 0xE0 ? 0x20ull : 0);
+    alignas(64) unsigned char area[4096] = {};
+    *(unsigned int *)(area + 24) = _mm_getcsr();
+    *(uint64_t *)(area + 512) = mask;
+    for (int i : {2, 5}) {
+        if (!(mask & (1ull << i))) continue;
+        __cpuidex(cp, 0xD, i);
+        if ((unsigned)cp[1] + (unsigned)cp[0] > sizeof(area)) return;
+        for (int j = 0; j < cp[0]; ++j) area[cp[1] + j] = 0xFF;
+    }
+#if defined(_WIN64)
+    _xrstor64(area, mask);
+#else
+    _xrstor(area, mask);
+#endif
+}

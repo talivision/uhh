@@ -12,7 +12,7 @@
 #include <intrin.h>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 28;   /* 28: init_returns (x86hunt); 27: ring record's header and text start on one cache line, log_head on a line of its own (perf5); 26: tblock retired on a line of its own, drain wake-up (drain_wait); 25: per-thread hit blocks (tblocks); 24: huntaudit early_init (on top of 23: runfix1 log carry + running count; 21: held_floor) */
+constexpr uint32_t PROBE_AGENT_VERSION = 30;   /* 30: reusable channel epoch and target mapping handle; 29: init receives a per-session mapping handle (layout unchanged); 28: init_returns (x86hunt); 27: ring record's header and text start on one cache line, log_head on a line of its own (perf5); 26: tblock retired on a line of its own, drain wake-up (drain_wait); 25: per-thread hit blocks (tblocks); 24: huntaudit early_init (on top of 23: runfix1 log carry + running count; 21: held_floor) */
 constexpr uint32_t PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH = 1u << 9;   /* agent side only needs this one */   /* == PROBE_UNSAFE_FAST_PATCH (asserted in session.cpp) */
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 128;   /* inline probes per session; the 129th is refused */
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
@@ -248,11 +248,12 @@ struct probe_agent_shared {
     uint32_t magic;
     uint32_t version;
     uint32_t request_count;
-    uint32_t reserved;
+    volatile LONG session_epoch;  /* controller advances BEFORE reset; never zeroed during reuse */
     volatile LONG service_ready;   /* agent's persistent install thread is waiting on the svc event */
     volatile LONG xstate_mode;     /* bench/test knob: 0 = default (gated), 1 = none, 2 = full, 3 = as without OSXSAVE */
     uint32_t controller_pid;       /* lets producers tell a dead controller from a busy one */
     volatile LONG64 overrides;     /* set_reg calls that changed a register, inline side */
+    uint64_t agent_mapping;        /* retained target handle: reuse the same view on ordinary reattach */
     alignas(64) volatile LONG64 log_head;   /* next position producers claim */
     volatile LONG controller_gone; /* set when the controller stops consuming (detach/close): log calls return at once */
     volatile LONG ring_stalled;    /* controller: the ring is stuck behind a live producer's slot -- use PROBE_IPC_LOG */

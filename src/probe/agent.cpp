@@ -12,10 +12,11 @@
 #include <cstdarg>
 #include <intrin.h>
 #include <immintrin.h>
+#include <new>
 
 static HMODULE self_module;
 static HANDLE mapping;
-static probe_agent_shared *shared;
+static probe_agent_shared *volatile shared;  // MSVC volatile: whole pointer publication on x64/x86
 // Never destroyed: at process exit a static array's destructors would unhook through
 // SafetyHook's stock path (page made non-executable while other threads may still run,
 // and on ntdll stub pages the installer then faults on itself). The process is going
@@ -24,15 +25,14 @@ static SafetyHookMid *const hooks = new SafetyHookMid[PROBE_AGENT_MAX_PROBES];
 static uint64_t sites[PROBE_AGENT_MAX_PROBES];
 static probe_callback callbacks[PROBE_AGENT_MAX_PROBES];
 
-struct AgentState { probe_agent_shared *shared; uint32_t index; };
-static AgentState states[PROBE_AGENT_MAX_PROBES];
+struct AgentState { probe_agent_shared *shared; uint32_t index; probe_session *proxy; LONG epoch; };
 
 /* Callback memory helpers fail closed on bad target addresses. They never change
    page protections: executable writes belong to the hook installer, not hits. */
 /* A bad pointer must fail cleanly WITHOUT raising an exception the target could observe
    (its vectored handlers see first-chance faults before our __except). So the range is
    validated first. The last validated region is cached per thread FOR THE CURRENT HIT
-   (call_mid and call_original reset it), so repeated access to the same buffer/stack/image
+   (call_mid, call_func and call_original reset it), so repeated access to the same buffer/stack/image
    within a callback costs a bounds check, not a syscall -- while a page the target
    decommits, guards or protects between hits is validated afresh (a stale entry faulted,
    and a read of a PAGE_GUARD page consumed the target's guard). The __try stays only for a
@@ -223,7 +223,7 @@ extern "C" int set_reg(probe_context *c, enum probe_register reg, uint64_t value
     if (*slot != value) {
         *slot = value;
         auto *state = static_cast<AgentState *>(c->controller);
-        if (state && state->shared) InterlockedIncrement64(&state->shared->overrides);   // same metric as controller
+        if (state && state->shared && state->epoch == state->shared->session_epoch) InterlockedIncrement64(&state->shared->overrides);   // same metric as controller
     }
     return 1;
 }
@@ -715,7 +715,7 @@ static uint32_t log_carry_block(const HitScope *h);
 // probe_agent_shared.hpp for the only cases that do not end in the ring.
 static void agent_log(probe_context *c, bool stack, const char *format, va_list ap) {
     auto *state = c ? static_cast<AgentState *>(c->controller) : nullptr;
-    if (!state || !state->shared || !format) return;
+    if (!state || !state->shared || !format || state->shared != shared || state->epoch != state->shared->session_epoch) return;
     probe_agent_log local;                     // the record, built on this stack
     // The controller's formatter: an invalid format (%k, %n) used to fast-fail the TARGET
     // through the CRT's invalid-parameter handler; now logged as "[unformattable] <format>".
@@ -818,7 +818,8 @@ extern "C" void send_log_stack(probe_context *c, const char *format, ...) {
 }
 extern "C" const void *get_config(probe_context *c) {
     if (g_ctrl) return g_ctrl->get_config(c);
-    return c ? c->config : nullptr;
+    const auto *state = c ? static_cast<const AgentState *>(c->controller) : nullptr;
+    return state && state->epoch == state->shared->session_epoch ? c->config : nullptr;
 }
 
 // call_func inside the target: resolve and call directly on this (the hit) thread.
@@ -1105,10 +1106,12 @@ extern "C" int call_func(probe_context *c, const char *symbol, uint64_t *ret, in
     const uint64_t fn = resolve_callee(symbol, pin);
     if (!fn) return 0;
 #if defined(_WIN64)
-    return call_raw(fn, a, ret) ? 1 : 0;
+    const int ok = call_raw(fn, a, ret) ? 1 : 0;
 #else
-    return call_raw(fn, a, ret, nargs) ? 1 : 0;
+    const int ok = call_raw(fn, a, ret, nargs) ? 1 : 0;
 #endif
+    forget_region();                                   // the callee may have changed protections
+    return ok;
 }
 
 /* ---- call_original / return_from (inline). ----
@@ -1171,7 +1174,7 @@ struct HitScope;
    own after a non-unwinding longjmp, see hit_scope_live). */
 // Where a hit is counted: the owner's per-thread block (blk, the common path: plain stores,
 // see probe_agent_tblock) or, for a thread without one, its hit_stripes line (interlocked).
-struct HitAcct { probe_agent_tblock *blk; probe_agent_stripe *line; uint32_t probe; };
+struct HitAcct { probe_agent_tblock *blk; probe_agent_stripe *line; uint32_t probe; probe_agent_shared *channel; LONG epoch; };
 // One cache line per slot (alignas(64)): every hit writes its own slot (active, active_acct,
 // active_logged), and threads created together get neighbouring ids, i.e. neighbouring slots --
 // unaligned (x86 72 bytes, x64 120) two threads' hits wrote the same line and it moved between
@@ -1223,9 +1226,10 @@ static bool slot_owner_gone(LONG tid) {
     HANDLE h = OpenThread(SYNCHRONIZE | THREAD_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)tid);
     if (!h) {
         const DWORD e = GetLastError();
-        return e == ERROR_INVALID_PARAMETER || e == ERROR_ACCESS_DENIED;
+        return e == ERROR_INVALID_PARAMETER;
     }
-    const bool gone = GetProcessIdOfThread(h) != GetCurrentProcessId() || WaitForSingleObject(h, 0) == WAIT_OBJECT_0;
+    const DWORD pid = GetProcessIdOfThread(h);
+    const bool gone = (pid && pid != GetCurrentProcessId()) || WaitForSingleObject(h, 0) == WAIT_OBJECT_0;
     CloseHandle(h);
     return gone;
 }
@@ -1377,7 +1381,9 @@ struct OrigPost {                    // x64: written by uhh_orig_thunk (gpr +0x0
     unsigned char xmm[8][16];        // x64 XMM0-5; x86 XMM0-7
 };
 static_assert(offsetof(OrigPost, xmm) == 0x30, "uhh_orig_thunk layout");
+static void hit_settle(const HitAcct &a, bool logged);
 struct HitScope {
+    ~HitScope();
     // Not zero-filled per hit (post / seen are written before they are read: only after
     // call_original ran, see orig_ran) -- ~250 bytes of memset per hit showed on x86.
     HitScope(const HitAcct &a, ThreadSlot *s) : acct(a), slot(s) {}
@@ -1395,6 +1401,8 @@ struct HitScope {
     bool orig_ran = false;
     uint64_t orig_ret = 0;          // RAX / EAX (x86 EDX: probe_context::orig_edx)
     DWORD orig_error = 0, orig_status = 0;
+    ULONG program_guarantee = 0;
+    bool guarantee_saved = false;
     OrigPost post;
     uint64_t seen[6];          // the context's registers matching post.gpr when the original returned
     unsigned char *x87_post = nullptr; // x86: FNSAVE image of the x87 state after the original (an ST0
@@ -1549,7 +1557,7 @@ static void warn_once(probe_context *c, const char *text);
 extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
     if (g_ctrl) return g_ctrl->call_original(c, nargs, out);
     auto *state = c ? static_cast<AgentState *>(c->controller) : nullptr;
-    if (!state || !state->shared || state->index >= PROBE_AGENT_MAX_PROBES) return 0;
+    if (!state || !state->shared || state->epoch != state->shared->session_epoch || state->index >= PROBE_AGENT_MAX_PROBES) return 0;
     if (nargs < 0 || nargs > kOrigMaxArgs) { warn_once(c, "call_original refused: nargs must be 0..16"); return 0; }
     auto *scope = static_cast<HitScope *>(c->hit_scope);
     const uint64_t tramp = state->shared->requests[state->index].trampoline;
@@ -1636,12 +1644,19 @@ extern "C" void return_from(probe_context *c, uint64_t value, int nargs) {
    debugger; the callback itself is passed by EXPORT NAME and the controller runs its
    own copy of the same source (breakpoint/HW probes execute controller-side). */
 struct probe_session { uint32_t site; };
-static probe_session proxies[PROBE_AGENT_MAX_PROBES];
+static probe_session *proxies;                         // one table per distinct channel (reused normally)
+struct AgentChannel {
+    HANDLE handle;
+    probe_agent_shared *view;
+    probe_session *sessions;
+    AgentChannel *next;
+};
+static AgentChannel *g_channels;                       // extra entries only for surviving-callback fallback
 
 extern "C" probe_session *get_session(probe_context *c) {
     if (g_ctrl) return g_ctrl->get_session(c);
     auto *state = c ? static_cast<AgentState *>(c->controller) : nullptr;
-    return state && state->index < PROBE_AGENT_MAX_PROBES ? &proxies[state->index] : nullptr;
+    return state && state->epoch == state->shared->session_epoch && state->index < PROBE_AGENT_MAX_PROBES ? state->proxy : nullptr;
 }
 
 // SEH cannot share a frame with C++ objects; keep the raise in its own function.
@@ -1654,7 +1669,7 @@ static bool raise_ipc(probe_ipc_request *req) {
 
 static int forward(probe_session *s, uint32_t op, uint64_t address, const char *symbol,
                    probe_callback cb, uint32_t flags, const void *config = nullptr, size_t config_len = 0) {
-    if (!s || s < proxies || s >= proxies + PROBE_AGENT_MAX_PROBES || !cb) return 0;
+    if (!s || (uintptr_t)s < (uintptr_t)proxies || (uintptr_t)s >= (uintptr_t)(proxies + PROBE_AGENT_MAX_PROBES) || !cb) return 0;
     if (config_len && !config) return 0;
     probe_ipc_request req{};
     req.op = op; req.flags = flags; req.origin_site = s->site; req.address = address;
@@ -1691,7 +1706,9 @@ static volatile LONG g_stopping;
 // callbacks_interrupted (probe_agent_stripe).
 // A callback ended (returned, or was unwound past): it no longer runs, and its unaccounted
 // unit goes -- unless its first log already carried it (probe_agent_stripe).
+static void restore_hit_guarantee(HitScope *h);
 static void hit_settle(const HitAcct &a, bool logged) {
+    if (a.epoch != a.channel->session_epoch) return;     // old session already reported this hit
     if (probe_agent_tblock *b = a.blk) {                 // the owner's block: plain stores
         if (!logged) probe_agent_store64(&b->done, probe_agent_load64(&b->done) + 1);
         b->running = b->running - 1;
@@ -1701,12 +1718,16 @@ static void hit_settle(const HitAcct &a, bool logged) {
     if (!logged) InterlockedExchangeAdd64(&a.line->value, -PROBE_AGENT_INFLIGHT_ONE);
     InterlockedDecrement64(&a.line->running);
 }
+// Keep running nonzero through the last shared-state operation (including a late warning).
+// The controller may reuse the channel as soon as it observes zero.
+HitScope::~HitScope() { if (!abandoned) hit_settle(acct, logged); }
 // An exception or longjmp left the original (call_original) and is unwinding past this
 // hit's callback: settle what call_mid would have on return (once).
 static void hit_scope_abandon(HitScope *h) {
     if (InterlockedExchange(&h->abandoned, 1)) return;
     if (h->slot && h->slot->active == h) h->slot->active = nullptr;
     if (!h->slot) InterlockedDecrement(&g_untracked_running);   // call_mid's own decrement never runs now
+    restore_hit_guarantee(h);
     hit_settle(h->acct, h->logged);
 }
 // The hit a record from c may carry: c's own, on its own thread while its callback runs (the
@@ -1722,7 +1743,7 @@ static HitScope *log_carrier(probe_context *c) {
 }
 // The block a carried record names (probe_agent_log::reserved): index + 1, 0 = the stripes.
 static uint32_t log_carry_block(const HitScope *h) {
-    return h && h->acct.blk && shared ? (uint32_t)(h->acct.blk - shared->tblocks) + 1 : 0;
+    return h && h->acct.blk && h->acct.channel ? (uint32_t)(h->acct.blk - h->acct.channel->tblocks) + 1 : 0;
 }
 // The carrier's record was published / handed over (the controller retires the unit), or
 // dropped (counted in log_dropped: the unit goes here).
@@ -1788,6 +1809,12 @@ static inline volatile ULONG *teb_stack_guarantee() { return (volatile ULONG *)(
 #else
 static inline volatile ULONG *teb_stack_guarantee() { return (volatile ULONG *)((unsigned char *)NtCurrentTeb() + 0xF78); }
 #endif
+static void restore_hit_guarantee(HitScope *h) {
+    if (h->guarantee_saved) {
+        *teb_stack_guarantee() = h->program_guarantee;
+        h->guarantee_saved = false;
+    }
+}
 static ULONG g_cb_guarantee;             // 0: unknown offset / not needed -- left alone
 static void probe_stack_guarantee_offset() {   // on an agent thread (its guarantee is ours to change)
     // (A request below the system's effective default is a no-op that leaves the field alone:
@@ -1818,6 +1845,11 @@ static bool run_callback(probe_callback cb, probe_context *c) {
     DWORD code = 0;
     volatile ULONG *const guarantee = teb_stack_guarantee();
     const ULONG program_guarantee = g_cb_guarantee ? *guarantee : 0;
+    auto *scope = static_cast<HitScope *>(c->hit_scope);
+    if (g_cb_guarantee && scope) {
+        scope->program_guarantee = program_guarantee;
+        scope->guarantee_saved = true;
+    }
     const bool lift = g_cb_guarantee > program_guarantee;
     if (lift) *guarantee = g_cb_guarantee;
     __try { cb(c); }
@@ -1825,7 +1857,7 @@ static bool run_callback(probe_callback cb, probe_context *c) {
     // A callback that overflowed the stack used up the thread's guard page (the target's
     // stack): restore it, or the program's own next overflow is no longer catchable.
     if (code == EXCEPTION_STACK_OVERFLOW) _resetstkoflw();
-    if (lift) *guarantee = program_guarantee;
+    if (scope) restore_hit_guarantee(scope);
     if (const auto *h = static_cast<const HitScope *>(c->hit_scope); h && h->orig_ran) {
         last_error = h->orig_error; last_status = h->orig_status;
     }
@@ -1857,6 +1889,12 @@ static void load_regs(probe_regs &r, const safetyhook::Context &native) {
 static_assert(sizeof(probe_context) - (offsetof(probe_context, orig_pop) + sizeof(int32_t)) < 8,
               "call_mid initialises probe_context field by field: add the new field there");
 static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char *x87_post) {
+    struct TebScope {
+        DWORD error = *teb_last_error(), status = *teb_last_status();
+        void restore() const { *teb_last_status() = status; *teb_last_error() = error; }
+        ~TebScope() { restore(); }
+    } teb;
+    AgentState state{shared, index, &proxies[index], shared->session_epoch};                     // this hit keeps its own session
     probe_context c;
     load_regs(c.regs, native);
 #if !defined(_WIN64)
@@ -1868,7 +1906,7 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     const auto &request = shared->requests[index];
     c.config = !request.config_len ? nullptr
              : request.config_len > PROBE_AGENT_CONFIG_CAP ? (void *)(uintptr_t)request.config_remote : (void *)request.config;
-    c.ops = &local_ops; c.tid = current_tid(); c.site = index; c.controller = &states[index];
+    c.ops = &local_ops; c.tid = current_tid(); c.site = index; c.controller = &state;
     // Count the hit before the call so a faulting callback is still accounted, and run
     // the callback under SEH so an access violation (or any exception) inside user code
     // cannot take down the target. On a fault we skip register write-back, leaving the
@@ -1882,7 +1920,7 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     if (ts && ts->busy) return false;                      // the agent's own query: see ThreadSlot
     // Count the hit and its unaccounted unit FIRST (a thread killed at any later instant leaves
     // it counted: probe_agent_tblock), then mark a callback running.
-    HitAcct acct{ts ? slot_block(ts, c.tid) : nullptr, nullptr, index};
+    HitAcct acct{ts ? slot_block(ts, c.tid) : nullptr, nullptr, index, state.shared, state.epoch};
     if (probe_agent_tblock *b = acct.blk) {
         probe_agent_store64(&b->hits[index], probe_agent_load64(&b->hits[index]) + 1);
         b->running = b->running + 1;
@@ -1945,11 +1983,12 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     if (ts) { ts->active_acct = acct; ts->active_logged = 0; ts->active = &scope; }
     else InterlockedIncrement(&g_untracked_running);       // no slot at all: see count_live_callbacks
     c.hit_scope = &scope;
+    teb.restore();                                      // bookkeeping must not reach the callback/target
     bool callback_ok = run_callback(cb, &c);
+    teb.error = *teb_last_error(); teb.status = *teb_last_status();
     if (ts) ts->active = nullptr;
     else InterlockedDecrement(&g_untracked_running);
     scope.canary = 0;
-    hit_settle(acct, scope.logged);
     if (!callback_ok) {
         // A faulting callback is a no-op: its register changes are discarded -- unless it had
         // already run the original (call_original). Falling through would run the original a
@@ -2033,8 +2072,8 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
 // CRT: the CRT's memset/memcpy pick AVX paths ending in VZEROUPPER (wiping every YMM upper
 // half the target may have live at a mid-function site), and its x86 rep-stos/movs paths
 // run BACKWARDS if the site executes with DF=1. So: clear DF, then save what the stub
-// does not (MXCSR always; AVX/AVX-512 when live, or unconditionally when the CPU cannot
-// report liveness), using intrinsics only -- then run the hit. The stub restores RFLAGS
+// does not (including enabled AVX/AVX-512 components in INIT), using intrinsics only
+// -- then run the hit. The stub restores RFLAGS
 // (so the target's DF) on the way out.
 // N: the save area, sized to the CPU's need (g_xs.size): 1 KiB covers x87 + SSE + AVX (832
 // bytes) -- no stack probe per hit (an x86 frame over 4 KiB calls __chkstk); 4 KiB otherwise.
@@ -2133,9 +2172,7 @@ static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
     const bool xs_ok = g_xs.ok && xmode != 3;
     uint64_t mask = 0;
     if (xmode != 1 && xs_ok) {
-        if (xmode == 2) mask = g_xs.mask;
-        else if (g_xs.xinuse) mask = _xgetbv(1) & g_xs.avx_mask;  // only components actually live
-        else mask = g_xs.avx_mask;                         // liveness unknown: keep AVX state
+        mask = g_xs.mask;                                  // XRSTOR must initialise components absent in XSTATE_BV too
     }
 #if !defined(_WIN64)
     // Bench knobs, x86: 4 = x87 + MXCSR by FXSAVE, 5 = by FNSAVE (when no AVX state is live).
@@ -2314,8 +2351,18 @@ static void enable_hook(void *p) {
 // ours. Such a hook is abandoned in place (its trampoline and stub leak, never reached).
 static bool site_mapped(uint64_t site);
 static bool bytes_equal(const void *a, const uint8_t *b, size_t n) {
+    uintptr_t at = (uintptr_t)a, end = at + n;
+    if (end < at) return false;
+    while (at < end) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery((void *)at, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) || !(mbi.Protect & 0xFE)) return false;
+        const uintptr_t next = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (next <= at) return false;
+        at = next;
+    }
     __try { return std::memcmp(a, b, n) == 0; }
-    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) { return false; }
+    __except ((GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION || GetExceptionCode() == STATUS_GUARD_PAGE_VIOLATION) ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) { return false; }
 }
 static void disable_hook(void *p) {
     auto *op = static_cast<HookOp *>(p);
@@ -2443,13 +2490,24 @@ static void resolve_callbacks() {
 // SafetyHook reads the site only outside its allocator lock; a hook whose write faulted is
 // abandoned in place (never touched again).
 static bool site_mapped(uint64_t site) {
-    MEMORY_BASIC_INFORMATION mbi{};
-    return VirtualQuery((void *)(uintptr_t)site, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
-           (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+    // Include the decoder's lookahead and a patch straddling two pages (max 14 + 15 bytes).
+    if (!addressable(site, 32)) return false;
+    uintptr_t at = (uintptr_t)site, end = at + 32;
+    if (end < at) return false;
+    while (at < end) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery((void *)at, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) ||
+            !(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) return false;
+        const uintptr_t next = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (next <= at) return false;
+        at = next;
+    }
+    return true;
 }
 static bool seh_run(void (*fn)(void *), void *ctx) {
     __try { fn(ctx); return true; }
-    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) { return false; }
+    __except ((GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION || GetExceptionCode() == STATUS_GUARD_PAGE_VIOLATION) ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) { return false; }
 }
 
 static void install_pending_locked() {
@@ -2476,7 +2534,7 @@ static void install_pending_locked() {
         if (!site_mapped(request.site)) continue;          // its module is going away: stays pending
         if (InterlockedCompareExchange(&request.status, PROBE_AGENT_INSTALLING, PROBE_AGENT_PENDING) != PROBE_AGENT_PENDING)
             continue;
-        sites[i] = request.site; states[i] = {shared, i}; proxies[i].site = i;
+        sites[i] = request.site; proxies[i].site = i;
         if (g_shadow[i].lo) { g_shadow[i].lo = 0; InterlockedDecrement(&g_shadow_count); }
         if (hooks[i]) {
             // A re-install after the module was unloaded: the old hook's code and target are
@@ -2897,7 +2955,7 @@ static void test_init_stall() {
 }
 
 extern "C" volatile long uhh_safetyhook_keep_calls;
-extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
+extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *channel) {
     TidScope<8> own(g_agent_threads);
     // Counted on every return through a usable channel (see init_returns): the controller tells
     // a returned init from one cut off by the target's end.
@@ -2907,13 +2965,23 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
                 InterlockedIncrement(&shared->init_returns);
         }
     } returned;
-    if (!shared) {
-        wchar_t name[64]; probe_agent_mapping_name(GetCurrentProcessId(), name);
-        mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, name);
-        if (!mapping) return 1;
-        shared = static_cast<probe_agent_shared *>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(*shared)));
-        if (!shared || shared->magic != PROBE_AGENT_MAGIC || shared->version != PROBE_AGENT_VERSION) return 2;
+    if (channel && channel != mapping) {
+        AgentChannel *entry = g_channels;
+        while (entry && entry->handle != (HANDLE)channel) entry = entry->next;
+        if (!entry) {
+            auto *view = static_cast<probe_agent_shared *>(MapViewOfFile((HANDLE)channel, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(*shared)));
+            if (!view || view->magic != PROBE_AGENT_MAGIC || view->version != PROBE_AGENT_VERSION) return 2;
+            auto *next_proxies = new (std::nothrow) probe_session[PROBE_AGENT_MAX_PROBES];
+            if (!next_proxies) { UnmapViewOfFile(view); return 4; }
+            entry = new (std::nothrow) AgentChannel{(HANDLE)channel, view, next_proxies, g_channels};
+            if (!entry) { delete[] next_proxies; UnmapViewOfFile(view); return 4; }
+            g_channels = entry;
+        }
+        proxies = entry->sessions;
+        mapping = entry->handle;
+        shared = entry->view;                           // only fallback channels add retained views/handles
     }
+    if (!shared) return 1;
     if (shared->request_count > PROBE_AGENT_MAX_PROBES) return 3;
     g_xmode = shared->xstate_mode;
     // The drain event, opened once and never closed (a producer may be signalling it): the handle

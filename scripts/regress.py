@@ -8170,6 +8170,109 @@ def check_agent_unwind():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def check_agent_safety():
+    """Seven inline-agent review reproductions; fixtures assert their pressure/preconditions.
+    256 live owners fill the hit-block table before the dead/denied-owner sweeps.
+    No CPU support is needed except for the explicitly reported vector subcases."""
+    d, t = exe("ar_driver.exe"), exe("ar_target.exe")
+    if not d or not t:
+        return missing_bin("cdx-agent", "ar_driver/ar_target")
+    cases = [
+        ("guard", "ctrl_cfr_a.dll!CfrValue", "ar_on_empty", {"armed": 1, "stopped": 1, "guard_intact": 1}, 0),
+        ("denied", "ar_target.exe!ar_pressure_site", "ar_on_empty", {"filled": 1, "blocked": 1, "kept": 1, "error": 0x12345678}, 257),
+        ("error", "ar_target.exe!ar_pressure_site", "ar_on_empty", {"filled": 1, "gone": 1, "kept": 0, "error": 0x12345678}, 257),
+        ("guarantee", "ar_target.exe!ar_guarantee_throw", "ar_on_guarantee", {"caught": 1}, 1),
+        ("cache", "ar_target.exe!ar_cache_site", "ar_on_cache", {"guard_intact": 1}, 1),
+        ("vector", "ar_target.exe!ar_vector_site", "ar_on_vector", {"clean": 1}, None),
+    ]
+    for case, symbol, callback, want_row, want_hits in cases:
+        name = f"cdx-agent-{case}-inline"
+        try:
+            r, o = run([d, "--probe", f"{symbol}={callback}", "--", t, f"review-{case}"])
+            row = next((x for x in o if x.get("kind") == "ar"), {})
+            rep = report(o)
+            bad = []
+            if r.returncode != 0 or rep.get("app_exit") != 0: bad.append(f"exit={r.returncode}/{rep.get('app_exit')}")
+            if not row or any(row.get(k) != v for k, v in want_row.items()): bad.append(f"row={row} want={want_row}")
+            if rep.get("error") is not None: bad.append(f"error={rep.get('error')}")
+            if rep.get("log_dropped") != 0 or rep.get("callbacks_interrupted", 0) != 0:
+                bad.append(f"dropped/intr={rep.get('log_dropped')}/{rep.get('callbacks_interrupted')}")
+            hits = sum(p.get("hits") or 0 for p in probes(o))
+            if case == "vector": want_hits = row.get("avx", -1)
+            if hits != want_hits: bad.append(f"hits={hits} want={want_hits}")
+            logs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
+            expected_logs = {"cache": ["ar cache first=1 called=1 guarded=1 second=0"],
+                             "guarantee": ["ar guarantee"], "vector": ["ar vector"] if row.get("avx") else []}.get(case, [])
+            if logs != expected_logs: bad.append(f"logs={logs} want={expected_logs}")
+            if case == "guarantee" and row.get("before") != row.get("after"): bad.append(f"guarantee changed: {row}")
+            detail = str(row)
+            if case == "vector":
+                detail += "; " + ("YMM checked" if row.get("avx") else "AVX skipped: CPU/OS support absent")
+                detail += "; " + ("opmask checked" if row.get("opmask") else "AVX-512 skipped: CPU/OS support absent")
+            record(name, not bad, "; ".join(bad) or detail)
+        except Exception as e:
+            record(name, False, repr(e))
+
+    # A callback suspended past detach keeps the OLD config and never publishes into the
+    # second channel. The new session has exactly one hit/log and no interrupted unit.
+    name = "cdx-agent-epoch-inline"
+    target = None
+    drivers = []
+    try:
+        target = subprocess.Popen([str(t), "review-epoch"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        out, err = Lines(target.stdout), Lines(target.stderr)
+        ready = out.wait_for(lambda l: '"kind":"ready"' in l, 30)
+        if not ready: raise RuntimeError("epoch target not ready")
+        pid = json.loads(ready)["pid"]
+        def attach(config):
+            p = subprocess.Popen([str(d), "--review-attach", str(pid), str(config)], stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            po, pe = Lines(p.stdout), Lines(p.stderr)
+            drivers.append((p, po, pe))
+            if not po.wait_for(lambda l: '"kind":"attached"' in l, 60): raise RuntimeError(f"attach {config} failed: {pe.lines}")
+            if not pe.wait_for(lambda l: l.startswith("probe: active "), 60): raise RuntimeError(f"hook {config} not active: {pe.lines}")
+            return p, po, pe
+        def cue(p, text):
+            p.stdin.write(text); p.stdin.flush()
+        p1, o1, e1 = attach(1)
+        cue(target, "s")
+        if not out.wait_for(lambda l: '"kind":"parked"' in l, 30): raise RuntimeError("callback not parked")
+        cue(p1, "\n"); p1.wait(timeout=90)
+        o1.objs()
+        p2, o2, e2 = attach(2)
+        cue(target, "r")
+        line = out.wait_for(lambda l: '"kind":"ar"' in l, 30)
+        if not line: raise RuntimeError(f"old callback did not return: {out.lines} {err.lines}")
+        row = json.loads(line)
+        # Exit normally so the second session prints a full probe_report.
+        cue(target, "q"); target.wait(timeout=30)
+        if not o2.wait_for(lambda l: '"kind":"probe_report"' in l, 30): raise RuntimeError("no second report")
+        cue(p2, "\n"); p2.wait(timeout=90)
+        second = o2.objs()
+        rep = report(second)
+        hits = sum(p.get("hits") or 0 for p in probes(second))
+        logs = [x.get("message") for x in second if x.get("kind") == "probe_log"]
+        # No log was published, so stdout need not have a probe_final; the detach line
+        # is the authoritative accounting for the first (still suspended) callback.
+        e1.t.join(timeout=10)
+        final = re.search(r"probe: detached: hits=(\d+) logs_written=(\d+) log_dropped=(\d+) in_flight=(\d+) running=(\d+)", "\n".join(e1.lines))
+        bad = []
+        if p1.returncode or p2.returncode or target.returncode: bad.append(f"rc={p1.returncode}/{p2.returncode}/{target.returncode}")
+        if row.get("old_config") != 1 or row.get("new_config") != 2: bad.append(f"configs={row}")
+        if not final or tuple(map(int, final.groups())) != (1, 0, 0, 1, 1): bad.append(f"first detach={e1.lines}")
+        if hits != 1 or logs != ["ar epoch 2"]: bad.append(f"new hits/logs={hits}/{logs}")
+        if rep.get("callbacks_interrupted", 0) != 0 or rep.get("log_dropped") != 0 or rep.get("error") is not None:
+            bad.append(f"new report={rep}")
+        record(name, not bad, "; ".join(bad) or "old hit interrupted=1; config retained=1; new hits=logs=1, dropped=intr=0")
+    except Exception as e:
+        record(name, False, repr(e))
+    finally:
+        for p, _, _ in drivers:
+            if p.poll() is None: p.kill()
+        if target and target.poll() is None: target.kill()
+
+
 def check_agent_review():
     """Inline-agent static review (examples/agent_review), one reproduction per finding
     (agent-unwind: check_agent_unwind). agent-faultafter: a callback that ran the
@@ -8550,6 +8653,7 @@ def lc_reattach(cfgname, cfg, cycles=20):
         tg = LcTarget("--threads", 4, "--churn", "--slow-every", 50, "--slow-ms", 5)
         import random
         rnd = random.Random(1234)
+        mapped_baseline = None
         for k in range(cycles):
             d = LcDriver(tg.pid, cfg, "--detach-on-stdin")
             try:
@@ -8565,6 +8669,14 @@ def lc_reattach(cfgname, cfg, cycles=20):
             logs_total += d.logs
             c = tg.check()
             tg.reset(); time.sleep(0.2); c2 = tg.check()
+            if lc_has_inline(cfg) and c.get("dead") is None:
+                mapped = c.get("mapped_bytes")
+                if not isinstance(mapped, int):
+                    bad.append(f"c{k}: missing mapped-section byte count")
+                elif mapped_baseline is None:
+                    mapped_baseline = mapped
+                elif mapped != mapped_baseline:
+                    bad.append(f"c{k}: mapped bytes={mapped} want={mapped_baseline} (ordinary reattach retained a section view)")
             if not lc_has_inline(cfg) and c.get("dead") is None and c.get("agent_loaded") != 0:
                 bad.append(f"c{k}: agent module in a breakpoint/hw-only target {lc_brief(c)}")
             if not ok_logs or not lc_clean(c) or c2.get("flips") != 0 or d.p.returncode != 0:
@@ -12177,6 +12289,7 @@ def main():
     if want(check_callorig_deep): check_callorig_deep()
     if want(check_callconv): check_callconv()
     if want(check_agent_review): check_agent_review()
+    if want(check_agent_safety): check_agent_safety()
     if want(check_agent_unwind): check_agent_unwind()
     if want(check_callfunc_registry): check_callfunc_registry()
     if want(check_transparency): check_transparency()
