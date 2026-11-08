@@ -165,16 +165,23 @@ int ar_review_case(const char *k) {
         const uint64_t enabled = (cp[2] & (1 << 27)) ? _xgetbv(0) : 0;
         const uint64_t mask = (enabled & 6) == 6 ? (4ull | ((enabled & 0xE0) == 0xE0 ? 0xE0ull : 0)) : 0;
         int clean = 1, bad_phase = -1;
-        const int checks = !mask ? 0 : (mask & 0x20) ? 3 : 2;
+#if defined(_WIN64)
+        const int checks = !mask ? 0 : (mask & 0x20) ? 5 : 2;
+#else
+        const int checks = !mask ? 0 : (mask & 0x20) ? 4 : 2;
+#endif
         for (int phase = 0; phase < checks; ++phase) {
             alignas(64) unsigned char area[4096] = {}, before[4096] = {};
             *(unsigned int *)(area + 24) = _mm_getcsr();
             // 0: all INIT (no-save/x86 FX path). 1: live YMM (ordinary save path).
             // 2: live opmasks, INIT YMM: adding component 2 before saved component 5
             // must NOT change the offsets of the XSAVEC image being restored.
-            const uint64_t live = phase == 1 ? 4ull : phase == 2 ? 0x20ull : 0;
+            // 3/4: a live ZMM upper/high-register component must survive VZEROUPPER on
+            // newly dirtied YMM state (component 6 is restored after VZEROUPPER zeros it).
+            const uint64_t live = phase == 1 ? 4ull : phase == 2 ? 0x20ull
+                                : phase == 3 ? 0x40ull : phase == 4 ? 0x80ull : 0;
             *(uint64_t *)(area + 512) = live;
-            for (int i : {2, 5}) {
+            for (int i : {2, 5, 6, 7}) {
                 if (!(live & (1ull << i))) continue;
                 __cpuidex(cp, 0xD, i);
                 for (int j = 0; j < cp[0]; ++j) area[cp[1] + j] = (unsigned char)(0x50 + phase);
@@ -197,6 +204,7 @@ int ar_review_case(const char *k) {
                 int bytes = cp[0];
 #if !defined(_WIN64)
                 if (i == 2 && bytes > 128) bytes = 128;    // x86 has YMM0..7 only
+                if (i == 6 && bytes > 256) bytes = 256;    // likewise ZMM0..7 upper halves
 #endif
                 for (int j = 0; j < bytes; ++j) {
                     const int got = (bv & (1ull << i)) ? area[cp[1] + j] : 0;

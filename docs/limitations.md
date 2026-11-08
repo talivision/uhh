@@ -273,8 +273,9 @@ data) prints on all backends.
   Ordinary reattach reuses the named channel, its target view/handle and session proxies.
   If the old channel still counts a possibly surviving callback (including a suspended one),
   reattach uses a fresh channel instead; that rare fallback retains the old storage until
-  process exit so the callback's config and accounting pointers remain valid. Epoch checks
-  reject stale per-hit state after a channel reset.
+  process exit so the callback's config and accounting pointers remain valid. The epoch is
+  captured once at callback entry and checked once per log attempt. Callback accounting remains
+  running through the final shared-state access, so ordinary API reads need no epoch check.
 - **x86 inline stack walks** are a verified return-address scan, not PDB-based; a frameless
   function reached by an indirect call can lose its immediate caller
   ([symbols.md](symbols.md#stacks-per-backend-send_log_stack)).

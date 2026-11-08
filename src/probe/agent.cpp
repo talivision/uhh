@@ -13,6 +13,7 @@
 #include <intrin.h>
 #include <immintrin.h>
 #include <new>
+#include <type_traits>
 
 static HMODULE self_module;
 static HANDLE mapping;
@@ -25,7 +26,13 @@ static SafetyHookMid *const hooks = new SafetyHookMid[PROBE_AGENT_MAX_PROBES];
 static uint64_t sites[PROBE_AGENT_MAX_PROBES];
 static probe_callback callbacks[PROBE_AGENT_MAX_PROBES];
 
-struct AgentState { probe_agent_shared *shared; uint32_t index; probe_session *proxy; LONG epoch; };
+struct probe_session { uint32_t site; };
+struct AgentState { probe_agent_shared *shared; uint32_t index; probe_session proxy; };
+static_assert(sizeof(AgentState) == (sizeof(void *) == 8 ? 16 : 12), "keep proxy in the x64 state padding");
+static AgentState *states;                             // immutable per-channel objects, retained with its view
+static __forceinline LONG load_epoch(const probe_agent_shared *sh) {
+    return __iso_volatile_load32(reinterpret_cast<const volatile __int32 *>(&sh->session_epoch));
+}
 
 /* Callback memory helpers fail closed on bad target addresses. They never change
    page protections: executable writes belong to the hook installer, not hits. */
@@ -223,7 +230,7 @@ extern "C" int set_reg(probe_context *c, enum probe_register reg, uint64_t value
     if (*slot != value) {
         *slot = value;
         auto *state = static_cast<AgentState *>(c->controller);
-        if (state && state->shared && state->epoch == state->shared->session_epoch) InterlockedIncrement64(&state->shared->overrides);   // same metric as controller
+        if (state && state->shared) InterlockedIncrement64(&state->shared->overrides);   // same metric as controller
     }
     return 1;
 }
@@ -706,16 +713,23 @@ static void wake_drainer(probe_agent_shared *sh) {
 }
 
 struct HitScope;
-static HitScope *log_carrier(probe_context *c);
-static void log_carried(HitScope *h, bool dropped);
-static uint32_t log_carry_block(const HitScope *h);
+static __forceinline DWORD current_tid();
+static __forceinline bool log_epoch_current(probe_context *c, const probe_agent_shared *sh);
+static __forceinline HitScope *log_carrier(probe_context *c);
+static __forceinline void log_carried(HitScope *h, bool dropped);
+static __forceinline uint32_t log_carry_block(const HitScope *h, const probe_agent_shared *sh);
 
 // Format and stack are produced BEFORE claiming a ring slot so a slot is held only
 // for a copy. A full ring makes the producer wait (backpressure); see the ring's comment in
 // probe_agent_shared.hpp for the only cases that do not end in the ring.
 static void agent_log(probe_context *c, bool stack, const char *format, va_list ap) {
     auto *state = c ? static_cast<AgentState *>(c->controller) : nullptr;
-    if (!state || !state->shared || !format || state->shared != shared || state->epoch != state->shared->session_epoch) return;
+    if (!state || !state->shared || !format) return;
+    auto *sh = state->shared;
+    if (!log_epoch_current(c, sh)) return;              // once per record; running pins this channel until publication
+    if (sh->controller_gone) {
+        InterlockedIncrement(&sh->log_dropped); log_carried(log_carrier(c), true); return;
+    }
     probe_agent_log local;                     // the record, built on this stack
     // The controller's formatter: an invalid format (%k, %n) used to fast-fail the TARGET
     // through the CRT's invalid-parameter handler; now logged as "[unformattable] <format>".
@@ -729,17 +743,13 @@ static void agent_log(probe_context *c, bool stack, const char *format, va_list 
     // from the publish on, the hit is accounted by this record, not as interrupted.
     HitScope *const carrier = log_carrier(c);
     local.carry = carrier ? 1 : 0;
-    local.reserved = log_carry_block(carrier);
-    auto *sh = state->shared;
-    if (sh->controller_gone) {                                    // nobody will read it
-        InterlockedIncrement(&sh->log_dropped); log_carried(carrier, true); return;
-    }
+    local.reserved = log_carry_block(carrier, sh);
     LONG64 pos = sh->log_head;
     probe_agent_log *rec = nullptr;
     // Heartbeat watch: time is accumulated in small steps so a debugger freezing the whole
     // process (when nothing here runs) never counts as the controller being idle.
     ULONGLONG last_tick = 0, idle = 0; LONG64 seen_beat = -1; bool ipc_failed = false;
-    const DWORD me = GetCurrentThreadId();
+    const DWORD me = current_tid();
     for (;;) {
         rec = &sh->logs[(uint64_t)pos % PROBE_AGENT_LOG_CAP];
         LONG64 diff = rec->seq - pos;
@@ -818,8 +828,7 @@ extern "C" void send_log_stack(probe_context *c, const char *format, ...) {
 }
 extern "C" const void *get_config(probe_context *c) {
     if (g_ctrl) return g_ctrl->get_config(c);
-    const auto *state = c ? static_cast<const AgentState *>(c->controller) : nullptr;
-    return state && state->epoch == state->shared->session_epoch ? c->config : nullptr;
+    return c ? c->config : nullptr;
 }
 
 // call_func inside the target: resolve and call directly on this (the hit) thread.
@@ -1174,7 +1183,7 @@ struct HitScope;
    own after a non-unwinding longjmp, see hit_scope_live). */
 // Where a hit is counted: the owner's per-thread block (blk, the common path: plain stores,
 // see probe_agent_tblock) or, for a thread without one, its hit_stripes line (interlocked).
-struct HitAcct { probe_agent_tblock *blk; probe_agent_stripe *line; uint32_t probe; probe_agent_shared *channel; LONG epoch; };
+struct HitAcct { probe_agent_tblock *blk; probe_agent_stripe *line; uint32_t probe; };
 // One cache line per slot (alignas(64)): every hit writes its own slot (active, active_acct,
 // active_logged), and threads created together get neighbouring ids, i.e. neighbouring slots --
 // unaligned (x86 72 bytes, x64 120) two threads' hits wrote the same line and it moved between
@@ -1196,6 +1205,7 @@ struct alignas(64) ThreadSlot {
     LONG blk_gen;
     ULONGLONG blk_retry;
 };
+static_assert(sizeof(ThreadSlot) == 128, "keep each thread slot within two cache lines");
 constexpr uint32_t AGENT_THREAD_SLOTS = 4096;
 static ThreadSlot g_threads[AGENT_THREAD_SLOTS];
 // When every slot is owned (4096 distinct thread ids have hit a probe over the process's life),
@@ -1365,11 +1375,11 @@ static probe_agent_tblock *slot_block(ThreadSlot *ts, DWORD tid) {
 #if defined(_WIN64)
 static inline volatile DWORD *teb_last_status() { return (volatile DWORD *)((unsigned char *)NtCurrentTeb() + 0x1250); }
 static inline volatile DWORD *teb_last_error() { return (volatile DWORD *)((unsigned char *)NtCurrentTeb() + 0x68); }
-static inline DWORD current_tid() { return __readgsdword(0x48); }   // TEB ClientId.UniqueThread
+static __forceinline DWORD current_tid() { return __readgsdword(0x48); }   // TEB ClientId.UniqueThread
 #else
 static inline volatile DWORD *teb_last_status() { return (volatile DWORD *)((unsigned char *)NtCurrentTeb() + 0xBF4); }
 static inline volatile DWORD *teb_last_error() { return (volatile DWORD *)((unsigned char *)NtCurrentTeb() + 0x34); }
-static inline DWORD current_tid() { return __readfsdword(0x24); }
+static __forceinline DWORD current_tid() { return __readfsdword(0x24); }
 #endif
 
 /* The volatile registers call_original's original left: with return_from the caller gets
@@ -1381,16 +1391,15 @@ struct OrigPost {                    // x64: written by uhh_orig_thunk (gpr +0x0
     unsigned char xmm[8][16];        // x64 XMM0-5; x86 XMM0-7
 };
 static_assert(offsetof(OrigPost, xmm) == 0x30, "uhh_orig_thunk layout");
-static void hit_settle(const HitAcct &a, bool logged);
+static __forceinline void hit_settle(const HitAcct &a, bool logged);
 struct HitScope {
-    ~HitScope();
     // Not zero-filled per hit (post / seen are written before they are read: only after
     // call_original ran, see orig_ran) -- ~250 bytes of memset per hit showed on x86.
-    HitScope(const HitAcct &a, ThreadSlot *s) : acct(a), slot(s) {}
+    HitScope(const HitAcct &a, ThreadSlot *s, LONG e) : acct(a), slot(s), epoch(e) {}
     HitAcct acct;                   // where it is counted: its unaccounted unit and running count
     ThreadSlot *slot;               // this thread's slot (null: none free, see thread_slot)
     volatile LONG abandoned = 0;
-    bool logged = false;            // its first log carried the unaccounted unit (see agent_log)
+    LONG epoch;                        // one relaxed snapshot at callback entry; checked by log publication only
     const void *xmm6 = nullptr;     // x64: the hit's XMM6..XMM15 (safetyhook Context, contiguous)
     uintptr_t canary = 0;           // (uintptr_t)this ^ HIT_CANARY while the callback runs
     const void *xmm0 = nullptr;     // the hit's XMM0..XMM5 (vector/float arguments; safetyhook Context)
@@ -1399,16 +1408,18 @@ struct HitScope {
     // OrigPost -- and the thread's last error / last status as the original left them (the
     // callback's own Win32 calls are undone back to these, not to the values before the hit).
     bool orig_ran = false;
+    bool logged = false;            // its first log carried the unaccounted unit (see agent_log)
+    bool guarantee_saved = false;
+    ULONG program_guarantee;       // written before guarantee_saved; pack into the x64 flag padding
     uint64_t orig_ret = 0;          // RAX / EAX (x86 EDX: probe_context::orig_edx)
     DWORD orig_error = 0, orig_status = 0;
-    ULONG program_guarantee = 0;
-    bool guarantee_saved = false;
     OrigPost post;
     uint64_t seen[6];          // the context's registers matching post.gpr when the original returned
     unsigned char *x87_post = nullptr; // x86: FNSAVE image of the x87 state after the original (an ST0
                                        // result): mid_entry's 108-byte buffer, reloaded after the
                                        // extended-state restore
 };
+static_assert(std::is_trivially_destructible_v<HitScope>, "no per-hit destructor/EH cleanup");
 constexpr uintptr_t HIT_CANARY = (uintptr_t)0x5A17C0DEA11CE5EDull;
 static void hit_scope_abandon(HitScope *h);
 // Is h -- this thread's recorded running hit -- still live? A hit nested in a callback runs
@@ -1557,7 +1568,7 @@ static void warn_once(probe_context *c, const char *text);
 extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
     if (g_ctrl) return g_ctrl->call_original(c, nargs, out);
     auto *state = c ? static_cast<AgentState *>(c->controller) : nullptr;
-    if (!state || !state->shared || state->epoch != state->shared->session_epoch || state->index >= PROBE_AGENT_MAX_PROBES) return 0;
+    if (!state || !state->shared || state->index >= PROBE_AGENT_MAX_PROBES) return 0;
     if (nargs < 0 || nargs > kOrigMaxArgs) { warn_once(c, "call_original refused: nargs must be 0..16"); return 0; }
     auto *scope = static_cast<HitScope *>(c->hit_scope);
     const uint64_t tramp = state->shared->requests[state->index].trampoline;
@@ -1643,12 +1654,10 @@ extern "C" void return_from(probe_context *c, uint64_t value, int nargs) {
    callback module to resolve names in). Each call is one synchronous exception to the
    debugger; the callback itself is passed by EXPORT NAME and the controller runs its
    own copy of the same source (breakpoint/HW probes execute controller-side). */
-struct probe_session { uint32_t site; };
-static probe_session *proxies;                         // one table per distinct channel (reused normally)
 struct AgentChannel {
     HANDLE handle;
     probe_agent_shared *view;
-    probe_session *sessions;
+    AgentState *states;
     AgentChannel *next;
 };
 static AgentChannel *g_channels;                       // extra entries only for surviving-callback fallback
@@ -1656,7 +1665,7 @@ static AgentChannel *g_channels;                       // extra entries only for
 extern "C" probe_session *get_session(probe_context *c) {
     if (g_ctrl) return g_ctrl->get_session(c);
     auto *state = c ? static_cast<AgentState *>(c->controller) : nullptr;
-    return state && state->epoch == state->shared->session_epoch && state->index < PROBE_AGENT_MAX_PROBES ? state->proxy : nullptr;
+    return state && state->index < PROBE_AGENT_MAX_PROBES ? &state->proxy : nullptr;
 }
 
 // SEH cannot share a frame with C++ objects; keep the raise in its own function.
@@ -1669,7 +1678,9 @@ static bool raise_ipc(probe_ipc_request *req) {
 
 static int forward(probe_session *s, uint32_t op, uint64_t address, const char *symbol,
                    probe_callback cb, uint32_t flags, const void *config = nullptr, size_t config_len = 0) {
-    if (!s || (uintptr_t)s < (uintptr_t)proxies || (uintptr_t)s >= (uintptr_t)(proxies + PROBE_AGENT_MAX_PROBES) || !cb) return 0;
+    if (!s || !states || !cb) return 0;
+    const uintptr_t offset = (uintptr_t)s - (uintptr_t)&states[0].proxy;
+    if (offset >= sizeof(AgentState) * PROBE_AGENT_MAX_PROBES || offset % sizeof(AgentState)) return 0;
     if (config_len && !config) return 0;
     probe_ipc_request req{};
     req.op = op; req.flags = flags; req.origin_site = s->site; req.address = address;
@@ -1707,8 +1718,9 @@ static volatile LONG g_stopping;
 // A callback ended (returned, or was unwound past): it no longer runs, and its unaccounted
 // unit goes -- unless its first log already carried it (probe_agent_stripe).
 static void restore_hit_guarantee(HitScope *h);
-static void hit_settle(const HitAcct &a, bool logged) {
-    if (a.epoch != a.channel->session_epoch) return;     // old session already reported this hit
+static __forceinline void hit_settle(const HitAcct &a, bool logged) {
+    // The controller reuses a channel only after running==0; live callbacks get a separate
+    // channel on reattach. No epoch read is needed here, and running is the LAST store.
     if (probe_agent_tblock *b = a.blk) {                 // the owner's block: plain stores
         if (!logged) probe_agent_store64(&b->done, probe_agent_load64(&b->done) + 1);
         b->running = b->running - 1;
@@ -1718,9 +1730,14 @@ static void hit_settle(const HitAcct &a, bool logged) {
     if (!logged) InterlockedExchangeAdd64(&a.line->value, -PROBE_AGENT_INFLIGHT_ONE);
     InterlockedDecrement64(&a.line->running);
 }
-// Keep running nonzero through the last shared-state operation (including a late warning).
-// The controller may reuse the channel as soon as it observes zero.
-HitScope::~HitScope() { if (!abandoned) hit_settle(acct, logged); }
+// Explicit finalisation avoids destructor/EH work on every hit while retaining the channel
+// through late warnings. Original-function unwinds settle separately in hit_scope_abandon.
+static __forceinline bool finish_hit(bool result, DWORD error, DWORD status, const HitScope *scope = nullptr) {
+    if (scope && !scope->abandoned) hit_settle(scope->acct, scope->logged);
+    *teb_last_status() = status;
+    *teb_last_error() = error;
+    return result;
+}
 // An exception or longjmp left the original (call_original) and is unwinding past this
 // hit's callback: settle what call_mid would have on return (once).
 static void hit_scope_abandon(HitScope *h) {
@@ -1733,21 +1750,24 @@ static void hit_scope_abandon(HitScope *h) {
 // The hit a record from c may carry: c's own, on its own thread while its callback runs (the
 // slot names it), and only for its first record. A thread without a slot (the table is full)
 // carries nothing: its unit leaves when the callback returns, as before v23.
-static HitScope *log_carrier(probe_context *c) {
+static __forceinline bool log_epoch_current(probe_context *c, const probe_agent_shared *sh) {
+    const auto *h = static_cast<const HitScope *>(c->hit_scope);
+    return h && h->epoch == load_epoch(sh);
+}
+static __forceinline HitScope *log_carrier(probe_context *c) {
     if (!c || !c->hit_scope) return nullptr;
-    ThreadSlot *ts = cached_slot();
-    if (!ts) ts = thread_slot(GetCurrentThreadId(), false);
-    if (!ts || ts->active != c->hit_scope) return nullptr;
     auto *h = static_cast<HitScope *>(c->hit_scope);
+    ThreadSlot *const ts = h->slot;
+    if (!ts || (DWORD)ts->tid != current_tid() || ts->active != h) return nullptr;
     return h->logged ? nullptr : h;
 }
 // The block a carried record names (probe_agent_log::reserved): index + 1, 0 = the stripes.
-static uint32_t log_carry_block(const HitScope *h) {
-    return h && h->acct.blk && h->acct.channel ? (uint32_t)(h->acct.blk - h->acct.channel->tblocks) + 1 : 0;
+static __forceinline uint32_t log_carry_block(const HitScope *h, const probe_agent_shared *sh) {
+    return h && h->acct.blk ? (uint32_t)(h->acct.blk - sh->tblocks) + 1 : 0;
 }
 // The carrier's record was published / handed over (the controller retires the unit), or
 // dropped (counted in log_dropped: the unit goes here).
-static void log_carried(HitScope *h, bool dropped) {
+static __forceinline void log_carried(HitScope *h, bool dropped) {
     if (!h) return;
     if (dropped) {
         if (probe_agent_tblock *b = h->acct.blk) probe_agent_store64(&b->done, probe_agent_load64(&b->done) + 1);
@@ -1845,7 +1865,7 @@ static __forceinline void clear_df() {
 // the original left if call_original ran (see HitScope).
 static bool run_callback(probe_callback cb, probe_context *c, DWORD &last_error, DWORD &last_status) {
     // The entry scope saved these before bookkeeping and restored them at callback entry.
-    // Update that snapshot only for call_original; its destructor restores it on exit.
+    // Update that snapshot only for call_original; finish_hit restores it on every exit.
     bool ok = true;
     DWORD code = 0;
     volatile ULONG *const guarantee = teb_stack_guarantee();
@@ -1894,11 +1914,9 @@ static_assert(sizeof(probe_context) - (offsetof(probe_context, orig_pop) + sizeo
 static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char *x87_post) {
     struct TebScope {
         DWORD error = *teb_last_error(), status = *teb_last_status();
-        void restore() const { *teb_last_status() = status; *teb_last_error() = error; }
-        ~TebScope() { restore(); }
+        __forceinline void restore() const { *teb_last_status() = status; *teb_last_error() = error; }
     } teb;
-    AgentState state{shared, index, &proxies[index], 0};   // this hit keeps its own session
-    state.epoch = state.shared->session_epoch;
+    AgentState *const state = &states[index];
     probe_context c;
     load_regs(c.regs, native);
 #if !defined(_WIN64)
@@ -1907,24 +1925,24 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     c.regs.pc = sites[index]; c.hit_sp = c.regs.rsp;
     c.backend = nullptr; c.ret_pop = 0; c.called_original = 0; c.returned = 0; c.hit_scope = nullptr;
     c.orig_edx = 0; c.orig_pop = 0;
-    const auto &request = state.shared->requests[index];
+    const auto &request = state->shared->requests[index];
     c.config = !request.config_len ? nullptr
              : request.config_len > PROBE_AGENT_CONFIG_CAP ? (void *)(uintptr_t)request.config_remote : (void *)request.config;
-    c.ops = &local_ops; c.tid = current_tid(); c.site = index; c.controller = &state;
+    c.ops = &local_ops; c.tid = current_tid(); c.site = index; c.controller = state;
     // Count the hit before the call so a faulting callback is still accounted, and run
     // the callback under SEH so an access violation (or any exception) inside user code
     // cannot take down the target. On a fault we skip register write-back, leaving the
     // target's registers untouched (the callback behaves as a no-op mutation).
     // A hit is a callback run: while being unhooked the hook passes straight through and
     // that pass is NOT counted (else a detach would report hits that have no callback/log).
-    if (g_agent_threads.has(c.tid) || g_sweeper == (LONG)c.tid) return false;   // the agent's own work: see g_agent_threads, take_dead_slot
+    if (g_agent_threads.has(c.tid) || g_sweeper == (LONG)c.tid) return finish_hit(false, teb.error, teb.status);   // the agent's own work: see g_agent_threads, take_dead_slot
     const probe_callback cb = callbacks[index];
-    if (!cb) return false;
+    if (!cb) return finish_hit(false, teb.error, teb.status);
     ThreadSlot *const ts = my_slot(c.tid);
-    if (ts && ts->busy) return false;                      // the agent's own query: see ThreadSlot
+    if (ts && ts->busy) return finish_hit(false, teb.error, teb.status);                      // the agent's own query: see ThreadSlot
     // Count the hit and its unaccounted unit FIRST (a thread killed at any later instant leaves
     // it counted: probe_agent_tblock), then mark a callback running.
-    HitAcct acct{ts ? slot_block(ts, c.tid) : nullptr, nullptr, index, state.shared, state.epoch};
+    HitAcct acct{ts ? slot_block(ts, c.tid) : nullptr, nullptr, index};
     if (probe_agent_tblock *b = acct.blk) {
         probe_agent_store64(&b->hits[index], probe_agent_load64(&b->hits[index]) + 1);
         b->running = b->running + 1;
@@ -1932,7 +1950,7 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
         // ONE atomic add counts the hit and its unaccounted unit (see probe_agent_stripe): a
         // thread killed between two separate counters left a hit that was neither logged nor
         // interrupted. `running` is separate: it is not accounting.
-        acct.line = &state.shared->hit_stripes[index][(c.tid >> 2) & (PROBE_AGENT_STRIPES - 1)];
+        acct.line = &state->shared->hit_stripes[index][(c.tid >> 2) & (PROBE_AGENT_STRIPES - 1)];
         InterlockedExchangeAdd64(&acct.line->value, 1 + PROBE_AGENT_INFLIGHT_ONE);
         InterlockedIncrement64(&acct.line->running);
     }
@@ -1950,7 +1968,7 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
         } else {
             InterlockedExchangeAdd64(&acct.line->value, -(1 + PROBE_AGENT_INFLIGHT_ONE)); InterlockedDecrement64(&acct.line->running);
         }
-        return false;
+        return finish_hit(false, teb.error, teb.status);
     }
     // A probe hit by code the callback itself runs (call_func of a probed function, or a
     // probed API called directly) is counted but does not re-enter a callback -- exactly
@@ -1967,7 +1985,7 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
         ts->active = nullptr;
     }
     if (ts && ts->active) {
-        hit_settle(acct, false); return false;
+        hit_settle(acct, false); return finish_hit(false, teb.error, teb.status);
     }
     // The mid-hook stub preserves GPRs, flags and XMM0-15 only. The callback (and the CRT
     // it calls) may touch x87/MXCSR/YMM/ZMM state -- e.g. vzeroupper -- which the target
@@ -1976,7 +1994,7 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     // Extended state (MXCSR, AVX/AVX-512) and DF are handled in mid_entry, BEFORE any of
     // this C code runs -- see there.
     forget_region();     // validated regions are trusted within ONE hit only (see RegionCache)
-    HitScope scope{acct, ts};
+    HitScope scope{acct, ts, load_epoch(state->shared)};  // one relaxed snapshot at callback entry
     scope.canary = (uintptr_t)&scope ^ HIT_CANARY;
 #if defined(_WIN64)
     scope.xmm6 = &native.xmm6;
@@ -1999,11 +2017,11 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
         // caller as with return_from: with return_from's value if one was set, else the
         // original's own result (x86: EDX:EAX and the bytes it popped), and everything else
         // the original left, like any return_from after call_original (below).
-        if (!c.called_original || !scope.orig_ran) return false;
+        if (!c.called_original || !scope.orig_ran) return finish_hit(false, teb.error, teb.status, &scope);
         const uint64_t ax = c.returned ? c.regs.rax : scope.orig_ret, dx = c.returned ? c.regs.rdx : c.orig_edx;
 #if !defined(_WIN64)
         if (!c.returned) {
-            if (c.orig_pop < 0 || c.orig_pop > 1020 || (c.orig_pop & 3)) return false;   // not measured
+            if (c.orig_pop < 0 || c.orig_pop > 1020 || (c.orig_pop & 3)) return finish_hit(false, teb.error, teb.status, &scope);   // not measured
             c.ret_pop = (uint32_t)c.orig_pop;
         }
 #endif
@@ -2061,35 +2079,41 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
             for (size_t k = 0; k < std::size(regs); ++k)
                 if (!callback_ok || now[k] == scope.seen[k]) *regs[k] = (uintptr_t)scope.post.gpr[k];
             std::memcpy(&native.xmm0, scope.post.xmm, xmm_n * 16);
-            return scope.x87_post != nullptr;
+            return finish_hit(scope.x87_post != nullptr, teb.error, teb.status, &scope);
         }
-        return false;
+        return finish_hit(false, teb.error, teb.status, &scope);
     } else if (c.returned || c.called_original) {
         warn_once(&c, c.returned ? "return_from could not be applied (no return thunk); the original runs"
                                  : "call_original without return_from -- the original runs again on fall-through");
     }
-    return false;
+    return finish_hit(false, teb.error, teb.status, &scope);
 }
 
-// A callback activated state that was INIT at the hit. Use a separate STANDARD image:
-// XSTATE_BV=0 requests architectural initialisation, XCOMP_BV=0 avoids changing the compacted
-// layout of the original live-component save. Keep the large frame off every unchanged hit.
-static __declspec(noinline) void init_new_xstate(uint64_t mask, unsigned int mxcsr) {
-    alignas(64) unsigned char area[4096];
-    __stosb(area + 512, 0, 64);
-    // Standard XRSTOR reads MXCSR when AVX is requested, even with XSTATE_BV[2]=0.
-    *reinterpret_cast<unsigned int *>(area + 24) = mxcsr;
-#if defined(_WIN64)
-    _xrstor64(area, mask);
-#else
-    _xrstor(area, mask);
-#endif
+// All-zero STANDARD image for components whose architectural initial state is requested.
+// It is immutable and shared by hits; no per-hit frame/header clear or XCOMP_BV modification.
+// AVX's MXCSR dependency is avoided by handling YMM/ZMM0..15 uppers with VZEROUPPER first.
+alignas(64) static const unsigned char g_init_xstate[4096] = {};
+static __declspec(noinline) void init_new_uppers() {
+    // Isolate AVX code from callers that must also run on CPUs without AVX.
+    _mm256_zeroupper();
 }
-static __forceinline void restore_new_xstate(uint64_t saved, unsigned int mxcsr) {
+static __forceinline void restore_new_xstate(uint64_t saved) {
     const uint64_t missing = g_xs.avx_mask & ~saved;
-    if (!missing || !g_xs.xinuse) return;               // no XGETBV(1) on CPUs that do not support it
-    const uint64_t added = _xgetbv(1) & missing;
-    if (added) init_new_xstate(added, mxcsr);
+    if (!missing || !g_xs.xinuse) return;
+    uint64_t added = _xgetbv(1) & missing;
+    if (!added) return;
+    if (added & 0x44ull) {
+        // Collateral zeroing of an originally live ZMM upper is undone by the saved-image
+        // restore immediately afterwards. An unsaved upper was INIT and must stay zero.
+        init_new_uppers();
+        added &= ~0x44ull;
+    }
+    if (!added) return;
+#if defined(_WIN64)
+    _xrstor64(g_init_xstate, added);
+#else
+    _xrstor(g_init_xstate, added);
+#endif
 }
 
 // Entry point of every inline hit. It runs FIRST, before any C code that might call the
@@ -2113,7 +2137,7 @@ static __declspec(noinline) bool mid_entry_saved(safetyhook::Context &native, ui
 #endif
     unsigned int mxcsr = _mm_getcsr();
     const bool x87 = call_mid(native, index, x87_post);
-    restore_new_xstate(mask, mxcsr);
+    restore_new_xstate(mask);
 #if defined(_WIN64)
     _xrstor64(area, mask);
 #else
@@ -2135,12 +2159,12 @@ static __declspec(noinline) bool mid_entry_fx(safetyhook::Context &native, uint3
 #if defined(_WIN64)
     _fxsave64(fx);
     const bool x87 = call_mid(native, index, x87_post);
-    restore_new_xstate(saved, *reinterpret_cast<const unsigned int *>(fx + 24));
+    restore_new_xstate(saved);
     _fxrstor64(fx);
 #else
     _fxsave(fx);
     const bool x87 = call_mid(native, index, x87_post);
-    restore_new_xstate(saved, *reinterpret_cast<const unsigned int *>(fx + 24));
+    restore_new_xstate(saved);
     _fxrstor(fx);
 #endif
     return x87;
@@ -2157,7 +2181,7 @@ static __declspec(noinline) bool mid_entry_fnsave(safetyhook::Context &native, u
             fldcw word ptr [eax] }                          // the program's CW (first word of the image)
     unsigned int mxcsr = _mm_getcsr();
     const bool x87 = call_mid(native, index, x87_post);
-    restore_new_xstate(saved, mxcsr);
+    restore_new_xstate(saved);
     _mm_setcsr(mxcsr);
     __asm { mov eax, p
             frstor [eax] }
@@ -2232,7 +2256,7 @@ static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
     else {
         unsigned int mxcsr = _mm_getcsr();                 // the common case: nothing live but MXCSR
         x87 = call_mid(native, index, x87_post);
-        restore_new_xstate(0, mxcsr);
+        restore_new_xstate(0);
         _mm_setcsr(mxcsr);
     }
 #if !defined(_WIN64)
@@ -2565,7 +2589,7 @@ static void install_pending_locked() {
         if (!site_mapped(request.site)) continue;          // its module is going away: stays pending
         if (InterlockedCompareExchange(&request.status, PROBE_AGENT_INSTALLING, PROBE_AGENT_PENDING) != PROBE_AGENT_PENDING)
             continue;
-        sites[i] = request.site; proxies[i].site = i;
+        sites[i] = request.site;
         if (g_shadow[i].lo) { g_shadow[i].lo = 0; InterlockedDecrement(&g_shadow_count); }
         if (hooks[i]) {
             // A re-install after the module was unloaded: the old hook's code and target are
@@ -3002,13 +3026,14 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *channel) {
         if (!entry) {
             auto *view = static_cast<probe_agent_shared *>(MapViewOfFile((HANDLE)channel, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(*shared)));
             if (!view || view->magic != PROBE_AGENT_MAGIC || view->version != PROBE_AGENT_VERSION) return 2;
-            auto *next_proxies = new (std::nothrow) probe_session[PROBE_AGENT_MAX_PROBES];
-            if (!next_proxies) { UnmapViewOfFile(view); return 4; }
-            entry = new (std::nothrow) AgentChannel{(HANDLE)channel, view, next_proxies, g_channels};
-            if (!entry) { delete[] next_proxies; UnmapViewOfFile(view); return 4; }
+            auto *next_states = new (std::nothrow) AgentState[PROBE_AGENT_MAX_PROBES];
+            if (!next_states) { UnmapViewOfFile(view); return 4; }
+            for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i) next_states[i] = {view, i, {i}};
+            entry = new (std::nothrow) AgentChannel{(HANDLE)channel, view, next_states, g_channels};
+            if (!entry) { delete[] next_states; UnmapViewOfFile(view); return 4; }
             g_channels = entry;
         }
-        proxies = entry->sessions;
+        states = entry->states;
         mapping = entry->handle;
         shared = entry->view;                           // only fallback channels add retained views/handles
     }
