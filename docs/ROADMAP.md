@@ -2490,6 +2490,9 @@ on x64 and x86, before the fix (9a3cbc3).
    resolves again; that behaviour is ntdll's and was not separately tested here. breakpoint/hw: the resolution and the start of the call happen while the target
    is stopped at the debug event, so the resolve -> invoke window does not exist there (an unload by another thread
    while the callee RUNS is the program's own race on every backend).
+   Cost (perf_ab --group methods, 3 interleaved rounds, base = 0465280): inline call_func x64 2,207 -> 2,272 ns,
+   x86 2,217 -> 2,283 ns (+3%, ~65 ns: LdrAddRefDll + LdrUnloadDll; within the harness's 5% "immaterial" bar);
+   inline empty unchanged.
 2. **[P2] Symbol-based data watchpoints were refused as "inside an instruction" (session.cpp arm_probe) -- real, fixed.**
    `boundary-watch-{sym,rva}` (watch_driver now takes any location): PROBE_HW|PROBE_WATCH_WRITE on
    `boundary_target.exe!BndSmc+0x4` and on the same address as module+RVA -- the imm32 of a `mov eax, imm32` in .text
