@@ -350,6 +350,13 @@ struct probe_session {
     bool entry_seen = false;
     bool thread_start_fixup = false;           // library INT3 at ntdll!RtlUserThreadStart armed
     bool restore_fixup = false;                // library INT3s at ntdll!NtContinue[Ex] armed
+    uint64_t debug_dispatch_addr = 0;
+    uhh_session::Probe *debug_dispatch_probe = nullptr;
+    // Windows snapshots the user exception CONTEXT before the debugger edits live DR6.
+    // Repair only UHH's status changes, at dispatcher entry before any target handler.
+    struct DebugDelivery { uint64_t ip = 0; DWORD64 clear_bits = 0, set_bits = 0; };
+    std::unordered_map<DWORD, DebugDelivery> debug_delivery;
+
     std::unordered_map<DWORD, uint64_t> restore_resume;   // x86: a WOW64 restore sent through call_trap -> its real EIP
     bool thread_start_due = false;             // a hw probe was released: arm it after this event
     HANDLE svc_event = nullptr;                // agent service: "install pending requests"
@@ -458,7 +465,7 @@ struct probe_session {
     std::unordered_map<DWORD, LateCall> call_late;
     // Data-watch hits held while a call is in flight (callbacks never overlap): the thread is
     // suspended right after the access, its callback replayed once no call is left.
-    struct WatchHeld { HANDLE thread = nullptr; DEBUG_EVENT ev{}; };
+    struct WatchHeld { HANDLE thread = nullptr; DEBUG_EVENT ev{}; uhh_session::Probe *probes[4]{}; };
     std::vector<WatchHeld> watch_deferred;
     // call_original in flight (breakpoint/hw, see call_original): the probe address the call
     // starts at, the hit's SP, whether the breakpoint entry pass is still pending (the call's
@@ -686,10 +693,11 @@ bool arm_gates_for_pending(probe_session *s);
 bool handle_gate(probe_session *s, const DEBUG_EVENT &event, bool &handled);
 void release_held(probe_session *s, const char *why);
 bool kick_agent(probe_session *s);
+bool reuse_target_agent(probe_session *s);
 bool bind_pending_shared(probe_session *s);
 void retarget_pending(probe_session *s);
 void ipc_thaw(probe_session *s);
-void ipc_freeze_thread(probe_session *s, DWORD tid);
+bool ipc_freeze_thread(probe_session *s, DWORD tid);
 bool handle_ipc(probe_session *s, const DEBUG_EVENT &event);
 HANDLE create_remote_thread_boosted(HANDLE process, LPTHREAD_START_ROUTINE entry, void *argument, DWORD *tid);
 bool start_agent_load(probe_session *s);
@@ -744,6 +752,9 @@ void arm_thread_start_fixup(probe_session *s);
 void release_hw(probe_session *s, Probe &p);
 void enforce_owned_drs(const probe_session *s, DWORD tid, CONTEXT &c, bool clear_stale);
 bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled);
+bool queue_debug_delivery(probe_session *s, DWORD tid, uint64_t ip, DWORD64 clear_bits, DWORD64 set_bits);
+bool repair_debug_delivery(probe_session *s, DWORD tid, const CONTEXT &native);
+
 #if defined(UHH_TEST_HOOKS)
 extern bool g_test_die_on_continue;
 void test_note_repcopy();

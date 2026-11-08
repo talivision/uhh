@@ -4,6 +4,7 @@
 #include <immintrin.h>
 #include <aclapi.h>
 #include <cstring>
+#include <cstdlib>
 #include <initializer_list>
 #include <vector>
 #define AR_EXPORT extern "C" __declspec(dllexport) __declspec(noinline)
@@ -56,6 +57,27 @@ static int epoch_case() {
     CloseHandle(t); CloseHandle(control.entered); CloseHandle(control.release);
     return old_config == 1 && control.observed == 2 ? 0 : 8;
 }
+AR_EXPORT void ar_shared_write_site(int value) { InterlockedExchange(&review_sink, value); }
+AR_EXPORT void ar_shared_read_site() { InterlockedIncrement(&review_sink); }
+AR_EXPORT int ar_config_site() { InterlockedIncrement(&review_sink); return 1; }
+AR_EXPORT void ar_vector_clobber() {
+    int cp[4]; __cpuid(cp, 1);
+    if (!(cp[2] & (1 << 27))) return;
+    const uint64_t enabled = _xgetbv(0);
+    if ((enabled & 6) != 6) return;
+    const uint64_t mask = 4ull | ((enabled & 0xE0) == 0xE0 ? 0x20ull : 0);
+    alignas(64) unsigned char area[4096] = {};
+    *(uint64_t *)(area + 512) = mask;
+    for (int i : {2, 5}) if (mask & (1ull << i)) {
+        __cpuidex(cp, 0xD, i);
+        memset(area + cp[1], 0xA5, (size_t)cp[0]);
+    }
+#if defined(_WIN64)
+    _xrstor64(area, mask);
+#else
+    _xrstor(area, mask);
+#endif
+}
 static int stop_guarded() {
     using Stop = DWORD (WINAPI *)(void *);
     auto fn = (Stop)GetProcAddress(GetModuleHandleW(L"probe_api_agent.dll"), "probe_agent_stop");
@@ -65,6 +87,29 @@ static int stop_guarded() {
 }
 int ar_review_case(const char *k) {
     if (!strcmp(k, "review-epoch")) return epoch_case();
+    if (!strcmp(k, "review-shared") || !strcmp(k, "review-config")) {
+        // /OPT:ICF can fold identical exported bodies, even with different signatures.
+        const bool distinct = (uintptr_t)&ar_shared_write_site != (uintptr_t)&ar_shared_read_site;
+        printf("{\"kind\":\"ready\",\"pid\":%lu,\"distinct\":%d}\n", GetCurrentProcessId(), distinct ? 1 : 0); fflush(stdout);
+        if (!distinct) return 2;
+        int n = 0;
+        for (int ch; (ch = getchar()) != EOF && ch != 'q'; ) {
+            if (ch == 'm') {
+                char text[64] = {}; if (!fgets(text, sizeof(text), stdin)) return 2;
+                MEMORY_BASIC_INFORMATION mbi{};
+                const SIZE_T got = VirtualQuery((void *)(uintptr_t)strtoull(text, nullptr, 16), &mbi, sizeof(mbi));
+                printf("{\"kind\":\"memory\",\"state\":%lu}\n", got ? mbi.State : 0); fflush(stdout);
+            }
+            if (ch == 'x') {
+                ++n;
+                int value = 0;
+                if (!strcmp(k, "review-shared")) { ar_shared_write_site(n); ar_shared_read_site(); }
+                else value = ar_config_site();
+                printf("{\"kind\":\"ar\",\"n\":%d,\"value\":%d}\n", n, value); fflush(stdout);
+            }
+        }
+        return 0;
+    }
     if (!strcmp(k, "review-cache")) {
         void *p = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!p) return 2;

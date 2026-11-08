@@ -1370,6 +1370,8 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             std::fprintf(stderr, "  step-done tid=%lu displaced=%d\n",
                          (unsigned long)event.dwThreadId, step->second.displaced);
         const bool pass = target_hw || step->second.prog_tf;
+        if (pass && !step->second.prog_tf && event.u.Exception.dwFirstChance &&
+            !queue_debug_delivery(s, event.dwThreadId, (uint64_t)EMU_IP(native), 0x4000u, native.Dr6 & 0xE00Fu)) return false;
         stepping.erase(step);
         if (!pass) disposition = DBG_CONTINUE;
         return true;
@@ -1379,6 +1381,8 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         thread = event_thread(s, event.dwThreadId);
         if (!thread || !GetThreadContext(thread, &native)) { set_error(s, win_error("get breakpoint context")); return false; }
     }
+    if (code == EXCEPTION_BREAKPOINT && address == s->debug_dispatch_addr &&
+        !repair_debug_delivery(s, event.dwThreadId, native)) return false;
     if (defer_hits_now(s, event.dwThreadId) && !probe->internal &&
         defer_hit_during_call(s, event.dwThreadId, address, true)) {
         disposition = DBG_CONTINUE; return true;
@@ -1797,6 +1801,7 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
         // whatever handle had reused the value (e.g. a held thread's -> left suspended).
         break;
     case EXIT_THREAD_DEBUG_EVENT: {
+        s->debug_delivery.erase(event.dwThreadId);
         if (event.dwThreadId == s->remote_tid) ok = complete_remote_thread(s, event.u.ExitThread.dwExitCode);
         if (event.dwThreadId == s->ipc_freezer) ipc_thaw(s);       // agent thread died mid-write: never strand the rest
         s->threads.erase(event.dwThreadId);

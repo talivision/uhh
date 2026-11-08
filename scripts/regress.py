@@ -7694,7 +7694,7 @@ def check_ctrl_own_debug():
     d = exe("ctrl_dr_review.exe")
     if not d:
         return missing_bin("ctrl-own-debug", "ctrl_dr_review")
-    for case in ("release", "queued", "queued-same", "queued-rearm", "deferred", "deferred-reused", "deferred-carried-reused", "watch-tf", "watch-tf-carried", "gate", "step-entry", "step-own", "step-mixed", "step-tf", "detach-dr", "detach-tf"):
+    for case in ("release", "queued", "queued-same", "queued-rearm", "deferred", "deferred-reused", "deferred-carried-reused", "watch-tf", "watch-tf-carried", "gate", "step-entry", "step-own", "step-own-detach", "step-mixed", "step-tf", "detach-dr", "detach-tf"):
         name = f"ctrl-own-debug-{case}"
         try:
             r, o = run([d, case], timeout=30)
@@ -8386,6 +8386,196 @@ def check_agent_unwind():
         record("agent-unwind-rebased", False, repr(e))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def check_session_agentipc():
+    """cxr7 agent #1/#2/#4, lifecycle #1/#4 and call #1/#2/#3.
+    Retained images, mixed shared sections, failed safe freezes/stops, retry handles,
+    call XSTATE, deferred-watch allocation pressure and remote call-stub ownership.
+    All failure injection is confined to probe_api_testhooks.
+    """
+    d, t = exe("ar_driver_th.exe"), exe("ar_target.exe")
+    if not d or not t:
+        return missing_bin("session-agentipc", "ar_driver_th/ar_target")
+
+    # Always exercise a real call, including on hosts where the vector phases skip.
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"session-call-basic-{bk}"
+        try:
+            r, o = run([d, "--backend", bk, "--probe", "ar_target.exe!ar_shared_read_site=ar_on_vector_call",
+                        "--", t, "review-shared"], feed="x\nq\n", timeout=20)
+            logs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
+            rep = report(o)
+            ok = (r.returncode == 0 and logs == ["ar vector call 1"] and
+                  sum(x.get("hits", 0) for x in probes(o)) == 1 and rep.get("log_dropped") == 0)
+            record(name, ok, f"logs={logs} report={rep} stderr={r.stderr[-500:]!r}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"session-call-xstate-{bk}"
+        try:
+            r, o = run([d, "--backend", bk, "--probe", "ar_target.exe!ar_vector_site=ar_on_vector_call",
+                        "--", t, "review-vector"], timeout=20)
+            row = next((x for x in o if x.get("kind") == "ar"), {})
+            rep = report(o)
+            logs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
+            n = row.get("checks", -1)
+            ok = (r.returncode == 0 and row.get("clean") == 1 and n >= 0 and
+                  logs == ["ar vector call 1"] * n and sum(x.get("hits", 0) for x in probes(o)) == n and
+                  rep.get("log_dropped") == 0 and rep.get("callbacks_interrupted", 0) == 0)
+            record(name, ok, f"row={row} logs={len(logs)} report={rep}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    for bk in ("breakpoint", "hw"):
+        name = f"session-watch-fiber-{bk}"
+        try:
+            r, o = run([d, "--backend", bk, "--probe", "ar_target.exe!ar_cf_site=ar_on_cf",
+                        "--probe", "ar_target.exe!ar_cfw_setup=ar_on_cfwl_setup", "--", t, "cfwatchlock"],
+                       env=dict(os.environ, UHH_TEST_WATCH_FIBER_FAIL="1"), timeout=20)
+            logs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
+            want = ["ar cfw setup=1", "ar cfw slow ok=1 r=11", "ar cfw watch ok=1 r=9"]
+            rep = report(o)
+            ok = (r.returncode == 0 and sorted(logs) == sorted(want) and sum(x.get("hits", 0) for x in probes(o)) == 3 and
+                  rep.get("log_dropped") == 0 and
+                  rep.get("callbacks_interrupted", 0) == 0 and "probe: test: watch fiber denied" in r.stderr)
+            record(name, ok, f"logs={logs} report={rep}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    def cue(p, text):
+        p.stdin.write(text); p.stdin.flush()
+
+    # Fresh controller processes on every cycle: this also tests shared sections across
+    # different local DLL mappings. Keep the target alive until all memory queries finish.
+    for case in ("shared", "identity", "config", "retry", "stub", "freeze", "freeze-context", "unknown-image"):
+        name = f"session-agentipc-{case}"
+        target = None
+        drivers = []
+        tmp = Path(tempfile.mkdtemp(prefix="uhh-agentipc-"))
+        try:
+            target = subprocess.Popen([str(t), "review-config" if case in ("config", "freeze", "freeze-context") else "review-shared"],
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=BIN)
+            out, err = Lines(target.stdout), Lines(target.stderr)
+            ready = out.wait_for(lambda l: '"kind":"ready"' in l, 10)
+            if not ready: raise RuntimeError(f"target not ready: {err.lines}")
+            pid = json.loads(ready)["pid"]
+            if json.loads(ready).get("distinct") != 1: raise RuntimeError("fixture sites were folded")
+            driver = d
+            if case == "identity":
+                # Only the agent changes between controllers; its retained per-session
+                # target copy remains untouched. A PE timestamp difference proves mismatch.
+                shutil.copy2(d, tmp / d.name)
+                shutil.copy2(BIN / "probe_api_agent.dll", tmp / "probe_api_agent.dll")
+                driver = tmp / d.name
+
+            def attach(mode, cfg=1, env=None, active=1):
+                p = subprocess.Popen([str(driver), "--review-" + mode, str(pid), str(cfg)],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     text=True, cwd=BIN, env=dict(os.environ, **(env or {})))
+                po, pe = Lines(p.stdout), Lines(p.stderr)
+                drivers.append((p, po, pe))
+                if not po.wait_for(lambda l: '"kind":"attached"' in l, 10):
+                    raise RuntimeError(f"not attached: {pe.lines}")
+                if active and not pe.wait_for(lambda l: sum(x.startswith("probe: active ") for x in pe.lines) >= active, 10):
+                    raise RuntimeError(f"not active: {pe.lines}")
+                return p, po, pe
+
+            def detach(p):
+                cue(p, "\n"); p.wait(timeout=20)
+                if p.returncode: raise RuntimeError(f"driver exit={p.returncode}")
+
+            def hit(n):
+                cue(target, "x\n")
+                line = out.wait_for(lambda l: '"kind":"ar"' in l and json.loads(l).get("n") == n, 10)
+                if not line: raise RuntimeError(f"no hit {n}: {out.lines} {err.lines}")
+                return json.loads(line)
+
+            if case in ("shared", "identity"):
+                for n in range(1, 4 if case == "shared" else 2):
+                    p, po, pe = attach("shared", 1 if n % 2 else 2, active=2)
+                    hit(n)
+                    if not po.wait_for(lambda l: l.startswith("{") and json.loads(l).get("message") == f"ar shared {n}", 10):
+                        raise RuntimeError(f"shared value missing: {po.lines}")
+                    detach(p)
+                if case == "identity":
+                    agent = tmp / "probe_api_agent.dll"
+                    data = bytearray(agent.read_bytes())
+                    peoff = int.from_bytes(data[0x3c:0x40], "little")
+                    data[peoff + 8] ^= 1
+                    agent.write_bytes(data)
+                    p = subprocess.Popen([str(driver), "--review-shared", str(pid), "1"], stdin=subprocess.PIPE,
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=BIN)
+                    drivers.append((p, None, None))
+                    output, error = p.communicate("\n", timeout=20)
+                    if p.returncode == 0 or "retained inline agent differs" not in output + error:
+                        raise RuntimeError(f"different image was accepted: rc={p.returncode} {error}")
+                    hit(2)                         # still alive and executing its original code
+            elif case == "unknown-image":
+                p, po, pe = attach("shared", env={"UHH_TEST_REUSE_UNKNOWN": "1"}, active=2)
+                hit(1)
+                if not po.wait_for(lambda l: l.startswith("{") and json.loads(l).get("message") == "ar shared 1", 10):
+                    raise RuntimeError(f"fresh injection did not run callbacks: {po.lines}")
+                detach(p)
+                if not any("probe: test: unrelated image unidentified" in l for l in pe.lines):
+                    raise RuntimeError("unknown-image path was not exercised")
+            elif case == "config":
+                p, po, pe = attach("config", env={"UHH_TEST_STOP_FAIL": "1"})
+                if hit(1).get("value") != 77: raise RuntimeError("config callback not installed")
+                detach(p)
+                # Stop never ran, and no callback was running at the instant of close.
+                if hit(2).get("value") != 77: raise RuntimeError("live hook lost its remote config")
+            elif case == "retry":
+                r, o = run([d, "--review-retry", str(pid), "1"],
+                           env=dict(os.environ, UHH_TEST_ATTACH_FAIL="1"), timeout=20)
+                row = next((x for x in o if x.get("kind") == "retry"), {})
+                if r.returncode or row.get("growth", 100) > 2: raise RuntimeError(f"handle leak: {row} {r.stderr}")
+                hit(1)
+            elif case == "stub":
+                p, po, pe = attach("stub", env={"UHH_TEST_CALL_STUB_TRACE": "1", "UHH_TEST_CALL_STUB_FAIL": "1"})
+                hit(1); hit(2)
+                detach(p)
+                pe.t.join(timeout=10)
+                po.t.join(timeout=2)
+                logs = [json.loads(l).get("message") for l in list(po.lines) if l.startswith("{")]
+                calls = [m for m in logs if isinstance(m, str) and m.startswith("ar vector call ")]
+                if calls != ["ar vector call 0", "ar vector call 1"]:
+                    raise RuntimeError(f"stub failure/retry call results={calls}; stderr={pe.lines}")
+                addresses = re.findall(r"probe: test: call stub ([0-9a-f]+)", "\n".join(pe.lines))
+                if len(addresses) < 2: raise RuntimeError(f"stub failure/retry missing: {pe.lines}")
+                for i, address in enumerate(addresses):
+                    cue(target, "m" + address + "\n")
+                    if not out.wait_for(lambda l: sum('"kind":"memory"' in x for x in out.lines) > i, 10):
+                        raise RuntimeError("memory query timed out")
+                states = [json.loads(x).get("state") for x in list(out.lines) if '"kind":"memory"' in x]
+                if states != [0x10000] * len(addresses): raise RuntimeError(f"stub pages still committed: {states}")
+            else:
+                knob = "UHH_TEST_FREEZE_FAIL" if case == "freeze" else "UHH_TEST_FREEZE_CONTEXT_FAIL"
+                message = "probe: test: freeze denied" if case == "freeze" else "probe: test: freeze context denied"
+                p, po, pe = attach("config", env={knob: "1"}, active=0)
+                if not pe.wait_for(lambda l: message in l, 10): raise RuntimeError("freeze not attempted")
+                # A failed asynchronous install retires its request; attach need not
+                # end the event loop. Assert the actual install outcome, then close it.
+                if not pe.wait_for(lambda l: "inline agent failed to install ar_target.exe!ar_config_site (status=-3)" in l, 10):
+                    raise RuntimeError(f"install failure not reported: {pe.lines}")
+                if any(x.startswith("probe: active ") and "ar_config_site" in x for x in pe.lines):
+                    raise RuntimeError("hook installed despite failed freeze")
+                if hit(1).get("value") != 1: raise RuntimeError("failed freeze still admitted the config callback")
+                detach(p)
+                if hit(2).get("value") != 1: raise RuntimeError("failed freeze left patched code after detach")
+            cue(target, "q\n"); target.wait(timeout=20)
+            if target.returncode: raise RuntimeError(f"target exit={target.returncode} {err.lines}")
+            record(name, True, "target clean; failure path / retained image checks passed")
+        except Exception as e:
+            record(name, False, repr(e))
+        finally:
+            for p, _, _ in drivers:
+                if p.poll() is None:
+                    p.kill(); p.wait(timeout=5)
+            if target and target.poll() is None:
+                target.kill(); target.wait(timeout=5)
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 def check_agent_safety():
@@ -12513,6 +12703,7 @@ def main():
     if want(check_callorig_deep): check_callorig_deep()
     if want(check_callconv): check_callconv()
     if want(check_agent_review): check_agent_review()
+    if want(check_session_agentipc): check_session_agentipc()
     if want(check_agent_safety): check_agent_safety()
     if want(check_agent_unwind): check_agent_unwind()
     if want(check_callfunc_registry): check_callfunc_registry()

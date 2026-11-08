@@ -514,6 +514,62 @@ static bool ensure_local_agent(probe_session *s) {
     return true;
 }
 
+static bool read_file_exports(const std::wstring &path, std::unordered_set<std::string> &out);
+
+// Reattach must map the very same file as the retained target image: this both
+// validates export RVAs and reconnects the image's UHH_SHARED section.
+bool reuse_target_agent(probe_session *s) {
+    bool needed = false;
+    for (const auto &p : s->probes) if ((p->flags & PROBE_INLINE) || !p->shared_export.empty()) needed = true;
+    if (!needed) return true;
+    HMODULE mods[1024]; DWORD need = 0;
+    // Enumeration is only an opportunity to reuse an identified agent. Detours and
+    // loader activity can expose unnamed/transient mappings; they are not evidence
+    // of an incompatible UHH image and must not prevent an ordinary fresh attach.
+    if (!K32EnumProcessModulesEx(s->pi.hProcess, mods, sizeof(mods), &need, LIST_MODULES_ALL)) return true;
+    for (DWORD i = 0; i < std::min<size_t>(need, sizeof(mods)) / sizeof(HMODULE); ++i) {
+        wchar_t path[32768];
+        DWORD n = K32GetModuleFileNameExW(s->pi.hProcess, mods[i], path, (DWORD)(sizeof(path) / sizeof(path[0])));
+#if defined(UHH_TEST_HOOKS)
+        if (!i && std::getenv("UHH_TEST_REUSE_UNKNOWN")) {
+            n = 0; std::fprintf(stderr, "probe: test: unrelated image unidentified\n");
+        }
+#endif
+        if (!n || n >= sizeof(path) / sizeof(path[0])) continue;
+        const wchar_t *base = wcsrchr(path, L'\\');
+        if (_wcsicmp(base ? base + 1 : path, L"probe_api_agent.dll")) continue;
+        std::unordered_set<std::string> exports;
+        if (!read_file_exports(path, exports) || !exports.count("probe_agent_init") ||
+            !exports.count("probe_agent_stop") || !exports.count("probe_agent_bind_controller")) continue;
+        if (!ensure_local_agent(s)) return false;
+        auto read = [](const std::wstring &file, std::vector<unsigned char> &bytes) {
+            HANDLE f = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                                   nullptr, OPEN_EXISTING, 0, nullptr);
+            if (f == INVALID_HANDLE_VALUE) return false;
+            const bool ok = read_whole_file(f, bytes); CloseHandle(f);
+            if (ok) trim_agent_image(bytes);
+            return ok;
+        };
+        std::vector<unsigned char> want, have;
+        if (!read(s->agent_path, want) || !read(path, have)) continue;
+        if (want != have) {
+            set_error(s, "retained inline agent differs from this build; restart the target before attaching"); return false;
+        }
+        // ensure_local_agent may already have bound pending callbacks to the new copy.
+        for (auto &p : s->probes) {
+            HMODULE owner{};
+            if (!(p->flags & PROBE_INLINE) && module_of(reinterpret_cast<const void *>(p->callback), owner) &&
+                owner == s->local_agent && !callback_export_name(p->callback, p->shared_export)) {
+                set_error(s, "cannot rebind retained agent callback"); return false;
+            }
+        }
+        FreeLibrary(s->local_agent); s->local_agent = nullptr; s->agent_prep_module = nullptr;
+        s->agent_path = path; s->agent_prep_error = 0;
+        return ensure_local_agent(s);
+    }
+    return true;
+}
+
 // The export names of the agent DLL FILE (the per-session copy is the same bytes), read from the
 // file's export directory -- so a probe_add can refuse a UHH_SHARED callback the agent does not
 // export without waiting for the agent to load.
@@ -1019,23 +1075,35 @@ void ipc_thaw(probe_session *s) {
     if (any) guard_resync(s);                                // our suspensions are over: off the list
 }
 
-void ipc_freeze_thread(probe_session *s, DWORD tid) {
+bool ipc_freeze_thread(probe_session *s, DWORD tid) {
     HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION,
                           FALSE, tid);                     // (QUERY_LIMITED: GetThreadId, guard_sync)
-    if (!t) return;
+#if defined(UHH_TEST_HOOKS)
+    if (t && std::getenv("UHH_TEST_FREEZE_FAIL")) {
+        CloseHandle(t); std::fprintf(stderr, "probe: test: freeze denied\n"); return false;
+    }
+#endif
+    if (!t) return false;
     guard_note_hold(s, tid);
-    if (SuspendThread(t) == (DWORD)-1) { CloseHandle(t); return; }
-    s->ipc_frozen.push_back(t);
+    if (SuspendThread(t) == (DWORD)-1) { CloseHandle(t); return false; }
+    try { s->ipc_frozen.push_back(t); }
+    catch (...) { ResumeThread(t); CloseHandle(t); return false; }
+    return true;
 }
 
 // A frozen thread stopped strictly inside a range the agent is about to overwrite would
 // resume on torn bytes. Move it to the same instruction in that hook's trampoline, which
 // holds relocated copies of exactly those instructions (one-to-one, in order) and then
 // jumps back to site + patch_len.
-static void move_into_trampoline(probe_session *s, HANDLE t) {
+static bool move_into_trampoline(probe_session *s, HANDLE t) {
     CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL;
     GuardTouch touch(s, GetThreadId(t));
-    if (!GetThreadContext(t, &c)) return;
+#if defined(UHH_TEST_HOOKS)
+    if (std::getenv("UHH_TEST_FREEZE_CONTEXT_FAIL")) {
+        std::fprintf(stderr, "probe: test: freeze context denied\n"); return false;
+    }
+#endif
+    if (!GetThreadContext(t, &c)) return false;
 #if defined(_WIN64)
     uint64_t ip = c.Rip;
 #else
@@ -1063,8 +1131,7 @@ static void move_into_trampoline(probe_session *s, HANDLE t) {
 #else
                 c.Eip = (DWORD)(tramp + q);
 #endif
-                SetThreadContext(t, &c);
-                return;
+                return SetThreadContext(t, &c) != FALSE;
             }
             ZydisDecodedInstruction a{}, b{};
             if (!ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(&dec, nullptr, ob + o, on - o, &a)) ||
@@ -1073,17 +1140,31 @@ static void move_into_trampoline(probe_session *s, HANDLE t) {
         }
         std::fprintf(stderr, "probe: freeze: thread at 0x%llx inside hook range 0x%llx+%u not mapped\n",
                      (unsigned long long)ip, (unsigned long long)site, len);
-        return;
+        return false;
     }
+    return true;
 }
 
 static int32_t ipc_freeze(probe_session *s, DWORD self, uint64_t mask) {
     ipc_thaw(s);                                  // a stale freeze (agent thread died) never stacks
     for (DWORD tid : s->threads) {
         if (tid == self) continue;
-        size_t before = s->ipc_frozen.size();
-        ipc_freeze_thread(s, tid);
-        if (mask && s->ipc_frozen.size() > before) move_into_trampoline(s, s->ipc_frozen.back());
+        if (!ipc_freeze_thread(s, tid)) {
+            ipc_thaw(s); return 0;
+        }
+    }
+    std::vector<CONTEXT> before;
+    try { if (mask) before.resize(s->ipc_frozen.size()); }
+    catch (...) { ipc_thaw(s); return 0; }
+    if (mask) {
+        for (size_t i = 0; i < before.size(); ++i) {
+            before[i].ContextFlags = CONTEXT_CONTROL;
+            if (!GetThreadContext(s->ipc_frozen[i], &before[i])) { ipc_thaw(s); return 0; }
+        }
+        for (size_t i = 0; i < before.size(); ++i) if (!move_into_trampoline(s, s->ipc_frozen[i])) {
+            for (size_t j = 0; j < i; ++j) SetThreadContext(s->ipc_frozen[j], &before[j]);
+            ipc_thaw(s); return 0;
+        }
     }
     s->ipc_freezer = self;
     return 1;

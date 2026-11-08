@@ -276,9 +276,19 @@ reads, a slow (50 ms) callback under 32 threads.
   fixture now compares each delivered event to a separate Windows run with only the
   program's TF/watchpoints: event count, code, location, flags, BS/BD/BT, every target-enabled
   Bn, and the target's DR address/control fields must match. Both VEH snapshots are printed;
-  no target-owned status assertion is removed. The old stderr lacked the failing VEH fields,
-  so combined target-watch preservation still requires this comparison on Windows.
-  Windows verification pending; shared agent layout/version unchanged.
+  no target-owned status assertion is removed. CI round 4 proved an actual delivery bug:
+  reference DR6 was `0xffff0ff1/2`, while UHH delivered `0xffff4ff1/3`. SetThreadContext edits
+  the live registers but does not repair the already-saved exception CONTEXT delivered to
+  VEH/SEH. A temporary internal breakpoint at KiUserExceptionDispatcher now removes UHH's
+  BS/Bn from that saved context, preserves the program's status, and retires after pending
+  deliveries complete. Detach keeps it through its event drain, then removes it too;
+  `ctrl-own-debug-step-own-detach` covers detach immediately after forwarding the #DB.
+  Both reference and observed runs use DEBUG_ONLY_THIS_PROCESS. A pure-TF run also arms a
+  non-firing debugger-owned execute breakpoint in data: with DR7=0 Windows can omit DR6
+  from the captured context even when TF raised #DB. This keeps debug-status capture active
+  on both architectures without adding a target event. Arming, incoming cause, target VEH
+  state and temporary-breakpoint removal are asserted. Windows verification pending;
+  shared agent layout/version unchanged.
 - ✅ (A8) hw: a hardware probe inside a DLL that 4 threads keep LoadLibrary/FreeLibrary-ing missed
   hits (60-125 of 240, "whole threads"). Proven cause (huntaudit): NOT the late UNLOAD suspected
   here -- with the stale-unload guard of 6d0147a disabled, 24 runs (x64 + x86) saw no late unload
@@ -3072,3 +3082,89 @@ keeping the full output, a ring of hardware-breakpoint events and a full minidum
   ROADMAP history keeps its old `session.cpp` references.
 - 🔧 [fan-out] Faster builds (user, 2026-11-05): parallel MSBuild (/MP, MultiToolTask, Directory.Build.rsp -maxCpuCount; `-DUHH_PARALLEL_MSBUILD=OFF` to disable) and `scripts\build.ps1` (Ninja Multi-Config). VM (4 cores), same tree: clean x64 221 s -> 83 s (VS) / 73 s (Ninja), x86 220 s -> 85 s / 66 s; touch session.cpp x64 49 s -> 24 s / 23 s. Still open: PCH / unity for session.cpp, not relinking every example when the library changes
 - ⬜ Final independent whole-codebase sanity review; README/API docs pass
+
+## cxr7 controller injection / calls / lifecycle review (2026-11-08)
+
+Implemented; Windows x64/x86 validation pending (`check_session_agentipc`, estimate in
+`ci_shards.py`). No shared IPC layout change or agent version bump.
+
+- session_agent #1/#2: real despite the epoch/channel reuse redesign. The retained DLL
+  was still selected by basename while init/stop RVAs and UHH_SHARED callbacks came from
+  a new controller copy. Compare normalized agent files before attach, refuse a changed
+  build, and map the retained file in the controller. Checks `session-agentipc-identity`
+  and `session-agentipc-shared` (successive mixed breakpoint/hw + inline sessions).
+- session_agent #4: real; failed open/suspend, context reads, unmapped relocation and
+  context writes now refuse the freeze; undo earlier relocations and thaw on failure.
+  Checks `session-agentipc-freeze` / `session-agentipc-freeze-context`.
+- session_lifecycle #1: real; the documented allowance for callbacks already running
+  does not cover hooks still admitting new callbacks. Keep remote configs if stop did
+  not complete. Check `session-agentipc-config` (stop creation refused, zero running
+  callbacks at close, a new hit reads the last byte of a 4 KiB config after close).
+- session_lifecycle #4: real; close/reset the process handle and clean symbols on failed
+  attach. Check `session-agentipc-retry` (20 failed attaches on one session; handles flat).
+- session_call #1: real; the owner decision about lock/exception effects of hijacked calls
+  does not allow register corruption by a lock-free non-throwing callee. Save/restore the
+  enabled XSTATE components, including components initially in INIT state. Checks
+  `session-call-xstate-{breakpoint,hw,inline}` (existing INIT/live YMM/opmask/ZMM fixture,
+  now with a call_func callee clobbering upper state; AVX phases skip on unsupported CPUs).
+- session_call #2: real; retain a deferred watch and its suspension when a fiber cannot
+  be obtained; account held hits as dropped if replay is impossible at final shutdown.
+  Checks `session-watch-fiber-{breakpoint,hw}` (one failed replay allocation; exact logs).
+- session_call #3: real; release failed call-stub writes and register successful allocations
+  in scratch_blocks. Check `session-agentipc-stub` queries both allocations from the still
+  live target after close and requires MEM_FREE.
+
+### agentipc CI follow-up (run 42461348615)
+
+Windows CI exposed a library regression and three fixture assumptions; corrections below
+are implemented but await Windows x64/x86 rerun. Existing Detours checks are unchanged.
+
+- `reuse_target_agent` no longer rejects an attach because module enumeration or an
+  unrelated module's filename lookup failed. Only an identified `probe_api_agent.dll`
+  carrying the agent init/stop/controller-bind exports is considered for reuse; an actual
+  byte mismatch still refuses that reuse. Unidentified modules fall through to the
+  existing fresh-injection path. `session-agentipc-unknown-image` deterministically
+  suppresses one unrelated image's filename and requires fresh mixed callbacks to run;
+  `session-agentipc-identity` still requires a changed retained agent to be refused.
+- The shared fixture's write/read sites had identical `InterlockedIncrement` bodies and
+  were eligible for MSVC /OPT:ICF folding, placing inline and breakpoint probes on one
+  instruction. The writer now exchanges its argument into the sink; the fixture also
+  asserts that the site addresses differ. Reattach still requires values 1, 2 and 3 to
+  cross the mixed backends in successive controller processes.
+- Retry measurements now end each debugger thread before taking the next handle count,
+  while retaining the same session across attempts. Each throwaway thread explicitly
+  releases its DbgUi debug object after detach, excluding debug-object/event lifetimes
+  from the measurement. Leaked explicit OpenProcess handles survive this cleanup and
+  remain visible. One warm-up precedes the measured 20 failed retries.
+- Freeze checks assert the reported HOOK_FAILED status and native return value (1, versus
+  the callback's 77), both before and after detach. They no longer assume an asynchronous
+  failed install must end probe_run, nor wait for an unrelated mixed reader's guard.
+- New-check waits are 10 s for progress and 20 s for process completion, replacing 30/60/90/
+  120 s waits. Removed the live pipe-reader join on a failure path; killed children are
+  reaped. The CI estimate is 20/25 s, to be updated from the next Windows run.
+
+### agentipc call-context follow-up (run 42475546386)
+
+The failure summary shows breakpoint/hw calls returning 0, but does not contain the
+XSTATE API failure stage/error. Windows verification and that diagnostic are pending;
+these changes must not yet be described as a confirmed fix of the CI failures.
+
+- Restrict the call snapshot to system-enabled XCR0 user components allowed by the
+  architecture's SDK mask. Do not request system-only/supervisor components; CET_U/SSP
+  continues through thread_ssp on abandoned x64 calls. x86 keeps EXTENDED_REGISTERS for
+  XMM0-7; x64 keeps FLOATING_POINT. Include the legacy mask when selecting snapshot state.
+- Validate InitializeContext's size-query result and supported context flags. Preserve
+  those flags across GetThreadContext and materialize absent extended components' INIT
+  bytes before selecting them for restore. Setting their validity bits alone is unsafe:
+  GetThreadContext leaves absent components' data undefined (GetXStateFeaturesMask docs).
+- Report every new context-setup failure through the existing once-per-probe call_refused
+  diagnostic, with API stage, Win32 error and requested mask, instead of silently returning 0.
+- Add session-call-basic-{breakpoint,hw,inline} to always require one successful call even
+  when the vector fixture has no AVX phases. The stub lifetime check now also requires the
+  failed write to return call_func=0 and its retry to return call_func=1, before querying
+  both allocations as MEM_FREE after close. Previously it could pass with every call failing.
+- The stub still enters through CALL RAX/EAX and the return INT3, so CET's shadow-stack
+  pairing is retained. Its allocation is not freed by run_call: successful allocations stay
+  in scratch_blocks until session cleanup, after finish_calls/detach; failed writes free
+  immediately. Existing conformance, transparency, reuse, concurrent-call and CET checks
+  remain unchanged and must pass on Windows before this follow-up is considered verified.

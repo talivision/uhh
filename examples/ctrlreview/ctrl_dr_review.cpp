@@ -13,6 +13,7 @@ struct ChildState {
     LONG data[8];
 };
 static ChildState child_state{};
+static uint64_t child_done = 0;
 static unsigned callbacks = 0;
 static void hit(probe_context *) { ++callbacks; }
 static void dr_require(bool ok, const char *stage) {
@@ -22,6 +23,11 @@ static void dr_require(bool ok, const char *stage) {
     }
 }
 static LONG CALLBACK child_veh(EXCEPTION_POINTERS *e) {
+    if (child_done && e->ExceptionRecord->ExceptionCode == EXCEPTION_BREAKPOINT &&
+        (uint64_t)(uintptr_t)e->ExceptionRecord->ExceptionAddress == child_done) {
+        EMU_IP(*e->ContextRecord) = (decltype(EMU_IP(*e->ContextRecord)))(child_done + 1);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
     ++child_state.seen;
     child_state.flags = e->ContextRecord->EFlags;
@@ -36,30 +42,33 @@ static LONG CALLBACK child_veh(EXCEPTION_POINTERS *e) {
     e->ContextRecord->Dr6 = 0;
     return EXCEPTION_CONTINUE_EXECUTION;
 }
-static int child() {
+static int child(bool linger) {
     // pcmpeqd xmm0,xmm0; int3 (ready); movq [CX],xmm0; nop; int3 (done); ret.
     // One eight-byte store can fire distinct dword watches on data[0] and data[1],
     // on x64 and x86. CX is the first __fastcall argument on both architectures.
     const unsigned char code[] = {0x66,0x0F,0x76,0xC0, 0xCC, 0x66,0x0F,0xD6,0x01, 0x90,0xCC,0xC3};
     void *mem = VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
     if (!mem || !AddVectoredExceptionHandler(1, child_veh)) return 3;
+    if (linger) child_done = (uint64_t)(uintptr_t)mem + 10;
     std::memcpy(mem, code, sizeof(code));
     FlushInstructionCache(GetCurrentProcess(), mem, sizeof(code));
     const ULONG_PTR info[] = {(ULONG_PTR)mem, (ULONG_PTR)&child_state};
     RaiseException(announce, 0, 2, info);
     reinterpret_cast<void (__fastcall *)(LONG *)>(mem)(child_state.data);
+    if (linger) Sleep(INFINITE);
     return 0;
 }
 struct Debuggee {
     PROCESS_INFORMATION pi{};
     DEBUG_EVENT ev{};
     bool pending = false, attached = true;
-    uint64_t code = 0, state = 0;
-    Debuggee() {
+    uint64_t code = 0, state = 0, ntdll = 0;
+    probe_session *session = nullptr; // only the UHH run dispatches library-owned events
+    explicit Debuggee(bool linger = false) {
         char path[MAX_PATH];
         const DWORD n = GetModuleFileNameA(nullptr, path, MAX_PATH);
         dr_require(n && n < MAX_PATH, "child executable path");
-        std::string command = std::string("\"") + path + "\" --dr-child";
+        std::string command = std::string("\"") + path + (linger ? "\" --dr-child-detach" : "\" --dr-child");
         STARTUPINFOA startup{}; startup.cb = sizeof(startup);
         dr_require(!!CreateProcessA(nullptr, command.data(), nullptr, nullptr, FALSE, DEBUG_ONLY_THIS_PROCESS,
                                  nullptr, nullptr, &startup, &pi), "create debuggee");
@@ -93,7 +102,12 @@ struct Debuggee {
         const ULONGLONG until = GetTickCount64() + 10000;
         while (GetTickCount64() < until) {
             if (!WaitForDebugEvent(&ev, 100)) continue;
-            pending = true; close_file(ev);
+            pending = true;
+            if (ev.dwDebugEventCode == LOAD_DLL_DEBUG_EVENT) {
+                const auto base = (uint64_t)(uintptr_t)ev.u.LoadDll.lpBaseOfDll;
+                if (iequals(event_module_name(pi.hProcess, ev.u.LoadDll.hFile, base), "ntdll.dll")) ntdll = base;
+            }
+            close_file(ev);
             dr_require(ev.dwDebugEventCode != EXIT_PROCESS_DEBUG_EVENT, "child alive");
             if (ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
                 auto &ex = ev.u.Exception.ExceptionRecord;
@@ -105,6 +119,12 @@ struct Debuggee {
                     if (ex.ExceptionCode == 0x4000001Fu) ex.ExceptionCode = EXCEPTION_BREAKPOINT;
                     const uint64_t at = (uint64_t)(uintptr_t)ex.ExceptionAddress;
                     if (ex.ExceptionCode == wanted && at == (address ? address : code + 4) && code) return;
+                    if (session && ((ex.ExceptionCode == EXCEPTION_BREAKPOINT && probe_at(session, at)) ||
+                        (ex.ExceptionCode == EXCEPTION_SINGLE_STEP && session->stepping.count(ev.dwThreadId)))) {
+                        DWORD disposition = 0;
+                        dr_require(dispatch_event(session, ev, disposition), "dispatch library exception-context repair");
+                        resume(disposition); continue;
+                    }
                     // The only unsolicited exception is the initial loader breakpoint.
                     if (code || ex.ExceptionCode != EXCEPTION_BREAKPOINT)
                         std::fprintf(stderr, "dr-review: unexpected code=0x%lx at=0x%llx wanted=0x%lx at=0x%llx\n",
@@ -143,8 +163,15 @@ static void initial_flags(CONTEXT &c) {
     // PCMPEQD and MOVQ leave EFLAGS unchanged. Bit 1 is reserved, not a program flag.
     c.EFlags &= ~(0x8D5u | 0x100u | 0x10000u);
 }
+static void passive_debug_register(CONTEXT &c, uint64_t data) {
+    // With DR7=0 Windows can omit debug status from its captured CONTEXT even though
+    // TF really raised #DB. Use the same debug-active context class as the UHH run:
+    // a debugger-owned EXECUTE breakpoint in data, which no instruction can execute.
+    c.Dr3 = (decltype(c.Dr3))(data + 16);
+    c.Dr7 |= (decltype(c.Dr7))1 << 6;
+}
 static unsigned target_slots_for(const std::string &mode) {
-    return mode == "step-own" ? 1u : mode == "step-mixed" ? 2u : 0u;
+    return (mode == "step-own" || mode == "step-own-detach") ? 1u : mode == "step-mixed" ? 2u : 0u;
 }
 static void print_veh(const char *label, const ChildState &r) {
     std::fprintf(stderr, "dr-review: %s VEH seen=%ld flags=0x%lx dr6=0x%llx dr7=0x%llx ip=0x%llx exception=0x%llx code=0x%lx\n",
@@ -161,10 +188,19 @@ static ChildState reference_event(const std::string &mode) {
     c.Dr2 = c.Dr3 = c.Dr6 = c.Dr7 = 0;
     for (unsigned k = 0; k < 2; ++k)
         if (slots & (1u << k)) c.Dr7 |= ((decltype(c.Dr7))1 << (k * 2)) | ((decltype(c.Dr7))0xD << (16 + k * 4));
-    if (!slots) c.EFlags |= 0x100u; // the PROGRAM's step, without any UHH watch/step
-    d.put(c); d.resume(); d.wait(EXCEPTION_SINGLE_STEP, d.code + 9);
+    if (!slots) {
+        passive_debug_register(c, data);
+        c.EFlags |= 0x100u; // the PROGRAM's step; the passive debugger register cannot fire
+    }
+    d.put(c);
+    const auto armed = d.get();
+    if (!slots) dr_require((armed.EFlags & 0x100u) && (armed.Dr7 & 0x40u) && armed.Dr3 == data + 16,
+                           "reference TF and non-firing debugger register armed");
+    d.resume(); d.wait(EXCEPTION_SINGLE_STEP, d.code + 9);
     const auto incoming = d.get();
     const DWORD64 mask = 0xE000u | slots;
+    std::fprintf(stderr, "dr-review: reference #DB dr6=0x%llx dr7=0x%llx flags=0x%lx\n",
+                 (unsigned long long)incoming.Dr6, (unsigned long long)incoming.Dr7, (unsigned long)incoming.EFlags);
     dr_require((incoming.Dr6 & mask) == (slots ? slots : 0x4000u), "reference exception cause");
     d.resume(DBG_EXCEPTION_NOT_HANDLED); d.wait(EXCEPTION_BREAKPOINT, d.code + 10);
     const auto result = d.result(); print_veh("reference", result);
@@ -181,6 +217,13 @@ static void compare_event(const Debuggee &d, const ChildState &reference, const 
     // Keep BS/BD/BT and EVERY target-enabled B-bit in the comparison. Only raw Bn of
     // non-target slots (not architecturally meaningful for the program) are excluded.
     const DWORD64 mask = 0xE000u | slots;
+    dr_require(!d.session || d.session->debug_delivery.empty(), "saved debug exception context repaired");
+    if (d.session && d.session->debug_dispatch_probe) {
+        const Probe *p = d.session->debug_dispatch_probe;
+        unsigned char byte = 0; SIZE_T n = 0;
+        dr_require(!p->active && !!ReadProcessMemory(d.pi.hProcess, (void *)(uintptr_t)p->address, &byte, 1, &n) &&
+                   n == 1 && byte == p->original, "temporary dispatcher breakpoint removed");
+    }
     dr_require(result.seen == reference.seen && result.exception_code == reference.exception_code &&
                result.parameters == reference.parameters && result.ip == d.code + 9 &&
                result.exception_address == d.code + 9, "target event count/code/location unchanged");
@@ -196,7 +239,8 @@ static void compare_event(const Debuggee &d, const ChildState &reference, const 
 }
 
 int run(int argc, char **argv) {
-    if (argc == 2 && !std::strcmp(argv[1], "--dr-child")) return child();
+    if (argc == 2 && !std::strcmp(argv[1], "--dr-child")) return child(false);
+    if (argc == 2 && !std::strcmp(argv[1], "--dr-child-detach")) return child(true);
     if (argc != 2) return 2;
     const std::string mode = argv[1];
     bool ok = false;
@@ -204,13 +248,15 @@ int run(int argc, char **argv) {
     try {
         ChildState reference{};
         if (mode == "watch-tf" || mode == "watch-tf-carried" || mode == "step-own" ||
-            mode == "step-mixed" || mode == "step-tf") reference = reference_event(mode);
-        Debuggee d;
+            mode == "step-mixed" || mode == "step-tf" || mode == "step-own-detach") reference = reference_event(mode);
+        Debuggee d(mode == "step-own-detach");
         d.wait(EXCEPTION_BREAKPOINT); // after the loader: the child's ready INT3
         auto session = std::make_unique<probe_session>();
         auto *s = session.get();
         s->pi = d.pi; s->threads.insert(d.pi.dwThreadId); s->thread_handle[d.pi.dwThreadId] = d.pi.hThread;
         s->event_tid = d.pi.dwThreadId; s->initial_break = true;
+        dr_require(d.ntdll != 0, "observe target ntdll mapping");
+        s->module_bases["ntdll.dll"] = d.ntdll; d.session = s;
         s->detaching = true; // no asynchronous library installs in this isolated dispatcher
         const uint64_t site = d.code + 5, done = d.code + 10;
         const uint64_t old_address = d.state + offsetof(ChildState, data), new_address = old_address + 4;
@@ -337,10 +383,10 @@ int run(int argc, char **argv) {
             dr_require(dispatch_event(s, d.ev, disposition) && disposition == DBG_CONTINUE, "software hit dispatched");
             const auto st = s->stepping.find(d.pi.dwThreadId);
             dr_require(st != s->stepping.end() && !st->second.displaced && st->second.prog_tf && callbacks == 1, "program TF steps at real site");
-        } else if (mode == "step-own" || mode == "step-tf" || mode == "step-mixed") {
+        } else if (mode == "step-own" || mode == "step-tf" || mode == "step-mixed" || mode == "step-own-detach") {
             const bool mixed = mode == "step-mixed", tf = mode == "step-tf";
             p->active = mixed; s->hw_active = mixed ? 1 : 0; s->dr_used = s->dr_ever = mixed ? 1 : 0;
-            if (tf) c.Dr7 = 0;
+            if (tf) { c.Dr7 = 0; passive_debug_register(c, old_address); }
             StepState st{}; st.site = site; st.insn_len = 4; st.prog_tf = tf;
             s->stepping.emplace(d.pi.dwThreadId, st);
             if (tf) {
@@ -354,7 +400,15 @@ int run(int argc, char **argv) {
             DWORD disposition = 0;
             dr_require(dispatch_event(s, d.ev, disposition) && disposition == DBG_EXCEPTION_NOT_HANDLED, "step forwards target exception");
             dr_require(s->stepping.empty() && callbacks == (mixed ? 1u : 0u) && p->hits == (mixed ? 1u : 0u), "step completion and mixed callback");
-            d.resume(disposition); d.wait(EXCEPTION_BREAKPOINT, done);
+            d.resume(disposition);
+            if (mode == "step-own-detach") {
+                // Detach before the queued dispatcher catch is serviced. Its drain must
+                // repair the target's context, then remove the temporary INT3 too.
+                detach(s);
+                BOOL debugged = TRUE;
+                dr_require(!!CheckRemoteDebuggerPresent(d.pi.hProcess, &debugged) && !debugged, "detach with pending debug delivery");
+                d.attached = false;
+            } else d.wait(EXCEPTION_BREAKPOINT, done);
             compare_event(d, reference, mode);
         } else if (mode == "detach-dr" || mode == "detach-tf") {
             const bool tf = mode == "detach-tf";

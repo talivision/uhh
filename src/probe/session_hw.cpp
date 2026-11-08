@@ -480,6 +480,73 @@ void enforce_owned_drs(const probe_session *s, DWORD tid, CONTEXT &c, bool clear
         c.Dr7 = (decltype(c.Dr7))dr7;
     }
 }
+// SetThreadContext changes the live register image, but Windows has already saved the
+// exception CONTEXT that KiUserExceptionDispatcher will give VEH/SEH. A combined #DB
+// otherwise leaks our BS/Bn to the target (CI: 0xffff4ff3 instead of 0xffff0ff2).
+static void debug_delivery_noop(probe_context *) {}
+bool queue_debug_delivery(probe_session *s, DWORD tid, uint64_t ip, DWORD64 clear_bits, DWORD64 set_bits) {
+    if (!clear_bits && !set_bits) return true;
+    if (!s->debug_dispatch_addr) {
+        s->debug_dispatch_addr = resolve_symbol(s, "ntdll.dll!KiUserExceptionDispatcher");
+        if (!s->debug_dispatch_addr) { set_error(s, "cannot resolve debug exception dispatcher"); return false; }
+    }
+    if (!probe_at(s, s->debug_dispatch_addr)) {
+        if (!s->debug_dispatch_probe) {
+            auto p = std::make_unique<Probe>();
+            p->location = "<debug-delivery>"; p->rva = s->debug_dispatch_addr;
+            p->internal = true; p->callback = debug_delivery_noop;
+            Probe *raw = p.get(); s->probes.push_back(std::move(p)); s->debug_dispatch_probe = raw;
+        }
+        auto &p = *s->debug_dispatch_probe;
+        p.flags = PROBE_BREAKPOINT; p.retired = false;
+        if (!arm_breakpoint(s, p, 0)) return false;
+    }
+    auto &d = s->debug_delivery[tid];
+    d.ip = ip; d.clear_bits |= clear_bits;
+    d.set_bits = (d.set_bits & ~clear_bits) | set_bits;
+    return true;
+}
+bool repair_debug_delivery(probe_session *s, DWORD tid, const CONTEXT &native) {
+    const auto it = s->debug_delivery.find(tid);
+    if (it != s->debug_delivery.end()) {
+        uint64_t rec = (uint64_t)EMU_SP(native);
+        size_t n = 0;
+#if defined(_WIN64)
+        // Fixed dispatcher ABI: CONTEXT, CONTEXT_EX (0x18), alignment (8), record.
+        const uint64_t exception = rec + sizeof(CONTEXT) + 0x20;
+#else
+        // Dispatcher has no return address: [ESP]=EXCEPTION_RECORD*, [ESP+4]=CONTEXT*.
+        uint32_t ptrs[2]{};
+        if (!remote_read(s->pi.hProcess, rec, ptrs, sizeof(ptrs), &n) || n != sizeof(ptrs)) {
+            set_error(s, "read debug exception context pointer"); return false;
+        }
+        const uint64_t exception = ptrs[0]; rec = ptrs[1];
+#endif
+        EXCEPTION_RECORD ex{};
+        if (!remote_read(s->pi.hProcess, exception, &ex, sizeof(ex), &n) || n != sizeof(ex)) {
+            set_error(s, "read debug exception record"); return false;
+        }
+        if (ex.ExceptionCode != EXCEPTION_SINGLE_STEP && ex.ExceptionCode != 0x4000001Eu) return true;
+        // x64: the fixed CONTEXT starts at RSP, before CONTEXT_EX and EXCEPTION_RECORD.
+        CONTEXT img{};
+        if (!remote_read(s->pi.hProcess, rec, &img, sizeof(img), &n) || n != sizeof(img)) {
+            set_error(s, "read debug exception context"); return false;
+        }
+        if ((img.ContextFlags & CONTEXT_CONTROL) != CONTEXT_CONTROL || (uint64_t)EMU_IP(img) != it->second.ip)
+            return true; // another (nested) exception: leave its context entirely alone
+        const auto dr6 = (decltype(img.Dr6))((img.Dr6 & ~it->second.clear_bits) | it->second.set_bits);
+        if (!remote_write(s->pi.hProcess, rec + offsetof(CONTEXT, Dr6), &dr6, sizeof(dr6), &n) || n != sizeof(dr6)) {
+            set_error(s, "write debug exception status"); return false;
+        }
+        s->debug_delivery.erase(it);
+    }
+    // Last delivery: the ordinary one-shot path restores the byte and runs at the real
+    // dispatcher entry without a TF step. A user's probe at the site keeps its own flags.
+    if (s->debug_delivery.empty() && s->debug_dispatch_probe && s->debug_dispatch_probe->active)
+        s->debug_dispatch_probe->flags |= PROBE_ONCE;
+    return true;
+}
+
 bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
     handled = false;
     HANDLE thread = event_thread(s, event.dwThreadId);      // cached: see event_thread
@@ -720,6 +787,8 @@ bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
     const bool our_step = step != s->stepping.end() && !step->second.tail_int3 && !step->second.prog_tf;
     handled = !(native.Dr6 & 0xF & theirs) && !(native.Dr6 & 0xA000u) &&
               (!(native.Dr6 & 0x4000u) || our_step);
+    if (!handled && event.u.Exception.dwFirstChance && consumed &&
+        !queue_debug_delivery(s, event.dwThreadId, (uint64_t)EMU_IP(native), consumed, native.Dr6 & 0xE00Fu)) return false;
     return true;
 }
 
