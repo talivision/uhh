@@ -744,11 +744,35 @@ static int run_headcorrupt() {
     return 0;
 }
 
+static int run_logsite_code(bool callpair, bool whole = false) {
+    auto *code = (unsigned char *)VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!code) return 1;
+    memset(code, 0x90, 4096);
+    const unsigned char pair[] = {0xff, 0xd0, 0xe8, 0, 0, 0, 0, 0xc3};
+    const unsigned char mov[] = {0xb8, 1, 0, 0, 0, 0x90, 0x90, 0x90, 0x90, 0xc3};
+    memcpy(code, callpair ? pair : mov, callpair ? sizeof(pair) : sizeof(mov));
+    FlushInstructionCache(GetCurrentProcess(), code, 4096);
+    CtrlAnnounce(code, nullptr);
+    int bad = 0;
+    if (!callpair) {
+        // The entry callback reads these arguments before MOV changes EAX. Use the
+        // same cdecl arguments on x86 and the native argument registers on x64.
+        typedef int (__cdecl *fn)(const void *, uintptr_t);
+        for (int i = 0; i < 12; ++i) bad += ((fn)code)(code, whole ? 1u : 0u) != i + 2;
+    }
+    // Keep the allocation mapped until process exit (it still owns an active probe).
+    std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"logsite\",\"bad\":%d}\n", bad);
+    return bad ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: ctrl_target <scenario> [opts]\n"); return 2; }
     const std::string sc = argv[1];
     int rc = 2;
-    if (sc == "fault") rc = run_fault(arg_int(argc, argv, "--n", 200));
+    if (sc == "siteempty") rc = 0;
+    else if (sc == "codewrite") rc = run_logsite_code(false, arg_int(argc, argv, "--whole", 0) != 0);
+    else if (sc == "callpair") rc = run_logsite_code(true);
+    else if (sc == "fault") rc = run_fault(arg_int(argc, argv, "--n", 200));
     else if (sc == "inplace") rc = run_inplace(arg_int(argc, argv, "--threads", 8), arg_int(argc, argv, "--n", 3000));
     else if (sc == "absunload") rc = run_absunload(arg_int(argc, argv, "--cycles", 5), arg_int(argc, argv, "--n", 100));
     else if (sc == "symunload") rc = run_symunload(arg_int(argc, argv, "--cycles", 4), arg_int(argc, argv, "--n", 1500));

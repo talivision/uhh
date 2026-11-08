@@ -281,7 +281,7 @@ static uint32_t inline_patch_len(const unsigned char *b, size_t n, int64_t *call
         off += insn.length;
         if (exited && insn.mnemonic != ZYDIS_MNEMONIC_NOP && insn.mnemonic != ZYDIS_MNEMONIC_INT3)
             *code_after_exit = true;                   // reachable only by a jump into the patch
-        if (insn.meta.category == ZYDIS_CATEGORY_CALL) *call_end = (int64_t)off;
+        if (insn.meta.category == ZYDIS_CATEGORY_CALL && *call_end < 0) *call_end = (int64_t)off;
         if (!exited && (insn.meta.category == ZYDIS_CATEGORY_RET || insn.meta.category == ZYDIS_CATEGORY_UNCOND_BR ||
                         insn.mnemonic == ZYDIS_MNEMONIC_INT3 || insn.mnemonic == ZYDIS_MNEMONIC_UD2)) {
             exited = true;
@@ -312,7 +312,7 @@ struct SiteAnalysis {
     const char *bounds_from = "none";
     std::vector<uint64_t> insns;                // instruction starts in the function (linear)
     std::set<uint64_t> entries;                 // entry points (absolute)
-    int tables = 0;                             // switch tables recovered
+    std::set<uint64_t> resolved_jumps;          // the particular jumps explained by switch tables
     std::vector<uint64_t> indirect_jumps;       // jmp reg / jmp [reg...]: targets unknown unless a table explains them
 };
 
@@ -388,6 +388,11 @@ static void analyse_site(probe_session *s, uint64_t base, uint64_t site, SiteAna
     if (!a.func_start || a.func_end - a.func_start > (1u << 16)) { a.func_start = a.func_end = 0; return; }
     std::vector<unsigned char> code(a.func_end - a.func_start); size_t got = 0;
     if (!remote_read(s->pi.hProcess, a.func_start, code.data(), code.size(), &got) || got != code.size()) { a.func_start = a.func_end = 0; return; }
+    // Decode the program's stream, including branches currently covered by our INT3s.
+    for (const auto &q : s->probes)
+        if (q->active && (q->flags & PROBE_BREAKPOINT) && !q->orig_insn.empty() &&
+            q->address >= a.func_start && q->address < a.func_end && code[q->address - a.func_start] == 0xcc)
+            code[q->address - a.func_start] = q->original;
     ZydisDecoder dec;
 #if defined(_WIN64)
     ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
@@ -442,7 +447,31 @@ static void analyse_site(probe_session *s, uint64_t base, uint64_t site, SiteAna
                     if (!inside(t)) break;
                     a.entries.insert(t); ++found;
                 }
-                if (found) ++a.tables;
+                if (found) {
+#if defined(_WIN64)
+                    // Associate the image-relative load/add/jump sequence with its own jump.
+                    if ((in.mnemonic == ZYDIS_MNEMONIC_MOV || in.mnemonic == ZYDIS_MNEMONIC_MOVSXD) &&
+                        ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                        const auto dest = ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, ops[0].reg.value);
+                        bool added = false;
+                        for (size_t f = off + in.length, i = 0; i < 2 && f < code.size(); ++i) {
+                            ZydisDecodedInstruction fi; ZydisDecodedOperand fo[ZYDIS_MAX_OPERAND_COUNT];
+                            if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, code.data() + f, code.size() - f, &fi, fo))) break;
+                            if (fi.mnemonic == ZYDIS_MNEMONIC_JMP) {
+                                if (added && fo[0].type == ZYDIS_OPERAND_TYPE_REGISTER && fo[0].reg.value == dest)
+                                    a.resolved_jumps.insert(fs + f);
+                                break;
+                            }
+                            if (fi.mnemonic != ZYDIS_MNEMONIC_ADD || fo[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+                                fo[0].reg.value != dest || fo[1].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+                                fo[1].reg.value != o.mem.base) break;
+                            added = true; f += fi.length;
+                        }
+                    }
+#else
+                    if (in.mnemonic == ZYDIS_MNEMONIC_JMP) a.resolved_jumps.insert(at);
+#endif
+                }
             }
         }
         off += in.length;
@@ -564,9 +593,11 @@ static bool inline_site_unsafe(probe_session *s, const Probe &p, std::string &wh
     // Unresolved indirect jumps make MID-function sites unverifiable. At the function's own
     // start they do not: a switch/jump table targets case labels in the body, never the
     // entry's first bytes (direct back-edges to the entry were checked above).
-    if (reason.empty() && a.func_start && a.func_start != p.address && !a.indirect_jumps.empty() && !a.tables) {
+    const auto unresolved = std::find_if(a.indirect_jumps.begin(), a.indirect_jumps.end(),
+        [&](uint64_t j) { return !a.resolved_jumps.count(j); });
+    if (reason.empty() && a.func_start && a.func_start != p.address && unresolved != a.indirect_jumps.end()) {
         std::snprintf(buf, sizeof(buf), "%u-byte hook cannot be verified: the function has an indirect jump at 0x%llx "
-                      "with unknown targets", len, (unsigned long long)a.indirect_jumps.front());
+                      "with unknown targets", len, (unsigned long long)*unresolved);
         reason = buf;
     }
     if (reason.empty() && !a.func_start) {
@@ -607,7 +638,7 @@ static bool inline_site_unsafe(probe_session *s, const Probe &p, std::string &wh
     std::string modname;
     for (auto &kv : s->module_bases) if (kv.second == base) { modname = kv.first; break; }
     std::vector<std::pair<uint64_t, uint64_t>> cands;    // (distance, address)
-    const bool fn_ok = !(!a.indirect_jumps.empty() && !a.tables);
+    const bool fn_ok = unresolved == a.indirect_jumps.end();
     for (uint64_t x : a.insns) {
         if (x == p.address || !fn_ok) continue;
         unsigned char c[32] = {}; size_t cn = 0;
@@ -917,7 +948,7 @@ bool vet_site(probe_session *s, Probe &p, bool &moved_to_hw) {
     }
     std::string json;
     if (!detect_prehook(s, p, json)) return true;
-    s->prehooks.push_back(json);
+    { std::lock_guard<std::mutex> lock(s->probes_mu); s->prehooks.push_back(json); }
     if (!(p.flags & PROBE_INLINE) || (p.flags & PROBE_ALLOW_PREHOOKED)) return true;
     if (p.flags & PROBE_FALLBACK_HW) {
         p.flags = (p.flags & ~(uint32_t)PROBE_INLINE) | PROBE_HW; moved_to_hw = true;

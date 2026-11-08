@@ -268,7 +268,17 @@ reads, a slow (50 ms) callback under 32 threads.
   and `sessions-repeat`. The original fixture tried to write synthetic DR6/TF onto a
   never-started thread, which Windows sanitizes; it now arms watches, executes real stores,
   and checks a positive callback after every stale-hit rejection. Existing call/watch checks
-  retain their assertions. Windows verification pending; shared agent layout/version unchanged.
+  retain their assertions. CI round 3 exposed two fixture errors: BS records a step after TF
+  has been cleared, and raw DR6 Bn for a disabled slot is unspecified (Intel SDM Vol. 3B,
+  253669-088, sections 19.2.3 and 19.3.1.4,
+  https://cdrdv2-public.intel.com/858456/253669-088-sdm-vol-3b.pdf; Windows TF-clear behavior
+  is also exercised by Wine's `dlls/ntdll/tests/exception.c`, `single_step_handler`). The
+  fixture now compares each delivered event to a separate Windows run with only the
+  program's TF/watchpoints: event count, code, location, flags, BS/BD/BT, every target-enabled
+  Bn, and the target's DR address/control fields must match. Both VEH snapshots are printed;
+  no target-owned status assertion is removed. The old stderr lacked the failing VEH fields,
+  so combined target-watch preservation still requires this comparison on Windows.
+  Windows verification pending; shared agent layout/version unchanged.
 - ✅ (A8) hw: a hardware probe inside a DLL that 4 threads keep LoadLibrary/FreeLibrary-ing missed
   hits (60-125 of 240, "whole threads"). Proven cause (huntaudit): NOT the late UNLOAD suspected
   here -- with the stale-unload guard of 6d0147a disabled, 24 runs (x64 + x86) saw no late unload

@@ -327,7 +327,7 @@ extern "C" int probe_add_symbol_cfg(probe_session *s, const char *location, prob
         }
         std::fprintf(stderr, "probe: pending %s\n", p->location.c_str());
         Probe *raw = p.get();
-        s->probes.push_back(std::move(p));          // heap-stable: callbacks may add mid-iteration
+        { std::lock_guard<std::mutex> lock(s->probes_mu); s->probes.push_back(std::move(p)); }          // heap-stable: callbacks may add mid-iteration
         if (s->launched && type == PROBE_INLINE && !register_runtime_inline(s, *raw)) {
             raw->retired = true; return scope.done(0);
         }
@@ -367,7 +367,7 @@ static int add_absolute(probe_session *s, uint64_t address, probe_callback cb, u
         if (!bind_shared_callback(s, p->callback, flags, pending)) return scope.done(0);
         if ((flags & PROBE_INLINE) && !inline_callback_names(s, cb, p->callback_export)) return scope.done(0);
         Probe *raw = p.get();
-        s->probes.push_back(std::move(p));
+        { std::lock_guard<std::mutex> lock(s->probes_mu); s->probes.push_back(std::move(p)); }
         if (refuse_mid_instruction(s, *raw, address)) return scope.done(0);   // (never a data watch)
         bool ok = (flags & PROBE_INLINE) ? register_runtime_inline(s, *raw) && resolve_inline(s, *raw, 0) && kick_agent(s)
                 : (flags & PROBE_HW)     ? arm_hw(s, *raw, 0) : arm_breakpoint(s, *raw, 0);
@@ -455,7 +455,38 @@ static int callback_write(void *backend, uint64_t a, const void *b, size_t n, si
     *done = 0;
     if (!n) return 1;
     if (!remote_range_ok(s->pi.hProcess, a, n, true)) return 0;
-    return remote_write(s->pi.hProcess, a, b, n, done);
+    // Keep our INT3s armed while changing the program bytes underneath them.
+    std::vector<unsigned char> patched;
+    try {
+        for (auto &p : s->probes)
+            if (p->active && (p->flags & PROBE_BREAKPOINT) && p->address < a + n &&
+                (p->address >= a || a - p->address < 16)) {
+                p->orig_insn.reserve(16); p->follow.reserve(15);
+            }
+        for (const auto &p : s->probes)
+            if (p->active && (p->flags & PROBE_BREAKPOINT) && p->address >= a && p->address - a < n) {
+                if (patched.empty()) patched.assign(static_cast<const unsigned char *>(b), static_cast<const unsigned char *>(b) + n);
+                patched[p->address - a] = 0xcc;
+            }
+    } catch (...) { return 0; }
+    const int ok = remote_write(s->pi.hProcess, a, patched.empty() ? b : patched.data(), n, done);
+    for (auto &p : s->probes)
+        if (p->active && (p->flags & PROBE_BREAKPOINT) && p->address >= a && p->address - a < *done)
+            p->original = static_cast<const unsigned char *>(b)[p->address - a];
+    for (auto &p : s->probes)
+        if (p->active && (p->flags & PROBE_BREAKPOINT) && p->address < a + *done &&
+            (p->address >= a || a - p->address < 16)) {
+            if (!refresh_breakpoint(s, *p)) {
+                // Undecodable code must execute at its real address, including its faults.
+                p->orig_insn.assign(1, p->original); p->insn_len = 1;
+                p->displaced_ok = false; p->rep_string = false; p->tramp = p->dtramp = 0;
+            }
+        }
+    if (*done) {
+        sync_int3_table(s);
+        FlushInstructionCache(s->pi.hProcess, (void *)(uintptr_t)a, *done);
+    }
+    return ok;
 }
 const probe_ops callback_ops = {callback_read, callback_write};
 
@@ -607,6 +638,7 @@ extern "C" int probe_run(probe_session *s) {
 #endif
         if (!ok) break;
     }
+    std::unique_lock<std::mutex> report_lock(s->report_mu);
     bench_phase("run_loop_end");
     s->run_phase = "ending the session";
     finish_calls(s);                                      // callbacks still parked in call_func
@@ -640,6 +672,7 @@ extern "C" int probe_run(probe_session *s) {
     int result = (s->exited || s->detached) && s->error.empty();
     fibers.end();
     if (g_ctrl_runs.fetch_sub(1) == 1 && g_runs_done) SetEvent(g_runs_done);   // a closing console may go on
+    report_lock.unlock();
     s->running = false;                                   // last touch of s on this thread
     return result;
 }
@@ -666,6 +699,7 @@ static void json_string(FILE *out, const std::string &value) {
 
 extern "C" void probe_report(probe_session *s, FILE *out) {
     if (!s || !out) return;
+    std::lock_guard<std::mutex> report_lock(s->report_mu);
     bench_phase("report_begin");
     if (s->exited) stop_drainer(s); else drain_agent_logs(s);
     // All probe_log lines precede report records -- on a target still running (not exited,
@@ -694,29 +728,31 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
         if (s->tail_failed && !s->live_output_closed) tail_error = s->tail_error;
     }
     const uint64_t written = s->logs_written.load();
-    if (s->shared) {
-        MemoryBarrier();
-        for (auto &p : s->probes) if (p->flags & PROBE_INLINE)
-            p->hits = probe_agent_hits(s->shared, p->agent_index);
+    // Heap-stable pointers survive runtime additions; the vector itself does not. Copy only
+    // under the growth lock, and use atomic counters/state without blocking the debug thread.
+    std::vector<Probe *> probes;
+    std::vector<std::string> prehooks;
+    {
+        std::lock_guard<std::mutex> lock(s->probes_mu);
+        for (const auto &p : s->probes) probes.push_back(p.get());
+        prehooks = s->prehooks;
     }
-    // One snapshot of each probe's hits serves its probe record AND the total: on a live
-    // target the debug loop keeps counting breakpoint/hw hits while the report is written.
-    std::vector<uint64_t> snap;
-    snap.reserve(s->probes.size());
-    for (const auto &p : s->probes) snap.push_back(p->hits);
-    for (const auto &j : s->prehooks) { std::fputs(j.c_str(), out); std::fputc('\n', out); }
-    for (size_t i = 0; i < snap.size(); ++i) {
-        const auto &p = s->probes[i];
-        if (p->internal) continue;
-        std::fputs("{\"kind\":\"probe\",\"location\":", out); json_string(out, p->location);
-        std::fprintf(out, ",\"backend\":\"%s\",\"active\":%s,\"hits\":%llu}\n",
-                     p->flags & PROBE_INLINE ? "inline" : p->flags & PROBE_HW ? "hw" : "breakpoint",
-                     p->active ? "true" : "false", (unsigned long long)snap[i]);
-    }
+    for (const auto &j : prehooks) { std::fputs(j.c_str(), out); std::fputc('\n', out); }
     uint64_t hits = 0, active = 0;
     size_t visible = 0;
-    for (size_t i = 0; i < snap.size(); ++i)
-        if (!s->probes[i]->internal) { hits += snap[i]; active += s->probes[i]->active; ++visible; }
+    for (const auto *p : probes) {
+        if (p->internal) continue;
+        const uint32_t flags = p->flags.load();
+        const bool armed = p->active.load();
+        const uint32_t index = p->agent_index.load();
+        const uint64_t count = s->shared && (flags & PROBE_INLINE) && index < PROBE_AGENT_MAX_PROBES
+            ? probe_agent_hits(s->shared, index) : p->hits.load();
+        hits += count; active += armed; ++visible;
+        std::fputs("{\"kind\":\"probe\",\"location\":", out); json_string(out, p->location);
+        std::fprintf(out, ",\"backend\":\"%s\",\"active\":%s,\"hits\":%llu}\n",
+                     flags & PROBE_INLINE ? "inline" : flags & PROBE_HW ? "hw" : "breakpoint",
+                     armed ? "true" : "false", (unsigned long long)count);
+    }
     PROCESS_MEMORY_COUNTERS memory{}; memory.cb = (DWORD)sizeof(memory);
     uint64_t peak_mb = GetProcessMemoryInfo(GetCurrentProcess(), &memory, (DWORD)sizeof(memory))
                            ? ((uint64_t)memory.PeakWorkingSetSize + (1024 * 1024 - 1)) / (1024 * 1024) : 0;
@@ -736,7 +772,7 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
         uint64_t unexplained = 0;
         const uint64_t cut = probe_agent_cut_off(s->shared, unexplained, [&](uint32_t index, uint32_t tid, uint64_t n) {
             std::string loc = "probe #" + std::to_string(index);
-            for (const auto &p : s->probes)
+            for (const auto *p : probes)
                 if ((p->flags & PROBE_INLINE) && p->agent_index == index) { loc = p->location; break; }
             where += " " + loc + (tid ? " (tid " + std::to_string(tid) + ")" : "") + (n > 1 ? " x" + std::to_string(n) : "");
         });
@@ -751,7 +787,7 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
                  (unsigned long long)hits, (unsigned long long)(s->overrides + (s->shared ? (uint64_t)s->shared->overrides : 0)),
                  (unsigned long long)dropped, (unsigned long long)interrupted,
                  (unsigned long long)written,
-                 (unsigned long long)peak_mb, s->exit_code, live_closed ? "true" : "false");
+                 (unsigned long long)peak_mb, s->exit_code.load(), live_closed ? "true" : "false");
     // stdout_logs: probe_log records the live tail wrote to stdout -- equal to logs_written
     // unless stdout is NUL (no tail: null), its reader went away (live_output_closed), a
     // stdout write failed (live_output_error, also on stderr and in "error") or the session
@@ -844,7 +880,7 @@ extern "C" void probe_close(probe_session *s) {
         const uint64_t running = s->shared && !ended_first ? probe_agent_running(s->shared) : 0;
         if (ended_first) {      // in_flight here: callbacks the target's end interrupted (probe_report's callbacks_interrupted)
             std::fprintf(stderr, "probe: ended: the target exited before the detach (exit code %lu): hits=%llu "
-                                 "logs_written=%llu log_dropped=%llu in_flight=%llu\n", (unsigned long)s->exit_code,
+                                 "logs_written=%llu log_dropped=%llu in_flight=%llu\n", (unsigned long)s->exit_code.load(),
                          (unsigned long long)hits, (unsigned long long)written, (unsigned long long)dropped,
                          (unsigned long long)in_flight);
         } else {

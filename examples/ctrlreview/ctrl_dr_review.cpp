@@ -6,7 +6,12 @@
 namespace dr_review_fixture {
 using namespace uhh_session;
 static constexpr DWORD announce = 0xE055D071u;
-struct ChildState { LONG seen; DWORD flags; DWORD64 dr6; LONG data[8]; };
+struct ChildState {
+    LONG seen; DWORD flags; DWORD64 dr6, dr7, dr0, dr1;
+    ULONG_PTR ip, exception_address;
+    DWORD exception_code, parameters;
+    LONG data[8];
+};
 static ChildState child_state{};
 static unsigned callbacks = 0;
 static void hit(probe_context *) { ++callbacks; }
@@ -21,6 +26,12 @@ static LONG CALLBACK child_veh(EXCEPTION_POINTERS *e) {
     ++child_state.seen;
     child_state.flags = e->ContextRecord->EFlags;
     child_state.dr6 = e->ContextRecord->Dr6;
+    child_state.dr7 = e->ContextRecord->Dr7;
+    child_state.dr0 = e->ContextRecord->Dr0; child_state.dr1 = e->ContextRecord->Dr1;
+    child_state.ip = (ULONG_PTR)EMU_IP(*e->ContextRecord);
+    child_state.exception_address = (ULONG_PTR)e->ExceptionRecord->ExceptionAddress;
+    child_state.exception_code = e->ExceptionRecord->ExceptionCode;
+    child_state.parameters = e->ExceptionRecord->NumberParameters;
     e->ContextRecord->EFlags &= ~0x100u;
     e->ContextRecord->Dr6 = 0;
     return EXCEPTION_CONTINUE_EXECUTION;
@@ -119,6 +130,71 @@ struct Debuggee {
     }
 };
 
+// Intel SDM Vol. 3B (253669-088), 19.2.3 and 19.3.1.4:
+// https://cdrdv2-public.intel.com/858456/253669-088-sdm-vol-3b.pdf
+// BS records the step even after TF is cleared. Bn for a disabled slot is unspecified;
+// test Bn only for target-enabled slots, not all four raw bits. Windows also clears TF
+// in the user exception context (observed in CI and covered by Wine's ntdll exception tests,
+// https://github.com/wine-mirror/wine/blob/master/dlls/ntdll/tests/exception.c
+// single_step_handler on x86/x64). Measure the uninstrumented Windows VEH result rather
+// than confusing the TF requested BEFORE execution with the flags delivered AFTER #DB.
+static void initial_flags(CONTEXT &c) {
+    // Make arithmetic flags equal between independent reference/observed processes.
+    // PCMPEQD and MOVQ leave EFLAGS unchanged. Bit 1 is reserved, not a program flag.
+    c.EFlags &= ~(0x8D5u | 0x100u | 0x10000u);
+}
+static unsigned target_slots_for(const std::string &mode) {
+    return mode == "step-own" ? 1u : mode == "step-mixed" ? 2u : 0u;
+}
+static void print_veh(const char *label, const ChildState &r) {
+    std::fprintf(stderr, "dr-review: %s VEH seen=%ld flags=0x%lx dr6=0x%llx dr7=0x%llx ip=0x%llx exception=0x%llx code=0x%lx\n",
+                 label, (long)r.seen, (unsigned long)r.flags, (unsigned long long)r.dr6,
+                 (unsigned long long)r.dr7, (unsigned long long)r.ip,
+                 (unsigned long long)r.exception_address, (unsigned long)r.exception_code);
+}
+static ChildState reference_event(const std::string &mode) {
+    Debuggee d; d.wait(EXCEPTION_BREAKPOINT);
+    auto c = d.get(); initial_flags(c);
+    const unsigned slots = target_slots_for(mode);
+    const uint64_t data = d.state + offsetof(ChildState, data);
+    c.Dr0 = (decltype(c.Dr0))data; c.Dr1 = (decltype(c.Dr1))(data + 4);
+    c.Dr2 = c.Dr3 = c.Dr6 = c.Dr7 = 0;
+    for (unsigned k = 0; k < 2; ++k)
+        if (slots & (1u << k)) c.Dr7 |= ((decltype(c.Dr7))1 << (k * 2)) | ((decltype(c.Dr7))0xD << (16 + k * 4));
+    if (!slots) c.EFlags |= 0x100u; // the PROGRAM's step, without any UHH watch/step
+    d.put(c); d.resume(); d.wait(EXCEPTION_SINGLE_STEP, d.code + 9);
+    const auto incoming = d.get();
+    const DWORD64 mask = 0xE000u | slots;
+    dr_require((incoming.Dr6 & mask) == (slots ? slots : 0x4000u), "reference exception cause");
+    d.resume(DBG_EXCEPTION_NOT_HANDLED); d.wait(EXCEPTION_BREAKPOINT, d.code + 10);
+    const auto result = d.result(); print_veh("reference", result);
+    dr_require(result.seen == 1 && result.exception_code == EXCEPTION_SINGLE_STEP &&
+               result.ip == d.code + 9 && result.exception_address == d.code + 9,
+               "reference event delivered at original instruction stream");
+    dr_require(!(result.flags & 0x100u), "Windows reference delivers cleared TF");
+    dr_require((result.dr6 & mask) == (slots ? slots : 0x4000u), "reference VEH cause preserved");
+    return result;
+}
+static void compare_event(const Debuggee &d, const ChildState &reference, const std::string &mode) {
+    const auto result = d.result(); print_veh("instrumented", result);
+    const unsigned slots = target_slots_for(mode);
+    // Keep BS/BD/BT and EVERY target-enabled B-bit in the comparison. Only raw Bn of
+    // non-target slots (not architecturally meaningful for the program) are excluded.
+    const DWORD64 mask = 0xE000u | slots;
+    dr_require(result.seen == reference.seen && result.exception_code == reference.exception_code &&
+               result.parameters == reference.parameters && result.ip == d.code + 9 &&
+               result.exception_address == d.code + 9, "target event count/code/location unchanged");
+    dr_require(((result.flags ^ reference.flags) & ~0x2u) == 0, "target VEH flags unchanged from Windows reference");
+    dr_require((result.dr6 & mask) == (reference.dr6 & mask), "target VEH step/watch status unchanged from Windows reference");
+    const uint64_t data = d.state + offsetof(ChildState, data);
+    for (unsigned k = 0; k < 2; ++k) {
+        if (!(slots & (1u << k))) continue;
+        const DWORD64 field = ((DWORD64)3 << (k * 2)) | ((DWORD64)0xF << (16 + k * 4));
+        dr_require((result.dr7 & field) == (reference.dr7 & field) &&
+                   (k ? result.dr1 : result.dr0) == data + k * 4, "target VEH debug-register ownership unchanged");
+    }
+}
+
 int run(int argc, char **argv) {
     if (argc == 2 && !std::strcmp(argv[1], "--dr-child")) return child();
     if (argc != 2) return 2;
@@ -126,6 +202,9 @@ int run(int argc, char **argv) {
     bool ok = false;
     std::string failed;
     try {
+        ChildState reference{};
+        if (mode == "watch-tf" || mode == "watch-tf-carried" || mode == "step-own" ||
+            mode == "step-mixed" || mode == "step-tf") reference = reference_event(mode);
         Debuggee d;
         d.wait(EXCEPTION_BREAKPOINT); // after the loader: the child's ready INT3
         auto session = std::make_unique<probe_session>();
@@ -141,7 +220,7 @@ int run(int argc, char **argv) {
         probe->hw_generation = 1; probe->address = old_address; probe->dr_slot = 0; probe->callback = hit;
         Probe *p = probe.get(); s->probes.push_back(std::move(probe));
         s->dr_used = s->dr_ever = 1; s->hw_active = 1; s->hw_armed_ever.insert(old_address);
-        auto c = d.get();
+        auto c = d.get(); initial_flags(c);
         c.Dr0 = (decltype(c.Dr0))old_address; c.Dr1 = c.Dr2 = c.Dr3 = c.Dr6 = 0;
         c.Dr7 = 1 | ((decltype(c.Dr7))0xD << 16); c.EFlags &= ~0x100u;
         auto watch_event = [&](bool tf, bool mixed = false) {
@@ -236,8 +315,7 @@ int run(int argc, char **argv) {
             bool handled = false;
             dr_require(handle_hw(s, d.ev, handled) && !handled && callbacks == 1 && p->hits == 1, "watch callback and target step forwarding");
             d.resume(DBG_EXCEPTION_NOT_HANDLED); d.wait(EXCEPTION_BREAKPOINT, done);
-            const auto result = d.result();
-            dr_require(result.seen == 1 && (result.flags & 0x100) && (result.dr6 & 0x4000) && !(result.dr6 & 1), "target VEH sees its step only");
+            compare_event(d, reference, mode);
         } else if (mode == "gate") {
             watch_event(false); // B0 belongs to the target, whose slot replaced the gate
             p->active = false; s->hw_active = 0; s->gates.emplace_back(target_address, 0);
@@ -267,15 +345,17 @@ int run(int argc, char **argv) {
             s->stepping.emplace(d.pi.dwThreadId, st);
             if (tf) {
                 c.EFlags |= 0x100; d.put(c); d.resume(); d.wait(EXCEPTION_SINGLE_STEP, site + 4);
-                dr_require((d.get().Dr6 & 0xE00F) == 0x4000, "real TF-only exception");
+                const auto raised = d.get();
+                std::fprintf(stderr, "dr-review: real TF-only #DB dr6=0x%llx flags=0x%lx\n",
+                             (unsigned long long)raised.Dr6, (unsigned long)raised.EFlags);
+                // No target slot is enabled; SDM 19.2.3 does not define the raw B0-B3.
+                dr_require((raised.Dr6 & 0xE000u) == 0x4000, "real TF-only exception");
             } else watch_event(true, mixed);
             DWORD disposition = 0;
             dr_require(dispatch_event(s, d.ev, disposition) && disposition == DBG_EXCEPTION_NOT_HANDLED, "step forwards target exception");
             dr_require(s->stepping.empty() && callbacks == (mixed ? 1u : 0u) && p->hits == (mixed ? 1u : 0u), "step completion and mixed callback");
             d.resume(disposition); d.wait(EXCEPTION_BREAKPOINT, done);
-            const auto result = d.result();
-            dr_require(result.seen == 1 && ((result.flags & 0x100) != 0) == tf &&
-                    ((result.dr6 & 0x4000) != 0) == tf && (tf || (result.dr6 & (mixed ? 2 : 1))), "target VEH sees only its own flags/status");
+            compare_event(d, reference, mode);
         } else if (mode == "detach-dr" || mode == "detach-tf") {
             const bool tf = mode == "detach-tf";
             p->active = false; s->hw_active = 0; s->dr_used = 0;
