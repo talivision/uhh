@@ -7223,6 +7223,114 @@ def own_watch_slots_bad(w, n, bk):
     return ""
 
 
+def check_logsite_review():
+    """cxr7 controller log/site findings: deterministic failure windows, unload ordering,
+    concurrent runtime adds/reports, writable displaced code, and inline entry checks.
+    Runs on both architectures; no deliberately unsafe patch is ever executed."""
+    driver, th, target = exe("ctrl_driver.exe"), exe("ctrl_driver_th.exe"), exe("ctrl_target.exe")
+    trace, stream = exe("uhh_trace_th.exe"), exe("logstream_target.exe")
+    if not all((driver, th, target, trace, stream)):
+        return missing_bin("logsite-review", "ctrl_driver[/_th]/ctrl_target/uhh_trace_th/logstream_target")
+
+    def go(sc, bk, child, opts=(), env=None, test=False):
+        return run([th if test else driver, "--scenario", sc, "--backend", bk, *opts,
+                    "--", target, *child], env=env, timeout=90)
+
+    for sc, why in (("sitebranch", "jump/call target"), ("sitemixed", "unknown targets")):
+        name = f"logsite-{sc}"
+        try:
+            r, o = go(sc, "inline", ["siteempty"])
+            record(name, r.returncode != 0 and why in r.stderr and "refused" in r.stderr,
+                   f"rc={r.returncode} expected refusal={why!r}; {r.stderr[-700:]}")
+        except Exception as e:
+            record(name, False, repr(e))
+    name = "logsite-callpair"
+    try:
+        r, o = go("callpair", "breakpoint", ["callpair"])
+        logs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
+        record(name, r.returncode == 0 and "callpair add=0" in logs and "call's return point at +0x2" in r.stderr,
+               f"rc={r.returncode} logs={logs} stderr={r.stderr[-500:]}")
+    except Exception as e:
+        record(name, False, repr(e))
+
+    for bk in ("breakpoint", "hw"):
+        for mode in ("immediate", "whole"):
+            name = f"logsite-codewrite-{bk}-{mode}"
+            try:
+                r, o = go("codewrite", bk, ["codewrite"], ["--shape", mode])
+                rep = next((x for x in o if x.get("kind") == "probe_report"), {})
+                res = next((x for x in o if x.get("kind") == "ctrl_result"), {})
+                messages = [x.get("message") for x in o if x.get("kind") == "probe_log"]
+                expected = ["codearm add=1"] + [f"codewrite ok=1 value={n}" for n in range(2, 14)]
+                record(name, r.returncode == 0 and res.get("bad") == 0 and messages == expected and
+                       rep.get("hits") == rep.get("logs_written") == 13 and rep.get("log_dropped") == 0,
+                       f"rc={r.returncode} result={res} report={rep} logs={messages}")
+            except Exception as e:
+                record(name, False, repr(e))
+
+    name = "logsite-live-report"
+    try:
+        r, o = go("livereport", "breakpoint", ["int3cap", "--n", 1000])
+        rows, reports, bad = [], [], []
+        for x in o:
+            if x.get("kind") == "probe": rows.append(x)
+            elif x.get("kind") == "probe_report":
+                reports.append(x)
+                if x.get("hits") != sum(p.get("hits", 0) for p in rows) or x.get("probes") != len(rows):
+                    bad.append("probe rows disagree with their report")
+                rows = []
+        if len(reports) < 2: bad.append("no live report")
+        if not any(1 < x.get("probes", 0) < 1001 for x in reports):
+            bad.append("no report sampled the growing collection")
+        if not reports or reports[-1].get("probes") != 1001: bad.append("runtime additions not all present")
+        if r.returncode != 0: bad.append(f"rc={r.returncode} {r.stderr[-400:]}")
+        record(name, not bad, "; ".join(bad) or f"{len(reports)} consistent reports while adding 1000 probes")
+    except Exception as e:
+        record(name, False, repr(e))
+
+    for bk in ("breakpoint", "inline"):
+        name = f"logsite-chunk-oom-{bk}"
+        try:
+            env = dict(os.environ, UHH_TEST_CHUNK_FAIL_AT="1")
+            res = _filefail_run([th, "--scenario", "symunload", "--backend", bk, "--", target,
+                                 "symunload", "--cycles", "1", "--n", "8"], env, 90)
+            rc, timeout, logs, text, rep, file_logs, err = res
+            record(name, not timeout and rep.get("hits") == 8 and rep.get("log_dropped", 0) > 0 and
+                   rep.get("hits") == rep.get("logs_written", 0) + rep.get("log_dropped", 0) +
+                   rep.get("callbacks_interrupted", 0) and bool(rep.get("error")),
+                   f"rc={rc} timeout={timeout} report={rep}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    name = "logsite-unload-stall"
+    try:
+        env = dict(os.environ, UHH_TEST_UNLOAD_STALL="1")
+        r, o = go("symunload", "inline", ["symunload", "--cycles", 1, "--n", 1], env=env, test=True)
+        logs = [x for x in o if x.get("kind") == "probe_log"]
+        rep = next((x for x in o if x.get("kind") == "probe_report"), {})
+        record(name, r.returncode == 0 and "unload ring hole inserted" in r.stderr and len(logs) == 1 and
+               any("CtrlDllLeaf" in str(f) for f in logs[0].get("stack", [])[:1]) and
+               rep.get("hits") == rep.get("logs_written") == 1 and rep.get("log_dropped") == 0,
+               f"rc={r.returncode} report={rep} logs={logs} stderr={r.stderr[-500:]}")
+    except Exception as e:
+        record(name, False, repr(e))
+
+    for bk in ("breakpoint", "inline"):
+        name = f"logsite-file-prefix-{bk}"
+        try:
+            env = dict(os.environ, UHH_TEST_FILE_FAIL_AT="8", UHH_TEST_FILE_LOST_PAUSE="1")
+            rc, timeout, logs, text, rep, file_logs, err = _filefail_run(
+                [trace, "--backend", bk, "-p", "logstream_target.exe!LogSite:d", "--", stream], env, 90)
+            record(name, not timeout and rep.get("log_dropped", 0) > 0 and
+                   rep.get("logs_written") == len(file_logs) and
+                   [x.get("seq") for x in file_logs] == list(range(len(file_logs))) and
+                   rep.get("hits") == rep.get("logs_written", 0) + rep.get("log_dropped", 0) +
+                   rep.get("callbacks_interrupted", 0) and "incomplete" in (rep.get("error") or ""),
+                   f"rc={rc} timeout={timeout} file={len(file_logs)} report={rep}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
 def check_ctrl_review():
     """Controller review findings (examples/ctrlreview, docs/ROADMAP.md "Controller review
     findings"), each reproduced by its own fixture:
@@ -12423,6 +12531,7 @@ def main():
     if want(check_realapps): check_realapps()
     if args.soak_minutes > 0:
         if want(check_soak): check_soak(args.soak_minutes)
+    if want(check_logsite_review): check_logsite_review()
     if want(check_ctrl_review): check_ctrl_review()
     if want(check_ctrl_warm): check_ctrl_warm()
     if want(check_stream_filestall): check_stream_filestall()

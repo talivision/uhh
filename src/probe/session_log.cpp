@@ -218,7 +218,12 @@ static void file_lost(probe_session *s, uint64_t records, const std::string &why
         s->controller_dropped.fetch_add(records, std::memory_order_relaxed);
         s->logs_written.fetch_sub(records, std::memory_order_relaxed);
         message = file_incomplete(why, s->logs_written.load());
+        s->file_failed = true; s->file_error = message;
     }
+#if defined(UHH_TEST_HOOKS)
+    // Let the next writer batch reach the former failure-publication window.
+    if (std::getenv("UHH_TEST_FILE_LOST_PAUSE")) Sleep(300);
+#endif
     break_log_file(s, message);
 }
 
@@ -513,9 +518,14 @@ static void log_writer_main(probe_session *s) {
                     size_t taken = 0;
                     while (!s->log_queue.empty() && taken < LOG_PACK) {
                         const size_t n = records_of(s->log_queue.front());
+#if defined(UHH_TEST_HOOKS)
+                        static uint64_t pulls = 0;
+                        const char *fail_at = std::getenv("UHH_TEST_CHUNK_FAIL_AT");
+                        if (n && fail_at && ++pulls == std::strtoull(fail_at, nullptr, 10)) throw std::bad_alloc();
+#endif
+                        chunk.push_back(std::move(s->log_queue.front()));
                         unwritten += n; taken += n ? n : 1;
                         s->log_queue_records -= n;
-                        chunk.push_back(std::move(s->log_queue.front()));
                         s->log_queue.pop_front();
                     }
                     std::reverse(chunk.begin(), chunk.end());           // taken from the back below, in order
@@ -1163,7 +1173,28 @@ void sym_unload(probe_session *s, uint64_t base) {
     auto sz = s->module_sizes.find(base);
     const uint64_t size = sz != s->module_sizes.end() ? sz->second : 1;
     if (s->log_writer.joinable()) {
-        drain_agent_logs(s);                               // inline records captured before the unload
+#if defined(UHH_TEST_HOOKS)
+        if (s->shared && std::getenv("UHH_TEST_UNLOAD_STALL")) {
+            std::lock_guard<std::mutex> consume(s->drain_mu);
+            auto *sh = s->shared;
+            const LONG64 tail = sh->log_tail, head = sh->log_head;
+            if (head > tail && head - tail < PROBE_AGENT_LOG_CAP) {
+                auto &first = sh->logs[(uint64_t)tail % PROBE_AGENT_LOG_CAP];
+                auto &last = sh->logs[(uint64_t)head % PROBE_AGENT_LOG_CAP];
+                if (first.seq == tail + 1 && last.seq == head) {
+                    // A real, published stack record behind a permanently unfinished slot.
+                    last = first; last.seq = head + 1;
+                    first.owner = 0; first.seq = tail;
+                    sh->log_head = head + 1;
+                    std::fprintf(stderr, "probe: test: unload ring hole inserted\n");
+                }
+            }
+        }
+#endif
+        drain_agent_logs(s, true);                          // inline records captured before the unload
+        // At UNLOAD_DLL the debuggee is stopped. Every published record, even behind
+        // several unfinished slots, must precede the symbol retirement marker.
+        if (s->shared) deliver_past_stall(s, true);
         std::unique_lock<std::mutex> lock(s->queue_mu);
         s->queue_writable.wait(lock, [s] {
             return s->log_queue_records < probe_session::LOG_QUEUE_CAP || s->writer_failed;
@@ -1341,7 +1372,13 @@ static std::unique_lock<std::mutex> lock_drain(probe_session *s) {
 // into a full ring (stdout slower than the producers) every freed slot is refilled at once,
 // so "until the ring is empty" never ended -- holding drain_mu all the while (a report before
 // a detach never came). Callers that need more call again (the drainer loops).
-size_t drain_agent_logs(probe_session *s) {
+size_t drain_agent_logs(probe_session *s, bool unloading) {
+#if defined(UHH_TEST_HOOKS)
+    // Hold real records until UNLOAD_DLL, so the symbol-retirement ordering is deterministic.
+    if (!unloading && !s->exited && std::getenv("UHH_TEST_UNLOAD_STALL")) return 0;
+#else
+    (void)unloading;
+#endif
     if (!s->shared) return 0;
     auto *sh = s->shared;
     size_t moved = 0;
@@ -1396,17 +1433,20 @@ static bool ring_owner_gone(probe_session *s, DWORD tid) {
 // The tail is stuck behind an unpublished slot: deliver the PUBLISHED records after it now,
 // in ring order, marking each seq = -(pos + 1) (delivered; drain_agent_logs frees it when the
 // tail gets there). Stops at the next unpublished slot: a record beyond THAT could belong to
-// the same producer as a later one published during the scan (per-thread order).
-void deliver_past_stall(probe_session *s) {
+// the same producer as a later one published during the scan (per-thread order). At an
+// unload all producers are stopped: all_published visits every hole before retiring symbols.
+void deliver_past_stall(probe_session *s, bool all_published) {
     auto *sh = s->shared;
     auto consume = lock_drain(s);
     LONG64 tail = sh->log_tail, head = sh->log_head;
+    if ((uint64_t)head - (uint64_t)tail > PROBE_AGENT_LOG_CAP)
+        head = (LONG64)((uint64_t)tail + PROBE_AGENT_LOG_CAP);
     if (head <= tail || sh->logs[(uint64_t)tail % PROBE_AGENT_LOG_CAP].seq != tail) return;
     for (LONG64 pos = tail + 1; pos < head; ++pos) {
         auto &rec = sh->logs[(uint64_t)pos % PROBE_AGENT_LOG_CAP];
         LONG64 seq = rec.seq;
         if (seq == -(pos + 1)) continue;
-        if (seq != pos + 1) break;
+        if (seq != pos + 1) { if (all_published) continue; break; }
         MemoryBarrier();
         enqueue_agent_record(s, rec);
         InterlockedExchange64(&rec.seq, -(pos + 1));

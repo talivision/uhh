@@ -37,4 +37,22 @@ CtrlSled PROC
     DB 1200 DUP (90h)
     ret
 CtrlSled ENDP
+PUBLIC CtrlHiddenBranch, CtrlMixedJump
+CtrlHiddenBranch PROC
+    DB 75h, 01h                 ; jnz to one byte inside the prospective patch
+    DB 12 DUP (90h)
+    ret
+CtrlHiddenBranch ENDP
+CtrlMixedJump PROC
+    DB 0FFh, 24h, 8Dh          ; jmp [ecx*4+absolute table]
+    DD CtrlSwitchCase
+    jmp edx
+    DB 12 DUP (90h)
+CtrlSwitchDest:
+    ret
+CtrlMixedJump ENDP
+.const
+CtrlSwitchCase LABEL DWORD
+    DD CtrlSwitchDest, 0
+
 END
