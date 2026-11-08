@@ -59,6 +59,8 @@ Checks:
   - gated-e2e-<mode>-f<b>-o<b>-c<b>-r<b>: the flagship use case end to end, every backend for
     each of the flag/open/close/read probes, launch and attach (before/after the config parse),
     compared EXACTLY with the target's own per-thread record (probe_app --churn --truth).
+  - gated-guardwin-<stall|early>-<bp|hw>: an attach whose pending breakpoint/hw flag probe's
+    module loads before the agent's controller-death guard is up (or before its init returns).
 A missing project-built binary (an example not built) is a FAIL, never a SKIP (missing_bin()).
 SKIP is only for a check that does not apply to this build (x86-only / x64-only: skip()) or
 an absent OPTIONAL EXTERNAL dependency -- Frida, Intel SDE, a system program this Windows
@@ -10300,15 +10302,17 @@ def e2e_launch(combo, threads, rounds, truth):
     return r.returncode, report(o).get("app_exit"), o, o, r.stderr
 
 
-def e2e_attach(combo, threads, rounds, truth, post):
+def e2e_attach(combo, threads, rounds, truth, post, env=None, wait_active=True):
     """probe_app runs on its own and waits at its gate (post: with configparse.dll already
     loaded and the config parsed once); uhh_attach attaches by pid, every probe that can arm
-    is confirmed active, then the gate is released."""
+    is confirmed active (not wait_active: the gate goes as soon as the attach returns), then
+    the gate is released. env: the target's environment."""
     fb, ob, cb, rb = combo
     procs = []
     try:
         tgt = subprocess.Popen([str(exe("probe_app.exe")), *map(str, e2e_target_args(threads, rounds, truth, post))],
-                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                               env=env)
         procs.append(tgt)
         tout = Lines(tgt.stdout)
         waiting = tout.wait_for(lambda l: '"kind":"waiting"' in l, 60)
@@ -10323,7 +10327,8 @@ def e2e_attach(combo, threads, rounds, truth, post):
         aout, aerr = Lines(att.stdout), Lines(att.stderr)
         if not aout.wait_for(lambda l: '"kind":"attached"' in l, 60):
             raise RuntimeError(f"uhh_attach did not attach: {aerr.lines[-3:]}")
-        for loc in (OPEN_LOCATION, E2E_CLOSE_LOCATION, READ_LOCATION) + ((FLAG_LOCATION,) if post else ()):
+        for loc in ((OPEN_LOCATION, E2E_CLOSE_LOCATION, READ_LOCATION) + ((FLAG_LOCATION,) if post else ())
+                    if wait_active else ()):
             if not aerr.wait_for(lambda l, loc=loc: l.startswith(f"probe: active {loc} "), 60):
                 raise RuntimeError(f"{loc} never became active: {aerr.lines[-3:]}")
         tgt.stdin.write("x"); tgt.stdin.flush()
@@ -10357,11 +10362,13 @@ def check_gated_e2e(threads=8, rounds=16):
     probe forgot the old value); read hits == read logs == truth; open hits == truth;
     logs_written == delivered on stdout == records in the session file; nothing dropped or
     interrupted; no warning; checksum == an uninstrumented run; exit 0 everywhere.
-    UHH_E2E=<comma substrings of the record name> runs a subset (debugging)."""
+    UHH_E2E=<comma substrings of the record name> runs a subset (debugging); UHH_E2E_REPEAT=N
+    runs each selected row N times (one record each)."""
     g, a, p = exe("gated_config.exe"), exe("uhh_attach.exe"), exe("probe_app.exe")
     if not g or not a or not p:
         return missing_bin("gated-e2e", "gated_config/uhh_attach/probe_app")
     sel = [x for x in os.environ.get("UHH_E2E", "").split(",") if x]
+    repeat = max(1, int(os.environ.get("UHH_E2E_REPEAT", "1") or 1))
     tmp = Path(tempfile.gettempdir()) / f"uhh-e2e-{os.getpid()}"
     tmp.mkdir(exist_ok=True)
     base = {}
@@ -10386,19 +10393,93 @@ def check_gated_e2e(threads=8, rounds=16):
             name = f"gated-e2e-{mode}-" + "-".join(f"{k}{E2E_SHORT[b]}" for k, b in zip("focr", combo))
             if sel and not any(s in name for s in sel):
                 continue
-            truth_path = tmp / "truth.jsonl"
-            try:
-                truth_path.unlink(missing_ok=True)
-                if mode == "launch":
-                    rc, trc, o, t_objs, err = e2e_launch(combo, threads, rounds, truth_path)
-                else:
-                    rc, trc, o, t_objs, err = e2e_attach(combo, threads, rounds, truth_path, mode == "attach-post")
-                truth = e2e_truth(truth_path) if truth_path.exists() else []
-                ok, detail = e2e_judge(combo, rc, trc, o, t_objs, err, truth, base)
-                record(name, ok, detail)
-            except Exception as e:
-                record(name, False, repr(e)[:300])
+            for _ in range(repeat):
+                truth_path = tmp / "truth.jsonl"
+                try:
+                    truth_path.unlink(missing_ok=True)
+                    if mode == "launch":
+                        rc, trc, o, t_objs, err = e2e_launch(combo, threads, rounds, truth_path)
+                    else:
+                        rc, trc, o, t_objs, err = e2e_attach(combo, threads, rounds, truth_path, mode == "attach-post")
+                    truth = e2e_truth(truth_path) if truth_path.exists() else []
+                    ok, detail = e2e_judge(combo, rc, trc, o, t_objs, err, truth, base)
+                    record(name, ok, detail)
+                except Exception as e:
+                    record(name, False, repr(e)[:300])
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+def check_gated_guardwin(threads=4, rounds=4):
+    """gated-guardwin-<when>-<b>: gated_config attached BEFORE configparse.dll is loaded (the
+    flag probe, ParseConfig+0x16 as a breakpoint or hw probe, is pending) with inline open/
+    close/read probes -- so the session has the agent, and the attach arms its breakpoint/hw
+    probes only once the agent's controller-death guard is up. A module that LOADS meanwhile
+    must still be probed before its code runs: exactly one flag hit and one override, reads on.
+      stall-<b>: the agent's init returns 1.5 s after its service thread runs (agent test knob
+        UHH_TEST_INIT_STALL_MS, the target's environment). The service thread's INSTALL_DONE
+        reports the inline probes active, the gate is released and configparse.dll loads
+        before the init returns. Full gated-e2e judge. Was: the flag probe was skipped at the
+        load (the guard counted as up only once the init returned), armed after ParseConfig
+        had run -- flag hits=0, reads disabled, nothing on stderr (gated-e2e-attach-pre-fbp-
+        oin-cin-rin, x86, once in a full run; here every time).
+      early-<b>: the gate is released as soon as the attach returns, before the agent is
+        loaded: configparse.dll loads while the guard is not up. The inline probes go active
+        whenever they do, so only the flag, the program's result and stderr are judged.
+    UHH_GUARDWIN_N=N runs each row N times (default 3)."""
+    g, a, p = exe("gated_config.exe"), exe("uhh_attach.exe"), exe("probe_app.exe")
+    if not g or not a or not p:
+        return missing_bin("gated-guardwin", "gated_config/uhh_attach/probe_app")
+    n = max(1, int(os.environ.get("UHH_GUARDWIN_N", "3") or 3))
+    tmp = Path(tempfile.gettempdir()) / f"uhh-guardwin-{os.getpid()}"
+    tmp.mkdir(exist_ok=True)
+    try:
+        _, bo = run([p, "--no-wait", *e2e_target_args(threads, rounds, tmp / "base.jsonl"),
+                     "--config", "reads_enabled=1"], timeout=120)
+        base = app(bo)
+        if base.get("reads_enabled") != 1 or not base.get("successful_reads"):
+            return record("gated-guardwin-baseline", False, f"uninstrumented: {base}")
+        for when in ("stall", "early"):
+            for fb in ("breakpoint", "hw"):
+                name = f"gated-guardwin-{when}-{E2E_SHORT[fb]}"
+                combo = (fb, "inline", "inline", "inline")
+                env = dict(os.environ, UHH_TEST_INIT_STALL_MS="1500") if when == "stall" else None
+                for _ in range(n):
+                    truth_path = tmp / "truth.jsonl"
+                    try:
+                        truth_path.unlink(missing_ok=True)
+                        rc, trc, o, t_objs, err = e2e_attach(combo, threads, rounds, truth_path, False, env=env,
+                                                             wait_active=when == "stall")
+                        if when == "stall":
+                            truth = e2e_truth(truth_path) if truth_path.exists() else []
+                            ok, detail = e2e_judge(combo, rc, trc, o, t_objs, err, truth, base)
+                        else:
+                            rep, ap = report(o), app(t_objs)
+                            fl = next((x for x in probes(o) if x.get("location") == FLAG_LOCATION), {})
+                            warns = [l[:140] for l in (err or "").splitlines()
+                                     if "warning" in l.lower() or "refused" in l.lower()]
+                            bad = []
+                            if rc != 0 or trc != 0 or rep.get("error") is not None:
+                                bad.append(f"rc={rc}/{trc} error={str(rep.get('error'))[:100]}")
+                            if (ap.get("reads_enabled") != 1 or ap.get("successful_reads") != base.get("successful_reads")
+                                    or ap.get("checksum") != base.get("checksum")):
+                                bad.append(f"app reads_enabled={ap.get('reads_enabled')} "
+                                           f"reads={ap.get('successful_reads')}/{base.get('successful_reads')}")
+                            if fl.get("backend") != fb or fl.get("active") is not True:
+                                bad.append(f"flag backend={fl.get('backend')} active={fl.get('active')}")
+                            if fl.get("hits") != 1 or rep.get("overrides") != 1:
+                                bad.append(f"flag hits={fl.get('hits')} overrides={rep.get('overrides')}")
+                            if warns:
+                                bad.append(f"warnings={warns[:2]}")
+                            ok = not bad
+                            detail = (f"flag={fl.get('hits')}/{rep.get('overrides')} reads_enabled={ap.get('reads_enabled')} "
+                                      f"reads={ap.get('successful_reads')}" + ("" if ok else " BAD: " + " | ".join(bad)))
+                        record(name, ok, detail)
+                    except Exception as e:
+                        record(name, False, repr(e)[:300])
+    except Exception as e:
+        record("gated-guardwin-baseline", False, repr(e)[:300])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def check_cx2_review():
@@ -12173,6 +12254,7 @@ def main():
     if want(check_cet_agent): check_cet_agent()
     if want(check_sessions_repeat): check_sessions_repeat()
     if want(check_gated_e2e): check_gated_e2e()
+    if want(check_gated_guardwin): check_gated_guardwin()
     if want(check_realbig): check_realbig("" if args.bigapps else REALBIG_DEFAULT)
     if want(check_stdout_powershell): check_stdout_powershell()
     if want(check_powershell_detach): check_powershell_detach()
