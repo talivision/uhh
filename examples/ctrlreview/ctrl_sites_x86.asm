@@ -48,7 +48,7 @@ CtrlMixedJump PROC
     DD CtrlSwitchCase
     jmp edx
     DB 12 DUP (90h)
-CtrlSwitchDest:
+CtrlSwitchDest::                ; module scope: referenced by the table outside this PROC
     ret
 CtrlMixedJump ENDP
 .const

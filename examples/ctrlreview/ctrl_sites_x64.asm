@@ -53,7 +53,7 @@ CtrlMixedJump PROC FRAME
     jmp rax
     jmp rdx
     DB 12 DUP (90h)
-CtrlSwitchDest:
+CtrlSwitchDest::                ; module scope: referenced by the table outside this PROC
     ret
 CtrlMixedJump ENDP
 .const
