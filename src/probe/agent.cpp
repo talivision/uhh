@@ -1011,8 +1011,8 @@ static void unwatch_unloads() {
    last. The program's own reference counting is untouched otherwise (our reference is ours,
    balanced on every path). The ntdll entry points take the loader's module-table lock only
    (not the loader lock, as GetModuleHandleEx would), unless the release is the last
-   reference. Residual: an unload already past its last reference but not yet notified;
-   ntdll refuses a reference to a module whose load count is zero (then we resolve again).
+   reference. Residual: an unload already past its last reference but not yet notified (if
+   LdrAddRefDll refuses that module -- load count zero -- we resolve again).
    Absolute addresses ("0x...") are pinned the same way when they lie in a loaded image; code
    outside any image is called as before (nothing to pin). */
 struct CalleePin {

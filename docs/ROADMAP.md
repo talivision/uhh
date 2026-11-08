@@ -44,7 +44,7 @@ identical source under every backend.
 - ✅ Loader-time probe hits (a probe firing before the loader breakpoint) handled as hits, not swallowed (was crashing findstr x86)
 - 🔧 Inline hooks on ntdll syscall stubs (the page ban is REMOVED): hooks are written with the target frozen by the controller (FREEZE/THAW IPC), page kept executable, threads inside the overwritten bytes moved to the trampoline; SafetyHook patched at build time (`cmake/patch_safetyhook.cmake`). gated_config/attach now probe `ntdll!NtReadVirtualMemory` / `ntdll!NtOpenProcess` directly. Tests: `ntdll-churn-*` (attach/hook/detach cycles under load, all backends), `patch-race-{frozen,unsafe}` (`PROBE_UNSAFE_FAST_PATCH` must fail sometimes; frozen never)
 - 🔧 Inline site safety check (refused with the reason, or hw with `PROBE_FALLBACK_HW`; `PROBE_ALLOW_UNSAFE_SITE` overrides with a warning): overwritten bytes contain a non-final CALL; another export starts inside them; a branch (x64 .pdata function) lands inside them; an exit (ret/jmp) followed by non-padding inside them. Inline at a `ret` works over padding; packed code (ntdll stub rets) is refused -- breakpoint/hw there. Test: `ret-probe-*`
-- 🔧 Instruction-boundary check, every backend (2026-11-08, branch `boundary`): a site INSIDE an instruction is refused on breakpoint, hw and inline alike (`probe <loc> refused: site is inside an instruction: N byte(s) into the M-byte <mnemonic> at <A> (instruction stream decoded from <src>); nearest instruction boundaries <A>, <B>`); no flag overrides it. Before: inline ran the hook jump's displacement bytes (crash), breakpoint wrote its INT3 into an operand (target corrupted, rc=1), hw silently never fired (0 hits). The stream is decoded by following control flow (fall-through, direct branches/calls, switch tables) from trusted starts -- the site's function start and the .pdata/PDB/CFG starts inside its extent (x64 .pdata, PDB on both arches), else the symbol the location names -- never a linear sweep; no verdict (site taken as given) when the site is an export/trusted start, when nothing decoded covers it (code reached only by indirect jumps; no extent and no symbol), or when decoded instructions overlap. Test: `boundary-*` (examples/boundary: extent, no extent, module+RVA, plus boundary controls and a stray-data-byte control).
+- 🔧 Instruction-boundary check, every backend (2026-11-08, branch `boundary`): a site INSIDE an instruction is refused on breakpoint, hw and inline alike (`probe <loc> refused: site is inside an instruction: N byte(s) into the M-byte <mnemonic> at <A> (instruction stream decoded from <src>); nearest instruction boundaries <A>, <B>`); no flag overrides it. Before: inline ran the hook jump's displacement bytes (crash), breakpoint wrote its INT3 into an operand (target corrupted, rc=1), hw silently never fired (0 hits). The stream is decoded by following control flow (fall-through, direct branches/calls, switch tables) from trusted starts -- the site's function start and the .pdata/PDB/CFG starts inside its extent (x64 .pdata, PDB on both arches), else the symbol the location names -- never a linear sweep; no verdict (site taken as given) when the site is an export/trusted start, when nothing decoded covers it (code reached only by indirect jumps; no extent and no symbol), or when decoded instructions overlap. Test: `boundary-*` (examples/boundary: extent, no extent, module+RVA, plus boundary controls and a stray-data-byte control). codex5: data watchpoints are never judged (`boundary-watch-*`); an instruction known only through a call's fall-through refuses only when every indirect jump in the region is a resolved switch (`boundary-noret-*`).
 - ✗ Handle->pid through `kernel32!OpenProcess`: example design, documented (not a library item)
 - ✅ Memory reads/writes at scale: millions of `get_mem`/`set_mem` across threads and backends; exact values, writes visible to the target, page-crossing and large sizes, unmapped/protected addresses fail cleanly, throughput per backend
 - 🔧 Continuous evaluators (two full rounds done; more to come): independent agents repeatedly hunting edge cases, regressions and gaps against the gated_config use case
@@ -2459,6 +2459,53 @@ Checks (final, on the merge): VM `--only cdx_review,callfunc,stacks,hunt_stack,c
 ret_probe,hitcost_methods,symbols,callorig_hunt,portability,edgehunt,sidefx,transparency` x64 + x86 all green (incl.
 new `cdx-cfnx-*`, `cdx-codeprot-*` and polish's `portability-matrix add.other-module`, `callorig-hunt-warn-dr`); full
 suite = the branch CI. Agent protocol unchanged (v28).
+
+## Codex review 5 findings (2026-11-08, read-only Codex review of 607fe19..0d7ab88 -- perf6 + boundary; branch `codex5-fixes`, regress `cdx-cfrace-inline`, `cdx-cfpin-inline`, `boundary-noret-*`, `boundary-watch-*`)
+
+Three claims, all real; each forced by checks that FAILED on 0465280 (the tests + an agent test knob on 0d7ab88's code)
+on x64 and x86, before the fix (9a3cbc3).
+1. **[P1] Inline call_func could call unrelated code after an unload race (agent.cpp resolve_callee) -- real, fixed.**
+   Not only the perf6 cache: resolving a name and calling the address were always two steps (GetProcAddress, then the
+   call), and nothing kept the module alive in between. Test knob (agent, target environment, read once at init):
+   `UHH_TEST_CF_STALL=resolved|pinned` stops ONE inline call_func right after the resolution / right after the module
+   pin and hands over to the target (`Local\uhh_test_cf_<pid>` / `..._go_<pid>`) -- deterministic, no sleeps.
+   `cdx-cfrace-inline`: the target frees cfr.dll A and maps B at A's fixed base meanwhile; before: `cf phase=4 ok=1
+   r=99` (B's CfrDecoy, at A's old CfrValue address); after: `r=2` (resolved again: B's CfrValue). `cdx-cfpin-inline`:
+   the target frees A while the call is pinned; before: A unmapped under the call (`held=0`, the call faulted, `ok=0`);
+   after: `held=1`, `r=1` (A's code, as resolved), A unmapped right after the call (`gone_after=1`), next call refused.
+   Fix: the callee's module is PINNED from after the resolution until the call returns -- ntdll!LdrAddRefDll on the
+   image holding the callee (VirtualQuery's AllocationBase, the query the executable check already made), released by
+   LdrUnloadDll after the call -- and the unload generation is re-checked AFTER the pin: unchanged since before the
+   resolution means no unload notification (sent before the unmap) came in between, so the pinned module is the one
+   resolved; changed means release and resolve again (bounded: 4 tries, then refused). Absolute "0x..." callees in a
+   loaded image are pinned the same way; code outside any image is called as before. **The observable cost, argued:**
+   only in that race, a FreeLibrary of the callee's DLL on another thread DURING the call returns as always but the unmap
+   (DllMain(DETACH), unload notifications) is deferred to our release at the end of the call, on the calling thread --
+   as if the program's last FreeLibrary had happened there a moment later. The alternative is executing whatever occupies
+   the address (or faulting in a hole, a first-chance exception the program's handlers see): a crash or silent
+   corruption, against the gospel. The program's own reference counts are untouched otherwise (our reference is balanced
+   on every path, including a faulting callee). LdrAddRefDll/LdrUnloadDll take the module-table lock, not the loader
+   lock (GetModuleHandleEx without UNCHANGED_REFCOUNT may take the loader lock -- not used). Residual: an unload already
+   past its last reference but not yet notified. If LdrAddRefDll refuses such a module (load count zero) the attempt
+   resolves again; that behaviour is ntdll's and was not separately tested here. breakpoint/hw: the resolution and the start of the call happen while the target
+   is stopped at the debug event, so the resolve -> invoke window does not exist there (an unload by another thread
+   while the callee RUNS is the program's own race on every backend).
+2. **[P2] Symbol-based data watchpoints were refused as "inside an instruction" (session.cpp arm_probe) -- real, fixed.**
+   `boundary-watch-{sym,rva}` (watch_driver now takes any location): PROBE_HW|PROBE_WATCH_WRITE on
+   `boundary_target.exe!BndSmc+0x4` and on the same address as module+RVA -- the imm32 of a `mov eax, imm32` in .text
+   (extent: x64 .pdata, x86 PDB) that `boundary_target --smc 40` rewrites. Before: `refused: site is inside an
+   instruction` (0 hits); after: 41 hits = 41 callbacks = the program's 41 stores. Fix: refuse_mid_instruction never
+   judges a PROBE_WATCH_* probe, on every path (the absolute path's separate skip folded into it).
+3. **[P2] A call's fall-through could falsely refuse a real instruction start (session.cpp site_inside_instruction) --
+   real, fixed.** `boundary-noret-<b>`: BndNoret has `call BndDie` (never returns), a data byte B8, then the real block,
+   one `ret`, reached only by `lea/mov reg, <it>; jmp reg`. Before: the probe on that ret was refused on every backend
+   (`1 byte(s) into the 5-byte mov at BndNoret+0x17`, not overridable). After: accepted, 50/50 hits on breakpoint, hw and
+   inline (inline with --allow-unsafe-site, for its own overridable "hook across the end of the function" rule of a
+   1-byte ret). Rule (chosen for no false refusals over catching every case): the region is decoded twice, once never
+   passing a call's fall-through; an instruction known ONLY through a fall-through refuses only when every indirect jump
+   decoded in the region is a resolved switch table (then a real block there would itself have been decoded, and shown as
+   an overlap -> no verdict). Costs coverage only in functions with an unresolved indirect jump, and there only past a
+   call. All earlier boundary-* rows unchanged.
 
 ## Real-world cases
 - ✅ Microsoft Detours samples replicated (`examples/famous/detours_*`: simple, traceapi, withdll/attach, retval) -- findings above
