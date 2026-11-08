@@ -23,12 +23,15 @@
 #include <atomic>
 #include <string>
 #include <thread>
+#include "../review_fault.hpp"
 
 static uint32_t parse_backend(const char *name) {
     return !std::strcmp(name, "none") ? 0u : backend_flag(name) ? backend_flag(name) : ~0u;
 }
 
 int main(int argc, char **argv) {
+    review_fault_tag = "lifecycle_driver_fault";
+    SetUnhandledExceptionFilter(review_fault_report);
     if (argc < 2) { std::fprintf(stderr, "usage: lifecycle_driver <pid> [options]\n"); return 2; }
     uint32_t pid = (uint32_t)std::strtoul(argv[1], nullptr, 0);
     uint32_t open_b = PROBE_INLINE, close_b = PROBE_INLINE, read_b = PROBE_INLINE, flag_b = PROBE_INLINE,

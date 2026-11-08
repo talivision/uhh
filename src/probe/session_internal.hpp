@@ -287,6 +287,8 @@ struct probe_session {
     uint64_t overrides = 0;
     std::string error;
     HANDLE mapping = nullptr, remote_thread = nullptr;
+    HANDLE agent_mapping = nullptr;             // TARGET handle: never CloseHandle in this process
+    bool agent_mapping_duplicated = false;      // this session created it (not borrowed from the agent)
     probe_agent_shared *shared = nullptr;
     HMODULE local_agent = nullptr;
     // The controller's agent DLL is prepared (the per-session copy made, then loaded) on its own
@@ -656,6 +658,7 @@ uint64_t forwarded_export_target(probe_session *s, const std::string &module, co
 void start_agent_prep(probe_session *s);
 bool bind_shared_callback(probe_session *s, probe_callback &cb, uint32_t flags, std::string &pending_export);
 bool resolve_inline(probe_session *s, Probe &p, uint64_t base);
+void release_unclaimed_agent_mapping(probe_session *s);
 bool create_agent_channel(probe_session *s);
 bool register_runtime_inline(probe_session *s, Probe &p);
 bool inline_hold_needed(const probe_session *s);

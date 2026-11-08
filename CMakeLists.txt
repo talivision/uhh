@@ -561,7 +561,9 @@ target_link_libraries(cc_driver PRIVATE probe_api)
 add_dependencies(cc_driver cc_target probe_api_agent)
 
 # --- inline-agent review findings (regress `agent-*`, examples/agent_review) -------------
-add_executable(ar_target examples/agent_review/ar_target.cpp)
+add_executable(ar_target examples/agent_review/ar_target.cpp examples/agent_review/ar_review.cpp)
+target_include_directories(ar_target PRIVATE include)
+target_link_libraries(ar_target PRIVATE advapi32)
 target_link_options(ar_target PRIVATE /INCREMENTAL:NO)
 # /EHs without c: the extern "C" callees DO throw (the catches must not be elided).
 target_compile_options(ar_target PRIVATE /EHc-)
@@ -689,6 +691,7 @@ add_executable(ctrl_driver examples/ctrlreview/ctrl_driver.cpp examples/ctrlrevi
 target_include_directories(ctrl_driver PRIVATE include)
 target_link_libraries(ctrl_driver PRIVATE probe_api)
 add_dependencies(ctrl_driver ctrl_target ctrl_dll ctrl_cfr_a ctrl_cfr_b probe_api_agent)
+add_dependencies(ar_target ctrl_cfr_a)
 # A host DLL linking UHH statically, loaded/unloaded in a loop (regress ctrl-symload-unload).
 add_library(symhost SHARED examples/ctrlreview/symhost_dll.cpp)
 target_include_directories(symhost PRIVATE include)

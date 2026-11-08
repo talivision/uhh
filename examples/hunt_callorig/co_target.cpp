@@ -12,6 +12,7 @@
 #include <vector>
 #include <atomic>
 #include <algorithm>
+#include "../review_fault.hpp"
 
 #define CO_EXPORT extern "C" __declspec(dllexport) __declspec(noinline)
 
@@ -220,6 +221,10 @@ static int run_susp(bool gate) {
 
 int main(int argc, char **argv) {
     const char *k = argc > 1 ? argv[1] : "";
+    if (!strcmp(k, "retaddr")) {
+        review_fault_tag = "co_retaddr_fault";
+        AddVectoredExceptionHandler(1, review_fault_report);
+    }
     if (!strcmp(k, "susp")) return run_susp(argc > 2 && !strcmp(argv[2], "--wait"));
     if (argc > 2 && !strcmp(argv[2], "--wait") && !wait_gate()) return 3;
     intptr_t sum = 0, after = 0;

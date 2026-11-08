@@ -11,10 +11,15 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <thread>
+#include <atomic>
 
 #define CB(n) extern "C" void n(probe_context *);
+CB(ar_on_empty) CB(ar_on_cache) CB(ar_on_guarantee) CB(ar_on_epoch) CB(ar_on_vector)
 CB(ar_on_site) CB(ar_on_fault_ret) CB(ar_on_fault_noret) CB(ar_on_alloc) CB(ar_on_jump) CB(ar_on_after) CB(ar_on_prot) CB(ar_on_cf) CB(ar_on_cf_inner) CB(ar_on_dr_arm) CB(ar_on_d5_callee) CB(ar_on_d5_callee_fb) CB(ar_on_cfw_setup) CB(ar_on_cob) CB(ar_on_cfwl_setup) CB(ar_on_dr2_arm)
 static const struct { const char *name; probe_callback fn; } k_callbacks[] = {
+    {"ar_on_empty", ar_on_empty}, {"ar_on_cache", ar_on_cache}, {"ar_on_guarantee", ar_on_guarantee},
+    {"ar_on_epoch", ar_on_epoch}, {"ar_on_vector", ar_on_vector},
     {"ar_on_site", ar_on_site}, {"ar_on_fault_ret", ar_on_fault_ret}, {"ar_on_fault_noret", ar_on_fault_noret},
     {"ar_on_alloc", ar_on_alloc}, {"ar_on_jump", ar_on_jump}, {"ar_on_after", ar_on_after}, {"ar_on_prot", ar_on_prot},
     {"ar_on_cf", ar_on_cf}, {"ar_on_cf_inner", ar_on_cf_inner}, {"ar_on_dr_arm", ar_on_dr_arm},
@@ -40,7 +45,33 @@ static int run_once(uint32_t bk, const std::vector<std::pair<std::string, probe_
     return r;
 }
 
+// Attach/run on one thread, close from another, like lifecycle_driver.
+static int review_attach(DWORD pid, LONG config) {
+    probe_session *s = probe_session_create();
+    if (!s || !probe_add_symbol_cfg(s, "ar_target.exe!ar_epoch_site", ar_on_epoch, PROBE_INLINE, &config, sizeof(config))) return 2;
+    HANDLE attached = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    bool ok = false;
+    std::atomic<int> phase{0};
+    std::thread runner([&] {
+        ok = probe_attach(s, pid);
+        SetEvent(attached);
+        if (ok) {
+            printf("{\"kind\":\"attached\"}\n"); fflush(stdout);
+            probe_run(s);
+            int idle = 0;
+            if (phase.compare_exchange_strong(idle, 1)) { probe_report(s, stdout); phase = 2; }
+        }
+    });
+    WaitForSingleObject(attached, INFINITE); CloseHandle(attached);
+    if (ok) { char line[8]; if (!fgets(line, sizeof(line), stdin)) {} }
+    int idle = 0;
+    if (!phase.compare_exchange_strong(idle, 3)) while (phase.load() != 2) Sleep(1);
+    probe_close(s); runner.join();
+    return ok ? 0 : 3;
+}
 int main(int argc, char **argv) {
+    if (argc == 4 && !strcmp(argv[1], "--review-attach"))
+        return review_attach((DWORD)strtoul(argv[2], nullptr, 10), (LONG)strtol(argv[3], nullptr, 10));
     const char *backend = "inline";
     int repeat = 1;
     std::vector<std::pair<std::string, probe_callback>> adds;

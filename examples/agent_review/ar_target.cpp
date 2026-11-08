@@ -353,9 +353,12 @@ static int wait_gate() {
     return ReadFile(GetStdHandle(STD_INPUT_HANDLE), &b, 1, &n, nullptr) && n == 1;
 }
 
+int ar_review_case(const char *k);
 int main(int argc, char **argv) {
     const char *k = argc > 1 ? argv[1] : "";
     if (argc > 2 && !strcmp(argv[2], "--wait") && !wait_gate()) return 3;
+    const int review = ar_review_case(k);
+    if (review >= 0) return review;
     if (!strcmp(k, "where")) {
         std::vector<Fixup> fx[5];
         long at[5];

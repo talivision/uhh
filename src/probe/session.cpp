@@ -894,13 +894,16 @@ extern "C" void probe_close(probe_session *s) {
     if (s->remote_path && s->pi.hProcess) VirtualFreeEx(s->pi.hProcess, s->remote_path, 0, MEM_RELEASE);
     if (s->shared) UnmapViewOfFile(s->shared);
     if (s->mapping) CloseHandle(s->mapping);
+    bench_phase("close_channel");
     if (s->local_agent) FreeLibrary(s->local_agent);
+    bench_phase("close_local_agent");
     if (!s->agent_copy.empty()) {             // fails if the (detached) target still has it loaded
         DeleteFileW(s->agent_copy.c_str());
         RemoveDirectoryW(s->agent_copy.substr(0, s->agent_copy.find_last_of(L'\\')).c_str());
     }
     if (s->pi.hThread) CloseHandle(s->pi.hThread);
     if (s->pi.hProcess) CloseHandle(s->pi.hProcess);
+    bench_phase("close_handles");
     delete s;
     bench_phase("close_end");
     if (std::getenv("UHH_BENCH_PHASES"))

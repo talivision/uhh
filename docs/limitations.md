@@ -270,6 +270,17 @@ data) prints on all backends.
   by a non-unwinding `longjmp` keeps its thread marked as in a call.
 - **The agent stays loaded after a detach** (Lifecycle), quiescent: hooks removed, logging
   stopped. A later attach to the same process reuses it.
+  Ordinary reattach reuses the named channel, its target view/handle and session proxies.
+  If the old channel still counts a possibly surviving callback (including a suspended one),
+  reattach uses a fresh channel instead; that rare fallback retains the old storage until
+  process exit so the callback's config and accounting pointers remain valid. The epoch is
+  captured once at callback entry and checked once per log attempt. Callback accounting remains
+  running through the final shared-state access, so ordinary API reads need no epoch check.
+  Inline SSE restoration uses the hook stub's complete XMM snapshot; MXCSR is saved separately,
+  irrespective of XINUSE[1] (Intel SDM Vol. 1, 13.6/13.8: that bit need not describe MXCSR).
+  Newly activated AVX uppers use VZEROUPPER. On x86, newly activated x87 state is reset to
+  architectural INIT (FCW=037F, empty tags and zero physical registers), not Windows' FCW=027F;
+  FNINIT alone would leave stale physical registers. Other supported components retain XRSTOR.
 - **x86 inline stack walks** are a verified return-address scan, not PDB-based; a frameless
   function reached by an indirect call can lose its immediate caller
   ([symbols.md](symbols.md#stacks-per-backend-send_log_stack)).

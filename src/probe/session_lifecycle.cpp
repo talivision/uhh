@@ -301,6 +301,7 @@ extern "C" int probe_attach(probe_session *s, uint32_t pid) {
     // A failure below lets go of the target at once and leaves the session NOT attached: a
     // probe_close (from any thread) then has nothing to detach and no probe_run to wait for.
     auto fail = [&] {
+        release_unclaimed_agent_mapping(s);
         DebugActiveProcessStop(pid);
         s->attached = s->launched = false; s->debug_tid = 0;
         return 0;
@@ -582,6 +583,7 @@ void detach(probe_session *s) {
         if (HANDLE h = (HANDLE)(uintptr_t)InterlockedExchange64(&g.controller_process, 0))
             DuplicateHandle(s->pi.hProcess, h, nullptr, nullptr, 0, FALSE, DUPLICATE_CLOSE_SOURCE);
     }
+    release_unclaimed_agent_mapping(s);            // still exclusive: no reattach can borrow this handle yet
     if (!s->exited) DebugActiveProcessStop(s->pi.dwProcessId);
     for (HANDLE t : frozen) { ResumeThread(t); CloseHandle(t); }
     s->detach_frozen.clear();
