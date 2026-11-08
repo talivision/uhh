@@ -3,13 +3,14 @@
 #include "../../src/probe/session_internal.hpp"
 #include <stdexcept>
 
+namespace dr_review_fixture {
 using namespace uhh_session;
 static constexpr DWORD announce = 0xE055D071u;
 struct ChildState { LONG seen; DWORD flags; DWORD64 dr6; LONG data[8]; };
 static ChildState child_state{};
 static unsigned callbacks = 0;
 static void hit(probe_context *) { ++callbacks; }
-static void require(bool ok, const char *stage) {
+static void dr_require(bool ok, const char *stage) {
     if (!ok) {
         std::fprintf(stderr, "dr-review: %s failed (Win32=%lu)\n", stage, (unsigned long)GetLastError());
         throw std::runtime_error(stage);
@@ -46,10 +47,10 @@ struct Debuggee {
     Debuggee() {
         char path[MAX_PATH];
         const DWORD n = GetModuleFileNameA(nullptr, path, MAX_PATH);
-        require(n && n < MAX_PATH, "child executable path");
+        dr_require(n && n < MAX_PATH, "child executable path");
         std::string command = std::string("\"") + path + "\" --dr-child";
         STARTUPINFOA startup{}; startup.cb = sizeof(startup);
-        require(!!CreateProcessA(nullptr, command.data(), nullptr, nullptr, FALSE, DEBUG_ONLY_THIS_PROCESS,
+        dr_require(!!CreateProcessA(nullptr, command.data(), nullptr, nullptr, FALSE, DEBUG_ONLY_THIS_PROCESS,
                                  nullptr, nullptr, &startup, &pi), "create debuggee");
     }
     ~Debuggee() {
@@ -73,20 +74,20 @@ struct Debuggee {
         if (e.dwDebugEventCode == LOAD_DLL_DEBUG_EVENT && e.u.LoadDll.hFile) CloseHandle(e.u.LoadDll.hFile);
     }
     void resume(DWORD disposition = DBG_CONTINUE) {
-        require(pending && !!ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, disposition), "continue event");
+        dr_require(pending && !!ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, disposition), "continue event");
         pending = false;
     }
     void wait(DWORD wanted, uint64_t address = 0) {
-        require(!pending, "previous event continued");
+        dr_require(!pending, "previous event continued");
         const ULONGLONG until = GetTickCount64() + 10000;
         while (GetTickCount64() < until) {
             if (!WaitForDebugEvent(&ev, 100)) continue;
             pending = true; close_file(ev);
-            require(ev.dwDebugEventCode != EXIT_PROCESS_DEBUG_EVENT, "child alive");
+            dr_require(ev.dwDebugEventCode != EXIT_PROCESS_DEBUG_EVENT, "child alive");
             if (ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
                 auto &ex = ev.u.Exception.ExceptionRecord;
                 if (ex.ExceptionCode == announce) {
-                    require(ex.NumberParameters == 2, "announcement arguments");
+                    dr_require(ex.NumberParameters == 2, "announcement arguments");
                     code = ex.ExceptionInformation[0]; state = ex.ExceptionInformation[1];
                 } else {
                     if (ex.ExceptionCode == 0x4000001Eu) ex.ExceptionCode = EXCEPTION_SINGLE_STEP;
@@ -98,27 +99,27 @@ struct Debuggee {
                         std::fprintf(stderr, "dr-review: unexpected code=0x%lx at=0x%llx wanted=0x%lx at=0x%llx\n",
                                      (unsigned long)ex.ExceptionCode, (unsigned long long)at, (unsigned long)wanted,
                                      (unsigned long long)(address ? address : code + 4));
-                    require(!code && ex.ExceptionCode == EXCEPTION_BREAKPOINT, "expected exception address/code");
+                    dr_require(!code && ex.ExceptionCode == EXCEPTION_BREAKPOINT, "expected exception address/code");
                 }
             }
             resume();
         }
-        require(false, "debug event timeout");
+        dr_require(false, "debug event timeout");
     }
     CONTEXT get() const {
         CONTEXT c{}; c.ContextFlags = CONTEXT_ALL;
-        require(!!GetThreadContext(pi.hThread, &c), "get event context");
+        dr_require(!!GetThreadContext(pi.hThread, &c), "get event context");
         return c;
     }
-    void put(const CONTEXT &c) const { require(!!SetThreadContext(pi.hThread, &c), "set event context"); }
+    void put(const CONTEXT &c) const { dr_require(!!SetThreadContext(pi.hThread, &c), "set event context"); }
     ChildState result() const {
         ChildState out{}; SIZE_T n = 0;
-        require(!!ReadProcessMemory(pi.hProcess, (void *)(uintptr_t)state, &out, sizeof(out), &n) && n == sizeof(out), "read child result");
+        dr_require(!!ReadProcessMemory(pi.hProcess, (void *)(uintptr_t)state, &out, sizeof(out), &n) && n == sizeof(out), "read child result");
         return out;
     }
 };
 
-int main(int argc, char **argv) {
+int run(int argc, char **argv) {
     if (argc == 2 && !std::strcmp(argv[1], "--dr-child")) return child();
     if (argc != 2) return 2;
     const std::string mode = argv[1];
@@ -151,13 +152,13 @@ int main(int argc, char **argv) {
             }
             d.put(c);
             const auto armed = d.get();
-            require(armed.Dr0 == c.Dr0 && (armed.Dr7 & 1) && ((armed.Dr7 >> 16) & 0xF) == 0xD, "watch armed before execution");
+            dr_require(armed.Dr0 == c.Dr0 && (armed.Dr7 & 1) && ((armed.Dr7 >> 16) & 0xF) == 0xD, "watch armed before execution");
             d.resume(); d.wait(EXCEPTION_SINGLE_STEP, site + 4);
             const auto raised = d.get();
             const DWORD64 expect = (tf ? 0x4000u : 0u) | (mixed ? 3u : 1u);
             std::fprintf(stderr, "dr-review: real #DB dr6=0x%llx flags=0x%lx\n",
                          (unsigned long long)raised.Dr6, (unsigned long)raised.EFlags);
-            require((raised.Dr6 & 0xE00Fu) == expect, "real hardware exception status");
+            dr_require((raised.Dr6 & 0xE00Fu) == expect, "real hardware exception status");
         };
         auto positive_watch = [&] {
             // Every stale-hit rejection must still accept a subsequent REAL access.
@@ -169,11 +170,11 @@ int main(int argc, char **argv) {
             d.put(next); d.resume(); d.wait(EXCEPTION_SINGLE_STEP, site + 4);
             settle_hw_thread(s, d.pi.dwThreadId); // a new event, not the previous hit's carry
             s->event_tid = d.pi.dwThreadId;
-            require((d.get().Dr6 & 0xE00Fu) == 1, "new access real B0");
+            dr_require((d.get().Dr6 & 0xE00Fu) == 1, "new access real B0");
             const unsigned before = callbacks; const uint64_t hits = p->hits;
             bool handled = false;
-            require(handle_hw(s, d.ev, handled) && handled, "new access handled");
-            require(callbacks == before + 1 && p->hits == hits + 1, "new access callback and hit");
+            dr_require(handle_hw(s, d.ev, handled) && handled, "new access handled");
+            dr_require(callbacks == before + 1 && p->hits == hits + 1, "new access callback and hit");
         };
         if (mode == "release") {
             c.Dr0 = (decltype(c.Dr0))target_address; c.Dr1 = (decltype(c.Dr1))(target_address + 4);
@@ -182,11 +183,11 @@ int main(int argc, char **argv) {
             const auto before = d.get();
             hw_yield_to_target(s, d.pi.dwThreadId, d.pi.hThread); release_hw(s, *p);
             const auto after = d.get();
-            require(after.Dr0 == before.Dr0 && after.Dr7 == before.Dr7, "release preserves target slots");
+            dr_require(after.Dr0 == before.Dr0 && after.Dr7 == before.Dr7, "release preserves target slots");
         } else if (mode == "queued" || mode == "queued-same" || mode == "queued-rearm") {
             watch_event(false);
             s->event_tid = 0; keep_queued_dr6(s, d.pi.dwThreadId, d.pi.hThread);
-            require((s->dr6_lost.at(d.pi.dwThreadId).bits & 1) != 0, "queued B0 captured");
+            dr_require((s->dr6_lost.at(d.pi.dwThreadId).bits & 1) != 0, "queued B0 captured");
             if (mode != "queued-rearm") {
                 auto replacement = std::make_unique<Probe>(*p);
                 p->active = false; p->dr_slot = -1;
@@ -194,60 +195,60 @@ int main(int argc, char **argv) {
             }
             p->address = mode == "queued" ? new_address : old_address; p->hw_generation = 2;
             s->hw_armed_ever.insert(p->address);
-            require(set_dr_on_thread(d.pi.hThread, 0, p->address, true, 1, 3), "replace queued slot");
+            dr_require(set_dr_on_thread(d.pi.hThread, 0, p->address, true, 1, 3), "replace queued slot");
             settle_hw_thread(s, d.pi.dwThreadId);
-            require((dr6_carried(s, d.pi.dwThreadId) & 1) != 0, "queued B0 carried");
+            dr_require((dr6_carried(s, d.pi.dwThreadId) & 1) != 0, "queued B0 carried");
             bool handled = false;
-            require(handle_hw(s, d.ev, handled) && handled && callbacks == 0 && p->hits == 0, "stale access rejected");
+            dr_require(handle_hw(s, d.ev, handled) && handled && callbacks == 0 && p->hits == 0, "stale access rejected");
             positive_watch();
         } else if (mode == "deferred" || mode == "deferred-reused" || mode == "deferred-carried-reused") {
             watch_event(false);
             if (mode == "deferred-carried-reused") {
                 s->event_tid = 0; keep_queued_dr6(s, d.pi.dwThreadId, d.pi.hThread);
                 p->address = new_address; p->hw_generation = 2; s->hw_armed_ever.insert(new_address);
-                require(set_dr_on_thread(d.pi.hThread, 0, new_address, true, 1, 3), "replace before holding carried watch");
+                dr_require(set_dr_on_thread(d.pi.hThread, 0, new_address, true, 1, 3), "replace before holding carried watch");
                 settle_hw_thread(s, d.pi.dwThreadId);
             }
             auto raised = d.get(); raised.Dr6 |= dr6_carried(s, d.pi.dwThreadId);
-            require(hold_watch_hit(s, d.ev, raised, 0), "watch held during call");
+            dr_require(hold_watch_hit(s, d.ev, raised, 0), "watch held during call");
             const auto &saved = s->dr6_lost.at(d.pi.dwThreadId);
-            require(saved.address[0] == old_address && saved.generation[0] == 1, "held watch ownership captured");
+            dr_require(saved.address[0] == old_address && saved.generation[0] == 1, "held watch ownership captured");
             if (mode == "deferred-reused") {
                 p->address = new_address; p->hw_generation = 2; s->hw_armed_ever.insert(new_address);
-                require(set_dr_on_thread(d.pi.hThread, 0, new_address, true, 1, 3), "replace held watch");
+                dr_require(set_dr_on_thread(d.pi.hThread, 0, new_address, true, 1, 3), "replace held watch");
             }
             d.resume(); // thread remains suspended by hold_watch_hit, exactly as during a call
             {
                 FiberHost fibers(s);
-                require(poll_calls(s), "replay held watch after call");
+                dr_require(poll_calls(s), "replay held watch after call");
             }
-            require(s->watch_deferred.empty() && callbacks == (mode == "deferred" ? 1u : 0u), "held watch callback identity");
+            dr_require(s->watch_deferred.empty() && callbacks == (mode == "deferred" ? 1u : 0u), "held watch callback identity");
             d.wait(EXCEPTION_BREAKPOINT, done);
             positive_watch();
         } else if (mode == "watch-tf" || mode == "watch-tf-carried") {
             watch_event(true);
             if (mode == "watch-tf-carried") {
                 s->event_tid = 0; keep_queued_dr6(s, d.pi.dwThreadId, d.pi.hThread);
-                require(set_dr_on_thread(d.pi.hThread, 0, old_address, true, 1, 3), "write DRs over queued BS+B0");
+                dr_require(set_dr_on_thread(d.pi.hThread, 0, old_address, true, 1, 3), "write DRs over queued BS+B0");
                 settle_hw_thread(s, d.pi.dwThreadId);
-                require((dr6_carried(s, d.pi.dwThreadId) & 0x4001) == 0x4001, "BS+B0 carried");
+                dr_require((dr6_carried(s, d.pi.dwThreadId) & 0x4001) == 0x4001, "BS+B0 carried");
             }
             bool handled = false;
-            require(handle_hw(s, d.ev, handled) && !handled && callbacks == 1 && p->hits == 1, "watch callback and target step forwarding");
+            dr_require(handle_hw(s, d.ev, handled) && !handled && callbacks == 1 && p->hits == 1, "watch callback and target step forwarding");
             d.resume(DBG_EXCEPTION_NOT_HANDLED); d.wait(EXCEPTION_BREAKPOINT, done);
             const auto result = d.result();
-            require(result.seen == 1 && (result.flags & 0x100) && (result.dr6 & 0x4000) && !(result.dr6 & 1), "target VEH sees its step only");
+            dr_require(result.seen == 1 && (result.flags & 0x100) && (result.dr6 & 0x4000) && !(result.dr6 & 1), "target VEH sees its step only");
         } else if (mode == "gate") {
             watch_event(false); // B0 belongs to the target, whose slot replaced the gate
             p->active = false; s->hw_active = 0; s->gates.emplace_back(target_address, 0);
             s->hw_armed_ever.insert(target_address); s->detaching = false;
             bool handled = false;
-            require(!handle_gate(s, d.ev, handled) && !handled && s->held.empty(), "foreign exception is not an install gate");
+            dr_require(!handle_gate(s, d.ev, handled) && !handled && s->held.empty(), "foreign exception is not an install gate");
             const auto before = d.get(); release_held(s, "test"); const auto after = d.get();
-            require(after.Dr0 == before.Dr0 && after.Dr7 == before.Dr7, "gate cleanup preserves target slot");
+            dr_require(after.Dr0 == before.Dr0 && after.Dr7 == before.Dr7, "gate cleanup preserves target slot");
         } else if (mode == "step-entry") {
             const unsigned char trap = 0xCC; SIZE_T n = 0;
-            require(!!WriteProcessMemory(d.pi.hProcess, (void *)(uintptr_t)site, &trap, 1, &n) && n == 1, "arm software site");
+            dr_require(!!WriteProcessMemory(d.pi.hProcess, (void *)(uintptr_t)site, &trap, 1, &n) && n == 1, "arm software site");
             FlushInstructionCache(d.pi.hProcess, (void *)(uintptr_t)site, 1);
             p->flags = PROBE_BREAKPOINT; p->dr_slot = -1; p->address = site;
             p->original = 0x66; p->orig_insn = {0x66,0x0F,0xD6,0x01}; p->insn_len = 4; p->displaced_ok = true;
@@ -255,9 +256,9 @@ int main(int argc, char **argv) {
             c.Dr7 = c.Dr6 = 0; c.EFlags |= 0x100; d.put(c);
             d.resume(); d.wait(EXCEPTION_BREAKPOINT, site);
             DWORD disposition = 0;
-            require(dispatch_event(s, d.ev, disposition) && disposition == DBG_CONTINUE, "software hit dispatched");
+            dr_require(dispatch_event(s, d.ev, disposition) && disposition == DBG_CONTINUE, "software hit dispatched");
             const auto st = s->stepping.find(d.pi.dwThreadId);
-            require(st != s->stepping.end() && !st->second.displaced && st->second.prog_tf && callbacks == 1, "program TF steps at real site");
+            dr_require(st != s->stepping.end() && !st->second.displaced && st->second.prog_tf && callbacks == 1, "program TF steps at real site");
         } else if (mode == "step-own" || mode == "step-tf" || mode == "step-mixed") {
             const bool mixed = mode == "step-mixed", tf = mode == "step-tf";
             p->active = mixed; s->hw_active = mixed ? 1 : 0; s->dr_used = s->dr_ever = mixed ? 1 : 0;
@@ -266,14 +267,14 @@ int main(int argc, char **argv) {
             s->stepping.emplace(d.pi.dwThreadId, st);
             if (tf) {
                 c.EFlags |= 0x100; d.put(c); d.resume(); d.wait(EXCEPTION_SINGLE_STEP, site + 4);
-                require((d.get().Dr6 & 0xE00F) == 0x4000, "real TF-only exception");
+                dr_require((d.get().Dr6 & 0xE00F) == 0x4000, "real TF-only exception");
             } else watch_event(true, mixed);
             DWORD disposition = 0;
-            require(dispatch_event(s, d.ev, disposition) && disposition == DBG_EXCEPTION_NOT_HANDLED, "step forwards target exception");
-            require(s->stepping.empty() && callbacks == (mixed ? 1u : 0u) && p->hits == (mixed ? 1u : 0u), "step completion and mixed callback");
+            dr_require(dispatch_event(s, d.ev, disposition) && disposition == DBG_EXCEPTION_NOT_HANDLED, "step forwards target exception");
+            dr_require(s->stepping.empty() && callbacks == (mixed ? 1u : 0u) && p->hits == (mixed ? 1u : 0u), "step completion and mixed callback");
             d.resume(disposition); d.wait(EXCEPTION_BREAKPOINT, done);
             const auto result = d.result();
-            require(result.seen == 1 && ((result.flags & 0x100) != 0) == tf &&
+            dr_require(result.seen == 1 && ((result.flags & 0x100) != 0) == tf &&
                     ((result.dr6 & 0x4000) != 0) == tf && (tf || (result.dr6 & (mixed ? 2 : 1))), "target VEH sees only its own flags/status");
         } else if (mode == "detach-dr" || mode == "detach-tf") {
             const bool tf = mode == "detach-tf";
@@ -282,16 +283,16 @@ int main(int argc, char **argv) {
             if (tf) { s->dr_ever = 0; c.Dr7 = 0; c.EFlags |= 0x100; }
             d.put(c);
             const auto before = d.get();
-            require(((before.EFlags & 0x100) != 0) == tf, "detach input TF");
-            require(SuspendThread(d.pi.hThread) != (DWORD)-1, "hold child across detach");
+            dr_require(((before.EFlags & 0x100) != 0) == tf, "detach input TF");
+            dr_require(SuspendThread(d.pi.hThread) != (DWORD)-1, "hold child across detach");
             d.resume(); detach(s);
             BOOL debugged = TRUE;
-            require(!!CheckRemoteDebuggerPresent(d.pi.hProcess, &debugged) && !debugged, "debugger detached");
+            dr_require(!!CheckRemoteDebuggerPresent(d.pi.hProcess, &debugged) && !debugged, "debugger detached");
             d.attached = false;
             const auto after = d.get();
-            require(after.Dr0 == before.Dr0 && after.Dr7 == before.Dr7 &&
+            dr_require(after.Dr0 == before.Dr0 && after.Dr7 == before.Dr7 &&
                     ((after.EFlags ^ before.EFlags) & 0x100) == 0, "detach preserves target DRs/TF");
-        } else require(false, "known scenario");
+        } else dr_require(false, "known scenario");
         for (auto &kv : s->own_thread_handle) CloseHandle(kv.second);
         ok = true;
     } catch (const std::exception &e) {
@@ -300,4 +301,10 @@ int main(int argc, char **argv) {
     std::printf("{\"kind\":\"dr_review\",\"case\":\"%s\",\"ok\":%d,\"callbacks\":%u,\"failure\":\"%s\"}\n",
                 mode.c_str(), ok ? 1 : 0, callbacks, failed.c_str());
     return ok ? 0 : 1;
+}
+
+} // namespace dr_review_fixture
+
+int main(int argc, char **argv) {
+    return dr_review_fixture::run(argc, argv);
 }
