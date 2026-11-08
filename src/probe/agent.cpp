@@ -327,38 +327,15 @@ static bool looks_like_return(uint32_t addr) {
 // return slot) as a bound and tie-break only.
 // No-fault rule: every stack read is inside the hit thread's TEB stack bounds, and every
 // code/data read is inside a region VirtualQuery reported committed and readable -- a
-// per-capture cache, never trusted across hits -- with one exception: executable IMAGE
-// regions (module code) are remembered across captures until a module unloads (the loader's
-// notification bumps g_unload_gen before the image is unmapped; see the call_func cache),
-// like the read-region cache does for get_mem. A value inside the thread's own stack is
-// classified from the TEB bounds (committed read/write, never image code) without a query.
-// (perf6: the per-capture VirtualQuery of the stack and of each module's code -- a WOW64
-// system call each -- was most of an x86 inline send_log_stack, ~10 us.)
-// Nothing here can raise an exception the target's vectored handlers would see. Scans are
-// bounded (16 KiB per frame, 128 queries).
-struct X86Code { volatile LONG seq; volatile LONG gen; volatile uint32_t lo, hi; };
-static X86Code g_x86_code[16];
-static bool x86_code_known(uint32_t a, uint32_t &lo, uint32_t &hi) {
-    if (!g_dll_cookie) return false;
-    const LONG gen = g_unload_gen;
-    for (X86Code &e : g_x86_code) {
-        const LONG s1 = e.seq;
-        if (s1 & 1) continue;
-        const uint32_t l = e.lo, h = e.hi; const LONG g = e.gen;
-        _ReadWriteBarrier();
-        if (e.seq == s1 && g == gen && a >= l && a < h) { lo = l; hi = h; return true; }
-    }
-    return false;
-}
-static void x86_code_learn(uint32_t lo, uint32_t hi, LONG gen) {
-    if (!g_dll_cookie) return;
-    static volatile LONG next;
-    X86Code &e = g_x86_code[(uint32_t)InterlockedIncrement(&next) & 15];
-    const LONG s1 = e.seq;
-    if ((s1 & 1) || InterlockedCompareExchange(&e.seq, s1 + 1, s1) != s1) return;
-    e.lo = lo; e.hi = hi; e.gen = gen;
-    InterlockedExchange(&e.seq, s1 + 2);
-}
+// per-capture cache, never trusted across captures. A value inside the thread's own stack is
+// classified from the TEB bounds (committed read/write by construction, never a guard or
+// no-access page: the guard page sits below StackLimit) without a query, the one shortcut that
+// is safe to keep across hits (perf6). Module code is NOT cached across captures: the program
+// can VirtualProtect its own still-loaded code to NO_ACCESS/NX/GUARD between hits, so each
+// capture re-queries it -- a changed protection then reads as unreadable and the bytes are
+// never touched (a cached "readable" verdict would fault, which the target's vectored handlers
+// would see, and touching a guard page would consume it). Scans are bounded (16 KiB per frame,
+// 128 queries). Nothing here can raise an exception the target's vectored handlers would see.
 struct X86Mem {
     struct Region { uint32_t lo, hi; bool read, exec; };
     Region r[16]{}; uint32_t used = 0, next = 0; int budget = 128;
@@ -372,11 +349,8 @@ struct X86Mem {
         const NT_TIB *tib = reinterpret_cast<const NT_TIB *>(NtCurrentTeb());
         const uint32_t slo = (uint32_t)(uintptr_t)tib->StackLimit, shi = (uint32_t)(uintptr_t)tib->StackBase;
         if (a >= slo && a < shi) return keep(Region{slo, shi, true, false});
-        uint32_t clo = 0, chi = 0;
-        if (x86_code_known(a, clo, chi)) return keep(Region{clo, chi, true, true});
         if (budget <= 0) return nullptr;
         --budget;
-        const LONG gen = g_unload_gen;                       // before the query (see x86_code_learn)
         MEMORY_BASIC_INFORMATION mbi{};
         if (!VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof(mbi))) return nullptr;
         Region g{};
@@ -389,7 +363,6 @@ struct X86Mem {
                   prot == PAGE_EXECUTE_READ || prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY);
         g.exec = g.read && mbi.Type == MEM_IMAGE &&
                  (prot == PAGE_EXECUTE_READ || prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY);
-        if (g.exec) x86_code_learn(g.lo, g.hi, gen);
         return keep(g);
     }
     // [a, a+n) lies in ONE readable region (and in executable image code when exec).
@@ -957,8 +930,12 @@ static bool executable(uint64_t a) {
 // mapped at its address is never called through a stale entry (regress cdx-cfreuse-*). The
 // generation is sampled BEFORE resolving: an unload racing the resolution leaves the entry
 // stale at once. Without the notification (registration failed) nothing is cached.
-// The executable verdict is cached with the entry, like the per-thread read-region cache:
-// image code that loses execute rights while its module stays loaded is not re-checked.
+// Only the RESOLUTION (name -> address) is cached; executability is re-checked on every call
+// (executable(), a VirtualQuery that reads protection and never touches the page), because the
+// program can VirtualProtect still-loaded module code to NO_ACCESS/NX/GUARD between calls:
+// calling it would raise a first-chance exception the target's vectored handlers would see
+// (breakpoint/hw refuse such a call silently). The VirtualQuery stays far below the resolve it
+// replaces (GetModuleHandleA + GetProcAddress + parse).
 // Entries are per-slot seqlocks (odd = being written): lock-free, any thread, no allocation.
 struct CfEntry { volatile LONG seq; volatile LONG gen; volatile uint64_t fn; volatile uint32_t len; char sym[116]; };
 static CfEntry g_cf_cache[64];
@@ -1008,12 +985,16 @@ static uint64_t resolve_callee(const char *symbol) {
     const size_t len = absolute || !g_dll_cookie ? 0 : strnlen(symbol, sizeof(CfEntry::sym) + 1);
     const bool cacheable = len && len <= sizeof(CfEntry::sym);
     const uint32_t h = cacheable ? cf_hash(symbol, len) : 0;
-    if (cacheable) if (const uint64_t fn = cf_lookup(symbol, len, h)) return fn;
-    const LONG gen = g_unload_gen;                          // before resolving (see above)
-    const uint64_t fn = agent_resolve(symbol);
-    if (!fn || !executable(fn)) return 0;
-    if (cacheable) cf_store(symbol, len, h, fn, gen);
-    return fn;
+    uint64_t fn = cacheable ? cf_lookup(symbol, len, h) : 0;
+    if (!fn) {
+        const LONG gen = g_unload_gen;                      // before resolving (see above)
+        fn = agent_resolve(symbol);
+        if (!fn) return 0;
+        if (cacheable) cf_store(symbol, len, h, fn, gen);   // cache the resolution only
+    }
+    // Checked on EVERY call, never cached (see above): refuse silently if it is not executable
+    // now, rather than call into it and raise a fault the program's handlers would see.
+    return executable(fn) ? fn : 0;
 }
 
 // A fixed set of thread ids (not TLS: it must work on a thread that is still in its loader

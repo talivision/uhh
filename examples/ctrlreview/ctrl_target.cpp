@@ -24,6 +24,10 @@
 //   ctrl_target absreuse                absolute INT3 in an unloaded DLL; its address reused (cdx-absreuse)
 //   ctrl_target cfreuse                 call_func into a DLL that unloads and whose name and base
 //                                       another DLL then takes (cdx-cfreuse)
+//   ctrl_target cfnx                    call_func into module code whose execute rights the program
+//                                       removes between calls: must refuse, not fault (cdx-cfnx)
+//   ctrl_target codeprot                inline stack capture while the program guards / no-accesses
+//                                       a code page of a loaded module (cdx-codeprot)
 //   ctrl_target int3cap [--n N]         N armed INT3s read back with get_mem (cdx-int3cap)
 //   ctrl_target bigcfg                  a dynamic add with a > 64 MiB config (cdx-bigcfg)
 //   ctrl_target shape --shape S [--threads T] [--n N]
@@ -463,6 +467,107 @@ static int run_cfreuse() {
     return 0;
 }
 
+// ---- cdx-cfnx: the program removes execute rights from a still-loaded module's code between
+// call_func calls. call_func must refuse (return 0) the same as breakpoint/hw, WITHOUT calling
+// into the page -- a call would raise a first-chance exception this program's handler would see.
+static volatile LONG g_cfnx_fault = 0;
+static unsigned char *volatile g_cfnx_page = nullptr;
+static LONG CALLBACK cfnx_veh(EXCEPTION_POINTERS *e) {
+    const DWORD code = e->ExceptionRecord->ExceptionCode;
+    if ((code != EXCEPTION_ACCESS_VIOLATION && code != STATUS_GUARD_PAGE_VIOLATION) ||
+        e->ExceptionRecord->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    unsigned char *a = (unsigned char *)e->ExceptionRecord->ExceptionInformation[1];
+    if (!g_cfnx_page || a < g_cfnx_page || a >= g_cfnx_page + 4096) return EXCEPTION_CONTINUE_SEARCH;
+    InterlockedIncrement(&g_cfnx_fault);                 // our capture/call touched the page: a side effect
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+static int run_cfnx() {
+    wchar_t self[MAX_PATH], tmp[MAX_PATH];
+    if (!GetModuleFileNameW(nullptr, self, MAX_PATH) || !GetTempPathW(MAX_PATH, tmp)) return 1;
+    std::wstring dir(self); dir.resize(dir.find_last_of(L'\\') + 1);
+    const std::wstring root = std::wstring(tmp) + L"uhh-cfnx-" + std::to_wstring(GetCurrentProcessId());
+    const std::wstring f = root + L"\\cfr.dll";
+    CreateDirectoryW(root.c_str(), nullptr);
+    if (!CopyFileW((dir + L"ctrl_cfr_a.dll").c_str(), f.c_str(), FALSE)) {
+        std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"cfnx\",\"error\":\"copy\"}\n"); return 1;
+    }
+    HMODULE m = LoadLibraryW(f.c_str());
+    unsigned char *fn = m ? (unsigned char *)GetProcAddress(m, "CfrValue") : nullptr;
+    if (!fn) { std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"cfnx\",\"error\":\"load\"}\n"); return 1; }
+    g_cfnx_page = (unsigned char *)((uintptr_t)fn & ~(uintptr_t)0xFFF);
+    PVOID h = AddVectoredExceptionHandler(1, cfnx_veh);
+    CtrlCall(1);                                         // executable: call_func reaches CfrValue (primes the cache)
+    DWORD old = 0;
+    const int ro = VirtualProtect(g_cfnx_page, 4096, PAGE_READONLY, &old) ? 1 : 0;   // drop execute, keep read
+    CtrlCall(2);                                         // not executable now: call_func must refuse, not fault
+    VirtualProtect(g_cfnx_page, 4096, PAGE_EXECUTE_READ, &old);                       // restore execute
+    CtrlCall(3);                                         // executable again
+    const LONG faults = g_cfnx_fault;
+    if (h) RemoveVectoredExceptionHandler(h);
+    FreeLibrary(m);
+    DeleteFileW(f.c_str()); RemoveDirectoryW(root.c_str());
+    std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"cfnx\",\"ro\":%d,\"faults\":%ld}\n", ro, faults);
+    return 0;
+}
+
+// ---- cdx-codeprot: the program toggles PAGE_GUARD / PAGE_NOACCESS on a code page of a
+// loaded module (ctrl_dll) between hits while an inline stack-capturing probe runs. The x86
+// capture scan re-queries protection each time (never trusts a cached "readable exec" verdict),
+// so the guarded/no-access page is skipped UNTOUCHED: no crash, the guard page stays armed, no
+// spurious fault reaches this program's handler, and the frames stay honest. A stack local
+// holding (page + 0x40) is planted so the walk's return-address scan classifies the page every
+// hit (its check reads the bytes just before 0x40, inside the page): the query must gate it.
+static volatile LONG g_codeprot_fault = 0;
+static unsigned char *volatile g_codeprot_page = nullptr;
+static LONG CALLBACK codeprot_veh(EXCEPTION_POINTERS *e) {
+    const DWORD code = e->ExceptionRecord->ExceptionCode;
+    if ((code != EXCEPTION_ACCESS_VIOLATION && code != STATUS_GUARD_PAGE_VIOLATION) ||
+        e->ExceptionRecord->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    unsigned char *a = (unsigned char *)e->ExceptionRecord->ExceptionInformation[1];
+    if (!g_codeprot_page || a < g_codeprot_page || a >= g_codeprot_page + 4096) return EXCEPTION_CONTINUE_SEARCH;
+    InterlockedIncrement(&g_codeprot_fault);             // our capture touched the page
+    DWORD old = 0;                                        // re-arm so a buggy build does not hang / stay disarmed
+    VirtualProtect(g_codeprot_page, 4096, PAGE_EXECUTE_READ | (code == STATUS_GUARD_PAGE_VIOLATION ? PAGE_GUARD : 0), &old);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+extern "C" __declspec(dllexport) __declspec(noinline) void CtrlCodeLeaf(void) {
+    static volatile int sink; sink++;                    // the probed site (inline send_log_stack)
+}
+static volatile uintptr_t g_code_sink;
+static __declspec(noinline) void CtrlCodeMid(uintptr_t planted) {
+    volatile uintptr_t p = planted;                      // on the stack, inside the walk's scan window
+    CtrlCodeLeaf();
+    g_code_sink = p;                                     // keep it live across the call
+}
+static int run_codeprot() {
+    HMODULE m = LoadLibraryA("ctrl_dll.dll");
+    unsigned char *leaf = m ? (unsigned char *)GetProcAddress(m, "CtrlDllLeaf") : nullptr;
+    if (!leaf) { std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"codeprot\",\"error\":\"load\"}\n"); return 1; }
+    unsigned char *page = (unsigned char *)((uintptr_t)leaf & ~(uintptr_t)0xFFF);   // a code page we never execute here
+    g_codeprot_page = page;
+    const uintptr_t planted = (uintptr_t)page + 0x40;
+    PVOID h = AddVectoredExceptionHandler(1, codeprot_veh);
+    for (int i = 0; i < 50; ++i) CtrlCodeMid(planted);  // page executable/readable: prime any classification cache
+    DWORD old = 0;
+    const int guard_set = VirtualProtect(page, 4096, PAGE_EXECUTE_READ | PAGE_GUARD, &old) ? 1 : 0;
+    for (int i = 0; i < 200; ++i) CtrlCodeMid(planted);
+    MEMORY_BASIC_INFORMATION mbi{};
+    const int guard_intact = (VirtualQuery(page, &mbi, sizeof(mbi)) && (mbi.Protect & PAGE_GUARD)) ? 1 : 0;
+    VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &old);
+    const LONG guard_faults = g_codeprot_fault;
+    g_codeprot_fault = 0;
+    VirtualProtect(page, 4096, PAGE_NOACCESS, &old);
+    for (int i = 0; i < 200; ++i) CtrlCodeMid(planted);
+    VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &old);
+    const LONG na_faults = g_codeprot_fault;
+    if (h) RemoveVectoredExceptionHandler(h);
+    FreeLibrary(m);
+    std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"codeprot\",\"guard_set\":%d,\"guard_intact\":%d,"
+                "\"guard_faults\":%ld,\"na_faults\":%ld,\"hits\":%d}\n",
+                guard_set, guard_intact, guard_faults, na_faults, 450);
+    return 0;
+}
+
 // ---- cdx-int3cap: more armed software breakpoints than the agent's INT3 table used to hold --
 static int run_int3cap(int n) {
     CtrlOp((const void *)&CtrlSled, (uintptr_t)n, 0);  // UHH: a breakpoint on each sled byte
@@ -589,6 +694,8 @@ int main(int argc, char **argv) {
     else if (sc == "owndrx") rc = run_owndrx(arg_int(argc, argv, "--n", 50));
     else if (sc == "absreuse") rc = run_absreuse();
     else if (sc == "cfreuse") rc = run_cfreuse();
+    else if (sc == "cfnx") rc = run_cfnx();
+    else if (sc == "codeprot") rc = run_codeprot();
     else if (sc == "int3cap") rc = run_int3cap(arg_int(argc, argv, "--n", 1200));
     else if (sc == "bigcfg") rc = run_bigcfg();
     else if (sc == "shape") rc = run_shape(arg_str(argc, argv, "--shape", ""), arg_int(argc, argv, "--threads", 8),

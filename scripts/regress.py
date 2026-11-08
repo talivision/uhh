@@ -7446,6 +7446,42 @@ def check_cdx_review():
         except Exception as e:
             record(name, False, repr(e))
 
+    # cdx-cfnx: the program drops execute rights from still-loaded module code between call_func
+    # calls -> call_func must refuse (ok=0) WITHOUT calling into it (no fault reaches the program's
+    # own handler, faults=0). The inline agent re-checks executability on every call (never caches
+    # the exec verdict); breakpoint/hw refuse via the controller.
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"cdx-cfnx-{bk}"
+        if not cfr:
+            record(name, False, "missing ctrl_cfr_a.dll"); continue
+        try:
+            res, logs, rows, bad = go("cfnx", bk, [])
+            if res.get("ro") != 1: bad.append(f"ro={res.get('ro')} (VirtualProtect failed)")
+            if res.get("faults") != 0: bad.append(f"faults={res.get('faults')} (capture/call touched the NX page)")
+            cf = [m for m in logs if m.startswith("cf ")]
+            want = ["cf phase=1 ok=1 r=1", "cf phase=2 ok=0 r=-1", "cf phase=3 ok=1 r=1"]
+            if cf != want: bad.append(f"calls={cf} (want {want})")
+            record(name, not bad, " ".join(bad) or "exec call=1, NX refused (no fault), exec again=1")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    # cdx-codeprot: the program toggles PAGE_GUARD then PAGE_NOACCESS on a code page of a loaded
+    # module between hits of an inline stack-capturing probe. The capture must leave the guard
+    # armed, raise no fault the program sees, and not crash -- its frames stay honest.
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"cdx-codeprot-{bk}"
+        try:
+            res, logs, rows, bad = go("codeprot", bk, [])
+            if res.get("guard_set") != 1: bad.append(f"guard_set={res.get('guard_set')}")
+            if res.get("guard_intact") != 1: bad.append(f"guard_intact={res.get('guard_intact')} (a touch consumed the guard page)")
+            if res.get("guard_faults") != 0: bad.append(f"guard_faults={res.get('guard_faults')}")
+            if res.get("na_faults") != 0: bad.append(f"na_faults={res.get('na_faults')}")
+            leaf = sum(1 for m in logs if m == "leaf")
+            if leaf != res.get("hits"): bad.append(f"stack logs={leaf} (want {res.get('hits')})")
+            record(name, not bad, " ".join(bad) or f"guard intact, no fault, {leaf} honest stack logs")
+        except Exception as e:
+            record(name, False, repr(e))
+
     for bk in ("breakpoint", "hw", "inline"):
         name = f"cdx-int3cap-{bk}"
         try:
