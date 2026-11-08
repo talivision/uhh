@@ -3820,6 +3820,23 @@ def check_module_review():
     if not d or not t or not exe("modrel_owner.dll"):
         return missing_bin("module-review", "ctrl_driver/ctrl_target/modrel_owner")
     x86 = pe_is_x86(t)
+    # Check the built PE, not just successful linkage: ForwardValue must point into
+    # the export directory at the forwarder string, rather than at a local thunk.
+    for side in ("low", "high"):
+        name = f"module-review-forwarder-image-{side}"
+        try:
+            path = exe(f"modrel_forward_{side}.dll")
+            data = Path(path).read_bytes()
+            pe = struct.unpack_from("<I", data, 0x3C)[0]
+            opt = pe + 24
+            dd = opt + (96 if struct.unpack_from("<H", data, opt)[0] == 0x10B else 112)
+            start, size = struct.unpack_from("<II", data, dd)
+            expected = b"modrel_owner.ModValue\0"
+            rva, value = pe_export_bytes(path, "ForwardValue", len(expected), rva=True)
+            ok = start <= rva and rva + len(expected) <= start + size and value == expected
+            record(name, ok, f"ForwardValue RVA={rva:#x} bytes={value!r}")
+        except Exception as e:
+            record(name, False, repr(e))
     cases = [("modforward", bk, side) for bk in ("breakpoint", "hw", "inline") for side in ("low", "high")]
     cases += [(sc, bk, "low") for sc in ("modreload", "modcall", "modhistory", "modreloc")
               for bk in ("breakpoint", "hw", "inline") if sc != "modreload" or bk == "breakpoint"]
