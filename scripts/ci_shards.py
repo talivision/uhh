@@ -54,7 +54,7 @@ EST = {
     "check_detours_withdll": (35, 35), "check_dynwatch": (1, 1), "check_edgehunt": (22, 17),
     "check_emulated_sites": (73, 138), "check_entry_hold_threads": (1, 3), "check_famous_files": (14, 14),
     "check_famous_heap": (11, 20), "check_famous_loader": (1, 1), "check_famous_retval": (5, 5),
-    "check_famous_tls": (2, 2), "check_forwarded_probe": (1, 1), "check_frida_coexist": (4, 9),
+    "check_famous_tls": (2, 2), "check_forwarded_probe": (1, 1), "check_module_review": (15, 15), "check_frida_coexist": (4, 9),
     "check_frida_parity": (1, 1), "check_gated_e2e": (343, 364), "check_gated_guardwin": (30, 30), "check_gated_filter": (5, 6), "check_gated_map": (3, 3),
     "check_gated_mem": (8, 7), "check_gated_off": (1, 1), "check_handle_map": (20, 21),
     "check_hotpatch_prologue": (1, 1), "check_hunt": (85, 420), "check_init_cutoff": (18, 18), "check_hw_once_slots": (6, 6),

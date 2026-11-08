@@ -744,11 +744,102 @@ static int run_headcorrupt() {
     return 0;
 }
 
+// ---- module reload / forwarding / address-size review --------------------------------
+static int run_modmodules(const std::string &sc, const char *which) {
+    typedef int (*Value)(int);
+    typedef int (*Sys)(unsigned long);
+    std::vector<void *> reserved;
+    int bad = 0, calls = 0;
+    unsigned long ssn = 0;
+#if defined(_WIN64)
+    const unsigned char *stub = (const unsigned char *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtYieldExecution");
+    if (!stub || stub[0] != 0x4c || stub[3] != 0xb8) return 5;
+    std::memcpy(&ssn, stub + 4, 4);
+#endif
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        HMODULE owner = LoadLibraryA("modrel_owner.dll");
+        HMODULE fwd = LoadLibraryA((std::string("modrel_forward_") + which + ".dll").c_str());
+        if (!owner || !fwd) return 6;
+        if (!cycle && sc == "modforward" &&
+            ((!std::strcmp(which, "low") && (uintptr_t)owner <= (uintptr_t)fwd) ||
+             (!std::strcmp(which, "high") && (uintptr_t)owner >= (uintptr_t)fwd))) return 10;
+        Value value = (Value)GetProcAddress(owner, "ModValue");
+        Sys sys = (Sys)GetProcAddress(owner, "ModSys");
+        if (!value || !sys) return 7;
+        if (sc == "modforward") {
+            bad += value(5) != 12; ++calls;
+            FreeLibrary(fwd); fwd = nullptr;
+            bad += value(5) != 12; ++calls; // forwarding image gone, owner is still live
+        } else if (sc == "modreload") {
+            bad += sys(ssn) != 0; ++calls;
+        } else { CtrlCall(sc == "modhistory" ? GetCurrentProcessId() : (uintptr_t)cycle); ++calls; }
+        auto dos = (const IMAGE_DOS_HEADER *)owner;
+        auto nt = (const IMAGE_NT_HEADERS *)((const char *)owner + dos->e_lfanew);
+        const SIZE_T size = nt->OptionalHeader.SizeOfImage;
+        FreeLibrary(owner);
+        if (fwd) FreeLibrary(fwd);
+        // Force a different mapping on the next cycle. Old continuations must never run.
+        void *hold = VirtualAlloc(owner, size, MEM_RESERVE, PAGE_NOACCESS);
+        if (!hold && sc == "modreload") return 8;
+        if (hold) reserved.push_back(hold);
+    }
+    for (void *hold : reserved) VirtualFree(hold, 0, MEM_RELEASE);
+    std::printf("{\"kind\":\"ctrl_result\",\"calls\":%d,\"bad\":%d}\n", calls, bad);
+    return bad ? 9 : 0;
+}
+static int run_modreloc() {
+    unsigned char *code = (unsigned char *)VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!code) return 5;
+    int bad = 0, calls = 0;
+#if defined(_WIN64)
+    // LEA with EIP-relative addressing wraps the result at 32 bits. It never faults,
+    // so a wrongly displaced copy cannot hide behind the fault-retry path.
+    const unsigned char lea[] = {0x67, 0x8d, 0x05, 0, 0, 0, 0, 0xc3};
+    std::memcpy(code, lea, sizeof(lea));
+    FlushInstructionCache(GetCurrentProcess(), code, sizeof(lea));
+    CtrlAnnounce(code, nullptr);
+    typedef uintptr_t (*Fn)();
+    for (int i = 0; i < 5; ++i) { bad += ((Fn)code)() != (uint32_t)(uintptr_t)(code + 7); ++calls; }
+    // Use a second page: changing an already-probed instruction is another finding.
+    code = (unsigned char *)VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!code) return 6;
+#endif
+    void *low = VirtualAlloc((void *)(uintptr_t)0x20000, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!low) return 7;
+#if defined(_WIN64)
+    void *high = VirtualAlloc((void *)(uintptr_t)0x100020000ull, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!high) return 8;
+#endif
+    // mov eax,fffffff0; [addr32] jmp [eax+20020] -> pointer at 20010.
+    const unsigned char branch[] = {0xb8, 0xf0, 0xff, 0xff, 0xff,
+#if defined(_WIN64)
+        0x67,
+#endif
+        0xff, 0xa0, 0x20, 0x00, 0x02, 0x00};
+    std::memcpy(code, branch, sizeof(branch));
+    const unsigned char good[] = {0xb8, 0x2a, 0, 0, 0, 0xc3};
+    const unsigned char wrong[] = {0xb8, 0x63, 0, 0, 0, 0xc3};
+    std::memcpy(code + 64, good, sizeof(good)); std::memcpy(code + 80, wrong, sizeof(wrong));
+    *(uintptr_t *)((char *)low + 16) = (uintptr_t)(code + 64);
+#if defined(_WIN64)
+    *(uintptr_t *)((char *)high + 16) = (uintptr_t)(code + 80);
+#endif
+    FlushInstructionCache(GetCurrentProcess(), code, 96);
+    CtrlAnnounce(code + 5, nullptr);
+    typedef int (*Branch)();
+    for (int i = 0; i < 5; ++i) { bad += ((Branch)code)() != 42; ++calls; }
+    std::printf("{\"kind\":\"ctrl_result\",\"calls\":%d,\"bad\":%d}\n", calls, bad);
+    return bad ? 9 : 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: ctrl_target <scenario> [opts]\n"); return 2; }
     const std::string sc = argv[1];
     int rc = 2;
-    if (sc == "fault") rc = run_fault(arg_int(argc, argv, "--n", 200));
+    if (sc == "modforward" || sc == "modcall" || sc == "modhistory" || sc == "modreload")
+        rc = run_modmodules(sc, arg_str(argc, argv, "--dll", "low"));
+    else if (sc == "modreloc") rc = run_modreloc();
+    else if (sc == "fault") rc = run_fault(arg_int(argc, argv, "--n", 200));
     else if (sc == "inplace") rc = run_inplace(arg_int(argc, argv, "--threads", 8), arg_int(argc, argv, "--n", 3000));
     else if (sc == "absunload") rc = run_absunload(arg_int(argc, argv, "--cycles", 5), arg_int(argc, argv, "--n", 100));
     else if (sc == "symunload") rc = run_symunload(arg_int(argc, argv, "--cycles", 4), arg_int(argc, argv, "--n", 1500));

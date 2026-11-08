@@ -62,26 +62,19 @@ static bool arm_probe(probe_session *s, Probe &item, uint64_t base) {
     // Inline stays inline.)
     if (!item.export_name.empty()) {
         uint64_t exp = 0;
-        const bool exported = resolve_export(s, base, item.export_name, exp);
-        if (!exported && s->error.find("forwarded") != std::string::npos) {
-            // A forwarded export: probe the function it forwards to (in its own module).
-            uint64_t target = forwarded_export_target(s, item.module, item.export_name);
-            std::string owner; uint64_t owner_rva = 0;
-            if (!target && forwarded_export_owner(item.module, item.export_name, owner, owner_rva) &&
-                !iequals(owner, item.module)) {
-                // The forward target's module is not mapped yet (ole32!CoCreateInstance ->
-                // combase, mapped AFTER ole32): the probe now lives in that module and stays
-                // pending until it loads, like any probe on a not-yet-loaded module.
-                s->error.clear();
-                std::fprintf(stderr, "probe: %s is forwarded -> %s+0x%llx (pending until it loads)\n",
-                             item.location.c_str(), owner.c_str(), (unsigned long long)owner_rva);
-                item.module = owner; item.export_name.clear(); item.rva = owner_rva + item.sym_offset;
-                return true;
-            }
-            if (!target) { s->error += " (and its target module is not loaded in the target yet)"; return false; }
+        std::string forward;
+        const bool exported = resolve_export(s, base, item.export_name, exp, &forward);
+        if (!exported && !forward.empty()) {
+            std::string owner = item.module, symbol = item.export_name;
+            uint64_t owner_base = 0;
+            if (!remote_export_owner(s, owner, symbol, owner_base, exp)) return false;
+            // Ownership follows the code mapping, not the forwarding image. Keep the
+            // destination symbol so a reload re-reads its export table instead of an old RVA.
+            item.module = owner; item.export_name = symbol;
             s->error.clear();
-            exp = target - base;                       // may point into another module: base + rva is absolute
-            std::fprintf(stderr, "probe: %s is forwarded -> 0x%llx\n", item.location.c_str(), (unsigned long long)target);
+            if (!owner_base) return true;
+            base = owner_base;
+            boundary_done = false;
         } else if (!exported) {
             // Not exported: try the module's symbols (PDB beside the image, or a symbol
             // server via _NT_SYMBOL_PATH) -- internal functions by name.

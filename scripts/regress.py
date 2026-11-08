@@ -3809,6 +3809,52 @@ def check_shared_mix(threads=8, reads=1000):
             record(name, False, repr(e))
 
 
+def check_module_review():
+    """Controller module reload, target forwarder ownership/resolution and addr32 execution.
+    The owner has a fixed preferred base between the two forwarding images; reservations
+    force each reload elsewhere. No controller copy of either application DLL is loaded.
+    x86 exercises reload/forwarding and native 32-bit address wrapping; EIP-relative LEA
+    and address-size-overridden branches apply to x64 only.
+    """
+    d, t = exe("ctrl_driver.exe"), exe("ctrl_target.exe")
+    if not d or not t or not exe("modrel_owner.dll"):
+        return missing_bin("module-review", "ctrl_driver/ctrl_target/modrel_owner")
+    x86 = pe_is_x86(t)
+    cases = [("modforward", bk, side) for bk in ("breakpoint", "hw", "inline") for side in ("low", "high")]
+    cases += [(sc, bk, "low") for sc in ("modreload", "modcall", "modhistory", "modreloc")
+              for bk in ("breakpoint", "hw", "inline") if sc != "modreload" or bk == "breakpoint"]
+    for sc, bk, side in cases:
+        name = f"module-review-{sc}-{side}-{bk}"
+        try:
+            r, o = run([d, "--scenario", sc, "--shape", side, "--backend", bk, "--", t, sc, "--dll", side], timeout=180)
+            res = next((x for x in o if x.get("kind") == "ctrl_result"), {})
+            rows = [x for x in o if x.get("kind") == "probe"]
+            logs = [x for x in famous_objs(r, o) if x.get("kind") == "probe_log"]
+            rep = report(o)
+            calls = (5 if x86 else 10) if sc == "modreloc" else 6 if sc == "modforward" else 3
+            arms = (1 if x86 else 2) if sc == "modreloc" else 0
+            bad = []
+            expected_exit = 1 if sc == "modhistory" else 0
+            if r.returncode != expected_exit or rep.get("app_exit") != 0:
+                bad.append(f"exit={r.returncode}/{rep.get('app_exit')} expected={expected_exit}/0")
+            if sc == "modhistory" and rep.get("error") != "launch argv is empty": bad.append(f"history_error={rep.get('error')}")
+            # modhistory leaves a rejected second launch's diagnostic (after launch cleared setup errors).
+            if sc != "modhistory" and rep.get("error") is not None: bad.append(f"error={rep.get('error')}")
+            if res.get("calls") != calls or res.get("bad") != 0: bad.append(f"target={res}")
+            hits = sum(x.get("hits", 0) for x in rows)
+            if hits != calls + arms or len(logs) != hits: bad.append(f"hits={hits} logs={len(logs)} want={calls + arms}")
+            if rep.get("log_dropped", 0): bad.append(f"dropped={rep.get('log_dropped')}")
+            if rep.get("logs_written") != hits: bad.append(f"written={rep.get('logs_written')} hits={hits}")
+            if [x.get("seq") for x in logs] != list(range(len(logs))): bad.append("non-contiguous log sequence")
+            messages = Counter(str(x.get("message", "")) for x in logs)
+            if sc == "modcall" and messages != Counter({"modcall ok=1 r=12": calls}): bad.append(f"callbacks={messages}")
+            if sc == "modhistory" and messages != Counter({"modhistory ok=1 match=1": calls}): bad.append(f"callbacks={messages}")
+            if sc == "modreloc" and messages != Counter({"load": calls, "modarm ok=1": arms}): bad.append(f"callbacks={messages}")
+            record(name, not bad, " ".join(bad) or f"calls=hits=logs={calls}, arms={arms}, target unchanged")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
 def check_forwarded_probe():
     """A probe on a FORWARDED export (kernel32!HeapAlloc -> ntdll!RtlAllocateHeap) lands on
     the forward target, on every backend; the target is unaffected."""
@@ -12387,6 +12433,7 @@ def main():
     if want(check_shared_mix): check_shared_mix()
     if want(check_handle_map): check_handle_map()
     if want(check_gated_mem): check_gated_mem()
+    if want(check_module_review): check_module_review()
     if want(check_forwarded_probe): check_forwarded_probe()
     if want(check_crash_logs): check_crash_logs()
     if want(check_carry_exact): check_carry_exact()

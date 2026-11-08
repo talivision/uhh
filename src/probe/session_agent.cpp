@@ -21,32 +21,6 @@ bool module_of(const void *address, HMODULE &m) {
                               reinterpret_cast<LPCSTR>(address), &m) != 0;
 }
 
-// A forwarded export (kernel32!HeapAlloc -> ntdll!RtlAllocateHeap, or into an API set):
-// follow it the way the loader does, through THIS process's copy of the same system DLL
-// (controller and target are the same bitness, so they load the same files), then map the
-// final function onto the target's module of the same name. 0 = not resolvable.
-// Where a forwarded export finally lands: module name + RVA, via this process's copy of
-// the same system DLL (same bitness as the target, so the same files).
-bool forwarded_export_owner(const std::string &module, const std::string &name,
-                                   std::string &owner_name, uint64_t &owner_rva) {
-    HMODULE m = GetModuleHandleA(module.c_str());
-    if (!m) m = LoadLibraryExA(module.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    FARPROC f = m ? GetProcAddress(m, name.c_str()) : nullptr;
-    HMODULE owner{};
-    if (!f || !module_of(reinterpret_cast<const void *>(f), owner)) return false;
-    owner_name = module_name_from_module(owner);
-    owner_rva = (uint64_t)((uintptr_t)f - (uintptr_t)owner);
-    return !owner_name.empty();
-}
-
-uint64_t forwarded_export_target(probe_session *s, const std::string &module, const std::string &name) {
-    std::string owner_name; uint64_t rva = 0;
-    if (!forwarded_export_owner(module, name, owner_name, rva)) return 0;
-    for (auto &kv : s->module_bases)
-        if (iequals(kv.first, owner_name)) return kv.second + rva;
-    return 0;
-}
-
 static std::wstring sibling_agent_path() {
     wchar_t path[MAX_PATH]; DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
     if (!n || n >= MAX_PATH) return L"probe_api_agent.dll";

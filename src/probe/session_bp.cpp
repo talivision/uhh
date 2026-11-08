@@ -171,9 +171,8 @@ bool emulate_site(probe_session *s, const Probe &p, CONTEXT &c) {
             uint64_t base = 0, index = 0;
             if (!emu_reg(c, o.mem.base, next, base) || !emu_reg(c, o.mem.index, next, index)) return false;
             uint64_t a = base + index * o.mem.scale + (uint64_t)o.mem.disp.value;
-#if !defined(_WIN64)
-            a = (uint32_t)a;
-#endif
+            if (in.address_width == 32) a = (uint32_t)a;
+            else if (in.address_width == 16) a = (uint16_t)a;
             t = 0; size_t n = 0;
             return remote_range_ok(h, a, ptr, false) && remote_read(h, a, &t, ptr, &n) && n == ptr;
         }
@@ -299,6 +298,9 @@ static bool decode_site(const unsigned char *bytes, size_t n, uint32_t &len,
     }
     // RIP-relative memory operand (x64): record the disp32 so the copy can be retargeted.
     for (int i = 0; i < insn.operand_count; ++i) {
+        if (ops[i].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[i].mem.base == ZYDIS_REGISTER_EIP) {
+            displaced_ok = false; return true;        // addr32 wraps at 4 GiB: execute at the real site
+        }
         if (ops[i].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[i].mem.base == ZYDIS_REGISTER_RIP) {
             if (insn.raw.disp.size == 32 && insn.raw.disp.offset) riprel_off = insn.raw.disp.offset;
             else displaced_ok = false;                // RIP-relative but not a disp32 we can retarget
@@ -317,6 +319,7 @@ size_t int3_armed(const probe_session *s) {
     return n;
 }
 bool arm_breakpoint(probe_session *s, Probe &p, uint64_t base) {
+    p.tramp = 0; // A new image/site needs a new syscall continuation; old copies may still be running.
     if (p.rva > UINT64_MAX - base) { set_error(s, "probe address overflow"); return false; }
     uint64_t address = base + p.rva; size_t got{};
     unsigned char buf[16];

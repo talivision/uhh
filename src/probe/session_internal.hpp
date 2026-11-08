@@ -652,9 +652,6 @@ std::string symbolize(probe_session *s, uint64_t addr);
 void vlog_entry(probe_context *c, int stack, const char *format, va_list ap);
 // session_agent.cpp
 bool module_of(const void *address, HMODULE &m);
-bool forwarded_export_owner(const std::string &module, const std::string &name,
-                            std::string &owner_name, uint64_t &owner_rva);
-uint64_t forwarded_export_target(probe_session *s, const std::string &module, const std::string &name);
 void start_agent_prep(probe_session *s);
 bool bind_shared_callback(probe_session *s, probe_callback &cb, uint32_t flags, std::string &pending_export);
 bool resolve_inline(probe_session *s, Probe &p, uint64_t base);
@@ -771,7 +768,8 @@ void sym_register(probe_session *s, HANDLE file, uint64_t base);
 std::string module_name_from_module(HMODULE module);
 bool iequals(const std::string &a, const std::string &b);
 bool parse_location(probe_session *s, const char *text, Probe &p);
-bool resolve_export(probe_session *s, uint64_t base, const std::string &name, uint64_t &rva);
+bool resolve_export(probe_session *s, uint64_t base, const std::string &name, uint64_t &rva, std::string *forward = nullptr);
+bool remote_export_owner(probe_session *s, std::string &module, std::string &name, uint64_t &base, uint64_t &rva);
 uint64_t resolve_symbol(probe_session *s, const char *symbol);
 
 // Program debug register `slot` for execute (rw=0,len=0) or a data watchpoint. rw:

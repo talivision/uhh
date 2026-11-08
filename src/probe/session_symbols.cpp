@@ -179,8 +179,9 @@ bool parse_location(probe_session *s, const char *text, Probe &p) {
 }
 
 // Resolve an export by name from the TARGET's image (read remotely; works before the
-// module has run any code). Forwarded exports are rejected: hook the forward target.
-bool resolve_export(probe_session *s, uint64_t base, const std::string &name, uint64_t &rva) {
+// module has run any code). A forwarder is returned separately from a code RVA.
+bool resolve_export(probe_session *s, uint64_t base, const std::string &name, uint64_t &rva, std::string *forward) {
+    if (forward) forward->clear();
     HANDLE h = s->pi.hProcess; size_t got = 0;
     IMAGE_DOS_HEADER dos{};
     if (!remote_read(h, base, &dos, sizeof(dos), &got) || got != sizeof(dos) || dos.e_magic != IMAGE_DOS_SIGNATURE) {
@@ -215,6 +216,25 @@ bool resolve_export(probe_session *s, uint64_t base, const std::string &name, ui
         set_error(s, "export lookup: cannot read export tables"); return false;
     }
     char buf[256];
+    auto result = [&](uint32_t f) {
+        if (!f) return false;
+        if (in_dir(f, 1)) {
+            const char *str = reinterpret_cast<const char *>(blob.data() + (f - dir.VirtualAddress));
+            const size_t lim = dir.Size - (f - dir.VirtualAddress);
+            const size_t n = strnlen(str, lim);
+            if (!n || n == lim) return false;
+            if (forward) forward->assign(str, n);
+            else set_error(s, "export '" + name + "' is forwarded; probe the forward target");
+            return false;
+        }
+        rva = f; return true;
+    };
+    if (!name.empty() && name[0] == '#') {
+        char *end = nullptr;
+        const unsigned long ordinal = std::strtoul(name.c_str() + 1, &end, 10);
+        if (end == name.c_str() + 1 || *end || ordinal < ex->Base || ordinal - ex->Base >= funcs.size()) return false;
+        return result(funcs[ordinal - ex->Base]);
+    }
     for (size_t i = 0; i < names.size(); ++i) {
         size_t n = 0;
         if (in_dir(names[i], 1)) {
@@ -229,10 +249,37 @@ bool resolve_export(probe_session *s, uint64_t base, const std::string &name, ui
         if (name != buf) continue;
         if (ords[i] >= funcs.size()) break;
         uint32_t f = funcs[ords[i]];
-        if (in_dir(f, 0)) { set_error(s, "export '" + name + "' is forwarded; probe the forward target"); return false; }
-        rva = f; return true;
+        return result(f);
     }
     set_error(s, "export '" + name + "' not found"); return false;
+}
+
+// Follow the TARGET's forwarder strings and export tables. An absent destination remains
+// a named pending probe, so its RVA is read from that image when it actually loads.
+bool remote_export_owner(probe_session *s, std::string &module, std::string &name, uint64_t &base, uint64_t &rva) {
+    for (unsigned depth = 0; depth < 32; ++depth) {
+        base = 0;
+        for (const auto &kv : s->module_bases) if (iequals(kv.first, module)) { base = kv.second; break; }
+        if (!base) return true;
+        std::string forward;
+        if (resolve_export(s, base, name, rva, &forward)) return true;
+        if (forward.empty()) return false;
+        const size_t dot = forward.rfind('.');
+        if (dot == std::string::npos || !dot || dot + 1 == forward.size()) return false;
+        std::string next = forward.substr(0, dot);
+        if (next.find('.') == std::string::npos) next += ".dll";
+        // API contracts are aliases, not mapped images. Use the OS's contract mapping
+        // only, then read the named export from the destination TARGET image.
+        if (next.rfind("api-", 0) == 0 || next.rfind("ext-", 0) == 0) {
+            HMODULE alias = LoadLibraryExA(next.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+            if (!alias) return false;
+            next = module_name_from_module(alias);
+            FreeLibrary(alias);
+            if (next.empty()) return false;
+        }
+        module = next; name = forward.substr(dot + 1);
+    }
+    return false; // cycles / implausibly deep chains
 }
 
 // ---- call_func: run a target function on the stopped thread -------------------------
@@ -245,30 +292,19 @@ uint64_t resolve_symbol(probe_session *s, const char *symbol) {
     if (!symbol || !*symbol) return 0;
     if (symbol[0] == '0' && (symbol[1] == 'x' || symbol[1] == 'X')) return std::strtoull(symbol + 2, nullptr, 16);
     Probe tmp; std::string saved = s->error;
-    if (!parse_location(s, symbol, tmp)) { s->error = saved; return 0; }
-    // tmp.module is already in module_of_location's form ("kernel32!X" -> kernel32.dll),
-    // the same match a probe location gets.
-    for (auto &kv : s->module_bases)
-        if (iequals(kv.first, tmp.module)) {
-            uint64_t rva = tmp.rva;
-            if (!tmp.export_name.empty()) {
-                uint64_t exp = 0;
-                if (!resolve_export(s, kv.second, tmp.export_name, exp)) {
-                    // A forwarded export (kernel32!HeapAlloc -> ntdll!RtlAllocateHeap, or into an
-                    // API set): follow it the way the loader does, via this process's copy of the
-                    // same system DLL (same bitness as the target, so the same files), then map
-                    // the final function to the target module of the same name.
-                    const bool forwarded = s->error.find("forwarded") != std::string::npos;
-                    s->error = saved;
-                    if (!forwarded) return 0;
-                    uint64_t target = forwarded_export_target(s, tmp.module, tmp.export_name);
-                    return target ? target + tmp.sym_offset : 0;
-                }
-                rva = exp + tmp.sym_offset;
-            }
-            s->error = saved; return kv.second + rva;
+    s->error.clear();
+    uint64_t base = 0, rva = 0, result = 0;
+    if (parse_location(s, symbol, tmp)) {
+        if (!tmp.export_name.empty()) {
+            if (remote_export_owner(s, tmp.module, tmp.export_name, base, rva) && base &&
+                rva <= UINT64_MAX - base && tmp.sym_offset <= UINT64_MAX - base - rva)
+                result = base + rva + tmp.sym_offset;
+        } else {
+            for (const auto &kv : s->module_bases) if (iequals(kv.first, tmp.module) && tmp.rva <= UINT64_MAX - kv.second)
+                result = kv.second + tmp.rva;
         }
-    s->error = saved; return 0;
+    }
+    s->error = saved; return result;
 }
 
 } // namespace uhh_session

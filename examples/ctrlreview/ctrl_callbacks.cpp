@@ -87,3 +87,20 @@ CTRL_EXPORT void ctrl_on_bigcfg(probe_context *c) {
     free(cfg);
     send_log(c, "%s bigcfg add=%d", r == 1 ? "ok" : "FAIL", r);
 }
+
+// Module-review callbacks, shared verbatim by every backend.
+CTRL_EXPORT void ctrl_on_modcall(probe_context *c) {
+    uint64_t r = 0;
+    const int ok = call_func(c, "modrel_forward_low.dll!ForwardValue", &r, 1, (uint64_t)5);
+    send_log(c, "modcall ok=%d r=%llu", ok, (unsigned long long)r);
+}
+CTRL_EXPORT void ctrl_on_modarm(probe_context *c) {
+    const int ok = probe_add_address(get_session(c), get_func_arg(c, 0), ctrl_on_load, cfg_backend(c));
+    send_log(c, "modarm ok=%d", ok);
+}
+
+CTRL_EXPORT void ctrl_on_modhistory(probe_context *c) {
+    uint64_t r = 0;
+    const int ok = call_func(c, "kernel32.dll!GetCurrentProcessId", &r, 0);
+    send_log(c, "modhistory ok=%d match=%d", ok, ok && r == get_func_arg(c, 0));
+}

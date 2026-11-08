@@ -22,6 +22,9 @@ void ctrl_on_wonce(probe_context *);
 void ctrl_on_bigcfg(probe_context *);
 void ctrl_on_shape(probe_context *);
 void ctrl_on_cfcall(probe_context *);
+void ctrl_on_modcall(probe_context *);
+void ctrl_on_modhistory(probe_context *);
+void ctrl_on_modarm(probe_context *);
 }
 struct ctrl_cfg { uint32_t backend; uint32_t pad; };
 
@@ -72,7 +75,19 @@ int main(int argc, char **argv) {
     ctrl_cfg k{backend, 0};
     bool ok = s != nullptr;
     if (ok) {
-        if (sc == "fault" || sc == "faultreg" || sc == "faultmix")
+        if (sc == "modforward")
+            ok = probe_add_symbol(s, ("modrel_forward_" + shape + ".dll!ForwardValue").c_str(), ctrl_on_load, backend);
+        else if (sc == "modcall" || sc == "modhistory") {
+            ok = probe_add_symbol(s, "ctrl_target.exe!CtrlCall", sc == "modhistory" ? ctrl_on_modhistory : ctrl_on_modcall, backend);
+        } else if (sc == "modreload") {
+#if defined(_WIN64)
+            ok = probe_add_symbol(s, "modrel_owner.dll!ModSysInsn", ctrl_on_load, backend);
+#else
+            ok = probe_add_symbol(s, "modrel_owner.dll!ModSys", ctrl_on_load, backend);
+#endif
+        } else if (sc == "modreloc")
+            ok = probe_add_symbol_cfg(s, "ctrl_target.exe!CtrlAnnounce", ctrl_on_modarm, backend, &k, sizeof(k));
+        else if (sc == "fault" || sc == "faultreg" || sc == "faultmix")
             ok = probe_add_symbol(s, "ctrl_target.exe!CtrlLoadInsn", ctrl_on_load, backend);
         else if (sc == "inplace")
             ok = probe_add_symbol(s, "ctrl_target.exe!CtrlLoopInsn", ctrl_on_loop, backend);
@@ -110,7 +125,11 @@ int main(int argc, char **argv) {
                     sc.c_str(), launched, agent_copies_left(), kept);
         return launched == 0 ? 0 : 1;
     }
-    ok = ok && probe_launch(s, child.data()) && probe_run(s) && probe_wait_for_exit(s);
+    ok = ok && probe_launch(s, child.data());
+    // Launch clears pre-launch errors, and dynamic adds restore theirs. Leave a real
+    // unrelated diagnostic AFTER launch, before the valid forwarded call_func.
+    if (ok && sc == "modhistory") (void)probe_launch(s, nullptr);
+    ok = ok && probe_run(s) && probe_wait_for_exit(s);
     if (s) { probe_report(s, stdout); probe_close(s); }
     return ok ? 0 : 1;
 }
