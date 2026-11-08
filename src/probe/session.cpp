@@ -404,6 +404,10 @@ struct probe_session {
     bool detached_hooks = false;               // detach removed the inline hooks (stop_drainer may settle)
     bool guard_ready = false;                  // attach: breakpoint/hw probes may arm (no agent, or its guard is up / given up)
     ULONGLONG guard_since = 0;
+    // attach: the modules mapped when the attach began (their LOAD_DLL events are the kernel's
+    // replay); any other load is a fresh mapping whose code has not run yet (see arm_module)
+    std::unordered_set<uint64_t> attach_modules;
+    bool attach_modules_ok = false;
     bool agent_init_started = false;           // this session started the agent's init
     // The early init (on the main thread at the loader breakpoint) ran to completion: the agent
     // made its service thread then, and it reports itself (INSTALL_DONE) once process init lets it
@@ -4511,17 +4515,32 @@ static void warn_bare_module(probe_session *s, const std::string &module) {
 // Launch-time probes that fail to arm fail the session (the user asked for them up
 // front). A probe added at runtime -- possibly pending on a module that loads much
 // later -- only reports its failure and retires; the run and other probes continue.
-static bool arm_module(probe_session *s, const std::string &module, uint64_t base) {
+// fresh: the module has just been mapped (its LOAD_DLL, not the attach's replay of one already
+// loaded) and none of its code has run yet.
+static bool guard_set_ready(probe_session *s, const char *why);
+static bool arm_module(probe_session *s, const std::string &module, uint64_t base, bool fresh) {
     // Detaching: a module loading while the detach drains its last events must not get a
     // fresh INT3 / debug register / hook after everything was removed (seen: a DLL that
     // reloaded during the drain kept its new INT3 and the detached target died on it).
     if (s->detaching) return true;
     warn_bare_module(s, module);
     bool all_ok = true;
+    // The agent's service thread runs: its init has put the guard in place (the vectored
+    // handler goes in before the service thread starts), so the guard is up -- whether or not
+    // that init has returned yet. Its INSTALL_DONE reports the inline probes active before
+    // the init returns; a module loaded in between had its breakpoint/hw probes skipped here
+    // and armed only when the init returned -- after the loading thread had run its code
+    // (gated-e2e-attach-pre-fbp-oin-cin-rin, x86: no flag hit; regress gated-guardwin-stall-*).
+    if (guard_pending(s) && s->shared->service_ready) all_ok = guard_set_ready(s, nullptr);
     for (size_t i = 0; i < s->probes.size(); ++i) {
         Probe &item = *s->probes[i];
         if (item.active || item.retired || item.address || !iequals(item.module, module)) continue;
-        if (!(item.flags & PROBE_INLINE) && guard_pending(s)) continue;   // armed by guard_set_ready
+        // Not up yet: a module already loaded at the attach waits for the guard (armed by
+        // guard_set_ready; no unguarded trap). A FRESH mapping cannot wait: its loading
+        // thread runs its code next, and a probe armed later misses those calls. It is armed
+        // now; the guard covers it from the moment it is up (the INT3 table / DR mask are
+        // mirrored already). regress gated-guardwin-early-*.
+        if (!(item.flags & PROBE_INLINE) && guard_pending(s) && !fresh) continue;
         std::string saved = s->error;
         bool ok = false;
         try { ok = arm_probe(s, item, base); }
@@ -4559,7 +4578,7 @@ static bool guard_set_ready(probe_session *s, const char *why) {
                                   "breakpoint/hw probes armed without it\n", why);
     bool ok = true;
     std::vector<std::pair<std::string, uint64_t>> mods(s->module_bases.begin(), s->module_bases.end());
-    for (auto &m : mods) ok = arm_module(s, m.first, m.second) && ok;
+    for (auto &m : mods) ok = arm_module(s, m.first, m.second, false) && ok;
     guard_sync(s);
     return ok;
 }
@@ -5585,6 +5604,16 @@ extern "C" int probe_attach(probe_session *s, uint32_t pid) {
         set_error(s, win_error("attach debugger")); CloseHandle(s->pi.hProcess); s->pi.hProcess = nullptr; return 0;
     }
     DebugSetProcessKillOnExit(FALSE);              // our exit must never take the target down
+    // The modules mapped now: the attach replays a LOAD_DLL for each (its threads are held
+    // until their replayed events are continued); every other LOAD_DLL is a fresh mapping.
+    {
+        HMODULE mods[1024]; DWORD need = 0;
+        for (int tries = 0; tries < 3 && !s->attach_modules_ok; ++tries)
+            if (K32EnumProcessModulesEx(s->pi.hProcess, mods, sizeof(mods), &need, LIST_MODULES_ALL) && need <= sizeof(mods)) {
+                for (DWORD i = 0; i < need / sizeof(HMODULE); ++i) s->attach_modules.insert((uint64_t)(uintptr_t)mods[i]);
+                s->attach_modules_ok = true;
+            }
+    }
     s->debug_tid = GetCurrentThreadId();
     s->pi.dwProcessId = pid;
     s->attached = true; s->launched = true; s->inline_ready = true;
@@ -6554,7 +6583,7 @@ static void park_thread(probe_session *s, DWORD tid, DWORD disposition) {
 // Called by the event loop around every wait. `blocked`: how long the last wait for a debug
 // event blocked (the target ran unfrozen meanwhile, give or take), `got`: an event came.
 // Returns the next wait's timeout.
-static bool arm_module(probe_session *s, const std::string &module, uint64_t base);
+static bool arm_module(probe_session *s, const std::string &module, uint64_t base, bool fresh);
 static bool arm_gates_for_pending(probe_session *s);
 static bool arm_quietly(probe_session *s, const std::string &name, uint64_t base);
 static bool site_executable(HANDLE h, uint64_t a) {
@@ -7074,6 +7103,10 @@ static bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
         if (n == offsetof(probe_ipc_request, address) && head.op == PROBE_IPC_INSTALL_DONE) {
             // Harmless if forged: acceptance re-checks every request status itself.
             if (!accept_agent_install(s)) { std::fprintf(stderr, "probe: %s\n", s->error.c_str()); }
+            // This thread runs: the guard is up (see arm_module) -- breakpoint/hw probes go
+            // active with the inline ones, not when the init thread returns.
+            else if (guard_pending(s) && s->shared->service_ready && !guard_set_ready(s, nullptr))
+                std::fprintf(stderr, "probe: %s\n", s->error.c_str());
             // Still pending after a round: its site is not installable YET (a relocated DLL's
             // code is not executable until the loader has finished relocating it). Asking again
             // at once made the agent spin round after round, each an event that freezes the
@@ -9607,7 +9640,7 @@ static bool arm_quietly(probe_session *s, const std::string &name, uint64_t base
     const std::string saved = s->error;
     std::vector<std::pair<Probe *, bool>> was;                 // the module's probes: retired before?
     for (auto &p : s->probes) if (iequals(p->module, name)) was.emplace_back(p.get(), p->retired);
-    const bool ok = arm_module(s, name, base);
+    const bool ok = arm_module(s, name, base, false);
     if (!ok) {
         if (trace_enabled()) std::fprintf(stderr, "  re-arm %s at 0x%llx failed (%s): pending\n", name.c_str(),
                                           (unsigned long long)base, s->error.c_str());
@@ -9639,7 +9672,7 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
         std::string name = event_module_name(s->pi.hProcess, event.u.CreateProcessInfo.hFile, base);
         if (!name.empty()) s->module_bases[name] = base;
         sym_register(s, event.u.CreateProcessInfo.hFile, base);
-        ok = arm_module(s, name, base);
+        ok = arm_module(s, name, base, false);
         if (ok && !s->attached) arm_entry_fixup(s, (uint64_t)(uintptr_t)event.u.CreateProcessInfo.lpStartAddress);
         if (event.u.CreateProcessInfo.hFile) CloseHandle(event.u.CreateProcessInfo.hFile);
         break;
@@ -9754,7 +9787,8 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
         if (!name.empty()) s->module_bases[name] = base;
         if (!name.empty()) s->module_instances.emplace_back(name, base);
         sym_register(s, event.u.LoadDll.hFile, base);
-        ok = arm_module(s, name, base);
+        ok = arm_module(s, name, base, !s->attached || s->initial_break ||
+                                       (s->attach_modules_ok && !s->attach_modules.count(base)));
         // A pending inline probe of this module resolved in ANOTHER instance (two mappings of
         // one DLL, one of them discarded -- which one is not known yet): gate this copy of the
         // site as well until the hook is in; retarget_pending moves the probe if its own copy
