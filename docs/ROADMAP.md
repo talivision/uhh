@@ -2510,6 +2510,35 @@ on x64 and x86, before the fix (9a3cbc3).
    an overlap -> no verdict). Costs coverage only in functions with an unresolved indirect jump, and there only past a
    call. All earlier boundary-* rows unchanged.
 
+## e2eflake: a pending breakpoint flag probe armed too late on attach (2026-11-08, branch `e2eflake`, regress `gated-guardwin-*`)
+
+Failure (post-push full VM suite on main 0bb3f9c, x86, once): `gated-e2e-attach-pre-fbp-oin-cin-rin` -- flag hits=0,
+the program kept reads disabled, all four probes reported active, nothing on stderr. Reproduced on 0bb3f9c's binaries:
+1 of 100 runs of that row on x86 (same signature).
+**Root cause.** An attach with inline probes arms its breakpoint/hw probes only once the agent's controller-death guard
+is up (L1); `arm_module` SKIPPED a breakpoint/hw probe while the guard was pending, to be armed by `guard_set_ready`,
+which ran when the agent's init THREAD returned (EXIT_THREAD). But the agent's service thread raises INSTALL_DONE as soon
+as it runs -- while init is still on its way out (waiting for `service_up`, its orphan check) -- and that INSTALL_DONE
+reports the inline probes active. gated-e2e attach-pre releases the target's gate on those "active" lines; the target
+then loaded configparse.dll, its LOAD_DLL found the guard still pending, the flag probe was skipped, the thread ran
+ParseConfig, and init returned a moment later: the INT3 went in after the only call (and reported active, hits=0).
+The same skip hit any module that loaded during the whole agent load/init window of an attach -- silently.
+**Fix (session.cpp, 79a8d6f).** (1) The guard counts as up once the service thread runs (`service_ready`): init installs
+the guard's vectored handler before starting it, and the INT3 table / DR mask are mirrored already -- checked on
+INSTALL_DONE (breakpoint/hw probes go active with the inline ones) and at every module arm. (2) A FRESH mapping -- a
+LOAD_DLL that is not the attach's replay of an already-loaded module (the module list is taken right after
+DebugActiveProcess, while the target's threads are held for their replayed events; everything after the attach
+breakpoint is fresh) -- gets its breakpoint/hw probes at once even while the guard is pending: its code runs next, so
+waiting means missing calls. Such a trap is unguarded until the guard comes up (milliseconds; a controller killed in that
+window leaves it in place -- the same exposure every breakpoint/hw-only session has by owner decision 2026-11-07).
+Modules already loaded at the attach still wait for the guard (no hit can be promised before "active" there).
+**Checks.** `gated-guardwin-stall-{bp,hw}`: attach-pre with the agent test knob UHH_TEST_INIT_STALL_MS=1500 (init returns
+1.5 s after its service thread runs), full gated-e2e judge. `gated-guardwin-early-{bp,hw}`: the gate is released as soon
+as the attach returns, before the agent is loaded (flag, program result and stderr judged). On 0bb3f9c: 20/20 FAIL on
+x86 and on x64 (5 runs per row). After (79a8d6f, VM): gated-guardwin-* 40/40 on x86 and 40/40 on x64 (10 per row);
+the original row 120/120 on x86 and 120/120 on x64 (`UHH_E2E_REPEAT=120`); every gated-e2e attach-pre fbp/fhw and
+attach-post row 135/135 on each arch. `UHH_E2E_REPEAT=N` repeats selected gated-e2e rows.
+
 ## Real-world cases
 - ✅ Microsoft Detours samples replicated (`examples/famous/detours_*`: simple, traceapi, withdll/attach, retval) -- findings above
 - ✅ (1) Real binaries via `uhh_trace`: curl `CreateFileW` + `connect` (all backends); ✅ findstr via `ntdll!NtCreateFile`
