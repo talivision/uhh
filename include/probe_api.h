@@ -254,7 +254,7 @@ int call_func(probe_context *, const char *symbol, uint64_t *ret, int nargs, ...
    and a debug register set on that thread only catches its return (needs one of the 4
    debug registers for the duration of the call: a free one, or -- when the hit is itself a
    hw execute probe -- its own, lent on that thread (a recursive entry on that thread during
-   the call then goes uncounted); refused -- 0, one warning -- otherwise). Probes hit INSIDE the original: those of the same kind (inline inside an
+   the call then goes uncounted); refused -- 0, warned once per probe -- otherwise). Probes hit INSIDE the original: those of the same kind (inline inside an
    inline call; breakpoint/hw inside a breakpoint/hw call) -- this one included, for a
    recursive function -- count their hits but run no callback; probes of the other kind fire
    normally. On breakpoint/hw other threads' hits wait until the call ends.
@@ -304,8 +304,9 @@ void return_from(probe_context *, uint64_t value, int nargs);
    controller synchronously. Same callback source works in every backend. From a callback,
    only probe_add_symbol[_cfg] / probe_add_address / probe_watch may be used, and the new
    probe's callback must be EXPORTED (dllexport) by the module of the calling callback: an
-   inline callback's request names it by export and the controller resolves that name there,
-   so a non-exported callback is refused (0) on every backend. A config has no extra size
+   inline callback's request names it by export and the controller resolves that name only
+   there (the target is untrusted), so a non-exported callback, or one of another module, is
+   refused (0) on every backend. A config has no extra size
    limit from a callback (4 GB everywhere, see probe_add_symbol), an inline probe's included;
    a symbol string sent from an inline callback is limited to 64 KiB. */
 probe_session *get_session(probe_context *);

@@ -60,6 +60,7 @@ First steps for any problem:
 | `too many inline probes (max 128)` | the 129th inline probe | breakpoint/hw for the rest |
 | `inline callback is not a named export` | an inline callback without `__declspec(dllexport)` | export it (`extern "C" __declspec(dllexport)`) |
 | `a probe added from a callback needs a callback exported by name (dllexport)` | a static (non-exported) callback passed from inside a callback | export it, in the same module as the calling callback |
+| `a probe added from a callback needs a callback exported by the calling callback's module` | a callback of another module passed from inside a callback (inline: `... ('<name>' is not exported there)`) | move it into the calling callback's module |
 | `callback uses UHH_SHARED state but is not a named export ...` / `UHH_SHARED callback '<name>' is not exported by the agent DLL` | a breakpoint/hw callback in a module with `UHH_SHARED` globals runs from the agent DLL, so it must be an export the agent has | export it and add its file to the agent sources |
 | `absolute-address probes need a running target` | `probe_add_address` / `probe_watch` before launch | call them from a callback (or after launch) |
 | `probe_watch address must be 4-byte aligned (watches one dword)` | unaligned watch address | watch the aligned dword containing it |
@@ -93,7 +94,7 @@ First steps for any problem:
 | `probe: warning: callback for <loc> raised 0x...; abandoned (hit counted, no register changes applied)` | the callback faulted or threw (often: dereferencing a target pointer on breakpoint/hw) | read target memory with `get_mem`; inline the program's vectored handlers saw the exception too |
 | Log text `[unformattable] <format>` | `%s` of a target pointer in a breakpoint/hw callback, `%n`, or a faulting argument | `get_mem` strings into a local buffer first ([limitations.md](limitations.md#formatting-target-strings)) |
 | `uhh warning: call_original refused: not at a function entry ([SP] is no return address)` | the probe is not on the function's first instruction (or after a `push`) | probe the entry; the original has not run, let the hit fall through |
-| `call_original refused: needs one free debug register (all 4 in use)` | breakpoint/hw `call_original` needs a debug register for the call | at most 3 hw probes, or put the probe itself on hw (it lends its own slot), or inline |
+| `uhh warning: call_original refused: needs one free debug register (all 4 in use)` | breakpoint/hw `call_original` needs a debug register for the call | at most 3 hw probes, or put the probe itself on hw (it lends its own slot), or inline |
 | `call_original refused: nargs must be 0..16` | `nargs` out of range | - |
 | `call_original without return_from -- the original runs again on fall-through` | the callback called the original but did not `return_from` | add `return_from(c, ret, nargs)` |
 | `return_from nargs=N but the original popped M bytes (ret M); the original's count is used` | wrong x86 `nargs` for the convention | pass the stack slots the callee pops ([api.md](api.md#callback-functions)) |
