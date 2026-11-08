@@ -15,9 +15,11 @@
 #include <atomic>
 
 #define CB(n) extern "C" void n(probe_context *);
+CB(ar_on_shared_write) CB(ar_on_shared_read) CB(ar_on_vector_call) CB(ar_on_config_late)
 CB(ar_on_empty) CB(ar_on_cache) CB(ar_on_guarantee) CB(ar_on_epoch) CB(ar_on_vector)
 CB(ar_on_site) CB(ar_on_fault_ret) CB(ar_on_fault_noret) CB(ar_on_alloc) CB(ar_on_jump) CB(ar_on_after) CB(ar_on_prot) CB(ar_on_cf) CB(ar_on_cf_inner) CB(ar_on_dr_arm) CB(ar_on_d5_callee) CB(ar_on_d5_callee_fb) CB(ar_on_cfw_setup) CB(ar_on_cob) CB(ar_on_cfwl_setup) CB(ar_on_dr2_arm)
 static const struct { const char *name; probe_callback fn; } k_callbacks[] = {
+    {"ar_on_vector_call", ar_on_vector_call},
     {"ar_on_empty", ar_on_empty}, {"ar_on_cache", ar_on_cache}, {"ar_on_guarantee", ar_on_guarantee},
     {"ar_on_epoch", ar_on_epoch}, {"ar_on_vector", ar_on_vector},
     {"ar_on_site", ar_on_site}, {"ar_on_fault_ret", ar_on_fault_ret}, {"ar_on_fault_noret", ar_on_fault_noret},
@@ -46,9 +48,29 @@ static int run_once(uint32_t bk, const std::vector<std::pair<std::string, probe_
 }
 
 // Attach/run on one thread, close from another, like lifecycle_driver.
-static int review_attach(DWORD pid, LONG config) {
+static int review_attach(DWORD pid, LONG config, const char *mode = nullptr) {
     probe_session *s = probe_session_create();
-    if (!s || !probe_add_symbol_cfg(s, "ar_target.exe!ar_epoch_site", ar_on_epoch, PROBE_INLINE, &config, sizeof(config))) return 2;
+    if (!s) return 2;
+    if (mode && !strcmp(mode, "--review-retry")) {
+        DWORD before = 0, after = 0;
+        GetProcessHandleCount(GetCurrentProcess(), &before);
+        for (int i = 0; i < 20; ++i) if (probe_attach(s, pid)) { probe_close(s); return 3; }
+        GetProcessHandleCount(GetCurrentProcess(), &after);
+        probe_close(s);
+        printf("{\"kind\":\"retry\",\"growth\":%ld}\n", (LONG)after - (LONG)before);
+        return after <= before + 2 ? 0 : 4;
+    }
+    bool added = false;
+    if (mode && !strcmp(mode, "--review-stub")) {
+        added = probe_add_symbol(s, "ar_target.exe!ar_shared_read_site", ar_on_vector_call, PROBE_BREAKPOINT) != 0;
+    } else if (mode && !strcmp(mode, "--review-shared")) {
+        added = probe_add_symbol(s, "ar_target.exe!ar_shared_write_site", ar_on_shared_write, PROBE_INLINE) &&
+                probe_add_symbol(s, "ar_target.exe!ar_shared_read_site", ar_on_shared_read, config == 1 ? PROBE_BREAKPOINT : PROBE_HW);
+    } else if (mode && !strcmp(mode, "--review-config")) {
+        unsigned char cfg[4096] = {}; cfg[4095] = 77;
+        added = probe_add_symbol_cfg(s, "ar_target.exe!ar_config_site", ar_on_config_late, PROBE_INLINE, cfg, sizeof(cfg)) != 0;
+    } else added = probe_add_symbol_cfg(s, "ar_target.exe!ar_epoch_site", ar_on_epoch, PROBE_INLINE, &config, sizeof(config)) != 0;
+    if (!added) { probe_close(s); return 2; }
     HANDLE attached = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     bool ok = false;
     std::atomic<int> phase{0};
@@ -66,12 +88,13 @@ static int review_attach(DWORD pid, LONG config) {
     if (ok) { char line[8]; if (!fgets(line, sizeof(line), stdin)) {} }
     int idle = 0;
     if (!phase.compare_exchange_strong(idle, 3)) while (phase.load() != 2) Sleep(1);
+    if (!ok) probe_report(s, stdout);
     probe_close(s); runner.join();
     return ok ? 0 : 3;
 }
 int main(int argc, char **argv) {
-    if (argc == 4 && !strcmp(argv[1], "--review-attach"))
-        return review_attach((DWORD)strtoul(argv[2], nullptr, 10), (LONG)strtol(argv[3], nullptr, 10));
+    if (argc == 4 && !strncmp(argv[1], "--review-", 9))
+        return review_attach((DWORD)strtoul(argv[2], nullptr, 10), (LONG)strtol(argv[3], nullptr, 10), argv[1]);
     const char *backend = "inline";
     int repeat = 1;
     std::vector<std::pair<std::string, probe_callback>> adds;

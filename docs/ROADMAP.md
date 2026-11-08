@@ -3045,3 +3045,34 @@ keeping the full output, a ring of hardware-breakpoint events and a full minidum
   ROADMAP history keeps its old `session.cpp` references.
 - 🔧 [fan-out] Faster builds (user, 2026-11-05): parallel MSBuild (/MP, MultiToolTask, Directory.Build.rsp -maxCpuCount; `-DUHH_PARALLEL_MSBUILD=OFF` to disable) and `scripts\build.ps1` (Ninja Multi-Config). VM (4 cores), same tree: clean x64 221 s -> 83 s (VS) / 73 s (Ninja), x86 220 s -> 85 s / 66 s; touch session.cpp x64 49 s -> 24 s / 23 s. Still open: PCH / unity for session.cpp, not relinking every example when the library changes
 - ⬜ Final independent whole-codebase sanity review; README/API docs pass
+
+## cxr7 controller injection / calls / lifecycle review (2026-11-08)
+
+Implemented; Windows x64/x86 validation pending (`check_session_agentipc`, estimate in
+`ci_shards.py`). No shared IPC layout change or agent version bump.
+
+- session_agent #1/#2: real despite the epoch/channel reuse redesign. The retained DLL
+  was still selected by basename while init/stop RVAs and UHH_SHARED callbacks came from
+  a new controller copy. Compare normalized agent files before attach, refuse a changed
+  build, and map the retained file in the controller. Checks `session-agentipc-identity`
+  and `session-agentipc-shared` (successive mixed breakpoint/hw + inline sessions).
+- session_agent #4: real; failed open/suspend, context reads, unmapped relocation and
+  context writes now refuse the freeze; undo earlier relocations and thaw on failure.
+  Checks `session-agentipc-freeze` / `session-agentipc-freeze-context`.
+- session_lifecycle #1: real; the documented allowance for callbacks already running
+  does not cover hooks still admitting new callbacks. Keep remote configs if stop did
+  not complete. Check `session-agentipc-config` (stop creation refused, zero running
+  callbacks at close, a new hit reads the last byte of a 4 KiB config after close).
+- session_lifecycle #4: real; close/reset the process handle and clean symbols on failed
+  attach. Check `session-agentipc-retry` (20 failed attaches on one session; handles flat).
+- session_call #1: real; the owner decision about lock/exception effects of hijacked calls
+  does not allow register corruption by a lock-free non-throwing callee. Save/restore the
+  enabled XSTATE components, including components initially in INIT state. Checks
+  `session-call-xstate-{breakpoint,hw,inline}` (existing INIT/live YMM/opmask/ZMM fixture,
+  now with a call_func callee clobbering upper state; AVX phases skip on unsupported CPUs).
+- session_call #2: real; retain a deferred watch and its suspension when a fiber cannot
+  be obtained; account held hits as dropped if replay is impossible at final shutdown.
+  Checks `session-watch-fiber-{breakpoint,hw}` (one failed replay allocation; exact logs).
+- session_call #3: real; release failed call-stub writes and register successful allocations
+  in scratch_blocks. Check `session-agentipc-stub` queries both allocations from the still
+  live target after close and requires MEM_FREE.

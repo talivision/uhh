@@ -8250,6 +8250,164 @@ def check_agent_unwind():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def check_session_agentipc():
+    """cxr7 agent #1/#2/#4, lifecycle #1/#4 and call #1/#2/#3.
+    Retained images, mixed shared sections, failed safe freezes/stops, retry handles,
+    call XSTATE, deferred-watch allocation pressure and remote call-stub ownership.
+    All failure injection is confined to probe_api_testhooks.
+    """
+    d, t = exe("ar_driver_th.exe"), exe("ar_target.exe")
+    if not d or not t:
+        return missing_bin("session-agentipc", "ar_driver_th/ar_target")
+
+    for bk in ("breakpoint", "hw", "inline"):
+        name = f"session-call-xstate-{bk}"
+        try:
+            r, o = run([d, "--backend", bk, "--probe", "ar_target.exe!ar_vector_site=ar_on_vector_call",
+                        "--", t, "review-vector"], timeout=120)
+            row = next((x for x in o if x.get("kind") == "ar"), {})
+            rep = report(o)
+            logs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
+            n = row.get("checks", -1)
+            ok = (r.returncode == 0 and row.get("clean") == 1 and n >= 0 and
+                  logs == ["ar vector call 1"] * n and sum(x.get("hits", 0) for x in probes(o)) == n and
+                  rep.get("log_dropped") == 0 and rep.get("callbacks_interrupted", 0) == 0)
+            record(name, ok, f"row={row} logs={len(logs)} report={rep}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    for bk in ("breakpoint", "hw"):
+        name = f"session-watch-fiber-{bk}"
+        try:
+            r, o = run([d, "--backend", bk, "--probe", "ar_target.exe!ar_cf_site=ar_on_cf",
+                        "--probe", "ar_target.exe!ar_cfw_setup=ar_on_cfwl_setup", "--", t, "cfwatchlock"],
+                       env=dict(os.environ, UHH_TEST_WATCH_FIBER_FAIL="1"), timeout=90)
+            logs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
+            want = ["ar cfw setup=1", "ar cfw slow ok=1 r=11", "ar cfw watch ok=1 r=9"]
+            rep = report(o)
+            ok = (r.returncode == 0 and sorted(logs) == sorted(want) and sum(x.get("hits", 0) for x in probes(o)) == 3 and
+                  rep.get("log_dropped") == 0 and
+                  rep.get("callbacks_interrupted", 0) == 0 and "probe: test: watch fiber denied" in r.stderr)
+            record(name, ok, f"logs={logs} report={rep}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    def cue(p, text):
+        p.stdin.write(text); p.stdin.flush()
+
+    # Fresh controller processes on every cycle: this also tests shared sections across
+    # different local DLL mappings. Keep the target alive until all memory queries finish.
+    for case in ("shared", "identity", "config", "retry", "stub", "freeze", "freeze-context"):
+        name = f"session-agentipc-{case}"
+        target = None
+        drivers = []
+        tmp = Path(tempfile.mkdtemp(prefix="uhh-agentipc-"))
+        try:
+            target = subprocess.Popen([str(t), "review-config" if case == "config" else "review-shared"],
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=BIN)
+            out, err = Lines(target.stdout), Lines(target.stderr)
+            ready = out.wait_for(lambda l: '"kind":"ready"' in l, 30)
+            if not ready: raise RuntimeError(f"target not ready: {err.lines}")
+            pid = json.loads(ready)["pid"]
+            driver = d
+            if case == "identity":
+                # Only the agent changes between controllers; its retained per-session
+                # target copy remains untouched. A PE timestamp difference proves mismatch.
+                shutil.copy2(d, tmp / d.name)
+                shutil.copy2(BIN / "probe_api_agent.dll", tmp / "probe_api_agent.dll")
+                driver = tmp / d.name
+
+            def attach(mode, cfg=1, env=None, active=1):
+                p = subprocess.Popen([str(driver), "--review-" + mode, str(pid), str(cfg)],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     text=True, cwd=BIN, env=dict(os.environ, **(env or {})))
+                po, pe = Lines(p.stdout), Lines(p.stderr)
+                drivers.append((p, po, pe))
+                if not po.wait_for(lambda l: '"kind":"attached"' in l, 60):
+                    raise RuntimeError(f"not attached: {pe.lines}")
+                if active and not pe.wait_for(lambda l: sum(x.startswith("probe: active ") for x in pe.lines) >= active, 60):
+                    raise RuntimeError(f"not active: {pe.lines}")
+                return p, po, pe
+
+            def detach(p):
+                cue(p, "\n"); p.wait(timeout=90)
+                if p.returncode: raise RuntimeError(f"driver exit={p.returncode}")
+
+            def hit(n):
+                cue(target, "x\n")
+                line = out.wait_for(lambda l: '"kind":"ar"' in l and json.loads(l).get("n") == n, 30)
+                if not line: raise RuntimeError(f"no hit {n}: {out.lines} {err.lines}")
+                return json.loads(line)
+
+            if case in ("shared", "identity"):
+                for n in range(1, 4 if case == "shared" else 2):
+                    p, po, pe = attach("shared", 1 if n % 2 else 2, active=2)
+                    hit(n)
+                    if not po.wait_for(lambda l: l.startswith("{") and json.loads(l).get("message") == f"ar shared {n}", 30):
+                        # JSON formatting is deliberately not part of this assertion.
+                        if not any(x.get("message") == f"ar shared {n}" for x in po.objs()):
+                            raise RuntimeError(f"shared value missing: {po.lines}")
+                    detach(p)
+                if case == "identity":
+                    agent = tmp / "probe_api_agent.dll"
+                    data = bytearray(agent.read_bytes())
+                    peoff = int.from_bytes(data[0x3c:0x40], "little")
+                    data[peoff + 8] ^= 1
+                    agent.write_bytes(data)
+                    p = subprocess.Popen([str(driver), "--review-shared", str(pid), "1"], stdin=subprocess.PIPE,
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=BIN)
+                    drivers.append((p, None, None))
+                    output, error = p.communicate("\n", timeout=90)
+                    if p.returncode == 0 or "retained inline agent differs" not in output + error:
+                        raise RuntimeError(f"different image was accepted: rc={p.returncode} {error}")
+                    hit(2)                         # still alive and executing its original code
+            elif case == "config":
+                p, po, pe = attach("config", env={"UHH_TEST_STOP_FAIL": "1"})
+                if hit(1).get("value") != 77: raise RuntimeError("config callback not installed")
+                detach(p)
+                # Stop never ran, and no callback was running at the instant of close.
+                if hit(2).get("value") != 77: raise RuntimeError("live hook lost its remote config")
+            elif case == "retry":
+                r, o = run([d, "--review-retry", str(pid), "1"],
+                           env=dict(os.environ, UHH_TEST_ATTACH_FAIL="1"), timeout=90)
+                row = next((x for x in o if x.get("kind") == "retry"), {})
+                if r.returncode or row.get("growth", 100) > 2: raise RuntimeError(f"handle leak: {row} {r.stderr}")
+                hit(1)
+            elif case == "stub":
+                p, po, pe = attach("stub", env={"UHH_TEST_CALL_STUB_TRACE": "1", "UHH_TEST_CALL_STUB_FAIL": "1"})
+                hit(1); hit(2)
+                detach(p)
+                pe.t.join(timeout=10)
+                addresses = re.findall(r"probe: test: call stub ([0-9a-f]+)", "\n".join(pe.lines))
+                if len(addresses) < 2: raise RuntimeError(f"stub failure/retry missing: {pe.lines}")
+                for i, address in enumerate(addresses):
+                    cue(target, "m" + address + "\n")
+                    if not out.wait_for(lambda l: sum('"kind":"memory"' in x for x in out.lines) > i, 30):
+                        raise RuntimeError("memory query timed out")
+                states = [json.loads(x).get("state") for x in list(out.lines) if '"kind":"memory"' in x]
+                if states != [0x10000] * len(addresses): raise RuntimeError(f"stub pages still committed: {states}")
+            else:
+                knob = "UHH_TEST_FREEZE_FAIL" if case == "freeze" else "UHH_TEST_FREEZE_CONTEXT_FAIL"
+                message = "probe: test: freeze denied" if case == "freeze" else "probe: test: freeze context denied"
+                p, po, pe = attach("shared", env={knob: "1"}, active=0)
+                if not pe.wait_for(lambda l: message in l, 60): raise RuntimeError("freeze not attempted")
+                if not po.wait_for(lambda l: '"kind":"probe_report"' in l, 60): raise RuntimeError("failed install did not end run")
+                if any(x.startswith("probe: active ") and "ar_shared_write_site" in x for x in pe.lines):
+                    raise RuntimeError("hook installed despite failed freeze")
+                detach(p)
+                hit(1)
+            cue(target, "q\n"); target.wait(timeout=30)
+            if target.returncode: raise RuntimeError(f"target exit={target.returncode} {err.lines}")
+            record(name, True, "target clean; failure path / retained image checks passed")
+        except Exception as e:
+            record(name, False, repr(e))
+        finally:
+            for p, _, _ in drivers:
+                if p.poll() is None: p.kill()
+            if target and target.poll() is None: target.kill()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 def check_agent_safety():
     """Seven inline-agent review reproductions; fixtures assert their pressure/preconditions.
     256 live owners fill the hit-block table before the dead/denied-owner sweeps.
@@ -12375,6 +12533,7 @@ def main():
     if want(check_callorig_deep): check_callorig_deep()
     if want(check_callconv): check_callconv()
     if want(check_agent_review): check_agent_review()
+    if want(check_session_agentipc): check_session_agentipc()
     if want(check_agent_safety): check_agent_safety()
     if want(check_agent_unwind): check_agent_unwind()
     if want(check_callfunc_registry): check_callfunc_registry()

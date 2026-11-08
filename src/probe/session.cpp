@@ -876,9 +876,11 @@ extern "C" void probe_close(probe_session *s) {
         // A config block stays in a detached target while any inline callback is still in flight
         // there (its thread suspended by the program, or past the drain): that callback's
         // get_config points into it. Freed, it read freed (or reused) memory.
+        // A stop that never completed can also admit NEW callbacks.
         const uint64_t left = s->detached && !s->exited && s->shared ? probe_agent_running(s->shared) : 0;
-        if (left && !s->config_blocks.empty())
-            std::fprintf(stderr, "probe: detach: %zu config block(s) left in the target for %llu callback(s) still in flight\n",
+        const bool hooks_live = s->detached && !s->exited && s->remote_agent && !s->detached_hooks;
+        if ((left || hooks_live) && !s->config_blocks.empty())
+            std::fprintf(stderr, "probe: detach: %zu config block(s) left in the target (running=%llu; hooks may still be live)\n",
                          s->config_blocks.size(), (unsigned long long)left);
         else
             for (uint64_t b : s->config_blocks) VirtualFreeEx(s->pi.hProcess, (void *)(uintptr_t)b, 0, MEM_RELEASE);

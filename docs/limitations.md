@@ -271,6 +271,8 @@ data) prints on all backends.
 - **The agent stays loaded after a detach** (Lifecycle), quiescent: hooks removed, logging
   stopped. A later attach to the same process reuses it.
   Ordinary reattach reuses the named channel, its target view/handle and session proxies.
+  The controller maps the retained agent file too, preserving `UHH_SHARED` across backends.
+  A different agent build is refused before attaching; restart the target to use it.
   If the old channel still counts a possibly surviving callback (including a suspended one),
   reattach uses a fresh channel instead; that rare fallback retains the old storage until
   process exit so the callback's config and accounting pointers remain valid. The epoch is
@@ -331,7 +333,8 @@ data) prints on all backends.
   after that is lost.** Their config blocks stay allocated, so the program is unaffected.
   *Workaround:* keep inline callbacks short and lock-free.
 - **Config blocks can stay in a detached target** (📄 Codex library review (2)): a config
-  block is left allocated while a callback that may read it is still in flight; stderr says so.
+  block is left allocated while a callback that may read it is still in flight, or the
+  agent stop did not complete and hooks may admit new callbacks; stderr says so.
 - **Controller death:** an **attached** target in a session with **inline probes** is
   protected by the agent's controller-death guard (Lifecycle L1): the agent restores
   breakpoints, clears debug registers, resumes held threads and removes inline hooks. A
