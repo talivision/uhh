@@ -8264,7 +8264,7 @@ def check_session_agentipc():
         name = f"session-call-xstate-{bk}"
         try:
             r, o = run([d, "--backend", bk, "--probe", "ar_target.exe!ar_vector_site=ar_on_vector_call",
-                        "--", t, "review-vector"], timeout=120)
+                        "--", t, "review-vector"], timeout=20)
             row = next((x for x in o if x.get("kind") == "ar"), {})
             rep = report(o)
             logs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
@@ -8281,7 +8281,7 @@ def check_session_agentipc():
         try:
             r, o = run([d, "--backend", bk, "--probe", "ar_target.exe!ar_cf_site=ar_on_cf",
                         "--probe", "ar_target.exe!ar_cfw_setup=ar_on_cfwl_setup", "--", t, "cfwatchlock"],
-                       env=dict(os.environ, UHH_TEST_WATCH_FIBER_FAIL="1"), timeout=90)
+                       env=dict(os.environ, UHH_TEST_WATCH_FIBER_FAIL="1"), timeout=20)
             logs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
             want = ["ar cfw setup=1", "ar cfw slow ok=1 r=11", "ar cfw watch ok=1 r=9"]
             rep = report(o)
@@ -8297,18 +8297,19 @@ def check_session_agentipc():
 
     # Fresh controller processes on every cycle: this also tests shared sections across
     # different local DLL mappings. Keep the target alive until all memory queries finish.
-    for case in ("shared", "identity", "config", "retry", "stub", "freeze", "freeze-context"):
+    for case in ("shared", "identity", "config", "retry", "stub", "freeze", "freeze-context", "unknown-image"):
         name = f"session-agentipc-{case}"
         target = None
         drivers = []
         tmp = Path(tempfile.mkdtemp(prefix="uhh-agentipc-"))
         try:
-            target = subprocess.Popen([str(t), "review-config" if case == "config" else "review-shared"],
+            target = subprocess.Popen([str(t), "review-config" if case in ("config", "freeze", "freeze-context") else "review-shared"],
                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=BIN)
             out, err = Lines(target.stdout), Lines(target.stderr)
-            ready = out.wait_for(lambda l: '"kind":"ready"' in l, 30)
+            ready = out.wait_for(lambda l: '"kind":"ready"' in l, 10)
             if not ready: raise RuntimeError(f"target not ready: {err.lines}")
             pid = json.loads(ready)["pid"]
+            if json.loads(ready).get("distinct") != 1: raise RuntimeError("fixture sites were folded")
             driver = d
             if case == "identity":
                 # Only the agent changes between controllers; its retained per-session
@@ -8323,19 +8324,19 @@ def check_session_agentipc():
                                      text=True, cwd=BIN, env=dict(os.environ, **(env or {})))
                 po, pe = Lines(p.stdout), Lines(p.stderr)
                 drivers.append((p, po, pe))
-                if not po.wait_for(lambda l: '"kind":"attached"' in l, 60):
+                if not po.wait_for(lambda l: '"kind":"attached"' in l, 10):
                     raise RuntimeError(f"not attached: {pe.lines}")
-                if active and not pe.wait_for(lambda l: sum(x.startswith("probe: active ") for x in pe.lines) >= active, 60):
+                if active and not pe.wait_for(lambda l: sum(x.startswith("probe: active ") for x in pe.lines) >= active, 10):
                     raise RuntimeError(f"not active: {pe.lines}")
                 return p, po, pe
 
             def detach(p):
-                cue(p, "\n"); p.wait(timeout=90)
+                cue(p, "\n"); p.wait(timeout=20)
                 if p.returncode: raise RuntimeError(f"driver exit={p.returncode}")
 
             def hit(n):
                 cue(target, "x\n")
-                line = out.wait_for(lambda l: '"kind":"ar"' in l and json.loads(l).get("n") == n, 30)
+                line = out.wait_for(lambda l: '"kind":"ar"' in l and json.loads(l).get("n") == n, 10)
                 if not line: raise RuntimeError(f"no hit {n}: {out.lines} {err.lines}")
                 return json.loads(line)
 
@@ -8343,10 +8344,8 @@ def check_session_agentipc():
                 for n in range(1, 4 if case == "shared" else 2):
                     p, po, pe = attach("shared", 1 if n % 2 else 2, active=2)
                     hit(n)
-                    if not po.wait_for(lambda l: l.startswith("{") and json.loads(l).get("message") == f"ar shared {n}", 30):
-                        # JSON formatting is deliberately not part of this assertion.
-                        if not any(x.get("message") == f"ar shared {n}" for x in po.objs()):
-                            raise RuntimeError(f"shared value missing: {po.lines}")
+                    if not po.wait_for(lambda l: l.startswith("{") and json.loads(l).get("message") == f"ar shared {n}", 10):
+                        raise RuntimeError(f"shared value missing: {po.lines}")
                     detach(p)
                 if case == "identity":
                     agent = tmp / "probe_api_agent.dll"
@@ -8357,10 +8356,18 @@ def check_session_agentipc():
                     p = subprocess.Popen([str(driver), "--review-shared", str(pid), "1"], stdin=subprocess.PIPE,
                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=BIN)
                     drivers.append((p, None, None))
-                    output, error = p.communicate("\n", timeout=90)
+                    output, error = p.communicate("\n", timeout=20)
                     if p.returncode == 0 or "retained inline agent differs" not in output + error:
                         raise RuntimeError(f"different image was accepted: rc={p.returncode} {error}")
                     hit(2)                         # still alive and executing its original code
+            elif case == "unknown-image":
+                p, po, pe = attach("shared", env={"UHH_TEST_REUSE_UNKNOWN": "1"}, active=2)
+                hit(1)
+                if not po.wait_for(lambda l: l.startswith("{") and json.loads(l).get("message") == "ar shared 1", 10):
+                    raise RuntimeError(f"fresh injection did not run callbacks: {po.lines}")
+                detach(p)
+                if not any("probe: test: unrelated image unidentified" in l for l in pe.lines):
+                    raise RuntimeError("unknown-image path was not exercised")
             elif case == "config":
                 p, po, pe = attach("config", env={"UHH_TEST_STOP_FAIL": "1"})
                 if hit(1).get("value") != 77: raise RuntimeError("config callback not installed")
@@ -8369,7 +8376,7 @@ def check_session_agentipc():
                 if hit(2).get("value") != 77: raise RuntimeError("live hook lost its remote config")
             elif case == "retry":
                 r, o = run([d, "--review-retry", str(pid), "1"],
-                           env=dict(os.environ, UHH_TEST_ATTACH_FAIL="1"), timeout=90)
+                           env=dict(os.environ, UHH_TEST_ATTACH_FAIL="1"), timeout=20)
                 row = next((x for x in o if x.get("kind") == "retry"), {})
                 if r.returncode or row.get("growth", 100) > 2: raise RuntimeError(f"handle leak: {row} {r.stderr}")
                 hit(1)
@@ -8382,29 +8389,35 @@ def check_session_agentipc():
                 if len(addresses) < 2: raise RuntimeError(f"stub failure/retry missing: {pe.lines}")
                 for i, address in enumerate(addresses):
                     cue(target, "m" + address + "\n")
-                    if not out.wait_for(lambda l: sum('"kind":"memory"' in x for x in out.lines) > i, 30):
+                    if not out.wait_for(lambda l: sum('"kind":"memory"' in x for x in out.lines) > i, 10):
                         raise RuntimeError("memory query timed out")
                 states = [json.loads(x).get("state") for x in list(out.lines) if '"kind":"memory"' in x]
                 if states != [0x10000] * len(addresses): raise RuntimeError(f"stub pages still committed: {states}")
             else:
                 knob = "UHH_TEST_FREEZE_FAIL" if case == "freeze" else "UHH_TEST_FREEZE_CONTEXT_FAIL"
                 message = "probe: test: freeze denied" if case == "freeze" else "probe: test: freeze context denied"
-                p, po, pe = attach("shared", env={knob: "1"}, active=0)
-                if not pe.wait_for(lambda l: message in l, 60): raise RuntimeError("freeze not attempted")
-                if not po.wait_for(lambda l: '"kind":"probe_report"' in l, 60): raise RuntimeError("failed install did not end run")
-                if any(x.startswith("probe: active ") and "ar_shared_write_site" in x for x in pe.lines):
+                p, po, pe = attach("config", env={knob: "1"}, active=0)
+                if not pe.wait_for(lambda l: message in l, 10): raise RuntimeError("freeze not attempted")
+                # A failed asynchronous install retires its request; attach need not
+                # end the event loop. Assert the actual install outcome, then close it.
+                if not pe.wait_for(lambda l: "inline agent failed to install ar_target.exe!ar_config_site (status=-3)" in l, 10):
+                    raise RuntimeError(f"install failure not reported: {pe.lines}")
+                if any(x.startswith("probe: active ") and "ar_config_site" in x for x in pe.lines):
                     raise RuntimeError("hook installed despite failed freeze")
+                if hit(1).get("value") != 1: raise RuntimeError("failed freeze still admitted the config callback")
                 detach(p)
-                hit(1)
-            cue(target, "q\n"); target.wait(timeout=30)
+                if hit(2).get("value") != 1: raise RuntimeError("failed freeze left patched code after detach")
+            cue(target, "q\n"); target.wait(timeout=20)
             if target.returncode: raise RuntimeError(f"target exit={target.returncode} {err.lines}")
             record(name, True, "target clean; failure path / retained image checks passed")
         except Exception as e:
             record(name, False, repr(e))
         finally:
             for p, _, _ in drivers:
-                if p.poll() is None: p.kill()
-            if target and target.poll() is None: target.kill()
+                if p.poll() is None:
+                    p.kill(); p.wait(timeout=5)
+            if target and target.poll() is None:
+                target.kill(); target.wait(timeout=5)
             shutil.rmtree(tmp, ignore_errors=True)
 
 

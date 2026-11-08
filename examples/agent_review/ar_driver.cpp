@@ -53,8 +53,29 @@ static int review_attach(DWORD pid, LONG config, const char *mode = nullptr) {
     if (!s) return 2;
     if (mode && !strcmp(mode, "--review-retry")) {
         DWORD before = 0, after = 0;
-        GetProcessHandleCount(GetCurrentProcess(), &before);
-        for (int i = 0; i < 20; ++i) if (probe_attach(s, pid)) { probe_close(s); return 3; }
+        // Debug-event handles belong to the attaching thread. End each debugger
+        // thread before measuring: its OS-owned debug handles are not process-handle
+        // leaks in probe_attach. The session (and any leaked OpenProcess handles)
+        // survives all attempts. Warm up the CRT/thread machinery before the baseline.
+        using GetDebugObject = HANDLE (NTAPI *)();
+        using SetDebugObject = void (NTAPI *)(HANDLE);
+        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        const auto get_debug = reinterpret_cast<GetDebugObject>(GetProcAddress(ntdll, "DbgUiGetThreadDebugObject"));
+        const auto set_debug = reinterpret_cast<SetDebugObject>(GetProcAddress(ntdll, "DbgUiSetThreadDebugObject"));
+        if (!get_debug || !set_debug) { probe_close(s); return 5; }
+        bool unexpected = false;
+        for (int i = 0; i <= 20; ++i) {
+            std::thread attempt([&] {
+                unexpected = probe_attach(s, pid) != 0;
+                if (unexpected) probe_close(s);       // close on its owning debugger thread
+                // DbgUiConnectToDbg stores this handle in the thread's TEB. It is
+                // process-owned; explicitly release this throwaway debugger's object.
+                if (HANDLE debug = get_debug()) { set_debug(nullptr); CloseHandle(debug); }
+            });
+            attempt.join();
+            if (unexpected) return 3;
+            if (!i) GetProcessHandleCount(GetCurrentProcess(), &before);
+        }
         GetProcessHandleCount(GetCurrentProcess(), &after);
         probe_close(s);
         printf("{\"kind\":\"retry\",\"growth\":%ld}\n", (LONG)after - (LONG)before);

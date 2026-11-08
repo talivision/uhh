@@ -514,6 +514,8 @@ static bool ensure_local_agent(probe_session *s) {
     return true;
 }
 
+static bool read_file_exports(const std::wstring &path, std::unordered_set<std::string> &out);
+
 // Reattach must map the very same file as the retained target image: this both
 // validates export RVAs and reconnects the image's UHH_SHARED section.
 bool reuse_target_agent(probe_session *s) {
@@ -521,15 +523,24 @@ bool reuse_target_agent(probe_session *s) {
     for (const auto &p : s->probes) if ((p->flags & PROBE_INLINE) || !p->shared_export.empty()) needed = true;
     if (!needed) return true;
     HMODULE mods[1024]; DWORD need = 0;
-    if (!K32EnumProcessModulesEx(s->pi.hProcess, mods, sizeof(mods), &need, LIST_MODULES_ALL) || need > sizeof(mods)) {
-        set_error(s, "cannot enumerate target images for agent reuse"); return false;
-    }
-    for (DWORD i = 0; i < need / sizeof(HMODULE); ++i) {
+    // Enumeration is only an opportunity to reuse an identified agent. Detours and
+    // loader activity can expose unnamed/transient mappings; they are not evidence
+    // of an incompatible UHH image and must not prevent an ordinary fresh attach.
+    if (!K32EnumProcessModulesEx(s->pi.hProcess, mods, sizeof(mods), &need, LIST_MODULES_ALL)) return true;
+    for (DWORD i = 0; i < std::min<size_t>(need, sizeof(mods)) / sizeof(HMODULE); ++i) {
         wchar_t path[32768];
         DWORD n = K32GetModuleFileNameExW(s->pi.hProcess, mods[i], path, (DWORD)(sizeof(path) / sizeof(path[0])));
-        if (!n || n >= sizeof(path) / sizeof(path[0])) { set_error(s, "cannot identify target image for agent reuse"); return false; }
+#if defined(UHH_TEST_HOOKS)
+        if (!i && std::getenv("UHH_TEST_REUSE_UNKNOWN")) {
+            n = 0; std::fprintf(stderr, "probe: test: unrelated image unidentified\n");
+        }
+#endif
+        if (!n || n >= sizeof(path) / sizeof(path[0])) continue;
         const wchar_t *base = wcsrchr(path, L'\\');
         if (_wcsicmp(base ? base + 1 : path, L"probe_api_agent.dll")) continue;
+        std::unordered_set<std::string> exports;
+        if (!read_file_exports(path, exports) || !exports.count("probe_agent_init") ||
+            !exports.count("probe_agent_stop") || !exports.count("probe_agent_bind_controller")) continue;
         if (!ensure_local_agent(s)) return false;
         auto read = [](const std::wstring &file, std::vector<unsigned char> &bytes) {
             HANDLE f = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
@@ -540,7 +551,8 @@ bool reuse_target_agent(probe_session *s) {
             return ok;
         };
         std::vector<unsigned char> want, have;
-        if (!read(s->agent_path, want) || !read(path, have) || want != have) {
+        if (!read(s->agent_path, want) || !read(path, have)) continue;
+        if (want != have) {
             set_error(s, "retained inline agent differs from this build; restart the target before attaching"); return false;
         }
         // ensure_local_agent may already have bound pending callbacks to the new copy.

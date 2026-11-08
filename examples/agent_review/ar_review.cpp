@@ -57,7 +57,7 @@ static int epoch_case() {
     CloseHandle(t); CloseHandle(control.entered); CloseHandle(control.release);
     return old_config == 1 && control.observed == 2 ? 0 : 8;
 }
-AR_EXPORT void ar_shared_write_site(int) { InterlockedIncrement(&review_sink); }
+AR_EXPORT void ar_shared_write_site(int value) { InterlockedExchange(&review_sink, value); }
 AR_EXPORT void ar_shared_read_site() { InterlockedIncrement(&review_sink); }
 AR_EXPORT int ar_config_site() { InterlockedIncrement(&review_sink); return 1; }
 AR_EXPORT void ar_vector_clobber() {
@@ -88,7 +88,10 @@ static int stop_guarded() {
 int ar_review_case(const char *k) {
     if (!strcmp(k, "review-epoch")) return epoch_case();
     if (!strcmp(k, "review-shared") || !strcmp(k, "review-config")) {
-        printf("{\"kind\":\"ready\",\"pid\":%lu}\n", GetCurrentProcessId()); fflush(stdout);
+        // /OPT:ICF can fold identical exported bodies, even with different signatures.
+        const bool distinct = (uintptr_t)&ar_shared_write_site != (uintptr_t)&ar_shared_read_site;
+        printf("{\"kind\":\"ready\",\"pid\":%lu,\"distinct\":%d}\n", GetCurrentProcessId(), distinct ? 1 : 0); fflush(stdout);
+        if (!distinct) return 2;
         int n = 0;
         for (int ch; (ch = getchar()) != EOF && ch != 'q'; ) {
             if (ch == 'm') {

@@ -3076,3 +3076,32 @@ Implemented; Windows x64/x86 validation pending (`check_session_agentipc`, estim
 - session_call #3: real; release failed call-stub writes and register successful allocations
   in scratch_blocks. Check `session-agentipc-stub` queries both allocations from the still
   live target after close and requires MEM_FREE.
+
+### agentipc CI follow-up (run 42461348615)
+
+Windows CI exposed a library regression and three fixture assumptions; corrections below
+are implemented but await Windows x64/x86 rerun. Existing Detours checks are unchanged.
+
+- `reuse_target_agent` no longer rejects an attach because module enumeration or an
+  unrelated module's filename lookup failed. Only an identified `probe_api_agent.dll`
+  carrying the agent init/stop/controller-bind exports is considered for reuse; an actual
+  byte mismatch still refuses that reuse. Unidentified modules fall through to the
+  existing fresh-injection path. `session-agentipc-unknown-image` deterministically
+  suppresses one unrelated image's filename and requires fresh mixed callbacks to run;
+  `session-agentipc-identity` still requires a changed retained agent to be refused.
+- The shared fixture's write/read sites had identical `InterlockedIncrement` bodies and
+  were eligible for MSVC /OPT:ICF folding, placing inline and breakpoint probes on one
+  instruction. The writer now exchanges its argument into the sink; the fixture also
+  asserts that the site addresses differ. Reattach still requires values 1, 2 and 3 to
+  cross the mixed backends in successive controller processes.
+- Retry measurements now end each debugger thread before taking the next handle count,
+  while retaining the same session across attempts. Each throwaway thread explicitly
+  releases its DbgUi debug object after detach, excluding debug-object/event lifetimes
+  from the measurement. Leaked explicit OpenProcess handles survive this cleanup and
+  remain visible. One warm-up precedes the measured 20 failed retries.
+- Freeze checks assert the reported HOOK_FAILED status and native return value (1, versus
+  the callback's 77), both before and after detach. They no longer assume an asynchronous
+  failed install must end probe_run, nor wait for an unrelated mixed reader's guard.
+- New-check waits are 10 s for progress and 20 s for process completion, replacing 30/60/90/
+  120 s waits. Removed the live pipe-reader join on a failure path; killed children are
+  reaped. The CI estimate is 20/25 s, to be updated from the next Windows run.
