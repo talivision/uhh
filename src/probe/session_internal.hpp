@@ -560,7 +560,7 @@ struct probe_session {
     // profilers do) -- undoing our resume state (an INT3 hit resumed one byte into the
     // instruction, a hw hit without RF reported twice). Such a thread is held by us as well
     // until the target resumes it; then whatever it wrote back gets our changes re-applied.
-    struct CtxWatch { DWORD tid = 0; HANDLE t = nullptr; CONTEXT before{}, after{}; };
+    struct CtxWatch { DWORD tid = 0; HANDLE t = nullptr; CONTEXT before{}, after{}; ULONGLONG deadline = 0; };
     std::vector<std::unique_ptr<CtxWatch>> ctx_watch;
 };
 
@@ -648,7 +648,7 @@ bool service_event(probe_session *s, DEBUG_EVENT &ev);
 void pump(probe_session *s, DWORD ms);
 void park_release(probe_session *s);
 DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blocked, bool got);
-void ctx_watch_poll(probe_session *s, bool all = false, bool debug_frozen = false);
+void ctx_watch_poll(probe_session *s, bool all = false);
 HANDLE event_thread(probe_session *s, DWORD tid);
 void forget_event_thread(probe_session *s, DWORD tid);
 void trace_thread_stacks(probe_session *s, const char *why);

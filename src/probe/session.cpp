@@ -616,7 +616,7 @@ extern "C" int probe_run(probe_session *s) {
         const BOOL got_event = WaitForDebugEvent(&event, wait_ms);   // short: also polls stop requests
         const DWORD wait_err = got_event ? 0 : GetLastError();
         wait_ms = fair_tick(s, std::chrono::steady_clock::now() - wait_t0, got_event);
-        if (!s->ctx_watch.empty()) ctx_watch_poll(s, false, got_event && event.dwProcessId == s->pi.dwProcessId);
+        if (!s->ctx_watch.empty()) ctx_watch_poll(s);
         if (!got_event) {
             if (wait_err == ERROR_SEM_TIMEOUT) {            // idle: drain and wait again
                 inplace_watchdog(s);

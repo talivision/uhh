@@ -89,8 +89,19 @@ ONLY = []     # --only substrings (empty: the full suite)
 
 
 def run(args, timeout=180, feed=None, env=None):
-    r = subprocess.run([str(a) for a in args], capture_output=True, text=True,
-                       timeout=timeout, input=feed, env=env)
+    argv = [str(a) for a in args]
+    p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         stdin=subprocess.PIPE if feed is not None else None, env=env)
+    try:
+        stdout, stderr = p.communicate(input=feed, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.wait(timeout=10)
+        # On Windows subprocess.run calls communicate() WITHOUT a timeout here. A target
+        # or grandchild can still own the pipe writers after the controller dies, so EOF
+        # need never arrive. Do not join/close the reader threads on this timeout path.
+        raise
+    r = subprocess.CompletedProcess(argv, p.returncode, stdout, stderr)
     objs = []
     for line in r.stdout.splitlines():
         line = line.strip()
