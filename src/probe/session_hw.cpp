@@ -340,7 +340,7 @@ void arm_entry_fixup(probe_session *s, uint64_t entry) {
         auto p = std::make_unique<Probe>();
         p->location = "<entry>"; p->flags = PROBE_BREAKPOINT | PROBE_ONCE; p->callback = reapply_hw;
         p->rva = entry; p->internal = true;
-        Probe *raw = p.get(); s->probes.push_back(std::move(p));
+        Probe *raw = p.get(); { std::lock_guard<std::mutex> lock(s->probes_mu); s->probes.push_back(std::move(p)); }
         std::string saved = s->error;
         if (!arm_breakpoint(s, *raw, 0)) { raw->retired = true; s->error = saved; }
     } catch (...) {}
@@ -403,7 +403,7 @@ void arm_thread_start_fixup(probe_session *s) {
         auto p = std::make_unique<Probe>();
         p->location = "<thread-start>"; p->flags = PROBE_BREAKPOINT; p->callback = thread_start_fixup;
         p->rva = at; p->internal = true;
-        Probe *raw = p.get(); s->probes.push_back(std::move(p));
+        Probe *raw = p.get(); { std::lock_guard<std::mutex> lock(s->probes_mu); s->probes.push_back(std::move(p)); }
         std::string saved = s->error;
         if (!arm_breakpoint(s, *raw, 0)) { raw->retired = true; s->error = saved; }
     } catch (...) {}

@@ -10,8 +10,12 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <thread>
+#include <atomic>
 
 extern "C" {
+void ctrl_on_codearm(probe_context *);
+void ctrl_on_callpair(probe_context *);
 void ctrl_on_load(probe_context *);
 void ctrl_on_loop(probe_context *);
 void ctrl_on_announce(probe_context *);
@@ -72,7 +76,7 @@ int main(int argc, char **argv) {
         }
     }
     probe_session *s = probe_session_create();
-    ctrl_cfg k{backend, 0};
+    ctrl_cfg k{backend, shape == "whole" ? 1u : 0u};
     bool ok = s != nullptr;
     if (ok) {
         if (sc == "modforward")
@@ -87,6 +91,21 @@ int main(int argc, char **argv) {
 #endif
         } else if (sc == "modreloc")
             ok = probe_add_symbol_cfg(s, "ctrl_target.exe!CtrlAnnounce", ctrl_on_modarm, backend, &k, sizeof(k));
+        else if (sc == "codewrite")
+            ok = probe_add_symbol_cfg(s, "ctrl_target.exe!CtrlAnnounce", ctrl_on_codearm, backend, &k, sizeof(k));
+        else if (sc == "callpair")
+            ok = probe_add_symbol(s, "ctrl_target.exe!CtrlAnnounce", ctrl_on_callpair, backend);
+        else if (sc == "sitebranch") {
+            ok = probe_add_symbol(s, "ctrl_target.exe!CtrlHiddenBranch", ctrl_on_tick, PROBE_BREAKPOINT) &&
+                 probe_add_symbol(s, "ctrl_target.exe!CtrlHiddenBranch+0x2", ctrl_on_tick, PROBE_INLINE);
+        } else if (sc == "sitemixed")
+#if defined(_WIN64)
+            ok = probe_add_symbol(s, "ctrl_target.exe!CtrlMixedJump+0xf", ctrl_on_tick, PROBE_INLINE);
+#else
+            ok = probe_add_symbol(s, "ctrl_target.exe!CtrlMixedJump+0x9", ctrl_on_tick, PROBE_INLINE);
+#endif
+        else if (sc == "livereport")
+            ok = probe_add_symbol(s, "ctrl_target.exe!CtrlOp", ctrl_on_op, backend);
         else if (sc == "fault" || sc == "faultreg" || sc == "faultmix")
             ok = probe_add_symbol(s, "ctrl_target.exe!CtrlLoadInsn", ctrl_on_load, backend);
         else if (sc == "inplace")
@@ -129,7 +148,22 @@ int main(int argc, char **argv) {
     // Launch clears pre-launch errors, and dynamic adds restore theirs. Leave a real
     // unrelated diagnostic AFTER launch, before the valid forwarded call_func.
     if (ok && sc == "modhistory") (void)probe_launch(s, nullptr);
+    std::atomic<bool> finished{false};
+    FILE *live = nullptr;
+    if (sc == "livereport") tmpfile_s(&live);
+    std::thread reporter;
+    if (ok && live) reporter = std::thread([&] {
+        while (!finished.load()) { probe_report(s, live); Sleep(5); }
+    });
     ok = ok && probe_run(s) && probe_wait_for_exit(s);
+    finished = true;
+    if (reporter.joinable()) reporter.join();
+    if (live) {
+        std::rewind(live);
+        char buf[4096]; size_t n = 0;
+        while ((n = std::fread(buf, 1, sizeof(buf), live)) != 0) std::fwrite(buf, 1, n, stdout);
+        std::fclose(live);
+    }
     if (s) { probe_report(s, stdout); probe_close(s); }
     return ok ? 0 : 1;
 }

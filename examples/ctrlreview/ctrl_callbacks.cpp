@@ -104,3 +104,24 @@ CTRL_EXPORT void ctrl_on_modhistory(probe_context *c) {
     const int ok = call_func(c, "kernel32.dll!GetCurrentProcessId", &r, 0);
     send_log(c, "modhistory ok=%d match=%d", ok, ok && r == get_func_arg(c, 0));
 }
+
+// Writable-code patches exercise both a displaced immediate and a write covering the INT3.
+CTRL_EXPORT void ctrl_on_codewrite(probe_context *c) {
+    const uint64_t pc = get_func_arg(c, 0);
+    unsigned char code[5] = {};
+    int ok = get_mem(c, pc, code, sizeof(code));
+    uint32_t value = 0; memcpy(&value, code + 1, sizeof(value)); ++value;
+    memcpy(code + 1, &value, sizeof(value));
+    const int whole = get_func_arg(c, 1) != 0;
+    ok = ok && set_mem(c, pc + (whole ? 0 : 1), code + (whole ? 0 : 1), whole ? 5 : 4);
+    send_log(c, "codewrite ok=%d value=%u whole=%d", ok, value, whole);
+}
+CTRL_EXPORT void ctrl_on_codearm(probe_context *c) {
+    const uint64_t addr = get_func_arg(c, 0);
+    const int added = probe_add_address(get_session(c), addr, ctrl_on_codewrite, cfg_backend(c));
+    send_log(c, "codearm add=%d", added);
+}
+CTRL_EXPORT void ctrl_on_callpair(probe_context *c) {
+    const int added = probe_add_address(get_session(c), get_func_arg(c, 0), ctrl_on_work, PROBE_INLINE);
+    send_log(c, "callpair add=%d", added);
+}

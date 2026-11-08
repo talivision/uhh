@@ -3811,14 +3811,15 @@ def check_shared_mix(threads=8, reads=1000):
 
 def check_module_review():
     """Controller module reload, target forwarder ownership/resolution and addr32 execution.
-    The owner has a fixed preferred base between the two forwarding images; reservations
-    force each reload elsewhere. No controller copy of either application DLL is loaded.
+    Forwarding uses /FIXED images with the owner between the two forwarders. A separate
+    relocatable owner and reservations exercise reload at different bases. No controller
+    copy of either application DLL is loaded.
     x86 exercises reload/forwarding and native 32-bit address wrapping; EIP-relative LEA
     and address-size-overridden branches apply to x64 only.
     """
     d, t = exe("ctrl_driver.exe"), exe("ctrl_target.exe")
-    if not d or not t or not exe("modrel_owner.dll"):
-        return missing_bin("module-review", "ctrl_driver/ctrl_target/modrel_owner")
+    if not d or not t or not exe("modrel_owner.dll") or not exe("modrel_order_owner.dll"):
+        return missing_bin("module-review", "ctrl_driver/ctrl_target/modrel_owner/modrel_order_owner")
     x86 = pe_is_x86(t)
     # Check the built PE, not just successful linkage: ForwardValue must point into
     # the export directory at the forwarder string, rather than at a local thunk.
@@ -3831,12 +3832,27 @@ def check_module_review():
             opt = pe + 24
             dd = opt + (96 if struct.unpack_from("<H", data, opt)[0] == 0x10B else 112)
             start, size = struct.unpack_from("<II", data, dd)
-            expected = b"modrel_owner.ModValue\0"
+            expected = b"modrel_order_owner.ModValue\0"
             rva, value = pe_export_bytes(path, "ForwardValue", len(expected), rva=True)
-            ok = start <= rva and rva + len(expected) <= start + size and value == expected
-            record(name, ok, f"ForwardValue RVA={rva:#x} bytes={value!r}")
+            base, image_size, _, chars, fixups, _ = pe_layout(data)
+            anchor = pe_export_bytes(path, "ModForwardRelocation", 4 if x86 else 8)
+            address = int.from_bytes(anchor, "little")
+            expected_base = 0x50000000 if side == "low" else 0x70000000
+            ok = (start <= rva and rva + len(expected) <= start + size and value == expected and
+                  base == expected_base and not fixups and not (struct.unpack_from("<H", data, chars)[0] & 0x40) and
+                  base <= address < base + image_size)
+            record(name, ok, f"base={base:#x} anchor={address:#x} ForwardValue RVA={rva:#x} bytes={value!r}")
         except Exception as e:
             record(name, False, repr(e))
+    try:
+        fixed = Path(exe("modrel_order_owner.dll")).read_bytes()
+        base, _, _, chars, fixups, _ = pe_layout(fixed)
+        reload_fixups = pe_layout(Path(exe("modrel_owner.dll")).read_bytes())[4]
+        ok = (base == 0x60000000 and not fixups and bool(reload_fixups) and
+              not (struct.unpack_from("<H", fixed, chars)[0] & 0x40))
+        record("module-review-owner-images", ok, f"fixed_base={base:#x} fixed_relocs={len(fixups)} reload_relocs={len(reload_fixups)}")
+    except Exception as e:
+        record("module-review-owner-images", False, repr(e))
     cases = [("modforward", bk, side) for bk in ("breakpoint", "hw", "inline") for side in ("low", "high")]
     cases += [(sc, bk, "low") for sc in ("modreload", "modcall", "modhistory", "modreloc")
               for bk in ("breakpoint", "hw", "inline") if sc != "modreload" or bk == "breakpoint"]
@@ -3858,6 +3874,12 @@ def check_module_review():
             # modhistory leaves a rejected second launch's diagnostic (after launch cleared setup errors).
             if sc != "modhistory" and rep.get("error") is not None: bad.append(f"error={rep.get('error')}")
             if res.get("calls") != calls or res.get("bad") != 0: bad.append(f"target={res}")
+            if sc == "modforward":
+                owner_base = int(res.get("owner_base", "0"), 16)
+                forward_base = int(res.get("forward_base", "0"), 16)
+                if (owner_base != 0x60000000 or
+                        forward_base != (0x50000000 if side == "low" else 0x70000000)):
+                    bad.append(f"wrong mapping: owner={owner_base:#x} forward={forward_base:#x}")
             hits = sum(x.get("hits", 0) for x in rows)
             if hits != calls + arms or len(logs) != hits: bad.append(f"hits={hits} logs={len(logs)} want={calls + arms}")
             if rep.get("log_dropped", 0): bad.append(f"dropped={rep.get('log_dropped')}")
@@ -7284,6 +7306,121 @@ def own_watch_slots_bad(w, n, bk):
     if len(w) != 4 or got_free != want_free or any(v not in (-1, n) for v in w):
         return f"own_watch_per_slot={w} (want {want_free} free slot(s) with {n} traps each, the rest -1)"
     return ""
+
+
+def check_logsite_review():
+    """cxr7 controller log/site findings: deterministic failure windows, unload ordering,
+    concurrent runtime adds/reports, writable displaced code, and inline entry checks.
+    Runs on both architectures; no deliberately unsafe patch is ever executed."""
+    driver, th, target = exe("ctrl_driver.exe"), exe("ctrl_driver_th.exe"), exe("ctrl_target.exe")
+    trace, stream = exe("uhh_trace_th.exe"), exe("logstream_target.exe")
+    if not all((driver, th, target, trace, stream)):
+        return missing_bin("logsite-review", "ctrl_driver[/_th]/ctrl_target/uhh_trace_th/logstream_target")
+
+    def go(sc, bk, child, opts=(), env=None, test=False):
+        return run([th if test else driver, "--scenario", sc, "--backend", bk, *opts,
+                    "--", target, *child], env=env, timeout=90)
+
+    for sc, why in (("sitebranch", "jump/call target"), ("sitemixed", "unknown targets")):
+        name = f"logsite-{sc}"
+        try:
+            r, o = go(sc, "inline", ["siteempty"])
+            record(name, r.returncode != 0 and why in r.stderr and "refused" in r.stderr,
+                   f"rc={r.returncode} expected refusal={why!r}; {r.stderr[-700:]}")
+        except Exception as e:
+            record(name, False, repr(e))
+    name = "logsite-callpair"
+    try:
+        r, o = go("callpair", "breakpoint", ["callpair"])
+        logs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
+        inline = [x for x in o if x.get("kind") == "probe" and x.get("backend") == "inline"]
+        # Submission succeeds; pending-inline vetting must retire it before installation.
+        record(name, r.returncode == 0 and logs == ["callpair add=1"] and len(inline) == 1 and
+               inline[0].get("active") is False and inline[0].get("hits") == 0 and
+               "refused: 7-byte hook would be written across a call's return point at +0x2" in r.stderr,
+               f"rc={r.returncode} logs={logs} inline={inline} stderr={r.stderr[-500:]}")
+    except Exception as e:
+        record(name, False, repr(e))
+
+    for bk in ("breakpoint", "hw"):
+        for mode in ("immediate", "whole"):
+            name = f"logsite-codewrite-{bk}-{mode}"
+            try:
+                r, o = go("codewrite", bk, ["codewrite", "--whole", int(mode == "whole")])
+                rep = next((x for x in o if x.get("kind") == "probe_report"), {})
+                res = next((x for x in o if x.get("kind") == "ctrl_result"), {})
+                messages = [x.get("message") for x in o if x.get("kind") == "probe_log"]
+                sites = [x for x in o if x.get("kind") == "probe" and str(x.get("location", "")).startswith("0x")]
+                expected = ["codearm add=1"] + [f"codewrite ok=1 value={n} whole={int(mode == 'whole')}"
+                                                 for n in range(2, 14)]
+                record(name, r.returncode == 0 and res.get("bad") == 0 and messages == expected and
+                       rep.get("hits") == rep.get("logs_written") == 13 and rep.get("log_dropped") == 0 and
+                       len(sites) == 1 and sites[0].get("backend") == bk and sites[0].get("hits") == 12,
+                       f"rc={r.returncode} result={res} report={rep} sites={sites} logs={messages}")
+            except Exception as e:
+                record(name, False, repr(e))
+
+    name = "logsite-live-report"
+    try:
+        r, o = go("livereport", "breakpoint", ["int3cap", "--n", 1000])
+        rows, reports, bad = [], [], []
+        for x in o:
+            if x.get("kind") == "probe": rows.append(x)
+            elif x.get("kind") == "probe_report":
+                reports.append(x)
+                if x.get("hits") != sum(p.get("hits", 0) for p in rows) or x.get("probes") != len(rows):
+                    bad.append("probe rows disagree with their report")
+                rows = []
+        if len(reports) < 2: bad.append("no live report")
+        if not any(1 < x.get("probes", 0) < 1001 for x in reports):
+            bad.append("no report sampled the growing collection")
+        if not reports or reports[-1].get("probes") != 1001: bad.append("runtime additions not all present")
+        if r.returncode != 0: bad.append(f"rc={r.returncode} {r.stderr[-400:]}")
+        record(name, not bad, "; ".join(bad) or f"{len(reports)} consistent reports while adding 1000 probes")
+    except Exception as e:
+        record(name, False, repr(e))
+
+    for bk in ("breakpoint", "inline"):
+        name = f"logsite-chunk-oom-{bk}"
+        try:
+            env = dict(os.environ, UHH_TEST_CHUNK_FAIL_AT="1")
+            res = _filefail_run([th, "--scenario", "symunload", "--backend", bk, "--", target,
+                                 "symunload", "--cycles", "1", "--n", "8"], env, 90)
+            rc, timeout, logs, text, rep, file_logs, err = res
+            record(name, not timeout and rep.get("hits") == 8 and rep.get("log_dropped", 0) > 0 and
+                   rep.get("hits") == rep.get("logs_written", 0) + rep.get("log_dropped", 0) +
+                   rep.get("callbacks_interrupted", 0) and bool(rep.get("error")),
+                   f"rc={rc} timeout={timeout} report={rep}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    name = "logsite-unload-stall"
+    try:
+        env = dict(os.environ, UHH_TEST_UNLOAD_STALL="1")
+        r, o = go("symunload", "inline", ["symunload", "--cycles", 1, "--n", 1], env=env, test=True)
+        logs = [x for x in o if x.get("kind") == "probe_log"]
+        rep = next((x for x in o if x.get("kind") == "probe_report"), {})
+        record(name, r.returncode == 0 and "unload ring hole inserted" in r.stderr and len(logs) == 1 and
+               any("CtrlDllLeaf" in str(f) for f in logs[0].get("stack", [])[:1]) and
+               rep.get("hits") == rep.get("logs_written") == 1 and rep.get("log_dropped") == 0,
+               f"rc={r.returncode} report={rep} logs={logs} stderr={r.stderr[-500:]}")
+    except Exception as e:
+        record(name, False, repr(e))
+
+    for bk in ("breakpoint", "inline"):
+        name = f"logsite-file-prefix-{bk}"
+        try:
+            env = dict(os.environ, UHH_TEST_FILE_FAIL_AT="8", UHH_TEST_FILE_LOST_PAUSE="1")
+            rc, timeout, logs, text, rep, file_logs, err = _filefail_run(
+                [trace, "--backend", bk, "-p", "logstream_target.exe!LogSite:d", "--", stream], env, 90)
+            record(name, not timeout and rep.get("log_dropped", 0) > 0 and
+                   rep.get("logs_written") == len(file_logs) and
+                   [x.get("seq") for x in file_logs] == list(range(len(file_logs))) and
+                   rep.get("hits") == rep.get("logs_written", 0) + rep.get("log_dropped", 0) +
+                   rep.get("callbacks_interrupted", 0) and "incomplete" in (rep.get("error") or ""),
+                   f"rc={rc} timeout={timeout} file={len(file_logs)} report={rep}")
+        except Exception as e:
+            record(name, False, repr(e))
 
 
 def check_ctrl_review():
@@ -12487,6 +12624,7 @@ def main():
     if want(check_realapps): check_realapps()
     if args.soak_minutes > 0:
         if want(check_soak): check_soak(args.soak_minutes)
+    if want(check_logsite_review): check_logsite_review()
     if want(check_ctrl_review): check_ctrl_review()
     if want(check_ctrl_warm): check_ctrl_warm()
     if want(check_stream_filestall): check_stream_filestall()

@@ -745,51 +745,71 @@ static int run_headcorrupt() {
 }
 
 // ---- module reload / forwarding / address-size review --------------------------------
+static int mod_failure(const char *stage, int code, DWORD error = 0, int cycle = -1,
+                       HMODULE owner = nullptr, HMODULE fwd = nullptr) {
+    std::printf("{\"kind\":\"ctrl_result\",\"error\":\"%s\",\"code\":%d,\"win32\":%lu,\"cycle\":%d,"
+                "\"owner_base\":\"0x%llx\",\"forward_base\":\"0x%llx\"}\n", stage, code,
+                (unsigned long)error, cycle, (unsigned long long)(uintptr_t)owner, (unsigned long long)(uintptr_t)fwd);
+    std::fflush(stdout);
+    return code;
+}
 static int run_modmodules(const std::string &sc, const char *which) {
     typedef int (*Value)(int);
     typedef int (*Sys)(unsigned long);
     std::vector<void *> reserved;
     int bad = 0, calls = 0;
+    uintptr_t first_owner = 0, first_forward = 0;
     unsigned long ssn = 0;
 #if defined(_WIN64)
-    const unsigned char *stub = (const unsigned char *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtYieldExecution");
-    if (!stub || stub[0] != 0x4c || stub[3] != 0xb8) return 5;
-    std::memcpy(&ssn, stub + 4, 4);
+    if (sc == "modreload") {
+        const unsigned char *stub = (const unsigned char *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtYieldExecution");
+        if (!stub || stub[0] != 0x4c || stub[3] != 0xb8) return mod_failure("syscall-stub", 5);
+        std::memcpy(&ssn, stub + 4, 4);
+    }
 #endif
     for (int cycle = 0; cycle < 3; ++cycle) {
-        HMODULE owner = LoadLibraryA("modrel_owner.dll");
+        HMODULE owner = LoadLibraryA(sc == "modreload" ? "modrel_owner.dll" : "modrel_order_owner.dll");
+        if (!owner) return mod_failure("load-owner", 6, GetLastError(), cycle);
         HMODULE fwd = LoadLibraryA((std::string("modrel_forward_") + which + ".dll").c_str());
-        if (!owner || !fwd) return 6;
-        if (!cycle && sc == "modforward" &&
+        if (!fwd) return mod_failure("load-forwarder", 6, GetLastError(), cycle, owner);
+        if (!cycle) { first_owner = (uintptr_t)owner; first_forward = (uintptr_t)fwd; }
+        if (sc == "modforward" &&
             ((!std::strcmp(which, "low") && (uintptr_t)owner <= (uintptr_t)fwd) ||
-             (!std::strcmp(which, "high") && (uintptr_t)owner >= (uintptr_t)fwd))) return 10;
+             (!std::strcmp(which, "high") && (uintptr_t)owner >= (uintptr_t)fwd)))
+            return mod_failure("address-order", 10, 0, cycle, owner, fwd);
         Value value = (Value)GetProcAddress(owner, "ModValue");
-        Sys sys = (Sys)GetProcAddress(owner, "ModSys");
-        if (!value || !sys) return 7;
+        if (!value) return mod_failure("resolve-ModValue", 7, GetLastError(), cycle, owner, fwd);
         if (sc == "modforward") {
             bad += value(5) != 12; ++calls;
-            FreeLibrary(fwd); fwd = nullptr;
+            if (!FreeLibrary(fwd)) return mod_failure("unload-forwarder", 11, GetLastError(), cycle, owner, fwd);
+            fwd = nullptr;
             bad += value(5) != 12; ++calls; // forwarding image gone, owner is still live
         } else if (sc == "modreload") {
+            Sys sys = (Sys)GetProcAddress(owner, "ModSys");
+            if (!sys) return mod_failure("resolve-ModSys", 7, GetLastError(), cycle, owner, fwd);
             bad += sys(ssn) != 0; ++calls;
         } else { CtrlCall(sc == "modhistory" ? GetCurrentProcessId() : (uintptr_t)cycle); ++calls; }
         auto dos = (const IMAGE_DOS_HEADER *)owner;
         auto nt = (const IMAGE_NT_HEADERS *)((const char *)owner + dos->e_lfanew);
         const SIZE_T size = nt->OptionalHeader.SizeOfImage;
-        FreeLibrary(owner);
-        if (fwd) FreeLibrary(fwd);
-        // Force a different mapping on the next cycle. Old continuations must never run.
-        void *hold = VirtualAlloc(owner, size, MEM_RESERVE, PAGE_NOACCESS);
-        if (!hold && sc == "modreload") return 8;
-        if (hold) reserved.push_back(hold);
+        if (!FreeLibrary(owner)) return mod_failure("unload-owner", 11, GetLastError(), cycle, owner, fwd);
+        if (fwd && !FreeLibrary(fwd)) return mod_failure("unload-forwarder", 11, GetLastError(), cycle, owner, fwd);
+        // Only the reload test needs a different mapping. The ordering pair is fixed.
+        if (sc == "modreload") {
+            void *hold = VirtualAlloc(owner, size, MEM_RESERVE, PAGE_NOACCESS);
+            if (!hold) return mod_failure("reserve-old-owner", 8, GetLastError(), cycle, owner);
+            reserved.push_back(hold);
+        }
     }
     for (void *hold : reserved) VirtualFree(hold, 0, MEM_RELEASE);
-    std::printf("{\"kind\":\"ctrl_result\",\"calls\":%d,\"bad\":%d}\n", calls, bad);
+    std::printf("{\"kind\":\"ctrl_result\",\"calls\":%d,\"bad\":%d,"
+                "\"owner_base\":\"0x%llx\",\"forward_base\":\"0x%llx\"}\n", calls, bad,
+                (unsigned long long)first_owner, (unsigned long long)first_forward);
     return bad ? 9 : 0;
 }
 static int run_modreloc() {
     unsigned char *code = (unsigned char *)VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-    if (!code) return 5;
+    if (!code) return mod_failure("allocate-code", 5, GetLastError());
     int bad = 0, calls = 0;
 #if defined(_WIN64)
     // LEA with EIP-relative addressing wraps the result at 32 bits. It never faults,
@@ -802,13 +822,13 @@ static int run_modreloc() {
     for (int i = 0; i < 5; ++i) { bad += ((Fn)code)() != (uint32_t)(uintptr_t)(code + 7); ++calls; }
     // Use a second page: changing an already-probed instruction is another finding.
     code = (unsigned char *)VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-    if (!code) return 6;
+    if (!code) return mod_failure("allocate-branch-code", 6, GetLastError());
 #endif
     void *low = VirtualAlloc((void *)(uintptr_t)0x20000, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    if (!low) return 7;
+    if (!low) return mod_failure("allocate-low-pointer", 7, GetLastError());
 #if defined(_WIN64)
     void *high = VirtualAlloc((void *)(uintptr_t)0x100020000ull, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    if (!high) return 8;
+    if (!high) return mod_failure("allocate-high-pointer", 8, GetLastError());
 #endif
     // mov eax,fffffff0; [addr32] jmp [eax+20020] -> pointer at 20010.
     const unsigned char branch[] = {0xb8, 0xf0, 0xff, 0xff, 0xff,
@@ -832,6 +852,27 @@ static int run_modreloc() {
     return bad ? 9 : 0;
 }
 
+static int run_logsite_code(bool callpair, bool whole = false) {
+    auto *code = (unsigned char *)VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!code) return 1;
+    memset(code, 0x90, 4096);
+    const unsigned char pair[] = {0xff, 0xd0, 0xe8, 0, 0, 0, 0, 0xc3};
+    const unsigned char mov[] = {0xb8, 1, 0, 0, 0, 0x90, 0x90, 0x90, 0x90, 0xc3};
+    memcpy(code, callpair ? pair : mov, callpair ? sizeof(pair) : sizeof(mov));
+    FlushInstructionCache(GetCurrentProcess(), code, 4096);
+    CtrlAnnounce(code, nullptr);
+    int bad = 0;
+    if (!callpair) {
+        // The entry callback reads these arguments before MOV changes EAX. Use the
+        // same cdecl arguments on x86 and the native argument registers on x64.
+        typedef int (__cdecl *fn)(const void *, uintptr_t);
+        for (int i = 0; i < 12; ++i) bad += ((fn)code)(code, whole ? 1u : 0u) != i + 2;
+    }
+    // Keep the allocation mapped until process exit (it still owns an active probe).
+    std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"logsite\",\"bad\":%d}\n", bad);
+    return bad ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: ctrl_target <scenario> [opts]\n"); return 2; }
     const std::string sc = argv[1];
@@ -839,6 +880,9 @@ int main(int argc, char **argv) {
     if (sc == "modforward" || sc == "modcall" || sc == "modhistory" || sc == "modreload")
         rc = run_modmodules(sc, arg_str(argc, argv, "--dll", "low"));
     else if (sc == "modreloc") rc = run_modreloc();
+    else if (sc == "siteempty") rc = 0;
+    else if (sc == "codewrite") rc = run_logsite_code(false, arg_int(argc, argv, "--whole", 0) != 0);
+    else if (sc == "callpair") rc = run_logsite_code(true);
     else if (sc == "fault") rc = run_fault(arg_int(argc, argv, "--n", 200));
     else if (sc == "inplace") rc = run_inplace(arg_int(argc, argv, "--threads", 8), arg_int(argc, argv, "--n", 3000));
     else if (sc == "absunload") rc = run_absunload(arg_int(argc, argv, "--cycles", 5), arg_int(argc, argv, "--n", 100));

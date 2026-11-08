@@ -459,7 +459,7 @@ Probe *adopt_relocated_breakpoint(probe_session *s, uint64_t at) {
         a->rva = at; a->internal = true; a->alias_of = &p;
         if (!patch(s->pi.hProcess, at, p.original)) return nullptr;    // the copy now runs the real code
         Probe *raw = a.get();
-        s->probes.push_back(std::move(a));                              // returns before the loop goes on
+        { std::lock_guard<std::mutex> lock(s->probes_mu); s->probes.push_back(std::move(a)); }                              // returns before the loop goes on
         std::string saved = s->error;
         if (!arm_breakpoint(s, *raw, 0)) {                   // the copy now holds the real byte:
             raw->retired = true; s->error = saved;               // rewind onto it (stale-INT3 path)
@@ -719,6 +719,22 @@ uint64_t displaced_trampoline(probe_session *s, Probe &p) {
     probe_session::DTramp d; d.site = p.address; d.len = p.insn_len; d.probe = &p;
     s->dtramps[at] = d;
     return at;
+}
+// set_mem changed writable code. Retain old trampoline allocations for threads already
+// executing them, but decode the program's new bytes before the current hit resumes.
+bool refresh_breakpoint(probe_session *s, Probe &p) {
+    unsigned char buf[16]; size_t got = 0;
+    if (!remote_read(s->pi.hProcess, p.address, buf, sizeof(buf), &got) || got != sizeof(buf)) return false;
+    for (const auto &q : s->probes)
+        if (q->active && (q->flags & PROBE_BREAKPOINT) && q->address >= p.address &&
+            q->address - p.address < sizeof(buf) && buf[q->address - p.address] == 0xcc)
+            buf[q->address - p.address] = q->original;
+    uint32_t len = 0; bool disp = false, rep = false; int riprel = -1;
+    if (!decode_site(buf, sizeof(buf), len, disp, riprel, &rep) || !len) return false;
+    p.orig_insn.assign(buf, buf + len); p.follow.assign(buf + 1, buf + sizeof(buf));
+    p.insn_len = len; p.displaced_ok = disp; p.riprel_disp_off = riprel; p.rep_string = rep;
+    p.tramp = 0; p.dtramp = 0; p.dtramp_site = 0;
+    return true;
 }
 // A hardware execute probe's site as a displaced trampoline: an execute hit resumes there
 // instead of at the site with RF. RF lives only until the instruction runs; a context the
