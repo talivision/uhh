@@ -4114,6 +4114,194 @@ static bool inline_site_unsafe(probe_session *s, const Probe &p, std::string &wh
     return true;
 }
 
+// ---- Instruction boundaries (every backend) ---------------------------------------------
+// A site INSIDE an instruction is wrong on every backend: breakpoint writes its INT3 over an
+// operand byte (the instruction changes), inline makes the program execute the hook jump's
+// displacement bytes, hw execute never fires (the CPU only matches instruction starts). It is
+// refused, with the nearest boundaries, wherever the instruction stream is KNOWN: decoded by
+// following control flow -- fall-through, direct branches and calls, switch tables -- from
+// trusted code starts: the start of the site's function (its extent from .pdata on x64, the
+// PDB on both arches) and the .pdata/PDB/CFG starts inside it; with no extent, the symbol the
+// location names. Never a linear sweep (data in code would mis-decode real instructions). No
+// verdict -- today's behaviour -- when the site is itself an export or trusted start, when no
+// decoded instruction covers it (code reached only through an unknown indirect jump, or no
+// extent and no symbol), or when decoded instructions overlap anywhere in the region
+// (overlapping code: obfuscation, hand-written tricks).
+static bool exec_section_bounds(probe_session *s, uint64_t base, uint64_t addr, uint64_t &lo, uint64_t &hi) {
+    IMAGE_DOS_HEADER dos{}; IMAGE_NT_HEADERS nt{}; size_t got = 0;
+    if (!remote_read(s->pi.hProcess, base, &dos, sizeof(dos), &got) || got != sizeof(dos) ||
+        dos.e_magic != IMAGE_DOS_SIGNATURE) return false;
+    const uint64_t nth = base + (uint32_t)dos.e_lfanew;
+    if (!remote_read(s->pi.hProcess, nth, &nt, sizeof(nt), &got) || got != sizeof(nt) ||
+        nt.Signature != IMAGE_NT_SIGNATURE) return false;
+    const uint16_t nsec = nt.FileHeader.NumberOfSections;
+    if (!nsec || nsec > 96) return false;
+    std::vector<IMAGE_SECTION_HEADER> sec(nsec);
+    const uint64_t first = nth + offsetof(IMAGE_NT_HEADERS, OptionalHeader) + nt.FileHeader.SizeOfOptionalHeader;
+    if (!remote_read(s->pi.hProcess, first, sec.data(), nsec * sizeof(IMAGE_SECTION_HEADER), &got) ||
+        got != nsec * sizeof(IMAGE_SECTION_HEADER)) return false;
+    for (const auto &h : sec) {
+        const uint64_t st = base + h.VirtualAddress, en = st + (std::max)(h.Misc.VirtualSize, h.SizeOfRawData);
+        if (addr < st || addr >= en) continue;
+        if (!(h.Characteristics & IMAGE_SCN_MEM_EXECUTE)) return false;
+        lo = st; hi = en;
+        return true;
+    }
+    return false;
+}
+
+// `anchor`: the address of the symbol the location names (0: none). True = refused (why set).
+static bool site_inside_instruction(probe_session *s, const Probe &p, uint64_t site, uint64_t anchor, std::string &why) {
+    const uint64_t base = image_base_of(s, site);
+    uint64_t sec_lo = 0, sec_hi = 0;
+    if (!base || !exec_section_bounds(s, base, site, sec_lo, sec_hi)) return false;   // no image / not code
+    // Trusted code starts. The site being one of them ends it: an instruction starts there.
+    std::set<uint64_t> starts, exports;
+    add_export_starts(s, base, exports);
+    if (exports.count(site)) return false;
+    add_cfg_starts(s, base, starts);
+    uint64_t fs = 0, fe = 0;
+    const char *src = nullptr;
+#if defined(_WIN64)
+    add_pdata(s, base, site, starts, fs, fe);
+    if (fs) src = ".pdata";
+#endif
+    if (s->sym_ready) {
+        uint64_t ps = 0; uint32_t pz = 0;
+        if (uhh_sym::containing_function(s->pi.hProcess, site, ps, pz) && pz && pz <= (1u << 20)) {
+            starts.insert(ps);
+            if (!fs) { fs = ps; fe = ps + pz; src = "the PDB"; }
+        }
+    }
+    if (anchor) starts.insert(anchor);
+    if (starts.count(site)) return false;
+    // The region decoded: the site's function; with no extent, from the symbol the location
+    // names to just past the site (never from ANOTHER function's start: its code can run on
+    // into data -- a no-return call before a switch table -- and decode it over a real site).
+    uint64_t lo = fs, hi = fe;
+    std::string from = src ? src : "";
+    if (!fs || fe - fs > (1u << 16)) {
+        if (!anchor || anchor > site || site - anchor > 4096) return false;
+        lo = anchor; hi = site + 16; from = p.export_name;
+    }
+    lo = (std::max)(lo, sec_lo); hi = (std::min)(hi, sec_hi);
+    if (site < lo || site >= hi) return false;
+    std::vector<unsigned char> code((size_t)(hi - lo)); size_t got = 0;
+    if (!remote_read(s->pi.hProcess, lo, code.data(), code.size(), &got) || got != code.size()) return false;
+    for (auto &q : s->probes)                       // the PROGRAM's bytes: our INT3s read as the original
+        if (q->active && (q->flags & PROBE_BREAKPOINT) && !q->orig_insn.empty() && q->address >= lo &&
+            q->address < hi && code[(size_t)(q->address - lo)] == 0xCC)
+            code[(size_t)(q->address - lo)] = q->original;
+    uint32_t image_size = 0; IMAGE_DATA_DIRECTORY unused{};
+    read_image_dir(s, base, IMAGE_DIRECTORY_ENTRY_EXPORT, unused, &image_size);
+    ZydisDecoder dec; zydis_init(dec);
+    std::map<uint64_t, ZydisDecodedInstruction> insns;
+    std::vector<uint64_t> work;
+    for (auto it = starts.lower_bound(lo); it != starts.end() && *it < hi; ++it) work.push_back(*it);
+    auto push = [&](uint64_t t) { if (t >= lo && t < hi && !insns.count(t)) work.push_back(t); };
+    // Switch tables (entries pushed while they land in the region): x86 `jmp [idx*4 + table]`
+    // (absolute entries); x64 MSVC `mov r32, [rB + idx*4 + rva]` then `add r, rB` / `jmp r`
+    // within the next few instructions (image-relative entries, rB = image base).
+    auto table = [&](uint64_t at) {
+        for (int e = 0; e < 4096; ++e) {
+            uint32_t v = 0; size_t n = 0;
+            if (!remote_read(s->pi.hProcess, at + 4ull * e, &v, 4, &n) || n != 4) break;
+#if defined(_WIN64)
+            const uint64_t t = base + v;
+#else
+            const uint64_t t = v;
+#endif
+            if (t < lo || t >= hi) break;
+            push(t);
+        }
+    };
+    while (!work.empty()) {
+        const uint64_t at = work.back(); work.pop_back();
+        if (insns.count(at)) continue;
+        ZydisDecodedInstruction in; ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+        if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, code.data() + (size_t)(at - lo), code.size() - (size_t)(at - lo), &in, ops)))
+            continue;                               // (a path into undecodable bytes just ends)
+        insns.emplace(at, in);
+        const uint64_t next = at + in.length;
+        for (int k = 0; k < in.operand_count_visible; ++k) {
+            const auto &o = ops[k];
+            if (o.type == ZYDIS_OPERAND_TYPE_IMMEDIATE && o.imm.is_relative && in.meta.branch_type != ZYDIS_BRANCH_TYPE_NONE) {
+                uint64_t t = next + (uint64_t)o.imm.value.s;
+#if !defined(_WIN64)
+                t = (uint32_t)t;
+#endif
+                push(t);
+            }
+            if (o.type != ZYDIS_OPERAND_TYPE_MEMORY || o.mem.index == ZYDIS_REGISTER_NONE || o.mem.scale != 4 ||
+                !o.mem.disp.has_displacement || o.mem.disp.value <= 0) continue;
+#if defined(_WIN64)
+            if (in.mnemonic != ZYDIS_MNEMONIC_MOV && in.mnemonic != ZYDIS_MNEMONIC_MOVSXD) continue;
+            if ((uint64_t)o.mem.disp.value >= image_size || o.mem.base == ZYDIS_REGISTER_NONE) continue;
+            bool jumps = false;
+            for (uint64_t f = next, i = 0; i < 4 && f < hi; ++i) {
+                ZydisDecodedInstruction fi; ZydisDecodedOperand fo[ZYDIS_MAX_OPERAND_COUNT];
+                if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, code.data() + (size_t)(f - lo), code.size() - (size_t)(f - lo), &fi, fo))) break;
+                if (fi.mnemonic == ZYDIS_MNEMONIC_JMP) { jumps = fo[0].type == ZYDIS_OPERAND_TYPE_REGISTER; break; }
+                if (fi.meta.branch_type != ZYDIS_BRANCH_TYPE_NONE) break;
+                f += fi.length;
+            }
+            if (jumps) table(base + (uint64_t)o.mem.disp.value);
+#else
+            const uint64_t t = (uint32_t)o.mem.disp.value;
+            if (in.mnemonic == ZYDIS_MNEMONIC_JMP && t >= base && t - base < image_size) table(t);
+#endif
+        }
+        const bool ends = in.meta.category == ZYDIS_CATEGORY_RET || in.meta.category == ZYDIS_CATEGORY_UNCOND_BR ||
+                          in.mnemonic == ZYDIS_MNEMONIC_INT3 || in.mnemonic == ZYDIS_MNEMONIC_UD2 ||
+                          in.mnemonic == ZYDIS_MNEMONIC_HLT;
+        if (!ends) push(next);
+    }
+    // Overlapping decoded code anywhere in the region: the stream is not one stream.
+    uint64_t prev_end = 0;
+    for (const auto &kv : insns) {
+        if (kv.first < prev_end) return false;
+        prev_end = kv.first + kv.second.length;
+    }
+    auto cover = insns.upper_bound(site);
+    if (cover == insns.begin()) return false;
+    --cover;
+    const uint64_t at = cover->first, end = at + cover->second.length;
+    if (at == site || site >= end) return false;    // a boundary, or bytes nothing decoded covers: no verdict
+    std::string modname;
+    for (auto &kv : s->module_bases) if (kv.second == base) { modname = kv.first; break; }
+    auto name = [&](uint64_t a) {
+        char b[160];
+        if (anchor && !p.export_name.empty() && a >= anchor) {
+            const size_t plus = p.location.find('+');
+            std::snprintf(b, sizeof(b), "%s+0x%llx", p.location.substr(0, plus).c_str(), (unsigned long long)(a - anchor));
+        } else {
+            std::snprintf(b, sizeof(b), "%s+0x%llx", modname.empty() ? "module" : modname.c_str(), (unsigned long long)(a - base));
+        }
+        return std::string(b);
+    };
+    char buf[512];
+    std::snprintf(buf, sizeof(buf), "site is inside an instruction: %llu byte(s) into the %u-byte %s at %s "
+                  "(instruction stream decoded from %s); nearest instruction boundaries %s, %s",
+                  (unsigned long long)(site - at), (unsigned)cover->second.length,
+                  ZydisMnemonicGetString(cover->second.mnemonic), name(at).c_str(), from.c_str(),
+                  name(at).c_str(), name(end).c_str());
+    why = buf;
+    return true;
+}
+
+// Refuse a probe whose site is inside an instruction (any backend; no flag overrides it).
+static bool refuse_mid_instruction(probe_session *s, Probe &p, uint64_t site) {
+    if (!p.export_name.empty() && !p.sym_offset) return false;     // the named symbol itself
+    const uint64_t anchor = !p.export_name.empty() && site >= p.sym_offset ? site - p.sym_offset : 0;
+    std::string why;
+    if (!site_inside_instruction(s, p, site, anchor, why)) return false;
+    const std::string msg = "probe " + p.location + " refused: " + why;
+    std::fprintf(stderr, "probe: %s\n", msg.c_str());
+    set_error(s, msg);
+    p.retired = true;
+    return true;
+}
+
 // Two inline hooks whose patches overlap corrupt each other: the second decodes (and
 // relocates) the first one's jump bytes, and removing either restores bytes under the
 // other. Same address included. Never overridable: refused, or hw with PROBE_FALLBACK_HW.
@@ -4191,6 +4379,7 @@ static bool arm_probe(probe_session *s, Probe &item, uint64_t base) {
     // Judge an inline site BEFORE any backend decision, so a foreign hook is always
     // reported (and handled per PROBE_ALLOW_PREHOOKED / PROBE_FALLBACK_HW) -- including
     // when the late-install rule below would move the probe anyway.
+    bool boundary_done = false;            // the instruction-boundary check ran (every backend)
     if (item.flags & PROBE_INLINE) {
         Probe view = item; view.base = base;
         bool known = true;
@@ -4203,6 +4392,8 @@ static bool arm_probe(probe_session *s, Probe &item, uint64_t base) {
         // (A forwarded / symbol-only name has no RVA here yet: its real site is judged by
         //  vet_pending_inline before the hook is written -- never the module header.)
         view.address = base + view.rva;
+        if (known && refuse_mid_instruction(s, item, view.address)) return false;
+        boundary_done = known;
         bool moved = false;
         if (known && !vet_site(s, view, moved)) { item.retired = true; return false; }
         if (moved) item.flags = view.flags;                // pre-hooked -> hw (PROBE_FALLBACK_HW)
@@ -4256,6 +4447,7 @@ static bool arm_probe(probe_session *s, Probe &item, uint64_t base) {
         }
         item.rva = exp + item.sym_offset;
     }
+    if (!boundary_done && refuse_mid_instruction(s, item, base + item.rva)) return false;
     if (item.flags & PROBE_BREAKPOINT) {
         // Judge the site BEFORE planting our INT3 (address is known: base + rva).
         Probe probe_view = item; probe_view.base = base; probe_view.address = base + item.rva;
@@ -4895,6 +5087,8 @@ static int add_absolute(probe_session *s, uint64_t address, probe_callback cb, u
         if ((flags & PROBE_INLINE) && !inline_callback_names(s, cb, p->callback_export)) return scope.done(0);
         Probe *raw = p.get();
         s->probes.push_back(std::move(p));
+        if (!(flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) && refuse_mid_instruction(s, *raw, address))
+            return scope.done(0);
         bool ok = (flags & PROBE_INLINE) ? register_runtime_inline(s, *raw) && resolve_inline(s, *raw, 0) && kick_agent(s)
                 : (flags & PROBE_HW)     ? arm_hw(s, *raw, 0) : arm_breakpoint(s, *raw, 0);
         if (!ok) raw->retired = true;
