@@ -29,6 +29,7 @@ void ctrl_on_cfcall(probe_context *);
 void ctrl_on_modcall(probe_context *);
 void ctrl_on_modhistory(probe_context *);
 void ctrl_on_modarm(probe_context *);
+void ctrl_on_modforwardarm(probe_context *);
 }
 struct ctrl_cfg { uint32_t backend; uint32_t pad; };
 
@@ -80,7 +81,7 @@ int main(int argc, char **argv) {
     bool ok = s != nullptr;
     if (ok) {
         if (sc == "modforward")
-            ok = probe_add_symbol(s, ("modrel_forward_" + shape + ".dll!ForwardValue").c_str(), ctrl_on_load, backend);
+            ok = probe_add_symbol_cfg(s, "ctrl_target.exe!CtrlAnnounce", ctrl_on_modforwardarm, backend, &k, sizeof(k));
         else if (sc == "modcall" || sc == "modhistory") {
             ok = probe_add_symbol(s, "ctrl_target.exe!CtrlCall", sc == "modhistory" ? ctrl_on_modhistory : ctrl_on_modcall, backend);
         } else if (sc == "modreload") {

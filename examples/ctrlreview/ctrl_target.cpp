@@ -759,6 +759,7 @@ static int run_modmodules(const std::string &sc, const char *which) {
     std::vector<void *> reserved;
     int bad = 0, calls = 0;
     uintptr_t first_owner = 0, first_forward = 0;
+    bool low_is_source = false;
     unsigned long ssn = 0;
 #if defined(_WIN64)
     if (sc == "modreload") {
@@ -768,15 +769,30 @@ static int run_modmodules(const std::string &sc, const char *which) {
     }
 #endif
     for (int cycle = 0; cycle < 3; ++cycle) {
-        HMODULE owner = LoadLibraryA(sc == "modreload" ? "modrel_owner.dll" : "modrel_order_owner.dll");
-        if (!owner) return mod_failure("load-owner", 6, GetLastError(), cycle);
-        HMODULE fwd = LoadLibraryA((std::string("modrel_forward_") + which + ".dll").c_str());
-        if (!fwd) return mod_failure("load-forwarder", 6, GetLastError(), cycle, owner);
-        if (!cycle) { first_owner = (uintptr_t)owner; first_forward = (uintptr_t)fwd; }
-        if (sc == "modforward" &&
-            ((!std::strcmp(which, "low") && (uintptr_t)owner <= (uintptr_t)fwd) ||
-             (!std::strcmp(which, "high") && (uintptr_t)owner >= (uintptr_t)fwd)))
-            return mod_failure("address-order", 10, 0, cycle, owner, fwd);
+        HMODULE owner = nullptr, fwd = nullptr;
+        if (sc == "modforward") {
+            HMODULE low = LoadLibraryA("modrel_forward_low.dll");
+            if (!low) return mod_failure("load-low-forwarder", 6, GetLastError(), cycle);
+            HMODULE high = LoadLibraryA("modrel_forward_high.dll");
+            if (!high) return mod_failure("load-high-forwarder", 6, GetLastError(), cycle, low);
+            // File names do not promise placement. Select the source by the actual bases,
+            // then keep those module identities for the unload/reload cycles.
+            if (!cycle) low_is_source = ((uintptr_t)low < (uintptr_t)high) == !std::strcmp(which, "low");
+            fwd = low_is_source ? low : high;
+            owner = low_is_source ? high : low;
+        } else {
+            owner = LoadLibraryA(sc == "modreload" ? "modrel_owner.dll" : "modrel_forward_high.dll");
+            if (!owner) return mod_failure("load-owner", 6, GetLastError(), cycle);
+            fwd = LoadLibraryA("modrel_forward_low.dll");
+            if (!fwd) return mod_failure("load-forwarder", 6, GetLastError(), cycle, owner);
+        }
+        if (!cycle) {
+            first_owner = (uintptr_t)owner; first_forward = (uintptr_t)fwd;
+            if (sc == "modforward") {
+                const std::string symbol = std::string(low_is_source ? "modrel_forward_low.dll" : "modrel_forward_high.dll") + "!ForwardValue";
+                CtrlAnnounce((void *)symbol.c_str(), (void *)(uintptr_t)(symbol.size() + 1));
+            }
+        }
         Value value = (Value)GetProcAddress(owner, "ModValue");
         if (!value) return mod_failure("resolve-ModValue", 7, GetLastError(), cycle, owner, fwd);
         if (sc == "modforward") {
@@ -794,7 +810,7 @@ static int run_modmodules(const std::string &sc, const char *which) {
         const SIZE_T size = nt->OptionalHeader.SizeOfImage;
         if (!FreeLibrary(owner)) return mod_failure("unload-owner", 11, GetLastError(), cycle, owner, fwd);
         if (fwd && !FreeLibrary(fwd)) return mod_failure("unload-forwarder", 11, GetLastError(), cycle, owner, fwd);
-        // Only the reload test needs a different mapping. The ordering pair is fixed.
+        // Only the reload test reserves old mappings; the forwarding pair is freely relocatable.
         if (sc == "modreload") {
             void *hold = VirtualAlloc(owner, size, MEM_RESERVE, PAGE_NOACCESS);
             if (!hold) return mod_failure("reserve-old-owner", 8, GetLastError(), cycle, owner);

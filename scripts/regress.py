@@ -3811,15 +3811,16 @@ def check_shared_mix(threads=8, reads=1000):
 
 def check_module_review():
     """Controller module reload, target forwarder ownership/resolution and addr32 execution.
-    Forwarding uses /FIXED images with the owner between the two forwarders. A separate
-    relocatable owner and reservations exercise reload at different bases. No controller
-    copy of either application DLL is loaded.
+    Both forwarding images own ModValue and forward ForwardValue to the other image.
+    After loading both, the target chooses its source by actual address order, then arms
+    that symbol from a callback. A separate owner and reservations exercise syscall reload.
+    All images are relocatable; no controller copy of an application DLL is loaded.
     x86 exercises reload/forwarding and native 32-bit address wrapping; EIP-relative LEA
     and address-size-overridden branches apply to x64 only.
     """
     d, t = exe("ctrl_driver.exe"), exe("ctrl_target.exe")
-    if not d or not t or not exe("modrel_owner.dll") or not exe("modrel_order_owner.dll"):
-        return missing_bin("module-review", "ctrl_driver/ctrl_target/modrel_owner/modrel_order_owner")
+    if not d or not t or not exe("modrel_owner.dll"):
+        return missing_bin("module-review", "ctrl_driver/ctrl_target/modrel_owner")
     x86 = pe_is_x86(t)
     # Check the built PE, not just successful linkage: ForwardValue must point into
     # the export directory at the forwarder string, rather than at a local thunk.
@@ -3832,25 +3833,22 @@ def check_module_review():
             opt = pe + 24
             dd = opt + (96 if struct.unpack_from("<H", data, opt)[0] == 0x10B else 112)
             start, size = struct.unpack_from("<II", data, dd)
-            expected = b"modrel_order_owner.ModValue\0"
+            other = "high" if side == "low" else "low"
+            expected = f"modrel_forward_{other}.ModValue\0".encode("ascii")
             rva, value = pe_export_bytes(path, "ForwardValue", len(expected), rva=True)
-            base, image_size, _, chars, fixups, _ = pe_layout(data)
+            base, image_size, _, _, fixups, _ = pe_layout(data)
             anchor = pe_export_bytes(path, "ModForwardRelocation", 4 if x86 else 8)
             address = int.from_bytes(anchor, "little")
-            expected_base = 0x50000000 if side == "low" else 0x70000000
+            local_value = pe_export_rva(path, "ModValue")
             ok = (start <= rva and rva + len(expected) <= start + size and value == expected and
-                  base == expected_base and not fixups and not (struct.unpack_from("<H", data, chars)[0] & 0x40) and
-                  base <= address < base + image_size)
+                  bool(fixups) and base <= address < base + image_size and local_value is not None and
+                  not (start <= local_value < start + size))
             record(name, ok, f"base={base:#x} anchor={address:#x} ForwardValue RVA={rva:#x} bytes={value!r}")
         except Exception as e:
             record(name, False, repr(e))
     try:
-        fixed = Path(exe("modrel_order_owner.dll")).read_bytes()
-        base, _, _, chars, fixups, _ = pe_layout(fixed)
         reload_fixups = pe_layout(Path(exe("modrel_owner.dll")).read_bytes())[4]
-        ok = (base == 0x60000000 and not fixups and bool(reload_fixups) and
-              not (struct.unpack_from("<H", fixed, chars)[0] & 0x40))
-        record("module-review-owner-images", ok, f"fixed_base={base:#x} fixed_relocs={len(fixups)} reload_relocs={len(reload_fixups)}")
+        record("module-review-owner-images", bool(reload_fixups), f"reload_relocs={len(reload_fixups)}")
     except Exception as e:
         record("module-review-owner-images", False, repr(e))
     cases = [("modforward", bk, side) for bk in ("breakpoint", "hw", "inline") for side in ("low", "high")]
@@ -3865,7 +3863,7 @@ def check_module_review():
             logs = [x for x in famous_objs(r, o) if x.get("kind") == "probe_log"]
             rep = report(o)
             calls = (5 if x86 else 10) if sc == "modreloc" else 6 if sc == "modforward" else 3
-            arms = (1 if x86 else 2) if sc == "modreloc" else 0
+            arms = 1 if sc == "modforward" else (1 if x86 else 2) if sc == "modreloc" else 0
             bad = []
             expected_exit = 1 if sc == "modhistory" else 0
             if r.returncode != expected_exit or rep.get("app_exit") != 0:
@@ -3877,9 +3875,8 @@ def check_module_review():
             if sc == "modforward":
                 owner_base = int(res.get("owner_base", "0"), 16)
                 forward_base = int(res.get("forward_base", "0"), 16)
-                if (owner_base != 0x60000000 or
-                        forward_base != (0x50000000 if side == "low" else 0x70000000)):
-                    bad.append(f"wrong mapping: owner={owner_base:#x} forward={forward_base:#x}")
+                ordered = 0 < forward_base < owner_base if side == "low" else 0 < owner_base < forward_base
+                if not ordered: bad.append(f"wrong order: owner={owner_base:#x} forward={forward_base:#x}")
             hits = sum(x.get("hits", 0) for x in rows)
             if hits != calls + arms or len(logs) != hits: bad.append(f"hits={hits} logs={len(logs)} want={calls + arms}")
             if rep.get("log_dropped", 0): bad.append(f"dropped={rep.get('log_dropped')}")
@@ -3889,7 +3886,8 @@ def check_module_review():
             if sc == "modcall" and messages != Counter({"modcall ok=1 r=12": calls}): bad.append(f"callbacks={messages}")
             if sc == "modhistory" and messages != Counter({"modhistory ok=1 match=1": calls}): bad.append(f"callbacks={messages}")
             if sc == "modreloc" and messages != Counter({"load": calls, "modarm ok=1": arms}): bad.append(f"callbacks={messages}")
-            record(name, not bad, " ".join(bad) or f"calls=hits=logs={calls}, arms={arms}, target unchanged")
+            if sc == "modforward" and messages != Counter({"load": calls, "modforward arm=1": arms}): bad.append(f"callbacks={messages}")
+            record(name, not bad, " ".join(bad) or f"calls={calls} hits={hits} logs={len(logs)} arms={arms}, target unchanged")
         except Exception as e:
             record(name, False, repr(e))
 

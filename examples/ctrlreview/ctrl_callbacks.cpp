@@ -125,3 +125,12 @@ CTRL_EXPORT void ctrl_on_callpair(probe_context *c) {
     const int added = probe_add_address(get_session(c), get_func_arg(c, 0), ctrl_on_work, PROBE_INLINE);
     send_log(c, "callpair add=%d", added);
 }
+
+// The target selects a source by ACTUAL mapping order before requesting its symbol.
+CTRL_EXPORT void ctrl_on_modforwardarm(probe_context *c) {
+    char symbol[128] = {};
+    const uint64_t n = get_func_arg(c, 1);
+    const int ok = n > 1 && n <= sizeof(symbol) && get_mem(c, get_func_arg(c, 0), symbol, (size_t)n) &&
+        symbol[(size_t)n - 1] == 0 && probe_add_symbol(get_session(c), symbol, ctrl_on_load, cfg_backend(c));
+    send_log(c, "modforward arm=%d", ok);
+}
