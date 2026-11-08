@@ -21,6 +21,23 @@ std::mutex &inherit_lock() {
 }
 namespace {
 
+template <typename T, auto Close>
+struct resource_owner {
+    T value;
+    explicit resource_owner(T resource) noexcept : value(resource) {}
+    resource_owner(const resource_owner &) = delete;
+    resource_owner &operator=(const resource_owner &) = delete;
+    ~resource_owner() { reset(); }
+    void reset() noexcept {
+        if (value && value != reinterpret_cast<T>(INVALID_HANDLE_VALUE)) Close(value);
+        value = nullptr;
+    }
+};
+
+using handle_owner = resource_owner<HANDLE, CloseHandle>;
+using key_owner = resource_owner<HKEY, RegCloseKey>;
+using find_owner = resource_owner<HANDLE, FindClose>;
+
 struct dbghelp_api {
     decltype(&::SymSetOptions) set_options = nullptr;
     decltype(&::SymInitializeW) initialize = nullptr;
@@ -148,18 +165,18 @@ bool query_registry_string(const wchar_t *subkey, REGSAM view, const wchar_t *va
     HKEY key = nullptr;
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey, 0, KEY_QUERY_VALUE | view, &key) != ERROR_SUCCESS)
         return false;
+    key_owner owned_key(key);
     DWORD type = 0;
     DWORD bytes = 0;
     LSTATUS status = RegQueryValueExW(key, value, nullptr, &type, nullptr, &bytes);
     if (status != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ) ||
         bytes < static_cast<DWORD>(sizeof(wchar_t))) {
-        RegCloseKey(key);
         return false;
     }
     std::vector<wchar_t> buffer(bytes / sizeof(wchar_t) + 1, L'\0');
     status = RegQueryValueExW(key, value, nullptr, &type,
                               reinterpret_cast<BYTE *>(buffer.data()), &bytes);
-    RegCloseKey(key);
+    owned_key.reset();
     if (status != ERROR_SUCCESS) return false;
     buffer.back() = L'\0';
     out.assign(buffer.data());
@@ -221,9 +238,9 @@ bool run_vswhere(const std::wstring &program, std::wstring &install_path) {
     HANDLE write_pipe = nullptr;
     std::unique_lock<std::mutex> inherit(inherit_lock());     // until write_pipe is closed here
     if (!CreatePipe(&read_pipe, &write_pipe, &security, 0)) return false;
+    handle_owner owned_read(read_pipe);
+    handle_owner owned_write(write_pipe);
     if (!SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0)) {
-        CloseHandle(read_pipe);
-        CloseHandle(write_pipe);
         return false;
     }
 
@@ -239,10 +256,11 @@ bool run_vswhere(const std::wstring &program, std::wstring &install_path) {
     PROCESS_INFORMATION process{};
     const BOOL created = CreateProcessW(program.c_str(), mutable_command.data(), nullptr, nullptr, TRUE,
                                         CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process);
-    CloseHandle(write_pipe);
+    handle_owner owned_process(process.hProcess);
+    handle_owner owned_thread(process.hThread);
+    owned_write.reset();
     inherit.unlock();
     if (!created) {
-        CloseHandle(read_pipe);
         return false;
     }
 
@@ -251,12 +269,12 @@ bool run_vswhere(const std::wstring &program, std::wstring &install_path) {
     DWORD count = 0;
     while (ReadFile(read_pipe, buffer, static_cast<DWORD>(sizeof(buffer)), &count, nullptr) && count != 0)
         bytes.append(buffer, count);
-    CloseHandle(read_pipe);
+    owned_read.reset();
     WaitForSingleObject(process.hProcess, INFINITE);
     DWORD exit_code = 1;
     GetExitCodeProcess(process.hProcess, &exit_code);
-    CloseHandle(process.hThread);
-    CloseHandle(process.hProcess);
+    owned_thread.reset();
+    owned_process.reset();
     if (exit_code != 0 || bytes.empty()) return false;
 
     const int chars = MultiByteToWideChar(CP_UTF8, 0, bytes.data(), static_cast<int>(bytes.size()), nullptr, 0);
@@ -275,17 +293,16 @@ bool search_vs_directory(const std::wstring &directory, std::wstring &result) {
     const std::wstring pattern = join_path(directory, L"*");
     HANDLE search = FindFirstFileW(pattern.c_str(), &item);
     if (search == INVALID_HANDLE_VALUE) return false;
+    find_owner owned_search(search);
     do {
         if ((item.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
             (item.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
             std::wcscmp(item.cFileName, L".") == 0 || std::wcscmp(item.cFileName, L"..") == 0)
             continue;
         if (search_vs_directory(join_path(directory, item.cFileName), result)) {
-            FindClose(search);
             return true;
         }
     } while (FindNextFileW(search, &item));
-    FindClose(search);
     return false;
 }
 
@@ -340,10 +357,11 @@ bool find_vs_dbghelp_cached(std::wstring &result) {
         const std::wstring part = cache + L"." + std::to_wstring(GetCurrentProcessId());
         HANDLE f = CreateFileW(part.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
         if (f != INVALID_HANDLE_VALUE) {
+            handle_owner owned_file(f);
             const std::wstring text = L"#" + (found ? result : std::wstring());
             DWORD wrote = 0;
             const BOOL ok = WriteFile(f, text.data(), (DWORD)(text.size() * sizeof(wchar_t)), &wrote, nullptr);
-            CloseHandle(f);
+            owned_file.reset();
             if (!ok || !MoveFileExW(part.c_str(), cache.c_str(), MOVEFILE_REPLACE_EXISTING)) DeleteFileW(part.c_str());
         }
     }
@@ -436,6 +454,8 @@ bool load_dbghelp() {
             if (path.empty()) return false;
             // Symbol-server support is supplied by symsrv.dll beside the Debugging
             // Tools DbgHelp. This flag makes that directory the dependency search path.
+            // Keep a successfully initialized reference for the process lifetime: controllers
+            // reuse DbgHelp and its caches across sessions, avoiding repeated load/lookup costs.
             g_dbghelp = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
             if (!g_dbghelp) {
                 g_load_error = win32_error("LoadLibraryExW(dbghelp.dll)");
