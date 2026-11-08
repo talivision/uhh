@@ -1774,12 +1774,14 @@ static struct XState { bool ok = false, compact = false, xinuse = false; uint64_
     int r[4];
     __cpuid(r, 1);
     if (!(r[2] & (1 << 27))) return x;                     // OSXSAVE
-    x.mask = _xgetbv(0) & 0xE7ull;
+    __cpuidex(r, 0xD, 0);
+    const uint64_t supported = (uint32_t)r[0] | ((uint64_t)(uint32_t)r[3] << 32);
+    x.full = (uint32_t)r[1];                               // full XCR0 area; this buffer is mask-specific
+    x.mask = _xgetbv(0) & supported & 0xE7ull;              // CPUID and XGETBV can differ under emulation
     x.avx_mask = x.mask & 0xE4ull;                         // AVX upper + AVX-512 (opmask, ZMM) only
 #if !defined(_WIN64)
     x.avx_mask |= x.mask & 1ull;                           // x87 (see above)
 #endif
-    __cpuidex(r, 0xD, 0); x.full = (uint32_t)r[1];
     char knob[8] = {};                                     // regress: a CPU with AMX tiles in XCR0
     if (GetEnvironmentVariableA("UHH_BENCH_XSTATE", knob, sizeof(knob)) && !strcmp(knob, "amx")) x.full += 8192;
     __cpuidex(r, 0xD, 1); x.compact = (r[0] & 2) != 0; x.xinuse = (r[0] & 4) != 0;   // XGETBV(1)
@@ -1787,8 +1789,12 @@ static struct XState { bool ok = false, compact = false, xinuse = false; uint64_
     for (int i = 2; i < 8; ++i) {
         if (!(x.mask & (1ull << i))) continue;
         __cpuidex(r, 0xD, i);                              // EAX size, EBX offset, ECX bit 1: 64-aligned
-        if (x.compact) size = ((r[2] & 2) ? (size + 63) & ~63u : size) + (uint32_t)r[0];
-        else if ((uint32_t)(r[1] + r[0]) > size) size = (uint32_t)(r[1] + r[0]);
+        const uint64_t end = x.compact
+            ? (uint64_t)((r[2] & 2) ? (size + 63) & ~63u : size) + (uint32_t)r[0]
+            : (uint64_t)(uint32_t)r[1] + (uint32_t)r[0];
+        const uint64_t standard_end = (uint64_t)(uint32_t)r[1] + (uint32_t)r[0];
+        if (!r[0] || end > 4096 || standard_end > 4096 || (uint32_t)r[1] < 576) return x;
+        if (end > size) size = (uint32_t)end;
     }
     x.size = size;
     x.ok = x.size <= 4096;
@@ -1837,10 +1843,9 @@ static __forceinline void clear_df() {
 // can change the thread's last-error / last-status, which the target may read right
 // after the probed instruction. Save and restore both (plain TEB fields: ~free) -- to what
 // the original left if call_original ran (see HitScope).
-static bool run_callback(probe_callback cb, probe_context *c) {
-    // The TEB fields themselves (what GetLastError / SetLastError read and write): two calls less per hit.
-    DWORD last_error = *teb_last_error(), last_status = *teb_last_status();
-    clear_df();
+static bool run_callback(probe_callback cb, probe_context *c, DWORD &last_error, DWORD &last_status) {
+    // The entry scope saved these before bookkeeping and restored them at callback entry.
+    // Update that snapshot only for call_original; its destructor restores it on exit.
     bool ok = true;
     DWORD code = 0;
     volatile ULONG *const guarantee = teb_stack_guarantee();
@@ -1861,8 +1866,6 @@ static bool run_callback(probe_callback cb, probe_context *c) {
     if (const auto *h = static_cast<const HitScope *>(c->hit_scope); h && h->orig_ran) {
         last_error = h->orig_error; last_status = h->orig_status;
     }
-    *teb_last_status() = last_status;
-    *teb_last_error() = last_error;
     return ok;
 }
 /* SafetyHook's Context is Context64 on x64 and Context32 on x86; fill the same gospel
@@ -1894,7 +1897,8 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
         void restore() const { *teb_last_status() = status; *teb_last_error() = error; }
         ~TebScope() { restore(); }
     } teb;
-    AgentState state{shared, index, &proxies[index], shared->session_epoch};                     // this hit keeps its own session
+    AgentState state{shared, index, &proxies[index], 0};   // this hit keeps its own session
+    state.epoch = state.shared->session_epoch;
     probe_context c;
     load_regs(c.regs, native);
 #if !defined(_WIN64)
@@ -1903,7 +1907,7 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     c.regs.pc = sites[index]; c.hit_sp = c.regs.rsp;
     c.backend = nullptr; c.ret_pop = 0; c.called_original = 0; c.returned = 0; c.hit_scope = nullptr;
     c.orig_edx = 0; c.orig_pop = 0;
-    const auto &request = shared->requests[index];
+    const auto &request = state.shared->requests[index];
     c.config = !request.config_len ? nullptr
              : request.config_len > PROBE_AGENT_CONFIG_CAP ? (void *)(uintptr_t)request.config_remote : (void *)request.config;
     c.ops = &local_ops; c.tid = current_tid(); c.site = index; c.controller = &state;
@@ -1928,7 +1932,7 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
         // ONE atomic add counts the hit and its unaccounted unit (see probe_agent_stripe): a
         // thread killed between two separate counters left a hit that was neither logged nor
         // interrupted. `running` is separate: it is not accounting.
-        acct.line = &shared->hit_stripes[index][(c.tid >> 2) & (PROBE_AGENT_STRIPES - 1)];
+        acct.line = &state.shared->hit_stripes[index][(c.tid >> 2) & (PROBE_AGENT_STRIPES - 1)];
         InterlockedExchangeAdd64(&acct.line->value, 1 + PROBE_AGENT_INFLIGHT_ONE);
         InterlockedIncrement64(&acct.line->running);
     }
@@ -1984,8 +1988,7 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     else InterlockedIncrement(&g_untracked_running);       // no slot at all: see count_live_callbacks
     c.hit_scope = &scope;
     teb.restore();                                      // bookkeeping must not reach the callback/target
-    bool callback_ok = run_callback(cb, &c);
-    teb.error = *teb_last_error(); teb.status = *teb_last_status();
+    bool callback_ok = run_callback(cb, &c, teb.error, teb.status);
     if (ts) ts->active = nullptr;
     else InterlockedDecrement(&g_untracked_running);
     scope.canary = 0;
@@ -2068,12 +2071,33 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     return false;
 }
 
+// A callback activated state that was INIT at the hit. Use a separate STANDARD image:
+// XSTATE_BV=0 requests architectural initialisation, XCOMP_BV=0 avoids changing the compacted
+// layout of the original live-component save. Keep the large frame off every unchanged hit.
+static __declspec(noinline) void init_new_xstate(uint64_t mask, unsigned int mxcsr) {
+    alignas(64) unsigned char area[4096];
+    __stosb(area + 512, 0, 64);
+    // Standard XRSTOR reads MXCSR when AVX is requested, even with XSTATE_BV[2]=0.
+    *reinterpret_cast<unsigned int *>(area + 24) = mxcsr;
+#if defined(_WIN64)
+    _xrstor64(area, mask);
+#else
+    _xrstor(area, mask);
+#endif
+}
+static __forceinline void restore_new_xstate(uint64_t saved, unsigned int mxcsr) {
+    const uint64_t missing = g_xs.avx_mask & ~saved;
+    if (!missing || !g_xs.xinuse) return;               // no XGETBV(1) on CPUs that do not support it
+    const uint64_t added = _xgetbv(1) & missing;
+    if (added) init_new_xstate(added, mxcsr);
+}
+
 // Entry point of every inline hit. It runs FIRST, before any C code that might call the
 // CRT: the CRT's memset/memcpy pick AVX paths ending in VZEROUPPER (wiping every YMM upper
 // half the target may have live at a mid-function site), and its x86 rep-stos/movs paths
 // run BACKWARDS if the site executes with DF=1. So: clear DF, then save what the stub
-// does not (including enabled AVX/AVX-512 components in INIT), using intrinsics only
-// -- then run the hit. The stub restores RFLAGS
+// does not (only live components), using intrinsics only -- then run the hit and initialise
+// any newly activated components. The stub restores RFLAGS
 // (so the target's DF) on the way out.
 // N: the save area, sized to the CPU's need (g_xs.size): 1 KiB covers x87 + SSE + AVX (832
 // bytes) -- no stack probe per hit (an x86 frame over 4 KiB calls __chkstk); 4 KiB otherwise.
@@ -2089,12 +2113,13 @@ static __declspec(noinline) bool mid_entry_saved(safetyhook::Context &native, ui
 #endif
     unsigned int mxcsr = _mm_getcsr();
     const bool x87 = call_mid(native, index, x87_post);
-    _mm_setcsr(mxcsr);
+    restore_new_xstate(mask, mxcsr);
 #if defined(_WIN64)
     _xrstor64(area, mask);
 #else
     _xrstor(area, mask);
 #endif
+    _mm_setcsr(mxcsr);
     return x87;
 }
 
@@ -2104,15 +2129,18 @@ static __declspec(noinline) bool mid_entry_saved(safetyhook::Context &native, ui
 // x87 stack / status word at a mid-function site (x86 returns floats in ST0, so any float call
 // pushes and pops it). The XMM registers the image also holds are put back by the hook stub
 // afterwards anyway; without OSXSAVE there is no AVX state to keep.
-static __declspec(noinline) bool mid_entry_fx(safetyhook::Context &native, uint32_t index, unsigned char *x87_post) {
+static __declspec(noinline) bool mid_entry_fx(safetyhook::Context &native, uint32_t index, unsigned char *x87_post,
+                                              uint64_t saved = ~0ull) {
     alignas(16) unsigned char fx[512];
 #if defined(_WIN64)
     _fxsave64(fx);
     const bool x87 = call_mid(native, index, x87_post);
+    restore_new_xstate(saved, *reinterpret_cast<const unsigned int *>(fx + 24));
     _fxrstor64(fx);
 #else
     _fxsave(fx);
     const bool x87 = call_mid(native, index, x87_post);
+    restore_new_xstate(saved, *reinterpret_cast<const unsigned int *>(fx + 24));
     _fxrstor(fx);
 #endif
     return x87;
@@ -2122,13 +2150,14 @@ static __declspec(noinline) bool mid_entry_fx(safetyhook::Context &native, uint3
 // x86 bench knob (xstate_mode 5, UHH_BENCH_XSTATE=fnsave): the x87 state by FNSAVE / FRSTOR
 // (108 bytes, x87 only; FNSAVE leaves the FPU initialised, so the program's control word is put
 // back for the callback), MXCSR by hand; AVX state, when live, by XSAVE as usual.
-static __declspec(noinline) bool mid_entry_fnsave(safetyhook::Context &native, uint32_t index, unsigned char *x87_post) {
+static __declspec(noinline) bool mid_entry_fnsave(safetyhook::Context &native, uint32_t index, unsigned char *x87_post, uint64_t saved) {
     unsigned char st[108]; unsigned char *p = st;
     __asm { mov eax, p
             fnsave [eax]
             fldcw word ptr [eax] }                          // the program's CW (first word of the image)
     unsigned int mxcsr = _mm_getcsr();
     const bool x87 = call_mid(native, index, x87_post);
+    restore_new_xstate(saved, mxcsr);
     _mm_setcsr(mxcsr);
     __asm { mov eax, p
             frstor [eax] }
@@ -2172,12 +2201,13 @@ static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
     const bool xs_ok = g_xs.ok && xmode != 3;
     uint64_t mask = 0;
     if (xmode != 1 && xs_ok) {
-        mask = g_xs.mask;                                  // XRSTOR must initialise components absent in XSTATE_BV too
+        if (xmode == 2) mask = g_xs.mask;
+        else mask = g_xs.xinuse ? _xgetbv(1) & g_xs.avx_mask : g_xs.avx_mask;
     }
 #if !defined(_WIN64)
     // Bench knobs, x86: 4 = x87 + MXCSR by FXSAVE, 5 = by FNSAVE (when no AVX state is live).
     if ((xmode == 4 || xmode == 5) && !(mask & ~1ull)) {
-        x87 = xmode == 4 ? mid_entry_fx(native, index, x87_post) : mid_entry_fnsave(native, index, x87_post);
+        x87 = xmode == 4 ? mid_entry_fx(native, index, x87_post, mask) : mid_entry_fnsave(native, index, x87_post, mask);
         if (x87) x87_restore(x87_post);
         return;
     }
@@ -2188,7 +2218,7 @@ static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
     // component would (plus MXCSR and XMM0-7, which the hook stub reloads anyway) -- measured
     // ~20 ns a hit cheaper than XSAVEC / XRSTOR into the save area (154 vs 174 ns).
     if (xmode == 0 && mask == 1) {
-        x87 = mid_entry_fx(native, index, x87_post);
+        x87 = mid_entry_fx(native, index, x87_post, mask);
         if (x87) x87_restore(x87_post);
         return;
     }
@@ -2202,6 +2232,7 @@ static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
     else {
         unsigned int mxcsr = _mm_getcsr();                 // the common case: nothing live but MXCSR
         x87 = call_mid(native, index, x87_post);
+        restore_new_xstate(0, mxcsr);
         _mm_setcsr(mxcsr);
     }
 #if !defined(_WIN64)

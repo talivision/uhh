@@ -8198,17 +8198,19 @@ def check_agent_safety():
             if rep.get("log_dropped") != 0 or rep.get("callbacks_interrupted", 0) != 0:
                 bad.append(f"dropped/intr={rep.get('log_dropped')}/{rep.get('callbacks_interrupted')}")
             hits = sum(p.get("hits") or 0 for p in probes(o))
-            if case == "vector": want_hits = row.get("avx", -1)
+            if case == "vector":
+                want_hits = 0 if not row.get("avx") else 3 if row.get("opmask") else 2
+                if row.get("checks") != want_hits: bad.append(f"vector phases={row.get('checks')} want={want_hits}")
             if hits != want_hits: bad.append(f"hits={hits} want={want_hits}")
             logs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
             expected_logs = {"cache": ["ar cache first=1 called=1 guarded=1 second=0"],
-                             "guarantee": ["ar guarantee"], "vector": ["ar vector"] if row.get("avx") else []}.get(case, [])
+                             "guarantee": ["ar guarantee"], "vector": ["ar vector"] * want_hits if row.get("avx") else []}.get(case, [])
             if logs != expected_logs: bad.append(f"logs={logs} want={expected_logs}")
             if case == "guarantee" and row.get("before") != row.get("after"): bad.append(f"guarantee changed: {row}")
             detail = str(row)
             if case == "vector":
-                detail += "; " + ("YMM checked" if row.get("avx") else "AVX skipped: CPU/OS support absent")
-                detail += "; " + ("opmask checked" if row.get("opmask") else "AVX-512 skipped: CPU/OS support absent")
+                detail += "; " + ("INIT + live YMM checked" if row.get("avx") else "AVX skipped: CPU/OS support absent")
+                detail += "; " + ("mixed INIT/live opmask + YMM checked" if row.get("opmask") else "AVX-512 skipped: CPU/OS support absent")
             record(name, not bad, "; ".join(bad) or detail)
         except Exception as e:
             record(name, False, repr(e))
@@ -8716,7 +8718,8 @@ def lc_detach_cases(cfgname, cfg):
         try:
             tg = LcTarget(*targs)
             dcfg = dict(cfg, **more)
-            d = LcDriver(tg.pid, dcfg, *(dargs + (("--detach-on-stdin",) if wait_s is not None else ())))
+            d = LcDriver(tg.pid, dcfg, *(dargs + (("--detach-on-stdin",) if wait_s is not None else ())),
+                         env={"UHH_BENCH_PHASES": "1"} if case == "early-0" and lc_has_inline(dcfg) else None)
             if wait_s is not None:
                 if not d.wait_attached() or not d.wait_active():
                     raise RuntimeError(f"not active: {d.errors()}")
@@ -8729,9 +8732,10 @@ def lc_detach_cases(cfgname, cfg):
             c = tg.check()
             tg.reset(); time.sleep(0.3); c2 = tg.check()
             a = tg.quit()
-            ok = fin_ok and d.p.returncode == 0 and ok_logs and lc_clean(c) and c2.get("flips") == 0 and lc_clean(a) and a.get("rc") == 0
+            channel_ok = not (case == "early-0" and c.get("agent_loaded") == 0 and c.get("agent_channel") != 0)
+            ok = channel_ok and fin_ok and d.p.returncode == 0 and ok_logs and lc_clean(c) and c2.get("flips") == 0 and lc_clean(a) and a.get("rc") == 0
             record(name, ok, f"detach_took={took:.1f}s logs={d.logs} final={fin} {lc_brief(c)} flips_after={c2.get('flips')} "
-                             f"exit={a.get('rc')}" + ("" if ok else f" driver_rc={d.p.returncode} err={d.errors()} unhandled={tg.unhandled()} "
+                             f"exit={a.get('rc')}" + ("" if ok else f" driver_rc={d.p.returncode} agent_channel={c.get('agent_channel')} err={d.errors()} unhandled={tg.unhandled()} "
                                          f"stderr_tail={[l[:200] for l in d.err.lines if not l.startswith('probe: active') and 'detach-drain' not in l][-8:]}"))
         except Exception as e:
             record(name, False, repr(e))
@@ -9355,7 +9359,7 @@ def check_cet_sde(n=20, threads=2, reads=50):
             p.stdin.write("x"); p.stdin.flush()
             p.wait(timeout=timeout); a.wait(timeout=60)
             o = out.objs(); err.t.join(timeout=30)
-            return p.returncode, o, violations(err.lines), a.returncode, aout.objs(), aerr.lines
+            return p.returncode, o, violations(err.lines), a.returncode, aout.objs(), aerr.lines + [l for l in err.lines if l.startswith("co_retaddr_fault")]
         finally:
             for x in procs:                    # only the processes this check started
                 if x.poll() is None:
@@ -9515,7 +9519,8 @@ def check_cet_sde(n=20, threads=2, reads=50):
                   got_logs == want_logs and not extra and rep.get("log_dropped") == 0 and rep.get("error") is None and
                   rc == 0 and arc == 0 and sorted(v) == sorted(bv))
             record(name, ok, f"row={row} want={want_row} hits={hb} logs={got_logs} extra={extra[:3]} violations={len(v)} "
-                             f"(uninstrumented {len(bv)}, same={sorted(v) == sorted(bv)}) err={rep.get('error')} rc={rc}/{arc}")
+                             f"(uninstrumented {len(bv)}, same={sorted(v) == sorted(bv)}) err={rep.get('error')} rc={rc}/{arc}"
+                             + ("" if ok else f" fault={[l for l in ael if l.startswith('co_retaddr_fault')] }"))
         except Exception as e:
             record(name, False, repr(e))
 

@@ -294,7 +294,8 @@ struct probe_session {
     uint64_t overrides = 0;
     std::string error;
     HANDLE mapping = nullptr, remote_thread = nullptr;
-    HANDLE agent_mapping = nullptr;             // target handle, retained with the agent view
+    HANDLE agent_mapping = nullptr;             // TARGET handle: never CloseHandle in this process
+    bool agent_mapping_duplicated = false;      // this session created it (not borrowed from the agent)
     probe_agent_shared *shared = nullptr;
     HMODULE local_agent = nullptr;
     // The controller's agent DLL is prepared (the per-session copy made, then loaded) on its own
@@ -5195,9 +5196,12 @@ static bool open_agent_section(probe_session *s, uint32_t count) {
             s->mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(probe_agent_shared))) : nullptr;
         if (!s->shared) { set_error(s, win_error("map replacement inline shared section")); return false; }
     }
-    if (!s->agent_mapping && !DuplicateHandle(GetCurrentProcess(), s->mapping, s->pi.hProcess,
-                                            &s->agent_mapping, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
-        set_error(s, win_error("duplicate inline shared section")); return false;
+    if (!s->agent_mapping) {
+        if (!DuplicateHandle(GetCurrentProcess(), s->mapping, s->pi.hProcess,
+                             &s->agent_mapping, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+            set_error(s, win_error("duplicate inline shared section")); return false;
+        }
+        s->agent_mapping_duplicated = true;
     }
     // Invalidate old per-hit snapshots before resetting counters; never clear the epoch itself.
     InterlockedIncrement(&s->shared->session_epoch);
@@ -5235,6 +5239,17 @@ static bool open_agent_section(probe_session *s, uint32_t count) {
     const bool la = ensure_local_agent(s);
     bench_phase("local_agent");
     return la;
+}
+
+// Before dropping the debug port: a 0 ms detach may never have started agent init.
+// Its unused duplicate must not keep a multi-MB section alive in a target with no agent.
+// Borrowed handles, and any handle an init could already be using, remain the agent's.
+static void release_unclaimed_agent_mapping(probe_session *s) {
+    if (!s->agent_mapping_duplicated || s->agent_init_started || !s->agent_mapping) return;
+    if (s->shared) s->shared->agent_mapping = 0;
+    DuplicateHandle(s->pi.hProcess, s->agent_mapping, nullptr, nullptr, 0, FALSE, DUPLICATE_CLOSE_SOURCE);
+    s->agent_mapping = nullptr;
+    s->agent_mapping_duplicated = false;
 }
 
 // A config larger than the request's inline buffer goes to a block allocated in the target
@@ -5643,6 +5658,7 @@ extern "C" int probe_attach(probe_session *s, uint32_t pid) {
     // A failure below lets go of the target at once and leaves the session NOT attached: a
     // probe_close (from any thread) then has nothing to detach and no probe_run to wait for.
     auto fail = [&] {
+        release_unclaimed_agent_mapping(s);
         DebugActiveProcessStop(pid);
         s->attached = s->launched = false; s->debug_tid = 0;
         return 0;
@@ -6237,6 +6253,7 @@ static void detach(probe_session *s) {
         if (HANDLE h = (HANDLE)(uintptr_t)InterlockedExchange64(&g.controller_process, 0))
             DuplicateHandle(s->pi.hProcess, h, nullptr, nullptr, 0, FALSE, DUPLICATE_CLOSE_SOURCE);
     }
+    release_unclaimed_agent_mapping(s);            // still exclusive: no reattach can borrow this handle yet
     if (!s->exited) DebugActiveProcessStop(s->pi.dwProcessId);
     for (HANDLE t : frozen) { ResumeThread(t); CloseHandle(t); }
     s->detach_frozen.clear();
@@ -10360,13 +10377,16 @@ extern "C" void probe_close(probe_session *s) {
     if (s->remote_path && s->pi.hProcess) VirtualFreeEx(s->pi.hProcess, s->remote_path, 0, MEM_RELEASE);
     if (s->shared) UnmapViewOfFile(s->shared);
     if (s->mapping) CloseHandle(s->mapping);
+    bench_phase("close_channel");
     if (s->local_agent) FreeLibrary(s->local_agent);
+    bench_phase("close_local_agent");
     if (!s->agent_copy.empty()) {             // fails if the (detached) target still has it loaded
         DeleteFileW(s->agent_copy.c_str());
         RemoveDirectoryW(s->agent_copy.substr(0, s->agent_copy.find_last_of(L'\\')).c_str());
     }
     if (s->pi.hThread) CloseHandle(s->pi.hThread);
     if (s->pi.hProcess) CloseHandle(s->pi.hProcess);
+    bench_phase("close_handles");
     delete s;
     bench_phase("close_end");
     if (std::getenv("UHH_BENCH_PHASES"))

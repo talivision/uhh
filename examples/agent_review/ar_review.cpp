@@ -2,6 +2,7 @@
 #include "probe_agent_shared.hpp"
 #include "ar_review.hpp"
 #include <immintrin.h>
+#include <aclapi.h>
 #include <cstring>
 #include <initializer_list>
 #include <vector>
@@ -100,12 +101,35 @@ int ar_review_case(const char *k) {
         while (pressure_ready != (LONG)PROBE_AGENT_TBLOCKS && GetTickCount64() < deadline) Sleep(1);
         const int filled = sh && pressure_ready == (LONG)PROBE_AGENT_TBLOCKS && sh->tblocks[0].owner == (LONG)tid;
         int blocked = 0, gone = 0;
+        HANDLE restricted = nullptr;
+        bool impersonating = false;
         if (denied) {
-            SECURITY_DESCRIPTOR sd{}; ACL acl{};
-            InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
-            InitializeAcl(&acl, sizeof(acl), ACL_REVISION); // empty DACL: no rights for OpenThread
-            SetSecurityDescriptorDacl(&sd, TRUE, &acl, FALSE);
-            if (SetKernelObjectSecurity(t, DACL_SECURITY_INFORMATION, &sd)) {
+            // An empty DACL alone is insufficient when the effective token has SeDebugPrivilege.
+            // Deny the precise rights explicitly, then run BOTH the preflight OpenThread and
+            // the agent sweep under a duplicate impersonation token with all privileges disabled.
+            BYTE everyone[SECURITY_MAX_SID_SIZE] = {};
+            DWORD sid_size = sizeof(everyone);
+            EXPLICIT_ACCESSA ea{};
+            ea.grfAccessPermissions = SYNCHRONIZE | THREAD_QUERY_LIMITED_INFORMATION;
+            ea.grfAccessMode = DENY_ACCESS;
+            ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+            ea.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+            ea.Trustee.ptstrName = (LPSTR)everyone;
+            PACL acl = nullptr;
+            HANDLE process_token = nullptr;
+            const bool secured = CreateWellKnownSid(WinWorldSid, nullptr, everyone, &sid_size) &&
+                SetEntriesInAclA(1, &ea, nullptr, &acl) == ERROR_SUCCESS &&
+                SetSecurityInfo(t, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                                nullptr, nullptr, acl, nullptr) == ERROR_SUCCESS;
+            if (acl) LocalFree(acl);
+            if (secured && OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &process_token)) {
+                if (DuplicateTokenEx(process_token, TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES | TOKEN_IMPERSONATE,
+                                     nullptr, SecurityImpersonation, TokenImpersonation, &restricted) &&
+                    AdjustTokenPrivileges(restricted, TRUE, nullptr, 0, nullptr, nullptr))
+                    impersonating = SetThreadToken(nullptr, restricted) != FALSE;
+                CloseHandle(process_token);
+            }
+            if (impersonating) {
                 HANDLE h = OpenThread(SYNCHRONIZE | THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
                 blocked = !h && GetLastError() == ERROR_ACCESS_DENIED;
                 if (h) CloseHandle(h);
@@ -126,6 +150,8 @@ int ar_review_case(const char *k) {
         ar_pressure_site();
         const DWORD error = GetLastError();
         const int kept = sh && sh->tblocks[0].owner == (LONG)tid;
+        if (impersonating) RevertToSelf();
+        if (restricted) CloseHandle(restricted);
         SetEvent(event); SetEvent(victim_event);
         if (t) { WaitForSingleObject(t, 10000); CloseHandle(t); }
         for (HANDLE h : fillers) { WaitForSingleObject(h, 10000); CloseHandle(h); }
@@ -137,28 +163,50 @@ int ar_review_case(const char *k) {
     if (!strcmp(k, "review-vector")) {
         int cp[4]; __cpuid(cp, 1);
         const uint64_t enabled = (cp[2] & (1 << 27)) ? _xgetbv(0) : 0;
-        const uint64_t mask = (enabled & 6) == 6 ? (4ull | ((enabled & 0xE0) == 0xE0 ? 0x20ull : 0)) : 0;
-        int clean = 1;
-        if (mask) {
-            alignas(64) unsigned char area[4096] = {};
+        const uint64_t mask = (enabled & 6) == 6 ? (4ull | ((enabled & 0xE0) == 0xE0 ? 0xE0ull : 0)) : 0;
+        int clean = 1, bad_phase = -1;
+        const int checks = !mask ? 0 : (mask & 0x20) ? 3 : 2;
+        for (int phase = 0; phase < checks; ++phase) {
+            alignas(64) unsigned char area[4096] = {}, before[4096] = {};
             *(unsigned int *)(area + 24) = _mm_getcsr();
+            // 0: all INIT (no-save/x86 FX path). 1: live YMM (ordinary save path).
+            // 2: live opmasks, INIT YMM: adding component 2 before saved component 5
+            // must NOT change the offsets of the XSAVEC image being restored.
+            const uint64_t live = phase == 1 ? 4ull : phase == 2 ? 0x20ull : 0;
+            *(uint64_t *)(area + 512) = live;
+            for (int i : {2, 5}) {
+                if (!(live & (1ull << i))) continue;
+                __cpuidex(cp, 0xD, i);
+                for (int j = 0; j < cp[0]; ++j) area[cp[1] + j] = (unsigned char)(0x50 + phase);
+            }
 #if defined(_WIN64)
-            _xrstor64(area, mask);                         // upper YMM and opmasks start in INIT
+            _xrstor64(area, mask);
+            _xsave64(before, mask);                       // canonical baseline, including INIT bits
             ar_vector_site();
             _xsave64(area, mask);
 #else
             _xrstor(area, mask);
+            _xsave(before, mask);
             ar_vector_site();
             _xsave(area, mask);
 #endif
-            const uint64_t bv = *(uint64_t *)(area + 512);
-            for (int i : {2, 5}) {
-                if (!(mask & (1ull << i)) || !(bv & (1ull << i))) continue;
+            const uint64_t bv = *(uint64_t *)(area + 512), prior = *(uint64_t *)(before + 512);
+            for (int i : {2, 5, 6, 7}) {
+                if (!(mask & (1ull << i))) continue;
                 __cpuidex(cp, 0xD, i);
-                for (int j = 0; j < cp[0]; ++j) if (area[cp[1] + j]) clean = 0;
+                int bytes = cp[0];
+#if !defined(_WIN64)
+                if (i == 2 && bytes > 128) bytes = 128;    // x86 has YMM0..7 only
+#endif
+                for (int j = 0; j < bytes; ++j) {
+                    const int got = (bv & (1ull << i)) ? area[cp[1] + j] : 0;
+                    const int want = (prior & (1ull << i)) ? before[cp[1] + j] : 0;
+                    if (got != want) { clean = 0; bad_phase = phase; }
+                }
             }
         }
-        printf("{\"kind\":\"ar\",\"avx\":%d,\"opmask\":%d,\"clean\":%d}\n", mask ? 1 : 0, (mask & 0x20) ? 1 : 0, clean);
+        printf("{\"kind\":\"ar\",\"avx\":%d,\"opmask\":%d,\"checks\":%d,\"clean\":%d,\"bad_phase\":%d}\n",
+               mask ? 1 : 0, (mask & 0x20) ? 1 : 0, checks, clean, bad_phase);
         return clean ? 0 : 3;
     }
     if (!strcmp(k, "review-guard")) {
