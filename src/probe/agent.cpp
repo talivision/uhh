@@ -822,12 +822,12 @@ extern "C" const void *get_config(probe_context *c) {
 }
 
 // call_func inside the target: resolve and call directly on this (the hit) thread.
-// The controller's grammar exactly (session.cpp parse_location / resolve_symbol), so a
+// The controller's grammar exactly (session_symbols.cpp parse_location / resolve_symbol), so a
 // call_func symbol resolves -- or is refused -- the same on every backend: "0xADDRESS",
 // "module+0xRVA", "module!Export[+0xOFF]"; offsets need "0x" and hex digits only; the module
 // is matched by its file name (a directory part is ignored), and a name without extension
 // means "<name>.dll" -- GetModuleHandleA's own reading, which the controller's
-// module_of_location (session.cpp, also used for every probe location) mirrors exactly.
+// module_of_location (session_symbols.cpp, also used for every probe location) mirrors exactly.
 // (GetModuleHandleA alone searched a full path as given; _strtoui64 accepted "+0", "+0xZZ"
 // and "+10"; the controller refuses all of those.)
 static bool agent_parse_hex(const char *p, const char *end, uint64_t *out) {
@@ -2663,7 +2663,7 @@ static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
         unsigned char original = 0;
         if (!int3_original(at, original)) {
             // The other INT3 of ours a thread can execute: the end of a displaced REP string
-            // copy in one of our scratch blocks (session.cpp: the copy, an INT3 instead of a
+            // copy in one of our scratch blocks (session_bp.cpp: the copy, an INT3 instead of a
             // trap flag, then a jump back to the code after the site). Skip to the jump back.
             LONG n = g.block_count; if (n > (LONG)PROBE_AGENT_GUARD_BLOCKS) n = PROBE_AGENT_GUARD_BLOCKS;
             bool in_block = false;
@@ -2971,7 +2971,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *) {
         service_event = OpenEventW(SYNCHRONIZE, FALSE, name);
         if (service_event) {
             service_up = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-            // Above normal priority, like the controller's threads in the target (see session.cpp
+            // Above normal priority, like the controller's threads in the target (see session_agent.cpp
             // create_remote_thread_boosted): a busy program must not delay installs and arming.
             HANDLE t = CreateThread(nullptr, 0, service_main, nullptr, CREATE_SUSPENDED, nullptr);
             if (t) { SetThreadPriority(t, THREAD_PRIORITY_HIGHEST); ResumeThread(t); }

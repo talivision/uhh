@@ -387,7 +387,7 @@ static DWORD WINAPI end_thread(void *p) {
     const ULONG_PTR dealloc = *(const ULONG_PTR *)(teb + TEB_DEALLOCATION_STACK);
     ULONG_PTR guarantee = (*(const ULONG *)(teb + TEB_GUARANTEED_STACK) + 4095) & ~(ULONG_PTR)4095;
     if (guarantee < 4096) guarantee = 4096;
-    /* UHH's bound (session.cpp stack_can_grow): a call frame below dealloc + guarantee + 4 pages
+    /* UHH's bound (session_call.cpp stack_can_grow): a call frame below dealloc + guarantee + 4 pages
        is refused. The hit sits just above it, so the frame 512+ bytes below crosses it. */
     read_at(dealloc + guarantee + 4 * 4096 + 0x200);
     if (!guard_intact()) InterlockedIncrement(&g_guard_lost);

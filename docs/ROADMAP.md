@@ -1325,7 +1325,7 @@ by itself, nothing dropped), detach while callbacks run / block in call_original
   (OutputDebugString-free: a shared counter) which VEH branch rejects the trap, and check whether
   the dying debugger leaves TF set on a thread in the middle of the in-place call_original.
 - Test infra notes: `UHH_LC=substr[,substr]` narrows lifecycle checks; lifecycle_driver links the
-  STATIC probe_api, so rebuild lifecycle_driver (not only probe_api) after session.cpp changes;
+  STATIC probe_api, so rebuild lifecycle_driver (not only probe_api) after src/probe/session*.cpp changes;
   the target is paced (`--pace-ms 1`) except inline controller-killed (needs the ring to fill).
 - Residual / by design: a breakpoint/hw call_func running in the target when the controller dies
   (the thread's context was redirected to the callee and is never restored); suspensions taken
@@ -3037,6 +3037,10 @@ keeping the full output, a ring of hardware-breakpoint events and a full minidum
 ## Later
 - ✅ x86 cumulative-session flakiness (possibly the same handle double-close; recheck) -- CLOSED with evidence (cfnest). The note dates from the first checkpoint (c617de4); its suspected cause, review finding I6 (handles closed twice on the launch failure path), was fixed long since. Rechecked with `ar_driver --repeat`: 60 sessions in ONE controller process, backends in turn (breakpoint, hw, inline), each a call_func + runtime data watch whose callback call_funcs during another thread's call: every session exact, nothing dropped, the controller's handle count flat (x64 73 -> 73, x86 89 -> 89). Regress `sessions-repeat` keeps it covered (also exercises the per-run callback-fiber host). (Separately: `callfunc-kill-reuse` -- inline, needs the OS to hand a killed thread's id to a new thread of the same process within 3000 creations -- failed on the shared VM in Nov-06 evening runs on the cfnest build AND on an unmodified baseline build (2/2): system-wide thread-id reuse under other agents' load, not a UHH regression.)
 - ✅ PDB-only symbols (`module!InternalFunc`), Microsoft symbol server via dbghelp+symsrv and `_NT_SYMBOL_PATH`, export/function enumeration (`uhh_trace --list`) — engine by Codex, wired into the library; suite checks added
-- ⬜ Split `src/probe/session.cpp` (debug loop, backends, symbols, attach/call)
+- ✅ Split `src/probe/session.cpp` (debug loop, backends, symbols, attach/call) -- done (branch split, pure move):
+  `session_internal.hpp` (shared structures + declarations), `session.cpp` (API), `session_loop.cpp`,
+  `session_log.cpp`, `session_agent.cpp`, `session_bp.cpp`, `session_hw.cpp`, `session_site.cpp`,
+  `session_call.cpp`, `session_lifecycle.cpp`, `session_symbols.cpp` (see CMakeLists `PROBE_API_SOURCES`).
+  ROADMAP history keeps its old `session.cpp` references.
 - 🔧 [fan-out] Faster builds (user, 2026-11-05): parallel MSBuild (/MP, MultiToolTask, Directory.Build.rsp -maxCpuCount; `-DUHH_PARALLEL_MSBUILD=OFF` to disable) and `scripts\build.ps1` (Ninja Multi-Config). VM (4 cores), same tree: clean x64 221 s -> 83 s (VS) / 73 s (Ninja), x86 220 s -> 85 s / 66 s; touch session.cpp x64 49 s -> 24 s / 23 s. Still open: PCH / unity for session.cpp, not relinking every example when the library changes
 - ⬜ Final independent whole-codebase sanity review; README/API docs pass
