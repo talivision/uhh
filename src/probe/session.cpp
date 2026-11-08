@@ -4125,8 +4125,10 @@ static bool inline_site_unsafe(probe_session *s, const Probe &p, std::string &wh
 // location names. Never a linear sweep (data in code would mis-decode real instructions). No
 // verdict -- today's behaviour -- when the site is itself an export or trusted start, when no
 // decoded instruction covers it (code reached only through an unknown indirect jump, or no
-// extent and no symbol), or when decoded instructions overlap anywhere in the region
-// (overlapping code: obfuscation, hand-written tricks).
+// extent and no symbol), when decoded instructions overlap anywhere in the region
+// (overlapping code: obfuscation, hand-written tricks), or when the covering instruction was
+// reached only through a call's fall-through (the call may not return: data after it) while
+// the region has an indirect jump that is not a resolved switch (it may reach the site).
 static bool exec_section_bounds(probe_session *s, uint64_t base, uint64_t addr, uint64_t &lo, uint64_t &hi) {
     IMAGE_DOS_HEADER dos{}; IMAGE_NT_HEADERS nt{}; size_t got = 0;
     if (!remote_read(s->pi.hProcess, base, &dos, sizeof(dos), &got) || got != sizeof(dos) ||
@@ -4195,67 +4197,84 @@ static bool site_inside_instruction(probe_session *s, const Probe &p, uint64_t s
     uint32_t image_size = 0; IMAGE_DATA_DIRECTORY unused{};
     read_image_dir(s, base, IMAGE_DIRECTORY_ENTRY_EXPORT, unused, &image_size);
     ZydisDecoder dec; zydis_init(dec);
-    std::map<uint64_t, ZydisDecodedInstruction> insns;
-    std::vector<uint64_t> work;
-    for (auto it = starts.lower_bound(lo); it != starts.end() && *it < hi; ++it) work.push_back(*it);
-    auto push = [&](uint64_t t) { if (t >= lo && t < hi && !insns.count(t)) work.push_back(t); };
-    // Switch tables (entries pushed while they land in the region): x86 `jmp [idx*4 + table]`
-    // (absolute entries); x64 MSVC `mov r32, [rB + idx*4 + rva]` then `add r, rB` / `jmp r`
-    // within the next few instructions (image-relative entries, rB = image base).
-    auto table = [&](uint64_t at) {
-        for (int e = 0; e < 4096; ++e) {
-            uint32_t v = 0; size_t n = 0;
-            if (!remote_read(s->pi.hProcess, at + 4ull * e, &v, 4, &n) || n != 4) break;
+    // Decoded twice: `insns` follows every edge, a call's fall-through included; `direct`
+    // never passes a call's fall-through. A call may not return (ExitProcess, a throw helper,
+    // a no-return routine of the program), and the bytes after it can be data that decodes
+    // over a real block reached only through an indirect jump UHH cannot resolve -- a false
+    // refusal (never overridable). So an instruction known only through a fall-through
+    // refuses only when every indirect jump decoded in the region was resolved (a switch
+    // table): then a real block there would have been decoded too, and shown as an overlap.
+    std::map<uint64_t, ZydisDecodedInstruction> insns, direct;
+    std::set<uint64_t> indirect_jumps, resolved_jumps;
+    auto decode = [&](bool through_calls, std::map<uint64_t, ZydisDecodedInstruction> &out) {
+        std::vector<uint64_t> work;
+        for (auto it = starts.lower_bound(lo); it != starts.end() && *it < hi; ++it) work.push_back(*it);
+        auto push = [&](uint64_t t) { if (t >= lo && t < hi && !out.count(t)) work.push_back(t); };
+        // Switch tables (entries pushed while they land in the region): x86 `jmp [idx*4 + table]`
+        // (absolute entries); x64 MSVC `mov r32, [rB + idx*4 + rva]` then `add r, rB` / `jmp r`
+        // within the next few instructions (image-relative entries, rB = image base).
+        // Returns the number of entries found.
+        auto table = [&](uint64_t at) {
+            int e = 0;
+            for (; e < 4096; ++e) {
+                uint32_t v = 0; size_t n = 0;
+                if (!remote_read(s->pi.hProcess, at + 4ull * e, &v, 4, &n) || n != 4) break;
 #if defined(_WIN64)
-            const uint64_t t = base + v;
+                const uint64_t t = base + v;
 #else
-            const uint64_t t = v;
+                const uint64_t t = v;
 #endif
-            if (t < lo || t >= hi) break;
-            push(t);
-        }
-    };
-    while (!work.empty()) {
-        const uint64_t at = work.back(); work.pop_back();
-        if (insns.count(at)) continue;
-        ZydisDecodedInstruction in; ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
-        if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, code.data() + (size_t)(at - lo), code.size() - (size_t)(at - lo), &in, ops)))
-            continue;                               // (a path into undecodable bytes just ends)
-        insns.emplace(at, in);
-        const uint64_t next = at + in.length;
-        for (int k = 0; k < in.operand_count_visible; ++k) {
-            const auto &o = ops[k];
-            if (o.type == ZYDIS_OPERAND_TYPE_IMMEDIATE && o.imm.is_relative && in.meta.branch_type != ZYDIS_BRANCH_TYPE_NONE) {
-                uint64_t t = next + (uint64_t)o.imm.value.s;
-#if !defined(_WIN64)
-                t = (uint32_t)t;
-#endif
+                if (t < lo || t >= hi) break;
                 push(t);
             }
-            if (o.type != ZYDIS_OPERAND_TYPE_MEMORY || o.mem.index == ZYDIS_REGISTER_NONE || o.mem.scale != 4 ||
-                !o.mem.disp.has_displacement || o.mem.disp.value <= 0) continue;
-#if defined(_WIN64)
-            if (in.mnemonic != ZYDIS_MNEMONIC_MOV && in.mnemonic != ZYDIS_MNEMONIC_MOVSXD) continue;
-            if ((uint64_t)o.mem.disp.value >= image_size || o.mem.base == ZYDIS_REGISTER_NONE) continue;
-            bool jumps = false;
-            for (uint64_t f = next, i = 0; i < 4 && f < hi; ++i) {
-                ZydisDecodedInstruction fi; ZydisDecodedOperand fo[ZYDIS_MAX_OPERAND_COUNT];
-                if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, code.data() + (size_t)(f - lo), code.size() - (size_t)(f - lo), &fi, fo))) break;
-                if (fi.mnemonic == ZYDIS_MNEMONIC_JMP) { jumps = fo[0].type == ZYDIS_OPERAND_TYPE_REGISTER; break; }
-                if (fi.meta.branch_type != ZYDIS_BRANCH_TYPE_NONE) break;
-                f += fi.length;
-            }
-            if (jumps) table(base + (uint64_t)o.mem.disp.value);
-#else
-            const uint64_t t = (uint32_t)o.mem.disp.value;
-            if (in.mnemonic == ZYDIS_MNEMONIC_JMP && t >= base && t - base < image_size) table(t);
+            return e;
+        };
+        while (!work.empty()) {
+            const uint64_t at = work.back(); work.pop_back();
+            if (out.count(at)) continue;
+            ZydisDecodedInstruction in; ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+            if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, code.data() + (size_t)(at - lo), code.size() - (size_t)(at - lo), &in, ops)))
+                continue;                               // (a path into undecodable bytes just ends)
+            out.emplace(at, in);
+            const uint64_t next = at + in.length;
+            if (in.mnemonic == ZYDIS_MNEMONIC_JMP && in.operand_count_visible >= 1 && ops[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE)
+                indirect_jumps.insert(at);
+            for (int k = 0; k < in.operand_count_visible; ++k) {
+                const auto &o = ops[k];
+                if (o.type == ZYDIS_OPERAND_TYPE_IMMEDIATE && o.imm.is_relative && in.meta.branch_type != ZYDIS_BRANCH_TYPE_NONE) {
+                    uint64_t t = next + (uint64_t)o.imm.value.s;
+#if !defined(_WIN64)
+                    t = (uint32_t)t;
 #endif
+                    push(t);
+                }
+                if (o.type != ZYDIS_OPERAND_TYPE_MEMORY || o.mem.index == ZYDIS_REGISTER_NONE || o.mem.scale != 4 ||
+                    !o.mem.disp.has_displacement || o.mem.disp.value <= 0) continue;
+#if defined(_WIN64)
+                if (in.mnemonic != ZYDIS_MNEMONIC_MOV && in.mnemonic != ZYDIS_MNEMONIC_MOVSXD) continue;
+                if ((uint64_t)o.mem.disp.value >= image_size || o.mem.base == ZYDIS_REGISTER_NONE) continue;
+                uint64_t jmp_at = 0;
+                for (uint64_t f = next, i = 0; i < 4 && f < hi; ++i) {
+                    ZydisDecodedInstruction fi; ZydisDecodedOperand fo[ZYDIS_MAX_OPERAND_COUNT];
+                    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, code.data() + (size_t)(f - lo), code.size() - (size_t)(f - lo), &fi, fo))) break;
+                    if (fi.mnemonic == ZYDIS_MNEMONIC_JMP) { if (fo[0].type == ZYDIS_OPERAND_TYPE_REGISTER) jmp_at = f; break; }
+                    if (fi.meta.branch_type != ZYDIS_BRANCH_TYPE_NONE) break;
+                    f += fi.length;
+                }
+                if (jmp_at && table(base + (uint64_t)o.mem.disp.value)) resolved_jumps.insert(jmp_at);
+#else
+                const uint64_t t = (uint32_t)o.mem.disp.value;
+                if (in.mnemonic == ZYDIS_MNEMONIC_JMP && t >= base && t - base < image_size && table(t)) resolved_jumps.insert(at);
+#endif
+            }
+            const bool ends = in.meta.category == ZYDIS_CATEGORY_RET || in.meta.category == ZYDIS_CATEGORY_UNCOND_BR ||
+                              in.mnemonic == ZYDIS_MNEMONIC_INT3 || in.mnemonic == ZYDIS_MNEMONIC_UD2 ||
+                              in.mnemonic == ZYDIS_MNEMONIC_HLT ||
+                              (!through_calls && in.meta.category == ZYDIS_CATEGORY_CALL);
+            if (!ends) push(next);
         }
-        const bool ends = in.meta.category == ZYDIS_CATEGORY_RET || in.meta.category == ZYDIS_CATEGORY_UNCOND_BR ||
-                          in.mnemonic == ZYDIS_MNEMONIC_INT3 || in.mnemonic == ZYDIS_MNEMONIC_UD2 ||
-                          in.mnemonic == ZYDIS_MNEMONIC_HLT;
-        if (!ends) push(next);
-    }
+    };
+    decode(true, insns);
     // Overlapping decoded code anywhere in the region: the stream is not one stream.
     uint64_t prev_end = 0;
     for (const auto &kv : insns) {
@@ -4267,6 +4286,13 @@ static bool site_inside_instruction(probe_session *s, const Probe &p, uint64_t s
     --cover;
     const uint64_t at = cover->first, end = at + cover->second.length;
     if (at == site || site >= end) return false;    // a boundary, or bytes nothing decoded covers: no verdict
+    // Covered only by code decoded through a call's fall-through (see above): no verdict
+    // unless every indirect jump in the region is a resolved switch.
+    decode(false, direct);
+    if (!direct.count(at)) {
+        for (uint64_t j : indirect_jumps)
+            if (!resolved_jumps.count(j)) return false;
+    }
     std::string modname;
     for (auto &kv : s->module_bases) if (kv.second == base) { modname = kv.first; break; }
     auto name = [&](uint64_t a) {
@@ -4290,7 +4316,11 @@ static bool site_inside_instruction(probe_session *s, const Probe &p, uint64_t s
 }
 
 // Refuse a probe whose site is inside an instruction (any backend; no flag overrides it).
+// A data watchpoint (PROBE_WATCH_*) watches bytes, not an instruction: any aligned dword is a
+// valid site, an operand byte in code included (self-modifying code, a variable in a code
+// section) -- never judged, on every path (absolute, module+RVA, symbol+offset).
 static bool refuse_mid_instruction(probe_session *s, Probe &p, uint64_t site) {
+    if (p.flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) return false;
     if (!p.export_name.empty() && !p.sym_offset) return false;     // the named symbol itself
     const uint64_t anchor = !p.export_name.empty() && site >= p.sym_offset ? site - p.sym_offset : 0;
     std::string why;
@@ -5087,8 +5117,7 @@ static int add_absolute(probe_session *s, uint64_t address, probe_callback cb, u
         if ((flags & PROBE_INLINE) && !inline_callback_names(s, cb, p->callback_export)) return scope.done(0);
         Probe *raw = p.get();
         s->probes.push_back(std::move(p));
-        if (!(flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) && refuse_mid_instruction(s, *raw, address))
-            return scope.done(0);
+        if (refuse_mid_instruction(s, *raw, address)) return scope.done(0);   // (never a data watch)
         bool ok = (flags & PROBE_INLINE) ? register_runtime_inline(s, *raw) && resolve_inline(s, *raw, 0) && kick_agent(s)
                 : (flags & PROBE_HW)     ? arm_hw(s, *raw, 0) : arm_breakpoint(s, *raw, 0);
         if (!ok) raw->retired = true;

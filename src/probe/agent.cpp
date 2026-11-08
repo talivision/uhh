@@ -909,18 +909,6 @@ static bool call_raw(uint64_t fn, const uint64_t *a, uint64_t *ret, int nargs) {
 }
 #endif
 
-// call_func of an address that is no committed executable memory (e.g. "0x1") returns 0
-// without calling it: the call would fault, and inline that first-chance fault is seen by the
-// target's vectored handlers -- breakpoint/hw (the debugger sees it first) return 0 silently.
-static bool executable(uint64_t a) {
-    if (!addressable(a, 1)) return false;
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (!VirtualQuery((const void *)(uintptr_t)a, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
-        (mbi.Protect & PAGE_GUARD)) return false;
-    const DWORD p = mbi.Protect & 0xFF;
-    return p == PAGE_EXECUTE || p == PAGE_EXECUTE_READ || p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
-}
-
 // call_func resolution cache (inline): symbol string -> callee, for names that resolve through
 // a module ("module!Export[+0xOFF]", "module+0xRVA"). Resolving every call (GetModuleHandleA +
 // GetProcAddress + a VirtualQuery for the executable check) was ~2.7 us for a ~1 ns callee.
@@ -931,11 +919,10 @@ static bool executable(uint64_t a) {
 // generation is sampled BEFORE resolving: an unload racing the resolution leaves the entry
 // stale at once. Without the notification (registration failed) nothing is cached.
 // Only the RESOLUTION (name -> address) is cached; executability is re-checked on every call
-// (executable(), a VirtualQuery that reads protection and never touches the page), because the
-// program can VirtualProtect still-loaded module code to NO_ACCESS/NX/GUARD between calls:
-// calling it would raise a first-chance exception the target's vectored handlers would see
-// (breakpoint/hw refuse such a call silently). The VirtualQuery stays far below the resolve it
-// replaces (GetModuleHandleA + GetProcAddress + parse).
+// (a VirtualQuery that reads protection and never touches the page), because the program can
+// VirtualProtect still-loaded module code to NO_ACCESS/NX/GUARD between calls: calling it
+// would raise a first-chance exception the target's vectored handlers would see (breakpoint/hw
+// refuse such a call silently).
 // Entries are per-slot seqlocks (odd = being written): lock-free, any thread, no allocation.
 struct CfEntry { volatile LONG seq; volatile LONG gen; volatile uint64_t fn; volatile uint32_t len; char sym[116]; };
 static CfEntry g_cf_cache[64];
@@ -944,10 +931,11 @@ static uint32_t cf_hash(const char *s, size_t n) {
     for (size_t i = 0; i < n; ++i) h = (h ^ (uint8_t)s[i]) * 16777619u;
     return h;
 }
-static uint64_t cf_lookup(const char *sym, size_t len, uint32_t h) {
+// An entry resolved in generation `gen` (the caller's sample of g_unload_gen), else 0.
+static uint64_t cf_lookup(const char *sym, size_t len, uint32_t h, LONG gen) {
     CfEntry &e = g_cf_cache[h & 63];
     const LONG s1 = e.seq;
-    if ((s1 & 1) || e.len != len || e.gen != g_unload_gen) return 0;
+    if ((s1 & 1) || e.len != len || e.gen != gen) return 0;
     _ReadWriteBarrier();
     const bool same = memcmp(e.sym, sym, len) == 0;
     const uint64_t fn = e.fn;
@@ -965,10 +953,15 @@ using ldr_notify_fn = VOID(CALLBACK *)(ULONG reason, const void *data, void *con
 static VOID CALLBACK on_dll_notification(ULONG reason, const void *, void *) {
     if (reason == 2) InterlockedIncrement(&g_unload_gen);    // LDR_DLL_NOTIFICATION_REASON_UNLOADED
 }
+using ldr_ref_fn = LONG(NTAPI *)(ULONG flags, PVOID base);
+using ldr_unload_fn = LONG(NTAPI *)(PVOID base);
+static ldr_ref_fn g_ldr_addref;          // ntdll!LdrAddRefDll / LdrUnloadDll: call_func's module pin
+static ldr_unload_fn g_ldr_unload;
 // Test knob (regress cdx-cfrace-inline, cdx-cfpin-inline): UHH_TEST_CF_STALL=resolved|pinned in
-// the TARGET's environment (read once at init) stops ONE inline call_func between resolving its
-// callee and calling it: it signals Local\uhh_test_cf_<pid> and waits for
-// Local\uhh_test_cf_go_<pid> while the target unloads (and replaces) the callee's DLL.
+// the TARGET's environment (read once at init) stops ONE inline call_func right after it
+// resolved its callee (before the module pin) or right after the pin: it signals
+// Local\uhh_test_cf_<pid> and waits for Local\uhh_test_cf_go_<pid> while the target unloads
+// (and replaces) the callee's DLL. Off: one load and compare per call.
 static volatile LONG g_test_cf_stall;    // 0 off, 1 resolved, 2 pinned
 static void test_cf_point(LONG where) {
     if (g_test_cf_stall != where || InterlockedCompareExchange(&g_test_cf_stall, 0, where) != where) return;
@@ -982,11 +975,14 @@ static void test_cf_point(LONG where) {
 }
 static void watch_unloads() {
     if (g_dll_cookie) return;
+    const HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    g_ldr_addref = reinterpret_cast<ldr_ref_fn>(GetProcAddress(nt, "LdrAddRefDll"));
+    g_ldr_unload = reinterpret_cast<ldr_unload_fn>(GetProcAddress(nt, "LdrUnloadDll"));
     char knob[16] = {};
     if (GetEnvironmentVariableA("UHH_TEST_CF_STALL", knob, sizeof(knob)))
         g_test_cf_stall = !strcmp(knob, "resolved") ? 1 : !strcmp(knob, "pinned") ? 2 : 0;
     using reg_fn = LONG(NTAPI *)(ULONG, ldr_notify_fn, void *, void **);
-    auto reg = reinterpret_cast<reg_fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "LdrRegisterDllNotification"));
+    auto reg = reinterpret_cast<reg_fn>(GetProcAddress(nt, "LdrRegisterDllNotification"));
     void *cookie = nullptr;
     if (reg && reg(0, on_dll_notification, nullptr, &cookie) >= 0) g_dll_cookie = cookie;
 }
@@ -997,22 +993,71 @@ static void unwatch_unloads() {
         unreg(g_dll_cookie);
     g_dll_cookie = nullptr;
 }
-static uint64_t resolve_callee(const char *symbol) {
+
+/* The callee's module lives until the call returns (codex5 #1). Resolving a name and calling
+   the address are two steps: a DLL unloaded by another thread in between -- and another image
+   mapped where it was -- would make call_func run unrelated code (or fault in a hole). So the
+   module holding the callee is PINNED for the call: a loader reference (LdrAddRefDll) taken
+   after the resolution and dropped (LdrUnloadDll) right after the call; and the unload
+   generation is re-checked AFTER pinning: unchanged since before the resolution, no unload
+   notification -- which the loader sends BEFORE unmapping -- came in between, so the pinned
+   module is the one resolved and stays mapped until we release it. Changed: release and
+   resolve again (bounded; then refuse).
+   The cost of the alternative decides it: without a pin call_func can execute whatever now
+   occupies the address. With it, one observable difference remains, and only in that race:
+   a FreeLibrary of the callee's DLL on another thread DURING the call returns as always, but
+   the unmap (and DllMain(DETACH), unload notifications) is deferred to our release at the
+   end of the call -- on the calling thread, as if the program had called FreeLibrary there
+   last. The program's own reference counting is untouched otherwise (our reference is ours,
+   balanced on every path). The ntdll entry points take the loader's module-table lock only
+   (not the loader lock, as GetModuleHandleEx would), unless the release is the last
+   reference. Residual: an unload already past its last reference but not yet notified;
+   ntdll refuses a reference to a module whose load count is zero (then we resolve again).
+   Absolute addresses ("0x...") are pinned the same way when they lie in a loaded image; code
+   outside any image is called as before (nothing to pin). */
+struct CalleePin {
+    void *module = nullptr;
+    ~CalleePin() { if (module) g_ldr_unload(module); }
+};
+static uint64_t resolve_callee(const char *symbol, CalleePin &pin) {
     if (!symbol || !*symbol) return 0;
     const bool absolute = symbol[0] == '0' && (symbol[1] == 'x' || symbol[1] == 'X');
     const size_t len = absolute || !g_dll_cookie ? 0 : strnlen(symbol, sizeof(CfEntry::sym) + 1);
     const bool cacheable = len && len <= sizeof(CfEntry::sym);
     const uint32_t h = cacheable ? cf_hash(symbol, len) : 0;
-    uint64_t fn = cacheable ? cf_lookup(symbol, len, h) : 0;
-    if (!fn) {
+    const bool can_pin = g_ldr_addref && g_ldr_unload && g_dll_cookie;   // (the generation needs the notification)
+    for (int attempt = 0; attempt < 4; ++attempt) {
         const LONG gen = g_unload_gen;                      // before resolving (see above)
-        fn = agent_resolve(symbol);
-        if (!fn) return 0;
-        if (cacheable) cf_store(symbol, len, h, fn, gen);   // cache the resolution only
+        uint64_t fn = cacheable ? cf_lookup(symbol, len, h, gen) : 0;
+        if (!fn) {
+            fn = agent_resolve(symbol);
+            if (!fn) return 0;
+            if (cacheable) cf_store(symbol, len, h, fn, gen);   // cache the resolution only
+        }
+        test_cf_point(1);
+        // Checked on EVERY call, never cached (see above): an address that is no committed
+        // executable memory now (e.g. "0x1") returns 0 without being called -- the call would
+        // fault, and inline that first-chance fault is seen by the target's vectored handlers
+        // (breakpoint/hw, where the debugger sees it first, return 0 silently).
+        if (!addressable(fn, 1)) return 0;
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery((const void *)(uintptr_t)fn, &mbi, sizeof(mbi))) return 0;
+        if (can_pin && mbi.State == MEM_COMMIT && mbi.Type == MEM_IMAGE) {
+            if (g_ldr_addref(0, mbi.AllocationBase) >= 0) pin.module = mbi.AllocationBase;
+            else if (!absolute) continue;                   // resolved through a module now going away
+            if (g_unload_gen != gen) {                      // an unload since the resolution: again
+                if (pin.module) { g_ldr_unload(pin.module); pin.module = nullptr; }
+                continue;
+            }
+        }
+        test_cf_point(2);
+        if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD)) return 0;
+        const DWORD p = mbi.Protect & 0xFF;
+        if (p == PAGE_EXECUTE || p == PAGE_EXECUTE_READ || p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY)
+            return fn;
+        return 0;
     }
-    // Checked on EVERY call, never cached (see above): refuse silently if it is not executable
-    // now, rather than call into it and raise a fault the program's handlers would see.
-    return executable(fn) ? fn : 0;
+    return 0;                                              // unloads kept racing the resolution
 }
 
 // A fixed set of thread ids (not TLS: it must work on a thread that is still in its loader
@@ -1056,9 +1101,9 @@ extern "C" int call_func(probe_context *c, const char *symbol, uint64_t *ret, in
     va_end(ap);
     if (g_ctrl) return g_ctrl->call_func_args(c, symbol, ret, nargs, a);
     if (!call_func_guarded(c)) return 0;
-    const uint64_t fn = resolve_callee(symbol);
+    CalleePin pin;                                         // the callee's module, until the call returns
+    const uint64_t fn = resolve_callee(symbol, pin);
     if (!fn) return 0;
-    test_cf_point(1); test_cf_point(2);                    // (test knob: no pin here)
 #if defined(_WIN64)
     return call_raw(fn, a, ret) ? 1 : 0;
 #else
