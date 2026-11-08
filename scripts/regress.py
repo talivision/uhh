@@ -7569,6 +7569,26 @@ def check_ctrl_symload():
         record(name, False, repr(e))
 
 
+def check_ctrl_own_debug():
+    """Real Windows thread contexts held suspended, passed through controller handlers.
+    Deterministic queued-slot reuse, target-owned DR release/gates/detach, combined
+    BS+B status, and target TF during software-step completion. The child never runs
+    with the fabricated context (examples/ctrlreview/ctrl_dr_review.cpp).
+    """
+    d, t = exe("ctrl_dr_review.exe"), exe("ctrl_target.exe")
+    if not d or not t:
+        return missing_bin("ctrl-own-debug", "ctrl_dr_review/ctrl_target")
+    for case in ("release", "queued", "queued-same", "queued-rearm", "watch-tf", "watch-tf-carried", "gate", "step-entry", "step-own", "step-mixed", "step-tf", "detach-dr", "detach-tf"):
+        name = f"ctrl-own-debug-{case}"
+        try:
+            r, o = run([d, case, t], timeout=30)
+            res = next((x for x in o if x.get("kind") == "dr_review"), {})
+            good = r.returncode == 0 and res.get("ok") == 1 and res.get("case") == case
+            record(name, good, f"exit={r.returncode} result={res}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+
 def check_cdx_review():
     """Codex review of the controller (docs/ROADMAP.md "Codex controller review"), fixture
     examples/ctrlreview, ONE callback source per check, every backend:
@@ -12428,6 +12448,7 @@ def main():
     if want(check_stream_filestall): check_stream_filestall()
     if want(check_stream_filefail): check_stream_filefail()
     if want(check_ctrl_symload): check_ctrl_symload()
+    if want(check_ctrl_own_debug): check_ctrl_own_debug()
     if want(check_cdx_review): check_cdx_review()
     if want(check_newapp_files): check_newapp_files()
     if want(check_newapp_flag): check_newapp_flag()

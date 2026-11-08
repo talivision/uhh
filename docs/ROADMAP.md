@@ -213,7 +213,7 @@ reads, a slow (50 ms) callback under 32 threads.
   with no trap flag, so there is no single-step completion event; a fault in the copy is mapped
   back to the real instruction (re-run in place, as before), a watch hit in it reports the real
   pc, a thread inside one at a detach is moved to the real code. A program that single-steps
-  itself (TF set at the hit) keeps the stepped copy. (2) fairness by YIELD rounds: when debug
+  itself (TF set at the hit) steps in place, preserving its exception address. (2) fairness by YIELD rounds: when debug
   events are dense (>= 2000/s) or the target ran unfrozen for less than a tenth of the last
   20 ms, each thread whose hit is continued in the next window is sent once through a per-thread
   yield stub (registers, flags, XMM saved; ntdll!NtDelayExecution until a deadline common to the
@@ -252,6 +252,17 @@ reads, a slow (50 ms) callback under 32 threads.
   sets on a running thread is seen at that thread's next debug event (UHH does not intercept
   SetThreadContext). `hunt-owndr-*` (DR0 set on a suspended new thread), `hunt-owndr-live-*`
   (DR0 set over UHH's on a running thread)
+- 🔧 Controller own-debug-register follow-up (2026-11-08): hardware release and inline-gate
+  cleanup clear only the address they installed; gate hits also verify the live slot and PC.
+  Detach preserves target-owned slots and TF, clearing TF only for a recorded UHH step that
+  did not start with the program's TF. A combined target BS/B-bit and UHH hit/step is passed
+  through after UHH's callback/completion; only UHH's B-bits and injected BS/TF are removed.
+  With target TF or debug registers, software instructions run in place so the target sees
+  the real exception address. Queued DR6 status keeps BS plus each B-bit's address and arm
+  generation, preventing slot reuse (including same-address reloads) from hitting a replacement
+  data probe. Tests: `check_ctrl_own_debug`, `ctrl-own-debug-*` (suspended real Windows contexts;
+  deterministic release, slot reuse, gate, step, and detach checks on both architectures).
+  Windows build/runtime verification pending; shared agent layout/version unchanged.
 - ✅ (A8) hw: a hardware probe inside a DLL that 4 threads keep LoadLibrary/FreeLibrary-ing missed
   hits (60-125 of 240, "whole threads"). Proven cause (huntaudit): NOT the late UNLOAD suspected
   here -- with the stale-unload guard of 6d0147a disabled, 24 runs (x64 + x86) saw no late unload

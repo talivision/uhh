@@ -100,6 +100,7 @@ struct Probe {
     probe_callback callback = nullptr;
     uint32_t flags = 0;
     std::vector<unsigned char> config;
+    uint64_t hw_generation = 0; // changes on every arm, including module reloads
     int dr_slot = -1;   // hardware-breakpoint DR register (0-3); -1 if not a HW probe
     bool active = false;
     bool warned_double_run = false;   // call_original without return_from (warn once)
@@ -331,6 +332,7 @@ struct probe_session {
     uint8_t dr_used = 0;
     std::vector<std::pair<uint64_t, int>> gates; // (inline site, DR slot): hw gates until its hook is confirmed
     uint8_t dr_ever = 0;
+    uint64_t hw_generation = 0;               // next hardware-probe arm identity
     uint8_t dr_next = 0;                       // next DR slot to try (rotation)
     uint64_t entry_reapply = 0;                // image entry: re-apply DRs on first arrival
     uint64_t entry_addr = 0;                   // image entry point (hold-for-install point)
@@ -372,10 +374,14 @@ struct probe_session {
     // address; a watchpoint's cannot be). The status read just before the write is kept with the
     // thread's registers; at its next event, unchanged registers mean it has not run since -- that
     // event IS the queued #DB -- and the status is carried into its handling (dr6_carry).
-    struct Dr6Lost { CONTEXT regs{}; DWORD64 bits = 0; };
+    // Keep each bit's original address and probe identity too: slot reuse cannot turn an
+    // old data access into a hit on a replacement probe (even at the same address).
+    struct Dr6Lost { CONTEXT regs{}; DWORD64 bits = 0; uint64_t address[4]{}; uint64_t generation[4]{}; };
     std::unordered_map<DWORD, Dr6Lost> dr6_lost;
     DWORD dr6_carry_tid = 0;
     DWORD64 dr6_carry = 0;
+    uint64_t dr6_carry_address[4]{};
+    uint64_t dr6_carry_generation[4]{};
     std::vector<HANDLE> ipc_frozen;            // threads suspended for an agent hook write (FREEZE..THAW)
     DWORD ipc_freezer = 0;                     // the agent thread doing that write (0 = no freeze)
     int hw_active = 0;
@@ -665,7 +671,7 @@ bool inline_hold_needed(const probe_session *s);
 bool agent_thread(probe_session *s, DWORD tid);
 void hold_thread(probe_session *s, DWORD tid);
 bool arm_gates_for_pending(probe_session *s);
-bool handle_gate(probe_session *s, const DEBUG_EVENT &event);
+bool handle_gate(probe_session *s, const DEBUG_EVENT &event, bool &handled);
 void release_held(probe_session *s, const char *why);
 bool kick_agent(probe_session *s);
 bool bind_pending_shared(probe_session *s);
@@ -794,6 +800,17 @@ inline bool set_dr_on_thread(HANDLE thread, int slot, uint64_t addr, bool enable
     DWORD64 dr7 = c.Dr7;
     if (enable) { dr7 &= ~fieldmask; dr7 |= ln | field; } else { dr7 &= ~(ln | fieldmask); }   // full release
     c.Dr7 = dr7;
+    return !!SetThreadContext(thread, &c);
+}
+// Release only the image installed at this site; the target may have replaced it.
+inline bool clear_dr_on_thread(HANDLE thread, int slot, uint64_t address) {
+    CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (!GetThreadContext(thread, &c)) return false;
+    if (dr_address(c, slot) != address) return true;
+    c.Dr7 &= ~((decltype(c.Dr7))3 << (slot * 2)) & ~((decltype(c.Dr7))0xF << (16 + slot * 4));
+    switch (slot) { case 0: c.Dr0 = 0; break; case 1: c.Dr1 = 0; break;
+                    case 2: c.Dr2 = 0; break; default: c.Dr3 = 0; break; }
+    c.Dr6 &= ~((decltype(c.Dr6))1 << slot);
     return !!SetThreadContext(thread, &c);
 }
 inline int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint64_t *ret, int nargs, const uint64_t *args,

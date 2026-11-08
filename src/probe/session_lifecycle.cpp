@@ -498,7 +498,7 @@ void detach(probe_session *s) {
 #else
             w.Eip = (DWORD)ip;
 #endif
-            w.EFlags &= ~0x100u;
+            if (!kv.second.prog_tf) w.EFlags &= ~0x100u;
             SetThreadContext(t, &w);
         }
         if (t) CloseHandle(t);
@@ -529,7 +529,7 @@ void detach(probe_session *s) {
     inplace_release_all(s);                                 // every INT3 is gone: nothing to hold for
     // Final pass, after every queued event has been continued: continuing an event can
     // restore the debug registers captured when the exception was raised. Clear our DR
-    // slots and the trap flag on every frozen thread one last time, right before letting go.
+    // images on every frozen thread one last time, preserving the target's own DRs and TF.
     std::string report_tids;
     for (HANDLE t : frozen) {
         CONTEXT w{}; w.ContextFlags = CONTEXT_DEBUG_REGISTERS | CONTEXT_CONTROL;
@@ -547,21 +547,21 @@ void detach(probe_session *s) {
             continue;
         }
         for (int slot = 0; slot < 4; ++slot) {
-            if (!(s->dr_ever & (1u << slot))) continue;
+            if (!(s->dr_ever & (1u << slot)) || !s->hw_armed_ever.count(dr_address(w, slot)) ||
+                target_owns_slot(s, GetThreadId(t), w, slot)) continue;
             w.Dr7 &= ~((DWORD64)3 << (slot * 2)) & ~((DWORD64)0xF << (16 + slot * 4));
+            w.Dr6 &= ~((decltype(w.Dr6))1 << slot);
             switch (slot) { case 0: w.Dr0 = 0; break; case 1: w.Dr1 = 0; break; case 2: w.Dr2 = 0; break; default: w.Dr3 = 0; }
         }
-        w.Dr6 = 0;
         // No slot left enabled: drop the exact-match bits too (WOW64 leaves LE set once a DR was
         // used, seen as dr7=0x100 on every thread of a detached 32-bit target).
         if (!(w.Dr7 & 0xFF)) w.Dr7 &= ~(decltype(w.Dr7))0x300;
-        w.EFlags &= ~0x100u;
         BOOL set_ok = SetThreadContext(t, &w);
         const DWORD set_err = set_ok ? 0 : GetLastError();
         if (!set_ok && thread_terminating(t)) continue;      // exiting (ERROR_ACCESS_DENIED): never runs user code again
         CONTEXT v{}; v.ContextFlags = CONTEXT_DEBUG_REGISTERS;
         GetThreadContext(t, &v);
-        if (!set_ok || (v.Dr7 & 0xFF))
+        if (!set_ok)
             report_tids += " " + std::to_string(GetThreadId(t)) + ":dr7=" + std::to_string((unsigned long long)v.Dr7) +
                            (set_ok ? "" : ":setfail=" + std::to_string(set_err));
     }

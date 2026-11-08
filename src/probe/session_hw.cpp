@@ -88,10 +88,18 @@ static DWORD handled_tid(const probe_session *s) { return s->event_tid; }
 void keep_queued_dr6(probe_session *s, DWORD tid, HANDLE t) {
     if (tid == handled_tid(s)) return;
     CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS;
-    if (!GetThreadContext(t, &c) || !(c.Dr6 & 0xF)) return;
+    if (!GetThreadContext(t, &c) || !(c.Dr6 & 0xE00Fu)) return;
     auto &l = s->dr6_lost[tid];
     if (l.bits && !same_thread_regs(l.regs, c)) l.bits = 0;
-    l.regs = c; l.bits |= c.Dr6 & 0xF;
+    for (int slot = 0; slot < 4; ++slot) {
+        if (!(c.Dr6 & (1u << slot)) || (l.bits & (1u << slot))) continue;
+        l.address[slot] = dr_address(c, slot); l.generation[slot] = 0;
+        for (const auto &p : s->probes)
+            if (p->active && (p->flags & PROBE_HW) && p->dr_slot == slot && p->address == l.address[slot]) {
+                l.generation[slot] = p->hw_generation; break;
+            }
+    }
+    l.regs = c; l.bits |= c.Dr6 & 0xE00Fu;
 }
 // The debug status lost by such a write, for the event of `tid` being handled (0 if none).
 DWORD64 dr6_carried(const probe_session *s, DWORD tid) {
@@ -133,6 +141,10 @@ void settle_hw_thread(probe_session *s, DWORD tid) {
         CONTEXT now{}; now.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
         if (t && GetThreadContext(t, &now) && same_thread_regs(l->second.regs, now)) {
             s->dr6_carry_tid = tid; s->dr6_carry = l->second.bits;
+            for (int slot = 0; slot < 4; ++slot) {
+                s->dr6_carry_address[slot] = l->second.address[slot];
+                s->dr6_carry_generation[slot] = l->second.generation[slot];
+            }
         }
         if (t) CloseHandle(t);
         s->dr6_lost.erase(l);
@@ -227,6 +239,7 @@ bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
     s->hw_armed_ever.insert(address);
     unretire_hw_address(s, address);
     p.dr_slot = slot; p.base = base; p.address = address; p.active = true;
+    p.hw_generation = ++s->hw_generation;
     std::fprintf(stderr, "probe: active %s -> base=0x%llx addr=0x%llx (hw DR%d, %s)\n",
                  p.location.c_str(), (unsigned long long)base, (unsigned long long)address, slot,
                  rw == 3 ? "watch rw" : rw == 1 ? "watch write" : "execute");
@@ -415,7 +428,7 @@ void release_hw(probe_session *s, Probe &p) {
     for (DWORD tid : s->threads) {
         HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
         GuardTouch touch(s, tid);
-        if (t) { keep_queued_dr6(s, tid, t); set_dr_on_thread(t, p.dr_slot, 0, false); CloseHandle(t); }
+        if (t) { keep_queued_dr6(s, tid, t); clear_dr_on_thread(t, p.dr_slot, p.address); CloseHandle(t); }
     }
     if (p.address) retire_hw_address(s, p.address);
     s->dr_used &= (uint8_t)~(1u << p.dr_slot);
@@ -580,6 +593,13 @@ bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
                 if (p->active && (p->flags & PROBE_HW) && p->dr_slot >= 0 && !(p->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) &&
                     p->address == pc && dr_address(native, slot) == pc) { probe = p.get(); break; }
         }
+        // Resolve queued data status against the address at the access, before our writes.
+        if (probe && (probe->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW))) {
+            const uint64_t hit_address = (dr6_carried(s, event.dwThreadId) & (1u << slot))
+                ? s->dr6_carry_address[slot] : dr_address(native, slot);
+            if (hit_address != probe->address || ((dr6_carried(s, event.dwThreadId) & (1u << slot)) &&
+                s->dr6_carry_generation[slot] != probe->hw_generation)) { consumed |= (1u << slot); any = true; continue; }
+        }
         if (probe && std::find(served.begin(), served.end(), probe) != served.end()) {
             consumed |= (1u << slot); any = true; continue;
         }
@@ -644,6 +664,11 @@ bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
         apply_return_from(s, probe, context, native);               // Rip -> ret gadget, Rsp -> the hit's
     }
     if (!any) {                                                      // none of our DRs fired
+        // A carried TARGET B-bit must reach its handler too, even when no UHH probe fired.
+        if (dr6_carried(s, event.dwThreadId)) {
+            native.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (!SetThreadContext(thread, &native)) { set_error(s, win_error("restore queued hardware status")); return false; }
+        }
         if (trace_enabled())
             std::fprintf(stderr, "  hw-not-ours tid=%lu dr6=0x%llx dr7=0x%llx dr0=0x%llx dr1=0x%llx dr2=0x%llx dr3=0x%llx "
                                  "used=0x%x ever=0x%x eflags=0x%lx\n", (unsigned long)event.dwThreadId,
@@ -691,7 +716,10 @@ bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
    
     // The same #DB also reports one of the target's OWN debug registers: it is the target's
     // exception too -- pass it on (our callbacks ran; their changes are applied above).
-    handled = !(native.Dr6 & 0xF & theirs);
+    const auto step = s->stepping.find(event.dwThreadId);
+    const bool our_step = step != s->stepping.end() && !step->second.tail_int3 && !step->second.prog_tf;
+    handled = !(native.Dr6 & 0xF & theirs) && !(native.Dr6 & 0xA000u) &&
+              (!(native.Dr6 & 0x4000u) || our_step);
     return true;
 }
 

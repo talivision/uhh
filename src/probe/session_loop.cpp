@@ -1031,8 +1031,12 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
                      (unsigned long)code, (unsigned long)event.dwThreadId,
                      (unsigned long long)address, step != stepping.end(), probe != nullptr,
                      (unsigned long)event.u.Exception.dwFirstChance);
-    if (code == EXCEPTION_SINGLE_STEP && step == stepping.end() && !s->gates.empty() && handle_gate(s, event)) {
-        disposition = DBG_CONTINUE; return true;
+    if (code == EXCEPTION_SINGLE_STEP && step == stepping.end() && !s->gates.empty()) {
+        bool handled = false;
+        if (handle_gate(s, event, handled)) {
+            if (handled) disposition = DBG_CONTINUE;
+            return true;
+        }
     }
     if (code == EXCEPTION_SINGLE_STEP && step == stepping.end() && (s->hw_active || s->dr_ever)) {
         bool handled = false;
@@ -1298,12 +1302,13 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         // watched address: then this #DB carries B-bits as well as BS. Service those
         // hardware hits first (their callbacks run, DR6 is cleared), then finish the step.
         bool hw_hit = false;
-        if (s->hw_active || s->dr_ever) {
+        bool target_hw = false;
+        {
             CONTEXT dr{}; dr.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-            if (GetThreadContext(thread, &dr) && (dr.Dr6 & 0xF)) {
+            if (GetThreadContext(thread, &dr) && ((dr.Dr6 | dr6_carried(s, event.dwThreadId)) & 0xF)) {
                 bool handled = false;
                 if (!handle_hw(s, event, handled)) { return false; }
-                hw_hit = handled;
+                hw_hit = handled; target_hw = !handled;
             }
         }
         if (step->second.tail_int3) {
@@ -1323,7 +1328,8 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             ok = !!SetThreadContext(thread, &native);
            
             if (!ok) { set_error(s, win_error("continue string instruction step")); return false; }
-            disposition = DBG_CONTINUE; return true;
+            if (!target_hw && !step->second.prog_tf) disposition = DBG_CONTINUE;
+            return true;
         }
         if (step->second.displaced) {
             // The instruction ran out-of-line; the INT3 was never lifted, so there is
@@ -1348,11 +1354,14 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
                 }
             }
         }
-        native.EFlags &= ~0x100u;
+        if (!step->second.prog_tf) {
+            native.EFlags &= ~0x100u;
+            native.Dr6 &= ~(decltype(native.Dr6))0x4000u; // BS came from our step, not the target
+        }
 #if defined(_WIN64)
         // SYSCALL saves RFLAGS in R11 -- with the trap flag WE set for the step. The program
         // can read R11 after the syscall; give it the flags image it would have had.
-        if (!step->second.displaced && step->second.syscall_insn) native.R11 &= ~(DWORD64)0x100;
+        if (!step->second.displaced && step->second.syscall_insn && !step->second.prog_tf) native.R11 &= ~(DWORD64)0x100;
 #endif
         if (ok) ok = !!SetThreadContext(thread, &native);
        
@@ -1360,7 +1369,10 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         if (trace_enabled())
             std::fprintf(stderr, "  step-done tid=%lu displaced=%d\n",
                          (unsigned long)event.dwThreadId, step->second.displaced);
-        stepping.erase(step); disposition = DBG_CONTINUE; return true;
+        const bool pass = target_hw || step->second.prog_tf;
+        stepping.erase(step);
+        if (!pass) disposition = DBG_CONTINUE;
+        return true;
     }
     if (!GetThreadContext(thread, &native)) {                 // a stale cached handle (a missed EXIT_THREAD): reopen once
         forget_event_thread(s, event.dwThreadId);
@@ -1450,11 +1462,16 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         if (at_entry && inline_hold_needed(s)) { hold_thread(s, event.dwThreadId); if (!kick_agent(s)) return false; }
         disposition = DBG_CONTINUE; return true;
     }
+    bool target_debug = (native.EFlags & 0x100u) != 0;
+    for (int slot = 0; slot < 4; ++slot)
+        if (((native.Dr7 >> (slot * 2)) & 3) &&
+            (target_owns_slot(s, event.dwThreadId, native, slot) || !s->hw_armed_ever.count(dr_address(native, slot))))
+            target_debug = true;
 #if defined(_WIN64)
     // SYSCALL / INT 2E: run from the site's trampoline -- the INT3 stays armed, no trap flag
     // (R11 gets the program's flags), and a syscall that blocks or returns elsewhere (APC,
     // NtContinue, a user-mode callback that hits probes on this thread) needs nothing from us.
-    if (uint64_t tr = syscall_trampoline(s, *probe)) {
+    if (uint64_t tr = target_debug ? 0 : syscall_trampoline(s, *probe)) {
         native.Rip = tr;
         native.ContextFlags = CONTEXT_FULL;
         bool ok = !!SetThreadContext(thread, &native);
@@ -1466,7 +1483,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
 #endif
     // Branches, call/ret, loop, pushf/popf: executed here on the context -- the INT3 stays
     // armed (exact under threads) and no trap flag is ever set (nothing leaks).
-    if (!probe->displaced_ok && emulate_site(s, *probe, native)) {
+    if (!target_debug && !probe->displaced_ok && emulate_site(s, *probe, native)) {
         native.ContextFlags = CONTEXT_FULL;               // keep any DRs the callback armed
         bool ok = !!SetThreadContext(thread, &native);
        
@@ -1478,9 +1495,9 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     // out-of-line with the INT3 left armed, so no other thread can cross this site unobserved
     // (no re-arm race) and no thread is suspended (no deadlock). Normally from the site's
     // trampoline, which jumps back by itself (one event per hit, see displaced_trampoline).
-    // A program that has the trap flag set itself is single-stepping through here: it keeps
-    // the stepped copy below (its own trap must not land inside our trampoline).
-    if (probe->displaced_ok && !(native.EFlags & 0x100u)) {
+    // Target-owned debug exceptions must arise at the real instruction, so their exception
+    // address as well as their context remains the program's own.
+    if (probe->displaced_ok && !target_debug) {
         if (const uint64_t tr = displaced_trampoline(s, *probe)) {
             EMU_IP(native) = (decltype(EMU_IP(native)))tr;
             native.ContextFlags = CONTEXT_FULL;               // keep any DRs the callback armed
@@ -1497,7 +1514,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             disposition = DBG_CONTINUE; return true;
         }
     }
-    bool displaced = probe->displaced_ok;
+    bool displaced = probe->displaced_ok && !target_debug;
     uint64_t scratch_addr = displaced ? thread_scratch(s, event.dwThreadId, probe->address) : 0;
     if (displaced && scratch_addr) {
         std::vector<unsigned char> code = probe->orig_insn;
@@ -1642,7 +1659,7 @@ static void module_unloaded(probe_session *s, uint64_t base) {
             for (DWORD tid : s->threads) {
                 HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
                 GuardTouch touch(s, tid);
-                if (t) { keep_queued_dr6(s, tid, t); set_dr_on_thread(t, g->second, 0, false); CloseHandle(t); }
+                if (t) { keep_queued_dr6(s, tid, t); clear_dr_on_thread(t, g->second, g->first); CloseHandle(t); }
             }
             s->dr_used &= (uint8_t)~(1u << g->second);
             retire_hw_address(s, g->first);
