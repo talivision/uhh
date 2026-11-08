@@ -211,8 +211,9 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "uhh_trace: unknown option %s\n", argv[i]); return 2;
     }
     if (cfgs.empty() || (!attach_pid && !attach_new && i >= argc)) {
-        std::fprintf(stderr, "usage: uhh_trace [--backend inline|breakpoint|hw] [--stack] -p mod!Export[:fmt] ... -- prog [args]\n"
-                             "       uhh_trace --list <module.dll|path> [--mask *pattern*]\n");
+        std::fprintf(stderr, "usage: uhh_trace [--backend inline|breakpoint|hw] [--stack] [--allow-unsafe-site] -p mod!Export[:fmt] ... -- prog [args]\n"
+                             "       uhh_trace --list <module.dll|path> [--mask *pattern*]\n"
+                             "       --allow-unsafe-site: override boundary checks on all execute backends and inline site checks\n");
         return 2;
     }
     probe_session *s = probe_session_create();
@@ -221,7 +222,7 @@ int main(int argc, char **argv) {
     // already hooked by someone else (or otherwise not inline-safe) move to a debug register.
     uint32_t flags = backend | (backend == PROBE_INLINE && fallback_hw ? static_cast<uint32_t>(PROBE_FALLBACK_HW) : 0u);
     if (unsafe_fast_patch && backend == PROBE_INLINE) flags |= PROBE_UNSAFE_FAST_PATCH;
-    if (allow_unsafe_site && backend == PROBE_INLINE) flags |= PROBE_ALLOW_UNSAFE_SITE;
+    if (allow_unsafe_site && !(flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW))) flags |= PROBE_ALLOW_UNSAFE_SITE;
     if (allow_prehooked && backend == PROBE_INLINE) flags |= PROBE_ALLOW_PREHOOKED;   // chain onto a foreign hook
     int ok = 1;
     for (size_t k = 0; k < cfgs.size(); ++k) {

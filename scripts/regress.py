@@ -3575,7 +3575,9 @@ def check_boundary(iters=50):
     and the same BndFrame site by module+RVA (no symbol). Controls, every backend: the real
     boundaries next to them install and hit exactly, and BndHidden+0x7 -- code after a stray
     data byte that a linear sweep would mis-decode, reached only by a direct call -- is not
-    refused (no false refusal where the stream is unknown)."""
+    refused (no false refusal where the stream is unknown). The overlapping MOV fixture
+    exercises the explicit unsafe override with exact hits and unchanged target output.
+    Existing operand-site override variants use zero iterations so their bytes never execute."""
     t, x = exe("uhh_trace.exe"), exe("boundary_target.exe")
     if not t or not x:
         return missing_bin("boundary", "uhh_trace/boundary_target")
@@ -3612,7 +3614,7 @@ def check_boundary(iters=50):
                     named, at, nxt = inside
                     want = f"nearest instruction boundaries {named}+0x{at:x}, {named}+0x{nxt:x}"
                     ok = (r.returncode != 0 and "site is inside an instruction" in err and want in err
-                          and f"at {named}+0x{at:x}" in err and not pr.get("hits"))
+                          and f"at {named}+0x{at:x}" in err and err.endswith("Override with PROBE_ALLOW_UNSAFE_SITE.") and not pr.get("hits"))
                 else:
                     ok = (r.returncode == 0 and tg.get("ok") is True and pr.get("backend") == bk
                           and pr.get("hits") == hits and not err)
@@ -3621,12 +3623,90 @@ def check_boundary(iters=50):
             except Exception as e:
                 record(name, False, repr(e))
 
+    # The outer MOV is reachable to the decoder through a never-taken JNZ; execution
+    # instead jumps indirectly into its immediate. Check every fixed byte and the pointer.
+    overlap = pe_export_bytes(x, "BndOverlap", 40) or b""
+    outer = 13 if x86 else 15
+    hidden_at = outer + 1
+    tail = bytes.fromhex("85c07502ffe2b8ffc0eb01c3c3") + b"\xcc" * 8
+    ptr_ok = (len(overlap) >= outer + 15 and overlap[:2] == b"\x33\xc0" and
+              overlap[outer - 6:outer + 15] == tail)
+    if x86:
+        ptr_ok = (ptr_ok and overlap[2] == 0xBA and
+                  int.from_bytes(overlap[3:7], "little") ==
+                  pe_layout(Path(x).read_bytes())[0] + pe_export_rva(x, "BndOverlap") + hidden_at)
+    else:
+        ptr_ok = (ptr_ok and overlap[2:5] == b"\x48\x8d\x15" and
+                  int.from_bytes(overlap[5:9], "little", signed=True) == hidden_at - 9)
+    if not ptr_ok:
+        record("boundary-layout-overlap", False, f"fixture layout changed: overlap={overlap.hex()}")
+    else:
+        baseline, base_objs = run([x, "--iters", iters], timeout=120)
+        base_target = next((o for o in base_objs if o.get("kind") == "target"), {})
+        loc = f"{m}!BndOverlap+0x{hidden_at:x}"
+        for bk in ("breakpoint", "hw", "inline"):
+            for allow in (False, True):
+                name = f"boundary-overlap-{bk}{'-unsafe' if allow else ''}"
+                try:
+                    extra = ["--allow-unsafe-site"] if allow else []
+                    r, objs = run([t, "--backend", bk, *extra, "-p", f"{loc}:-", "--",
+                                   x, "--iters", iters], timeout=120)
+                    pr = next((o for o in objs if o.get("kind") == "probe"), {})
+                    tg = next((o for o in objs if o.get("kind") == "target"), {})
+                    err = report(objs).get("error") or ""
+                    reason = (f"site is inside an instruction: 1 byte(s) into the 5-byte mov at "
+                              f"{m}!BndOverlap+0x{outer:x}")
+                    warning = f"probe: warning: {loc}: {reason}"
+                    logs = [o for o in objs if o.get("kind") == "probe_log" and
+                            str(o.get("message", "")).startswith(f"uhh warning: {loc}: {reason}")]
+                    if allow:
+                        ok = (baseline.returncode == 0 and base_target.get("ok") is True and
+                              r.returncode == 0 and tg == base_target and pr.get("backend") == bk and
+                              pr.get("hits") == iters and not err and len(logs) == 1 and
+                              sum(line.startswith(warning) and line.endswith(
+                                  " (installed: PROBE_ALLOW_UNSAFE_SITE)") for line in r.stderr.splitlines()) == 1)
+                    else:
+                        ok = (r.returncode != 0 and reason in err and
+                              err.endswith("Override with PROBE_ALLOW_UNSAFE_SITE.") and not pr.get("hits"))
+                    record(name, ok, f"hits={pr.get('hits')}/{iters} warnings={len(logs)} rc={r.returncode} err={err[:260]}")
+                except Exception as e:
+                    record(name, False, repr(e))
+
+    # Existing operand sites are deliberately NOT executed in these variants (--iters 0).
+    # Patching their bytes while running them would corrupt the fixture, even on INT3.
+    for case, loc, inside, _ in cases:
+        if not inside:
+            continue
+        for bk in ("breakpoint", "hw", "inline"):
+            name = f"boundary-{case}-{bk}-unsafe"
+            try:
+                r, objs = run([t, "--backend", bk, "--allow-unsafe-site", "-p", f"{loc}:-",
+                               "--", x, "--iters", 0], timeout=120)
+                pr = next((o for o in objs if o.get("kind") == "probe"), {})
+                tg = next((o for o in objs if o.get("kind") == "target"), {})
+                warnings = [o for o in objs if o.get("kind") == "probe_log" and
+                            str(o.get("message", "")).startswith(f"uhh warning: {loc}: site is inside an instruction:")]
+                ok = (r.returncode == 0 and tg.get("ok") is True and pr.get("backend") == bk and
+                      not report(objs).get("error") and len(warnings) == 1 and
+                      r.stderr.count(f"probe: warning: {loc}: site is inside an instruction:") == 1)
+                record(name, ok, f"rc={r.returncode} backend={pr.get('backend')} warnings={len(warnings)}")
+            except Exception as e:
+                record(name, False, repr(e))
+
+    # Hardware fallback alone must never bypass the boundary refusal.
+    loc = cases[0][1]
+    r, objs = run([t, "--backend", "inline", "--fallback-hw", "-p", f"{loc}:-",
+                   "--", x, "--iters", iters], timeout=120)
+    err = report(objs).get("error") or ""
+    record("boundary-fallback-inline", r.returncode != 0 and "site is inside an instruction" in err and
+           "hardware fallback" not in r.stderr, err[:260])
+
     # codex5 #3: BndNoret -- `call BndDie` (never returns), a data byte B8, then the real block,
     # one `ret`, reached only by an indirect jump. The call's fall-through decodes B8 C3.. as a
-    # `mov eax, imm32` over that ret: a false refusal (not overridable) before the fix. A probe
+    # `mov eax, imm32` over that ret: a false refusal before the fix. A probe
     # on the ret is accepted and hits on every backend (inline: --allow-unsafe-site, for the
     # inline-only "hook across the end of the function" rule of a 1-byte ret -- an overridable
-    # refusal, unlike the boundary one).
+    # refusal).
     noret = pe_export_bytes(x, "BndNoret", 32) or b""
     nr = 0x1A if x86 else 0x18
     if noret[nr - 6] != 0xE8 or noret[nr - 1:nr + 1] != b"\xb8\xc3":

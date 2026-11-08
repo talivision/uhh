@@ -66,8 +66,10 @@ Contents: [concepts](#concepts) · [types and macros](#types-and-macros) ·
   direct branches, switch tables) from the function start (`.pdata` on x64, the PDB on both
   arches), another `.pdata`/PDB/CFG function start, or the symbol the location names --
   never a linear sweep. Where it cannot (no extent and no symbol before the site, code reached
-  only through indirect jumps, overlapping code) the site is taken as given. No flag
-  overrides the refusal (`PROBE_ALLOW_UNSAFE_SITE` and `PROBE_FALLBACK_HW` included). The same
+  only through indirect jumps, overlapping code) the site is taken as given. `PROBE_ALLOW_UNSAFE_SITE` overrides this refusal on every execute backend, with one
+  stderr warning and one per-probe `uhh warning` log record; use it for known overlapping
+  instructions/obfuscated code. Refusals end with `Override with PROBE_ALLOW_UNSAFE_SITE.`
+  `PROBE_FALLBACK_HW` alone never bypasses this refusal. The same
   applies to `probe_add_address`.
 - A probe on a module that is not loaded yet stays **pending** and arms when the module
   loads (also a DLL loaded at run time). It goes back to pending when the module unloads
@@ -126,7 +128,7 @@ Pass exactly one backend flag, optionally ORed with options. An unknown bit is r
 | `PROBE_ALLOW_PREHOOKED` | inline | install over a site another tool already hooked, chaining through its hook. Without it such a site is refused for inline (breakpoint/hw only report it). |
 | `PROBE_FALLBACK_HW` | inline | when the inline site is refused (pre-hooked, unsafe, or overlapping another inline hook), use a hardware execute probe instead (`probe: X -> hardware fallback (...)`). Needs a free debug register. |
 | `PROBE_UNSAFE_FAST_PATCH` | inline | write the hook **without** freezing the target. By default every other thread is suspended while a hook is written (only at install/remove, never per hit) and a thread caught inside the overwritten bytes is moved onto the trampoline. With this flag such a thread can crash. For measurement only. |
-| `PROBE_ALLOW_UNSAFE_SITE` | inline | install even where the site check refuses (code could arrive inside the >= 5 overwritten bytes: a branch target, function start, return point, switch-table target, live code after a ret/jmp, an unresolvable indirect jump, the end of the section). The reason is printed as a warning. You assert nothing reaches those bytes. It does **not** override the [instruction-boundary refusal](#locations) (a site inside an instruction), on any backend. |
+| `PROBE_ALLOW_UNSAFE_SITE` | all execute backends | override the instruction-boundary refusal with one stderr warning and one per-probe `uhh warning` log record (never valid for data watchpoints). Inline additionally: install even where the site check refuses (code could arrive inside the >= 5 overwritten bytes: a branch target, function start, return point, switch-table target, live code after a ret/jmp, an unresolvable indirect jump, the end of the section). The reason is printed as a warning. You assert nothing reaches those bytes. The other inline checks keep their existing meaning. |
 
 ## Registers
 

@@ -97,6 +97,7 @@ struct Probe {
     bool active = false;
     bool warned_double_run = false;   // call_original without return_from (warn once)
     bool warned_pop = false;          // x86 return_from nargs contradicted call_original (warn once)
+    bool warned_boundary = false;     // boundary override warning (once per probe)
     bool warned_log = false;          // a "uhh warning: ..." log record was emitted (once per probe, as inline)
     bool warned_call = false;         // a breakpoint/hw call_func was refused (warn once)
 };
@@ -4201,7 +4202,7 @@ static bool site_inside_instruction(probe_session *s, const Probe &p, uint64_t s
     // never passes a call's fall-through. A call may not return (ExitProcess, a throw helper,
     // a no-return routine of the program), and the bytes after it can be data that decodes
     // over a real block reached only through an indirect jump UHH cannot resolve -- a false
-    // refusal (never overridable). So an instruction known only through a fall-through
+    // refusal. So an instruction known only through a fall-through
     // refuses only when every indirect jump decoded in the region was resolved (a switch
     // table): then a real block there would have been decoded too, and shown as an overlap.
     std::map<uint64_t, ZydisDecodedInstruction> insns, direct;
@@ -4315,7 +4316,9 @@ static bool site_inside_instruction(probe_session *s, const Probe &p, uint64_t s
     return true;
 }
 
-// Refuse a probe whose site is inside an instruction (any backend; no flag overrides it).
+// Refuse a probe inside an instruction unless explicitly overridden (any backend).
+static uint32_t probe_index(probe_session *s, const Probe *probe);
+static void warn_record(probe_context *c, Probe *probe, const char *text, bool *warned = nullptr);
 // A data watchpoint (PROBE_WATCH_*) watches bytes, not an instruction: any aligned dword is a
 // valid site, an operand byte in code included (self-modifying code, a variable in a code
 // section) -- never judged, on every path (absolute, module+RVA, symbol+offset).
@@ -4325,7 +4328,19 @@ static bool refuse_mid_instruction(probe_session *s, Probe &p, uint64_t site) {
     const uint64_t anchor = !p.export_name.empty() && site >= p.sym_offset ? site - p.sym_offset : 0;
     std::string why;
     if (!site_inside_instruction(s, p, site, anchor, why)) return false;
-    const std::string msg = "probe " + p.location + " refused: " + why;
+    if (p.flags & PROBE_ALLOW_UNSAFE_SITE) {
+        if (!p.warned_boundary) {
+            const std::string warning = p.location + ": " + why + " (installed: PROBE_ALLOW_UNSAFE_SITE)";
+            std::fprintf(stderr, "probe: warning: %s\n", warning.c_str());
+            CallbackState state{s, &p};
+            probe_context context{};
+            context.controller = &state;
+            context.site = probe_index(s, &p);
+            warn_record(&context, &p, warning.c_str(), &p.warned_boundary);
+        }
+        return false;
+    }
+    const std::string msg = "probe " + p.location + " refused: " + why + ". Override with PROBE_ALLOW_UNSAFE_SITE.";
     std::fprintf(stderr, "probe: %s\n", msg.c_str());
     set_error(s, msg);
     p.retired = true;
@@ -5031,7 +5046,7 @@ static bool check_flags(probe_session *s, uint32_t flags, bool allow_inline) {
         ((flags & PROBE_ALLOW_PREHOOKED) && type != PROBE_INLINE) || // only meaningful for inline
         ((flags & PROBE_FALLBACK_HW) && type != PROBE_INLINE) ||     // fallback only modifies an inline probe
         ((flags & PROBE_UNSAFE_FAST_PATCH) && type != PROBE_INLINE) || // only inline hooks write code
-        ((flags & PROBE_ALLOW_UNSAFE_SITE) && type != PROBE_INLINE) || // only inline hooks overwrite >1 byte
+        ((flags & PROBE_ALLOW_UNSAFE_SITE) && watch) || // any execute backend, never data watches
         (watch && type != PROBE_HW) ||                               // a watchpoint uses the DR/HW backend
         watch == (PROBE_WATCH_WRITE | PROBE_WATCH_RW) ||             // pick one access mode, not both
         ((flags & PROBE_ONCE) && type == PROBE_INLINE)) {            // one-shot needs a controller backend
@@ -7615,9 +7630,11 @@ static uint64_t ret_gadget(probe_session *s, uint32_t pop) {
 // The first call_original / return_from warning of a probe also goes to the LOG as one
 // "uhh warning: <text>" record -- the record the inline agent emits (it has no stderr), so
 // a log carries the same records on every backend.
-static void warn_record(probe_context *c, Probe *probe, const char *text) {
-    if (!c || !probe || probe->warned_log) return;
-    probe->warned_log = true;
+static void warn_record(probe_context *c, Probe *probe, const char *text, bool *warned) {
+    if (!c || !probe) return;
+    bool &once = warned ? *warned : probe->warned_log;
+    if (once) return;
+    once = true;
     send_log(c, "uhh warning: %s", text);
 }
 // After a callback: apply return_from (resume at the gadget, SP = the hit's) and return
