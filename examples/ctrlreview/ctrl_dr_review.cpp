@@ -1,158 +1,303 @@
-// Deterministic controller debug-context regressions. The child never runs: contexts model
-// queued Windows events, which are dispatched through the real controller helpers. In
-// particular, no timing race is needed to reuse a slot before its queued #DB is delivered.
+// Real #DB events for the controller's ownership/TF regressions. Windows sanitizes DR6
+// (and a never-started thread's flags) on context writes: do not fabricate exception status.
 #include "../../src/probe/session_internal.hpp"
+#include <stdexcept>
 
 using namespace uhh_session;
+static constexpr DWORD announce = 0xE055D071u;
+struct ChildState { LONG seen; DWORD flags; DWORD64 dr6; LONG data[8]; };
+static ChildState child_state{};
 static unsigned callbacks = 0;
 static void hit(probe_context *) { ++callbacks; }
+static void require(bool ok, const char *stage) {
+    if (!ok) {
+        std::fprintf(stderr, "dr-review: %s failed (Win32=%lu)\n", stage, (unsigned long)GetLastError());
+        throw std::runtime_error(stage);
+    }
+}
+static LONG CALLBACK child_veh(EXCEPTION_POINTERS *e) {
+    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+    ++child_state.seen;
+    child_state.flags = e->ContextRecord->EFlags;
+    child_state.dr6 = e->ContextRecord->Dr6;
+    e->ContextRecord->EFlags &= ~0x100u;
+    e->ContextRecord->Dr6 = 0;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+static int child() {
+    // pcmpeqd xmm0,xmm0; int3 (ready); movq [CX],xmm0; nop; int3 (done); ret.
+    // One eight-byte store can fire distinct dword watches on data[0] and data[1],
+    // on x64 and x86. CX is the first __fastcall argument on both architectures.
+    const unsigned char code[] = {0x66,0x0F,0x76,0xC0, 0xCC, 0x66,0x0F,0xD6,0x01, 0x90,0xCC,0xC3};
+    void *mem = VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!mem || !AddVectoredExceptionHandler(1, child_veh)) return 3;
+    std::memcpy(mem, code, sizeof(code));
+    FlushInstructionCache(GetCurrentProcess(), mem, sizeof(code));
+    const ULONG_PTR info[] = {(ULONG_PTR)mem, (ULONG_PTR)&child_state};
+    RaiseException(announce, 0, 2, info);
+    reinterpret_cast<void (__fastcall *)(LONG *)>(mem)(child_state.data);
+    return 0;
+}
+struct Debuggee {
+    PROCESS_INFORMATION pi{};
+    DEBUG_EVENT ev{};
+    bool pending = false, attached = true;
+    uint64_t code = 0, state = 0;
+    Debuggee() {
+        char path[MAX_PATH];
+        const DWORD n = GetModuleFileNameA(nullptr, path, MAX_PATH);
+        require(n && n < MAX_PATH, "child executable path");
+        std::string command = std::string("\"") + path + "\" --dr-child";
+        STARTUPINFOA startup{}; startup.cb = sizeof(startup);
+        require(!!CreateProcessA(nullptr, command.data(), nullptr, nullptr, FALSE, DEBUG_ONLY_THIS_PROCESS,
+                                 nullptr, nullptr, &startup, &pi), "create debuggee");
+    }
+    ~Debuggee() {
+        TerminateProcess(pi.hProcess, 0);
+        if (attached) {
+            if (pending) ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
+            for (int i = 0; i < 100; ++i) {
+                DEBUG_EVENT e{};
+                if (!WaitForDebugEvent(&e, 50)) break;
+                close_file(e);
+                ContinueDebugEvent(e.dwProcessId, e.dwThreadId, DBG_CONTINUE);
+                if (e.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT) break;
+            }
+            DebugActiveProcessStop(pi.dwProcessId);
+        }
+        WaitForSingleObject(pi.hProcess, 5000);
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    }
+    static void close_file(const DEBUG_EVENT &e) {
+        if (e.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT && e.u.CreateProcessInfo.hFile) CloseHandle(e.u.CreateProcessInfo.hFile);
+        if (e.dwDebugEventCode == LOAD_DLL_DEBUG_EVENT && e.u.LoadDll.hFile) CloseHandle(e.u.LoadDll.hFile);
+    }
+    void resume(DWORD disposition = DBG_CONTINUE) {
+        require(pending && !!ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, disposition), "continue event");
+        pending = false;
+    }
+    void wait(DWORD wanted, uint64_t address = 0) {
+        require(!pending, "previous event continued");
+        const ULONGLONG until = GetTickCount64() + 10000;
+        while (GetTickCount64() < until) {
+            if (!WaitForDebugEvent(&ev, 100)) continue;
+            pending = true; close_file(ev);
+            require(ev.dwDebugEventCode != EXIT_PROCESS_DEBUG_EVENT, "child alive");
+            if (ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
+                auto &ex = ev.u.Exception.ExceptionRecord;
+                if (ex.ExceptionCode == announce) {
+                    require(ex.NumberParameters == 2, "announcement arguments");
+                    code = ex.ExceptionInformation[0]; state = ex.ExceptionInformation[1];
+                } else {
+                    if (ex.ExceptionCode == 0x4000001Eu) ex.ExceptionCode = EXCEPTION_SINGLE_STEP;
+                    if (ex.ExceptionCode == 0x4000001Fu) ex.ExceptionCode = EXCEPTION_BREAKPOINT;
+                    const uint64_t at = (uint64_t)(uintptr_t)ex.ExceptionAddress;
+                    if (ex.ExceptionCode == wanted && at == (address ? address : code + 4) && code) return;
+                    // The only unsolicited exception is the initial loader breakpoint.
+                    if (code || ex.ExceptionCode != EXCEPTION_BREAKPOINT)
+                        std::fprintf(stderr, "dr-review: unexpected code=0x%lx at=0x%llx wanted=0x%lx at=0x%llx\n",
+                                     (unsigned long)ex.ExceptionCode, (unsigned long long)at, (unsigned long)wanted,
+                                     (unsigned long long)(address ? address : code + 4));
+                    require(!code && ex.ExceptionCode == EXCEPTION_BREAKPOINT, "expected exception address/code");
+                }
+            }
+            resume();
+        }
+        require(false, "debug event timeout");
+    }
+    CONTEXT get() const {
+        CONTEXT c{}; c.ContextFlags = CONTEXT_ALL;
+        require(!!GetThreadContext(pi.hThread, &c), "get event context");
+        return c;
+    }
+    void put(const CONTEXT &c) const { require(!!SetThreadContext(pi.hThread, &c), "set event context"); }
+    ChildState result() const {
+        ChildState out{}; SIZE_T n = 0;
+        require(!!ReadProcessMemory(pi.hProcess, (void *)(uintptr_t)state, &out, sizeof(out), &n) && n == sizeof(out), "read child result");
+        return out;
+    }
+};
 
 int main(int argc, char **argv) {
-    if (argc != 3) return 2;
-    STARTUPINFOA startup{}; startup.cb = sizeof(startup);
-    PROCESS_INFORMATION pi{};
-    std::string command = std::string("\"") + argv[2] + "\" owndr";
-    if (!CreateProcessA(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_SUSPENDED,
-                        nullptr, nullptr, &startup, &pi)) return 3;
-    // Heap allocation: the session contains large fixed buffers on both architectures.
-    auto session = std::make_unique<probe_session>();
-    auto *s = session.get();
-    s->pi = pi; s->threads.insert(pi.dwThreadId); s->thread_handle[pi.dwThreadId] = pi.hThread;
-    s->event_tid = pi.dwThreadId; s->initial_break = true;
-    s->detaching = true; // suppress asynchronous installs/holds in the synthetic dispatcher
-    CONTEXT c{}; c.ContextFlags = CONTEXT_ALL;
-    bool ok = !!GetThreadContext(pi.hThread, &c);
-    const uint64_t pc = (uint64_t)EMU_IP(c);
-    const uint64_t old_address = 0x12340000, new_address = 0x12350000, target_address = 0x12360000;
-    auto probe = std::make_unique<Probe>();
-    probe->flags = PROBE_HW | PROBE_WATCH_WRITE; probe->active = true;
-    probe->hw_generation = 1; probe->address = old_address; probe->dr_slot = 0; probe->callback = hit;
-    Probe *p = probe.get(); s->probes.push_back(std::move(probe));
-    s->dr_used = s->dr_ever = 1; s->hw_active = 1; s->hw_armed_ever.insert(old_address);
-    c.Dr0 = (decltype(c.Dr0))old_address; c.Dr1 = c.Dr2 = c.Dr3 = 0;
-    c.Dr7 = 1 | ((decltype(c.Dr7))0xD << 16); c.Dr6 = 1;
-    c.EFlags &= ~0x100u;
-    DEBUG_EVENT event{}; event.dwDebugEventCode = EXCEPTION_DEBUG_EVENT;
-    event.dwProcessId = pi.dwProcessId; event.dwThreadId = pi.dwThreadId;
-    event.u.Exception.dwFirstChance = 1;
-    event.u.Exception.ExceptionRecord.ExceptionCode = EXCEPTION_SINGLE_STEP;
-    event.u.Exception.ExceptionRecord.ExceptionAddress = (void *)(uintptr_t)pc;
+    if (argc == 2 && !std::strcmp(argv[1], "--dr-child")) return child();
+    if (argc != 2) return 2;
     const std::string mode = argv[1];
-    if (mode == "release") {
-        // The program claimed all slots; migration must yield. A later release cannot
-        // clear the foreign image in the probe's former slot.
-        c.Dr0 = (decltype(c.Dr0))target_address;
-        c.Dr1 = (decltype(c.Dr1))(target_address + 4);
-        c.Dr2 = (decltype(c.Dr2))(target_address + 8);
-        c.Dr3 = (decltype(c.Dr3))(target_address + 12);
-        c.Dr7 = 0xDDDD0055;
-        ok = ok && !!SetThreadContext(pi.hThread, &c);
-        hw_yield_to_target(s, pi.dwThreadId, pi.hThread);
-        release_hw(s, *p);
-        CONTEXT after{}; after.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-        ok = ok && !!GetThreadContext(pi.hThread, &after) && after.Dr0 == c.Dr0 && ((after.Dr7 ^ c.Dr7) & 0xFFFF03FFu) == 0;
-    } else if (mode == "queued" || mode == "queued-same" || mode == "queued-rearm") {
-        ok = ok && !!SetThreadContext(pi.hThread, &c);
-        s->event_tid = 0; keep_queued_dr6(s, pi.dwThreadId, pi.hThread);
-        // Reuse the slot before delivering the saved status. The old and replacement
-        // watches are distinct even though the B-bit has the same index.
-        const uint64_t replacement_address = mode == "queued" ? new_address : old_address;
-        if (mode != "queued-rearm") {
-            auto replacement = std::make_unique<Probe>(*p);
-            p->active = false; p->dr_slot = -1;
-            p = replacement.get(); s->probes.push_back(std::move(replacement));
-        }
-        p->address = replacement_address; p->hw_generation = 2;
-        s->hw_armed_ever.insert(replacement_address);
-        c.Dr0 = (decltype(c.Dr0))replacement_address; c.Dr6 = 0;
-        ok = ok && !!SetThreadContext(pi.hThread, &c);
-        settle_hw_thread(s, pi.dwThreadId);
-        bool handled = false;
-        ok = ok && dr6_carried(s, pi.dwThreadId) == 1 && handle_hw(s, event, handled) && handled && callbacks == 0 && p->hits == 0;
-    } else if (mode == "watch-tf" || mode == "watch-tf-carried") {
-        c.Dr6 |= 0x4000; c.EFlags |= 0x100;
-        ok = ok && !!SetThreadContext(pi.hThread, &c);
-        if (mode == "watch-tf-carried") {
-            s->event_tid = 0; keep_queued_dr6(s, pi.dwThreadId, pi.hThread);
-            c.Dr6 = 0; ok = ok && !!SetThreadContext(pi.hThread, &c);
-            settle_hw_thread(s, pi.dwThreadId);
-        }
-        bool handled = false;
-        ok = ok && handle_hw(s, event, handled) && !handled && callbacks == 1 && p->hits == 1;
-        CONTEXT after{}; after.ContextFlags = CONTEXT_ALL;
-        ok = ok && !!GetThreadContext(pi.hThread, &after) && (after.EFlags & 0x100) &&
-             (after.Dr6 & 0x4000) && !(after.Dr6 & 1);
-    } else if (mode == "gate") {
-        p->active = false; s->hw_active = 0;
-        s->gates.emplace_back(old_address, 0);
-        c.Dr0 = (decltype(c.Dr0))target_address;
-        ok = ok && !!SetThreadContext(pi.hThread, &c);
-        bool handled = false;
-        s->detaching = false; // a false-positive gate must visibly try to hold this thread
-        const bool gated = handle_gate(s, event, handled);
-        ok = ok && !gated && !handled && s->held.empty();
-        release_held(s, "test"); // also exercises clear_gates
-        CONTEXT after{}; after.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-        ok = ok && !!GetThreadContext(pi.hThread, &after) && after.Dr0 == c.Dr0 && ((after.Dr7 ^ c.Dr7) & 0xFFFF03FFu) == 0;
-    } else if (mode == "step-entry") {
-        // A target already single-stepping must execute at the real site: both the
-        // context and the eventual exception address must be outside UHH scratch.
-        void *site = VirtualAllocEx(pi.hProcess, nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-        const unsigned char code[] = {0xCC, 0x90, 0xC3};
-        SIZE_T written = 0;
-        ok = ok && site && !!WriteProcessMemory(pi.hProcess, site, code, sizeof(code), &written) && written == sizeof(code);
-        p->flags = PROBE_BREAKPOINT; p->dr_slot = -1; p->address = (uint64_t)(uintptr_t)site;
-        p->original = 0x90; p->orig_insn = {0x90}; p->insn_len = 1; p->displaced_ok = true;
-        s->dr_used = s->dr_ever = 0; s->hw_active = 0;
-        c.Dr0 = 0; c.Dr7 = c.Dr6 = 0; c.EFlags |= 0x100;
-        EMU_IP(c) = (decltype(EMU_IP(c)))(p->address + 1);
-        ok = ok && !!SetThreadContext(pi.hThread, &c);
-        event.u.Exception.ExceptionRecord.ExceptionCode = EXCEPTION_BREAKPOINT;
-        event.u.Exception.ExceptionRecord.ExceptionAddress = site;
-        DWORD disposition = 0;
-        ok = ok && dispatch_event(s, event, disposition) && disposition == DBG_CONTINUE;
-        const auto st = s->stepping.find(pi.dwThreadId);
-        ok = ok && st != s->stepping.end() && !st->second.displaced && st->second.prog_tf && callbacks == 1;
-    } else if (mode == "step-own" || mode == "step-tf" || mode == "step-mixed") {
-        // Model an ordinary software step at completion. In step-own there is no
-        // active UHH hardware probe: a breakpoint-only session must still pass B0.
-        const bool mixed = mode == "step-mixed";
-        p->active = mixed; s->hw_active = mixed ? 1 : 0; s->dr_used = s->dr_ever = mixed ? 1 : 0;
-        const bool tf = mode == "step-tf";
-        c.Dr0 = (decltype(c.Dr0))target_address; c.Dr6 = 0x4000 | (tf ? 0 : 1);
-        if (mixed) {
-            c.Dr0 = (decltype(c.Dr0))old_address; c.Dr1 = (decltype(c.Dr1))target_address;
-            c.Dr7 |= 4 | ((decltype(c.Dr7))0xD << 20); c.Dr6 |= 3;
-        }
-        c.EFlags |= 0x100;
-        StepState st{}; st.site = pc - 1; st.insn_len = 1; st.prog_tf = tf;
-        s->stepping.emplace(pi.dwThreadId, st);
-        ok = ok && !!SetThreadContext(pi.hThread, &c);
-        DWORD disposition = 0;
-        ok = ok && dispatch_event(s, event, disposition) && disposition == DBG_EXCEPTION_NOT_HANDLED;
-        CONTEXT after{}; after.ContextFlags = CONTEXT_ALL;
-        ok = ok && !!GetThreadContext(pi.hThread, &after) && ((after.EFlags & 0x100) != 0) == tf &&
-             ((after.Dr6 & 0x4000) != 0) == tf && (tf || (after.Dr6 & (mixed ? 2 : 1))) &&
-             callbacks == (mixed ? 1u : 0u) && s->stepping.empty();
-    } else if (mode == "detach-dr" || mode == "detach-tf") {
-        // detach() gets a real process and a suspended thread, but no live debugger.
-        // Its release/drain/final-context passes run unchanged; the initial suspension
-        // ensures that even when detach thaws its own holds, the fixture never executes.
-        p->active = false; s->hw_active = 0; s->dr_used = 0;
-        const bool tf = mode == "detach-tf";
-        c.Dr0 = (decltype(c.Dr0))target_address; c.Dr6 = 0;
-        if (tf) { s->dr_ever = 0; c.Dr7 = 0; c.EFlags |= 0x100; }
-        ok = ok && !!SetThreadContext(pi.hThread, &c);
-        detach(s);
-        CONTEXT after{}; after.ContextFlags = CONTEXT_ALL;
-        ok = ok && !!GetThreadContext(pi.hThread, &after) && after.Dr0 == c.Dr0 && ((after.Dr7 ^ c.Dr7) & 0xFFFF03FFu) == 0 &&
-             ((after.EFlags ^ c.EFlags) & 0x100) == 0;
-    } else ok = false;
-    std::printf("{\"kind\":\"dr_review\",\"case\":\"%s\",\"ok\":%d,\"callbacks\":%u}\n",
-                mode.c_str(), ok ? 1 : 0, callbacks);
-    // No target instruction is ever executed with a fabricated context.
-    TerminateProcess(pi.hProcess, 0); WaitForSingleObject(pi.hProcess, 5000);
-    for (auto &kv : s->own_thread_handle) CloseHandle(kv.second);
-    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    bool ok = false;
+    std::string failed;
+    try {
+        Debuggee d;
+        d.wait(EXCEPTION_BREAKPOINT); // after the loader: the child's ready INT3
+        auto session = std::make_unique<probe_session>();
+        auto *s = session.get();
+        s->pi = d.pi; s->threads.insert(d.pi.dwThreadId); s->thread_handle[d.pi.dwThreadId] = d.pi.hThread;
+        s->event_tid = d.pi.dwThreadId; s->initial_break = true;
+        s->detaching = true; // no asynchronous library installs in this isolated dispatcher
+        const uint64_t site = d.code + 5, done = d.code + 10;
+        const uint64_t old_address = d.state + offsetof(ChildState, data), new_address = old_address + 4;
+        const uint64_t target_address = old_address + 8;
+        auto probe = std::make_unique<Probe>();
+        probe->flags = PROBE_HW | PROBE_WATCH_WRITE; probe->active = true;
+        probe->hw_generation = 1; probe->address = old_address; probe->dr_slot = 0; probe->callback = hit;
+        Probe *p = probe.get(); s->probes.push_back(std::move(probe));
+        s->dr_used = s->dr_ever = 1; s->hw_active = 1; s->hw_armed_ever.insert(old_address);
+        auto c = d.get();
+        c.Dr0 = (decltype(c.Dr0))old_address; c.Dr1 = c.Dr2 = c.Dr3 = c.Dr6 = 0;
+        c.Dr7 = 1 | ((decltype(c.Dr7))0xD << 16); c.EFlags &= ~0x100u;
+        auto watch_event = [&](bool tf, bool mixed = false) {
+            if (tf) c.EFlags |= 0x100u;
+            if (mixed) {
+                c.Dr1 = (decltype(c.Dr1))new_address;
+                c.Dr7 |= 4 | ((decltype(c.Dr7))0xD << 20);
+            }
+            d.put(c);
+            const auto armed = d.get();
+            require(armed.Dr0 == c.Dr0 && (armed.Dr7 & 1) && ((armed.Dr7 >> 16) & 0xF) == 0xD, "watch armed before execution");
+            d.resume(); d.wait(EXCEPTION_SINGLE_STEP, site + 4);
+            const auto raised = d.get();
+            const DWORD64 expect = (tf ? 0x4000u : 0u) | (mixed ? 3u : 1u);
+            std::fprintf(stderr, "dr-review: real #DB dr6=0x%llx flags=0x%lx\n",
+                         (unsigned long long)raised.Dr6, (unsigned long)raised.EFlags);
+            require((raised.Dr6 & 0xE00Fu) == expect, "real hardware exception status");
+        };
+        auto positive_watch = [&] {
+            // Every stale-hit rejection must still accept a subsequent REAL access.
+            auto next = d.get();
+            EMU_IP(next) = (decltype(EMU_IP(next)))site;
+            next.EFlags &= ~0x100u; next.Dr6 = 0;
+            next.Dr0 = (decltype(next.Dr0))p->address;
+            next.Dr7 = 1 | ((decltype(next.Dr7))0xD << 16);
+            d.put(next); d.resume(); d.wait(EXCEPTION_SINGLE_STEP, site + 4);
+            settle_hw_thread(s, d.pi.dwThreadId); // a new event, not the previous hit's carry
+            s->event_tid = d.pi.dwThreadId;
+            require((d.get().Dr6 & 0xE00Fu) == 1, "new access real B0");
+            const unsigned before = callbacks; const uint64_t hits = p->hits;
+            bool handled = false;
+            require(handle_hw(s, d.ev, handled) && handled, "new access handled");
+            require(callbacks == before + 1 && p->hits == hits + 1, "new access callback and hit");
+        };
+        if (mode == "release") {
+            c.Dr0 = (decltype(c.Dr0))target_address; c.Dr1 = (decltype(c.Dr1))(target_address + 4);
+            c.Dr2 = (decltype(c.Dr2))(target_address + 8); c.Dr3 = (decltype(c.Dr3))(target_address + 12);
+            c.Dr7 = 0xDDDD0055; d.put(c);
+            const auto before = d.get();
+            hw_yield_to_target(s, d.pi.dwThreadId, d.pi.hThread); release_hw(s, *p);
+            const auto after = d.get();
+            require(after.Dr0 == before.Dr0 && after.Dr7 == before.Dr7, "release preserves target slots");
+        } else if (mode == "queued" || mode == "queued-same" || mode == "queued-rearm") {
+            watch_event(false);
+            s->event_tid = 0; keep_queued_dr6(s, d.pi.dwThreadId, d.pi.hThread);
+            require((s->dr6_lost.at(d.pi.dwThreadId).bits & 1) != 0, "queued B0 captured");
+            if (mode != "queued-rearm") {
+                auto replacement = std::make_unique<Probe>(*p);
+                p->active = false; p->dr_slot = -1;
+                p = replacement.get(); s->probes.push_back(std::move(replacement));
+            }
+            p->address = mode == "queued" ? new_address : old_address; p->hw_generation = 2;
+            s->hw_armed_ever.insert(p->address);
+            require(set_dr_on_thread(d.pi.hThread, 0, p->address, true, 1, 3), "replace queued slot");
+            settle_hw_thread(s, d.pi.dwThreadId);
+            require((dr6_carried(s, d.pi.dwThreadId) & 1) != 0, "queued B0 carried");
+            bool handled = false;
+            require(handle_hw(s, d.ev, handled) && handled && callbacks == 0 && p->hits == 0, "stale access rejected");
+            positive_watch();
+        } else if (mode == "deferred" || mode == "deferred-reused" || mode == "deferred-carried-reused") {
+            watch_event(false);
+            if (mode == "deferred-carried-reused") {
+                s->event_tid = 0; keep_queued_dr6(s, d.pi.dwThreadId, d.pi.hThread);
+                p->address = new_address; p->hw_generation = 2; s->hw_armed_ever.insert(new_address);
+                require(set_dr_on_thread(d.pi.hThread, 0, new_address, true, 1, 3), "replace before holding carried watch");
+                settle_hw_thread(s, d.pi.dwThreadId);
+            }
+            auto raised = d.get(); raised.Dr6 |= dr6_carried(s, d.pi.dwThreadId);
+            require(hold_watch_hit(s, d.ev, raised, 0), "watch held during call");
+            const auto &saved = s->dr6_lost.at(d.pi.dwThreadId);
+            require(saved.address[0] == old_address && saved.generation[0] == 1, "held watch ownership captured");
+            if (mode == "deferred-reused") {
+                p->address = new_address; p->hw_generation = 2; s->hw_armed_ever.insert(new_address);
+                require(set_dr_on_thread(d.pi.hThread, 0, new_address, true, 1, 3), "replace held watch");
+            }
+            d.resume(); // thread remains suspended by hold_watch_hit, exactly as during a call
+            {
+                FiberHost fibers(s);
+                require(poll_calls(s), "replay held watch after call");
+            }
+            require(s->watch_deferred.empty() && callbacks == (mode == "deferred" ? 1u : 0u), "held watch callback identity");
+            d.wait(EXCEPTION_BREAKPOINT, done);
+            positive_watch();
+        } else if (mode == "watch-tf" || mode == "watch-tf-carried") {
+            watch_event(true);
+            if (mode == "watch-tf-carried") {
+                s->event_tid = 0; keep_queued_dr6(s, d.pi.dwThreadId, d.pi.hThread);
+                require(set_dr_on_thread(d.pi.hThread, 0, old_address, true, 1, 3), "write DRs over queued BS+B0");
+                settle_hw_thread(s, d.pi.dwThreadId);
+                require((dr6_carried(s, d.pi.dwThreadId) & 0x4001) == 0x4001, "BS+B0 carried");
+            }
+            bool handled = false;
+            require(handle_hw(s, d.ev, handled) && !handled && callbacks == 1 && p->hits == 1, "watch callback and target step forwarding");
+            d.resume(DBG_EXCEPTION_NOT_HANDLED); d.wait(EXCEPTION_BREAKPOINT, done);
+            const auto result = d.result();
+            require(result.seen == 1 && (result.flags & 0x100) && (result.dr6 & 0x4000) && !(result.dr6 & 1), "target VEH sees its step only");
+        } else if (mode == "gate") {
+            watch_event(false); // B0 belongs to the target, whose slot replaced the gate
+            p->active = false; s->hw_active = 0; s->gates.emplace_back(target_address, 0);
+            s->hw_armed_ever.insert(target_address); s->detaching = false;
+            bool handled = false;
+            require(!handle_gate(s, d.ev, handled) && !handled && s->held.empty(), "foreign exception is not an install gate");
+            const auto before = d.get(); release_held(s, "test"); const auto after = d.get();
+            require(after.Dr0 == before.Dr0 && after.Dr7 == before.Dr7, "gate cleanup preserves target slot");
+        } else if (mode == "step-entry") {
+            const unsigned char trap = 0xCC; SIZE_T n = 0;
+            require(!!WriteProcessMemory(d.pi.hProcess, (void *)(uintptr_t)site, &trap, 1, &n) && n == 1, "arm software site");
+            FlushInstructionCache(d.pi.hProcess, (void *)(uintptr_t)site, 1);
+            p->flags = PROBE_BREAKPOINT; p->dr_slot = -1; p->address = site;
+            p->original = 0x66; p->orig_insn = {0x66,0x0F,0xD6,0x01}; p->insn_len = 4; p->displaced_ok = true;
+            s->dr_used = s->dr_ever = 0; s->hw_active = 0;
+            c.Dr7 = c.Dr6 = 0; c.EFlags |= 0x100; d.put(c);
+            d.resume(); d.wait(EXCEPTION_BREAKPOINT, site);
+            DWORD disposition = 0;
+            require(dispatch_event(s, d.ev, disposition) && disposition == DBG_CONTINUE, "software hit dispatched");
+            const auto st = s->stepping.find(d.pi.dwThreadId);
+            require(st != s->stepping.end() && !st->second.displaced && st->second.prog_tf && callbacks == 1, "program TF steps at real site");
+        } else if (mode == "step-own" || mode == "step-tf" || mode == "step-mixed") {
+            const bool mixed = mode == "step-mixed", tf = mode == "step-tf";
+            p->active = mixed; s->hw_active = mixed ? 1 : 0; s->dr_used = s->dr_ever = mixed ? 1 : 0;
+            if (tf) c.Dr7 = 0;
+            StepState st{}; st.site = site; st.insn_len = 4; st.prog_tf = tf;
+            s->stepping.emplace(d.pi.dwThreadId, st);
+            if (tf) {
+                c.EFlags |= 0x100; d.put(c); d.resume(); d.wait(EXCEPTION_SINGLE_STEP, site + 4);
+                require((d.get().Dr6 & 0xE00F) == 0x4000, "real TF-only exception");
+            } else watch_event(true, mixed);
+            DWORD disposition = 0;
+            require(dispatch_event(s, d.ev, disposition) && disposition == DBG_EXCEPTION_NOT_HANDLED, "step forwards target exception");
+            require(s->stepping.empty() && callbacks == (mixed ? 1u : 0u) && p->hits == (mixed ? 1u : 0u), "step completion and mixed callback");
+            d.resume(disposition); d.wait(EXCEPTION_BREAKPOINT, done);
+            const auto result = d.result();
+            require(result.seen == 1 && ((result.flags & 0x100) != 0) == tf &&
+                    ((result.dr6 & 0x4000) != 0) == tf && (tf || (result.dr6 & (mixed ? 2 : 1))), "target VEH sees only its own flags/status");
+        } else if (mode == "detach-dr" || mode == "detach-tf") {
+            const bool tf = mode == "detach-tf";
+            p->active = false; s->hw_active = 0; s->dr_used = 0;
+            c.Dr0 = (decltype(c.Dr0))target_address;
+            if (tf) { s->dr_ever = 0; c.Dr7 = 0; c.EFlags |= 0x100; }
+            d.put(c);
+            const auto before = d.get();
+            require(((before.EFlags & 0x100) != 0) == tf, "detach input TF");
+            require(SuspendThread(d.pi.hThread) != (DWORD)-1, "hold child across detach");
+            d.resume(); detach(s);
+            BOOL debugged = TRUE;
+            require(!!CheckRemoteDebuggerPresent(d.pi.hProcess, &debugged) && !debugged, "debugger detached");
+            d.attached = false;
+            const auto after = d.get();
+            require(after.Dr0 == before.Dr0 && after.Dr7 == before.Dr7 &&
+                    ((after.EFlags ^ before.EFlags) & 0x100) == 0, "detach preserves target DRs/TF");
+        } else require(false, "known scenario");
+        for (auto &kv : s->own_thread_handle) CloseHandle(kv.second);
+        ok = true;
+    } catch (const std::exception &e) {
+        failed = e.what(); // stage names are fixed literals without JSON metacharacters
+    }
+    std::printf("{\"kind\":\"dr_review\",\"case\":\"%s\",\"ok\":%d,\"callbacks\":%u,\"failure\":\"%s\"}\n",
+                mode.c_str(), ok ? 1 : 0, callbacks, failed.c_str());
     return ok ? 0 : 1;
 }

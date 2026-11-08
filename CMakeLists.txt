@@ -691,12 +691,11 @@ add_executable(ctrl_driver examples/ctrlreview/ctrl_driver.cpp examples/ctrlrevi
 target_include_directories(ctrl_driver PRIVATE include)
 target_link_libraries(ctrl_driver PRIVATE probe_api)
 add_dependencies(ctrl_driver ctrl_target ctrl_dll ctrl_cfr_a ctrl_cfr_b probe_api_agent)
-# Suspended-context controller regression checks (never execute fabricated target state).
+# Controller ownership regressions: a self-hosted debuggee generates real #DB events.
 add_executable(ctrl_dr_review examples/ctrlreview/ctrl_dr_review.cpp)
 target_link_libraries(ctrl_dr_review PRIVATE probe_api Zydis)
 target_include_directories(ctrl_dr_review PRIVATE src include)
 target_compile_options(ctrl_dr_review PRIVATE /W4)
-add_dependencies(ctrl_dr_review ctrl_target)
 
 add_dependencies(ar_target ctrl_cfr_a)
 # A host DLL linking UHH statically, loaded/unloaded in a loop (regress ctrl-symload-unload).

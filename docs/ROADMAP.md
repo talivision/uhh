@@ -260,9 +260,15 @@ reads, a slow (50 ms) callback under 32 threads.
   With target TF or debug registers, software instructions run in place so the target sees
   the real exception address. Queued DR6 status keeps BS plus each B-bit's address and arm
   generation, preventing slot reuse (including same-address reloads) from hitting a replacement
-  data probe. Tests: `check_ctrl_own_debug`, `ctrl-own-debug-*` (suspended real Windows contexts;
-  deterministic release, slot reuse, gate, step, and detach checks on both architectures).
-  Windows build/runtime verification pending; shared agent layout/version unchanged.
+  data probe. Tests: `check_ctrl_own_debug`, `ctrl-own-debug-*` (real #DB events from a
+  self-hosted debuggee, with incoming-status and target-VEH assertions; deterministic release,
+  slot reuse, gate, step, and detach checks on both architectures). CI follow-up: held data
+  watches also save address/generation before replay (`deferred`, `deferred-reused`); leaving
+  those fields zero rejected every deferred watch in `callfunc-watch[-lock]-{breakpoint,hw}`
+  and `sessions-repeat`. The original fixture tried to write synthetic DR6/TF onto a
+  never-started thread, which Windows sanitizes; it now arms watches, executes real stores,
+  and checks a positive callback after every stale-hit rejection. Existing call/watch checks
+  retain their assertions. Windows verification pending; shared agent layout/version unchanged.
 - ✅ (A8) hw: a hardware probe inside a DLL that 4 threads keep LoadLibrary/FreeLibrary-ing missed
   hits (60-125 of 240, "whole threads"). Proven cause (huntaudit): NOT the late UNLOAD suspected
   here -- with the stale-unload guard of 6d0147a disabled, 24 runs (x64 + x86) saw no late unload
