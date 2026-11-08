@@ -630,6 +630,19 @@ target_include_directories(stacks_driver PRIVATE include)
 target_link_libraries(stacks_driver PRIVATE probe_api)
 add_dependencies(stacks_driver stacks_target probe_api_agent)
 
+# --- instruction-boundary fixture (regress `boundary-*`, examples/boundary) -------------
+# Known instruction layouts; /Zi on the .asm too, so the x86 BndFrame gets a PDB extent.
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    set(BND_ASM examples/boundary/boundary_x86.asm)
+else()
+    set(BND_ASM examples/boundary/boundary_x64.asm)
+endif()
+add_executable(boundary_target examples/boundary/boundary_target.c ${BND_ASM})
+target_compile_options(boundary_target PRIVATE /Zi)
+target_compile_definitions(boundary_target PRIVATE _CRT_SECURE_NO_WARNINGS)
+target_link_options(boundary_target PRIVATE /DEBUG /INCREMENTAL:NO /EXPORT:BndFrame /EXPORT:BndLeaf /EXPORT:BndHidden)
+set_property(TARGET boundary_target PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+
 # --- controller review fixtures (regress `ctrl-*`, examples/ctrlreview) ------------------
 # inplace-* shapes (ctrl_shapes_*.asm): each probed instruction is exported for probe_add_symbol
 set(CTRL_SHAPES jmp8 jmp32 jcc8_taken jcc8_not jcc8_alt jcc32_taken call32 callmem ret loop_taken loop_not
