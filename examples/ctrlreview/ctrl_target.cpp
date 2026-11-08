@@ -24,6 +24,9 @@
 //   ctrl_target absreuse                absolute INT3 in an unloaded DLL; its address reused (cdx-absreuse)
 //   ctrl_target cfreuse                 call_func into a DLL that unloads and whose name and base
 //                                       another DLL then takes (cdx-cfreuse)
+//   ctrl_target cfrace | cfpin          call_func stalled (agent test knob UHH_TEST_CF_STALL) while
+//                                       another thread unloads the callee's DLL (cfrace: and maps
+//                                       another at its base) (cdx-cfrace / cdx-cfpin, inline)
 //   ctrl_target cfnx                    call_func into module code whose execute rights the program
 //                                       removes between calls: must refuse, not fault (cdx-cfnx)
 //   ctrl_target codeprot                inline stack capture while the program guards / no-accesses
@@ -467,6 +470,68 @@ static int run_cfreuse() {
     return 0;
 }
 
+// ---- cdx-cfrace / cdx-cfpin (codex5 #1): the unload lands INSIDE one call_func ------------
+// The agent's test knob (UHH_TEST_CF_STALL=resolved|pinned) stops the phase-4 call_func once,
+// right after it resolved cfr.dll!CfrValue (A's), before / after pinning the module, and
+// signals Local\uhh_test_cf_<pid>; a second thread then frees A (cfrace: and loads B at A's
+// base, CfrDecoy = 99 where A's CfrValue was) and releases it (Local\uhh_test_cf_go_<pid>).
+// cfrace: the call must reach B's CfrValue (2: resolved again) or be refused -- never 99.
+// cfpin: the pinned module stays mapped across the FreeLibrary (held), the call reaches A's
+// CfrValue (1), and A is really unmapped once the call is done (gone_after); phase 5 (nothing
+// named cfr.dll loaded) is refused.
+static bool image_at(uintptr_t base) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    return base && VirtualQuery((void *)base, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
+           mbi.Type == MEM_IMAGE && (uintptr_t)mbi.AllocationBase == base;
+}
+struct CfRace { HANDLE at, go; HMODULE ma, mb; const wchar_t *b; bool pin; int stalled, held; };
+static DWORD WINAPI cfrace_thread(void *p) {
+    CfRace &x = *(CfRace *)p;
+    x.stalled = WaitForSingleObject(x.at, 30000) == WAIT_OBJECT_0;   // the call_func is stopped
+    FreeLibrary(x.ma);
+    x.held = image_at((uintptr_t)x.ma);                  // still mapped: a reference outlived ours
+    if (!x.pin) x.mb = LoadLibraryW(x.b);                // B at A's base (fixed base, A is gone)
+    SetEvent(x.go);
+    return 0;
+}
+static int run_cfrace(bool pin) {
+    const char *sc = pin ? "cfpin" : "cfrace";
+    wchar_t self[MAX_PATH], tmp[MAX_PATH];
+    if (!GetModuleFileNameW(nullptr, self, MAX_PATH) || !GetTempPathW(MAX_PATH, tmp)) return 1;
+    std::wstring dir(self); dir.resize(dir.find_last_of(L'\\') + 1);
+    const std::wstring root = std::wstring(tmp) + L"uhh-" + std::wstring(pin ? L"cfpin-" : L"cfrace-") +
+                              std::to_wstring(GetCurrentProcessId());
+    const std::wstring a = root + L"\\a\\cfr.dll", b = root + L"\\b\\cfr.dll";
+    CreateDirectoryW(root.c_str(), nullptr);
+    CreateDirectoryW((root + L"\\a").c_str(), nullptr); CreateDirectoryW((root + L"\\b").c_str(), nullptr);
+    if (!CopyFileW((dir + L"ctrl_cfr_a.dll").c_str(), a.c_str(), FALSE) ||
+        !CopyFileW((dir + L"ctrl_cfr_b.dll").c_str(), b.c_str(), FALSE)) {
+        std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"%s\",\"error\":\"copy\"}\n", sc); return 1;
+    }
+    const std::wstring pid = std::to_wstring(GetCurrentProcessId());
+    HANDLE at = CreateEventW(nullptr, FALSE, FALSE, (L"Local\\uhh_test_cf_" + pid).c_str());
+    HANDLE go = CreateEventW(nullptr, TRUE, FALSE, (L"Local\\uhh_test_cf_go_" + pid).c_str());
+    CfRace r{};
+    r.at = at; r.go = go; r.b = b.c_str(); r.pin = pin;
+    r.ma = LoadLibraryW(a.c_str());
+    const uintptr_t base_a = (uintptr_t)r.ma;
+    if (!at || !go || !r.ma) {
+        std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"%s\",\"error\":\"setup\"}\n", sc); return 1;
+    }
+    HANDLE t = CreateThread(nullptr, 0, cfrace_thread, &r, 0, nullptr);
+    CtrlCall(4);
+    WaitForSingleObject(t, INFINITE); CloseHandle(t);
+    const int gone_after = !image_at(base_a) || (r.mb && (uintptr_t)r.mb == base_a);
+    CtrlCall(5);
+    if (r.mb) FreeLibrary(r.mb);
+    CloseHandle(at); CloseHandle(go);
+    DeleteFileW(a.c_str()); DeleteFileW(b.c_str());
+    RemoveDirectoryW((root + L"\\a").c_str()); RemoveDirectoryW((root + L"\\b").c_str()); RemoveDirectoryW(root.c_str());
+    std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"%s\",\"stalled\":%d,\"held\":%d,\"gone_after\":%d,"
+                "\"same_base\":%d}\n", sc, r.stalled, r.held, gone_after, r.mb && (uintptr_t)r.mb == base_a ? 1 : 0);
+    return 0;
+}
+
 // ---- cdx-cfnx: the program removes execute rights from a still-loaded module's code between
 // call_func calls. call_func must refuse (return 0) the same as breakpoint/hw, WITHOUT calling
 // into the page -- a call would raise a first-chance exception this program's handler would see.
@@ -695,6 +760,8 @@ int main(int argc, char **argv) {
     else if (sc == "absreuse") rc = run_absreuse();
     else if (sc == "cfreuse") rc = run_cfreuse();
     else if (sc == "cfnx") rc = run_cfnx();
+    else if (sc == "cfrace") rc = run_cfrace(false);
+    else if (sc == "cfpin") rc = run_cfrace(true);
     else if (sc == "codeprot") rc = run_codeprot();
     else if (sc == "int3cap") rc = run_int3cap(arg_int(argc, argv, "--n", 1200));
     else if (sc == "bigcfg") rc = run_bigcfg();

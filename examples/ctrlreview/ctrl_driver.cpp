@@ -1,4 +1,4 @@
-// ctrl_driver --scenario fault|faultreg|faultmix|inplace|absunload|symunload|owndr|owndrx|absreuse|cfreuse|cfnx|codeprot|int3cap|
+// ctrl_driver --scenario fault|faultreg|faultmix|inplace|absunload|symunload|owndr|owndrx|absreuse|cfreuse|cfnx|cfrace|cfpin|codeprot|int3cap|
 //                        bigcfg|headcorrupt|shape [--shape S] --backend b
 //             -- <ctrl_target.exe> <scenario> [opts]
 // Instruments ctrl_target for one controller-review finding (see ctrl_target.cpp) with
@@ -84,7 +84,7 @@ int main(int argc, char **argv) {
             ok = probe_add_symbol(s, "ctrl_target.exe!CtrlTick", ctrl_on_tick, backend);
         else if (sc == "absreuse" || sc == "int3cap")
             ok = probe_add_symbol(s, "ctrl_target.exe!CtrlOp", ctrl_on_op, backend);
-        else if (sc == "cfreuse" || sc == "cfnx")
+        else if (sc == "cfreuse" || sc == "cfnx" || sc == "cfrace" || sc == "cfpin")
             ok = probe_add_symbol(s, "ctrl_target.exe!CtrlCall", ctrl_on_cfcall, backend);
         else if (sc == "codeprot")
             ok = probe_add_symbol(s, "ctrl_target.exe!CtrlCodeLeaf", ctrl_on_leaf, backend);

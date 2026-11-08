@@ -965,8 +965,26 @@ using ldr_notify_fn = VOID(CALLBACK *)(ULONG reason, const void *data, void *con
 static VOID CALLBACK on_dll_notification(ULONG reason, const void *, void *) {
     if (reason == 2) InterlockedIncrement(&g_unload_gen);    // LDR_DLL_NOTIFICATION_REASON_UNLOADED
 }
+// Test knob (regress cdx-cfrace-inline, cdx-cfpin-inline): UHH_TEST_CF_STALL=resolved|pinned in
+// the TARGET's environment (read once at init) stops ONE inline call_func between resolving its
+// callee and calling it: it signals Local\uhh_test_cf_<pid> and waits for
+// Local\uhh_test_cf_go_<pid> while the target unloads (and replaces) the callee's DLL.
+static volatile LONG g_test_cf_stall;    // 0 off, 1 resolved, 2 pinned
+static void test_cf_point(LONG where) {
+    if (g_test_cf_stall != where || InterlockedCompareExchange(&g_test_cf_stall, 0, where) != where) return;
+    wchar_t at[64], go[64];
+    _snwprintf_s(at, _countof(at), _TRUNCATE, L"Local\\uhh_test_cf_%lu", GetCurrentProcessId());
+    _snwprintf_s(go, _countof(go), _TRUNCATE, L"Local\\uhh_test_cf_go_%lu", GetCurrentProcessId());
+    HANDLE a = OpenEventW(EVENT_MODIFY_STATE, FALSE, at), g = OpenEventW(SYNCHRONIZE, FALSE, go);
+    if (a && g) { SetEvent(a); WaitForSingleObject(g, INFINITE); }
+    if (a) CloseHandle(a);
+    if (g) CloseHandle(g);
+}
 static void watch_unloads() {
     if (g_dll_cookie) return;
+    char knob[16] = {};
+    if (GetEnvironmentVariableA("UHH_TEST_CF_STALL", knob, sizeof(knob)))
+        g_test_cf_stall = !strcmp(knob, "resolved") ? 1 : !strcmp(knob, "pinned") ? 2 : 0;
     using reg_fn = LONG(NTAPI *)(ULONG, ldr_notify_fn, void *, void **);
     auto reg = reinterpret_cast<reg_fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "LdrRegisterDllNotification"));
     void *cookie = nullptr;
@@ -1040,6 +1058,7 @@ extern "C" int call_func(probe_context *c, const char *symbol, uint64_t *ret, in
     if (!call_func_guarded(c)) return 0;
     const uint64_t fn = resolve_callee(symbol);
     if (!fn) return 0;
+    test_cf_point(1); test_cf_point(2);                    // (test knob: no pin here)
 #if defined(_WIN64)
     return call_raw(fn, a, ret) ? 1 : 0;
 #else

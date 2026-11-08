@@ -86,9 +86,9 @@ RESULTS = []  # (name, status, detail)
 ONLY = []     # --only substrings (empty: the full suite)
 
 
-def run(args, timeout=180, feed=None):
+def run(args, timeout=180, feed=None, env=None):
     r = subprocess.run([str(a) for a in args], capture_output=True, text=True,
-                       timeout=timeout, input=feed)
+                       timeout=timeout, input=feed, env=env)
     objs = []
     for line in r.stdout.splitlines():
         line = line.strip()
@@ -3621,6 +3621,60 @@ def check_boundary(iters=50):
             except Exception as e:
                 record(name, False, repr(e))
 
+    # codex5 #3: BndNoret -- `call BndDie` (never returns), a data byte B8, then the real block,
+    # one `ret`, reached only by an indirect jump. The call's fall-through decodes B8 C3.. as a
+    # `mov eax, imm32` over that ret: a false refusal (not overridable) before the fix. A probe
+    # on the ret is accepted and hits on every backend (inline: --allow-unsafe-site, for the
+    # inline-only "hook across the end of the function" rule of a 1-byte ret -- an overridable
+    # refusal, unlike the boundary one).
+    noret = pe_export_bytes(x, "BndNoret", 32) or b""
+    nr = 0x1A if x86 else 0x18
+    if noret[nr - 6] != 0xE8 or noret[nr - 1:nr + 1] != b"\xb8\xc3":
+        record("boundary-layout-noret", False, f"fixture layout changed: noret={noret.hex()}")
+    else:
+        for bk in ("breakpoint", "hw", "inline"):
+            name = f"boundary-noret-{bk}"
+            loc = f"{m}!BndNoret+0x{nr:x}"
+            try:
+                extra = ["--allow-unsafe-site"] if bk == "inline" else []
+                r, objs = run([t, "--backend", bk, *extra, "-p", f"{loc}:-", "--", x, "--iters", iters], timeout=120)
+                pr = next((o for o in objs if o.get("kind") == "probe"), {})
+                tg = next((o for o in objs if o.get("kind") == "target"), {})
+                err = report(objs).get("error") or ""
+                ok = (r.returncode == 0 and tg.get("ok") is True and pr.get("backend") == bk
+                      and pr.get("hits") == iters and not err)
+                record(name, ok, f"loc={loc} rc={r.returncode} backend={pr.get('backend')} hits={pr.get('hits')}/{iters} "
+                                 f"target_ok={tg.get('ok')} err={err[:260]}")
+            except Exception as e:
+                record(name, False, repr(e))
+
+    # codex5 #2: a DATA watchpoint (PROBE_HW | PROBE_WATCH_WRITE) by symbol+offset and by
+    # module+RVA on BndSmc+0x4 -- the imm32 of its `mov eax, imm32` in .text (an extent: x64
+    # .pdata, x86 PDB), which the program rewrites -- is armed and sees every store (k + 1).
+    # Before the fix both were refused as "inside an instruction" (the absolute path skipped it).
+    w = exe("watch_driver.exe")
+    smc = pe_export_bytes(x, "BndSmc", 16) or b""
+    if not w:
+        missing_bin("boundary-watch", "watch_driver")
+    elif smc[:4] != b"\x90\x90\x90\xb8" or smc[8] != 0xC3:
+        record("boundary-layout-smc", False, f"fixture layout changed: smc={smc.hex()}")
+    else:
+        k = 40
+        for case, loc in (("sym", f"{m}!BndSmc+0x4"), ("rva", f"{m}+0x{pe_export_rva(x, 'BndSmc') + 4:x}")):
+            name = f"boundary-watch-{case}"
+            try:
+                r, objs = run([w, loc, "--", x, "--smc", k], timeout=120)
+                pr = next((o for o in objs if o.get("kind") == "probe"), {})
+                tg = next((o for o in objs if o.get("kind") == "target"), {})
+                cb = next((o.get("callback_hits") for o in objs if o.get("kind") == "watch_driver"), None)
+                err = report(objs).get("error") or ""
+                ok = (r.returncode == 0 and tg.get("ok") is True and pr.get("hits") == k + 1 and cb == k + 1
+                      and not err)
+                record(name, ok, f"loc={loc} rc={r.returncode} hits={pr.get('hits')} callbacks={cb} (want {k + 1}) "
+                                 f"target_ok={tg.get('ok')} err={err[:260]}")
+            except Exception as e:
+                record(name, False, repr(e))
+
 
 def check_handle_map(threads=4, reads=500, decoys=5000):
     """(C11) The example handle->pid map has no silent cap: probe_app first opens and closes
@@ -7115,8 +7169,8 @@ def check_ctrl_review():
     if not d or not t or not dll:
         return missing_bin("ctrl-review", "ctrl_driver/ctrl_target/ctrl_dll")
 
-    def go(sc, bk, targs, timeout=180):
-        r, o = run([d, "--scenario", sc, "--backend", bk, "--", t, sc, *targs], timeout=timeout)
+    def go(sc, bk, targs, timeout=180, env=None):
+        r, o = run([d, "--scenario", sc, "--backend", bk, "--", t, sc, *targs], timeout=timeout, env=env)
         res = next((x for x in o if x.get("kind") == "ctrl_result"), {})
         logs = [x for x in o if x.get("kind") == "probe_log"]
         rows = [x for x in o if x.get("kind") == "probe"]
@@ -7449,6 +7503,8 @@ def check_cdx_review():
         unloaded, and after another cfr.dll (B) is mapped at the same fixed base: 1 / refused /
         2 on every backend (perf6: inline caches call_func resolutions; a stale entry would
         call A's address in B -- CfrDecoy, 99 -- or the unmapped image).
+      cdx-cfrace-inline / cdx-cfpin-inline: the unload lands inside ONE call_func (codex5 #1,
+        agent test knob): never A's address in B; the pinned callee outlives a FreeLibrary.
       cdx-int3cap-<b>: 1200 armed software breakpoints, all read back with ONE get_mem: the
         program's bytes on every backend, no 0xCC (inline saw 0xCC past the 1024th, and one
         inline read masked at most 64).
@@ -7458,8 +7514,8 @@ def check_cdx_review():
     if not d or not t or not dll:
         return missing_bin("cdx-review", "ctrl_driver/ctrl_target/ctrl_dll")
 
-    def go(sc, bk, targs, timeout=180):
-        r, o = run([d, "--scenario", sc, "--backend", bk, "--", t, sc, *targs], timeout=timeout)
+    def go(sc, bk, targs, timeout=180, env=None):
+        r, o = run([d, "--scenario", sc, "--backend", bk, "--", t, sc, *targs], timeout=timeout, env=env)
         res = next((x for x in o if x.get("kind") == "ctrl_result"), {})
         logs = [str(x.get("message", "")) for x in o if x.get("kind") == "probe_log"]
         rows = [x for x in o if x.get("kind") == "probe"]
@@ -7549,6 +7605,33 @@ def check_cdx_review():
             want = ["cf phase=1 ok=1 r=1", "cf phase=2 ok=0 r=-1", "cf phase=3 ok=1 r=1"]
             if cf != want: bad.append(f"calls={cf} (want {want})")
             record(name, not bad, " ".join(bad) or "exec call=1, NX refused (no fault), exec again=1")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    # codex5 #1, inline (the agent's call path; the test knob lives in the agent): the unload lands
+    # INSIDE one call_func, between resolving the callee and calling it (UHH_TEST_CF_STALL stops
+    # the call there and hands over to the target's second thread; see ctrl_target run_cfrace).
+    #   cdx-cfrace-inline: stopped right after the resolution; the thread frees cfr.dll A and maps
+    #     B at A's base -> the call reaches B's CfrValue (2, resolved again), never A's address in
+    #     B (CfrDecoy, 99: before the fix).
+    #   cdx-cfpin-inline: stopped right after the module pin; the thread's FreeLibrary(A) returns
+    #     but A stays mapped (held) until the call is done, the call reaches A's CfrValue (1), A is
+    #     unmapped right after it (gone_after) and the next call is refused (before the fix: A was
+    #     unmapped under the call, which faulted and returned 0).
+    for sc, want_cf, want_res in (
+            ("cfrace", ["cf phase=4 ok=1 r=2", "cf phase=5 ok=1 r=2"], {"stalled": 1, "held": 0, "same_base": 1}),
+            ("cfpin", ["cf phase=4 ok=1 r=1", "cf phase=5 ok=0 r=-1"], {"stalled": 1, "held": 1, "gone_after": 1})):
+        name = f"cdx-{sc}-inline"
+        if not cfr:
+            record(name, False, "missing ctrl_cfr_a.dll / ctrl_cfr_b.dll"); continue
+        try:
+            env = dict(os.environ, UHH_TEST_CF_STALL="resolved" if sc == "cfrace" else "pinned")
+            res, logs, rows, bad = go(sc, "inline", [], timeout=120, env=env)
+            for k, v in want_res.items():
+                if res.get(k) != v: bad.append(f"{k}={res.get(k)} (want {v})")
+            cf = [m for m in logs if m.startswith("cf ")]
+            if cf != want_cf: bad.append(f"calls={cf} (want {want_cf})")
+            record(name, not bad, " ".join(bad) or f"{cf} {res}")
         except Exception as e:
             record(name, False, repr(e))
 
