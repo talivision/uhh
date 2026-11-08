@@ -146,9 +146,22 @@ target_link_options(hook_edge PRIVATE "/MAP:$<TARGET_FILE_DIR:hook_edge>/hook_ed
 add_executable(parity_target examples/frida_parity/parity_target.c ${PARITY_ASM})
 target_link_options(parity_target PRIVATE "/MAP:$<TARGET_FILE_DIR:parity_target>/parity_target.map")
 
+# The controller library's sources (session_internal.hpp: the structures they share).
+set(PROBE_API_SOURCES
+    src/probe/session.cpp          # public API: create / add / run / report / close, callback context
+    src/probe/session_loop.cpp     # debug loop: event dispatch, exceptions, fairness, context round-trips
+    src/probe/session_log.cpp      # log pipeline: writer, file appender, tailer, ring drainer
+    src/probe/session_agent.cpp    # inline agent: copies, injection, install gates, IPC
+    src/probe/session_bp.cpp       # breakpoint backend: INT3, emulation, displaced stepping
+    src/probe/session_hw.cpp       # hw backend: debug registers, watchpoints, fixups
+    src/probe/session_site.cpp     # site analysis: pre-hooks, entry points, instruction boundaries
+    src/probe/session_call.cpp     # callbacks, call_func, call_original, return_from
+    src/probe/session_lifecycle.cpp  # launch / attach, controller-death guard, detach
+    src/probe/session_symbols.cpp  # module names, locations, export / symbol resolution
+    src/probe/symbols.cpp)
 # --- UHH library: the locked probe_api. External native-bitness INT3 and injected
 #     SafetyHook mid-hooks. Builds for both -A x64 and -A Win32. ----------------
-add_library(probe_api STATIC src/probe/session.cpp src/probe/symbols.cpp)
+add_library(probe_api STATIC ${PROBE_API_SOURCES})
 target_include_directories(probe_api PUBLIC include)
 target_link_libraries(probe_api PRIVATE Zydis)   # decode probe sites for displaced stepping
 
@@ -494,9 +507,9 @@ target_include_directories(co_driver PRIVATE include)
 target_link_libraries(co_driver PRIVATE probe_api)
 add_dependencies(co_driver co_target probe_api_agent)
 # Test-only build of the controller library: UHH_TEST_HOOKS compiles in fault-injection points
-# (session.cpp, e.g. the controller dying right after it writes an INT3). Linked only into
+# (src/probe/session*.cpp, e.g. the controller dying right after it writes an INT3). Linked only into
 # co_driver_th (regress `cxlib-*`); nothing shipped uses it.
-add_library(probe_api_testhooks STATIC src/probe/session.cpp src/probe/symbols.cpp)
+add_library(probe_api_testhooks STATIC ${PROBE_API_SOURCES})
 target_include_directories(probe_api_testhooks PUBLIC include)
 target_link_libraries(probe_api_testhooks PRIVATE Zydis)
 target_compile_definitions(probe_api_testhooks PRIVATE UHH_TEST_HOOKS _CRT_SECURE_NO_WARNINGS)
