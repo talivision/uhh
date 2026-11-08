@@ -4,7 +4,6 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
 
 #define CTRL_EXPORT extern "C" __declspec(dllexport)
 
@@ -89,29 +88,20 @@ CTRL_EXPORT void ctrl_on_bigcfg(probe_context *c) {
     send_log(c, "%s bigcfg add=%d", r == 1 ? "ok" : "FAIL", r);
 }
 
-struct ctrl_code_cfg { ctrl_cfg mode; uint64_t address; };
-
 // Writable-code patches exercise both a displaced immediate and a write covering the INT3.
 CTRL_EXPORT void ctrl_on_codewrite(probe_context *c) {
-    const ctrl_code_cfg *cfg = (const ctrl_code_cfg *)get_config(c);
-    const uint64_t pc = cfg->address;
+    const uint64_t pc = get_func_arg(c, 0);
     unsigned char code[5] = {};
     int ok = get_mem(c, pc, code, sizeof(code));
     uint32_t value = 0; memcpy(&value, code + 1, sizeof(value)); ++value;
     memcpy(code + 1, &value, sizeof(value));
-    const int whole = cfg->mode.pad != 0;
+    const int whole = get_func_arg(c, 1) != 0;
     ok = ok && set_mem(c, pc + (whole ? 0 : 1), code + (whole ? 0 : 1), whole ? 5 : 4);
-    send_log(c, "codewrite ok=%d value=%u", ok, value);
+    send_log(c, "codewrite ok=%d value=%u whole=%d", ok, value, whole);
 }
 CTRL_EXPORT void ctrl_on_codearm(probe_context *c) {
-    const ctrl_cfg *cfg = (const ctrl_cfg *)get_config(c);
-    // Add by address with a mode encoded in a small configuration.
-    char loc[32];
     const uint64_t addr = get_func_arg(c, 0);
-    // Symbol grammar accepts absolute addresses as well as module names.
-    snprintf(loc, sizeof(loc), "0x%llx", (unsigned long long)addr);
-    const ctrl_code_cfg code_cfg{*cfg, addr};
-    const int added = probe_add_symbol_cfg(get_session(c), loc, ctrl_on_codewrite, cfg_backend(c), &code_cfg, sizeof(code_cfg));
+    const int added = probe_add_address(get_session(c), addr, ctrl_on_codewrite, cfg_backend(c));
     send_log(c, "codearm add=%d", added);
 }
 CTRL_EXPORT void ctrl_on_callpair(probe_context *c) {

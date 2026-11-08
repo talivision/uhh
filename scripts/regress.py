@@ -7248,8 +7248,12 @@ def check_logsite_review():
     try:
         r, o = go("callpair", "breakpoint", ["callpair"])
         logs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
-        record(name, r.returncode == 0 and "callpair add=0" in logs and "call's return point at +0x2" in r.stderr,
-               f"rc={r.returncode} logs={logs} stderr={r.stderr[-500:]}")
+        inline = [x for x in o if x.get("kind") == "probe" and x.get("backend") == "inline"]
+        # Submission succeeds; pending-inline vetting must retire it before installation.
+        record(name, r.returncode == 0 and logs == ["callpair add=1"] and len(inline) == 1 and
+               inline[0].get("active") is False and inline[0].get("hits") == 0 and
+               "refused: 7-byte hook would be written across a call's return point at +0x2" in r.stderr,
+               f"rc={r.returncode} logs={logs} inline={inline} stderr={r.stderr[-500:]}")
     except Exception as e:
         record(name, False, repr(e))
 
@@ -7257,14 +7261,17 @@ def check_logsite_review():
         for mode in ("immediate", "whole"):
             name = f"logsite-codewrite-{bk}-{mode}"
             try:
-                r, o = go("codewrite", bk, ["codewrite"], ["--shape", mode])
+                r, o = go("codewrite", bk, ["codewrite", "--whole", int(mode == "whole")])
                 rep = next((x for x in o if x.get("kind") == "probe_report"), {})
                 res = next((x for x in o if x.get("kind") == "ctrl_result"), {})
                 messages = [x.get("message") for x in o if x.get("kind") == "probe_log"]
-                expected = ["codearm add=1"] + [f"codewrite ok=1 value={n}" for n in range(2, 14)]
+                sites = [x for x in o if x.get("kind") == "probe" and str(x.get("location", "")).startswith("0x")]
+                expected = ["codearm add=1"] + [f"codewrite ok=1 value={n} whole={int(mode == 'whole')}"
+                                                 for n in range(2, 14)]
                 record(name, r.returncode == 0 and res.get("bad") == 0 and messages == expected and
-                       rep.get("hits") == rep.get("logs_written") == 13 and rep.get("log_dropped") == 0,
-                       f"rc={r.returncode} result={res} report={rep} logs={messages}")
+                       rep.get("hits") == rep.get("logs_written") == 13 and rep.get("log_dropped") == 0 and
+                       len(sites) == 1 and sites[0].get("backend") == bk and sites[0].get("hits") == 12,
+                       f"rc={r.returncode} result={res} report={rep} sites={sites} logs={messages}")
             except Exception as e:
                 record(name, False, repr(e))
 
