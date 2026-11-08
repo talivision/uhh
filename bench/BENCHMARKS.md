@@ -27,8 +27,8 @@ op cost. Breakpoint/hw in **us**, inline in **ns**. Uninstrumented call: 2.5 ns 
 | get_mem 64 B at SP | 86.2 (2%) | 8.4 | 95.5 (3%) | 4.0 | 81.0 (3%) | 13.5 |
 | set_mem 8 B at SP (after an 8 B get_mem) | 86.0 (3%) | 8.2 | 100.8 (4%) | 9.3 | 90.4 (6%) | 22.9 |
 | send_log("hit %llu", arg0) | 81.3 (1%) | 3.5 | 91.2 (5%) | ~0 | 247 (34%) | 179 |
-| send_log_stack (perf6) | 163.4 (2%) | **86** | 173.6 (4%) | **85** | 1,285 (19%) | **1,216** |
-| call_func(kernel32!GetCurrentProcessId) (inline: perf6) | 279.5 (1%) | 202 | 290.6 (4%) | 199 | 139 (18%) | **69** |
+| send_log_stack (perf6) | 163.4 (2%) | **86** | 173.6 (4%) | **85** | 1,532 (33%) | **1,466** |
+| call_func(kernel32!GetCurrentProcessId) (inline: perf6) | 279.5 (1%) | 202 | 290.6 (4%) | 199 | 2,159 (2%) | **2,093** |
 | call_original + return_from | 300.4 (3%) | 223 | 250.2 (1%) | 159 | 935 (18%) | 867 |
 | control op: add_once (see below) | 274.1 (7%) | 196 | 285.5 (8%) | 194 | 305,962 (3%) | 305,895 |
 | **x86** empty = the hit itself | 124.4 (2%) | 124.4 | 138.2 (11%) | 138.2 | 136 (4%) | **134** |
@@ -38,8 +38,8 @@ op cost. Breakpoint/hw in **us**, inline in **ns**. Uninstrumented call: 2.5 ns 
 | get_mem 64 B at SP | 130.9 (2%) | 6.5 | 146.3 (9%) | 8.1 | 159 (2%) | 22.5 |
 | set_mem 8 B at SP (after an 8 B get_mem) | 139.2 (1%) | 14.8 | 152.4 (2%) | 14.2 | 174 (6%) | 37.3 |
 | send_log("hit %llu", arg0) | 135.0 (1%) | 10.6 | 148.7 (2%) | 10.5 | 269 (1%) | 133 |
-| send_log_stack (perf6) | 325 (1%) | **200** | 371 (9%) | **233** | 2,902 (21%) | **2,764** |
-| call_func(kernel32!GetCurrentProcessId) (inline: perf6) | 412 (9%) | 288 | 426 (3%) | 288 | 221 (3%) | **86** |
+| send_log_stack (perf6) | 325 (1%) | **200** | 371 (9%) | **233** | 9,019 (5%) | 8,883 |
+| call_func(kernel32!GetCurrentProcessId) (inline: perf6) | 412 (9%) | 288 | 426 (3%) | 288 | 2,171 (1%) | **2,035** |
 | call_original + return_from | 499 (5%) | 375 | 392 (4%) | 254 | 1,552 (3%) | 1,416 |
 | control op: add_once (see below) | 428 (17%) | 303 | 448 (7%) | 310 | 419,491 (4%) | 419,354 |
 
@@ -68,13 +68,19 @@ Surprises found by this table, and what `perf6` did about them (before/after: "U
   walk; frames identical. hw was slower than breakpoint on x86 because at a hw hit the walker sees the real prologue
   bytes (not our INT3) and walks one frame more (the caller the breakpoint path re-inserts from [esp]); it is ~35 us
   now. The writer's per-frame symbolization (dbghelp, same few addresses again and again) is cached by address
-  (cleared at every module load/unload), which is what made inline send_log_stack 5x cheaper on x64 (the log queue's
+  (cleared at every module load/unload), which is what makes inline send_log_stack 4.6x cheaper on x64 (the log queue's
   backpressure had made the program wait on the writer).
 - **Inline call_func was ~2.7 us** for a callee that takes ~1 ns: GetModuleHandleA + GetProcAddress + a VirtualQuery per
-  call. Fixed: a lock-free per-symbol cache, valid while no module has unloaded since the entry was resolved (the
-  loader's DLL notification, sent before an image is unmapped, bumps a generation); regress `cdx-cfreuse-*` (a DLL
-  unloaded and another mapped at its base under the same name: never called through the stale entry).
-- **Adding a probe from an inline callback costs ~100 us more than from breakpoint/hw** (x64 ~205 vs ~100 us): the
+  call. Fixed partly: a lock-free per-symbol cache for the NAME->address resolution, valid while no module has
+  unloaded since the entry was resolved (the loader's DLL notification, sent before an image is unmapped, bumps a
+  generation); regress `cdx-cfreuse-*` (a DLL unloaded and another mapped at its base under the same name: never
+  called through the stale entry). The VirtualQuery stays -- it is re-run on every call (regress `cdx-cfnx-*`) because
+  the gospel requires inline to refuse a target the program has made non-executable WITHOUT calling into it (a call
+  would raise a first-chance fault the program's own handlers would see; breakpoint/hw refuse silently). The
+  VirtualQuery turns out to be most of the cost on this VM, so the net is ~2.7 -> ~2.1 us (1.3x), not the resolve-only
+  figure.
+- **Adding a probe from an inline callback costs ~100 us more than from breakpoint/hw** (x64 ~205 vs ~100 us, not in
+  the table above -- it is the add_once rows minus the one-shot hit): the
   inline callback reaches the controller through one more debug event (a raised exception: the target stops, the
   debugger wakes, continues it) -- the same round trip as a breakpoint hit, and it is what makes the add synchronous
   (the probe is armed when the call returns, probe_api.h). The controller can only act inside a debug event (one
@@ -93,23 +99,30 @@ targets for both; quiet-VM placeholder held for the round). Median (spread) per 
 ns. Raw rows `bench/results/perf6-2026-11-08/` (x86 inline send_log_stack: a second run, `ab-x86-inline-stack.jsonl`,
 mid = perf6 without the x86 capture change, new = with it; the main run's x86 inline cell predates that change).
 
+These are the final, gospel-safe numbers (the two in-target caches were made fault-safe after a first pass;
+see the note under the table). base = merge-frida 5aad1ad. send_log_stack/call_func from `ab2_*`, add_once/empty from
+`ab-*`; x86 inline send_log_stack also measured against the no-capture-opt build in `ab2_x86_stack.jsonl`.
+
 | cell | x64 base | x64 perf6 | | x86 base | x86 perf6 | |
 |---|---:|---:|---:|---:|---:|---:|
 | breakpoint send_log_stack (us) | 236.0 (5%) | 163.4 (2%) | 1.4x | 895 (2%) | 325 (1%) | 2.8x |
 | hw send_log_stack (us) | 249.5 (1%) | 173.6 (4%) | 1.4x | 1,267 (65%) | 371 (9%) | 3.4x |
-| inline send_log_stack (ns) | 6,943 (186%) | 1,285 (19%) | 5.4x | 9,896 (26%) | 2,902 (21%) | 3.4x |
-| inline call_func (ns) | 2,774 (0%) | 139 (18%) | 20x | 2,844 (1%) | 221 (3%) | 12.9x |
+| inline send_log_stack (ns) | 7,110 (16%) | 1,532 (33%) | 4.6x | 9,907 (10%) | 9,019 (5%) | 1.1x |
+| inline call_func (ns) | 2,826 (8%) | 2,159 (2%) | 1.3x | 2,843 (1%) | 2,171 (1%) | 1.3x |
 | breakpoint add_once (us) | 256.6 (1%) | 257.1 (5%) | = | 420 (8%) | 428 (9%) | = |
 | hw add_once (us) | 286.5 (6%) | 279.5 (6%) | = | 442 (4%) | 441 (3%) | = |
 | inline add_once (us) | 290.7 (2%) | 283.8 (3%) | = | 410 (3%) | 413 (9%) | = |
 | empty (bp us / hw us / inline ns) | 77.0 / 89.8 / 67.7 | 77.7 / 88.8 / 69.3 | = | 123 / 136 / 140 | 125 / 138 / 135 | = |
 
-Op cost after (minus the same run's empty hit): send_log_stack x64 86 / 85 us (bp / hw; was 159 / 160 in this run),
-x86 200 / 233 us (was 772 / 1,131); inline send_log_stack 1.2 us x64 / 2.8 us x86 (was 6.9 / 9.8); inline call_func
-69 ns x64 / 86 ns x86 (was 2.7 us). How (docs/ROADMAP.md "perf6 findings"): the stack walk reads the target by page
-per walk (and answers reads in unreadable pages itself); the log writer's symbolization is cached by address; inline
-call_func resolutions are cached until a module unloads; the x86 inline capture classifies stack values from the TEB
-bounds and keeps module code regions until an unload. Frames reported are unchanged (`--only stack`, x64 + x86).
+Where the wins are (docs/ROADMAP.md "perf6 findings"): the big ones are **controller-side** and unconditionally safe --
+the stack walk reads the target by page per walk (breakpoint/hw send_log_stack, up to 3.4x on x86) and the log writer's
+per-frame symbolization is cached by address (inline send_log_stack x64 4.6x). The two **in-target** caches are more
+modest after being made fault-safe for the gospel: inline call_func keeps the name->address resolution but re-checks
+executability every call (1.3x, not resolve-only), and the x86 inline stack capture no longer caches module-code
+regions across hits (so x86 inline send_log_stack is ~1.1x, from the writer symbol cache only, not the 3.x of the first
+pass). A program that makes its own loaded code non-executable or a guard page between hits is refused / skipped without
+a fault or a consumed guard (regress `cdx-cfnx-*`, `cdx-codeprot-*`). Frames reported are unchanged (`--only stack`,
+x64 + x86).
 
 ### UHH_SHARED state vs plain globals (C7): equal on every backend
 

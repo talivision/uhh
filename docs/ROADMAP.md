@@ -2407,7 +2407,7 @@ windows-2022, and cet-hw).
   run the program's thread-attach/detach callouts like any thread (launch: before the entry
   point; attach/detach: while the program runs).
 
-## perf6 findings (2026-11-08, branch `perf6`: the per-method table's outliers; regress `cdx-cfreuse-*`)
+## perf6 findings (2026-11-08, branch `perf6`: the per-method table's outliers; regress `cdx-cfreuse-*`, `cdx-cfnx-*`, `cdx-codeprot-*`)
 
 Profiled with temporary QPC scopes (controller), then fixed; before/after in bench/BENCHMARKS.md "Update: perf6".
 1. **x86 bp/hw send_log_stack 0.77-1.13 ms** -- StackWalk64 read the target in ~170-280 ReadProcessMemory calls per
@@ -2422,25 +2422,42 @@ Profiled with temporary QPC scopes (controller), then fixed; before/after in ben
    caches answers by address per session, cleared at every register/unregister (the only inputs). Inline
    send_log_stack x64 6.9 -> 1.3 us.
 3. **Inline call_func 2.7 us** -- GetModuleHandleA + GetProcAddress + VirtualQuery per call. agent.cpp
-   `resolve_callee`: 64 seqlock slots keyed by the symbol string ("0x..." not cached), an entry valid while
-   `g_unload_gen` is what it was BEFORE the resolution; the loader's DLL notification (LdrRegisterDllNotification,
-   once per process at agent init; unregistered on a real unload of the agent) bumps it on every unload, before the
-   image is unmapped. 69 ns x64 / 86 ns x86. The executable check is cached with the entry (code that loses execute
-   rights while its module stays loaded is not re-checked -- the same trust as the get_mem read-region cache).
-   regress `cdx-cfreuse-<b>` (ctrlreview): cfr.dll A called, unloaded, cfr.dll B mapped at the same fixed base:
-   1 / refused / 2 on every backend; with the invalidation disabled it fails (99 = A's address in B).
-4. **x86 inline send_log_stack ~10 us** -- walk_x86 did a VirtualQuery (a WOW64 system call) per region per capture:
-   the thread's own stack and each module's code. Stack values are now classified from the TEB bounds; executable
-   IMAGE regions are kept across captures (16 seqlock slots) until `g_unload_gen` changes. ~2.9 us. Residual risk,
-   accepted as for the read-region cache: image code made NOACCESS/GUARD by the program while loaded.
+   `resolve_callee`: 64 seqlock slots cache the NAME->address resolution (keyed by the symbol string; "0x..." not
+   cached), an entry valid while `g_unload_gen` is what it was BEFORE the resolution; the loader's DLL notification
+   (LdrRegisterDllNotification, once per process at agent init; unregistered on a real unload of the agent) bumps it on
+   every unload, before the image is unmapped. regress `cdx-cfreuse-<b>` (ctrlreview): cfr.dll A called, unloaded,
+   cfr.dll B mapped at the same fixed base: 1 / refused / 2 on every backend; with the invalidation disabled it fails
+   (99 = A's address in B). The executable() check (a VirtualQuery) is NOT cached -- it runs on every call, because the
+   gospel requires inline to refuse a target the program has made non-executable WITHOUT calling into it (a call would
+   raise a first-chance fault the program's vectored handlers would see; bp/hw refuse silently via the controller).
+   regress `cdx-cfnx-<b>`: exec rights dropped from still-loaded module code between calls -> refused, no fault. That
+   VirtualQuery is most of call_func's cost on this VM, so the net is **2.7 -> 2.1 us (1.3x)**, not the resolve-only
+   ~0.1 us an unchecked cache would give (a first pass cached the verdict and hit the gospel issue above).
+4. **x86 inline send_log_stack ~10 us** -- walk_x86 did a VirtualQuery (a WOW64 system call) per region per capture.
+   Only the own-stack shortcut is kept (stack values classified from the TEB bounds -- [StackLimit,StackBase) is
+   committed read/write, never guard/no-access). Caching module-code regions across captures was REVERTED: a program
+   can VirtualProtect its own still-loaded code to NX/GUARD between hits, and a cached "readable" verdict would read it
+   (a fault the program's VEH sees; a guard-page touch consumes it). Each capture re-queries code protection, so a
+   changed page reads as unreadable and is skipped untouched. Net x86 inline send_log_stack is only **~1.1x** (the
+   writer symbol cache of (2)); the own-stack shortcut alone is within noise here. regress `cdx-codeprot-<b>`: the
+   program toggles GUARD then NO_ACCESS on a loaded module's code page (a planted return-address candidate forces the
+   scan to classify it every hit) while an inline send_log_stack probe runs -- guard stays armed, no fault, frames
+   honest, no crash.
 5. **Add from an inline callback ~100 us more than from bp/hw** -- one more debug event (the raised IPC exception):
    inherent while the debug thread alone owns the session and the add must be armed when it returns. Trimmed: one
    read of the IPC request instead of two; the "probe: ipc op=... -> 1" stderr line only on failure / PROBE_TRACE.
    No measurable change in the table. Not touched: the add itself (~25-35 us: 4 syscalls in `patch()`, the
    "probe: active" line).
-Checks: VM `--only stacks,hunt_stack,check_symbols,conformance,ctrl_review,cdx_review,callfunc,dynwatch,ret_probe,
-hitcost_methods,logs_format` x64 89/89, x86 89/89; after (4) x86 `stack,conformance,ctrl_review,logs_format,edgehunt,
-sidefx,transparency,detours_traceapi,dynwatch,cdx_review,callfunc` 149/149, x64 59/59. Agent protocol unchanged (v28).
+
+Gospel note: the two big wins (1, 2) are controller-side (ReadProcessMemory/dbghelp) and cannot fault the target. The
+two in-target caches (3, 4) were made fault-safe as above; the modest final numbers are the price of that safety.
+Merged origin/merge-frida (3fa8b72, incl. polish: add-from-callback module rules + the call_original DR warning
+record) into perf6; handle_ipc carries both polish's `cb_probe` tracking and perf6's single IPC read.
+
+Checks (final, on the merge): VM `--only cdx_review,callfunc,stacks,hunt_stack,conformance,logs_format,dynwatch,
+ret_probe,hitcost_methods,symbols,callorig_hunt,portability,edgehunt,sidefx,transparency` x64 + x86 all green (incl.
+new `cdx-cfnx-*`, `cdx-codeprot-*` and polish's `portability-matrix add.other-module`, `callorig-hunt-warn-dr`); full
+suite = the branch CI. Agent protocol unchanged (v28).
 
 ## Real-world cases
 - ✅ Microsoft Detours samples replicated (`examples/famous/detours_*`: simple, traceapi, withdll/attach, retval) -- findings above
