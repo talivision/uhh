@@ -3565,6 +3565,63 @@ def check_ret_probe(threads=2, reads=50):
             record(name, False, repr(e))
 
 
+def check_boundary(iters=50):
+    """boundary-*: a probe site INSIDE an instruction is refused on every backend, with the
+    nearest instruction boundaries, wherever UHH can decode the function (before: inline ran
+    the hook jump's displacement bytes and crashed the target, breakpoint wrote its INT3 over
+    an operand byte, hw never fired). examples/boundary has known layouts (asserted from the
+    exe's bytes): BndFrame (an extent: x64 .pdata, x86 PDB; the probed instruction is reached
+    only by a branch past an early ret), BndLeaf (no extent: decoded from the named symbol),
+    and the same BndFrame site by module+RVA (no symbol). Controls, every backend: the real
+    boundaries next to them install and hit exactly, and BndHidden+0x7 -- code after a stray
+    data byte that a linear sweep would mis-decode, reached only by a direct call -- is not
+    refused (no false refusal where the stream is unknown)."""
+    t, x = exe("uhh_trace.exe"), exe("boundary_target.exe")
+    if not t or not x:
+        return missing_bin("boundary", "uhh_trace/boundary_target")
+    x86 = pe_is_x86(x)
+    frame = pe_export_bytes(x, "BndFrame", 32) or b""
+    leaf = pe_export_bytes(x, "BndLeaf", 16) or b""
+    hidden = pe_export_bytes(x, "BndHidden", 16) or b""
+    body = 0xD if x86 else 0xB                         # imul eax, ebx, 12345678h (6 bytes)
+    layout_ok = (frame[body:body + 6] == bytes.fromhex("69c378563412") and leaf[:2] == b"\xc7\x05"
+                 and hidden[6:8] == b"\xb8\xb8")
+    if not layout_ok:
+        return record("boundary-layout", False, f"fixture layout changed: frame={frame.hex()} leaf={leaf.hex()} "
+                                                f"hidden={hidden.hex()}")
+    frva = pe_export_rva(x, "BndFrame")
+    m = "boundary_target.exe"
+    # (name, location, inside: (insn, next) offsets named relative to `named`, or None = must install, hits)
+    cases = [
+        ("frame", f"{m}!BndFrame+0x{body + 2:x}", (f"{m}!BndFrame", body, body + 6), 0),
+        ("leaf", f"{m}!BndLeaf+0x3", (f"{m}!BndLeaf", 0, 0xA), 0),
+        ("rva", f"{m}+0x{frva + body + 2:x}", (m, frva + body, frva + body + 6), 0),
+        ("frame-ok", f"{m}!BndFrame+0x{body:x}", None, iters),
+        ("leaf-ok", f"{m}!BndLeaf+0xa", None, iters),
+        ("hidden-ok", f"{m}!BndHidden+0x7", None, iters),
+    ]
+    for case, loc, inside, hits in cases:
+        for bk in ("breakpoint", "hw", "inline"):
+            name = f"boundary-{case}-{bk}"
+            try:
+                r, objs = run([t, "--backend", bk, "-p", f"{loc}:-", "--", x, "--iters", iters], timeout=120)
+                pr = next((o for o in objs if o.get("kind") == "probe"), {})
+                tg = next((o for o in objs if o.get("kind") == "target"), {})
+                err = report(objs).get("error") or ""
+                if inside:
+                    named, at, nxt = inside
+                    want = f"nearest instruction boundaries {named}+0x{at:x}, {named}+0x{nxt:x}"
+                    ok = (r.returncode != 0 and "site is inside an instruction" in err and want in err
+                          and f"at {named}+0x{at:x}" in err and not pr.get("hits"))
+                else:
+                    ok = (r.returncode == 0 and tg.get("ok") is True and pr.get("backend") == bk
+                          and pr.get("hits") == hits and not err)
+                record(name, ok, f"loc={loc} rc={r.returncode} backend={pr.get('backend')} hits={pr.get('hits')} "
+                                 f"target_ok={tg.get('ok')} err={err[:260]}")
+            except Exception as e:
+                record(name, False, repr(e))
+
+
 def check_handle_map(threads=4, reads=500, decoys=5000):
     """(C11) The example handle->pid map has no silent cap: probe_app first opens and closes
     ITSELF `decoys` times (far more than the old 1024-record limit; the handle values are
@@ -3979,8 +4036,15 @@ def check_refusals(calls=2000):
         record("refusals", False, repr(e))
 
 
-def pe_export_bytes(path, name, n=8):
-    """First n bytes of an exported function, read from the DLL FILE (no loading)."""
+def pe_export_rva(path, name):
+    """The RVA of an export, read from the image FILE (None if absent)."""
+    r = pe_export_bytes(path, name, 0, rva=True)
+    return r[0] if r else None
+
+
+def pe_export_bytes(path, name, n=8, rva=False):
+    """First n bytes of an exported function, read from the DLL FILE (no loading).
+    rva=True: (rva, bytes)."""
     import struct
     data = Path(path).read_bytes()
     pe = struct.unpack_from("<I", data, 0x3C)[0]
@@ -4006,7 +4070,7 @@ def pe_export_bytes(path, name, n=8):
         if nm == name:
             ordinal = struct.unpack_from("<H", data, off(aords) + 2 * i)[0]
             frva = struct.unpack_from("<I", data, off(afun) + 4 * ordinal)[0]
-            return data[off(frva):off(frva) + n]
+            return (frva, data[off(frva):off(frva) + n]) if rva else data[off(frva):off(frva) + n]
     return None
 
 
@@ -11940,6 +12004,7 @@ def main():
     if want(check_patch_race): check_patch_race()
     if want(check_emulated_sites): check_emulated_sites()
     if want(check_ret_probe): check_ret_probe()
+    if want(check_boundary): check_boundary()
     if want(check_gated_map): check_gated_map()
     if want(check_gated_filter): check_gated_filter()
     if want(check_callorig): check_callorig()

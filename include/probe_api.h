@@ -87,7 +87,8 @@ enum probe_flags {
        inside them -- a branch target, function start, return point or switch-table target,
        a ret/jmp followed by live code, an unresolvable indirect jump in the function, or the
        end of the code section. With this flag the reason is printed as a warning and the
-       hook is installed anyway: you assert that nothing reaches those bytes. */
+       hook is installed anyway: you assert that nothing reaches those bytes. It does not
+       override the instruction-boundary refusal (see probe_add_symbol), on any backend. */
     PROBE_ALLOW_UNSAFE_SITE = 1u << 10
 };
 
@@ -127,6 +128,12 @@ probe_session *probe_session_create(void);
    extension means "<name>.dll" ("kernel32!X" == "kernel32.dll!X"); an EXE is named with
    its extension ("probe_app.exe!X": "probe_app!X" names probe_app.dll, and a warning on
    stderr says so when probe_app.exe loads instead). Offsets are "+0x" hex only.
+   A site INSIDE an instruction (an offset or address that is not an instruction start) is
+   refused on every backend -- "probe <loc> refused: site is inside an instruction: ...;
+   nearest instruction boundaries A, B" -- wherever the function's code can be decoded
+   (its extent from .pdata on x64 or the PDB, else the symbol named before the offset); no
+   flag overrides it. Where it cannot be decoded (no extent and no symbol, code reached only
+   by indirect jumps) the site is taken as given. The same applies to probe_add_address.
    Limits, the same on every backend and from a callback: a config is at most 4 GB
    (UINT32_MAX bytes); in a session that also has inline probes at most 65536 software-
    breakpoint probes are armed at once (the next one is refused: inline get_mem must see the

@@ -57,6 +57,18 @@ Contents: [concepts](#concepts) · [types and macros](#types-and-macros) ·
   module name without extension means .dll); the loaded probe_app.exe is not matched --
   write probe_app.exe!Func to probe it` and the probe stays pending.
 - Offsets are `+0x` hexadecimal only.
+- **The site must be an instruction start.** A site inside an instruction is refused on
+  every backend (breakpoint would write its INT3 over an operand byte, inline would make the
+  program execute the hook's jump bytes, hw would never fire): `probe <loc> refused: site is
+  inside an instruction: 2 byte(s) into the 6-byte imul at app.exe!F+0xb (instruction stream
+  decoded from .pdata); nearest instruction boundaries app.exe!F+0xb, app.exe!F+0x11`. UHH
+  judges this where it can decode the function: by following its control flow (fall-through,
+  direct branches, switch tables) from the function start (`.pdata` on x64, the PDB on both
+  arches), another `.pdata`/PDB/CFG function start, or the symbol the location names --
+  never a linear sweep. Where it cannot (no extent and no symbol before the site, code reached
+  only through indirect jumps, overlapping code) the site is taken as given. No flag
+  overrides the refusal (`PROBE_ALLOW_UNSAFE_SITE` and `PROBE_FALLBACK_HW` included). The same
+  applies to `probe_add_address`.
 - A probe on a module that is not loaded yet stays **pending** and arms when the module
   loads (also a DLL loaded at run time). It goes back to pending when the module unloads
   and re-arms if it loads again.
@@ -114,7 +126,7 @@ Pass exactly one backend flag, optionally ORed with options. An unknown bit is r
 | `PROBE_ALLOW_PREHOOKED` | inline | install over a site another tool already hooked, chaining through its hook. Without it such a site is refused for inline (breakpoint/hw only report it). |
 | `PROBE_FALLBACK_HW` | inline | when the inline site is refused (pre-hooked, unsafe, or overlapping another inline hook), use a hardware execute probe instead (`probe: X -> hardware fallback (...)`). Needs a free debug register. |
 | `PROBE_UNSAFE_FAST_PATCH` | inline | write the hook **without** freezing the target. By default every other thread is suspended while a hook is written (only at install/remove, never per hit) and a thread caught inside the overwritten bytes is moved onto the trampoline. With this flag such a thread can crash. For measurement only. |
-| `PROBE_ALLOW_UNSAFE_SITE` | inline | install even where the site check refuses (code could arrive inside the >= 5 overwritten bytes: a branch target, function start, return point, switch-table target, live code after a ret/jmp, an unresolvable indirect jump, the end of the section). The reason is printed as a warning. You assert nothing reaches those bytes. |
+| `PROBE_ALLOW_UNSAFE_SITE` | inline | install even where the site check refuses (code could arrive inside the >= 5 overwritten bytes: a branch target, function start, return point, switch-table target, live code after a ret/jmp, an unresolvable indirect jump, the end of the section). The reason is printed as a warning. You assert nothing reaches those bytes. It does **not** override the [instruction-boundary refusal](#locations) (a site inside an instruction), on any backend. |
 
 ## Registers
 
@@ -163,7 +175,8 @@ A probe on an absolute address in the target, typically a return address read in
 callback. Needs a running target (`absolute-address probes need a running target`), so it
 is normally called from a callback. Watch flags are refused here (`use probe_watch for data
 watchpoints`). A probe whose address lies in a DLL that unloads is retired for good
-(`probe: <address> retired: its module unloaded`).
+(`probe: <address> retired: its module unloaded`). An address inside an instruction is
+refused as for [locations](#locations) (`probe 0x... refused: site is inside an instruction: ...`).
 
 ### `int probe_watch(probe_session *s, uint64_t address, probe_callback cb, uint32_t flags)`
 
