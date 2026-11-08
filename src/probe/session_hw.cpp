@@ -2,6 +2,8 @@
 // watchpoints, library fixups at thread start, hw hit handling.
 #include "session_internal.hpp"
 
+namespace uhh_session {
+
 // Hardware execute breakpoint: no code is modified, so there is no re-arm window and
 // nothing to single-step. Set the DR on every current thread; new threads get it in
 // the CREATE_THREAD handler. Exact under multithreading for ANY instruction (incl.
@@ -692,3 +694,5 @@ bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
     handled = !(native.Dr6 & 0xF & theirs);
     return true;
 }
+
+} // namespace uhh_session

@@ -2,6 +2,8 @@
 // instruction boundaries, site vetting.
 #include "session_internal.hpp"
 
+namespace uhh_session {
+
 // ---- Foreign-hook ("pre-hooked site") detection -------------------------------------
 // Compare the live bytes at a probe site with the same RVA in the module's file on disk
 // (bytes covered by base relocations are ignored: they legitimately differ). If they
@@ -914,3 +916,5 @@ bool vet_site(probe_session *s, Probe &p, bool &moved_to_hw) {
                  "use PROBE_ALLOW_PREHOOKED to chain, PROBE_FALLBACK_HW or PROBE_HW to avoid)");
     return false;
 }
+
+} // namespace uhh_session

@@ -1,6 +1,8 @@
 // Public x64 breakpoint + inline backends. The debug API binds event consumption
 // to the launching thread, so probe_run owns the event loop through exit.
 #include "session_internal.hpp"
+
+namespace uhh_session {
 bool trace_enabled() { static const bool on = std::getenv("PROBE_TRACE") != nullptr; return on; }
 void bench_phase(const char *what, const char *arg) {
     static const bool on = std::getenv("UHH_BENCH_PHASES") != nullptr;
@@ -196,12 +198,18 @@ uint32_t probe_index(probe_session *s, const Probe *probe) {
     return 0;
 }
 
+} // namespace uhh_session
+
+using namespace uhh_session;
+
 extern "C" probe_session *probe_session_create(void) {
     bench_phase("session_create");
     uhh_sym::preload();
     try { return new probe_session; }
     catch (...) { std::fprintf(stderr, "probe: error: session allocation failed\n"); return nullptr; }
 }
+
+namespace uhh_session {
 
 // Dynamic (post-launch) control-plane calls come from a callback while the target is
 // stopped. A failure there returns 0 to the callback but must not poison the session's
@@ -290,6 +298,8 @@ static bool check_flags(probe_session *s, uint32_t flags, bool allow_inline) {
     return true;
 }
 
+} // namespace uhh_session
+
 extern "C" int probe_add_symbol_cfg(probe_session *s, const char *location, probe_callback callback,
                                     uint32_t flags, const void *config, size_t config_len) {
     if (!s) return 0;
@@ -338,6 +348,8 @@ extern "C" int probe_add_symbol(probe_session *s, const char *location, probe_ca
     return probe_add_symbol_cfg(s, location, callback, flags, nullptr, 0);
 }
 
+namespace uhh_session {
+
 // Absolute-address probes only make sense once the process exists (ASLR), so they are a
 // runtime operation: typically called from a callback with an address it just read.
 static int add_absolute(probe_session *s, uint64_t address, probe_callback cb, uint32_t flags) {
@@ -364,6 +376,8 @@ static int add_absolute(probe_session *s, uint64_t address, probe_callback cb, u
     } catch (const std::exception &e) { set_error(s, e.what()); return scope.done(0); }
 }
 
+} // namespace uhh_session
+
 extern "C" int probe_add_address(probe_session *s, uint64_t address, probe_callback cb, uint32_t flags) {
     if (s && (flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW))) {
         DynamicScope scope(s); set_error(s, "use probe_watch for data watchpoints"); return scope.done(0);
@@ -382,6 +396,7 @@ extern "C" int probe_watch(probe_session *s, uint64_t address, probe_callback cb
     return add_absolute(s, address, cb, PROBE_HW | (mode ? mode : (uint32_t)PROBE_WATCH_WRITE) | (flags & PROBE_ONCE));
 }
 
+namespace uhh_session {
 
 // ---- Callback memory access (breakpoint/hw callbacks) ---------------------------------
 // The SAME policy as the inline agent's range check, so get_mem/set_mem answer the same on
@@ -523,6 +538,8 @@ static void test_die_after_hit(probe_session *s, const DEBUG_EVENT &ev) {
 }
 #endif
 
+} // namespace uhh_session
+
 extern "C" int probe_run(probe_session *s) {
     if (!s || !s->launched) { if (s) set_error(s, "session is not launched"); return 0; }
     if (s->ran) { set_error(s, "session already ran"); return 0; }
@@ -637,11 +654,15 @@ extern "C" int probe_wait_for_exit(probe_session *s) {
     return s->error.empty() && (s->interrupted || (s->exited && s->exit_code == 0));
 }
 
+namespace uhh_session {
+
 static void json_string(FILE *out, const std::string &value) {
     std::string text;
     append_json_string(text, value);
     std::fputs(text.c_str(), out);
 }
+
+} // namespace uhh_session
 
 extern "C" void probe_report(probe_session *s, FILE *out) {
     if (!s || !out) return;
@@ -889,6 +910,8 @@ extern "C" void probe_close(probe_session *s) {
                      (unsigned long long)g_diag_moved.load());
 }
 
+namespace uhh_session {
+
 static uint64_t *register_slot(probe_context *c, enum probe_register reg) {
     if (!c) return nullptr;
     switch (reg) {
@@ -905,6 +928,8 @@ static uint64_t *register_slot(probe_context *c, enum probe_register reg) {
     default: return nullptr;  /* x86: R8..R15 are unsupported -> null slot */
     }
 }
+
+} // namespace uhh_session
 
 extern "C" uint64_t get_reg(probe_context *c, enum probe_register reg) {
     uint64_t *slot = register_slot(c, reg);
@@ -964,8 +989,13 @@ extern "C" probe_session *get_session(probe_context *c) {
     auto *state = c ? static_cast<CallbackState *>(c->controller) : nullptr;
     return state ? state->session : nullptr;
 }
+
+namespace uhh_session {
+
 static const probe_controller_api g_controller_api = {
     get_reg, set_reg, get_func_arg, get_mem, set_mem, vlog_entry, get_config, call_func_args, get_session,
     probe_add_address, probe_watch, probe_add_symbol, probe_add_symbol_cfg, call_original, return_from,
 };
 const probe_controller_api *controller_api_table() { return &g_controller_api; }
+
+} // namespace uhh_session

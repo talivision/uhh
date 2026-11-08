@@ -2,6 +2,8 @@
 // injection (remote LoadLibrary / init), the shared section, install gates, frozen hook writes (IPC).
 #include "session_internal.hpp"
 
+namespace uhh_session {
+
 // ---- UHH_SHARED: one callbacks DLL file, loaded by controller and target ---------------
 static bool image_has_section(const unsigned char *base, const char *name) {
     auto dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
@@ -1441,3 +1443,5 @@ bool complete_remote_thread(probe_session *s, DWORD result) {
     }
     return true;
 }
+
+} // namespace uhh_session

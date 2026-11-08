@@ -1,6 +1,8 @@
 // The log pipeline: line formatting, the writer / file appender / stdout tailer threads, the
 // forwarded target stdout/stderr, the agent log ring drainer, and send_log.
 #include "session_internal.hpp"
+
+namespace uhh_session {
 struct LogPackHdr { uint32_t probe, tid, len, nframes, has_stack; };
 constexpr uint32_t LOG_PACK = 256;
 // Log records a queue entry stands for (an unload marker: none).
@@ -1704,6 +1706,10 @@ static void log_common(probe_context *c, bool stack, const char *format, va_list
     }
 }
 
+} // namespace uhh_session
+
+using namespace uhh_session;
+
 extern "C" void send_log(probe_context *c, const char *format, ...) {
     va_list ap; va_start(ap, format); log_common(c, false, format, ap); va_end(ap);
 }
@@ -1712,5 +1718,9 @@ extern "C" void send_log_stack(probe_context *c, const char *format, ...) {
     va_list ap; va_start(ap, format); log_common(c, true, format, ap); va_end(ap);
 }
 
+namespace uhh_session {
+
 // The table the controller's copy of the agent DLL forwards to (UHH_SHARED callbacks).
 void vlog_entry(probe_context *c, int stack, const char *format, va_list ap) { log_common(c, stack != 0, format, ap); }
+
+} // namespace uhh_session

@@ -1,5 +1,7 @@
 // Lifecycle: launch / attach, the controller-death guard, detach.
 #include "session_internal.hpp"
+
+namespace uhh_session {
 #if !defined(_WIN64)
 // A thread's suspend count, read without changing it (NtQueryInformationThread
 // ThreadSuspendCount, Windows 8.1+). False: unknown. NOTE: it includes the debug freeze (+1 for
@@ -166,6 +168,10 @@ void handling_running(probe_session *s, DWORD tid, bool running) {
 }
 
 static bool same_bitness(probe_session *s, HANDLE process);
+} // namespace uhh_session
+
+using namespace uhh_session;
+
 extern "C" int probe_launch(probe_session *s, char *const argv[]) {
     if (!s || !argv || !argv[0]) { if (s) set_error(s, "launch argv is empty"); return 0; }
     if (s->launched) { set_error(s, "session already launched"); return 0; }
@@ -244,6 +250,8 @@ extern "C" int probe_launch(probe_session *s, char *const argv[]) {
     } catch (const std::exception &e) { set_error(s, e.what()); return 0; }
 }
 
+namespace uhh_session {
+
 // The controller and target must be the same bitness: callbacks run with the controller's
 // view of registers, argument slots and pointer width. A mismatch would silently produce
 // garbage, so refuse it up front.
@@ -255,6 +263,8 @@ static bool same_bitness(probe_session *s, HANDLE process) {
                     : "target is a 64-bit process: use the x64 build of UHH");
     return false;
 }
+
+} // namespace uhh_session
 
 extern "C" int probe_attach(probe_session *s, uint32_t pid) {
     if (!s) return 0;
@@ -302,6 +312,8 @@ extern "C" int probe_attach(probe_session *s, uint32_t pid) {
     return 1;
 }
 
+namespace uhh_session {
+
 static void snapshot_pids(const char *name, std::unordered_set<DWORD> &out, DWORD *newest_new,
                           const std::unordered_set<DWORD> *exclude) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -329,6 +341,8 @@ static void snapshot_pids(const char *name, std::unordered_set<DWORD> &out, DWOR
     CloseHandle(snap);
 }
 
+} // namespace uhh_session
+
 extern "C" int probe_attach_new(probe_session *s, const char *image_name, uint32_t timeout_ms) {
     if (!s) return 0;
     if (!image_name || !*image_name) { set_error(s, "attach_new needs an image name"); return 0; }
@@ -348,6 +362,8 @@ extern "C" int probe_attach_new(probe_session *s, const char *image_name, uint32
     std::fprintf(stderr, "probe: new %s pid %lu -> attaching\n", image_name, (unsigned long)pid);
     return probe_attach(s, pid);
 }
+
+namespace uhh_session {
 
 // Detach from an attached, still-running target leaving it exactly as it ran before:
 // inline hooks removed by the agent, every INT3 restored, every debug register cleared,
@@ -574,3 +590,5 @@ void detach(probe_session *s) {
     stop_drainer(s);
     std::fprintf(stderr, "probe: detached from pid %lu\n", (unsigned long)s->pi.dwProcessId);
 }
+
+} // namespace uhh_session

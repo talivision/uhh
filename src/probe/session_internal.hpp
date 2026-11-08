@@ -38,6 +38,8 @@
 // bumps g_dr_epoch, so a hw hit re-reads its thread's DR image after the callbacks only when
 // something (a callback arming / releasing a hw probe, call_original's return catch) may have
 // rewritten it -- the re-read was ~27 us of a ~120 us hw hit (x64 VM), every hit.
+namespace uhh_session {
+
 inline std::atomic<uint64_t> g_dr_epoch{0};
 inline BOOL uhh_set_thread_context(HANDLE h, const CONTEXT *c) {
     if (c && (c->ContextFlags & CONTEXT_DEBUG_REGISTERS & ~CONTEXT_CONTROL & 0xFFu) != 0) g_dr_epoch.fetch_add(1, std::memory_order_relaxed);
@@ -45,8 +47,12 @@ inline BOOL uhh_set_thread_context(HANDLE h, const CONTEXT *c) {
 }
 #define SetThreadContext uhh_set_thread_context
 #pragma comment(lib, "psapi.lib")
+} // namespace uhh_session
+
 #include <aclapi.h>
 #pragma comment(lib, "advapi32.lib")
+
+namespace uhh_session {
 
 struct Probe {
     std::string location, module, callback_export;
@@ -185,8 +191,10 @@ struct EventFiber {
     bool stop_suspended = false;              // ...from the start (a replayed data-watch hit): call_func resumes it to call
 };
 
+} // namespace uhh_session
+
 struct probe_session {
-    std::vector<std::unique_ptr<Probe>> probes;
+    std::vector<std::unique_ptr<uhh_session::Probe>> probes;
     std::mutex agent_mu;
     std::mutex drain_mu;                       // shared ring has exactly one consumer at a time (lock_drain)
     std::atomic<int> drain_waiters{0};         // threads blocked taking drain_mu: the drainer lets them in
@@ -199,7 +207,7 @@ struct probe_session {
     // while symbolizing or writing, so a slow filesystem cannot invert locks with the
     // debugger or the agent-ring drainer.
     static constexpr size_t LOG_QUEUE_CAP = 2048;  // log RECORDS queued (a pack counts its records)
-    std::deque<LogRecord> log_queue;
+    std::deque<uhh_session::LogRecord> log_queue;
     size_t log_queue_records = 0;              // records_of() summed over log_queue (queue_mu)
     std::mutex queue_mu;
     std::condition_variable queue_readable, queue_writable, queue_flushed;
@@ -376,7 +384,7 @@ struct probe_session {
     uint64_t ret_gadgets = 0;                  // return_from: `ret` / `ret N` gadgets in the target
     bool warned_cb_fault = false;              // one stderr warning for a faulting controller-side callback
     DWORD cb_tid = 0;                          // thread whose callback / IPC is being serviced (0 = none)
-    const Probe *cb_probe = nullptr;           // whose callback runs (an IPC add: its inline origin probe)
+    const uhh_session::Probe *cb_probe = nullptr;           // whose callback runs (an IPC add: its inline origin probe)
     std::wstring agent_copy;                   // per-session copy of the agent DLL (UHH_SHARED), deleted at close
     std::vector<DWORD> pending_hold;           // callers of a runtime inline add: hold until it lands
     bool attached = false;                     // probe_attach: detach (not kill) on close
@@ -418,10 +426,10 @@ struct probe_session {
     // threads running a call_func callee -> the fiber parked on it.
     void *main_fiber = nullptr;
     bool fiber_converted = false, calls_closing = false, call_fiber_warned = false;
-    std::vector<EventFiber *> fiber_pool;
-    EventFiber *cur_fiber = nullptr;
+    std::vector<uhh_session::EventFiber *> fiber_pool;
+    uhh_session::EventFiber *cur_fiber = nullptr;
     DWORD event_tid = 0;                       // the thread of the event being handled now (0: none)
-    std::unordered_map<DWORD, EventFiber *> calls;
+    std::unordered_map<DWORD, uhh_session::EventFiber *> calls;
     // A call_func that timed out may already have its return trap (or a callee fault) QUEUED;
     // it arrives after the thread was restored: tid -> the IP the thread was left at when its
     // handling ended (it has not run since if it is still there).
@@ -443,7 +451,7 @@ struct probe_session {
     int co_borrowed_slot = -1;                 // a hw probe's own DR lent to the call_original thread's return catch
     bool co_warned_entry = false, co_warned_dr = false, co_warned_left = false, co_warned_nargs = false;
     bool initial_break = false;
-    std::unordered_map<DWORD, StepState> stepping;   // threads mid single-step
+    std::unordered_map<DWORD, uhh_session::StepState> stepping;   // threads mid single-step
     // Threads whose in-place step at a probe site faulted, the fault passed to the program
     // (without our trap flag: see StepState::refire). thread -> probe site and fault code.
     // If the handler continues execution there, the INT3 is hit again -- the same execution
@@ -467,7 +475,7 @@ struct probe_session {
     // thread inside one back to the real code (a fault in the copy, a watch hit, a detach).
     // Never freed while attached (a thread may be inside one); 64-byte entries carved from
     // blocks near the site (x64 RIP-relative reach), region (site >> 30) -> [next, end).
-    struct DTramp { uint64_t site = 0; uint32_t len = 0; Probe *probe = nullptr; };
+    struct DTramp { uint64_t site = 0; uint32_t len = 0; uhh_session::Probe *probe = nullptr; };
     std::map<uint64_t, DTramp> dtramps;
     std::map<uint64_t, std::pair<uint64_t, uint64_t>> dtramp_pool;
     // Fairness (ROADMAP A5): every debug event freezes the whole target, so threads that hit
@@ -514,7 +522,7 @@ struct probe_session {
     std::vector<std::pair<std::string, uint64_t>> module_instances;
     // Other instances' copies of inline sites (gated too, see LOAD_DLL): a thread hitting one
     // proves that instance is the live one -- its probe moves there (handle_gate).
-    struct ExtraGate { uint64_t site = 0, base = 0; Probe *probe = nullptr; };
+    struct ExtraGate { uint64_t site = 0, base = 0; uhh_session::Probe *probe = nullptr; };
     std::vector<ExtraGate> extra_gates;                   // ask the agent's service for another install round then (0: no)                   // timeBeginPeriod(1) held (only while something polls at 1 ms)
     std::chrono::steady_clock::time_point fair_window{}, last_event{};
     std::chrono::steady_clock::duration fair_gaps{};
@@ -527,6 +535,8 @@ struct probe_session {
     struct CtxWatch { DWORD tid = 0; HANDLE t = nullptr; CONTEXT before{}, after{}; };
     std::vector<std::unique_ptr<CtxWatch>> ctx_watch;
 };
+
+namespace uhh_session {
 // A 32-bit (WOW64) controller's Get/SetThreadContext on a thread other than the one whose
 // event it is handling is an implicit suspend + resume INSIDE the call (ROADMAP L13): killed in
 // the middle of one, the controller leaves that thread suspended once with nothing of ours
@@ -794,3 +804,5 @@ inline int call_in_target(probe_session *s, CallbackState *st, uint64_t fn, uint
     }
     return run_call(s, st, fn, ret, nargs, args, timeout_ms, 0, nullptr);     // committed now (else refused, loudly)
 }
+
+} // namespace uhh_session

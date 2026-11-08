@@ -2,6 +2,8 @@
 // trampolines, adopted relocated copies, the in-place window.
 #include "session_internal.hpp"
 
+namespace uhh_session {
+
 bool patch(HANDLE process, uint64_t address, unsigned char byte) {
     DWORD old{}, ignored{}; SIZE_T done{};
     if (!VirtualProtectEx(process, (void *)(uintptr_t)address, 1, PAGE_EXECUTE_READWRITE, &old)) return false;
@@ -762,3 +764,5 @@ void sync_int3_table(probe_session *s) {
     MemoryBarrier();
     InterlockedIncrement(&sh->int3_seq);
 }
+
+} // namespace uhh_session

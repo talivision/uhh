@@ -1,6 +1,8 @@
 // Callbacks and calls on breakpoint/hw: callback fibers, run_callback, call_func,
 // call_original, return_from and their traps.
 #include "session_internal.hpp"
+
+namespace uhh_session {
 #if defined(_WIN64)
 #define UHH_POST_AX Rax
 #else
@@ -933,6 +935,10 @@ int call_func_args(probe_context *c, const char *symbol, uint64_t *ret, int narg
     return call_in_target(st->session, st, fn, ret, nargs, args);
 }
 
+} // namespace uhh_session
+
+using namespace uhh_session;
+
 extern "C" int call_func(probe_context *c, const char *symbol, uint64_t *ret, int nargs, ...) {
     if (nargs < 0 || nargs > 8) return 0;
     uint64_t args[8] = {0};
@@ -941,6 +947,8 @@ extern "C" int call_func(probe_context *c, const char *symbol, uint64_t *ret, in
     va_end(ap);
     return call_func_args(c, symbol, ret, nargs, args);
 }
+
+namespace uhh_session {
 
 // call_original on breakpoint/hw: the original runs IN PLACE -- on the hit's own stack, from
 // the probe address, with the callback's registers -- exactly as the program would have run
@@ -1190,6 +1198,8 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
     RaiseException(UHH_CALL_RELEASED, 0, 0, nullptr);
     return 0;
 }
+} // namespace uhh_session
+
 extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
     auto *st = c ? static_cast<CallbackState *>(c->controller) : nullptr;
     if (!st || !st->session || !st->tid || !st->probe || st->released) return 0;

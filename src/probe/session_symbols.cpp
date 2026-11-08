@@ -1,6 +1,8 @@
 // Module names, locations ("module!Export+0xOFF"), export / symbol resolution.
 #include "session_internal.hpp"
 
+namespace uhh_session {
+
 static std::string basename_of(std::string path) {
     size_t p = path.find_last_of("\\/");
     return p == std::string::npos ? path : path.substr(p + 1);
@@ -268,3 +270,5 @@ uint64_t resolve_symbol(probe_session *s, const char *symbol) {
         }
     s->error = saved; return 0;
 }
+
+} // namespace uhh_session

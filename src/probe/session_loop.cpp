@@ -1,6 +1,8 @@
 // The debug loop: event service and dispatch, exception handling (breakpoint hits, steps,
 // faults), crash reports, suspensions of our own, fairness ticks, context round-trips.
 #include "session_internal.hpp"
+
+namespace uhh_session {
 // Debug events are per DEBUGGER THREAD, not per session: a thread that ran an earlier
 // session can still have that (terminated) target's last events queued. They belong to
 // another process -- continue them untouched and never let them reach this session's state.
@@ -1975,3 +1977,5 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
     }
     return ok;
 }
+
+} // namespace uhh_session
