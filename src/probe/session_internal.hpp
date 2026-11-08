@@ -54,6 +54,14 @@ inline BOOL uhh_set_thread_context(HANDLE h, const CONTEXT *c) {
 
 namespace uhh_session {
 
+// Probe views used by site vetting copy these values; live reports read them atomically.
+template<class T> struct ReportValue : std::atomic<T> {
+    using std::atomic<T>::atomic;
+    using std::atomic<T>::operator=;
+    ReportValue(const ReportValue &v) : std::atomic<T>(v.load()) {}
+    ReportValue &operator=(const ReportValue &v) { this->store(v.load()); return *this; }
+};
+
 struct Probe {
     std::string location, module, callback_export;
     // A breakpoint/hw callback whose module has UHH_SHARED state, added before the session's
@@ -74,8 +82,9 @@ struct Probe {
     struct Probe *alias_of = nullptr;
     bool runtime = false;      // added after launch: an install failure is reported, not fatal
     bool vetted = false;       // pre-hook check done for this inline install
-    uint64_t rva = 0, base = 0, address = 0, hits = 0;
-    uint32_t agent_index = UINT32_MAX;
+    uint64_t rva = 0, base = 0, address = 0;
+    ReportValue<uint64_t> hits{0};
+    ReportValue<uint32_t> agent_index{UINT32_MAX};
     uint32_t patch_len = 0;    // inline: bytes the hook overwrites at address (set when vetted)
     unsigned char original = 0;
     // Software-breakpoint displaced stepping: the full original instruction so it can
@@ -98,10 +107,10 @@ struct Probe {
     uint64_t dtramp = 0, dtramp_site = 0;
     std::vector<unsigned char> dtramp_insn;   // the instruction bytes that copy holds
     probe_callback callback = nullptr;
-    uint32_t flags = 0;
+    ReportValue<uint32_t> flags{0};
     std::vector<unsigned char> config;
     int dr_slot = -1;   // hardware-breakpoint DR register (0-3); -1 if not a HW probe
-    bool active = false;
+    ReportValue<bool> active{false};
     bool warned_double_run = false;   // call_original without return_from (warn once)
     bool warned_pop = false;          // x86 return_from nargs contradicted call_original (warn once)
     bool warned_boundary = false;     // boundary override warning (once per probe)
@@ -196,6 +205,8 @@ struct EventFiber {
 
 struct probe_session {
     std::vector<std::unique_ptr<uhh_session::Probe>> probes;
+    std::mutex report_mu;                      // report vs run-end drainer/writer shutdown
+    std::mutex probes_mu;                      // vector growth / report pointer snapshot and prehooks
     std::mutex agent_mu;
     std::mutex drain_mu;                       // shared ring has exactly one consumer at a time (lock_drain)
     std::atomic<int> drain_waiters{0};         // threads blocked taking drain_mu: the drainer lets them in
@@ -283,8 +294,8 @@ struct probe_session {
     std::unordered_map<uint64_t, uint32_t> module_sizes;          // mapped image base -> SizeOfImage
     std::vector<std::string> prehooks;                           // JSON lines for the report
     PROCESS_INFORMATION pi{};
-    DWORD exit_code = 1;
-    uint64_t overrides = 0;
+    std::atomic<DWORD> exit_code{1};
+    std::atomic<uint64_t> overrides{0};
     std::string error;
     HANDLE mapping = nullptr, remote_thread = nullptr;
     HANDLE agent_mapping = nullptr;             // TARGET handle: never CloseHandle in this process
@@ -379,7 +390,8 @@ struct probe_session {
     std::vector<HANDLE> ipc_frozen;            // threads suspended for an agent hook write (FREEZE..THAW)
     DWORD ipc_freezer = 0;                     // the agent thread doing that write (0 = no freeze)
     int hw_active = 0;
-    bool launched = false, exited = false, inline_ready = false;
+    bool launched = false, inline_ready = false;
+    std::atomic<bool> exited{false};
     bool cut_off_said = false;                        // probe_report named the interrupted callbacks
     bool interrupted = false, ctrl_counted = false;   // Ctrl+C ended this session / counted in g_ctrl_sessions
     std::atomic<bool> ran{false};              // probe_run has started (read by probe_close on any thread)
@@ -394,7 +406,7 @@ struct probe_session {
     std::atomic<bool> stop_requested{false};   // probe_close from another thread while probe_run runs
     std::atomic<bool> running{false};          // probe_run is executing (on some thread)
     std::atomic<const char *> run_phase{""};   // what probe_run is doing (a slow close says it)
-    bool detached = false;
+    std::atomic<bool> detached{false};
     bool detaching = false;                    // detach() running: no new holds, arming, gates or agent work
     bool detached_hooks = false;               // detach removed the inline hooks (stop_drainer may settle)
     bool guard_ready = false;                  // attach: breakpoint/hw probes may arm (no agent, or its guard is up / given up)
@@ -644,8 +656,8 @@ void sym_unload(probe_session *s, uint64_t base);
 void wait_sym_unloads(probe_session *s, uint64_t base, uint64_t size);
 void stop_log_output(probe_session *s);
 void enqueue_agent_record(probe_session *s, const probe_agent_log &rec);
-size_t drain_agent_logs(probe_session *s);
-void deliver_past_stall(probe_session *s);
+size_t drain_agent_logs(probe_session *s, bool unloading = false);
+void deliver_past_stall(probe_session *s, bool all_published = false);
 void start_drainer(probe_session *s);
 void stop_drainer(probe_session *s);
 std::string symbolize(probe_session *s, uint64_t addr);
@@ -688,6 +700,7 @@ bool target_has_shadow_stack(probe_session *s);
 bool emulate_site(probe_session *s, const Probe &p, CONTEXT &c);
 size_t int3_armed(const probe_session *s);
 bool arm_breakpoint(probe_session *s, Probe &p, uint64_t base);
+bool refresh_breakpoint(probe_session *s, Probe &p);
 void count_hit(Probe *p);
 Probe *adopt_relocated_breakpoint(probe_session *s, uint64_t at);
 bool still_armed(probe_session *s, uint64_t site);

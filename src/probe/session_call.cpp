@@ -246,7 +246,7 @@ void arm_restore_fixup(probe_session *s) {
             auto p = std::make_unique<Probe>();
             p->location = "<context-restore>"; p->flags = PROBE_BREAKPOINT; p->callback = restore_fixup;
             p->rva = at; p->internal = true;
-            Probe *raw = p.get(); s->probes.push_back(std::move(p));
+            Probe *raw = p.get(); { std::lock_guard<std::mutex> lock(s->probes_mu); s->probes.push_back(std::move(p)); }
             std::string saved = s->error;
             if (!arm_breakpoint(s, *raw, 0)) { raw->retired = true; s->error = saved; }
         } catch (...) {}
@@ -809,28 +809,54 @@ int run_call(probe_session *s, CallbackState *st, uint64_t fn, uint64_t *ret, in
         | CONTEXT_EXTENDED_REGISTERS
 #endif
         ;
-    DWORD64 features = GetEnabledXStateFeatures() & ~XSTATE_MASK_LEGACY;
-#if defined(XSTATE_MASK_CET_U)
-    features &= ~XSTATE_MASK_CET_U;                     // SSP has its own abandoned-call restore below
-#endif
+    // System-enabled features also include supervisor state. Only XCR0 user
+    // components represent registers a callee can change; CET_U/SSP is handled below.
+    int cpu[4]; __cpuid(cpu, 1);
+    const DWORD64 features = (cpu[2] & (1 << 27))
+        ? GetEnabledXStateFeatures() & _xgetbv(0) & XSTATE_MASK_ALLOWED & ~XSTATE_MASK_LEGACY : 0;
+    auto context_failed = [&](const char *stage) {
+        const DWORD error = GetLastError();
+        char why[192];
+        std::snprintf(why, sizeof(why), "%s failed (error %lu, XSTATE mask 0x%llx)", stage,
+                      (unsigned long)error, (unsigned long long)features);
+        call_refused(st->probe, why);
+        CloseHandle(thread);
+        return 0;
+    };
     if (features) {
         DWORD len = 0;
-        InitializeContext(nullptr, flags | CONTEXT_XSTATE, nullptr, &len);
+        if (InitializeContext(nullptr, flags | CONTEXT_XSTATE, nullptr, &len) ||
+            GetLastError() != ERROR_INSUFFICIENT_BUFFER || !len) return context_failed("size call context");
         try { state.resize(len); } catch (...) { CloseHandle(thread); return 0; }
-        if (!len || !InitializeContext(state.data(), flags | CONTEXT_XSTATE, &saved_context, &len) ||
-            !SetXStateFeaturesMask(saved_context, features)) { CloseHandle(thread); return 0; }
+        if (!InitializeContext(state.data(), flags | CONTEXT_XSTATE, &saved_context, &len))
+            return context_failed("initialize call context");
+        if ((saved_context->ContextFlags & CONTEXT_XSTATE) != CONTEXT_XSTATE) {
+            SetLastError(ERROR_NOT_SUPPORTED); return context_failed("initialize call XSTATE");
+        }
+        if (!SetXStateFeaturesMask(saved_context, features | XSTATE_MASK_LEGACY))
+            return context_failed("select call XSTATE");
     } else legacy.ContextFlags = flags;
     CONTEXT &saved = *saved_context;
-#if !defined(_WIN64)
-    saved.ContextFlags |= CONTEXT_EXTENDED_REGISTERS;                  // x86: XMM0-7 live here, not in FloatSave
-#endif
-    if (!GetThreadContext(thread, &saved)) {
-        if (trace_enabled()) std::fprintf(stderr, "  call_func: GetThreadContext(%lu) failed %lu\n", (unsigned long)st->tid, GetLastError());
-        CloseHandle(thread); return 0;
+    const DWORD saved_flags = saved.ContextFlags;
+    if (!GetThreadContext(thread, &saved)) return context_failed("get call context");
+    if (features) {
+        DWORD64 present = 0;
+        if (!GetXStateFeaturesMask(saved_context, &present)) return context_failed("read call XSTATE mask");
+        // GetThreadContext may omit INIT components: their bytes are undefined.
+        // Explicitly materialize their zero INIT image before requesting their restore,
+        // so a callee that activates them cannot leak its values back into the target.
+        saved.ContextFlags = saved_flags;
+        for (DWORD bit = 2; bit < 64; ++bit) if ((features & ~present) & (1ull << bit)) {
+            DWORD bytes = 0;
+            void *component = LocateXStateFeature(saved_context, bit, &bytes);
+            if (!component || !bytes) {
+                SetLastError(ERROR_NOT_SUPPORTED); return context_failed("locate INIT call XSTATE");
+            }
+            std::memset(component, 0, bytes);
+        }
+        if (!SetXStateFeaturesMask(saved_context, features | XSTATE_MASK_LEGACY))
+            return context_failed("restore call XSTATE mask");
     }
-    // Request INIT components too on restore: the callee may activate a previously
-    // unused YMM/ZMM component, which must then be reset by SetThreadContext.
-    if (features && !SetXStateFeaturesMask(saved_context, features)) { CloseHandle(thread); return 0; }
     // The call frame: [sp, sp + frame_size), its return-address slot at sp. Checked before
     // anything is written: a WriteProcessMemory into the stack's guard page would spend it.
 #if defined(_WIN64)

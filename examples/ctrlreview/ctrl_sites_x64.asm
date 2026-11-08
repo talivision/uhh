@@ -38,4 +38,26 @@ CtrlSled PROC
     DB 1200 DUP (90h)
     ret
 CtrlSled ENDP
+PUBLIC CtrlHiddenBranch, CtrlMixedJump
+CtrlHiddenBranch PROC FRAME
+    .endprolog
+    DB 75h, 01h                 ; jnz to one byte inside the prospective patch
+    DB 12 DUP (90h)
+    ret
+CtrlHiddenBranch ENDP
+CtrlMixedJump PROC FRAME
+    .endprolog
+    DB 41h, 8Bh, 84h, 8Bh     ; mov eax, [r11+rcx*4+table RVA]
+    DD IMAGEREL CtrlSwitchCase
+    add rax, r11
+    jmp rax
+    jmp rdx
+    DB 12 DUP (90h)
+CtrlSwitchDest::                ; module scope: referenced by the table outside this PROC
+    ret
+CtrlMixedJump ENDP
+.const
+CtrlSwitchCase LABEL DWORD
+    DD IMAGEREL CtrlSwitchDest, 0
+
 END

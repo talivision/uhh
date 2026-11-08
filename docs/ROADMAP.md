@@ -3105,3 +3105,29 @@ are implemented but await Windows x64/x86 rerun. Existing Detours checks are unc
 - New-check waits are 10 s for progress and 20 s for process completion, replacing 30/60/90/
   120 s waits. Removed the live pipe-reader join on a failure path; killed children are
   reaped. The CI estimate is 20/25 s, to be updated from the next Windows run.
+
+### agentipc call-context follow-up (run 42475546386)
+
+The failure summary shows breakpoint/hw calls returning 0, but does not contain the
+XSTATE API failure stage/error. Windows verification and that diagnostic are pending;
+these changes must not yet be described as a confirmed fix of the CI failures.
+
+- Restrict the call snapshot to system-enabled XCR0 user components allowed by the
+  architecture's SDK mask. Do not request system-only/supervisor components; CET_U/SSP
+  continues through thread_ssp on abandoned x64 calls. x86 keeps EXTENDED_REGISTERS for
+  XMM0-7; x64 keeps FLOATING_POINT. Include the legacy mask when selecting snapshot state.
+- Validate InitializeContext's size-query result and supported context flags. Preserve
+  those flags across GetThreadContext and materialize absent extended components' INIT
+  bytes before selecting them for restore. Setting their validity bits alone is unsafe:
+  GetThreadContext leaves absent components' data undefined (GetXStateFeaturesMask docs).
+- Report every new context-setup failure through the existing once-per-probe call_refused
+  diagnostic, with API stage, Win32 error and requested mask, instead of silently returning 0.
+- Add session-call-basic-{breakpoint,hw,inline} to always require one successful call even
+  when the vector fixture has no AVX phases. The stub lifetime check now also requires the
+  failed write to return call_func=0 and its retry to return call_func=1, before querying
+  both allocations as MEM_FREE after close. Previously it could pass with every call failing.
+- The stub still enters through CALL RAX/EAX and the return INT3, so CET's shadow-stack
+  pairing is retained. Its allocation is not freed by run_call: successful allocations stay
+  in scratch_blocks until session cleanup, after finish_calls/detach; failed writes free
+  immediately. Existing conformance, transparency, reuse, concurrent-call and CET checks
+  remain unchanged and must pass on Windows before this follow-up is considered verified.
