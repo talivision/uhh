@@ -7767,6 +7767,29 @@ def check_ctrl_symload():
         record(name, False, repr(e))
 
 
+def check_ctrl_own_debug():
+    """Real Windows #DB events from an eight-byte store and target TF, passed through
+    controller handlers. Slot reuse and held-watch replay must reject stale accesses
+    AND deliver a subsequent real access. The target's VEH checks forwarded status/TF.
+    The fixture verifies arming and incoming DR6, never synthesizes status by SetThreadContext
+    (Windows sanitizes it). See examples/ctrlreview/ctrl_dr_review.cpp.
+    """
+    d = exe("ctrl_dr_review.exe")
+    if not d:
+        return missing_bin("ctrl-own-debug", "ctrl_dr_review")
+    for case in ("release", "queued", "queued-same", "queued-rearm", "deferred", "deferred-reused", "deferred-carried-reused", "watch-tf", "watch-tf-carried", "gate", "step-entry", "step-own", "step-own-detach", "step-mixed", "step-tf", "detach-dr", "detach-tf"):
+        name = f"ctrl-own-debug-{case}"
+        try:
+            r, o = run([d, case], timeout=30)
+            res = next((x for x in o if x.get("kind") == "dr_review"), {})
+            good = r.returncode == 0 and res.get("ok") == 1 and res.get("case") == case
+            detail = f"exit={r.returncode} result={res}"
+            if not good: detail += f" stderr={r.stderr[-2400:]!r}"
+            record(name, good, detail)
+        except Exception as e:
+            record(name, False, repr(e))
+
+
 def check_cdx_review():
     """Codex review of the controller (docs/ROADMAP.md "Codex controller review"), fixture
     examples/ctrlreview, ONE callback source per check, every backend:
@@ -12819,6 +12842,7 @@ def main():
     if want(check_stream_filestall): check_stream_filestall()
     if want(check_stream_filefail): check_stream_filefail()
     if want(check_ctrl_symload): check_ctrl_symload()
+    if want(check_ctrl_own_debug): check_ctrl_own_debug()
     if want(check_cdx_review): check_cdx_review()
     if want(check_newapp_files): check_newapp_files()
     if want(check_newapp_flag): check_newapp_flag()

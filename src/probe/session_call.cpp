@@ -384,13 +384,20 @@ static void resume_deferred_hits(probe_session *s) {
 // target's own slots, no execute probe sharing it).
 bool hold_watch_hit(probe_session *s, const DEBUG_EVENT &event, const CONTEXT &native, uint8_t theirs) {
     const DWORD64 fired = native.Dr6 & 0xF;
+    if (!fired || (fired & theirs) || (native.Dr6 & 0xE000u)) return false;
+    probe_session::Dr6Lost saved{};
+    saved.regs = native; saved.bits = fired;
     probe_session::WatchHeld held; held.ev = event;
-    if (!fired || (fired & theirs)) return false;
     for (int slot = 0; slot < 4; ++slot) {
         if (!(fired & (1u << slot))) continue;
         Probe *p = nullptr;
         for (auto &q : s->probes) if (q->active && (q->flags & PROBE_HW) && q->dr_slot == slot) { p = q.get(); break; }
         if (!p || p->internal || !(p->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW))) return false;
+        // Replayed watches use the same ownership check as queued #DBs. Preserve the
+        // identity at the access, including an older identity already carried here.
+        const bool carried = (dr6_carried(s, event.dwThreadId) & (1u << slot)) != 0;
+        saved.address[slot] = carried ? s->dr6_carry_address[slot] : dr_address(native, slot);
+        saved.generation[slot] = carried ? s->dr6_carry_generation[slot] : p->hw_generation;
         held.probes[slot] = p;
     }
     HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
@@ -399,8 +406,7 @@ bool hold_watch_hit(probe_session *s, const DEBUG_EVENT &event, const CONTEXT &n
     guard_note_hold(s, event.dwThreadId);
     if (SuspendThread(t) == (DWORD)-1) { CloseHandle(t); return false; }
     try {
-        auto &l = s->dr6_lost[event.dwThreadId];
-        l.regs = native; l.bits |= fired;
+        s->dr6_lost[event.dwThreadId] = saved;
         held.thread = t; s->watch_deferred.push_back(held);
     } catch (...) { ResumeThread(t); CloseHandle(t); return false; }
     if (trace_enabled()) std::fprintf(stderr, "  watch hit held during a call tid=%lu dr6=0x%llx\n",

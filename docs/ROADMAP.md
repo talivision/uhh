@@ -213,7 +213,7 @@ reads, a slow (50 ms) callback under 32 threads.
   with no trap flag, so there is no single-step completion event; a fault in the copy is mapped
   back to the real instruction (re-run in place, as before), a watch hit in it reports the real
   pc, a thread inside one at a detach is moved to the real code. A program that single-steps
-  itself (TF set at the hit) keeps the stepped copy. (2) fairness by YIELD rounds: when debug
+  itself (TF set at the hit) steps in place, preserving its exception address. (2) fairness by YIELD rounds: when debug
   events are dense (>= 2000/s) or the target ran unfrozen for less than a tenth of the last
   20 ms, each thread whose hit is continued in the next window is sent once through a per-thread
   yield stub (registers, flags, XMM saved; ntdll!NtDelayExecution until a deadline common to the
@@ -252,6 +252,43 @@ reads, a slow (50 ms) callback under 32 threads.
   sets on a running thread is seen at that thread's next debug event (UHH does not intercept
   SetThreadContext). `hunt-owndr-*` (DR0 set on a suspended new thread), `hunt-owndr-live-*`
   (DR0 set over UHH's on a running thread)
+- 🔧 Controller own-debug-register follow-up (2026-11-08): hardware release and inline-gate
+  cleanup clear only the address they installed; gate hits also verify the live slot and PC.
+  Detach preserves target-owned slots and TF, clearing TF only for a recorded UHH step that
+  did not start with the program's TF. A combined target BS/B-bit and UHH hit/step is passed
+  through after UHH's callback/completion; only UHH's B-bits and injected BS/TF are removed.
+  With target TF or debug registers, software instructions run in place so the target sees
+  the real exception address. Queued DR6 status keeps BS plus each B-bit's address and arm
+  generation, preventing slot reuse (including same-address reloads) from hitting a replacement
+  data probe. Tests: `check_ctrl_own_debug`, `ctrl-own-debug-*` (real #DB events from a
+  self-hosted debuggee, with incoming-status and target-VEH assertions; deterministic release,
+  slot reuse, gate, step, and detach checks on both architectures). CI follow-up: held data
+  watches also save address/generation before replay (`deferred`, `deferred-reused`); leaving
+  those fields zero rejected every deferred watch in `callfunc-watch[-lock]-{breakpoint,hw}`
+  and `sessions-repeat`. The original fixture tried to write synthetic DR6/TF onto a
+  never-started thread, which Windows sanitizes; it now arms watches, executes real stores,
+  and checks a positive callback after every stale-hit rejection. Existing call/watch checks
+  retain their assertions. CI round 3 exposed two fixture errors: BS records a step after TF
+  has been cleared, and raw DR6 Bn for a disabled slot is unspecified (Intel SDM Vol. 3B,
+  253669-088, sections 19.2.3 and 19.3.1.4,
+  https://cdrdv2-public.intel.com/858456/253669-088-sdm-vol-3b.pdf; Windows TF-clear behavior
+  is also exercised by Wine's `dlls/ntdll/tests/exception.c`, `single_step_handler`). The
+  fixture now compares each delivered event to a separate Windows run with only the
+  program's TF/watchpoints: event count, code, location, flags, BS/BD/BT, every target-enabled
+  Bn, and the target's DR address/control fields must match. Both VEH snapshots are printed;
+  no target-owned status assertion is removed. CI round 4 proved an actual delivery bug:
+  reference DR6 was `0xffff0ff1/2`, while UHH delivered `0xffff4ff1/3`. SetThreadContext edits
+  the live registers but does not repair the already-saved exception CONTEXT delivered to
+  VEH/SEH. A temporary internal breakpoint at KiUserExceptionDispatcher now removes UHH's
+  BS/Bn from that saved context, preserves the program's status, and retires after pending
+  deliveries complete. Detach keeps it through its event drain, then removes it too;
+  `ctrl-own-debug-step-own-detach` covers detach immediately after forwarding the #DB.
+  Both reference and observed runs use DEBUG_ONLY_THIS_PROCESS. A pure-TF run also arms a
+  non-firing debugger-owned execute breakpoint in data: with DR7=0 Windows can omit DR6
+  from the captured context even when TF raised #DB. This keeps debug-status capture active
+  on both architectures without adding a target event. Arming, incoming cause, target VEH
+  state and temporary-breakpoint removal are asserted. Windows verification pending;
+  shared agent layout/version unchanged.
 - ✅ (A8) hw: a hardware probe inside a DLL that 4 threads keep LoadLibrary/FreeLibrary-ing missed
   hits (60-125 of 240, "whole threads"). Proven cause (huntaudit): NOT the late UNLOAD suspected
   here -- with the stale-unload guard of 6d0147a disabled, 24 runs (x64 + x86) saw no late unload

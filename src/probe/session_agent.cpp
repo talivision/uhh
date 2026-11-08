@@ -892,7 +892,7 @@ bool arm_gates_for_pending(probe_session *s) {
         for (DWORD tid : s->threads) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
             GuardTouch touch(s, tid);
-            if (t) { keep_queued_dr6(s, tid, t); set_dr_on_thread(t, slot, sites[i], true); CloseHandle(t); }
+            if (t) { keep_queued_dr6(s, tid, t); set_dr_on_thread(t, slot, sites[i], true, 0, 0, s); CloseHandle(t); }
         }
         s->dr_used |= (uint8_t)(1u << slot); s->dr_ever |= (uint8_t)(1u << slot);
         s->gates.push_back({sites[i], slot});
@@ -920,7 +920,7 @@ static void clear_gates(probe_session *s) {
         for (DWORD tid : s->threads) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
             GuardTouch touch(s, tid);
-            if (t) { keep_queued_dr6(s, tid, t); set_dr_on_thread(t, g.second, 0, false); CloseHandle(t); }
+            if (t) { keep_queued_dr6(s, tid, t); clear_dr_on_thread(t, g.second, g.first); CloseHandle(t); }
         }
         s->dr_used &= (uint8_t)~(1u << g.second);
         retire_hw_address(s, g.first);                       // a #DB already in flight is stale
@@ -929,7 +929,8 @@ static void clear_gates(probe_session *s) {
 }
 
 // A gate fired: hold this thread at the site until the hook is confirmed.
-bool handle_gate(probe_session *s, const DEBUG_EVENT &event) {
+bool handle_gate(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
+    handled = false;
     if (s->gates.empty()) return false;
     HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
     if (!thread) return false;
@@ -938,8 +939,9 @@ bool handle_gate(probe_session *s, const DEBUG_EVENT &event) {
     if (GetThreadContext(thread, &c)) {
         c.Dr6 |= dr6_carried(s, event.dwThreadId);
         for (auto &g : s->gates)
-            if (c.Dr6 & (1u << g.second)) { hit = true; c.Dr6 &= ~(DWORD64)(1u << g.second); }
-        if (hit) { c.EFlags |= 0x10000u; SetThreadContext(thread, &c); }   // RF: run the site once resumed
+            if ((c.Dr6 & (1u << g.second)) && dr_address(c, g.second) == g.first &&
+                ((c.Dr7 >> (g.second * 2)) & 3) && (uint64_t)EMU_IP(c) == g.first) { hit = true; c.Dr6 &= ~(DWORD64)(1u << g.second); }
+        if (hit) { handled = !(c.Dr6 & 0xE00Fu); c.EFlags |= 0x10000u; SetThreadContext(thread, &c); }   // RF: run the site once resumed
     }
     CloseHandle(thread);
     if (hit) {

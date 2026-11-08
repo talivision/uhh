@@ -714,6 +714,12 @@ foreach(v low high)
     target_link_options(modrel_forward_${v} PRIVATE /NOENTRY /DYNAMICBASE:NO /FIXED:NO /INCREMENTAL:NO)
 endforeach()
 add_dependencies(ctrl_driver modrel_owner modrel_forward_low modrel_forward_high)
+# Controller ownership regressions: a self-hosted debuggee generates real #DB events.
+add_executable(ctrl_dr_review examples/ctrlreview/ctrl_dr_review.cpp)
+target_link_libraries(ctrl_dr_review PRIVATE probe_api Zydis)
+target_include_directories(ctrl_dr_review PRIVATE src include)
+target_compile_options(ctrl_dr_review PRIVATE /W4)
+
 add_executable(ctrl_driver_th examples/ctrlreview/ctrl_driver.cpp examples/ctrlreview/ctrl_callbacks.cpp)
 target_include_directories(ctrl_driver_th PRIVATE include)
 target_compile_options(ctrl_driver_th PRIVATE /W4)
