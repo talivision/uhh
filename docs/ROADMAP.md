@@ -3191,7 +3191,6 @@ these changes must not yet be described as a confirmed fix of the CI failures.
   immediately. Existing conformance, transparency, reuse, concurrent-call and CET checks
   remain unchanged and must pass on Windows before this follow-up is considered verified.
 
-<<<<<<< HEAD
 ### Inline install failure diagnostics (ntdll-churn CI follow-up)
 
 A terminal inline install failure is not an accepted silent attach outcome. The common
@@ -3212,7 +3211,7 @@ Pending/installing requests remain pending. Existing attach-inline, gated-e2e an
 guardwin checks retain their assertions. The forced-failure attach survival check
 now uses its existing Lines reader instead of racing communicate() for stdout.
 Windows rerun pending.
-=======
+
 ### Controller call / hardware review (cxr14)
 
 - call #1: real. Return-catch cleanup now verifies the address and execute encoding
@@ -3236,4 +3235,3 @@ Windows rerun pending.
 These extend the existing real-Windows-#DB fixture; registered under
 `check_ctrl_call_hw_review` on both architectures. Static review only here; Windows
 build/runtime validation remains pending. Shared agent layout/version unchanged.
->>>>>>> origin/merge-frida
