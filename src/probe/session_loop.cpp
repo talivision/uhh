@@ -146,7 +146,7 @@ void pump(probe_session *s, DWORD ms) {
 // ---- Suspensions of our own, fairness, context round-trips ----------------------------
 // How many suspensions of thread `tid` are ours right now (every list we suspend into).
 static int our_suspends(const probe_session *s, DWORD tid) {
-    int n = 0;
+    int n = s->inline_add_wait_tid == tid ? 1 : 0;
     for (const auto *list : {&s->held, &s->ipc_frozen, &s->call_deferred})
         for (HANDLE t : *list) n += GetThreadId(t) == tid;
     for (const auto &e : s->inplace_suspended) n += e.first == tid;

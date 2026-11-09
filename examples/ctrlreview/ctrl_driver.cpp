@@ -14,6 +14,10 @@
 #include <atomic>
 
 extern "C" {
+void ctrl_on_apiguard(probe_context *);
+void ctrl_on_apiforeign(probe_context *);
+void ctrl_on_apiinstall(probe_context *);
+void ctrl_on_apithread(probe_context *);
 void ctrl_on_codearm(probe_context *);
 void ctrl_on_callpair(probe_context *);
 void ctrl_on_load(probe_context *);
@@ -31,6 +35,8 @@ void ctrl_on_modhistory(probe_context *);
 void ctrl_on_modarm(probe_context *);
 void ctrl_on_modforwardarm(probe_context *);
 }
+// Deliberately absent from probe_api_agent: a mapped inline install must report -2 as 0.
+extern "C" __declspec(dllexport) void ctrl_only_controller(probe_context *c) { send_log(c, "controller only"); }
 struct ctrl_cfg { uint32_t backend; uint32_t pad; };
 
 // The per-session agent copies this process left in %TEMP%\uhh (directories "<pid>-...").
@@ -80,7 +86,12 @@ int main(int argc, char **argv) {
     ctrl_cfg k{backend, shape == "whole" ? 1u : 0u};
     bool ok = s != nullptr;
     if (ok) {
-        if (sc == "modforward")
+        if (sc == "apiguard" || sc == "apiforeign" || sc == "apiinstall")
+            ok = probe_add_symbol(s, "ctrl_target.exe!CtrlApi", sc == "apiguard" ? ctrl_on_apiguard :
+                                  sc == "apiforeign" ? ctrl_on_apiforeign : ctrl_on_apiinstall, backend);
+        else if (sc == "apithread")
+            ok = probe_add_symbol(s, "ctrl_target.exe!CtrlTock", ctrl_on_apithread, backend);
+        else if (sc == "modforward")
             ok = probe_add_symbol_cfg(s, "ctrl_target.exe!CtrlAnnounce", ctrl_on_modforwardarm, backend, &k, sizeof(k));
         else if (sc == "modcall" || sc == "modhistory") {
             ok = probe_add_symbol(s, "ctrl_target.exe!CtrlCall", sc == "modhistory" ? ctrl_on_modhistory : ctrl_on_modcall, backend);

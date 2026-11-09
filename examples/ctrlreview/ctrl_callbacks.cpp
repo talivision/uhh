@@ -1,6 +1,7 @@
 // Controller-review fixture callbacks: ONE source under breakpoint, hw and inline (also
 // built into the agent DLL). The config carries the backend for runtime adds.
 #include "probe_api.h"
+#include <windows.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -133,4 +134,63 @@ CTRL_EXPORT void ctrl_on_modforwardarm(probe_context *c) {
     const int ok = n > 1 && n <= sizeof(symbol) && get_mem(c, get_func_arg(c, 0), symbol, (size_t)n) &&
         symbol[(size_t)n - 1] == 0 && probe_add_symbol(get_session(c), symbol, ctrl_on_load, cfg_backend(c));
     send_log(c, "modforward arm=%d", ok);
+}
+
+// API-contract review: re-protect a region after a warm read in the SAME callback.
+CTRL_EXPORT void ctrl_on_apiguard(probe_context *c) {
+    uint64_t pid = 0;
+    const uint64_t addr = get_func_arg(c, 1);
+    call_func(c, "kernel32.dll!GetCurrentProcessId", &pid, 0);
+    HANDLE h = OpenProcess(PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION, FALSE, (DWORD)pid);
+    unsigned char byte = 0;
+    const int warm = get_mem(c, addr, &byte, 1);
+    DWORD old = 0, ignored = 0;
+    const BOOL armed = h && VirtualProtectEx(h, (void *)(uintptr_t)addr, 4096, PAGE_READWRITE | PAGE_GUARD, &old);
+    const int read = get_mem(c, addr, &byte, 1);
+    MEMORY_BASIC_INFORMATION mbi{};
+    const int kept = h && VirtualQueryEx(h, (void *)(uintptr_t)addr, &mbi, sizeof(mbi)) && (mbi.Protect & PAGE_GUARD);
+    if (armed) VirtualProtectEx(h, (void *)(uintptr_t)addr, 4096, old, &ignored);
+    if (h) CloseHandle(h);
+    send_log(c, "apiguard warm=%d armed=%d read=%d kept=%d", warm, armed != FALSE, read, kept);
+}
+
+// Both modules export ctrl_on_tock, so name-only forwarding used to select ours silently.
+CTRL_EXPORT void ctrl_on_apiforeign(probe_context *c) {
+    HMODULE other = LoadLibraryW(L"ctrl_dll.dll");
+    const auto cb = other ? reinterpret_cast<probe_callback>(GetProcAddress(other, "ctrl_on_tock")) : nullptr;
+    const unsigned mode = (unsigned)get_func_arg(c, 0);
+    probe_session *s = get_session(c);
+    int r = -1;
+    if (cb) {
+        if (mode == 0) r = probe_add_address(s, get_func_arg(c, 1), cb, PROBE_BREAKPOINT);
+        else if (mode == 1) r = probe_add_symbol(s, "ctrl_target.exe!CtrlTock", cb, PROBE_BREAKPOINT);
+        else if (mode == 2) r = probe_add_symbol_cfg(s, "ctrl_target.exe!CtrlTock", cb, PROBE_BREAKPOINT, &mode, sizeof(mode));
+        else r = probe_watch(s, get_func_arg(c, 2), cb, PROBE_WATCH_WRITE);
+    }
+    send_log(c, "apiforeign mode=%u found=%d add=%d", mode, cb != nullptr, r);
+    if (other) FreeLibrary(other);
+}
+
+CTRL_EXPORT void ctrl_on_apiinstall(probe_context *c) {
+    const unsigned mode = (unsigned)get_func_arg(c, 0);
+    probe_callback cb = ctrl_on_tock;
+    if (mode >= 3 && mode < 6) cb = reinterpret_cast<probe_callback>(GetProcAddress(GetModuleHandleW(nullptr), "ctrl_only_controller"));
+    int r = 0;
+    if (mode % 3 == 0) r = probe_add_address(get_session(c), get_func_arg(c, 1), cb, PROBE_INLINE);
+    else if (mode % 3 == 1) r = probe_add_symbol(get_session(c), "ctrl_target.exe!CtrlTock", cb, PROBE_INLINE);
+    else r = probe_add_symbol_cfg(get_session(c), "ctrl_target.exe!CtrlTock", cb, PROBE_INLINE, &mode, sizeof(mode));
+    send_log(c, "apiinstall mode=%u add=%d", mode, r);
+    if (mode >= 6) {
+        uint64_t pid = 0, value = 0;
+        const int cf = mode == 6 ? call_func(c, "kernel32.dll!GetCurrentProcessId", &pid, 0) : -1;
+        const int co = call_original(c, 3, &value);
+        send_log(c, "apiinstall continued cf=%d original=%d", cf, co);
+        if (co) return_from(c, value, 0);
+    }
+}
+
+CTRL_EXPORT void ctrl_on_apithread(probe_context *c) {
+    uint64_t value = 0;
+    const int ok = call_func(c, "ctrl_target.exe!CtrlTock", &value, 1, (uint64_t)5);
+    send_log(c, "apithread ok=%d value=%d", ok, (int)value);
 }

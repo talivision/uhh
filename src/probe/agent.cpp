@@ -37,13 +37,9 @@ static __forceinline LONG load_epoch(const probe_agent_shared *sh) {
 /* Callback memory helpers fail closed on bad target addresses. They never change
    page protections: executable writes belong to the hook installer, not hits. */
 /* A bad pointer must fail cleanly WITHOUT raising an exception the target could observe
-   (its vectored handlers see first-chance faults before our __except). So the range is
-   validated first. The last validated region is cached per thread FOR THE CURRENT HIT
-   (call_mid, call_func and call_original reset it), so repeated access to the same buffer/stack/image
-   within a callback costs a bounds check, not a syscall -- while a page the target
-   decommits, guards or protects between hits is validated afresh (a stale entry faulted,
-   and a read of a PAGE_GUARD page consumed the target's guard). The __try stays only for a
-   region freed concurrently (a race the target would also have). */
+   (its vectored handlers see first-chance faults before our __except). Re-query on every
+   access: even within one callback, direct VirtualProtect calls can invalidate an earlier
+   check. The __try stays only for a region freed concurrently. */
 struct RegionCache { uintptr_t lo = 0, hi = 0; bool writable = false; };
 static thread_local RegionCache t_region;
 
@@ -68,27 +64,10 @@ static RegionCache *region_cache() { return tls_ready() ? &t_region : nullptr; }
 static bool range_ok(uintptr_t a, size_t n, bool write) {
     if (!n) return true;
     if (a + n < a) return false;
-    // This thread's own stack from this frame up to its base: committed read/write memory by
-    // construction (the guard page is below the lowest frame) -- no query. An inline callback
-    // runs on the hit thread, so the hit's stack arguments (get_func_arg on x86, every hit) are
-    // there: a VirtualQuery per hit cost x86 send_log ~1 us. A stack the TEB does not describe
-    // (switched without updating it) fails the bounds and is queried as before.
-    {
-        const NT_TIB *tib = reinterpret_cast<const NT_TIB *>(NtCurrentTeb());
-        const uintptr_t here = (uintptr_t)_AddressOfReturnAddress();
-        if (here >= (uintptr_t)tib->StackLimit && here < (uintptr_t)tib->StackBase &&
-            a >= here && a + n <= (uintptr_t)tib->StackBase)
-            return true;
-    }
     RegionCache scratch, *cache = region_cache();
     if (!cache) cache = &scratch;
     uintptr_t end = a + n;
     while (a < end) {
-        // Reads trust the per-thread cache across hits; WRITES re-check every time: the
-        // target may have made the region read-only since (a write fault would be visible).
-        if (!write && a >= cache->lo && a < cache->hi) {
-            a = cache->hi; continue;
-        }
         MEMORY_BASIC_INFORMATION mbi{};
         if (!VirtualQuery((void *)a, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
         DWORD prot = mbi.Protect & 0xFF;
@@ -1313,11 +1292,18 @@ static ThreadSlot *own_thread_slot(DWORD tid) {
 // slot up every time. A slot passes to another thread only from a dead owner, so a cached
 // slot stays this thread's.
 static thread_local ThreadSlot *t_slot;
+static thread_local ThreadSlot t_fallback;
+static bool private_slot(const ThreadSlot *ts) { return ts && ts->blk_gen == -1; }
 static inline ThreadSlot *cached_slot() { return tls_ready() ? t_slot : nullptr; }
 static inline void cache_slot(ThreadSlot *ts) { if (tls_ready()) t_slot = ts; }
 static ThreadSlot *my_slot(DWORD tid) {
     ThreadSlot *ts = cached_slot();
     if (!ts && (ts = own_thread_slot(tid)) != nullptr) cache_slot(ts);
+    if (!ts && tls_ready()) {
+        ts = &t_fallback;
+        ts->tid = (LONG)tid; ts->blk_gen = -1;
+        cache_slot(ts);
+    }
     return ts;
 }
 // The agent calls an API on a program thread (inside a callback): a probe that call hits passes
@@ -1352,6 +1338,7 @@ static probe_agent_tblock *steal_tblock(ThreadSlot *table, uint32_t size, DWORD 
     return nullptr;
 }
 static probe_agent_tblock *slot_block(ThreadSlot *ts, DWORD tid) {
+    if (private_slot(ts)) return nullptr;    // TLS fallback uses stripes, and the untracked live count
     const LONG gen = g_tblock_gen;
     if (ts->blk_gen == gen && (ts->blk || GetTickCount64() < ts->blk_retry)) return ts->blk;
     probe_agent_tblock *b = nullptr;
@@ -1439,8 +1426,8 @@ static bool hit_scope_live(const HitScope *h, uint64_t sp) {
 // allocate) is then counted without re-entering a callback -- the documented contract, which
 // breakpoint/hw keep too. Unguarded, an allocator probe whose callback calls call_func
 // recursed until STATUS_STACK_OVERFLOW (examples/famous heap_tracker). A thread without a
-// slot (the table is full) has no guard: call_func is refused with a warning, never run
-// unguarded.
+// registry slot uses its private TLS slot when available. A context without either guard
+// is refused with a warning, never run unguarded.
 static volatile LONG g_warned_call[PROBE_AGENT_MAX_PROBES];
 static bool call_func_guarded(probe_context *c) {
     const auto *h = c ? static_cast<const HitScope *>(c->hit_scope) : nullptr;
@@ -1682,6 +1669,12 @@ static int forward(probe_session *s, uint32_t op, uint64_t address, const char *
     const uintptr_t offset = (uintptr_t)s - (uintptr_t)&states[0].proxy;
     if (offset >= sizeof(AgentState) * PROBE_AGENT_MAX_PROBES || offset % sizeof(AgentState)) return 0;
     if (config_len && !config) return 0;
+    HMODULE owner{}, caller{};
+    const probe_callback origin = callbacks[offset / sizeof(AgentState)];
+    if (!origin || !GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                     reinterpret_cast<LPCSTR>(cb), &owner) ||
+        !GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(origin), &caller) || owner != caller) return 0;
     probe_ipc_request req{};
     req.op = op; req.flags = flags; req.origin_site = s->site; req.address = address;
     std::string name;
@@ -1743,7 +1736,7 @@ static __forceinline bool finish_hit(bool result, DWORD error, DWORD status, con
 static void hit_scope_abandon(HitScope *h) {
     if (InterlockedExchange(&h->abandoned, 1)) return;
     if (h->slot && h->slot->active == h) h->slot->active = nullptr;
-    if (!h->slot) InterlockedDecrement(&g_untracked_running);   // call_mid's own decrement never runs now
+    if (!h->slot || private_slot(h->slot)) InterlockedDecrement(&g_untracked_running);   // call_mid's own decrement never runs now
     restore_hit_guarantee(h);
     hit_settle(h->acct, h->logged);
 }
@@ -1981,11 +1974,19 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
         // flight (interrupted).
         const uint64_t now = thread_born(ts);
         if (!ts->born || !now || now == ts->born) hit_settle(ts->active_acct, ts->active_logged != 0);
+        if (private_slot(ts)) InterlockedDecrement(&g_untracked_running);
         ts->born = now;
         ts->active = nullptr;
     }
     if (ts && ts->active) {
         hit_settle(acct, false); return finish_hit(false, teb.error, teb.status);
+    }
+    if (!ts) {
+        // No static TLS yet AND both tables full: never run an unguarded callback. Direct
+        // calls of a probed API could otherwise recurse until the target's stack overflows.
+        warn_once(&c, "callback refused: agent thread table full before TLS initialisation");
+        hit_settle(acct, false);
+        return finish_hit(false, teb.error, teb.status);
     }
     // The mid-hook stub preserves GPRs, flags and XMM0-15 only. The callback (and the CRT
     // it calls) may touch x87/MXCSR/YMM/ZMM state -- e.g. vzeroupper -- which the target
@@ -1993,7 +1994,7 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     // and give C code the ABI-required DF=0.
     // Extended state (MXCSR, AVX/AVX-512) and DF are handled in mid_entry, BEFORE any of
     // this C code runs -- see there.
-    forget_region();     // validated regions are trusted within ONE hit only (see RegionCache)
+    forget_region();
     HitScope scope{acct, ts, load_epoch(state->shared)};  // one relaxed snapshot at callback entry
     scope.canary = (uintptr_t)&scope ^ HIT_CANARY;
 #if defined(_WIN64)
@@ -2003,12 +2004,12 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     scope.x87_post = x87_post;
     if (acct.blk) acct.blk->probe = (LONG)index;          // diagnostics: probe_agent_cut_off
     if (ts) { ts->active_acct = acct; ts->active_logged = 0; ts->active = &scope; }
-    else InterlockedIncrement(&g_untracked_running);       // no slot at all: see count_live_callbacks
+    if (!ts || private_slot(ts)) InterlockedIncrement(&g_untracked_running);
     c.hit_scope = &scope;
     teb.restore();                                      // bookkeeping must not reach the callback/target
     bool callback_ok = run_callback(cb, &c, teb.error, teb.status);
     if (ts) ts->active = nullptr;
-    else InterlockedDecrement(&g_untracked_running);
+    if (!ts || private_slot(ts)) InterlockedDecrement(&g_untracked_running);
     scope.canary = 0;
     if (!callback_ok) {
         // A faulting callback is a no-op: its register changes are discarded -- unless it had
@@ -2360,11 +2361,11 @@ static nt_raise_fn g_nt_raise;           // ntdll!NtRaiseException, resolved at 
 static LONG CALLBACK tramp_veh(EXCEPTION_POINTERS *ep) {
     const DWORD tid = GetCurrentThreadId();
     const uintptr_t ip = (uintptr_t)UHH_IP(ep->ContextRecord);
-    if (ThreadSlot *ts = thread_slot(tid, false))                       // a new exception (not our re-raise)
+    if (ThreadSlot *ts = cached_slot() ? cached_slot() : thread_slot(tid, false)) // a new exception (not our re-raise)
         if (ts->moved_to && (uintptr_t)ep->ExceptionRecord->ExceptionAddress != ts->moved_to) ts->moved_to = 0;
     uintptr_t site = 0;
     if ((uintptr_t)ep->ExceptionRecord->ExceptionAddress != ip || !tramp_to_site(ip, &site)) return EXCEPTION_CONTINUE_SEARCH;
-    if (ThreadSlot *ts = own_thread_slot(tid)) { ts->moved_from = ip; ts->moved_to = site; }
+    if (ThreadSlot *ts = my_slot(tid)) { ts->moved_from = ip; ts->moved_to = site; }
     // RE-RAISE at the original address rather than edit this dispatch: the dispatcher's own
     // frame keeps a separate copy of the faulting RIP/RSP (its machine frame), which the
     // unwind to a handler walks through -- edited only in the CONTEXT, the unwind no longer
@@ -2379,7 +2380,8 @@ static LONG CALLBACK tramp_veh(EXCEPTION_POINTERS *ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 static LONG CALLBACK tramp_vch(EXCEPTION_POINTERS *ep) {
-    ThreadSlot *ts = thread_slot(GetCurrentThreadId(), false);
+    ThreadSlot *ts = cached_slot();
+    if (!ts) ts = thread_slot(GetCurrentThreadId(), false);
     if (!ts || !ts->moved_to) return EXCEPTION_CONTINUE_SEARCH;
     if ((uintptr_t)UHH_IP(ep->ContextRecord) == ts->moved_to) UHH_IP(ep->ContextRecord) = ts->moved_from;
     ts->moved_to = 0;
@@ -2961,8 +2963,8 @@ static bool callback_live(const ThreadSlot &ts, DWORD self, DWORD pid) {
     return live;
 }
 static LONG count_live_callbacks() {
-    // A callback on a thread with no slot (more than 4096 + 256 probe-hitting threads alive at
-    // once) cannot be checked: counted as live.
+    // Private TLS fallback slots (more than 4096 + 256 live probe-hitting threads) cannot
+    // be enumerated here: their callbacks are conservatively counted as live.
     LONG n = g_untracked_running;
     const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
     for (const ThreadSlot &ts : g_threads) n += callback_live(ts, self, pid);

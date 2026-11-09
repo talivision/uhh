@@ -7841,6 +7841,68 @@ def check_ctrl_own_debug():
             record(name, False, repr(e))
 
 
+def check_api_contract():
+    """Public API review: guard re-protection, foreign callback collisions, and mapped
+    inline adds (installation errors must reach the callback). One source, every backend.
+    Modes 6/7 also exercise call_func/call_original after a synchronous inline add."""
+    d, t, dll = exe("ctrl_driver.exe"), exe("ctrl_target.exe"), exe("ctrl_dll.dll")
+    if not d or not t or not dll:
+        return missing_bin("api-contract", "ctrl_driver/ctrl_target/ctrl_dll")
+    for bk in ("breakpoint", "hw", "inline"):
+        cases = [("apiguard", 0)] + [("apiforeign", m) for m in range(4)]
+        cases += [("apiinstall", m) for m in range(8) if bk != "inline" or m not in (3, 4, 5)]
+        for sc, mode in cases:
+            name = f"api-{sc[3:]}-{mode}-{bk}"
+            try:
+                r, o = run([d, "--scenario", sc, "--backend", bk, "--", t, sc, "--mode", str(mode)], timeout=120)
+                logs = [str(x.get("message", "")) for x in o if x.get("kind") == "probe_log"]
+                res = next((x for x in o if x.get("kind") == "ctrl_result"), {})
+                rep = report(o)
+                bad = []
+                if r.returncode != 0 or res.get("guards") != 0 or res.get("value") != 6:
+                    bad.append(f"exit={r.returncode} target={res}")
+                if rep.get("error") is not None or rep.get("log_dropped") != 0 or rep.get("callbacks_interrupted", 0) != 0:
+                    bad.append(f"report={rep}")
+                if sc == "apiguard":
+                    expected = "apiguard warm=1 armed=1 read=0 kept=1"
+                elif sc == "apiforeign":
+                    expected = f"apiforeign mode={mode} found=1 add=0"
+                else:
+                    expected = f"apiinstall mode={mode} add={0 if 3 <= mode < 6 else 1}"
+                    if not 3 <= mode < 6 and logs.count("tock") != 1:
+                        bad.append(f"next call not hooked: tock={logs.count('tock')}")
+                    if mode >= 6 and f"apiinstall continued cf={1 if mode == 6 else -1} original=1" not in logs:
+                        bad.append(f"calls after add={logs}")
+                if expected not in logs: bad.append(f"missing {expected!r}: {logs}")
+                record(name, not bad, " ".join(bad) or expected)
+            except Exception as e:
+                record(name, False, repr(e))
+
+
+def check_api_threadfull():
+    """4354 threads remain alive after probing CtrlTock. Each callback calls that SAME
+    probed function through call_func: guard exhaustion must neither refuse the call nor
+    re-enter its callback. Real exhaustion, without a test-only substitute for TLS."""
+    d, t = exe("ctrl_driver.exe"), exe("ctrl_target.exe")
+    name = "api-threadfull-inline"
+    if not d or not t:
+        return missing_bin(name, "ctrl_driver/ctrl_target")
+    try:
+        r, o = run([d, "--scenario", "apithread", "--backend", "inline", "--", t, "apithread"], timeout=240)
+        logs = [str(x.get("message", "")) for x in o if x.get("kind") == "probe_log"]
+        res = next((x for x in o if x.get("kind") == "ctrl_result"), {})
+        rep = report(o)
+        ok = (r.returncode == 0 and res.get("created") == 4354 and res.get("called") == 4354
+              and len(logs) == 4354 and all(m == "apithread ok=1 value=6" for m in logs)
+              and rep.get("hits") == 8708 and rep.get("logs_written") == 4354
+              and rep.get("log_dropped") == 0 and rep.get("callbacks_interrupted", 0) == 0
+              and rep.get("error") is None)
+        record(name, ok, f"exit={r.returncode} target={res} hits={rep.get('hits')} logs={len(logs)} "
+               f"unexpected={[m for m in logs if m != 'apithread ok=1 value=6'][:3]}")
+    except Exception as e:
+        record(name, False, repr(e))
+
+
 def check_cdx_review():
     """Codex review of the controller (docs/ROADMAP.md "Codex controller review"), fixture
     examples/ctrlreview, ONE callback source per check, every backend:
@@ -12895,6 +12957,8 @@ def main():
     if want(check_ctrl_symload): check_ctrl_symload()
     if want(check_ctrl_own_debug): check_ctrl_own_debug()
     if want(check_cdx_review): check_cdx_review()
+    if want(check_api_contract): check_api_contract()
+    if want(check_api_threadfull): check_api_threadfull()
     if want(check_newapp_files): check_newapp_files()
     if want(check_newapp_flag): check_newapp_flag()
     if want(check_newapp_reg): check_newapp_reg()

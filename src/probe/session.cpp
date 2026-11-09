@@ -331,7 +331,10 @@ extern "C" int probe_add_symbol_cfg(probe_session *s, const char *location, prob
                     if (!arm_probe(s, *raw, kv.second)) { raw->retired = true; return scope.done(0); }
                     break;
                 }
-            if (type == PROBE_INLINE && raw->address && !kick_agent(s)) { raw->retired = true; return scope.done(0); }
+            if (type == PROBE_INLINE && raw->address) {
+                if (!kick_agent(s)) { raw->retired = true; return scope.done(0); }
+                if (!confirm_runtime_inline(s, *raw)) return scope.done(0);
+            }
         }
         return 1;
     } catch (const std::exception &e) { set_error(s, e.what()); return scope.done(0); }
@@ -365,6 +368,7 @@ static int add_absolute(probe_session *s, uint64_t address, probe_callback cb, u
         bool ok = (flags & PROBE_INLINE) ? register_runtime_inline(s, *raw) && resolve_inline(s, *raw, 0) && kick_agent(s)
                 : (flags & PROBE_HW)     ? arm_hw(s, *raw, 0) : arm_breakpoint(s, *raw, 0);
         if (!ok) raw->retired = true;
+        if (ok && (flags & PROBE_INLINE)) ok = confirm_runtime_inline(s, *raw);
         return scope.done(ok ? 1 : 0);
     } catch (const std::exception &e) { set_error(s, e.what()); return scope.done(0); }
 }

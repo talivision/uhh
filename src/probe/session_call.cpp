@@ -99,7 +99,8 @@ bool call_resume(probe_session *s, DWORD tid, EventFiber::Outcome how, const DEB
 // A thread running a call_func or call_original callee: its own probe hits are counted
 // without a callback (no re-entry, as inline).
 bool thread_in_call(const probe_session *s, DWORD tid) {
-    return tid && (tid == s->in_call_tid || s->calls.count(tid));
+    return tid && (tid == s->in_call_tid || s->calls.count(tid) ||
+                   (s->inline_add_wait_tid && (tid == s->remote_tid || agent_thread(s, tid))));
 }
 // Other threads' probe hits while a call_func or call_original is in flight are held back
 // (defer_hit_during_call) and replayed when no call is left: breakpoint/hw callbacks never
@@ -110,9 +111,10 @@ bool thread_in_call(const probe_session *s, DWORD tid) {
 // hit) waits for the 5 s timeout (documented; owner decision: no hardening).
 static void resume_deferred_hits(probe_session *s);
 static void release_deferred(probe_session *s) {
-    if (!s->in_call_tid && s->calls.empty()) resume_deferred_hits(s);
+    if (!s->in_call_tid && s->calls.empty() && !s->inline_add_wait_tid) resume_deferred_hits(s);
 }
 bool defer_hits_now(const probe_session *s, DWORD tid) {
+    if (s->inline_add_wait_tid) return tid != s->inline_add_wait_tid && !thread_in_call(s, tid);
     if (s->in_call_tid) return tid != s->in_call_tid;                  // call_original
     return !s->calls.empty() && !s->calls.count(tid);                  // call_func (not the callee's own)
 }
@@ -157,6 +159,7 @@ bool poll_calls(probe_session *s) {
             again = true; break;
         }
     }
+    if (!s->cur_fiber) release_deferred(s);      // runtime inline waits can also defer hits
     replay_held_watches(s);
     return ok;
 }
@@ -1124,7 +1127,14 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
         }
         if (running) { ResumeThread(thread); guard_resync(s); }
     };
-    if (!ContinueDebugEvent(st->pid, st->tid, DBG_CONTINUE)) {
+    EventFiber *const f = s->cur_fiber;
+    bool continued = false;
+    if (f && f->stop_suspended) {
+        continued = ResumeThread(f->resume_after) != (DWORD)-1;
+        if (continued) { CloseHandle(f->resume_after); f->resume_after = nullptr; f->stop_suspended = false; }
+        guard_resync(s);
+    } else continued = !!ContinueDebugEvent(st->pid, st->tid, DBG_CONTINUE);
+    if (!continued) {
         if (!borrowed) s->dr_used &= (uint8_t)~(1u << slot);
         s->in_call_tid = 0; s->co_addr = 0; s->co_borrowed_slot = -1;
         handling_running(s, st->tid, false); guard_sync(s);            // still at its event: listed again
@@ -1290,7 +1300,7 @@ extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
     }
     if (st->probe->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) return 0;
     if (st->session->in_call_tid) return 0;                            // no nesting
-    if (st->session->cur_fiber && st->session->cur_fiber->resume_after) return 0;   // held after a call_func timeout
+    if (st->session->cur_fiber && st->session->cur_fiber->resume_after && !st->session->cur_fiber->stop_suspended) return 0;   // held after a call_func timeout
     return call_original_in_place(st->session, st, c, out);
 }
 extern "C" void return_from(probe_context *c, uint64_t value, int nargs) {

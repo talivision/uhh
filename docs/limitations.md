@@ -82,6 +82,7 @@ Windows enforces no CET shadow stack for WOW64 processes. Details in [x86 / WOW6
 | Hardware probes | 4 in total (execute + watch), one debug register each (New-app NA6, Frida F6) | breakpoint/inline for the rest; filter so one site suffices |
 | `call_original` on hw / breakpoint | needs one of the 4 registers free for the call, unless the hit is itself a hw execute probe (call_original CO6) | at most 3 hw probes when other probes call `call_original`; `gated_config` puts NtClose on breakpoint when opens are hw |
 | Inline probes | 128 per session (the 129th is refused) | breakpoint/hw for more sites |
+| Inline recursion tracking | 4096 primary + 256 overflow thread slots, then per-thread TLS; before TLS exists, a hit with both tables full is counted but its callback is refused with a warning | avoid exhausting the tables during thread initialisation |
 | Software breakpoints in a session with inline probes | 65536 armed at once | - |
 | Config block | 4 GB | - |
 | Log message | 1023 bytes, then `...[truncated]` | log several records |
@@ -103,7 +104,9 @@ inside the target (📄 Portability D1-D6).
   inline, but one controller thread for all target threads on breakpoint/hw.
   *Workaround:* make shared state atomic or locked; key per-thread state by the target tid.
 - **D3: a faulting or throwing callback** is abandoned on every backend (hit counted,
-  register changes discarded, `set_mem` writes kept). Inline, the exception is raised in the
+  register changes discarded, `set_mem` writes kept). After successful `call_original`,
+  it returns the `return_from` value if set, else the original result, discarding other
+  register edits so the original is not executed twice. Inline, the exception is raised in the
   target, so the program's vectored handlers see the first chance; breakpoint/hw never.
   *Workaround:* check pointers with `get_mem` instead of dereferencing; do not throw out of
   callbacks.
@@ -133,6 +136,10 @@ data) prints on all backends.
 `examples/trace/trace_callback.cpp` does).
 
 ## Coverage and timing
+
+- **A mapped inline addition from a callback waits at most 5 s for installation.** It
+  returns 1 only once installed, or 0 on failure/timeout and releases the caller. A pending
+  install may still complete later. A symbol in an unloaded module returns 1 pending load.
 
 - **On launch, inline probes go live at the loader breakpoint** (Hunter A6): the target's
   main thread loads the agent there, after the static imports are mapped and before any DLL
@@ -268,7 +275,8 @@ data) prints on all backends.
 - **Remaining agent limits** (Agent review, ⬜): a thread that dies inside a callback and
   whose id is reused before the next hit is not reported as interrupted; a `call_func` left
   by a non-unwinding `longjmp` keeps its thread marked as in a call.
-- **The agent stays loaded after a detach** (Lifecycle), quiescent: hooks removed, logging
+- **The agent stays loaded after a detach** (Lifecycle), normally quiescent after confirmed
+  unhooking (see [bounded cleanup](#detach-and-close)): hooks removed, logging
   stopped. A later attach to the same process reuses it.
   Ordinary reattach reuses the named channel, its target view/handle and session proxies.
   The controller maps the retained agent file too, preserving `UHH_SHARED` across backends.
@@ -322,6 +330,11 @@ data) prints on all backends.
   `NUL` (the file still gets every record).
 
 ## Detach and close
+
+- **Inline unhooking is bounded too.** The controller waits up to 5 s for the agent stop
+  thread, then detaches even if removal is unconfirmed. Hooks may remain until the target
+  lets that thread run (for example, after releasing its loader lock). Close is not a
+  guarantee of completed inline removal; config and trampoline storage remain available.
 
 - **Detach waits at most 15 s for running inline callbacks** (owner decision 2026-11-07). It
   keeps delivering their logs while any in-flight callback can still finish (thread alive,

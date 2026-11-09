@@ -26,7 +26,7 @@ Contents: [concepts](#concepts) · [types and macros](#types-and-macros) ·
 | Backend | Mechanism | Code modified | Where the callback runs |
 |---|---|---|---|
 | `PROBE_BREAKPOINT` | INT3 written by the controller (a debugger); displaced stepping | 1 byte | in the controller, on its debugger thread |
-| `PROBE_HW` | execute debug register (DR0-DR3) | none | in the controller, on its debugger thread |
+| `PROBE_HW` | execute debug register (DR0-DR3) | watched site unchanged; internal ntdll INT3s possible | in the controller, on its debugger thread |
 | `PROBE_INLINE` | SafetyHook mid-function hook installed by `probe_api_agent.dll`, injected into the target | >= 5 bytes | inside the target, on the thread that hit the probe |
 
   One callback source runs under every backend. The functions below return the same values
@@ -92,7 +92,9 @@ Contents: [concepts](#concepts) · [types and macros](#types-and-macros) ·
   injected). In a session with inline probes, breakpoint/hw probes arm once the injected
   agent's controller-death guard is up (or after 5 s without it, with a warning).
 - A probe added from a callback: breakpoint/hw arm before the target resumes; an inline
-  probe holds the calling thread until its hook is in.
+  probe on a mapped site returns 1 only after installation confirms. It holds the calling
+  thread for at most 5 s; on timeout it returns 0 and releases the thread. The pending
+  install may still complete later. Symbols in unloaded modules return 1 pending their load.
 
 ## Types and macros
 
@@ -125,7 +127,7 @@ Pass exactly one backend flag, optionally ORed with options. An unknown bit is r
 | `PROBE_ONCE` | breakpoint, hw | remove the probe after its first hit. Refused with `PROBE_INLINE`. |
 | `PROBE_WATCH_WRITE` | hw | data watchpoint: fire when the address is written. With `probe_watch` it is the default. |
 | `PROBE_WATCH_RW` | hw | data watchpoint: fire when the address is read or written. Exactly one of WRITE / RW. |
-| `PROBE_ALLOW_PREHOOKED` | inline | install over a site another tool already hooked, chaining through its hook. Without it such a site is refused for inline (breakpoint/hw only report it). |
+| `PROBE_ALLOW_PREHOOKED` | inline | install over a site another tool already hooked, chaining through its hook. Without it such a site is refused for inline (breakpoint reports it but refuses an existing INT3; hw skips prehook detection). |
 | `PROBE_FALLBACK_HW` | inline | when the inline site is refused (pre-hooked, unsafe, or overlapping another inline hook), use a hardware execute probe instead (`probe: X -> hardware fallback (...)`). Needs a free debug register. |
 | `PROBE_UNSAFE_FAST_PATCH` | inline | write the hook **without** freezing the target. By default every other thread is suspended while a hook is written (only at install/remove, never per hit) and a thread caught inside the overwritten bytes is moved onto the trampoline. With this flag such a thread can crash. For measurement only. |
 | `PROBE_ALLOW_UNSAFE_SITE` | all execute backends | override the instruction-boundary refusal with one stderr warning and one per-probe `uhh warning` log record (never valid for data watchpoints). Inline additionally: install even where the site check refuses (code could arrive inside the >= 5 overwritten bytes: a branch target, function start, return point, switch-table target, live code after a ret/jmp, an unresolvable indirect jump, the end of the section). The reason is printed as a warning. You assert nothing reaches those bytes. The other inline checks keep their existing meaning. |
@@ -184,7 +186,10 @@ refused as for [locations](#locations) (`probe 0x... refused: site is inside an 
 
 A hardware **data** watchpoint on an absolute address: the callback fires when the
 location is written (`PROBE_WATCH_WRITE`, the default when no mode is given) or read or
-written (`PROBE_WATCH_RW`). Optional `| PROBE_ONCE`. No code is modified.
+written (`PROBE_WATCH_RW`). Optional `| PROBE_ONCE`. The watched address is not patched.
+Hardware sessions can install internal software breakpoints at `ntdll!NtContinue`,
+`NtContinueEx` and `RtlUserThreadStart` to maintain debug registers across context restores
+and thread creation.
 
 - The watch covers one dword: the address must be 4-byte aligned
   (`probe_watch address must be 4-byte aligned (watches one dword)`).
@@ -238,8 +243,10 @@ Attaches to a running process instead of launching one.
   [limitations.md](limitations.md#detach-and-close)).
 - Probes resolve against the modules already loaded and any loaded later.
 - `probe_run` returns when the target exits. `probe_close` on a still-running target
-  **detaches**: inline hooks removed, breakpoints restored, debug registers cleared, no
-  thread left mid-step; the target keeps running.
+  **detaches**: requests inline unhooking, restores breakpoints and clears debug registers;
+  the target keeps running. The agent stop wait is bounded to 5 s. If it cannot finish in
+  time, hooks may remain until the target lets the stop thread run; cleanup is not confirmed
+  at return (see [limitations.md](limitations.md#detach-and-close)).
 
 ### `int probe_attach_new(probe_session *s, const char *image_name, uint32_t timeout_ms)`
 
@@ -297,6 +304,8 @@ Ends the session and frees it; `s` is invalid afterwards.
 - An attached target that is still running is detached. stderr then shows
   `probe: detached: hits=.. logs_written=.. log_dropped=.. in_flight=.. running=..`
   (hits = logs_written + log_dropped + in_flight).
+- Inline unhooking has the bounded stop wait described at `probe_attach`; close does not
+  guarantee that unconfirmed hook removal has finished.
 - Detach waits at most 15 s for inline callbacks that are still running and can finish,
   delivering their logs meanwhile. After that it completes: `running=` counts the callbacks
   still running, `in_flight=` those of them that had not logged yet, and any log they write
@@ -342,7 +351,7 @@ convention:
 Copy target memory into `buffer`, or `buffer` into target memory. Return 1 only if the
 whole range was transferred.
 
-- The whole range is checked first (committed, readable / writable, no guard page); if
+- The whole range is checked on every call (committed, readable / writable, no guard page); if
   any part fails, nothing is read or written and the call returns 0. A guard page stays
   armed; a read-only page (code included) is not made writable.
 - `get_mem` of code under a probe returns the **program's** bytes, not UHH's INT3 or hook
@@ -502,6 +511,11 @@ stderr (`probe: warning: <location>: ...`, the first of each kind per session).
 
 The session the callback belongs to, for control-plane calls from a callback; see below.
 
+Inline recursion tracking uses 4096 primary and 256 overflow thread slots, then a TLS
+fallback. `call_func` remains guarded with that fallback. Before static TLS is available,
+a hit with both tables owned by live threads is counted but its callback is refused with
+a warning; it cannot safely run unguarded.
+
 ## Control from a callback
 
 `get_session(c)` works in every callback: breakpoint/hw get the real session; inline
@@ -524,6 +538,9 @@ source works in every backend.
 - A probe added for a module that is not loaded yet returns 1 and stays pending; if it
   cannot be armed when the module loads, stderr shows `probe: runtime probe <loc> failed to
   arm: <reason>` and the probe is dropped.
+- A mapped inline addition returns 1 only once its installation confirms; installation
+  failure returns 0. The wait is bounded to 5 s to avoid wedging the target; a timeout
+  returns 0 and releases the caller, and the pending hook may still install later.
 - Configs have no extra size limit from a callback (4 GB everywhere); a symbol string sent
   from an inline callback is limited to 64 KiB.
 

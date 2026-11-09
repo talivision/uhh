@@ -411,6 +411,7 @@ struct probe_session {
     int shadow_stack = -1;                     // target has hardware shadow stacks (CET): -1 unknown, 0/1
     uint64_t ret_gadgets = 0;                  // return_from: `ret` / `ret N` gadgets in the target
     bool warned_cb_fault = false;              // one stderr warning for a faulting controller-side callback
+    DWORD inline_add_wait_tid = 0;              // hold this callback while a runtime inline add confirms
     DWORD cb_tid = 0;                          // thread whose callback / IPC is being serviced (0 = none)
     const uhh_session::Probe *cb_probe = nullptr;           // whose callback runs (an IPC add: its inline origin probe)
     std::wstring agent_copy;                   // per-session copy of the agent DLL (UHH_SHARED), deleted at close
@@ -684,12 +685,13 @@ void release_unclaimed_agent_mapping(probe_session *s);
 bool create_agent_channel(probe_session *s);
 bool register_runtime_inline(probe_session *s, Probe &p);
 bool inline_hold_needed(const probe_session *s);
-bool agent_thread(probe_session *s, DWORD tid);
+bool agent_thread(const probe_session *s, DWORD tid);
 void hold_thread(probe_session *s, DWORD tid);
 bool arm_gates_for_pending(probe_session *s);
 bool handle_gate(probe_session *s, const DEBUG_EVENT &event, bool &handled);
 void release_held(probe_session *s, const char *why);
 bool kick_agent(probe_session *s);
+bool confirm_runtime_inline(probe_session *s, Probe &p);
 bool reuse_target_agent(probe_session *s);
 bool bind_pending_shared(probe_session *s);
 void retarget_pending(probe_session *s);

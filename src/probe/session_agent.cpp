@@ -774,8 +774,7 @@ static bool accept_agent_install(probe_session *s);
 // request slot -- creating the channel on first use -- and is installed by the agent on
 // a FRESH remote thread, never inside the calling callback: the installer freezes other
 // threads, and the caller may hold locks (heap, loader) a frozen thread is waiting on.
-// The calling thread is held until the agent confirms the hook (see pending_hold), so
-// from the caller's point of view the add is synchronous.
+// confirm_runtime_inline holds the caller while a mapped installation confirms.
 bool register_runtime_inline(probe_session *s, Probe &p) {
     if (!s->shared && !open_agent_section(s, 0)) return false;
     uint32_t idx = s->shared->request_count;
@@ -789,10 +788,8 @@ bool register_runtime_inline(probe_session *s, Probe &p) {
     fill_request(s, p);
     MemoryBarrier();
     s->shared->request_count = idx + 1;
-    // Synchronous for the caller: the thread whose callback added the probe is held
-    // (after its event is handled) until the agent confirms the hook, so its next call
-    // through the new site is seen. Other threads run on; they were never promised it.
-    if (s->cb_tid) s->pending_hold.push_back(s->cb_tid);
+    // The add waits in confirm_runtime_inline before returning to its callback. Do not
+    // queue another post-callback hold: confirmation may already have released the others.
     return true;
 }
 
@@ -820,7 +817,7 @@ bool inline_hold_needed(const probe_session *s) {
 
 // A thread of OUR agent (its service thread, started from the agent image): never hold it
 // -- it may own the agent's install lock or be the one that must do the install.
-bool agent_thread(probe_session *s, DWORD tid) {
+bool agent_thread(const probe_session *s, DWORD tid) {
     if (!s->remote_agent) return false;
     using QueryFn = LONG(NTAPI *)(HANDLE, ULONG, PVOID, ULONG, PULONG);
     static auto query = reinterpret_cast<QueryFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
@@ -1000,6 +997,53 @@ bool kick_agent(probe_session *s) {
     if (s->remote_work != probe_session::REMOTE_NONE) return true;   // picked up when it finishes
     if (!s->remote_agent) return start_agent_load(s);
     return start_agent_init(s);
+}
+// A mapped runtime add must return the installation result, not merely a successful kick.
+// Continue its event with the calling thread suspended, as call_func does, so the service
+// thread can install while this callback's stack and IPC request remain live.
+bool confirm_runtime_inline(probe_session *s, Probe &p) {
+    if (!(p.flags & PROBE_INLINE) || !p.address || !s->cb_tid || GetCurrentThreadId() != s->debug_tid) return true;
+    EventFiber *const f = s->cur_fiber;
+    if (!f || !s->shared) { set_error(s, "cannot wait for runtime inline installation"); return false; }
+    if (!f->resume_after) {
+        HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION, FALSE, s->cb_tid);
+        guard_note_hold(s, s->cb_tid);
+        if (!t || SuspendThread(t) == (DWORD)-1) {
+            if (t) CloseHandle(t);
+            set_error(s, win_error("hold runtime inline caller")); return false;
+        }
+        f->resume_after = t; f->stop_suspended = true;
+        if (!ContinueDebugEvent(f->ev.dwProcessId, f->ev.dwThreadId, DBG_CONTINUE)) {
+            const std::string why = win_error("continue runtime inline add");
+            ResumeThread(t); CloseHandle(t); f->resume_after = nullptr; f->stop_suspended = false;
+            set_error(s, why); return false;
+        }
+    }
+    struct WaitScope {
+        probe_session *s; DWORD prev;
+        ~WaitScope() { s->inline_add_wait_tid = prev; }
+    } wait{s, s->inline_add_wait_tid};
+    s->inline_add_wait_tid = s->cb_tid;
+    const ULONGLONG until = GetTickCount64() + 5000;
+    while (!s->exited && !s->stop_requested && GetTickCount64() < until) {
+        MemoryBarrier();
+        const LONG status = s->shared->requests[p.agent_index].status;
+        if (status == PROBE_AGENT_INSTALLED) return true;
+        if (p.retired || (status != PROBE_AGENT_PENDING && status != PROBE_AGENT_INSTALLING)) {
+            set_error(s, "runtime inline installation failed (status=" + std::to_string(status) + ")");
+            return false;
+        }
+        drain_agent_logs(s);
+        if (!poll_calls(s)) return false;
+        DEBUG_EVENT event{};
+        if (WaitForDebugEvent(&event, 20) && !continue_foreign_event(s, event) && !service_event(s, event)) return false;
+        if (s->rekick_at && GetTickCount64() >= s->rekick_at) {
+            s->rekick_at = 0;
+            if (agent_has_pending(s) && !kick_agent(s)) return false;
+        }
+    }
+    set_error(s, "runtime inline installation not confirmed within 5 s");
+    return false;
 }
 // UHH_SHARED callbacks still waiting for the agent (a session without inline probes opens no
 // channel, which is where the agent is otherwise loaded): load it and bind them now.

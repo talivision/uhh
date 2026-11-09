@@ -82,6 +82,11 @@ extern "C" __declspec(dllexport) __declspec(noinline) int CtrlTick(void *tock) {
     static volatile void *sink; sink = tock; return 1;
 }
 
+extern "C" __declspec(dllexport) __declspec(noinline) void CtrlApi(uintptr_t mode, void *addr, void *data) {
+    static volatile uintptr_t sink[3];
+    sink[0] = mode; sink[1] = (uintptr_t)addr; sink[2] = (uintptr_t)data;
+}
+
 static int arg_int(int argc, char **argv, const char *name, int def) {
     for (int i = 2; i + 1 < argc; ++i) if (!std::strcmp(argv[i], name)) return std::atoi(argv[i + 1]);
     return def;
@@ -889,11 +894,58 @@ static int run_logsite_code(bool callpair, bool whole = false) {
     return bad ? 1 : 0;
 }
 
+// Keep every thread alive after its hit so the recursion tables really exhaust on both arches.
+static HANDLE api_go;
+static volatile LONG api_called;
+static DWORD WINAPI api_thread(void *) {
+    CtrlTock(5);
+    InterlockedIncrement(&api_called);
+    WaitForSingleObject(api_go, INFINITE);
+    return 0;
+}
+static int run_apithread() {
+    api_go = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!api_go) return 1;
+    std::vector<HANDLE> threads;
+    for (int i = 0; i < 4354; ++i) {
+        HANDLE t = CreateThread(nullptr, 64 * 1024, api_thread, nullptr, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+        if (!t) break;
+        threads.push_back(t);
+    }
+    const ULONGLONG until = GetTickCount64() + 120000;
+    while (api_called < (LONG)threads.size() && GetTickCount64() < until) Sleep(5);
+    const LONG called = api_called;
+    SetEvent(api_go);
+    for (HANDLE t : threads) { WaitForSingleObject(t, 60000); CloseHandle(t); }
+    CloseHandle(api_go);
+    std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"apithread\",\"created\":%zu,\"called\":%ld}\n", threads.size(), called);
+    return threads.size() == 4354 && called == 4354 ? 0 : 1;
+}
+static volatile LONG api_guards;
+static LONG CALLBACK api_veh(EXCEPTION_POINTERS *e) {
+    if (e->ExceptionRecord->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) InterlockedIncrement(&api_guards);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+static int run_apicontract(const std::string &sc, int mode) {
+    void *page = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!page) return 1;
+    PVOID veh = AddVectoredExceptionHandler(1, api_veh);
+    CtrlApi((uintptr_t)mode, sc == "apiguard" ? page : (void *)&CtrlTock, page);
+    const int value = CtrlTock(5);                    // the very next instruction path must see a successful add
+    if (veh) RemoveVectoredExceptionHandler(veh);
+    VirtualFree(page, 0, MEM_RELEASE);
+    std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"%s\",\"guards\":%ld,\"value\":%d}\n", sc.c_str(), api_guards, value);
+    return value == 6 && api_guards == 0 ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: ctrl_target <scenario> [opts]\n"); return 2; }
     const std::string sc = argv[1];
     int rc = 2;
-    if (sc == "modforward" || sc == "modcall" || sc == "modhistory" || sc == "modreload")
+    if (sc == "apiguard" || sc == "apiforeign" || sc == "apiinstall")
+        rc = run_apicontract(sc, arg_int(argc, argv, "--mode", 0));
+    else if (sc == "apithread") rc = run_apithread();
+    else if (sc == "modforward" || sc == "modcall" || sc == "modhistory" || sc == "modreload")
         rc = run_modmodules(sc, arg_str(argc, argv, "--dll", "low"));
     else if (sc == "modreloc") rc = run_modreloc();
     else if (sc == "siteempty") rc = 0;
