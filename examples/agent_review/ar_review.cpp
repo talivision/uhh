@@ -38,8 +38,15 @@ static DWORD WINAPI pressure_thread(void *event) {
     return 0;
 }
 static DWORD WINAPI epoch_thread(void *p) { ar_epoch_site((ArEpochControl *)p); return 0; }
-static int epoch_case() {
+static int epoch_case(bool preaccount = false) {
     ArEpochControl control{CreateEventW(nullptr, TRUE, FALSE, nullptr), CreateEventW(nullptr, TRUE, FALSE, nullptr), 0};
+    if (preaccount) {
+        wchar_t name[80];
+        _snwprintf_s(name, _countof(name), _TRUNCATE, L"Local\\uhh_test_cf_%lu", GetCurrentProcessId());
+        CloseHandle(control.entered); control.entered = CreateEventW(nullptr, TRUE, FALSE, name);
+        _snwprintf_s(name, _countof(name), _TRUNCATE, L"Local\\uhh_test_cf_go_%lu", GetCurrentProcessId());
+        CloseHandle(control.release); control.release = CreateEventW(nullptr, TRUE, FALSE, name);
+    }
     printf("{\"kind\":\"ready\",\"pid\":%lu}\n", GetCurrentProcessId()); fflush(stdout);
     if (getchar() == EOF) return 2;
     HANDLE t = CreateThread(nullptr, 0, epoch_thread, &control, 0, nullptr);
@@ -55,7 +62,7 @@ static int epoch_case() {
     printf("{\"kind\":\"ar\",\"old_config\":%ld,\"new_config\":%ld}\n", old_config, control.observed); fflush(stdout);
     if (getchar() == EOF) return 7;
     CloseHandle(t); CloseHandle(control.entered); CloseHandle(control.release);
-    return old_config == 1 && control.observed == 2 ? 0 : 8;
+    return old_config == (preaccount ? 0 : 1) && control.observed == 2 ? 0 : 8;
 }
 AR_EXPORT void ar_shared_write_site(int value) { InterlockedExchange(&review_sink, value); }
 AR_EXPORT void ar_shared_read_site() { InterlockedIncrement(&review_sink); }
@@ -87,6 +94,16 @@ static int stop_guarded() {
 }
 int ar_review_case(const char *k) {
     if (!strcmp(k, "review-epoch")) return epoch_case();
+    if (!strcmp(k, "review-preaccount")) return epoch_case(true);
+    if (!strcmp(k, "review-slotless")) {
+        ArEpochControl control{CreateEventW(nullptr, TRUE, FALSE, nullptr), CreateEventW(nullptr, TRUE, FALSE, nullptr), 0};
+        HANDLE t = CreateThread(nullptr, 0, epoch_thread, &control, 0, nullptr);
+        if (!t || WaitForSingleObject(control.entered, 10000) != WAIT_OBJECT_0) return 2;
+        if (!TerminateThread(t, 0) || WaitForSingleObject(t, 10000) != WAIT_OBJECT_0) return 3;
+        CloseHandle(t); CloseHandle(control.entered); CloseHandle(control.release);
+        printf("{\"kind\":\"ar\",\"killed\":1}\n");
+        return 0;
+    }
     if (!strcmp(k, "review-shared") || !strcmp(k, "review-config")) {
         // /OPT:ICF can fold identical exported bodies, even with different signatures.
         const bool distinct = (uintptr_t)&ar_shared_write_site != (uintptr_t)&ar_shared_read_site;
@@ -210,15 +227,15 @@ int ar_review_case(const char *k) {
         const uint64_t enabled = (cp[2] & (1 << 27)) ? _xgetbv(0) : 0;
         const uint64_t mask = (enabled & 6) == 6 ? (4ull | ((enabled & 0xE0) == 0xE0 ? 0xE0ull : 0)) : 0;
 #if defined(_WIN64)
-        const uint64_t state_mask = mask | 2ull;         // XMM/MXCSR are restored by the stub/agent
+        const uint64_t state_mask = mask | 3ull;         // XMM/MXCSR are restored by the stub/agent
 #else
         const uint64_t state_mask = mask | 3ull;         // also exercise newly activated x87
 #endif
         int clean = 1, bad_phase = -1;
 #if defined(_WIN64)
-        const int checks = !mask ? 0 : (mask & 0x20) ? 5 : 2;
+        const int checks = !mask ? 0 : (mask & 0x20) ? 7 : 4;
 #else
-        const int checks = !mask ? 0 : (mask & 0x20) ? 4 : 2;
+        const int checks = !mask ? 0 : (mask & 0x20) ? 6 : 4;
 #endif
         for (int phase = 0; phase < checks; ++phase) {
             alignas(64) unsigned char area[4096] = {}, before[4096] = {};
@@ -229,7 +246,17 @@ int ar_review_case(const char *k) {
             // must NOT change the offsets of the XSAVEC image being restored.
             // 3/4: a live ZMM upper/high-register component must survive VZEROUPPER on
             // newly dirtied YMM state (component 6 is restored after VZEROUPPER zeros it).
-            const uint64_t live = phase == 1 ? 4ull : phase == 2 ? 0x20ull
+            const bool legacy = phase >= checks - 2;
+            if (legacy) {
+                // A live x87 stack, then MMX's all-valid tags / 64-bit payloads.
+                *(unsigned short *)(area + 0) = 0x027F;
+                area[4] = phase == checks - 1 ? 0xFF : 1;
+                for (int reg = 0; reg < 8; ++reg) {
+                    *(uint64_t *)(area + 32 + reg * 16) = 0x8000000000000123ull + reg;
+                    *(unsigned short *)(area + 40 + reg * 16) = phase == checks - 1 ? 0xFFFF : 0x3FFF;
+                }
+            }
+            const uint64_t live = legacy ? 1ull : phase == 1 ? 4ull : phase == 2 ? 0x20ull
                                 : phase == 3 ? 0x40ull : phase == 4 ? 0x80ull : 0;
             *(uint64_t *)(area + 512) = live;
             for (int i : {2, 5, 6, 7}) {
@@ -252,7 +279,6 @@ int ar_review_case(const char *k) {
                 memcmp(area + 160, before + 160, sizeof(void *) == 8 ? 256 : 128)) {
                 clean = 0; bad_phase = phase;
             }
-#if !defined(_WIN64)
             // Ignore reserved FXSAVE padding; check FCW/FSW/FTW, pointers/opcode and
             // all physical data registers, including those tagged empty after INIT.
             if (memcmp(area, before, 5) || memcmp(area + 6, before + 6, 18)) {
@@ -262,7 +288,6 @@ int ar_review_case(const char *k) {
                 if (memcmp(area + 32 + reg * 16, before + 32 + reg * 16, 10)) {
                     clean = 0; bad_phase = phase;
                 }
-#endif
             const uint64_t bv = *(uint64_t *)(area + 512), prior = *(uint64_t *)(before + 512);
             for (int i : {2, 5, 6, 7}) {
                 if (!(mask & (1ull << i))) continue;

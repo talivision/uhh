@@ -484,18 +484,25 @@ static bool image_at(uintptr_t base) {
     return base && VirtualQuery((void *)base, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
            mbi.Type == MEM_IMAGE && (uintptr_t)mbi.AllocationBase == base;
 }
-struct CfRace { HANDLE at, go; HMODULE ma, mb; const wchar_t *b; bool pin; int stalled, held; };
+struct CfRace { HANDLE at, go; HMODULE ma, mb; const wchar_t *b; bool pin, private_code; SIZE_T size; uintptr_t offset; void *replacement; int stalled, held; };
 static DWORD WINAPI cfrace_thread(void *p) {
     CfRace &x = *(CfRace *)p;
     x.stalled = WaitForSingleObject(x.at, 30000) == WAIT_OBJECT_0;   // the call_func is stopped
     FreeLibrary(x.ma);
     x.held = image_at((uintptr_t)x.ma);                  // still mapped: a reference outlived ours
-    if (!x.pin) x.mb = LoadLibraryW(x.b);                // B at A's base (fixed base, A is gone)
+    if (x.private_code) {
+        x.replacement = VirtualAlloc(x.ma, x.size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (x.replacement) {
+            const unsigned char code[] = {0xB8, 99, 0, 0, 0, 0xC3};
+            memcpy((unsigned char *)x.replacement + x.offset, code, sizeof(code));
+            FlushInstructionCache(GetCurrentProcess(), x.replacement, x.size);
+        }
+    } else if (!x.pin) x.mb = LoadLibraryW(x.b);                // B at A's base (fixed base, A is gone)
     SetEvent(x.go);
     return 0;
 }
-static int run_cfrace(bool pin) {
-    const char *sc = pin ? "cfpin" : "cfrace";
+static int run_cfrace(bool pin, bool private_code = false) {
+    const char *sc = private_code ? "cfprivate" : pin ? "cfpin" : "cfrace";
     wchar_t self[MAX_PATH], tmp[MAX_PATH];
     if (!GetModuleFileNameW(nullptr, self, MAX_PATH) || !GetTempPathW(MAX_PATH, tmp)) return 1;
     std::wstring dir(self); dir.resize(dir.find_last_of(L'\\') + 1);
@@ -514,6 +521,12 @@ static int run_cfrace(bool pin) {
     CfRace r{};
     r.at = at; r.go = go; r.b = b.c_str(); r.pin = pin;
     r.ma = LoadLibraryW(a.c_str());
+    r.private_code = private_code;
+    if (r.ma) {
+        const auto *dos = (const IMAGE_DOS_HEADER *)r.ma;
+        r.size = ((const IMAGE_NT_HEADERS *)((const unsigned char *)r.ma + dos->e_lfanew))->OptionalHeader.SizeOfImage;
+        r.offset = (uintptr_t)GetProcAddress(r.ma, "CfrValue") - (uintptr_t)r.ma;
+    }
     const uintptr_t base_a = (uintptr_t)r.ma;
     if (!at || !go || !r.ma) {
         std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"%s\",\"error\":\"setup\"}\n", sc); return 1;
@@ -524,11 +537,12 @@ static int run_cfrace(bool pin) {
     const int gone_after = !image_at(base_a) || (r.mb && (uintptr_t)r.mb == base_a);
     CtrlCall(5);
     if (r.mb) FreeLibrary(r.mb);
+    if (r.replacement) VirtualFree(r.replacement, 0, MEM_RELEASE);
     CloseHandle(at); CloseHandle(go);
     DeleteFileW(a.c_str()); DeleteFileW(b.c_str());
     RemoveDirectoryW((root + L"\\a").c_str()); RemoveDirectoryW((root + L"\\b").c_str()); RemoveDirectoryW(root.c_str());
     std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"%s\",\"stalled\":%d,\"held\":%d,\"gone_after\":%d,"
-                "\"same_base\":%d}\n", sc, r.stalled, r.held, gone_after, r.mb && (uintptr_t)r.mb == base_a ? 1 : 0);
+                "\"same_base\":%d}\n", sc, r.stalled, r.held, gone_after, (r.private_code ? r.replacement && (uintptr_t)r.replacement == base_a : r.mb && (uintptr_t)r.mb == base_a) ? 1 : 0);
     return 0;
 }
 
@@ -913,6 +927,7 @@ int main(int argc, char **argv) {
     else if (sc == "cfnx") rc = run_cfnx();
     else if (sc == "cfrace") rc = run_cfrace(false);
     else if (sc == "cfpin") rc = run_cfrace(true);
+    else if (sc == "cfprivate") rc = run_cfrace(false, true);
     else if (sc == "codeprot") rc = run_codeprot();
     else if (sc == "int3cap") rc = run_int3cap(arg_int(argc, argv, "--n", 1200));
     else if (sc == "bigcfg") rc = run_bigcfg();

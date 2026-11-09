@@ -1144,7 +1144,8 @@ overflows its stack. Every backend, x64 and x86.
 - ✅ (TR7, review b) **x86 inline: the x87 state was not saved** (default mask = AVX only). x86
   code returns floats in ST0, so any callback/CRT float call changes the x87 status/tag/stack a
   mid-function site may have live. The gated mask now includes x87 on x86 when it is in use.
-  (x64: not included -- MSVC x64 code never touches x87 -- so x64 hits keep the cheap path.)
+  The later cxr9 review extends the same XINUSE[0] gate to x64: although MSVC-generated
+  x64 code uses SSE, callbacks can call helpers using x87/MMX. INIT state keeps the gated path.
 - ✅ (TR8, review c) **inline get_mem trusted a per-thread region cache ACROSS hits**: a page the
   target decommitted / NOACCESSed / guarded later faulted (a first-chance AV its vectored
   handler saw) or silently consumed its PAGE_GUARD. The cache now lives for one hit (reset at

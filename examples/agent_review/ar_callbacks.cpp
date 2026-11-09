@@ -171,6 +171,12 @@ AR_CB void ar_on_guarantee(probe_context *c) {
     uint64_t r = 0;
     call_original(c, 0, &r);                           // unwinds to the program's own handler
 }
+AR_CB void ar_on_logged(probe_context *c) {
+    auto *control = (ArEpochControl *)(uintptr_t)get_func_arg(c, 0);
+    send_log(c, "ar delivered");
+    SetEvent(control->entered);
+    WaitForSingleObject(control->release, 30000);
+}
 AR_CB void ar_on_epoch(probe_context *c) {
     auto *control = (ArEpochControl *)(uintptr_t)get_func_arg(c, 0);
     const auto *config = (const LONG *)get_config(c);
@@ -191,13 +197,13 @@ AR_CB void ar_on_vector(probe_context *c) {
     _fxsave64(area);                                    // preserve ABI-nonvolatile XMM6..15
 #else
     _fxsave(area);
+#endif
     mask |= 1ull;
     *(unsigned short *)(area + 0) = 0x027F;
     *(unsigned short *)(area + 2) = 0;
     area[4] = 1;                                       // dirty ST0 as well as the control word
     *(uint64_t *)(area + 32) = 0x8000000000000000ull;
     *(unsigned short *)(area + 40) = 0x3FFF;
-#endif
     *(unsigned int *)(area + 24) = _mm_getcsr() ^ 0x2000u;
 #if defined(_WIN64)
     const int xmm_count = 6;

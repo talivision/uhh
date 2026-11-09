@@ -8662,7 +8662,7 @@ def check_session_agentipc():
 
 
 def check_agent_safety():
-    """Seven inline-agent review reproductions; fixtures assert their pressure/preconditions.
+    """Ten inline-agent review reproductions; fixtures assert their pressure/preconditions.
     256 live owners fill the hit-block table before the dead/denied-owner sweeps.
     No CPU support is needed except for the explicitly reported vector subcases."""
     d, t = exe("ar_driver.exe"), exe("ar_target.exe")
@@ -8675,11 +8675,13 @@ def check_agent_safety():
         ("guarantee", "ar_target.exe!ar_guarantee_throw", "ar_on_guarantee", {"caught": 1}, 1),
         ("cache", "ar_target.exe!ar_cache_site", "ar_on_cache", {"guard_intact": 1}, 1),
         ("vector", "ar_target.exe!ar_vector_site", "ar_on_vector", {"clean": 1}, None),
+        ("slotless", "ar_target.exe!ar_epoch_site", "ar_on_logged", {"killed": 1}, 1),
     ]
     for case, symbol, callback, want_row, want_hits in cases:
         name = f"cdx-agent-{case}-inline"
         try:
-            r, o = run([d, "--probe", f"{symbol}={callback}", "--", t, f"review-{case}"])
+            r, o = run([d, "--probe", f"{symbol}={callback}", "--", t, f"review-{case}"],
+                       env=dict(os.environ, UHH_TEST_SLOTLESS="1") if case == "slotless" else None)
             row = next((x for x in o if x.get("kind") == "ar"), {})
             rep = report(o)
             bad = []
@@ -8690,22 +8692,40 @@ def check_agent_safety():
                 bad.append(f"dropped/intr={rep.get('log_dropped')}/{rep.get('callbacks_interrupted')}")
             hits = sum(p.get("hits") or 0 for p in probes(o))
             if case == "vector":
-                want_hits = 0 if not row.get("avx") else (4 if pe_is_x86(t) else 5) if row.get("opmask") else 2
+                want_hits = 0 if not row.get("avx") else (6 if pe_is_x86(t) else 7) if row.get("opmask") else 4
                 if row.get("checks") != want_hits: bad.append(f"vector phases={row.get('checks')} want={want_hits}")
             if hits != want_hits: bad.append(f"hits={hits} want={want_hits}")
             logs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
             expected_logs = {"cache": ["ar cache first=1 called=1 guarded=1 second=0"],
-                             "guarantee": ["ar guarantee"], "vector": ["ar vector"] * want_hits if row.get("avx") else []}.get(case, [])
+                             "guarantee": ["ar guarantee"], "slotless": ["ar delivered"], "vector": ["ar vector"] * want_hits if row.get("avx") else []}.get(case, [])
             if logs != expected_logs: bad.append(f"logs={logs} want={expected_logs}")
             if case == "guarantee" and row.get("before") != row.get("after"): bad.append(f"guarantee changed: {row}")
             detail = str(row)
             if case == "vector":
-                if row.get("avx"): detail += "; XMM + INIT/non-INIT MXCSR checked; " + ("x87 INIT checked" if pe_is_x86(t) else "x87 uses existing x64 policy")
+                if row.get("avx"): detail += "; XMM + INIT/non-INIT MXCSR checked; " + "x87 INIT/live and MMX checked"
                 detail += "; " + ("INIT + live YMM checked" if row.get("avx") else "AVX skipped: CPU/OS support absent")
                 detail += "; " + ("mixed INIT/live opmask + YMM/ZMM checked" if row.get("opmask") else "AVX-512 skipped: CPU/OS support absent")
             record(name, not bad, "; ".join(bad) or detail)
         except Exception as e:
             record(name, False, repr(e))
+
+    name = "cdx-agent-cfprivate-inline"
+    try:
+        cd, ct = exe("ctrl_driver.exe"), exe("ctrl_target.exe")
+        if not cd or not ct: raise RuntimeError("missing ctrl_driver/ctrl_target")
+        r, o = run([cd, "--scenario", "cfprivate", "--backend", "inline", "--", ct, "cfprivate"],
+                   timeout=120, env=dict(os.environ, UHH_TEST_CF_STALL="resolved"))
+        row = next((x for x in o if x.get("kind") == "ctrl_result"), {})
+        logs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
+        cf = [m for m in logs if m.startswith("cf ")]
+        rep = report(o)
+        good = (r.returncode == 0 and rep.get("app_exit") == 0 and not rep.get("error")
+                and row.get("stalled") == 1 and row.get("same_base") == 1 and row.get("held") == 0
+                and cf == ["cf phase=4 ok=0 r=-1", "cf phase=5 ok=0 r=-1"]
+                and rep.get("log_dropped") == 0 and rep.get("callbacks_interrupted", 0) == 0)
+        record(name, good, f"result={row} calls={cf} exit={r.returncode}")
+    except Exception as e:
+        record(name, False, repr(e))
 
     # A callback suspended past detach keeps the OLD config and never publishes into the
     # second channel. The new session has exactly one hit/log and no interrupted unit.
@@ -8759,6 +8779,66 @@ def check_agent_safety():
         if rep.get("callbacks_interrupted", 0) != 0 or rep.get("log_dropped") != 0 or rep.get("error") is not None:
             bad.append(f"new report={rep}")
         record(name, not bad, "; ".join(bad) or "old hit interrupted=1; config retained=1; new hits=logs=1, dropped=intr=0")
+    except Exception as e:
+        record(name, False, repr(e))
+    finally:
+        for p, _, _ in drivers:
+            if p.poll() is None: p.kill()
+        if target and target.poll() is None: target.kill()
+
+
+    # A suspended hit before running is visible must not cross the session epoch.
+    name = "cdx-agent-preaccount-inline"
+    target = None
+    drivers = []
+    try:
+        target = subprocess.Popen([str(t), "review-preaccount"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                  env=dict(os.environ, UHH_TEST_PREACCOUNT="1"))
+        out, err = Lines(target.stdout), Lines(target.stderr)
+        ready = out.wait_for(lambda l: '"kind":"ready"' in l, 30)
+        if not ready: raise RuntimeError("epoch target not ready")
+        pid = json.loads(ready)["pid"]
+        def attach(config):
+            p = subprocess.Popen([str(d), "--review-attach", str(pid), str(config)], stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            po, pe = Lines(p.stdout), Lines(p.stderr)
+            drivers.append((p, po, pe))
+            if not po.wait_for(lambda l: '"kind":"attached"' in l, 60): raise RuntimeError(f"attach {config} failed: {pe.lines}")
+            if not pe.wait_for(lambda l: l.startswith("probe: active "), 60): raise RuntimeError(f"hook {config} not active: {pe.lines}")
+            return p, po, pe
+        def cue(p, text):
+            p.stdin.write(text); p.stdin.flush()
+        p1, o1, e1 = attach(1)
+        cue(target, "s")
+        if not out.wait_for(lambda l: '"kind":"parked"' in l, 30): raise RuntimeError("callback not parked")
+        cue(p1, "\n"); p1.wait(timeout=90)
+        o1.objs()
+        p2, o2, e2 = attach(2)
+        cue(target, "r")
+        line = out.wait_for(lambda l: '"kind":"ar"' in l, 30)
+        if not line: raise RuntimeError(f"old callback did not return: {out.lines} {err.lines}")
+        row = json.loads(line)
+        # Exit normally so the second session prints a full probe_report.
+        cue(target, "q"); target.wait(timeout=30)
+        if not o2.wait_for(lambda l: '"kind":"probe_report"' in l, 30): raise RuntimeError("no second report")
+        cue(p2, "\n"); p2.wait(timeout=90)
+        second = o2.objs()
+        rep = report(second)
+        hits = sum(p.get("hits") or 0 for p in probes(second))
+        logs = [x.get("message") for x in second if x.get("kind") == "probe_log"]
+        # No log was published, so stdout need not have a probe_final; the detach line
+        # is the authoritative accounting for the first (still suspended) callback.
+        e1.t.join(timeout=10)
+        final = re.search(r"probe: detached: hits=(\d+) logs_written=(\d+) log_dropped=(\d+) in_flight=(\d+) running=(\d+)", "\n".join(e1.lines))
+        bad = []
+        if p1.returncode or p2.returncode or target.returncode: bad.append(f"rc={p1.returncode}/{p2.returncode}/{target.returncode}")
+        if row.get("old_config") != 0 or row.get("new_config") != 2: bad.append(f"configs={row}")
+        if not final or tuple(map(int, final.groups())) != (0, 0, 0, 0, 0): bad.append(f"first detach={e1.lines}")
+        if hits != 1 or logs != ["ar epoch 2"]: bad.append(f"new hits/logs={hits}/{logs}")
+        if rep.get("callbacks_interrupted", 0) != 0 or rep.get("log_dropped") != 0 or rep.get("error") is not None:
+            bad.append(f"new report={rep}")
+        record(name, not bad, "; ".join(bad) or "old callback refused before config access; new hits=logs=1, dropped=intr=0")
     except Exception as e:
         record(name, False, repr(e))
     finally:
