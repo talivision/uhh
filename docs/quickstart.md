@@ -33,6 +33,8 @@ Rules that follow from how UHH works:
 - `probe_api_agent.dll` must sit **next to the controller executable**. It is needed (and
   injected into the target) only for inline probes, and loaded by the controller itself for
   breakpoint/hw callbacks that use `UHH_SHARED` state.
+- On reattach, the retained agent must match the controller's build. Restart the target
+  after changing the agent; UHH reuses the retained file to preserve shared callback state.
 - Rebuild the agent DLL and the drivers together. A driver and an agent built from
   different versions of the agent protocol fail with `probe_agent_init failed (code=0x2)`.
 
@@ -107,7 +109,9 @@ probe: active configparse.dll!ParseConfig+0x16 -> base=0x7ffcd5990000 addr=0x7ff
 ```
 
 The flag probe stays `pending` until `probe_app` loads `configparse.dll`; it arms at that
-load. Inline probes become `active` once the injected agent confirms each hook (on a launch
+load, even if an attach is still starting its agent guard. Already loaded modules
+wait for the guard during an inline attach (up to 5 s); each probe counts from its
+`active` line. Inline probes become `active` once the injected agent confirms each hook (on a launch
 at the loader breakpoint, before any DLL initialiser runs); the main thread is then held at
 the entry point until the agent's service thread is up.
 
@@ -218,8 +222,9 @@ See [examples/attach/README.md](../examples/attach/README.md) for the derivation
 500.
 
 If the controller ends while the target still runs (Ctrl+C, or `probe_close` from another
-thread), UHH **detaches**: hooks removed, breakpoints restored, debug registers cleared,
-and the target keeps running.
+thread), UHH **detaches**: inline unhooking requested, breakpoints restored,
+UHH-owned debug registers cleared, and the target keeps running. The agent stop wait
+is bounded to 5 s; unconfirmed unhooking can finish later.
 
 ## 3. Tracing any export: `uhh_trace`
 
@@ -242,7 +247,10 @@ itself is named with its extension (`app.exe!Func`).
 Other options: `--attach <pid> [--detach-after-ms N | --detach-on-stdin]` (detach after N ms
 or a line on stdin; the target runs on), `--attach-new <image> [--timeout ms]`,
 `--fallback-hw`, `--allow-unsafe-site`, `--allow-prehooked`, `--unsafe-fast-patch` (see the
-flags in [api.md](api.md#probe-flags)). The default backend is `breakpoint`. `--list` takes
+flags in [api.md](api.md#probe-flags)). `--allow-unsafe-site` overrides the
+instruction-boundary refusal on all execute backends; on inline it also overrides the
+unsafe-site check. It emits a warning and is for deliberately overlapping code.
+The default backend is `breakpoint`. `--list` takes
 exactly `--list <module> [--mask <pattern>]`.
 
 Choose exactly one target mode: launch after `--`, `--attach`, or `--attach-new`.
@@ -257,6 +265,8 @@ and exit 1; detach mode also exits 1 if instrumentation fails.
 The `:fmt` suffix is optional (default `xxxx`); C++ scope operators remain part of the
 symbol name, for example `-p "flagfeature.dll!Feature::IsEnabled"`.
 Formats longer than 15 characters are rejected with exit 2 rather than truncated.
+`d` prints a signed 32-bit integer, including negative values. Successful tracing or
+listing exits 0; listing failures exit 1.
 
 ## 4. Your own tool
 

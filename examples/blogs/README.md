@@ -53,7 +53,7 @@ any leftover), sockets on 127.0.0.1 only, DNS with `DNS_QUERY_NO_WIRE_QUERY`.
 * **Decoding handles runs code in the target.** The registry monitor turns key handles
   into paths with `call_func("ntdll.dll!NtQueryKey", ...)`, and allocates one 64 KiB
   scratch region in the target (`kernelbase!VirtualAlloc`) for the out-buffer -- a
-  deliberate, documented side effect. On breakpoint/hw each `call_func` is tens of
+  deliberate, documented side effect. On breakpoint/hw each `call_func` adds hundreds of
   microseconds.
 * **Per-hit cost shows up as frame jitter** (`game`): inline costs about a microsecond per
   frame; hw and breakpoint cost about 100-300 microseconds per hit (a debug event round

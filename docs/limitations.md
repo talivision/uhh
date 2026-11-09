@@ -23,7 +23,7 @@ return the same values everywhere. What differs:
 |---|---|---|---|
 | Mechanism | INT3 written by the controller (a debugger); the probed instruction runs from a per-site trampoline (displaced stepping) | execute debug register (DR0-DR3), or a data watchpoint | SafetyHook mid-function hook (a jump of >= 5 bytes) installed by `probe_api_agent.dll`, injected into the target |
 | Callback runs | in the controller, on its debugger thread, one hit at a time; the whole target is stopped meanwhile | same as breakpoint | inside the target, on the thread that hit the probe, concurrently with other threads' callbacks |
-| Added cost per hit, x64 / x86 (1 thread, test VM, `bench/BENCHMARKS.md`) | ~77 us / ~142 us | ~91 us / ~151 us | ~0.07 us / ~0.14 us, plus ~0.1 / ~0.15 us per `send_log` |
+| Added cost per hit, x64 / x86 (1 thread, test VM, `bench/BENCHMARKS.md`) | ~78 us / ~124 us | ~92 us / ~138 us | ~0.065 us / ~0.134 us; `send_log` adds ~0.18 / ~0.13 us |
 | 1 kHz frame loop, x64 (Blog B7, 2026-11-05) | frame time p50 ~300 us, p99 ~660 us; a few frames over budget | p50 ~220 us, p99 ~520 us; a few frames over budget | p50 1 us, p99 10 us; no frame missed |
 | How many | unlimited (65536 armed at once in a session that also has inline probes) | 4 in total: execute probes and watchpoints | 128 per session |
 | Sites | any instruction start (a site inside an instruction is refused unless `PROBE_ALLOW_UNSAFE_SITE` is set, [scope](#scope)); a site that already holds a foreign INT3 is refused | any instruction start | a site check refuses sites where code could arrive inside the overwritten bytes ([inline](#inline-backend)) |
@@ -33,11 +33,11 @@ return the same values everywhere. What differs:
 | `PROBE_ONCE` | yes | yes | refused |
 | Other threads | every hit stops the whole process; UHH's yield rounds let threads that hit nothing run between dense hits (Hunter A5) | same as breakpoint | unaffected |
 | Changes in the target | the INT3 byte; executable trampoline blocks | the threads' DR0-3/DR7; executable trampoline blocks; once a hw probe is armed or released while the program runs, library INT3s at `ntdll!RtlUserThreadStart`, `NtContinue` and `NtContinueEx` | the hook jump (written through the target's own `NtProtectVirtualMemory`); the agent DLL and its service thread (stays loaded after a detach); the callback uses the thread's stack (several KiB) and, for its own allocations, the target's heap |
-| Controller killed (attach) | the target keeps the INT3s and dies at its next hit (`0x80000003`) -- unless the session has an inline probe | same, `0x80000004` | the agent's controller-death guard removes every hook, INT3 and debug register; the target runs on |
+| Controller killed (attach) | the target keeps the INT3s and dies at its next hit (`0x80000003`) -- unless the session has an inline probe | same, `0x80000004` | the agent's controller-death guard removes its hooks, INT3s and debug registers; the target runs on |
 | CET shadow stacks (x64) | works; a CALL/RET at a probe site is stepped in place | works | works (the agent is linked /CETCOMPAT) |
-| `call_func` | the debugger runs the call on the stopped thread: tens of us; a callee exception abandons it; refused on a nearly exhausted stack | same as breakpoint | a direct call |
+| `call_func` | the debugger runs the call on the stopped thread: ~200 / ~290 us beyond the hit (x64 / x86); a callee exception abandons it; refused on a nearly exhausted stack | same as breakpoint | ~2.3 us including the hit; a temporary reference holds the callee module |
 | `call_original` | runs the original in place on the hit's stack; needs a free debug register for the call | same; a hw execute probe lends its own register | a real call in a new frame with a copy of the stack arguments (up to 256 bytes) and the argument registers |
-| x86 (WOW64) | ~2x the x64 cost per hit | ~2x the x64 cost per hit | the x87 state is saved per hit; stack snapshots are a verified return-address scan |
+| x86 (WOW64) | ~1.6x the x64 cost per hit | ~1.5x the x64 cost per hit | the x87 state is saved per hit; stack snapshots are a verified return-address scan |
 
 x64 against x86, on every backend: R8..R15 read 0 on x86; `get_func_arg` is a register or stack
 slot on x64 but always a 4-byte stack slot on x86; `return_from`'s `nargs` matters on x86 only;
@@ -215,7 +215,10 @@ data) prints on all backends.
 
 ## Hardware backend
 
-- **The target's own debug registers** (Hunter A7). UHH never takes a slot the target uses:
+- **The target's own debug registers and trap flag are preserved.** UHH clears only
+  its own DR6 status bits, forwards the target's debug exceptions, and restores the
+  target's TF after its own stepping, including fault/restart paths.
+  **Slot contention** (Hunter A7). UHH never takes a slot the target uses:
   a probe moves to a slot no thread of the target uses, and the target's own #DB goes to the
   target. With no free slot the probe yields on that thread (`probe: warning: <loc>: the
   program uses DRn itself on thread N and no debug register is free: the probe yields there`)
@@ -290,20 +293,9 @@ data) prints on all backends.
 - **The agent stays loaded after a detach** (Lifecycle), normally quiescent after confirmed
   unhooking (see [bounded cleanup](#detach-and-close)): hooks removed, logging
   stopped. A later attach to the same process reuses it.
-  Ordinary reattach reuses the named channel, its target view/handle and session proxies.
-  The controller maps the retained agent file too, preserving `UHH_SHARED` across backends.
-  A different agent build is refused before attaching; restart the target to use it.
-  If the old channel still counts a possibly surviving callback (including a suspended one),
-  reattach uses a fresh channel instead; that rare fallback retains the old storage until
-  process exit so the callback's config and accounting pointers remain valid. The epoch is
-  captured before session data at hit entry, checked after accounting admits the callback,
-  and checked once per log attempt. Callback accounting remains
-  running through the final shared-state access, so ordinary API reads need no epoch check.
-  Inline SSE restoration uses the hook stub's complete XMM snapshot; MXCSR is saved separately,
-  irrespective of XINUSE[1] (Intel SDM Vol. 1, 13.6/13.8: that bit need not describe MXCSR).
-  Newly activated AVX uppers use VZEROUPPER. On x86, newly activated x87 state is reset to
-  architectural INIT (FCW=037F, empty tags and zero physical registers), not Windows' FCW=027F;
-  FNINIT alone would leave stale physical registers. Other supported components retain XRSTOR.
+  Reattach maps the retained agent file in the controller to preserve `UHH_SHARED`
+  across backends. A different build is refused; restart the target to use it.
+  A callback surviving detach retains its old config and channel storage until process exit.
 - **x64 inline callback contract: leave x87/MMX unchanged**, including any helpers the
   callback calls. Ordinary MSVC x64 C/C++ and x64 CRT math use SSE; `long double` is
   `double`, and MSVC x64 supports neither `__m64` intrinsics nor inline assembly. The inline
@@ -341,8 +333,8 @@ data) prints on all backends.
 - **Inline callbacks killed by process exit** (ExitProcess/TerminateProcess) before their
   first log are reported as `callbacks_interrupted`; their logs never existed (Hunter A3). A
   stderr line names the probe and thread of each callback cut off while running.
-- **A failed session-file write ends the file** (Codex review 4): the error says what the file
-  holds (`seq` 0..logs_written-1); every later record is counted in `log_dropped`, and those
+- **A failed session-file write ends the file** (Codex review 4): the error reports the successfully
+  appended record count; the failed batch and every later record count in `log_dropped`, and those
   that still reached stdout number `stdout_logs - logs_written`.
 - **Session log files are not deleted.** They accumulate in `%TEMP%\uhh\logs`.
   *Workaround:* delete old `uhh-*.jsonl` files yourself.
@@ -382,6 +374,8 @@ data) prints on all backends.
   next hit (`0x80000003` / `0x80000004`), or runs on if it never reaches one. A **launched**
   target dies with its controller by design. Residual (Lifecycle): a breakpoint/hw `call_func`
   running when the controller dies leaves that thread redirected.
+  Breakpoint/hw probes on modules newly loaded during an inline attach arm before the
+  guard if necessary; controller death in that window can leave those traps installed.
   *Workaround:* end sessions with `probe_close` or Ctrl+C, not by killing the controller.
 - **`probe_close` must not run while `probe_attach` is still running on another thread.**
   *Workaround:* signal completion of the attach first, as `uhh_trace --detach-after-ms` does.

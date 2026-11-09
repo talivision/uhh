@@ -37,3 +37,6 @@ What it shows:
 Expected: `watch_hits == 2 * writes` (main thread + worker). The tracked block is not
 freed, because `HeapFree` writes free-list metadata into it — which the watchpoint
 would (correctly) also report. Covered by `scripts/regress.py` (`dynwatch-*`).
+
+Callbacks passed to an add from a callback must be named exports of the calling
+callback's module on every backend; callbacks from another module are refused.

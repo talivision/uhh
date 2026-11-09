@@ -35,9 +35,10 @@ Two nouns, two prefixes, and the compiler keeps them apart (both are opaque type
 
 `get_session(c)` is the bridge: **probes can be added from inside any callback** —
 breakpoint, hardware or inline (`probe_add_symbol[_cfg]`, `probe_add_address`,
-`probe_watch`; the new probe's callback must be exported). A breakpoint/hw probe added there
-is armed before the target resumes; an inline one holds the calling thread until its hook
-is in. From an inline callback (which runs inside the target) the call is forwarded to the
+`probe_watch`; the new probe's callback must be exported by the calling callback's module). A breakpoint/hw probe added there
+is armed before the target resumes; a mapped inline addition waits up to 5 s for
+installation. Agent failure or timeout returns 0; deferred safety refusal returns 1
+for the accepted submission and retires the probe with a diagnostic. From an inline callback (which runs inside the target) the call is forwarded to the
 controller synchronously; the callback source does not change.
 
 ```c
@@ -59,7 +60,9 @@ probe_add_symbol(s, "ucrtbase.dll!malloc", on_malloc, PROBE_BREAKPOINT);
 
 **Logs.** `send_log` and `send_log_stack` append `probe_log` JSON lines to a per-session
 file under `%TEMP%\uhh\logs` (its path is printed as `probe: logs -> ...`) and to the
-controller's stdout. Records are not dropped for speed: when the writer falls behind, the
+controller's stdout. `logs_written` counts file records; `stdout_logs` counts stdout
+records. A file-write failure ends the file and counts subsequent records in `log_dropped`,
+even if stdout received them. Records are not dropped for speed: when the writer falls behind, the
 logging thread waits. Every record carries `"seq"` (0, 1, 2, ...) and the final `probe_report` line
 says how many records stdout got (`stdout_logs`), so a capture proves its own completeness.
 `send_log_stack` captures raw return addresses at the hit and resolves them to
@@ -71,12 +74,16 @@ records never land inside one of its lines. Details: [api.md](docs/api.md#output
 
 | Backend | How | Added cost per hit, x64 / x86 | Modifies code? | Callback runs |
 |---|---|---|---|---|
-| `PROBE_INLINE` | SafetyHook mid-hook installed by the injected agent DLL | ~0.07 / ~0.14 µs | jump of ≥5 bytes | in the target, on the hit thread |
-| `PROBE_HW` | execute debug register (DR0–3), or a data watchpoint | ~91 / ~151 µs | no (≤4 probes) | in the controller |
-| `PROBE_BREAKPOINT` | external debugger, INT3 with displaced stepping | ~77 / ~142 µs | 1 byte | in the controller |
+| `PROBE_INLINE` | SafetyHook mid-hook installed by the injected agent DLL | ~0.065 / ~0.134 µs | jump of ≥5 bytes | in the target, on the hit thread |
+| `PROBE_HW` | execute debug register (DR0–3), or a data watchpoint | ~92 / ~138 µs | no (≤4 probes) | in the controller |
+| `PROBE_BREAKPOINT` | external debugger, INT3 with displaced stepping | ~78 / ~124 µs | 1 byte | in the controller |
 
-(Single thread on the test VM, `bench/BENCHMARKS.md`; a 1 kHz frame loop measured inline
+(Single thread on the test VM, [bench/BENCHMARKS.md](bench/BENCHMARKS.md); a 1 kHz frame loop measured inline
 frames at 1 µs p50, hw ~220 µs and breakpoint ~300 µs: [limitations.md](docs/limitations.md#per-backend-table).)
+
+Inline total costs on that VM: `send_log` ~0.25 / 0.27 µs, `send_log_stack`
+~1.5 / 9.0 µs, `call_func` with module pinning ~2.3 / 2.3 µs, and
+`call_original` + `return_from` ~0.94 / 1.55 µs (x64 / x86).
 
 All three are **exact under multithreading** (no dropped hits). The software
 breakpoint achieves this with **displaced (out-of-line) stepping**: the `INT3` stays armed
@@ -88,7 +95,9 @@ that must run in place). The hardware breakpoint modifies no probed code at all.
 first instruction, inline probes at the loader breakpoint (static imports mapped, before any
 DLL initialiser or TLS callback runs). On attach, each probe counts from its
 `probe: active` line on stderr. Probes may name a module that is not loaded yet: they stay
-pending and arm when it loads.
+pending and arm when it loads. During an inline attach, breakpoint/hw probes on
+newly loaded modules arm immediately; those on already loaded modules wait for the agent
+guard (up to 5 s). A newly armed trap is unguarded until that guard starts.
 
 Backends are picked **per probe** and interoperate in one session — e.g. a breakpoint on a
 config-flag site (fires once) mixed with an inline hook on a hot read path (millions of
