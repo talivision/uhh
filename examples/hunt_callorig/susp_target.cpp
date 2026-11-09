@@ -134,6 +134,8 @@ extern "C" { __declspec(dllexport) volatile LONG co_watch_value = 0; }
 static volatile LONG g_watch_exceptions, g_target_exceptions, g_own_hits, g_own_value;
 static constexpr ULONG_PTR WATCHDEATH_COOKIE = 0x57415443;
 static DWORD g_own_slot, g_stale_slots, g_stale_addresses;
+static bool g_watch_reuse;
+static __declspec(noinline) void watchdeath_execute() { InterlockedIncrement(&g_own_value); }
 static DWORD WINAPI watchdeath_own_dr(void *main_thread) {
     HANDLE t = (HANDLE)main_thread;
     if (SuspendThread(t) == (DWORD)-1) return 1;
@@ -143,6 +145,14 @@ static DWORD WINAPI watchdeath_own_dr(void *main_thread) {
         if (g_own_slot) {                      // post-death inspection; foreign slot is DR3
             g_stale_slots = (DWORD)c.Dr7 & 0x3F;
             g_stale_addresses = c.Dr0 || c.Dr1 || c.Dr2;
+            if (g_watch_reuse) {
+                // Reuse UHH's former slot for a target-owned execute breakpoint. The
+                // guard must forward its hit, even though dr_mask still includes DR0.
+                g_own_slot = 1;
+                c.Dr0 = (DWORD_PTR)&watchdeath_execute;
+                c.Dr7 = (c.Dr7 & ~(decltype(c.Dr7))0xF000F) | 1;
+                ok = SetThreadContext(t, &c) != 0;
+            }
         } else {
             ok = !(c.Dr7 & (3u << 6));
             if (ok) {
@@ -164,8 +174,9 @@ static LONG CALLBACK watchdeath_veh(EXCEPTION_POINTERS *ep) {
     if (ep->ExceptionRecord->NumberParameters == 1 &&
         ep->ExceptionRecord->ExceptionInformation[0] == WATCHDEATH_COOKIE)
         InterlockedIncrement(&g_target_exceptions);
-    else if ((ep->ContextRecord->Dr6 & g_own_slot) && (ep->ContextRecord->Dr7 & (3u << 6)) &&
-             ep->ContextRecord->Dr3 == (DWORD_PTR)&g_own_value)
+    else if ((ep->ContextRecord->Dr6 & g_own_slot) &&
+             (g_watch_reuse ? ep->ContextRecord->Dr0 == (DWORD_PTR)&watchdeath_execute :
+                              ep->ContextRecord->Dr3 == (DWORD_PTR)&g_own_value))
         InterlockedIncrement(&g_own_hits);
     else InterlockedIncrement(&g_watch_exceptions);
     // Let a failing guard finish too, so the regression reports the leaked exception.
@@ -194,10 +205,11 @@ static int run_watchdeath() {
     BOOL dbg = TRUE;
     for (int i = 0; i < 3000 && CheckRemoteDebuggerPresent(GetCurrentProcess(), &dbg) && dbg; ++i) Sleep(10);
     Sleep(1500);                               // inspect AFTER guard cleanup
-    if (!watchdeath_context()) return 4;        // x64: cleared; x86: still armed, handled lazily
+    if (!watchdeath_context()) return 4;        // both architectures: still armed, handled lazily
     co_watch_value = 41;
     co_watch_value += 1;                        // the UHH slot must now be disabled
-    g_own_value = 7;                            // the guard must preserve the foreign DR slot
+    if (g_watch_reuse) watchdeath_execute();    // re-used DR0 must reach the program's VEH
+    else g_own_value = 7;                       // the guard must preserve the foreign DR slot
     const ULONG_PTR cookie = WATCHDEATH_COOKIE;
     RaiseException(EXCEPTION_SINGLE_STEP, 0, 1, &cookie); // unrelated target exception passes through
     printf("{\"kind\":\"co\",\"case\":\"watchdeath\",\"value\":%ld,\"exceptions\":%ld,"
@@ -209,7 +221,10 @@ static int run_watchdeath() {
 
 int main(int argc, char **argv) {
     const char *k = argc > 1 ? argv[1] : "";
-    if (!strcmp(k, "watchdeath")) return run_watchdeath();
+    if (!strcmp(k, "watchdeath") || !strcmp(k, "watchreuse")) {
+        g_watch_reuse = !strcmp(k, "watchreuse");
+        return run_watchdeath();
+    }
     if (!strcmp(k, "deepthrow") || !strcmp(k, "deepseh") || !strcmp(k, "deepjmp") || !strcmp(k, "catchhit") ||
         !strcmp(k, "catchinside"))
         return run_deep(k);

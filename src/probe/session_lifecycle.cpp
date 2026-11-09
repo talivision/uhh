@@ -152,6 +152,18 @@ void guard_sync(probe_session *s) {
     n = 0;
     for (uint64_t b : s->scratch_blocks) if (n < PROBE_AGENT_GUARD_BLOCKS) g.blocks[n++] = b;
     g.block_count = (LONG)n;
+    // Append/publish each address before arming it. A controller killed during this
+    // mirror must not invalidate addresses already installed on running threads.
+    for (uint64_t address : s->hw_armed_ever) {
+        const LONG count = g.dr_site_count;
+        bool found = false;
+        for (LONG i = 0; i < count; ++i) if (g.dr_sites[i] == address) found = true;
+        if (!found && count < (LONG)PROBE_AGENT_GUARD_DR_SITES) {
+            g.dr_sites[count] = address;
+            MemoryBarrier();
+            g.dr_site_count = count + 1;
+        }
+    }
     g.dr_mask = s->dr_ever | s->dr_used;          // incl. a call_original's return-catch slot
     MemoryBarrier();
     g.enabled = 1;

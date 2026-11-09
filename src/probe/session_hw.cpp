@@ -208,6 +208,10 @@ bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
     // The guard's DR mask gets the slot BEFORE any thread has it armed (as for an INT3, see
     // arm_breakpoint): a controller killed in between left an enabled DR the guard took for
     // the target's own -- never cleared, its #DB unhandled (0x80000004) at the next hit.
+    if (!guard_dr_available(s, address)) {
+        set_error(s, "controller-death guard hardware address capacity exhausted");
+        return false;
+    }
     const uint8_t ever_before = s->dr_ever;
     s->dr_ever |= (uint8_t)(1u << slot);
     s->hw_armed_ever.insert(address);

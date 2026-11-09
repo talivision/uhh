@@ -3235,3 +3235,12 @@ Windows rerun pending.
 These extend the existing real-Windows-#DB fixture; registered under
 `check_ctrl_call_hw_review` on both architectures. Static review only here; Windows
 build/runtime validation remains pending. Shared agent layout/version unchanged.
+
+### Controller-death guard DR ownership (codex16)
+
+Running-thread debug-context writes could overwrite concurrent target DR edits, even on
+native x64. Death cleanup now uses the saved exception context on both architectures; dormant
+slots remain visible until hit. Removed the persistent cleared-execute-address exception
+fallback and require an armed UHH address as well as a slot bit. Shared guard layout version
+32 publishes the address filter. Checks: `cx2-killwatch-hw`, `cx2-killwatch-reuse-hw`
+(target reuses DR0 for its own execute breakpoint). Windows validation pending.

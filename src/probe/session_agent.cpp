@@ -881,6 +881,10 @@ bool arm_gates_for_pending(probe_session *s) {
     for (int slot = 0; slot < 4 && slots.size() < sites.size(); ++slot)
         if (!(s->dr_used & (1u << slot)) && !(foreign & (1u << slot))) slots.push_back(slot);
     if (slots.size() < sites.size()) return false;           // not enough DRs: caller holds instead
+    size_t new_guard_sites = 0;
+    for (uint64_t site : sites) if (!s->hw_armed_ever.count(site)) ++new_guard_sites;
+    if (s->attached && s->shared &&
+        s->hw_armed_ever.size() + new_guard_sites > PROBE_AGENT_GUARD_DR_SITES) return false;
     for (size_t i = 0; i < sites.size(); ++i) {
         const int slot = slots[i];
         s->hw_armed_ever.insert(sites[i]);

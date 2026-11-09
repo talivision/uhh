@@ -806,6 +806,12 @@ bool resolve_export(probe_session *s, uint64_t base, const std::string &name, ui
 bool remote_export_owner(probe_session *s, std::string &module, std::string &name, uint64_t &base, uint64_t &rva);
 uint64_t resolve_symbol(probe_session *s, const char *symbol);
 
+// Never install a trap the bounded death-guard ownership table cannot represent.
+inline bool guard_dr_available(const probe_session *s, uint64_t address) {
+    return !s->attached || !s->shared || s->hw_armed_ever.count(address) ||
+           s->hw_armed_ever.size() < PROBE_AGENT_GUARD_DR_SITES;
+}
+
 // Program debug register `slot` for execute (rw=0,len=0) or a data watchpoint. rw:
 // 0=execute, 1=write, 3=read/write. len: 0=1,1=2,3=4,2=8 bytes (Intel DR7 LEN encoding).
 // With `s` and `tid`: never over a slot the target itself has armed there; a past

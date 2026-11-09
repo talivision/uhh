@@ -2793,13 +2793,6 @@ static void set_ip(CONTEXT *c, uint64_t ip) {
     c->Eip = (DWORD)ip;
 #endif
 }
-static uint64_t get_ip(const CONTEXT *c) {
-#if defined(_WIN64)
-    return c->Rip;
-#else
-    return c->Eip;
-#endif
-}
 static void restore_byte(uint64_t at, unsigned char original) {
     __try {
         volatile unsigned char *p = (volatile unsigned char *)(uintptr_t)at;
@@ -2811,28 +2804,22 @@ static void restore_byte(uint64_t at, unsigned char original) {
         FlushInstructionCache(GetCurrentProcess(), (void *)p, 1);
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
-#if defined(_WIN64)
-// Active clearing can erase the status/address of a #DB already queued at debugger death.
-// Remember only UHH execute sites: a status-less data trap cannot be identified by its IP.
-static volatile LONG64 g_cleared[64];
-static volatile LONG g_cleared_n;
-static void remember_orphan_dr(const CONTEXT &c, DWORD mask) {
+// Inspect the saved exception context: never overwrite a running thread's DR edits.
+static DWORD orphan_dr_mask(const CONTEXT &c) {
     const uint64_t address[4] = {c.Dr0, c.Dr1, c.Dr2, c.Dr3};
+    const auto &g = shared->guard;
+    DWORD mask = 0;
+    const LONG n = g.dr_site_count;
+    if (n < 0 || n > (LONG)PROBE_AGENT_GUARD_DR_SITES) return 0;
     for (int slot = 0; slot < 4; ++slot) {
-        if (!(mask & (1u << slot)) || !((c.Dr7 >> (slot * 2)) & 3) ||
-            ((c.Dr7 >> (16 + slot * 4)) & 3) || !address[slot]) continue;
-        const LONG n = g_cleared_n;
-        bool found = false;
-        for (LONG i = 0; i < n; ++i) if ((uint64_t)g_cleared[i] == address[slot]) found = true;
-        if (!found && n < 64) {
-            g_cleared[n] = (LONG64)address[slot];
-            InterlockedExchange(&g_cleared_n, n + 1);     // publish AFTER the address (one cleanup writer)
-        }
+        if (!(g.dr_mask & (1u << slot)) || !((c.Dr7 >> (slot * 2)) & 3)) continue;
+        for (LONG i = 0; i < n; ++i)
+            if (g.dr_sites[i] == address[slot]) { mask |= 1u << slot; break; }
     }
+    return mask;
 }
-#endif
-// Change only our slot enables and addresses; DR6, foreign slots and all other state
-// are preserved by an active update. The VEH separately consumes our exception status.
+// Change only our slots in the saved exception context. The VEH separately consumes
+// our exception status; foreign slots and all other state are preserved.
 static void clear_orphan_dr(CONTEXT &c, DWORD mask) {
     for (int slot = 0; slot < 4; ++slot) {
         if (!(mask & (1u << slot))) continue;
@@ -2909,22 +2896,14 @@ static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
         if (g_guard_wake) SetEvent(g_guard_wake);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
-    const DWORD mask = (DWORD)g.dr_mask & 0xF;
+    const DWORD mask = orphan_dr_mask(*cx);
     const DWORD hits = (DWORD)cx->Dr6 & 0xF;
     // Never consume the target's own DR hit, even when one of ours fired too. Likewise a
     // target single-step / debug-register-access exception must reach its own handlers.
     const bool step = (cx->Dr6 & (1u << 14)) && tid_listed(g.step_tids, g.step_count, GetCurrentThreadId());
     if ((hits & ~mask) || (cx->Dr6 & (1u << 13)) || ((cx->Dr6 & (1u << 14)) && !step))
         return EXCEPTION_CONTINUE_SEARCH;
-    bool cleared_execute = false;
-#if defined(_WIN64)
-    if (!hits && !(cx->Dr6 & (1u << 14)) && g_lazy_dr) {
-        const LONG n = g_cleared_n;
-        for (LONG i = 0; i < n && !cleared_execute; ++i)
-            cleared_execute = (uint64_t)g_cleared[i] == at || (uint64_t)g_cleared[i] == get_ip(cx);
-    }
-#endif
-    if (!(hits & mask) && !step && !cleared_execute) return EXCEPTION_CONTINUE_SEARCH;
+    if (!(hits & mask) && !step) return EXCEPTION_CONTINUE_SEARCH;
     // A live controller consumes our traps before the VEH. This orphaned hit can precede
     // the service thread's death notification, even while the debug port is being torn down.
     if (!g_lazy_dr) InterlockedExchange(&g_lazy_dr, 1);
@@ -2969,42 +2948,20 @@ static void guard_cleanup() {
     for (LONG i = 0; i < n; ++i) if (shared->int3[i].address) restore_byte(shared->int3[i].address, shared->int3[i].original);
     InterlockedExchange(&g_lazy_dr, 1);                         // fallback if an update fails
     const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
-#if defined(_WIN64)
-    // Native context calls use a kernel APC without increasing the suspend count. Touch
-    // DEBUG_REGISTERS only: never write a running thread's control/integer state back.
-    const DWORD mask = (DWORD)g.dr_mask & 0xF;
-#else
-    // WOW64 Get/SetThreadContext implicitly suspends (ROADMAP R2). Leave those slots to
-    // the VEH rather than exposing a temporary suspension to the program.
-#endif
+    // Context reads/writes are not atomic, even on native x64. Leave dormant
+    // slots to the VEH rather than overwriting concurrent target DR changes.
     // Preserve the original two 200 ms grace intervals on EVERY backend. Inline hooks
     // keep counting/dropping orphaned calls until removal; a no-DR session needs this too.
     for (int pass = 0; pass < 2; ++pass, Sleep(200)) {
-        // Only native DR cleanup needs another scan for pending-event restoration.
-#if defined(_WIN64)
-        if (pass && !mask) continue;
-#else
         if (pass) continue;
-#endif
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (snap == INVALID_HANDLE_VALUE) continue;
         THREADENTRY32 te{}; te.dwSize = sizeof(te);
         for (BOOL more = Thread32First(snap, &te); more; more = Thread32Next(snap, &te)) {
             if (te.th32OwnerProcessID != pid) continue;
             DWORD access = THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION;
-#if defined(_WIN64)
-            access |= THREAD_GET_CONTEXT | THREAD_SET_CONTEXT;
-#endif
             HANDLE t = OpenThread(access, FALSE, te.th32ThreadID);
             if (!t) continue;
-#if defined(_WIN64)
-            CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-            if (mask && GetThreadContext(t, &c)) {
-                remember_orphan_dr(c, mask);               // before either DR7 or the addresses go away
-                clear_orphan_dr(c, mask);
-                SetThreadContext(t, &c);                        // failure: lazy VEH backstop
-            }
-#endif
             // Only release recorded controller holds, once per entry.
             if (!pass && te.th32ThreadID != self) resume_holds(g, t, te.th32ThreadID);
             CloseHandle(t);

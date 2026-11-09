@@ -1106,6 +1106,11 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
     }
     CONTEXT w = saved;
     to_context(*c, w);                                                 // the callback's registers
+    if (!guard_dr_available(s, ret_addr)) {
+        CloseHandle(thread);
+        warn_record(c, probe, "call_original refused: controller-death guard hardware address capacity exhausted");
+        return 0;
+    }
     s->hw_armed_ever.insert(ret_addr);
     auto *dr = slot == 0 ? &w.Dr0 : slot == 1 ? &w.Dr1 : slot == 2 ? &w.Dr2 : &w.Dr3;   // DWORD64 / DWORD
     *dr = (std::remove_reference_t<decltype(*dr)>)ret_addr;
