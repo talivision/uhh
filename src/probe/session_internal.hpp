@@ -558,8 +558,8 @@ struct probe_session {
     // itself had it suspended may get the context the target captured DURING that event
     // written back (Suspend + GetThreadContext + SetThreadContext + Resume, as GCs and
     // profilers do) -- undoing our resume state (an INT3 hit resumed one byte into the
-    // instruction, a hw hit without RF reported twice). Such a thread is held by us as well
-    // until the target resumes it; then whatever it wrote back gets our changes re-applied.
+    // instruction, a hw hit without RF reported twice). Re-apply our changes at its next
+    // exception event, without adding a suspension while the program runs.
     struct CtxWatch { DWORD tid = 0; HANDLE t = nullptr; CONTEXT before{}, after{}; };
     std::vector<std::unique_ptr<CtxWatch>> ctx_watch;
 };

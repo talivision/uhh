@@ -60,7 +60,7 @@ typedef LONG(NTAPI *NtOpenFn)(HANDLE *, ACCESS_MASK, OBJATTR *, CLIENTID *);
 static NtReadFn g_ntread;
 static HANDLE g_proc;
 static volatile LONG g_reads, g_bad, g_foreign, g_early, g_work, g_owndr, g_guards, g_twin;
-static LONG g_ctx_rounds, g_ctx_ms, g_ctx_max_ms;
+static LONG g_ctx_rounds, g_ctx_ms, g_ctx_max_ms, g_ctx_extra;
 static ULONG_PTR g_owndr_addr;
 static unsigned char g_pattern[64];
 static volatile LONG g_stop;
@@ -469,9 +469,11 @@ int main(int argc, char **argv) {
             CONTEXT c; memset(&c, 0, sizeof(c)); c.ContextFlags = CONTEXT_ALL;
             QueryPerformanceCounter(&ta);
             if ((ta.QuadPart - t0.QuadPart) / f.QuadPart >= 90) break;
-            if (SuspendThread(t) == (DWORD)-1) { InterlockedIncrement(&g_bad); continue; }
+            DWORD prev = SuspendThread(t);
+            if (prev == (DWORD)-1) { InterlockedIncrement(&g_bad); continue; }
+            if (prev != 0) ++g_ctx_extra;
             if (!GetThreadContext(t, &c) || !SetThreadContext(t, &c)) InterlockedIncrement(&g_bad);
-            ResumeThread(t);
+            if (ResumeThread(t) != 1) ++g_ctx_extra;
             QueryPerformanceCounter(&tb);
             const LONG ms = (LONG)((tb.QuadPart - ta.QuadPart) * 1000 / f.QuadPart);
             if (ms > g_ctx_max_ms) g_ctx_max_ms = ms;
@@ -576,9 +578,9 @@ int main(int argc, char **argv) {
     g_tls_on = 0;
     if (veh) RemoveVectoredExceptionHandler(veh);
     printf("{\"kind\":\"target\",\"scenario\":\"%s\",\"n\":%lu,\"reads\":%ld,\"bad\":%ld,\"foreign\":%ld,"
-           "\"early\":%ld,\"work\":%ld,\"owndr\":%ld,\"guards\":%ld,\"twin\":%ld,\"ctx_rounds\":%ld,\"ctx_ms\":%ld,\"ctx_max_round_ms\":%ld,\"alien\":%ld,"
+           "\"early\":%ld,\"work\":%ld,\"owndr\":%ld,\"guards\":%ld,\"twin\":%ld,\"ctx_extra\":%ld,\"ctx_rounds\":%ld,\"ctx_ms\":%ld,\"ctx_max_round_ms\":%ld,\"alien\":%ld,"
            "\"edge\":%ld,\"guard_lost\":%ld,\"checksum\":\"%llx\",\"pid\":%lu}\n",
-           sc, g_n, g_reads, g_bad, g_foreign, g_early, g_work, g_owndr, g_guards, g_twin, g_ctx_rounds, g_ctx_ms, g_ctx_max_ms, g_alien,
+           sc, g_n, g_reads, g_bad, g_foreign, g_early, g_work, g_owndr, g_guards, g_twin, g_ctx_extra, g_ctx_rounds, g_ctx_ms, g_ctx_max_ms, g_alien,
            g_edge, g_guard_lost, checksum(), GetCurrentProcessId());
     fflush(stdout);
     return 0;

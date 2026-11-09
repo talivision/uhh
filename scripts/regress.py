@@ -5289,10 +5289,12 @@ def hunt_run(backend, scenario, n, extra=(), timeout=600, readers=None):
     import os
     d, t = exe("hunt_driver.exe"), exe("hunt_target.exe")
     st = {"read": 0, "unmapped": 0, "pids": set(), "work": 0, "tid_ok": 0, "tid_bad": 0,
-          "recurse_ok": 0, "other": 0, "refused": []}
+          "recurse_ok": 0, "other": 0, "refused": [], "ctx_watch": 0}
     keep = []
 
     def on_err(line):
+        if "ctx-watch tid=" in line:
+            st["ctx_watch"] += 1
         if "call_func refused" in line and len(st["refused"]) < 20:
             st["refused"].append(line)
 
@@ -11278,6 +11280,30 @@ def check_cx2_review():
                 record(name, not bad, " ".join(bad + [detail]))
             except Exception as e:
                 record(name, False, repr(e))
+
+    # Exercise context repair without exposing a library suspension to the program.
+    for bk in ("breakpoint", "hw"):
+        name = f"cx2-ctxsusp-{bk}"
+        if not exe("hunt_driver.exe") or not exe("hunt_target.exe"):
+            missing_bin(name, "hunt_driver/hunt_target"); continue
+        old_trace = os.environ.get("PROBE_TRACE")
+        try:
+            os.environ["PROBE_TRACE"] = "1"
+            rc, tmo, tg, rd, wk, rep, st = hunt_run(bk, "ctx", 3000, timeout=180)
+            reads = tg.get("reads")
+            ok = (rc == 0 and not tmo and not rep.get("error") and reads and
+                  tg.get("bad") == 0 and tg.get("foreign") == 0 and tg.get("ctx_extra") == 0 and
+                  (tg.get("ctx_rounds") or 0) >= 100 and st["ctx_watch"] > 0 and
+                  rd.get("hits") == st["read"] == reads and rep.get("log_dropped") == 0)
+            record(name, ok, f"extra={tg.get('ctx_extra')} rounds={tg.get('ctx_rounds')} "
+                   f"watches={st['ctx_watch']} reads={reads} hits={rd.get('hits')} rc={rc} timeout={tmo}")
+        except Exception as e:
+            record(name, False, repr(e))
+        finally:
+            if old_trace is None:
+                os.environ.pop("PROBE_TRACE", None)
+            else:
+                os.environ["PROBE_TRACE"] = old_trace
 
     # cx2-cosample-<b>: the same call_original (co_hold, ~1.5 s inside the original) with the controller
     # staying; the program samples its worker's suspend count for 1 s. Any suspension of the
