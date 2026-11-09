@@ -276,13 +276,21 @@ data) prints on all backends.
   If the old channel still counts a possibly surviving callback (including a suspended one),
   reattach uses a fresh channel instead; that rare fallback retains the old storage until
   process exit so the callback's config and accounting pointers remain valid. The epoch is
-  captured once at callback entry and checked once per log attempt. Callback accounting remains
+  captured before session data at hit entry, checked after accounting admits the callback,
+  and checked once per log attempt. Callback accounting remains
   running through the final shared-state access, so ordinary API reads need no epoch check.
   Inline SSE restoration uses the hook stub's complete XMM snapshot; MXCSR is saved separately,
   irrespective of XINUSE[1] (Intel SDM Vol. 1, 13.6/13.8: that bit need not describe MXCSR).
   Newly activated AVX uppers use VZEROUPPER. On x86, newly activated x87 state is reset to
   architectural INIT (FCW=037F, empty tags and zero physical registers), not Windows' FCW=027F;
   FNINIT alone would leave stale physical registers. Other supported components retain XRSTOR.
+- **x64 inline callback contract: leave x87/MMX unchanged**, including any helpers the
+  callback calls. Ordinary MSVC x64 C/C++ and x64 CRT math use SSE; `long double` is
+  `double`, and MSVC x64 supports neither `__m64` intrinsics nor inline assembly. The inline
+  hot path therefore takes no x87/MMX snapshot. Assembly callbacks/helpers that use these
+  registers, or code explicitly restoring extended state, must save and restore x87/MMX
+  themselves on every exit. This keeps the target's live state intact without imposing a
+  snapshot on every compiled callback. x86 still preserves x87 automatically.
 - **x86 inline stack walks** are a verified return-address scan, not PDB-based; a frameless
   function reached by an indirect call can lose its immediate caller
   ([symbols.md](symbols.md#stacks-per-backend-send_log_stack)).
