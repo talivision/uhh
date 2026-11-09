@@ -1657,6 +1657,14 @@ then fixed. Fixtures: `ctrl_target faultmix`, `co_target susp / many / manydead`
   armed without the guard; `--only cxlib` 3 x 9/9 on reruns.
 
 ## Follow-ups (2026-11-07, branch `followups`, regress `stream-live-*`, `realbig-robocopy-detach-*`, `lifecycle-target-dies-*`, `cx2-evsusp-*` / `cx2-cosusp-*`)
+- Test calibration follow-up: `stream-live-*` and `stream-latency-*` now retry a latency-only
+  failure once when >= 100 sampler points show >= 20 ms scheduler noise (including the
+  20-50 ms range below citune's subtraction threshold). The fresh run must pass the same
+  strict quiet bounds / window-local noise subtraction; raw p99 >= 1 s fails immediately
+  on either attempt. Missing samples, delivery/order/clock/count failures and inline wake
+  failures do not qualify. Disk stalls do not qualify or increase the allowance;
+  `stream-filestall-*` and its injected 400 ms stall are unchanged. Quiet-machine writer
+  stalls still fail the original 100/250 ms bounds. Static review only; not run here.
 - ✅ (F1, test-side) **`stream-live-*` absolute p99 bound vs a loaded machine.** Same build, VM under load:
   p99 0.7-253 ms over 18 runs with every log delivered; one FAIL at 253 ms (x86 breakpoint), earlier 1102 ms
   (x64 hw). Fix: the stream-latency calibration (citune) applied -- an uninstrumented writer (logstream_target,

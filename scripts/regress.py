@@ -602,6 +602,10 @@ def check_stream_live(calls=2_000_000):
         that log's own window [event, arrival]) < 250 ms -- the machine's stalls are not UHH's
         (same build, VM under load: p99 0.7-253 ms over 18 runs, one 1102 ms), but latency UHH
         adds on top of them still fails.
+    A latency-only failure with >= 100 sampler points and >= 20 ms scheduler noise
+    gets one fresh run (including the moderately noisy 20-50 ms range); the second
+    run must pass the same bounds. Raw p99 must always be < 1 s, without retry at
+    or above that ceiling. Correctness failures and disk stalls never earn a retry.
     The controller's %TEMP% (its session file) is <build dir>/uhh-latency-tmp, as stream-latency's
     (a local, AV-excluded dir on the test machines: the check measures UHH, not the profile's AV)."""
     driver, target, sampler_exe = exe("hitcost_driver.exe"), exe("hitcost_target.exe"), exe("logstream_target.exe")
@@ -615,7 +619,8 @@ def check_stream_live(calls=2_000_000):
     env = dict(os.environ, TEMP=str(tmp), TMP=str(tmp))
     quiet_ms, bar_ms = 50.0, 250.0
     pct = lambda vals, q: sorted(vals)[max(0, math.ceil(q * len(vals)) - 1)] if vals else float("inf")
-    for backend, n in (("inline", calls), ("hw", 50_000), ("breakpoint", 50_000)):
+    runs = [(backend, n, 1) for backend, n in (("inline", calls), ("hw", 50_000), ("breakpoint", 50_000))]
+    for backend, n, attempt in runs:
         name = f"stream-live-{backend}"
         sampler = None
         try:
@@ -657,10 +662,14 @@ def check_stream_live(calls=2_000_000):
             quiet = tms(run_noise) < quiet_ms and len(sampler.samples) >= 100
             p50, p99, p99x = pct(lags, .5), pct(lags, .99), pct(excess, .99)
             frac = before_exit / logs if logs else 0
-            lat_ok = bool(samples) and tms(p99 if quiet else p99x) < bar_ms
-            ok = p.returncode == 0 and logs == n and lat_ok and frac >= 0.9
+            lat_ok = bool(samples) and tms(p99 if quiet else p99x) < bar_ms and tms(p99) < 1000.0
+            correct = p.returncode == 0 and logs == n and bool(samples) and frac >= 0.9
+            if correct and not lat_ok and _stream_latency_retry(sampler, tms(run_noise), tms(p99), attempt, name):
+                runs.insert(runs.index((backend, n, attempt)) + 1, (backend, n, 2))
+                continue
+            ok = correct and lat_ok
             record(name, ok, f"logs={logs:,}/{n:,} {'quiet' if quiet else 'noisy'}: "
-                             f"bar={'p99' if quiet else 'p99(lag-noise)'}<{bar_ms:.0f}ms lag_p50={tms(p50):.1f}ms "
+                             f"bar={'p99' if quiet else 'p99(lag-noise)'}<{bar_ms:.0f}ms raw_p99<1000ms attempt={attempt}/2 lag_p50={tms(p50):.1f}ms "
                              f"lag_p99={tms(p99):.1f}ms p99_excess={tms(p99x):.1f}ms lag_max={tms(max(lags, default=0)):.1f}ms "
                              f"max_gap={tms(max(gaps, default=0)):.1f}ms noise_run_max={tms(run_noise):.1f}ms "
                              f"sampler={len(sampler.samples)}@{tms(sampler.period):.1f}ms "
@@ -735,6 +744,21 @@ def _qpc_freq():
     f = ctypes.c_int64()
     ctypes.windll.kernel32.QueryPerformanceFrequency(ctypes.byref(f))
     return f.value
+
+
+def _stream_latency_retry(sampler, noise_ms, p99_ms, attempt, name):
+    """One fresh measurement for a moderately noisy, latency-only failure.
+
+    20 ms exceeds one ordinary 15.6 ms timer quantum, but catches contention below
+    the 50 ms threshold for window-local noise subtraction. Missing sampler data
+    is not evidence of noise. Never retry a >= 1 s raw p99, even on a noisy host.
+    Disk timings deliberately do not qualify: a blocked UHH writer is a regression.
+    """
+    retry = attempt == 1 and len(sampler.samples) >= 100 and noise_ms >= 20.0 and p99_ms < 1000.0
+    if retry:
+        print(f"{name}: retrying latency-only failure once: p99={p99_ms:.1f}ms "
+              f"noise_run_max={noise_ms:.1f}ms sampler={len(sampler.samples)}")
+    return retry
 
 
 class _NoiseSampler:
@@ -899,6 +923,10 @@ def check_stream_latency():
       - noisy machine (a shared VM, a 2-core cloud runner): p99 of (latency - the stall the
         sampler saw in that same record's window) < 100 ms -- the machine's own stalls are not
         UHH's, but any latency UHH adds on top of them still fails.
+    As in stream-live, a latency-only failure gets at most one fresh run with
+    >= 100 sampler points and >= 20 ms scheduler noise. Both attempts retain the
+    original bounds; raw p99 >= 1 s fails immediately. Correctness and inline wake
+    failures never earn a retry, nor does the sampler's disk-stall measurement.
     The target's own lines are forwarded by UHH separately from the records (a pipe and a
     forwarder thread), so a record can reach stdout before the tick line written just before
     its event: reported (log_before_tick), not required (no such cross-stream promise).
@@ -922,7 +950,8 @@ def check_stream_latency():
     tmp.mkdir(exist_ok=True)
     env = dict(os.environ, TEMP=str(tmp), TMP=str(tmp))
     quiet_ms, bar_ms, n = 50.0, 100.0, 50      # quiet: < ~3 timer quanta (15.6 ms) of stall
-    for backend in ("inline", "hw", "breakpoint"):
+    runs = [(backend, 1) for backend in ("inline", "hw", "breakpoint")]
+    for backend, attempt in runs:
         name = f"stream-latency-{backend}"
         ticks, logs, log_seq, objects, in_file = {}, {}, [], [], {}
         sampler = None
@@ -967,13 +996,21 @@ def check_stream_latency():
             before_tick = sum(1 for i in range(n) if i in logs and i in ticks and logs[i] < ticks[i][0])
             rep = report(objects)
             complete = len(lat) == n and len(ticks) == n + 1
-            lat_ok = ms(p99 if quiet else p99_excess) < bar_ms
-            ok = (not timed_out and rc == 0 and complete and in_order and causal and lat_ok and
-                  rep.get("logs_written") == n and rep.get("log_dropped") == 0)
+            lat_ok = ms(p99 if quiet else p99_excess) < bar_ms and ms(p99) < 1000.0
+            correct = (not timed_out and rc == 0 and complete and in_order and causal and
+                       rep.get("logs_written") == n and rep.get("log_dropped") == 0)
+            # Preserve the independent wake-up regression on the first measurement too.
+            p50_wake = p50 if quiet else pct(list(excess.values()), .5)
+            wake_ok = backend != "inline" or ms(p50_wake) < 8.0
+            if (correct and wake_ok and not lat_ok and
+                    _stream_latency_retry(sampler, ms(run_noise), ms(p99), attempt, name)):
+                runs.insert(runs.index((backend, attempt)) + 1, (backend, 2))
+                continue
+            ok = correct and lat_ok
             worst = sorted(lat, key=lat.get)[-3:][::-1]
             record(name, ok,
                    f"pairs={len(lat)}/{n} ticks={len(ticks)}/{n + 1} in_order={in_order} causal={causal} "
-                   f"{'quiet' if quiet else 'noisy'}: bar={'p99' if quiet else 'p99(latency-noise)'}<{bar_ms:.0f}ms "
+                   f"{'quiet' if quiet else 'noisy'}: bar={'p99' if quiet else 'p99(latency-noise)'}<{bar_ms:.0f}ms raw_p99<1000ms attempt={attempt}/2 "
                    f"p50={ms(p50):.1f}ms p99={ms(p99):.1f}ms p99_excess={ms(p99_excess):.1f}ms "
                    f"worst(#,ms,noise,in_file)={[(i, round(ms(lat[i]), 1), round(ms(noise[i]), 1), round(ms(in_file[i] - events[i]), 1) if i in in_file else None) for i in worst]} "
                    f"p99_to_file={ms(pct([in_file[i] - events[i] for i in lat if i in in_file], .99)):.1f}ms "
