@@ -408,6 +408,20 @@ void detach(probe_session *s) {
     // exit waits on the loader) would otherwise leave them live. If the stop cannot run within
     // the wait either, it runs whenever the target lets it -- then without us (the agent
     // freezes in-process for a session that is over).
+    // Snapshot BEFORE stop changes the channel/hooks. A clean detach alone does not imply
+    // this cycle ever installed anything (its timer can expire before init even starts).
+    if (s->shared) {
+        for (const auto &p : s->probes) {
+            const uint32_t index = p->agent_index.load();
+            if (!(p->flags & PROBE_INLINE) || index >= s->shared->request_count || index >= PROBE_AGENT_MAX_PROBES) continue;
+            std::fprintf(stderr, "probe: inline detach state %s index=%u status=%ld active=%d hits=%llu "
+                                 "epoch=%ld init_started=%d init_returns=%ld service_ready=%ld remote_work=%d controller_gone=%ld\n",
+                         p->location.c_str(), index, s->shared->requests[index].status, (int)p->active.load(),
+                         (unsigned long long)probe_agent_hits(s->shared, index), s->shared->session_epoch,
+                         (int)s->agent_init_started, s->shared->init_returns, s->shared->service_ready,
+                         (int)s->remote_work, s->shared->controller_gone);
+        }
+    }
     if (s->remote_agent && s->local_agent) {
         auto local_stop = reinterpret_cast<uintptr_t>(GetProcAddress(s->local_agent, "probe_agent_stop"));
         if (local_stop) {

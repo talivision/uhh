@@ -1494,6 +1494,14 @@ INT3"); nothing shipped links it. `--only cxlib`.
   detach,interrupt,conformance,transparency,agent_review,gated` 146/146 on x64 and 146/146 on x86.
 
 ## hw ONCE / ntdll-churn findings (2026-11-06, regress `hw-once-slots-*`, `ntdll-churn-*`, `cdx-owndrx-*`, `ctrl-owndr-*`)
+- 🔧 Inline zero-hit cycle investigation (2026-11-09): a clean detach does not prove hooks were
+  live during the cycle. `uhh_trace` starts its 300 ms timer after `probe_attach` returns,
+  before `probe_run` processes module replay / agent init; detach can cancel setup cleanly.
+  No stale-channel or skipped-init cause established by static inspection. Churn now prints
+  attach-to-active timing, whether activation preceded the detach request, report-time
+  active/hits, and each inline request's pre-stop status / hits / epoch / init / service state.
+  Status values: 0 pending, 1 installing, 2 installed (negative values are failures).
+  Assertions, cycle counts and timer durations unchanged; Windows CI verification pending.
 - ✅ (H1) hw: **target killed by STATUS_SINGLE_STEP after a PROBE_ONCE hw probe retired** (`hw-once-slots`
   failed on every run since the Codex controller review, x64 and x86: the ONCE probes fired once, then a
   worker died at HwSite / after the `lock inc` on g_w1). Cause: a thread still STARTING (in

@@ -246,6 +246,10 @@ int main(int argc, char **argv) {
         bool attach_ok = false;
         std::thread runner([&] {
             attach_ok = ok && probe_attach(s, (uint32_t)attach_pid);
+            if (attach_ok) {
+                std::fprintf(stderr, "probe: attach complete; detach timer ms=%lu stdin=%d\n", detach_ms, (int)detach_stdin);
+                std::fflush(stderr);
+            }
             SetEvent(attached);
             if (attach_ok) {
                 std::printf("{\"kind\":\"attached\",\"pid\":%lu}\n", attach_pid); std::fflush(stdout);
@@ -257,6 +261,7 @@ int main(int argc, char **argv) {
         if (!attach_ok) { runner.join(); probe_report(s, stdout); probe_close(s); return 1; }
         if (detach_stdin) { char line[64]; if (!std::fgets(line, sizeof(line), stdin)) {} }
         else Sleep(detach_ms);
+        std::fprintf(stderr, "probe: detach requested; taking report\n"); std::fflush(stderr);
         probe_report(s, stdout);              // what was observed before letting go
         probe_close(s);                       // detach: hooks removed, INT3s restored, DRs cleared
         runner.join();

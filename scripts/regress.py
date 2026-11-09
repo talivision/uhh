@@ -376,7 +376,7 @@ class Lines:
     """Collect a pipe's lines on a thread; wait for one matching a predicate."""
 
     def __init__(self, pipe):
-        self.lines, self.cv = [], threading.Condition()
+        self.lines, self.times, self.cv = [], [], threading.Condition()
         self.t = threading.Thread(target=self._pump, args=(pipe,), daemon=True)
         self.t.start()
 
@@ -384,6 +384,7 @@ class Lines:
         for line in pipe:
             with self.cv:
                 self.lines.append(line.rstrip("\r\n"))
+                self.times.append(time.monotonic())
                 self.cv.notify_all()
 
     def wait_for(self, pred, timeout):
@@ -2701,7 +2702,7 @@ def check_ntdll_churn(cycles=8, round_reads=1000000):
                 if not line or '"waiting"' in line:
                     break
             target.stdin.write(b"\n"); target.stdin.flush()
-            done, bad, secs = [], [], []
+            done, bad, secs, diagnostics = [], [], [], []
             for c in range(1, cycles + 1):
                 if target.poll() is not None:
                     bad.append(f"target ended before cycle {c}")
@@ -2727,11 +2728,23 @@ def check_ntdll_churn(cycles=8, round_reads=1000000):
                 fin = next((re.search(r"probe: detached: hits=(\d+) logs_written=(\d+) log_dropped=(\d+)", l)
                             for l in terr.lines if "probe: detached: hits=" in l), None)
                 hits, written, dropped = (int(x) for x in fin.groups()) if fin else (None, None, None)
+                timed = list(zip(terr.lines, terr.times))
+                attached_at = next((at for line, at in timed if line.startswith("probe: attach complete;")), None)
+                active_at = next((at for line, at in timed if line.startswith("probe: active ")), None)
+                detach_at = next((at for line, at in timed if line.startswith("probe: detach requested;")), None)
+                diag = dict(active_at_report=pr.get("active"), hits_at_report=pr.get("hits"),
+                            attach_to_active_ms=round(1000 * (active_at - attached_at), 1)
+                                if attached_at is not None and active_at is not None else None,
+                            active_before_detach=active_at <= detach_at
+                                if active_at is not None and detach_at is not None else None,
+                            install=[line for line in terr.lines if line.startswith("probe: inline detach state ")])
+                diagnostics.append(diag)
                 done.append(hits)
                 if (not det or tr.returncode != 0 or pr.get("backend") != bk or (not hits and c > 1) or
                         not (logs == hits == written) or dropped != 0):
                     bad.append(f"cycle{c}: rc={tr.returncode} detached={det} backend={pr.get('backend')} hits={hits} "
                                f"logs={logs} written={written} dropped={dropped} "
+                               f"diag={diag} "
                                f"err={' | '.join(terr.lines[-3:])[:400]}")
             if target.poll() is None:
                 target.stdin.write(b"\n"); target.stdin.flush()   # stop reading
@@ -2746,6 +2759,7 @@ def check_ntdll_churn(cycles=8, round_reads=1000000):
                   res.get("successful_reads") == rounds * total and base.get("checksum") is not None and
                   res.get("checksum") == rounds * base.get("checksum"))
             record(name, ok, f"cycles={len(done)} hits/cycle={done} secs/cycle={[round(x, 1) for x in secs]} "
+                             f"diagnostics/cycle={diagnostics} "
                              f"exit={target.returncode} rounds={rounds} reads={res.get('successful_reads')}/{rounds * total} "
                              f"checksum_exact={res.get('checksum') == rounds * (base.get('checksum') or 0)}"
                              + ("" if ok else f" bad={bad[:3]} target_unhandled={unhandled}"))
