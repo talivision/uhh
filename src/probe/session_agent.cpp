@@ -1064,9 +1064,24 @@ bool ipc_freeze_thread(probe_session *s, DWORD tid) {
         CloseHandle(t); std::fprintf(stderr, "probe: test: freeze denied\n"); return false;
     }
 #endif
-    if (!t) return false;
+    if (!t) {
+        // An EXIT_THREAD event can still be queued behind the agent's FREEZE.
+        const auto it = s->thread_handle.find(tid);
+        if (it != s->thread_handle.end() && thread_terminating(it->second)) return true;
+        std::fprintf(stderr, "probe: freeze: open thread %lu failed (%lu)\n",
+                     (unsigned long)tid, (unsigned long)GetLastError());
+        return false;
+    }
+    if (thread_terminating(t)) { CloseHandle(t); return true; }
     guard_note_hold(s, tid);
-    if (SuspendThread(t) == (DWORD)-1) { CloseHandle(t); return false; }
+    if (SuspendThread(t) == (DWORD)-1) {
+        const DWORD error = GetLastError();
+        const bool gone = thread_terminating(t);
+        CloseHandle(t);
+        if (!gone) std::fprintf(stderr, "probe: freeze: suspend thread %lu failed (%lu)\n",
+                                (unsigned long)tid, (unsigned long)error);
+        return gone;
+    }
     try { s->ipc_frozen.push_back(t); }
     catch (...) { ResumeThread(t); CloseHandle(t); return false; }
     return true;
@@ -1084,7 +1099,7 @@ static bool move_into_trampoline(probe_session *s, HANDLE t) {
         std::fprintf(stderr, "probe: test: freeze context denied\n"); return false;
     }
 #endif
-    if (!GetThreadContext(t, &c)) return false;
+    if (!GetThreadContext(t, &c)) return thread_terminating(t);
 #if defined(_WIN64)
     uint64_t ip = c.Rip;
 #else
@@ -1140,7 +1155,12 @@ static int32_t ipc_freeze(probe_session *s, DWORD self, uint64_t mask) {
     if (mask) {
         for (size_t i = 0; i < before.size(); ++i) {
             before[i].ContextFlags = CONTEXT_CONTROL;
-            if (!GetThreadContext(s->ipc_frozen[i], &before[i])) { ipc_thaw(s); return 0; }
+            if (!GetThreadContext(s->ipc_frozen[i], &before[i])) {
+                if (thread_terminating(s->ipc_frozen[i])) continue;
+                std::fprintf(stderr, "probe: freeze: get context thread %lu failed (%lu)\n",
+                             (unsigned long)GetThreadId(s->ipc_frozen[i]), (unsigned long)GetLastError());
+                ipc_thaw(s); return 0;
+            }
         }
         for (size_t i = 0; i < before.size(); ++i) if (!move_into_trampoline(s, s->ipc_frozen[i])) {
             for (size_t j = 0; j < i; ++j) SetThreadContext(s->ipc_frozen[j], &before[j]);

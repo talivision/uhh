@@ -16,6 +16,7 @@ static ChildState child_state{};
 static uint64_t child_done = 0;
 static unsigned callbacks = 0;
 static void hit(probe_context *) { ++callbacks; }
+static DWORD WINAPI exit_freeze_thread(void *) { return 0; }
 static void dr_require(bool ok, const char *stage) {
     if (!ok) {
         std::fprintf(stderr, "dr-review: %s failed (Win32=%lu)\n", stage, (unsigned long)GetLastError());
@@ -38,6 +39,12 @@ static LONG CALLBACK child_veh(EXCEPTION_POINTERS *e) {
     child_state.exception_address = (ULONG_PTR)e->ExceptionRecord->ExceptionAddress;
     child_state.exception_code = e->ExceptionRecord->ExceptionCode;
     child_state.parameters = e->ExceptionRecord->NumberParameters;
+    // Execute breakpoints fault before the instruction. Retire the program's fired
+    // execute slots after recording their delivered state so returning cannot retrap.
+    for (unsigned slot = 0; slot < 4; ++slot)
+        if ((e->ContextRecord->Dr6 & (1u << slot)) &&
+            !((e->ContextRecord->Dr7 >> (16 + slot * 4)) & 3u))
+            e->ContextRecord->Dr7 &= ~((decltype(e->ContextRecord->Dr7))3 << (slot * 2));
     e->ContextRecord->EFlags &= ~0x100u;
     e->ContextRecord->Dr6 = 0;
     return EXCEPTION_CONTINUE_EXECUTION;
@@ -301,7 +308,17 @@ int run(int argc, char **argv) {
             dr_require(handle_hw(s, d.ev, handled) && handled, "new access handled");
             dr_require(callbacks == before + 1 && p->hits == hits + 1, "new access callback and hit");
         };
-        if (mode == "live-report") {
+        if (mode == "freeze-exited") {
+            DWORD tid = 0;
+            HANDLE exited = CreateThread(nullptr, 0, exit_freeze_thread, nullptr, 0, &tid);
+            dr_require(exited != nullptr, "create exiting freeze thread");
+            const bool ended = WaitForSingleObject(exited, 10000) == WAIT_OBJECT_0;
+            s->thread_handle[tid] = exited; // retain identity while its exit event is pending
+            const bool frozen = ended && ipc_freeze_thread(s, tid);
+            s->thread_handle.erase(tid);
+            CloseHandle(exited);
+            dr_require(frozen && s->ipc_frozen.empty(), "terminated thread does not refuse install freeze");
+        } else if (mode == "live-report") {
             // A live report holds this mutex while traversing the vector.
             s->debug_dispatch_addr = resolve_symbol(s, "ntdll.dll!KiUserExceptionDispatcher");
             dr_require(s->debug_dispatch_addr != 0, "resolve dispatcher before report");

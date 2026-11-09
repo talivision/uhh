@@ -7790,7 +7790,7 @@ def check_ctrl_own_debug():
     d = exe("ctrl_dr_review.exe")
     if not d:
         return missing_bin("ctrl-own-debug", "ctrl_dr_review")
-    for case in ("release", "queued", "queued-same", "queued-rearm", "deferred", "deferred-reused", "deferred-carried-reused", "watch-tf", "watch-tf-carried", "gate", "gate-mixed", "step-entry", "step-own", "step-own-detach", "step-mixed", "step-tf", "detach-dr", "detach-tf"):
+    for case in ("release", "queued", "queued-same", "queued-rearm", "deferred", "deferred-reused", "deferred-carried-reused", "watch-tf", "watch-tf-carried", "gate", "gate-mixed", "freeze-exited", "step-entry", "step-own", "step-own-detach", "step-mixed", "step-tf", "detach-dr", "detach-tf"):
         name = f"ctrl-own-debug-{case}"
         try:
             r, o = run([d, case], timeout=30)
