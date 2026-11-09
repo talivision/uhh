@@ -15,8 +15,14 @@ struct ChildState {
 static ChildState child_state{};
 static uint64_t child_done = 0;
 static uint64_t child_gate_nop = 0;
+static uint64_t child_co_fault = 0;
 static unsigned callbacks = 0;
 static void hit(probe_context *) { ++callbacks; }
+static void original_hit(probe_context *c) {
+    ++callbacks;
+    uint64_t value = 0;
+    if (call_original(c, 0, &value)) return_from(c, value, 0);
+}
 static DWORD WINAPI exit_freeze_thread(void *) { return 0; }
 static void dr_require(bool ok, const char *stage) {
     if (!ok) {
@@ -25,6 +31,18 @@ static void dr_require(bool ok, const char *stage) {
     }
 }
 static LONG CALLBACK child_veh(EXCEPTION_POINTERS *e) {
+    if (e->ExceptionRecord->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION &&
+        (uint64_t)(uintptr_t)e->ExceptionRecord->ExceptionAddress == child_co_fault) {
+        CONTEXT &c = *e->ContextRecord;
+        const int slot = (int)child_state.data[4];
+        const auto address = (decltype(c.Dr0))(uintptr_t)&child_state.data[2];
+        (slot == 0 ? c.Dr0 : c.Dr1) = address;
+        c.Dr7 = (c.Dr7 & ~((decltype(c.Dr7))0xF << (16 + slot * 4))) |
+                ((decltype(c.Dr7))1 << (slot * 2)) | ((decltype(c.Dr7))0xD << (16 + slot * 4));
+        EMU_IP(c) += 2; // UD2 -> a loop: call_original times out and releases it
+        child_state.data[5] = 1;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (child_done && e->ExceptionRecord->ExceptionCode == EXCEPTION_BREAKPOINT &&
         (uint64_t)(uintptr_t)e->ExceptionRecord->ExceptionAddress == child_done) {
         EMU_IP(*e->ContextRecord) = (decltype(EMU_IP(*e->ContextRecord)))(child_done + 1);
@@ -67,6 +85,7 @@ static int child(bool linger) {
     if (!mem || !AddVectoredExceptionHandler(1, child_veh)) return 3;
     if (linger) child_done = (uint64_t)(uintptr_t)mem + 10;
     child_gate_nop = (uint64_t)(uintptr_t)mem + 9;
+    child_co_fault = (uint64_t)(uintptr_t)mem + 32;
     std::memcpy(mem, code, sizeof(code));
     FlushInstructionCache(GetCurrentProcess(), mem, sizeof(code));
     const ULONG_PTR info[] = {(ULONG_PTR)mem, (ULONG_PTR)&child_state};
@@ -324,7 +343,105 @@ int run(int argc, char **argv) {
             dr_require(handle_hw(s, d.ev, handled) && handled, "new access handled");
             dr_require(callbacks == before + 1 && p->hits == hits + 1, "new access callback and hit");
         };
-        if (mode == "freeze-exited") {
+        if (mode == "original-tf" || mode == "original-owned-free" || mode == "original-owned-borrowed") {
+            const bool tf = mode == "original-tf", borrowed = mode == "original-owned-borrowed";
+            // A real CALL supplies the frame call_original requires, on both architectures.
+            const unsigned char call[] = {0xE8, 22, 0, 0, 0}; // code+5 -> code+32
+            const unsigned char body[] = {0x66,0x0F,0xD6,0x01,0xC3}; // movq [CX],xmm0; ret
+            const unsigned char loop[] = {0x0F,0x0B,0xEB,0xFE}; // UD2; jmp $
+            SIZE_T n = 0;
+            dr_require(!!WriteProcessMemory(d.pi.hProcess, (void *)(uintptr_t)site, call, sizeof(call), &n) && n == sizeof(call), "write original caller");
+            const void *body_bytes = tf ? (const void *)body : (const void *)loop;
+            const SIZE_T body_size = tf ? sizeof(body) : sizeof(loop);
+            dr_require(!!WriteProcessMemory(d.pi.hProcess, (void *)(uintptr_t)(d.code + 32), body_bytes, body_size, &n) && n == body_size, "write original body");
+            FlushInstructionCache(d.pi.hProcess, (void *)(uintptr_t)d.code, 64);
+            p->flags = PROBE_HW; p->address = d.code + 32; p->callback = original_hit;
+            s->hw_armed_ever.insert(p->address);
+            if (borrowed) {
+                // All slots busy: the execute probe must lend DR0.
+                s->dr_used = s->dr_ever = 15;
+                for (int slot = 1; slot < 4; ++slot) {
+                    auto q = std::make_unique<Probe>(); q->flags = PROBE_HW; q->active = true;
+                    q->dr_slot = slot; q->address = old_address + 16 + (uint64_t)slot;
+                    s->hw_armed_ever.insert(q->address); s->probes.push_back(std::move(q));
+                }
+            }
+            const LONG return_slot = borrowed ? 0 : 1;
+            dr_require(!!WriteProcessMemory(d.pi.hProcess, (void *)(uintptr_t)(old_address + 16), &return_slot, sizeof(return_slot), &n) && n == sizeof(return_slot), "select return-catch slot");
+            c.Dr0 = (decltype(c.Dr0))p->address; c.Dr7 = 1; d.put(c);
+            d.resume(); d.wait(EXCEPTION_SINGLE_STEP, p->address);
+            if (tf) { auto entry = d.get(); entry.EFlags |= 0x100u; d.put(entry); }
+            CallbackState st{s, p, d.pi.dwProcessId, d.pi.dwThreadId};
+            auto entry = d.get();
+            auto context = from_context(entry, 0, p->address, &callback_ops, s);
+            context.controller = &st; context.tid = d.pi.dwThreadId;
+            run_callback(s, p, &context);
+            if (tf) {
+                const auto result = d.result();
+                dr_require(context.called_original && st.have_post && result.seen == 1 &&
+                           result.ip == d.code + 36 && (result.dr6 & 0x4000u), "original delivers target TF step");
+                dr_require(!(d.get().EFlags & 0x100u), "original keeps handler TF change");
+                dr_require(apply_return_from(s, p, context, entry) && !(entry.EFlags & 0x100u), "callback completion keeps handler TF change");
+            } else {
+                d.pending = false; // timeout released the original; no outstanding event
+                dr_require(st.released && SuspendThread(d.pi.hThread) != (DWORD)-1, "original released after timeout");
+                const auto live = d.get();
+                dr_require(d.result().data[5] == 1 && dr_address(live, return_slot) == target_address &&
+                           ((live.Dr7 >> (return_slot * 2)) & 3) &&
+                           ((live.Dr7 >> (16 + return_slot * 4)) & 0xF) == 0xD, "cleanup preserves target replacement of return catch");
+                ResumeThread(d.pi.hThread);
+            }
+        } else if (mode == "historical-owned") {
+            // The program reuses an address we once armed, after that arm settled.
+            s->hw_armed_ever.insert(target_address);
+            c.Dr0 = (decltype(c.Dr0))target_address; d.put(c);
+            auto before = d.get();
+            enforce_owned_drs(s, d.pi.dwThreadId, before, true);
+            dr_require(before.Dr0 == target_address, "repair preserves historical target address");
+            hw_yield_to_target(s, d.pi.dwThreadId, d.pi.hThread);
+            const auto after = d.get();
+            dr_require(p->dr_slot != 0 && after.Dr0 == target_address &&
+                       (after.Dr7 & 0xF0003u) == (c.Dr7 & 0xF0003u), "historical target address forces migration");
+        } else if (mode == "execute-own-watch") {
+            p->flags = PROBE_HW; p->address = site;
+            s->hw_armed_ever.insert(site);
+            c.Dr0 = (decltype(c.Dr0))site; c.Dr1 = (decltype(c.Dr1))old_address;
+            c.Dr7 = 5 | ((decltype(c.Dr7))0xD << 20); d.put(c);
+            d.resume(); d.wait(EXCEPTION_SINGLE_STEP, site);
+            bool handled = false;
+            dr_require(handle_hw(s, d.ev, handled) && handled && callbacks == 1, "execute callback before target watched access");
+            dr_require((uint64_t)EMU_IP(d.get()) == site, "target watch requires original instruction stream");
+            d.resume(); d.wait(EXCEPTION_SINGLE_STEP, site + 4);
+            DWORD disposition = 0;
+            dr_require(dispatch_event(s, d.ev, disposition) && disposition == DBG_EXCEPTION_NOT_HANDLED, "target data watch forwarded");
+            d.resume(disposition); d.wait(EXCEPTION_BREAKPOINT, done);
+            const auto result = d.result();
+            dr_require(result.seen == 1 && result.ip == site + 4 && result.exception_address == site + 4 &&
+                       (result.dr6 & 2) && result.dr1 == old_address, "target sees watched access at real address");
+        } else if (mode == "queued-migrated" || mode == "deferred-migrated") {
+            watch_event(false);
+            if (mode == "deferred-migrated") {
+                dr_require(hold_watch_hit(s, d.ev, d.get(), 0), "hold watch before migration");
+            } else {
+                s->event_tid = 0; keep_queued_dr6(s, d.pi.dwThreadId, d.pi.hThread);
+            }
+            // Model another thread claiming DR0: migration keeps this thread's B0
+            // identity, clears the old slot and installs the same arm in DR1.
+            dr_require(clear_dr_on_thread(d.pi.hThread, 0, old_address) &&
+                       set_dr_on_thread(d.pi.hThread, 1, old_address, true, 1, 3), "move watch image");
+            p->dr_slot = 1; s->dr_used = 2; s->dr_ever = 3;
+            if (mode == "deferred-migrated") {
+                d.resume();
+                { FiberHost fibers(s); dr_require(poll_calls(s), "replay migrated held watch"); }
+                dr_require(s->watch_deferred.empty(), "migrated held watch drained");
+                d.wait(EXCEPTION_BREAKPOINT, done);
+            } else {
+                settle_hw_thread(s, d.pi.dwThreadId);
+                bool handled = false;
+                dr_require(handle_hw(s, d.ev, handled) && handled, "queued migrated watch handled");
+            }
+            dr_require(callbacks == 1 && p->hits == 1, "migrated access counted and delivered exactly once");
+        } else if (mode == "freeze-exited") {
             DWORD tid = 0;
             HANDLE exited = CreateThread(nullptr, 0, exit_freeze_thread, nullptr, 0, &tid);
             dr_require(exited != nullptr, "create exiting freeze thread");

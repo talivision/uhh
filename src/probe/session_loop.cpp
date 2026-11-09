@@ -1795,12 +1795,12 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
         if (s->dr_used && event.u.CreateThread.hThread && !s->detaching)
             hw_yield_to_target(s, event.dwThreadId, event.u.CreateThread.hThread);
         if (event.u.CreateThread.hThread && !s->detaching)     // new thread inherits the gates
-            for (auto &g : s->gates) set_dr_on_thread(event.u.CreateThread.hThread, g.second, g.first, true, 0, 0, s);
+            for (auto &g : s->gates) set_dr_on_thread(event.u.CreateThread.hThread, g.second, g.first, true, 0, 0, s, event.dwThreadId);
         if (s->hw_active && event.u.CreateThread.hThread)     // new thread inherits the DRs
             for (auto &p : s->probes)
                 if (p->active && (p->flags & PROBE_HW)) {
                     uint32_t rw = 0, len = 0; hw_rw_len(p->flags, rw, len);
-                    set_dr_on_thread(event.u.CreateThread.hThread, p->dr_slot, p->address, true, rw, len, s);
+                    set_dr_on_thread(event.u.CreateThread.hThread, p->dr_slot, p->address, true, rw, len, s, event.dwThreadId);
                 }
         // A launched target's thread born while inline installs are outstanding (e.g. started
         // by a TLS callback or a static DLL's DllMain(PROCESS_ATTACH) during process init,

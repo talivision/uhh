@@ -52,6 +52,7 @@ EST = {
     "check_callorig_hunt": (0, 0), "check_callorig_deep": (5, 5), "check_cdx_review": (1, 2), "check_cet": (6, 6), "check_cet_sde": (194, 1),
     "check_conformance": (1, 1), "check_crash_logs": (7, 13), "check_ctrl_review": (12, 23), "check_ctrl_warm": (25, 25), "check_ctrl_symload": (3, 3), "check_ctrl_pack_oom": (10, 10),
     "check_ctrl_own_debug": (16, 16),
+    "check_ctrl_call_hw_review": (18, 20),
     "check_cxlib": (36, 73), "check_detach": (23, 37), "check_detours_retval": (1, 1),
     "check_detours_simple": (4, 4), "check_detours_stdin": (1, 1), "check_detours_traceapi": (2, 2),
     "check_detours_withdll": (35, 35), "check_dynwatch": (1, 1), "check_edgehunt": (22, 17),
