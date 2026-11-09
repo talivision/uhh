@@ -17,6 +17,14 @@ static uint64_t child_done = 0;
 static uint64_t child_gate_nop = 0;
 static unsigned callbacks = 0;
 static void hit(probe_context *) { ++callbacks; }
+static bool step_call_ok = false;
+static void step_call(probe_context *c) {
+    ++callbacks;
+    uint64_t value = 0;
+    step_call_ok = call_func(c, "ntdll.dll!NtYieldExecution", &value, 0) == 1;
+    const auto *st = static_cast<CallbackState *>(c->controller);
+    step_call_ok = step_call_ok && st->session->stepping.count(st->tid) == 1;
+}
 static DWORD WINAPI exit_freeze_thread(void *) { return 0; }
 static void dr_require(bool ok, const char *stage) {
     if (!ok) {
@@ -53,6 +61,9 @@ static LONG CALLBACK child_veh(EXCEPTION_POINTERS *e) {
     if (child_gate_nop && child_state.ip == child_gate_nop &&
         (child_state.dr6 & 2u) && child_state.dr1 == child_gate_nop &&
         (child_state.dr7 & 0xF0000Cu) == 4)
+        EMU_IP(*e->ContextRecord) = (decltype(EMU_IP(*e->ContextRecord)))(child_gate_nop + 1);
+    if (child_gate_nop && child_state.ip == child_gate_nop &&
+        (child_state.dr6 & 1u) && child_state.dr0 == child_gate_nop)
         EMU_IP(*e->ContextRecord) = (decltype(EMU_IP(*e->ContextRecord)))(child_gate_nop + 1);
     e->ContextRecord->EFlags &= ~0x100u;
     e->ContextRecord->Dr6 = 0;
@@ -324,7 +335,96 @@ int run(int argc, char **argv) {
             dr_require(handle_hw(s, d.ev, handled) && handled, "new access handled");
             dr_require(callbacks == before + 1 && p->hits == hits + 1, "new access callback and hit");
         };
-        if (mode == "freeze-exited") {
+        if (mode == "step-call") {
+            // A real store #DB completes an in-place step and fires our watch.
+            // Its callback's callee crosses an execute probe on the SAME thread.
+            const uint64_t fn = resolve_symbol(s, "ntdll.dll!NtYieldExecution");
+            dr_require(fn != 0, "resolve nested callee");
+            auto callee = std::make_unique<Probe>();
+            callee->flags = PROBE_HW; callee->active = true; callee->address = fn;
+            callee->dr_slot = 1; callee->hw_generation = 2; callee->callback = hit;
+            Probe *callee_probe = callee.get(); s->probes.push_back(std::move(callee));
+            s->dr_used = s->dr_ever = 3; s->hw_active = 2; s->hw_armed_ever.insert(fn);
+            p->callback = step_call;
+            c.Dr1 = (decltype(c.Dr1))fn; c.Dr7 |= 4;
+            auto software = std::make_unique<Probe>();
+            software->flags = PROBE_BREAKPOINT; software->active = true;
+            software->address = site; software->original = 0x66; software->insn_len = 4;
+            StepState st{}; st.probe = software.get(); st.site = site; st.insn_len = 4; st.windowed = true;
+            s->probes.push_back(std::move(software)); // its original byte is lifted during this step
+            s->stepping.emplace(d.pi.dwThreadId, st);
+            inplace_begin(s, d.pi.dwThreadId);
+            watch_event(true);
+            FiberHost fibers(s);
+            dr_require(service_event(s, d.ev), "dispatch watch callback call");
+            d.pending = false; // service_event owns continuation, including parked fibers
+            const ULONGLONG until = GetTickCount64() + 10000;
+            while (!d.pending && GetTickCount64() < until) {
+                DEBUG_EVENT ev{};
+                if (!WaitForDebugEvent(&ev, 100)) { dr_require(poll_calls(s), "poll nested call"); continue; }
+                Debuggee::close_file(ev);
+                const DWORD code = ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT ? ev.u.Exception.ExceptionRecord.ExceptionCode : 0;
+                if ((code == EXCEPTION_BREAKPOINT || code == 0x4000001Fu) &&
+                    (uint64_t)(uintptr_t)ev.u.Exception.ExceptionRecord.ExceptionAddress == done) {
+                    d.ev = ev; d.pending = true; break;
+                }
+                dr_require(ev.dwDebugEventCode != EXIT_PROCESS_DEBUG_EVENT && service_event(s, ev), "nested callee event");
+            }
+            dr_require(d.pending && step_call_ok && callbacks == 1 && p->hits == 1 && callee_probe->hits == 1 &&
+                       s->stepping.empty() && d.result().seen == 0, "nested call leaves outer step intact until completion");
+            unsigned char byte = 0; SIZE_T n = 0;
+            dr_require(!!ReadProcessMemory(d.pi.hProcess, (void *)(uintptr_t)site, &byte, 1, &n) &&
+                       n == 1 && byte == 0xCC && !s->inplace_owner, "software site rearmed and window released");
+        } else if (mode == "ctx-timeout") {
+            c.Dr7 = c.Dr6 = 0;
+            p->active = false; s->dr_used = s->dr_ever = 0; s->hw_active = 0;
+            auto w = std::make_unique<probe_session::CtxWatch>();
+            w->tid = d.pi.dwThreadId;
+            dr_require(!!DuplicateHandle(GetCurrentProcess(), d.pi.hThread, GetCurrentProcess(), &w->t,
+                                        0, FALSE, DUPLICATE_SAME_ACCESS), "duplicate context-watch handle");
+            w->before = c; EMU_IP(w->before) = (decltype(EMU_IP(w->before)))(site + 1);
+            w->after = c; EMU_IP(w->after) = (decltype(EMU_IP(w->after)))site;
+            w->deadline = 0; // expire the real watchdog deterministically, without a sleep
+            dr_require(SuspendThread(d.pi.hThread) != (DWORD)-1 && SuspendThread(d.pi.hThread) != (DWORD)-1,
+                       "target and controller suspend increments");
+            d.put(w->after); s->ctx_watch.push_back(std::move(w)); d.resume();
+            ctx_watch_poll(s);
+            dr_require(s->ctx_watch.size() == 1, "timeout retains pending context repair");
+            // The target can still write its old capture AFTER the watchdog ran.
+            d.put(s->ctx_watch.front()->before);
+            dr_require(ResumeThread(d.pi.hThread) != (DWORD)-1, "target releases its hold");
+            const ULONGLONG until = GetTickCount64() + 5000;
+            while (!s->ctx_watch.empty() && GetTickCount64() < until) { ctx_watch_poll(s); Sleep(1); }
+            dr_require(s->ctx_watch.empty(), "repair drains after target resume");
+            d.wait(EXCEPTION_BREAKPOINT, done);
+            dr_require(d.result().data[0] == -1 && d.result().seen == 0, "repaired thread executes whole instruction");
+        } else if (mode == "stale-gate-own") {
+            p->flags = PROBE_INLINE; p->address = site + 4; p->dr_slot = -1;
+            s->dr_used = 0; s->hw_active = 0; s->hw_armed_ever.insert(p->address);
+            s->detaching = false; s->remote_agent = 1; // isolated dispatcher: no agent install
+            c.Dr0 = (decltype(c.Dr0))p->address; c.Dr7 = 1; d.put(c);
+            d.resume(); d.wait(EXCEPTION_SINGLE_STEP, p->address);
+            dr_require((d.get().Dr6 & 1) != 0, "target execute breakpoint really fired");
+            const auto before = d.get(); DWORD disposition = 0;
+            dr_require(dispatch_event(s, d.ev, disposition) && disposition == DBG_EXCEPTION_NOT_HANDLED,
+                       "settled gate slot belongs to target");
+            const auto after = d.get();
+            dr_require(after.Dr0 == before.Dr0 && after.Dr7 == before.Dr7 && after.Dr6 == before.Dr6 &&
+                       after.EFlags == before.EFlags, "target debug state preserved at old inline gate");
+            d.resume(DBG_EXCEPTION_NOT_HANDLED); d.wait(EXCEPTION_BREAKPOINT, done);
+            dr_require(d.result().seen == 1 && (d.result().dr6 & 1), "target VEH receives its breakpoint");
+        } else if (mode == "yield-delay" || mode == "yield-spin") {
+            p->flags = PROBE_HW; p->address = resolve_symbol(s, mode == "yield-delay" ?
+                "ntdll.dll!NtDelayExecution" : "ntdll.dll!NtYieldExecution");
+            dr_require(p->address != 0, "resolve probed fairness helper");
+            s->dr_used = s->dr_ever = 0; s->hw_active = 0;
+            s->detaching = false; s->initial_break = false; s->parking = true;
+            c.Dr7 = c.Dr6 = 0; d.put(c);
+            const auto before = d.get(); DWORD disposition = 0;
+            dr_require(dispatch_event(s, d.ev, disposition) && disposition == DBG_CONTINUE, "first parking attempt");
+            dr_require(s->yield_stubs.empty() && EMU_IP(d.get()) == EMU_IP(before) && callbacks == 0,
+                       "first fairness park excludes probed helper");
+        } else if (mode == "freeze-exited") {
             DWORD tid = 0;
             HANDLE exited = CreateThread(nullptr, 0, exit_freeze_thread, nullptr, 0, &tid);
             dr_require(exited != nullptr, "create exiting freeze thread");

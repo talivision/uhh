@@ -7871,6 +7871,27 @@ def check_ctrl_symload():
         record(name, False, repr(e))
 
 
+def check_session_loop_review():
+    """Controller loop review: nested watch call_func during step completion, delayed
+    context write-back after watchdog expiry, target execute DR at a released inline
+    gate, and the first fairness park with either helper probed. Real Windows events
+    in ctrl_dr_review; expiry and first-round state are set deterministically.
+    """
+    d = exe("ctrl_dr_review.exe")
+    if not d:
+        return missing_bin("session-loop-review", "ctrl_dr_review")
+    for case in ("step-call", "ctx-timeout", "stale-gate-own", "yield-delay", "yield-spin"):
+        name = f"session-loop-{case}"
+        try:
+            r, o = run([d, case], timeout=30)
+            res = next((x for x in o if x.get("kind") == "dr_review"), {})
+            good = r.returncode == 0 and res.get("ok") == 1 and res.get("case") == case
+            record(name, good, f"exit={r.returncode} result={res}" +
+                   (f" stderr={r.stderr[-2400:]!r}" if not good else ""))
+        except Exception as e:
+            record(name, False, repr(e))
+
+
 def check_ctrl_own_debug():
     """Real Windows #DB events from an eight-byte store and target TF, passed through
     controller handlers. Slot reuse and held-watch replay must reject stale accesses
@@ -13221,6 +13242,7 @@ def main():
     if want(check_stream_filefail): check_stream_filefail()
     if want(check_ctrl_symload): check_ctrl_symload()
     if want(check_ctrl_own_debug): check_ctrl_own_debug()
+    if want(check_session_loop_review): check_session_loop_review()
     if want(check_cdx_review): check_cdx_review()
     if want(check_newapp_files): check_newapp_files()
     if want(check_newapp_flag): check_newapp_flag()
