@@ -49,7 +49,7 @@ EST = {
     "check_agent_safety": (25, 30), "check_agent_crt": (1, 1), "check_agent_review": (1, 1), "check_agent_unwind": (3, 3), "check_attach": (9, 13), "check_attach_new": (0, 0),
     "check_blog_pwsh_attach": (20, 25), "check_blog_replicas": (12, 13), "check_breakage": (21, 21),
     "check_callconv": (1, 1), "check_callfunc_registry": (1, 1), "check_callorig": (65, 71),
-    "check_callorig_hunt": (0, 0), "check_callorig_deep": (5, 5), "check_cdx_review": (1, 2), "check_cet": (6, 6), "check_cet_sde": (194, 1),
+    "check_callorig_hunt": (0, 0), "check_callorig_deep": (5, 5), "check_cdx_review": (3, 4), "check_cet": (6, 6), "check_cet_sde": (194, 1),
     "check_conformance": (1, 1), "check_crash_logs": (7, 13), "check_ctrl_review": (12, 23), "check_ctrl_warm": (25, 25), "check_ctrl_symload": (3, 3), "check_ctrl_pack_oom": (10, 10),
     "check_ctrl_own_debug": (14, 14),
     "check_cxlib": (36, 73), "check_detach": (23, 37), "check_detours_retval": (1, 1),
@@ -75,7 +75,7 @@ EST = {
     "check_realapps:ps-fileversion-inline": (15, 190), "check_realapps:rest": (30, 33), "check_realworld": (14, 14), "check_realworld_targets": (0, 0),
     "check_refusals": (1, 1), "check_ret_probe": (5, 6), "check_shared_mix": (13, 14), "check_sidefx": (3, 10),
     "check_sites": (1, 1), "check_stacks": (1, 1), "check_stdout_forward": (18, 20),
-    "check_stream_latency": (17, 17), "check_stream_live": (21, 44), "check_stream_order": (1, 1), "check_stream_filestall": (12, 12), "check_stream_filefail": (45, 45),
+    "check_stream_latency": (17, 17), "check_stream_live": (21, 44), "check_stream_order": (1, 1), "check_stream_filestall": (12, 12), "check_stream_filefail": (57, 57),
     "check_stream_sink_speed": (3, 8), "check_stream_volume": (149, 196), "check_symbols": (1, 1),
     "check_symbols_grammar": (0, 0), "check_transparency": (6, 9), "check_watchpoint": (2, 3),
 }

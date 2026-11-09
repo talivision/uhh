@@ -972,6 +972,7 @@ static ldr_unload_fn g_ldr_unload;
 // resolved its callee (before the module pin) or right after the pin: it signals
 // Local\uhh_test_cf_<pid> and waits for Local\uhh_test_cf_go_<pid> while the target unloads
 // (and replaces) the callee's DLL. Off: one load and compare per call.
+static bool g_test_cf_pin_fail;       // UHH_TEST_CF_PIN_FAIL: refuse absolute image pins
 static volatile LONG g_test_cf_stall;    // 0 off, 1 resolved, 2 pinned
 static void test_cf_point(LONG where) {
     if (g_test_cf_stall != where || InterlockedCompareExchange(&g_test_cf_stall, 0, where) != where) return;
@@ -991,6 +992,7 @@ static void watch_unloads() {
     char knob[16] = {};
     if (GetEnvironmentVariableA("UHH_TEST_CF_STALL", knob, sizeof(knob)))
         g_test_cf_stall = !strcmp(knob, "resolved") ? 1 : !strcmp(knob, "pinned") ? 2 : 0;
+    g_test_cf_pin_fail = GetEnvironmentVariableA("UHH_TEST_CF_PIN_FAIL", knob, sizeof(knob)) != 0;
     using reg_fn = LONG(NTAPI *)(ULONG, ldr_notify_fn, void *, void **);
     auto reg = reinterpret_cast<reg_fn>(GetProcAddress(nt, "LdrRegisterDllNotification"));
     void *cookie = nullptr;
@@ -1052,9 +1054,10 @@ static uint64_t resolve_callee(const char *symbol, CalleePin &pin) {
         if (!addressable(fn, 1)) return 0;
         MEMORY_BASIC_INFORMATION mbi{};
         if (!VirtualQuery((const void *)(uintptr_t)fn, &mbi, sizeof(mbi))) return 0;
-        if (can_pin && mbi.State == MEM_COMMIT && mbi.Type == MEM_IMAGE) {
-            if (g_ldr_addref(0, mbi.AllocationBase) >= 0) pin.module = mbi.AllocationBase;
-            else if (!absolute) continue;                   // resolved through a module now going away
+        if (mbi.State == MEM_COMMIT && mbi.Type == MEM_IMAGE) {
+            if (!can_pin) return 0;
+            if (!(absolute && g_test_cf_pin_fail) && g_ldr_addref(0, mbi.AllocationBase) >= 0) pin.module = mbi.AllocationBase;
+            else continue;                   // resolved through a module now going away
             if (g_unload_gen != gen) {                      // an unload since the resolution: again
                 if (pin.module) { g_ldr_unload(pin.module); pin.module = nullptr; }
                 continue;
