@@ -621,15 +621,16 @@ static int run_codeprot() {
     VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &old);
     const LONG guard_faults = g_codeprot_fault;
     g_codeprot_fault = 0;
-    VirtualProtect(page, 4096, PAGE_NOACCESS, &old);
+    const int na_set = VirtualProtect(page, 4096, PAGE_NOACCESS, &old) &&
+                       VirtualQuery(page, &mbi, sizeof(mbi)) && mbi.Protect == PAGE_NOACCESS;
     for (int i = 0; i < 200; ++i) CtrlCodeMid(planted);
     VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &old);
     const LONG na_faults = g_codeprot_fault;
     if (h) RemoveVectoredExceptionHandler(h);
     FreeLibrary(m);
     std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"codeprot\",\"guard_set\":%d,\"guard_intact\":%d,"
-                "\"guard_faults\":%ld,\"na_faults\":%ld,\"hits\":%d}\n",
-                guard_set, guard_intact, guard_faults, na_faults, 450);
+                "\"guard_faults\":%ld,\"na_set\":%d,\"na_faults\":%ld,\"hits\":%d}\n",
+                guard_set, guard_intact, guard_faults, na_set, na_faults, 450);
     return 0;
 }
 
