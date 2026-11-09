@@ -106,9 +106,15 @@ myapp+0x1052 [0x7ff612341052]
 
 `walk_stack` uses `StackWalk64`, `SymFunctionTableAccess64`, and
 `SymGetModuleBase64`. Its first returned frame is always the supplied program counter;
-later frames are callers recovered by DbgHelp.
+later frames are callers recovered by DbgHelp. Target memory is cached by page for
+one walk only. Formatted names are cached by address and cleared when modules are
+registered or unregistered. The selected DbgHelp DLL stays loaded for the controller
+process lifetime.
 
-## Names come from files, never from the target's memory
+## Display names come from files
+
+Probe export resolution separately reads the target's export tables and follows its
+forwarders. DbgHelp supplies PDB lookup and display names from disk.
 
 Each controller symbol session is two DbgHelp sessions:
 
@@ -174,7 +180,8 @@ symbolizes them as it writes the record, so the same callback logs the same stac
   The agent never raises an exception the target can see. Stack reads stay inside the
   thread's TEB stack bounds. Code and import-table reads stay inside regions that
   `VirtualQuery` reported committed and readable; that cache is built per capture and
-  never reused across hits. Each frame scans at most 16 KiB, and each capture makes at
+  never reused across hits, so changed code protections are respected without touching
+  guard or inaccessible pages. Stack bounds come from the TEB without a query. Each frame scans at most 16 KiB, and each capture makes at
   most 128 queries.
 - **Frame 0** is the probe site on every backend (`pc` of the hit), never the agent's
   own frames.

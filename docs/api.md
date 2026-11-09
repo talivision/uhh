@@ -74,8 +74,10 @@ Contents: [concepts](#concepts) · [types and macros](#types-and-macros) ·
 - A probe on a module that is not loaded yet stays **pending** and arms when the module
   loads (also a DLL loaded at run time). It goes back to pending when the module unloads
   and re-arms if it loads again.
-- A forwarded export (e.g. `kernel32.dll!HeapAlloc`) is followed to its target; if the
-  target module is not loaded yet the probe waits for it.
+- A forwarded export (e.g. `kernel32.dll!HeapAlloc`) is followed through the target
+  process's export tables, including ordinal forwarders. If its destination is not loaded,
+  the probe waits and resolves against that image when it loads. API-set contracts use
+  the OS contract mapping; export RVAs come from the target image.
 - PDB symbols: see [symbols.md](symbols.md). `uhh_trace --list <module> --mask <pattern>`
   lists what a module offers.
 
@@ -89,8 +91,11 @@ Contents: [concepts](#concepts) · [types and macros](#types-and-macros) ·
   entry point until the hooks are confirmed.) Probes on a module loaded later arm at its load.
 - **Attach:** the target keeps running while probes arm. Each probe counts from its
   `probe: active ...` line on stderr. Breakpoint/hw-only sessions arm at once (nothing is
-  injected). In a session with inline probes, breakpoint/hw probes arm once the injected
-  agent's controller-death guard is up (or after 5 s without it, with a warning).
+  injected). With inline probes, breakpoint/hw probes on already loaded modules wait
+  for the agent's controller-death guard (up to 5 s, then arm with a warning). The guard
+  is ready when the agent's service thread runs. Newly loaded modules arm their
+  breakpoint/hw probes immediately, even before the guard: killing the controller in
+  that window can leave those traps in the target.
 - A probe added from a callback: breakpoint/hw arm before the target resumes; an inline
   probe holds the calling thread until its hook is in.
 
@@ -234,11 +239,14 @@ Attaches to a running process instead of launching one.
   the controller then runs them from its own local copy of the agent DLL (still nothing is
   injected). Where the agent is loaded it is also the
   controller-death guard: if the controller dies, the agent restores breakpoints, clears
-  debug registers and removes hooks. A breakpoint/hw-only target has no such guard (see
+  UHH-owned debug registers and removes hooks. A breakpoint/hw-only target has no such guard (see
   [limitations.md](limitations.md#detach-and-close)).
-- Probes resolve against the modules already loaded and any loaded later.
+- Probes resolve against the modules already loaded and any loaded later. Reattach
+  reuses an identified retained agent only when its normalized file contents match
+  this build, and maps that same file in the controller to reconnect `UHH_SHARED`.
+  A different build is refused; restart the target to use it.
 - `probe_run` returns when the target exits. `probe_close` on a still-running target
-  **detaches**: inline hooks removed, breakpoints restored, debug registers cleared, no
+  **detaches**: inline hooks removed, breakpoints restored, UHH-owned debug registers cleared, no
   thread left mid-step; the target keeps running.
 
 ### `int probe_attach_new(probe_session *s, const char *image_name, uint32_t timeout_ms)`
@@ -400,7 +408,9 @@ ran; `*ret` receives the return register.
   `GetCurrentThreadId` this way: a direct Win32 call acts on the process the callback runs
   in.
 - **Breakpoint/hw:** the debugger runs the call on the stopped thread and restores its
-  context exactly. It costs tens of microseconds, so cache results. Other threads keep
+  context, including enabled extended register state. Context-setup failures return 0
+  with a once-per-probe diagnostic. It adds roughly 200 µs on x64 / 290 µs on x86 on
+  the test VM, so cache results. Other threads keep
   running; their hits wait until the call ends (a code probe's thread is rewound and hits
   again; a data watch's thread is held right after its access, and its callback runs once
   the call is over). Calls from several threads' callbacks all succeed, one after the other.
@@ -413,7 +423,10 @@ ran; `*ret` receives the return register.
   the thread first grows it itself; within the last pages of the thread's stack reservation
   the call is refused (returns 0, one stderr line per probe:
   `call_func refused: the thread's stack is nearly exhausted ...`).
-- **Inline:** a direct call. An exception in the callee is dispatched in the target as usual
+- **Inline:** a direct call (~2.3 µs including the hit on the test VM). Named resolutions
+  are cached until a module unload; executability is checked on every call. Named callees in loaded images are held by a temporary module reference during the call, so a concurrent
+  `FreeLibrary` may defer unload until the call returns. Repeated resolution/unload races
+  return 0 after four attempts. An exception in the callee is dispatched in the target as usual
   (handled inside: returns 1; unhandled: 0), and the target's vectored handlers see it.
 - Prefer `call_original` for the probed function itself, and keep `call_func` to callees
   that take no locks and do not throw.
@@ -583,12 +596,16 @@ Every `send_log`/`send_log_stack` record is appended as one JSON line to a per-s
 `%TEMP%\uhh\logs\uhh-<controller pid>-<n>.jsonl`; its path is printed once as
 `probe: logs -> ...`. The file is not deleted at close. The controller's log writer writes
 each batch of lines to its stdout first (the live tail), then hands it to the file's own
-appender thread, so a slow disk write never holds up stdout; a batch goes out within about
-10 ms, at once when the writer was idle. Logging never drops a record: when the writer falls
-behind, the logging thread waits. Redirect stdout to `NUL` to disable the tail and keep only
-the file. If a console tail falls behind for more than about a second, UHH prints a one-time
+appender thread. The bounded file queue absorbs short disk stalls; when full it
+back-pressures the writer and stdout; a batch goes out within about
+10 ms, at once when the writer was idle. When the writer falls behind, the logging
+thread waits instead of dropping records. A failed file append ends the file: its failed
+batch, queued batches and subsequent records count in `log_dropped`, including records
+already delivered to stdout. The session error reports the successfully appended count; stdout may still
+be complete. An allocation failure before append has the same effect. Redirect stdout
+to `NUL` to disable the tail and keep only the file. If a console tail falls behind for more than about a second, UHH prints a one-time
 warning suggesting a redirect to a file or pipe. Every flush (`probe_wait_for_exit`,
-`probe_report`, `probe_close`) waits until the file is complete.
+`probe_report`, `probe_close`) waits for pending file writes or their failure.
 
 ```json
 {"kind":"probe_log","probe":3,"tid":5124,"message":"read handle=0xa4 pid=7516 name=probe_app.exe addr=0x7ff7fb509690 size=16","seq":0}
@@ -618,12 +635,12 @@ characters in the text or a stack frame are escaped.
 | `overrides` | register changes made by callbacks (`set_reg` with a new value) |
 | `log_dropped` | records not in the session file: non-zero only when the controller stopped consuming (it died), ran out of memory for a record, or the file failed (every record after the failure; some may still be on stdout, see `stdout_logs`) |
 | `callbacks_interrupted` | inline callbacks cut off by the target process dying before their first log; their hits are counted, their logs never existed (one killed after its first log counts as that log) |
-| `logs_written` | records in the session file (it holds `seq` 0..`logs_written`-1) |
+| `logs_written` | records in successfully appended file batches |
 | `controller_peak_ws_mb` | the controller's peak working set |
 | `app_exit` | the target's exit code (1 if it did not exit, e.g. after a detach) |
-| `live_output_closed` | stdout's reader went away; the file still has every record |
+| `live_output_closed` | stdout's reader went away; file logging continues |
 | `stdout_logs` | `probe_log` records the live tail wrote to stdout before this report (null when stdout is `NUL`: no tail). Equal to `logs_written` unless the tail stopped (`live_output_closed` / `live_output_error`: fewer) or the session file failed (`error` says so; stdout may hold `stdout_logs - logs_written` more) |
-| `live_output_error` | a stdout write failed for another reason (also on stderr and in `error`); the file still has every record |
+| `live_output_error` | a stdout write failed for another reason (also on stderr and in `error`); file logging continues |
 | `error` | the session's first error, or null |
 
 A capture of stdout is complete when it ends with the `probe_report`, holds exactly
@@ -684,7 +701,7 @@ suite's portability matrix).
 | `%s` of a target pointer in `send_log` | not a valid pointer: `[unformattable] ...` (or controller bytes if mapped there too) | prints the string |
 | Callback that faults/throws | the target never sees the exception | the target's vectored handlers see the first chance |
 | `call_func` callee that raises (even if handled) | abandoned: returns 0 | dispatched in the target: 1 if handled |
-| `call_func` cost | tens of microseconds | a direct call |
+| `call_func` cost | ~200 µs x64 / ~290 µs x86 beyond the hit (test VM) | ~2.3 µs including the hit |
 | `PROBE_ONCE` | supported | refused |
 | Visible to the program | INT3 byte (breakpoint) or DR7 (hw) | hook jump in the code; page protection changes when hooks are written |
 | Live from (launch) | the first instruction | the loader breakpoint (before any DLL initialiser) |
@@ -692,3 +709,7 @@ suite's portability matrix).
 
 The full per-backend table (threads, side effects, visibility, CET, x86) and the remaining
 corner cases are in [limitations.md](limitations.md#per-backend-table).
+
+Developer source navigation: the controller is split across `src/probe/session*.cpp`,
+with shared internal declarations in `session_internal.hpp`. The public C API remains
+in `include/probe_api.h`; the split does not change it.

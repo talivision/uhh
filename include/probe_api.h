@@ -162,7 +162,7 @@ int probe_launch(probe_session *, char *const argv[]);
 /* Attach to an already-running process instead of launching one. Probes resolve against
    the modules already loaded (and any loaded later). probe_run returns when the target
    exits; probe_close on a still-running target DETACHES (restores breakpoints, clears
-   debug registers, removes inline hooks) instead of terminating it. The target keeps
+   UHH-owned debug registers, removes inline hooks) instead of terminating it. The target keeps
    running while the probes arm: each one counts from its "probe: active" line on (an
    inline hook once the injected agent confirms it; every hook write briefly suspends
    all threads so none is ever mid-patch). */

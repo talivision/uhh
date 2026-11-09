@@ -32,3 +32,8 @@ build-x64\Release\watch_driver.exe $rva -- build-x64\Release\watch_target.exe --
 
 Expected: the probe's hit count equals the number of writes (4 × 1000 = 4000), exactly.
 Verified on the VM: 4 threads × 1000 writes → `hits: 4000`, `callback_hits: 4000`.
+
+Data watchpoints do not require instruction boundaries, including when a symbol plus
+offset names data inside code. `PROBE_ALLOW_UNSAFE_SITE` is invalid for watchpoints.
+UHH preserves target-owned debug registers; if no slot is available on a thread, the
+probe yields there and reports a warning.

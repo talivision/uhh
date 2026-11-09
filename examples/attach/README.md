@@ -17,8 +17,10 @@ its files or its config:
 
 `configparse.dll` is not loaded yet when `uhh_attach` attaches (the target loads it
 after the keystroke), so the flag breakpoint stays pending and arms when the DLL
-loads. `ntdll` and `probe_app.exe` are already loaded, so those probes arm right after
-the attach.
+loads, even while an inline attach's agent guard is starting. Probes on already loaded
+modules wait for that guard (up to 5 s); breakpoint/hw-only attaches arm immediately.
+Each probe counts from its `probe: active` line. A newly loaded module's traps remain
+unguarded until the agent's service thread starts.
 
 **Handle -> pid.** A read only carries a handle. `track_open_process` runs the open itself
 (`call_original`), reads the new handle and records it with the pid from `CLIENT_ID`, then
