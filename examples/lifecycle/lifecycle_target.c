@@ -54,7 +54,7 @@ typedef void (*HuntWorkFn)(void (*)(void), volatile LONG *);
 
 static NtReadFn g_ntread; static NtOpenFn g_ntopen; static NtCloseFn g_ntclose; static ParseFn g_parse;
 static unsigned char g_pattern[64];
-static volatile LONG g_dr_stale;
+static volatile LONG g_dr_stale, g_tf_dirty;
 static volatile LONG g_stop, g_errors, g_flips, g_slow_calls, g_churned, g_dll_cycles, g_work;
 static unsigned char *g_reuse;                 /* dllreuse: the executable range committed over the old DLL */
 static SIZE_T g_reuse_len;
@@ -152,6 +152,7 @@ static int thread_dirty(HANDLE t, char *why, size_t cap) {
     /* A breakpoint is an ENABLED slot (DR7 L0-3/G0-3) or the trap flag. An address left in a
        disabled slot never fires (WOW64 does not propagate a zeroed address of a disabled slot):
        counted separately as "stale", for information. */
+    if (c.EFlags & 0x100) InterlockedIncrement(&g_tf_dirty);
     if ((c.Dr7 & 0xFF) || (c.EFlags & 0x100)) {
         _snprintf_s(why, cap, _TRUNCATE, "dr7=0x%llx dr0=0x%llx dr1=0x%llx dr2=0x%llx dr3=0x%llx tf=%d",
                     (unsigned long long)c.Dr7, (unsigned long long)c.Dr0, (unsigned long long)c.Dr1,
@@ -277,6 +278,7 @@ static void check(const char *kind) {
     char code_bad[256] = "", dr_bad[256] = "", dr_unknown_info[256] = "", why[96];
     int code_diff = 0, dr_dirty = 0, dr_unknown = 0, threads = 0;
     InterlockedExchange(&g_dr_stale, 0);
+    InterlockedExchange(&g_tf_dirty, 0);
     for (int i = 0; i < NSITES; ++i)
         if (g_site[i] && memcmp(g_snap[i], g_site[i], sizeof(g_snap[i]))) {
             ++code_diff;
@@ -334,10 +336,10 @@ static void check(const char *kind) {
     LONG susp = 0; char susp_info[256] = "";
     find_suspended(&susp, susp_info, sizeof(susp_info));
     printf("{\"kind\":\"%s\",\"susp\":%ld,\"susp_info\":\"%s\",\"code_diff\":%d,\"code_bad\":\"%s\",\"dr_dirty\":%d,\"dr_bad\":\"%s\","
-           "\"dr_unknown\":%d,\"dr_unknown_info\":\"%s\",\"dr_stale\":%ld,\"threads\":%d,"
+           "\"tf_dirty\":%ld,\"dr_unknown\":%d,\"dr_unknown_info\":\"%s\",\"dr_stale\":%ld,\"threads\":%d,"
            "\"debugger\":%d,\"agent_loaded\":%d,\"agent_channel\":%d,\"mapped_bytes\":%llu,\"iterations\":%lld,\"errors\":%ld,\"first_error\":\"%s\","
            "\"flips\":%ld,\"slow_calls\":%ld,\"churned\":%ld,\"dll_cycles\":%ld,\"late\":%ld,\"stuck\":%ld,\"stuck_info\":\"%s\",\"agent_thr\":\"%s\"}\n",
-           kind, susp, susp_info, code_diff, code_bad, dr_dirty, dr_bad, dr_unknown, dr_unknown_info, g_dr_stale, threads, IsDebuggerPresent() ? 1 : 0,
+           kind, susp, susp_info, code_diff, code_bad, dr_dirty, dr_bad, g_tf_dirty, dr_unknown, dr_unknown_info, g_dr_stale, threads, IsDebuggerPresent() ? 1 : 0,
            GetModuleHandleA("probe_api_agent.dll") != NULL, agent_channel_exists(), mapped_bytes(), (long long)g_iters, g_errors, g_first_error,
            g_flips, g_slow_calls, g_churned, g_dll_cycles, g_late, g_stuck, g_stuck_info, g_agent_thr);
     fflush(stdout);

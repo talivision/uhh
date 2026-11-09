@@ -2771,6 +2771,7 @@ static NtQipFn g_ntqip;
 static HANDLE g_guard_wake;           // auto-reset: re-check (new session / a trap was taken)
 static HANDLE g_ctl;                  // the controller process (owned here once taken)
 static volatile LONG g_orphan_cleaned;
+static volatile LONG g_lazy_dr;        // orphaned DRs are cleared by their own thread's VEH
 static bool no_debug_port() {         // nobody is debugging us (any more)
     ULONG_PTR port = 1;
     return g_ntqip && g_ntqip(GetCurrentProcess(), 7 /*ProcessDebugPort*/, &port, sizeof(port), nullptr) >= 0 && port == 0;
@@ -2800,28 +2801,6 @@ static void restore_byte(uint64_t at, unsigned char original) {
         VirtualProtect((void *)p, 1, old, &old);
         FlushInstructionCache(GetCurrentProcess(), (void *)p, 1);
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
-}
-// Addresses our slots held when the cleanup cleared them: a #DB already raised for one of them
-// (its thread was stopped at that event when the controller died) is delivered AFTER the clear,
-// when neither DR7 nor the address says it was ours any more.
-static volatile LONG64 g_cleared[64];
-static volatile LONG g_cleared_n;
-static void remember_cleared(uint64_t a) {
-    if (!a) return;
-    LONG n = g_cleared_n;
-    for (LONG i = 0; i < n && i < 64; ++i) if ((uint64_t)g_cleared[i] == a) return;
-    LONG i = InterlockedIncrement(&g_cleared_n) - 1;
-    if (i < 64) g_cleared[i] = (LONG64)a;
-}
-static void clear_dr_slots(CONTEXT &c, DWORD mask) {
-    for (int slot = 0; slot < 4; ++slot) {
-        if (!(mask & (1u << slot))) continue;
-        remember_cleared(slot == 0 ? (uint64_t)c.Dr0 : slot == 1 ? (uint64_t)c.Dr1 : slot == 2 ? (uint64_t)c.Dr2 : (uint64_t)c.Dr3);
-        c.Dr7 &= ~((decltype(c.Dr7))3 << (slot * 2)) & ~((decltype(c.Dr7))0xF << (16 + slot * 4));
-        switch (slot) { case 0: c.Dr0 = 0; break; case 1: c.Dr1 = 0; break; case 2: c.Dr2 = 0; break; default: c.Dr3 = 0; }
-    }
-    if (mask && !(c.Dr7 & 0xFF)) c.Dr7 &= ~(decltype(c.Dr7))0x300;   // no slot left: exact bits off too
-    c.Dr6 = 0;
 }
 // The program's byte under one of our armed INT3s (the INT3 table, sorted by address). The
 // controller may have died in the middle of a rewrite (int3_seq left odd): then a plain scan.
@@ -2891,42 +2870,24 @@ static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
         if (g_guard_wake) SetEvent(g_guard_wake);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
-    CONTEXT dr{}; dr.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    GetThreadContext(GetCurrentThread(), &dr);
     const DWORD mask = (DWORD)g.dr_mask & 0xF;
-    bool ours = (dr.Dr6 & mask) != 0 || tid_listed(g.step_tids, g.step_count, GetCurrentThreadId());
-    if (!ours) {   // DR6 is not always reported: an enabled slot of ours at this very address
-        const uint64_t ip = get_ip(cx);
-        const uint64_t a[4] = {(uint64_t)dr.Dr0, (uint64_t)dr.Dr1, (uint64_t)dr.Dr2, (uint64_t)dr.Dr3};
-        for (int slot = 0; slot < 4 && !ours; ++slot)
-            ours = (mask & (1u << slot)) && ((dr.Dr7 >> (slot * 2)) & 3) && (a[slot] == ip || a[slot] == at);
-        LONG n = g_cleared_n; if (n > 64) n = 64;
-        for (LONG i = 0; i < n && !ours; ++i) ours = (uint64_t)g_cleared[i] == ip || (uint64_t)g_cleared[i] == at;
-    }
-    if (!ours && no_debug_port()) {
-        // A trap-flag step or #DB the dying controller set up that left no trace we can match
-        // (seen on x64: a call_original's in-place run returning after the cleanup). With no
-        // enabled slot of the target's own on this thread nothing else of the program can have
-        // raised it, short of the program single-stepping itself (taken as ours: residual).
-        DWORD own = 0;
-        for (int slot = 0; slot < 4; ++slot)
-            if (!(mask & (1u << slot)) && ((dr.Dr7 >> (slot * 2)) & 3)) own |= 1u << slot;
-        ours = own == 0 && (dr.Dr6 & 0xF & ~mask) == 0;
-    }
-    if (!ours) {
-        const uint64_t ip = get_ip(cx);
-        LONG n = g.block_count; if (n > (LONG)PROBE_AGENT_GUARD_BLOCKS) n = PROBE_AGENT_GUARD_BLOCKS;
-        for (LONG i = 0; i < n && !ours; ++i) ours = g.blocks[i] && ip - g.blocks[i] < 0x10000;
-    }
-    if (!ours) return EXCEPTION_CONTINUE_SEARCH;
-    // A DR hit (execute: not yet run; data: already done) or the end of a step we started:
-    // drop our debug registers and the trap flag, and carry on from here. (A displaced step
-    // continues in its out-of-line copy, which jumps back to the code after the site.)
-    clear_dr_slots(dr, mask);
-    dr.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    SetThreadContext(GetCurrentThread(), &dr);
-    if ((cx->ContextFlags & CONTEXT_DEBUG_REGISTERS) == CONTEXT_DEBUG_REGISTERS) clear_dr_slots(*cx, mask);
-    cx->EFlags &= ~0x100u;
+    const DWORD hits = (DWORD)cx->Dr6 & 0xF;
+    // Never consume the target's own DR hit, even when one of ours fired too. Likewise a
+    // target single-step / debug-register-access exception must reach its own handlers.
+    const bool step = (cx->Dr6 & (1u << 14)) && tid_listed(g.step_tids, g.step_count, GetCurrentThreadId());
+    if ((hits & ~mask) || (cx->Dr6 & (1u << 13)) || ((cx->Dr6 & (1u << 14)) && !step))
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (!(hits & mask) && !step) return EXCEPTION_CONTINUE_SEARCH;
+    // A live controller consumes our traps before the VEH. This orphaned hit can precede
+    // the service thread's death notification, even while the debug port is being torn down.
+    if (!g_lazy_dr) InterlockedExchange(&g_lazy_dr, 1);
+    // Use the exception context: Get/SetThreadContext on the running current thread is
+    // not a register snapshot/restore. Data watchpoints report the address AFTER the
+    // access, so ownership comes from DR6, not the exception IP. Leave foreign slots intact.
+    for (int slot = 0; slot < 4; ++slot)
+        if (mask & (1u << slot)) cx->Dr7 &= ~((decltype(cx->Dr7))3 << (slot * 2));
+    cx->Dr6 &= ~(decltype(cx->Dr6))mask;
+    if (step) { cx->Dr6 &= ~(decltype(cx->Dr6))(1u << 14); cx->EFlags &= ~0x100u; }
     if (g_guard_wake) SetEvent(g_guard_wake);
     return EXCEPTION_CONTINUE_EXECUTION;
 }
@@ -2960,38 +2921,23 @@ static void guard_cleanup() {
     if (n < 0) n = 0;
     if (n > (LONG)PROBE_AGENT_INT3_CAP) n = PROBE_AGENT_INT3_CAP;
     for (LONG i = 0; i < n; ++i) if (shared->int3[i].address) restore_byte(shared->int3[i].address, shared->int3[i].original);
-    const DWORD mask = (DWORD)g.dr_mask & 0xF, self = GetCurrentThreadId(), pid = GetCurrentProcessId();
-    {   // this thread too (the controller armed its DRs like every other thread's)
-        CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-        if (GetThreadContext(GetCurrentThread(), &c)) { clear_dr_slots(c, mask); SetThreadContext(GetCurrentThread(), &c); }
-    }
-    // Twice: a thread the dying debugger had stopped at an event can be released with the
-    // debug registers it was stopped with, after the first pass.
-    for (int pass = 0; pass < 2; ++pass, Sleep(200)) {
+    // No context sweep: it would expose our temporary SuspendThread count to running
+    // program threads. A stale DR that never fires needs no work (including on this thread).
+    InterlockedExchange(&g_lazy_dr, 1);
+    const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snap != INVALID_HANDLE_VALUE) {
         THREADENTRY32 te{}; te.dwSize = sizeof(te);
         for (BOOL more = Thread32First(snap, &te); more; more = Thread32Next(snap, &te)) {
             if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
-            HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT |
-                                  THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+            HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
+                                  FALSE, te.th32ThreadID);
             if (!t) continue;
-            if (SuspendThread(t) != (DWORD)-1) {              // no heap / lock use while it is suspended
-                CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS | CONTEXT_CONTROL;
-                if (GetThreadContext(t, &c)) {
-                    clear_dr_slots(c, mask);
-                    if (tid_listed(g.step_tids, g.step_count, te.th32ThreadID)) c.EFlags &= ~0x100u;
-                    SetThreadContext(t, &c);
-                }
-                ResumeThread(t);
-            }
-            // The controller's holds: once per entry (a thread can be held twice, e.g. a deferred
-            // call_original hit that an in-place step window then suspended again).
-            if (!pass) resume_holds(g, t, te.th32ThreadID);
+            // Only release recorded controller holds, once per entry.
+            resume_holds(g, t, te.th32ThreadID);
             CloseHandle(t);
         }
         CloseHandle(snap);
-    }
     }
     InterlockedExchange(&g_self_freeze, 1);                     // no controller to freeze for us
     probe_agent_stop(nullptr);                                  // inline hooks out (no-op without any)
@@ -3091,7 +3037,10 @@ static DWORD WINAPI service_main(void *) {
             if (InterlockedExchange(&shared->live_query, 0)) { answer_live_query(); continue; }
             install_pending(); notify_installed(); continue;
         }
-        if (w == WAIT_OBJECT_0 + 2) { CloseHandle(g_ctl); g_ctl = nullptr; ctl_gone_at = GetTickCount64(); }
+        if (w == WAIT_OBJECT_0 + 2) {
+            InterlockedExchange(&g_lazy_dr, 1);
+            CloseHandle(g_ctl); g_ctl = nullptr; ctl_gone_at = GetTickCount64();
+        }
         else if (w == WAIT_FAILED) {
             if (!g_ctl) return 1;
             CloseHandle(g_ctl); g_ctl = nullptr; ctl_gone_at = GetTickCount64();
@@ -3184,7 +3133,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *channel) {
         AddVectoredExceptionHandler(1, guard_veh);
     }
     InterlockedExchange(&g_orphan_cleaned, 0);   // a new session: guard it afresh
-    InterlockedExchange(&g_cleared_n, 0);
+    InterlockedExchange(&g_lazy_dr, 0);
     if (g_guard_wake) SetEvent(g_guard_wake);    // the service thread takes the new controller handle
     InterlockedIncrement(&g_tblock_gen);   // a new (zeroed) channel: every thread claims a hit block again
     InterlockedExchange(&g_stopping, 0);   // a new session after a detach: callbacks run again

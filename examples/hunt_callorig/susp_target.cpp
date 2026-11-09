@@ -2,6 +2,8 @@
 // suspends a worker right after the controller let it run again, then the controller dies.
 //   susp_target evsusp: the worker's probe hit (co_add) was handled and continued; it counts on.
 //   susp_target cosusp: the worker is inside co_hold, run by its callback's call_original.
+//   susp_target watchdeath: a killed guarded controller leaves a data DR; writes must succeed
+//     without exposing its exception, while a foreign DR and an unrelated exception still work.
 //   susp_target cosample: the worker is inside co_hold, run by call_original, and the controller
 //     stays; the main thread samples the worker's suspend count for <= 1 s (SuspendThread +
 //     ResumeThread in a loop): a suspension of the CONTROLLER in place at a sample shows as a
@@ -127,8 +129,75 @@ static bool read_gate() {
     return false;
 }
 
+// A data-watch trap reports the instruction AFTER this write, not the data address.
+extern "C" { __declspec(dllexport) volatile LONG co_watch_value = 0; }
+static volatile LONG g_watch_exceptions, g_own_hits, g_own_value;
+static DWORD g_own_slot, g_stale_slots;
+static DWORD WINAPI watchdeath_own_dr(void *main_thread) {
+    HANDLE t = (HANDLE)main_thread;
+    if (SuspendThread(t) == (DWORD)-1) return 1;
+    CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    bool ok = GetThreadContext(t, &c) != 0;
+    if (ok) {
+        g_stale_slots = (DWORD)c.Dr7 & 0xFF;
+        int slot = 0;
+        while (slot < 4 && ((c.Dr7 >> (slot * 2)) & 3)) ++slot;
+        ok = slot < 4;
+        if (ok) {
+            g_own_slot = 1u << slot;
+            const DWORD_PTR address = (DWORD_PTR)&g_own_value;
+            switch (slot) { case 0: c.Dr0 = address; break; case 1: c.Dr1 = address; break;
+                            case 2: c.Dr2 = address; break; default: c.Dr3 = address; }
+            c.Dr7 &= ~((decltype(c.Dr7))0xF << (16 + slot * 4));
+            c.Dr7 |= ((decltype(c.Dr7))0xD << (16 + slot * 4)) | ((decltype(c.Dr7))1 << (slot * 2));
+            ok = SetThreadContext(t, &c) != 0;
+        }
+    }
+    ResumeThread(t);
+    return ok ? 0 : 1;
+}
+static LONG CALLBACK watchdeath_veh(EXCEPTION_POINTERS *ep) {
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+    if (ep->ContextRecord->Dr6 & g_own_slot) InterlockedIncrement(&g_own_hits);
+    else InterlockedIncrement(&g_watch_exceptions);
+    // Let a failing guard finish too, so the regression reports the leaked exception.
+    ep->ContextRecord->Dr7 &= ~(decltype(ep->ContextRecord->Dr7))0xFF;
+    ep->ContextRecord->Dr6 = 0;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+static int run_watchdeath() {
+    if (!AddVectoredExceptionHandler(1, watchdeath_veh)) return 4;
+    printf("{\"kind\":\"waiting\",\"pid\":%lu}\n", GetCurrentProcessId()); fflush(stdout);
+    if (!read_gate()) return 3;                 // the controller died with the watch armed
+    BOOL dbg = TRUE;
+    for (int i = 0; i < 3000 && CheckRemoteDebuggerPresent(GetCurrentProcess(), &dbg) && dbg; ++i) Sleep(10);
+    Sleep(1500);                               // exercise the lazy path AFTER guard cleanup
+    // Inspect the still-armed stale UHH slot and add a foreign slot from another thread.
+    HANDLE main_thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT,
+                                   FALSE, GetCurrentThreadId());
+    if (!main_thread) return 4;
+    HANDLE setup = CreateThread(nullptr, 0, watchdeath_own_dr, main_thread, 0, nullptr);
+    if (!setup) { CloseHandle(main_thread); return 4; }
+    const DWORD done = WaitForSingleObject(setup, 30000);
+    DWORD setup_rc = 1;
+    GetExitCodeThread(setup, &setup_rc);
+    CloseHandle(setup); CloseHandle(main_thread);
+    if (done != WAIT_OBJECT_0 || setup_rc != 0) return 4;
+    co_watch_value = 41;
+    co_watch_value += 1;                        // the UHH slot must now be disabled
+    const LONG leaked = g_watch_exceptions;
+    g_own_value = 7;                            // the guard must preserve the foreign DR slot
+    RaiseException(EXCEPTION_SINGLE_STEP, 0, 0, nullptr); // unrelated target exception passes through
+    printf("{\"kind\":\"co\",\"case\":\"watchdeath\",\"value\":%ld,\"exceptions\":%ld,"
+           "\"target_exceptions\":%ld,\"own_hits\":%ld,\"stale_slots\":%lu,\"debugger\":%d}\n",
+           co_watch_value, leaked, g_watch_exceptions - leaked, g_own_hits, g_stale_slots, (int)dbg);
+    fflush(stdout);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *k = argc > 1 ? argv[1] : "";
+    if (!strcmp(k, "watchdeath")) return run_watchdeath();
     if (!strcmp(k, "deepthrow") || !strcmp(k, "deepseh") || !strcmp(k, "deepjmp") || !strcmp(k, "catchhit") ||
         !strcmp(k, "catchinside"))
         return run_deep(k);

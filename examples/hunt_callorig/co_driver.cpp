@@ -1,7 +1,7 @@
 // co_driver --backend b [--inner-backend b2] --case name [--module m.exe] [--guard] [--attach pid [--detach-after ms | --detach-on-stdin]]
 //           [-- co_target.exe name]
-// --module: the probed functions' module (default co_target.exe; susp_target.exe for evsusp/cosusp
-// and deepthrow/deepseh/deepjmp/catchhit/catchinside).
+// --module: the probed functions' module (default co_target.exe; susp_target.exe for evsusp/cosusp,
+// watchdeath and deepthrow/deepseh/deepjmp/catchhit/catchinside).
 // --guard: also an inline probe on <module>!co_idle (never called), so a breakpoint/hw session has
 // the agent and its controller-death guard: only sessions with an inline probe inject it
 // (owner decision 2026-11-07).
@@ -89,6 +89,7 @@ int main(int argc, char **argv) {
     else if (k == "vslow") ok = add("co_vslow", co_on_vslow, bk) && add("co_after", co_on_after, bk);
     else if (k == "cbfault") ok = add("co_cbf", co_on_cbf, bk);
     else if (k == "spin") ok = add("co_add", co_on_spin, bk);
+    else if (k == "watchdeath") ok = add("co_watch_value", co_on_idle, PROBE_HW | PROBE_WATCH_WRITE);
     else if (k == "rep") ok = add("CoRepSite", co_on_spin, bk);
     else if (k == "susp" || k == "evsusp") ok = add("co_add", co_on_spin, bk);
     else if (k == "cosusp" || k == "cosample") ok = add("co_hold", co_on_hold, bk);

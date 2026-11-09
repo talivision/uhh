@@ -9404,10 +9404,11 @@ class LcTarget:
             self.p.kill()
 
 
-def lc_clean(c, attached_ok=False):
-    """A check line that says the target is exactly as before any tool came."""
+def lc_clean(c, attached_ok=False, orphaned_dr=False):
+    """A clean target; controller death alone permits dormant DR slots, never a trap flag."""
+    # Only controller death permits dormant DRs: orphaned slots are disabled at their next hit.
     # (late / stuck: the quit report -- worker threads that did not end, threads left suspended)
-    return (not c.get("dead") and not c.get("hung") and c.get("code_diff") == 0 and c.get("dr_dirty") == 0 and
+    return (not c.get("dead") and not c.get("hung") and c.get("code_diff") == 0 and (c.get("tf_dirty") == 0 if orphaned_dr else c.get("dr_dirty") == 0) and
             c.get("dr_unknown") == 0 and
             c.get("errors") == 0 and not c.get("late") and not c.get("stuck") and (attached_ok or c.get("debugger") == 0))
 
@@ -9760,8 +9761,8 @@ def lc_controller_killed(cfgname, cfg):
     and logging.
     Sessions with an inline probe (inline, mixed) carry the agent and its controller-death guard
     (Lifecycle L1): the TARGET must survive -- keep running, never fault, never hang, make no
-    error -- and, once the controller is gone, be left with no live hook / INT3 / debug register
-    (it would die or misbehave at its next hit otherwise).
+    error -- and, once the controller is gone, be left with no live hook / INT3. Unused stale
+    hardware slots may remain armed; their next hit is handled lazily in the target thread.
     breakpoint/hw-only sessions (owner decision 2026-11-07: the agent is injected only for inline
     probes; "controller-crash self-unhook: not worth the cost") inject nothing: while attached the
     target must have NO probe_api_agent.dll loaded, and a killed controller leaves its INT3s/DRs
@@ -9814,7 +9815,7 @@ def lc_controller_killed(cfgname, cfg):
             time.sleep(1.0)
             c2 = tg.check()
             progressed = (c2.get("iterations") or 0) > (c.get("iterations") or 0)
-            if not lc_clean(c2) or not progressed:
+            if not lc_clean(c2, orphaned_dr=True) or not progressed:
                 bad.append(f"kill@{when}: progressed={progressed} {lc_brief(c2)} unhandled={tg.unhandled()}")
             first_susp = c.get("susp_info") if c.get("susp") else ""
             a = tg.quit()
@@ -11667,8 +11668,10 @@ def check_cx2_review():
         callback's call_original (cosusp; the controller killed while the original runs). The
         guard listed that thread as held until the next sync (evsusp) / for the whole call and
         once per 20 ms poll (cosusp), so it released the PROGRAM's suspension: it must leave it.
-      touchprog / evsusp / cosusp run co_driver --guard (a never-called inline probe beside the
-        breakpoint/hw one): the agent and its guard exist only in sessions with an inline probe
+      cx2-killwatch-hw: killed after arming a data watchpoint; two later writes succeed
+        without a leaked exception, while a foreign DR hit and unrelated single-step pass through.
+      touchprog / evsusp / cosusp / killwatch run co_driver --guard (a never-called inline
+        probe beside the breakpoint/hw one): the agent and its guard exist only in sessions with an inline probe
         (owner decision 2026-11-07)."""
     cd, ct = exe("ctrl_driver.exe"), exe("ctrl_target.exe")
     d, t, dth = exe("co_driver.exe"), exe("co_target.exe"), exe("co_driver_th.exe")
@@ -11754,6 +11757,44 @@ def check_cx2_review():
             record(name, False, repr(e))
 
     st = exe("susp_target.exe")
+
+    # The kill-after-arm hook proves a data DR was installed. --guard supplies the agent;
+    # a hw-only attach intentionally has no controller-death guard / injection.
+    name = "cx2-killwatch-hw"
+    procs = []
+    try:
+        if not st:
+            raise RuntimeError("missing susp_target.exe")
+        tgt = subprocess.Popen([str(st), "watchdeath"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, text=True)
+        procs.append(tgt)
+        tout = Lines(tgt.stdout)
+        w = tout.wait_for(lambda l: '"kind":"waiting"' in l, 30)
+        if not w:
+            raise RuntimeError("target never reached its gate")
+        att = subprocess.Popen([str(dth), "--backend", "hw", "--guard", "--case", "watchdeath",
+                                "--module", "susp_target.exe", "--attach", str(json.loads(w)["pid"])],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                               env=dict(os.environ, UHH_TEST_DIE_AFTER_ARM="1"))
+        procs.append(att)
+        aerr = Lines(att.stderr)
+        att.wait(timeout=90)
+        aerr.t.join(timeout=30)
+        tgt.stdin.write("x"); tgt.stdin.flush()
+        tgt.wait(timeout=90)
+        row = next((x for x in tout.objs() if x.get("kind") == "co"), {})
+        ok = (att.returncode == 99 and tgt.returncode == 0 and row.get("value") == 42
+              and row.get("exceptions") == 0 and row.get("target_exceptions") == 1
+              and row.get("own_hits") == 1 and row.get("stale_slots", 0) != 0
+              and row.get("debugger") == 0 and not any("guard unavailable" in l for l in aerr.lines))
+        record(name, ok, f"controller_rc={att.returncode} (99: died after arming) target_rc={tgt.returncode} row={row}"
+                        + ("" if ok else f" ctl_err={aerr.lines[-4:]}"))
+    except Exception as e:
+        record(name, False, repr(e))
+    finally:
+        for q in procs:
+            if q.poll() is None:
+                q.kill()
 
     def susp_after(case, bk):
         """susp_target evsusp / cosusp: the program suspends its worker right after the controller let

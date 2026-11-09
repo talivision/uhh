@@ -370,13 +370,15 @@ data) prints on all backends.
   agent stop did not complete and hooks may admit new callbacks; stderr says so.
 - **Controller death:** an **attached** target in a session with **inline probes** is
   protected by the agent's controller-death guard (Lifecycle L1): the agent restores
-  breakpoints, clears debug registers, resumes held threads and removes inline hooks. A
+  breakpoints, resumes held threads and removes inline hooks. Orphaned UHH hardware slots
+  are disabled lazily in the faulting thread's exception context at their next hit; an
+  unused stale slot stays armed. Debug-register cleanup does not suspend threads. Inline
+  hook removal still briefly suspends other threads through the agent's in-process freeze. A
   **breakpoint/hw-only** attach injects nothing (owner decision 2026-11-07), so it has no
   guard: the target is not killed, but it keeps our INT3s / debug registers and dies at its
   next hit (`0x80000003` / `0x80000004`), or runs on if it never reaches one. A **launched**
   target dies with its controller by design. Residual (Lifecycle): a breakpoint/hw `call_func`
-  running when the controller dies leaves that thread redirected; after the controller is gone,
-  any single-step on a thread without its own debug registers is taken as UHH's.
+  running when the controller dies leaves that thread redirected.
   *Workaround:* end sessions with `probe_close` or Ctrl+C, not by killing the controller.
 - **`probe_close` must not run while `probe_attach` is still running on another thread.**
   *Workaround:* signal completion of the attach first, as `uhh_trace --detach-after-ms` does.
