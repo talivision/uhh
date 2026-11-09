@@ -1788,7 +1788,7 @@ static bool any_inflight() {
 // size = the save area THOSE components need (standard or compacted layout), not CPUID(0xD,0)
 // .EBX, which covers every XCR0 feature -- with AMX tiles (~11 KB) that exceeded the buffer,
 // and the hit then saved nothing at all (a callback's VZEROUPPER wiped the live YMM state).
-// The gated mask also keeps live x87/MMX on both architectures. 32-bit C code returns
+// x86: the gated mask also keeps live x87/MMX. 32-bit C code returns
 // floating-point values in ST0, so any callback (or CRT) float call pushes/pops the x87 stack
 // and changes its status word, which a mid-function site may have live.
 static struct XState { bool ok = false, compact = false, xinuse = false; uint64_t mask = 0, avx_mask = 0; uint32_t size = 0, full = 0; } g_xs = [] {
@@ -1801,7 +1801,9 @@ static struct XState { bool ok = false, compact = false, xinuse = false; uint64_
     x.full = (uint32_t)r[1];                               // full XCR0 area; this buffer is mask-specific
     x.mask = _xgetbv(0) & supported & 0xE7ull;              // CPUID and XGETBV can differ under emulation
     x.avx_mask = x.mask & 0xE4ull;                         // AVX upper + AVX-512 (opmask, ZMM) only
-    x.avx_mask |= x.mask & 1ull;                           // live x87/MMX on either architecture
+#if !defined(_WIN64)
+    x.avx_mask |= x.mask & 1ull;                           // x86 callbacks use x87; x64 contract: probe_api.h
+#endif
     char knob[8] = {};                                     // regress: a CPU with AMX tiles in XCR0
     if (GetEnvironmentVariableA("UHH_BENCH_XSTATE", knob, sizeof(knob)) && !strcmp(knob, "amx")) x.full += 8192;
     __cpuidex(r, 0xD, 1); x.compact = (r[0] & 2) != 0; x.xinuse = (r[0] & 4) != 0;   // XGETBV(1)
@@ -2111,9 +2113,7 @@ static __declspec(noinline) void init_new_uppers() {
     // Isolate AVX code from callers that must also run on CPUs without AVX.
     _mm256_zeroupper();
 }
-#if defined(_WIN64)
-extern "C" void uhh_init_x87();                           // agent_x64.asm: zero physical registers too
-#else
+#if !defined(_WIN64)
 static __declspec(noinline) void init_new_x87() {
     // SDM Vol. 1, 13.6: INIT includes zero data registers, not just empty tags.
     // FNINIT alone leaves their physical contents intact. Clear all eight, then
@@ -2137,14 +2137,12 @@ static __forceinline void restore_new_xstate(uint64_t saved) {
     if (!missing || !g_xs.xinuse) return;
     uint64_t added = _xgetbv(1) & missing;
     if (!added) return;
+#if !defined(_WIN64)
     if (added & 1ull) {
-#if defined(_WIN64)
-        uhh_init_x87();
-#else
         init_new_x87();
-#endif
         added &= ~1ull;
     }
+#endif
     if (added & 0x44ull) {
         // Collateral zeroing of an originally live ZMM upper is undone by the saved-image
         // restore immediately afterwards. An unsaved upper was INIT and must stay zero.
@@ -2190,7 +2188,8 @@ static __declspec(noinline) bool mid_entry_saved(safetyhook::Context &native, ui
     return x87;
 }
 
-// No usable XSAVE (no OSXSAVE, or a save area past the buffer): FXSAVE keeps the x87 state
+// No usable XSAVE (no OSXSAVE, or a save area past the buffer): x64 keeps MXCSR only
+// (see the callback contract in probe_api.h). On x86, FXSAVE keeps the x87 state
 // (ST0-7, control/status/tag words) and MXCSR around the callback, as XSAVE's x87 component
 // does on the gated path. MXCSR alone let a callback's (or the CRT's) float code change a live
 // x87 stack / status word at a mid-function site (x86 returns floats in ST0, so any float call
@@ -2198,13 +2197,13 @@ static __declspec(noinline) bool mid_entry_saved(safetyhook::Context &native, ui
 // afterwards anyway; without OSXSAVE there is no AVX state to keep.
 static __declspec(noinline) bool mid_entry_fx(safetyhook::Context &native, uint32_t index, unsigned char *x87_post,
                                               uint64_t saved = ~0ull) {
-    alignas(16) unsigned char fx[512];
 #if defined(_WIN64)
-    _fxsave64(fx);
+    const unsigned int mxcsr = _mm_getcsr();             // x87/MMX is the callback's responsibility on x64
     const bool x87 = call_mid(native, index, x87_post);
     restore_new_xstate(saved);
-    _fxrstor64(fx);
+    _mm_setcsr(mxcsr);
 #else
+    alignas(16) unsigned char fx[512];
     _fxsave(fx);
     const bool x87 = call_mid(native, index, x87_post);
     restore_new_xstate(saved);
@@ -2279,25 +2278,20 @@ static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
         return;
     }
 #endif
-    // Only x87/MMX live: use the smaller FXSAVE path on both architectures. Windows'
-    // non-INIT x87 control word normally keeps XINUSE[0] set even for integer-only code.
-    // FXSAVE / FXRSTOR preserves the same x87 state without an XSAVE header/layout or
-    // the larger save frame (the hook stub restores XMM registers afterwards).
+#if !defined(_WIN64)
+    // x86, only x87/MMX live: FXSAVE / FXRSTOR avoids the larger XSAVE frame.
     if (xmode == 0 && mask == 1) {
         x87 = mid_entry_fx(native, index, x87_post, mask);
-#if !defined(_WIN64)
         if (x87) x87_restore(x87_post);
-#else
-        (void)x87;
-#endif
         return;
     }
+#endif
     if (xmode == 1) x87 = call_mid(native, index, x87_post);
     else if (xmode == 3 && g_xs.ok && (g_xs.mask & 0xE4ull))
         x87 = mid_entry_noxsave_sim(native, index, g_xs.mask & 0xE4ull, x87_post);
     else if (mask) x87 = g_xs.size <= 1024 ? mid_entry_saved<1024>(native, index, mask, x87_post)
                                            : mid_entry_saved<4096>(native, index, mask, x87_post);
-    else if (!xs_ok) x87 = mid_entry_fx(native, index, x87_post);   // no XSAVE: x87 + MXCSR by FXSAVE
+    else if (!xs_ok) x87 = mid_entry_fx(native, index, x87_post);   // no XSAVE: x86 x87 + MXCSR; x64 MXCSR only
     else {
         unsigned int mxcsr = _mm_getcsr();                 // the common case: nothing live but MXCSR
         x87 = call_mid(native, index, x87_post);

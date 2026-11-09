@@ -227,13 +227,13 @@ int ar_review_case(const char *k) {
         const uint64_t enabled = (cp[2] & (1 << 27)) ? _xgetbv(0) : 0;
         const uint64_t mask = (enabled & 6) == 6 ? (4ull | ((enabled & 0xE0) == 0xE0 ? 0xE0ull : 0)) : 0;
 #if defined(_WIN64)
-        const uint64_t state_mask = mask | 3ull;         // XMM/MXCSR are restored by the stub/agent
+        const uint64_t state_mask = mask | 2ull;         // XMM/MXCSR are restored by the stub/agent
 #else
         const uint64_t state_mask = mask | 3ull;         // also exercise newly activated x87
 #endif
         int clean = 1, bad_phase = -1;
 #if defined(_WIN64)
-        const int checks = !mask ? 0 : (mask & 0x20) ? 7 : 4;
+        const int checks = !mask ? 0 : (mask & 0x20) ? 5 : 2;
 #else
         const int checks = !mask ? 0 : (mask & 0x20) ? 6 : 4;
 #endif
@@ -246,6 +246,9 @@ int ar_review_case(const char *k) {
             // must NOT change the offsets of the XSAVEC image being restored.
             // 3/4: a live ZMM upper/high-register component must survive VZEROUPPER on
             // newly dirtied YMM state (component 6 is restored after VZEROUPPER zeros it).
+#if defined(_WIN64)
+            const bool legacy = false;                  // x64 callback contract excludes x87/MMX clobbering
+#else
             const bool legacy = phase >= checks - 2;
             if (legacy) {
                 // A live x87 stack, then MMX's all-valid tags / 64-bit payloads.
@@ -256,6 +259,7 @@ int ar_review_case(const char *k) {
                     *(unsigned short *)(area + 40 + reg * 16) = phase == checks - 1 ? 0xFFFF : 0x3FFF;
                 }
             }
+#endif
             const uint64_t live = legacy ? 1ull : phase == 1 ? 4ull : phase == 2 ? 0x20ull
                                 : phase == 3 ? 0x40ull : phase == 4 ? 0x80ull : 0;
             *(uint64_t *)(area + 512) = live;
@@ -267,7 +271,7 @@ int ar_review_case(const char *k) {
 #if defined(_WIN64)
             _xrstor64(area, state_mask);
             _xsave64(before, state_mask);                 // canonical baseline, including INIT bits
-            ar_vector_site(phase == checks - 1 ? 1 : 0);
+            ar_vector_site(0);
             _xsave64(area, state_mask);
 #else
             _xrstor(area, state_mask);
@@ -279,6 +283,7 @@ int ar_review_case(const char *k) {
                 memcmp(area + 160, before + 160, sizeof(void *) == 8 ? 256 : 128)) {
                 clean = 0; bad_phase = phase;
             }
+#if !defined(_WIN64)
             // Ignore reserved FXSAVE padding; check FCW/FSW/FTW, pointers/opcode and
             // all physical data registers, including those tagged empty after INIT.
             if (memcmp(area, before, 5) || memcmp(area + 6, before + 6, 18)) {
@@ -288,6 +293,7 @@ int ar_review_case(const char *k) {
                 if (memcmp(area + 32 + reg * 16, before + 32 + reg * 16, 10)) {
                     clean = 0; bad_phase = phase;
                 }
+#endif
             const uint64_t bv = *(uint64_t *)(area + 512), prior = *(uint64_t *)(before + 512);
             for (int i : {2, 5, 6, 7}) {
                 if (!(mask & (1ull << i))) continue;

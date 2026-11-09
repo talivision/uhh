@@ -187,23 +187,17 @@ AR_CB void ar_on_epoch(probe_context *c) {
 }
 AR_CB void ar_on_vector(probe_context *c) {
     send_log(c, "ar vector");
+#if !defined(_WIN64)
     if (get_func_arg(c, 0)) {
         // Payload-only MMX corruption: CW/SW/tags/pointers are identical before/after.
         // Comparing only those fields cannot decide whether restoration is necessary.
         alignas(16) unsigned char legacy[512];
-#if defined(_WIN64)
-        _fxsave64(legacy);
-#else
         _fxsave(legacy);
-#endif
         for (int reg = 0; reg < 8; ++reg) legacy[32 + reg * 16] ^= 0x5A;
-#if defined(_WIN64)
-        _fxrstor64(legacy);
-#else
         _fxrstor(legacy);
-#endif
         return;
     }
+#endif
     int cp[4]; __cpuid(cp, 1);
     if (!(cp[2] & (1 << 27))) return;
     const uint64_t enabled = _xgetbv(0);
@@ -214,13 +208,13 @@ AR_CB void ar_on_vector(probe_context *c) {
     _fxsave64(area);                                    // preserve ABI-nonvolatile XMM6..15
 #else
     _fxsave(area);
-#endif
     mask |= 1ull;
     *(unsigned short *)(area + 0) = 0x027F;
     *(unsigned short *)(area + 2) = 0;
     area[4] = 1;                                       // dirty ST0 as well as the control word
     *(uint64_t *)(area + 32) = 0x8000000000000000ull;
     *(unsigned short *)(area + 40) = 0x3FFF;
+#endif
     *(unsigned int *)(area + 24) = _mm_getcsr() ^ 0x2000u;
 #if defined(_WIN64)
     const int xmm_count = 6;

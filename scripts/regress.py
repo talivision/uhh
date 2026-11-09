@@ -8692,7 +8692,7 @@ def check_agent_safety():
                 bad.append(f"dropped/intr={rep.get('log_dropped')}/{rep.get('callbacks_interrupted')}")
             hits = sum(p.get("hits") or 0 for p in probes(o))
             if case == "vector":
-                want_hits = 0 if not row.get("avx") else (6 if pe_is_x86(t) else 7) if row.get("opmask") else 4
+                want_hits = 0 if not row.get("avx") else (6 if pe_is_x86(t) else 5) if row.get("opmask") else (4 if pe_is_x86(t) else 2)
                 if row.get("checks") != want_hits: bad.append(f"vector phases={row.get('checks')} want={want_hits}")
             if hits != want_hits: bad.append(f"hits={hits} want={want_hits}")
             logs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
@@ -8702,7 +8702,7 @@ def check_agent_safety():
             if case == "guarantee" and row.get("before") != row.get("after"): bad.append(f"guarantee changed: {row}")
             detail = str(row)
             if case == "vector":
-                if row.get("avx"): detail += "; XMM + INIT/non-INIT MXCSR checked; " + "x87 INIT/live and MMX checked"
+                if row.get("avx"): detail += "; XMM + INIT/non-INIT MXCSR checked; " + ("x87 INIT/live and MMX checked" if pe_is_x86(t) else "x87/MMX unchanged by callback contract")
                 detail += "; " + ("INIT + live YMM checked" if row.get("avx") else "AVX skipped: CPU/OS support absent")
                 detail += "; " + ("mixed INIT/live opmask + YMM/ZMM checked" if row.get("opmask") else "AVX-512 skipped: CPU/OS support absent")
             record(name, not bad, "; ".join(bad) or detail)

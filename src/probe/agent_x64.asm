@@ -153,19 +153,4 @@ no_args_xmm:
     add rsp, 238h
     ret
 uhh_orig_thunk ENDP
-; An initially unused x87/MMX component dirtied by the callback: FNINIT alone
-; leaves physical payloads behind. Match the x86 init_new_x87 path.
-uhh_init_x87 PROC
-    fninit
-    fldz
-    fldz
-    fldz
-    fldz
-    fldz
-    fldz
-    fldz
-    fldz
-    fninit
-    ret
-uhh_init_x87 ENDP
 END
