@@ -107,7 +107,7 @@ static int run_deep(const char *k) {
 static HANDLE g_go;
 static intptr_t g_worker_ret;
 static DWORD WINAPI worker(void *p) {
-    WaitForSingleObject(g_go, INFINITE);
+    if (WaitForSingleObject(g_go, 60000) != WAIT_OBJECT_0) return 3;
     if (p) { g_worker_ret = co_hold((intptr_t)p); return 0; }   // cosusp: 4 (~3 s); cosample: 2
     g_worker_ret = co_add(1, 2);
     while (!g_spin_stop) { InterlockedIncrement(&g_spun); Sleep(1); }
@@ -115,7 +115,16 @@ static DWORD WINAPI worker(void *p) {
 }
 static bool read_gate() {
     char b; DWORD n = 0;
-    return ReadFile(GetStdHandle(STD_INPUT_HANDLE), &b, 1, &n, nullptr) && n == 1;
+    const HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+    const ULONGLONG deadline = GetTickCount64() + 60000;
+    while (GetTickCount64() < deadline) {
+        DWORD available = 0;
+        if (!PeekNamedPipe(in, nullptr, 0, nullptr, &available, nullptr)) return false;
+        if (available) return ReadFile(in, &b, 1, &n, nullptr) && n == 1;
+        Sleep(1);
+    }
+    fprintf(stderr, "susp_target: stdin gate timed out\n");
+    return false;
 }
 
 int main(int argc, char **argv) {
@@ -133,7 +142,9 @@ int main(int argc, char **argv) {
     printf("{\"kind\":\"waiting\",\"pid\":%lu,\"tid\":%lu}\n", GetCurrentProcessId(), GetCurrentThreadId()); fflush(stdout);
     if (!read_gate()) return 3;                                  // gate 1: the probe is active
     SetEvent(g_go);
-    for (int i = 0; i < 60000 && g_spun == 0; ++i) Sleep(1);     // it runs on (after its hit / in the original)
+    const ULONGLONG progress_deadline = GetTickCount64() + 60000;
+    while (g_spun == 0 && GetTickCount64() < progress_deadline) Sleep(1);
+    if (g_spun == 0) { fprintf(stderr, "susp_target: worker progress timed out\n"); return 5; }
     if (sample) {
         long n = 0, foreign = 0, in_original = 0;
         const ULONGLONG t0 = GetTickCount64();
@@ -150,6 +161,10 @@ int main(int argc, char **argv) {
         fflush(stdout);
         return 0;
     }
+    const LONG spun_before = g_spun;
+    BOOL debugger_before = FALSE;
+    CheckRemoteDebuggerPresent(GetCurrentProcess(), &debugger_before);
+    const ULONGLONG first_tick = GetTickCount64();
     const DWORD first = SuspendThread(w);
     printf("{\"kind\":\"susp\",\"tid\":%lu}\n", GetThreadId(w)); fflush(stdout);
     if (!read_gate()) return 3;                                  // gate 2: the controller is dead
@@ -163,8 +178,9 @@ int main(int argc, char **argv) {
     InterlockedExchange(&g_spin_stop, 1);
     const DWORD done = WaitForSingleObject(w, 30000);
     printf("{\"kind\":\"co\",\"case\":\"%s\",\"first\":%lu,\"prev\":%lu,\"ran_while_suspended\":%ld,"
-           "\"done\":%d,\"ret\":%lld,\"debugger\":%d}\n", k, first, prev, (long)(c2 - c1), done == WAIT_OBJECT_0,
-           (long long)g_worker_ret, (int)dbg);
+           "\"done\":%d,\"ret\":%lld,\"debugger\":%d,\"spun_before\":%ld,\"debugger_before\":%d,\"first_tick\":%llu}\n",
+           k, first, prev, (long)(c2 - c1), done == WAIT_OBJECT_0, (long long)g_worker_ret, (int)dbg,
+           (long)spun_before, (int)debugger_before, (unsigned long long)first_tick);
     fflush(stdout);
     return 0;
 }

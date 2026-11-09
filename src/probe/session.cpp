@@ -550,13 +550,15 @@ static void test_die_after_hit(probe_session *s, const DEBUG_EVENT &ev) {
     uint64_t hits = 0;
     for (auto &p : s->probes) if (!p->internal) hits += p->hits;
     if (!hits) return;
+    const ULONGLONG continued_tick = GetTickCount64();
     Sleep((DWORD)ms);
     const probe_agent_guard *g = s->shared ? &s->shared->guard : nullptr;
     std::string listed;
     for (LONG i = 0; g && i < g->held_count && i < (LONG)PROBE_AGENT_GUARD_TIDS; ++i)
         listed += (listed.empty() ? "" : ",") + std::to_string((unsigned long)g->held_tids[i]);
-    std::fprintf(stderr, "probe: test: dying %ld ms after continuing thread %lu (guard enabled=%ld held=[%s])\n",
-                 ms, (unsigned long)ev.dwThreadId, g ? (long)g->enabled : -1L, listed.c_str());
+    std::fprintf(stderr, "probe: test: dying %ld ms after continuing thread %lu (guard enabled=%ld held=[%s]) continued_tick=%llu dying_tick=%llu\n",
+                 ms, (unsigned long)ev.dwThreadId, g ? (long)g->enabled : -1L, listed.c_str(),
+                 (unsigned long long)continued_tick, (unsigned long long)GetTickCount64());
     std::fflush(nullptr);
     TerminateProcess(GetCurrentProcess(), 96);
 }

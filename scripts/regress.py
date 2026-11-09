@@ -89,8 +89,19 @@ ONLY = []     # --only substrings (empty: the full suite)
 
 
 def run(args, timeout=180, feed=None, env=None):
-    r = subprocess.run([str(a) for a in args], capture_output=True, text=True,
-                       timeout=timeout, input=feed, env=env)
+    argv = [str(a) for a in args]
+    p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         stdin=subprocess.PIPE if feed is not None else None, env=env)
+    try:
+        stdout, stderr = p.communicate(input=feed, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.wait(timeout=10)
+        # On Windows subprocess.run calls communicate() WITHOUT a timeout here. A target
+        # or grandchild can still own the pipe writers after the controller dies, so EOF
+        # need never arrive. Do not join/close the reader threads on this timeout path.
+        raise
+    r = subprocess.CompletedProcess(argv, p.returncode, stdout, stderr)
     objs = []
     for line in r.stdout.splitlines():
         line = line.strip()
@@ -11305,6 +11316,8 @@ def check_cx2_review():
             elif att.returncode == 0:
                 bad.append("controller ended before it was killed (the call_original was not in flight)")
             if rc != 0: bad.append(f"target_rc=0x{rc:x}")
+            if not row.get("spun_before"):
+                bad.append("worker never ran before the program suspended it (progress wait expired)")
             if row.get("first") != 0 or row.get("prev") != 1 or row.get("ran_while_suspended") != 0:
                 bad.append(f"SuspendThread first={row.get('first')} (want 0: no suspension of the controller's in place "
                            f"when the program suspends) ResumeThread prev={row.get('prev')} (want 1: the program's own "
@@ -11313,6 +11326,8 @@ def check_cx2_review():
             if row.get("done") != 1 or row.get("ret") != want: bad.append(f"target row={row} (ret want {want})")
             listed = re.search(r"held=\[([^\]]*)\]", died)
             return bad, (f"worker={wtid} prev={row.get('prev')} ran={row.get('ran_while_suspended')} ret={row.get('ret')}"
+                         + f" spun_before={row.get('spun_before')} debugger_before={row.get('debugger_before')}"
+                         + f" first_tick={row.get('first_tick')} death={died!r}"
                          + (f" guard_listed_worker={str(wtid) in listed.group(1).split(',')}" if listed else ""))
         finally:
             for q in procs:
