@@ -1144,7 +1144,10 @@ overflows its stack. Every backend, x64 and x86.
 - ✅ (TR7, review b) **x86 inline: the x87 state was not saved** (default mask = AVX only). x86
   code returns floats in ST0, so any callback/CRT float call changes the x87 status/tag/stack a
   mid-function site may have live. The gated mask now includes x87 on x86 when it is in use.
-  (x64: not included -- MSVC x64 code never touches x87 -- so x64 hits keep the cheap path.)
+  Owner decision after cxr9 VM perf A/B: x64 keeps no x87/MMX snapshot. MSVC x64 C/C++
+  uses SSE; assembly callbacks/helpers using x87/MMX must restore it themselves (the callback
+  contract in probe_api.h and limitations.md). XINUSE[0] normally stays set on Windows:
+  gated XSAVE added ~62 ns/hit, and the FXSAVE alternative still added ~48 ns/hit.
 - ✅ (TR8, review c) **inline get_mem trusted a per-thread region cache ACROSS hits**: a page the
   target decommitted / NOACCESSed / guarded later faulted (a first-chance AV its vectored
   handler saw) or silently consumed its PAGE_GUARD. The cache now lives for one hit (reset at

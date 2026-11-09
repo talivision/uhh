@@ -92,9 +92,10 @@ Contents: [concepts](#concepts) · [types and macros](#types-and-macros) ·
   injected). In a session with inline probes, breakpoint/hw probes arm once the injected
   agent's controller-death guard is up (or after 5 s without it, with a warning).
 - A probe added from a callback: breakpoint/hw arm before the target resumes; an inline
-  probe on a mapped site returns 1 only after installation confirms. It holds the calling
-  thread for at most 5 s; on timeout it returns 0 and releases the thread. The pending
-  install may still complete later. Symbols in unloaded modules return 1 pending their load.
+  probe on a mapped site waits for installation. A deferred site-safety refusal still
+  returns 1 for the accepted submission, with the probe retired and the refusal diagnosed;
+  an agent installation failure returns 0. It holds the calling thread for at most 5 s;
+  on timeout it returns 0 and releases the thread. The pending install may still complete later. Symbols in unloaded modules return 1 pending their load.
 
 ## Types and macros
 
@@ -356,7 +357,9 @@ whole range was transferred.
   (code included) are not made writable. Inline uses the calling thread's TEB committed
   stack bounds without a query, caches image-region protection verdicts until module unload,
   and queries other private/mapped regions once per region per callback. Stack capture uses
-  the same policy. `call_func` / `call_original` invalidate protection verdicts on return.
+  the same policy, except x86 speculative return-address scanning re-queries image regions
+  once per capture so a newly guarded candidate is skipped untouched.
+  `call_func` / `call_original` invalidate protection verdicts on return.
   Protection changes by another thread during a callback are an accepted race with these
   checks. Keep cached image-section protections stable while probing; callbacks changing
   protection must use `call_func` before accessing that memory again.
@@ -544,9 +547,10 @@ source works in every backend.
 - A probe added for a module that is not loaded yet returns 1 and stays pending; if it
   cannot be armed when the module loads, stderr shows `probe: runtime probe <loc> failed to
   arm: <reason>` and the probe is dropped.
-- A mapped inline addition returns 1 only once its installation confirms; installation
-  failure returns 0. The wait is bounded to 5 s to avoid wedging the target; a timeout
-  returns 0 and releases the caller, and the pending hook may still install later.
+- A mapped inline addition waits until installed; an agent installation failure returns 0.
+  Exception: deferred site-safety vetting may retire an accepted submission with a diagnostic
+  (return 1, inactive, no hits), preserving the submission semantics. The wait is bounded
+  to 5 s to avoid wedging the target; a timeout returns 0 and releases the caller, and the pending hook may still install later.
 - Configs have no extra size limit from a callback (4 GB everywhere); a symbol string sent
   from an inline callback is limited to 64 KiB.
 

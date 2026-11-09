@@ -81,6 +81,7 @@ struct Probe {
     std::vector<unsigned char> follow;
     struct Probe *alias_of = nullptr;
     bool runtime = false;      // added after launch: an install failure is reported, not fatal
+    bool deferred_site_refused = false; // accepted runtime submission retired by deferred safety vetting
     bool vetted = false;       // pre-hook check done for this inline install
     uint64_t rva = 0, base = 0, address = 0;
     ReportValue<uint64_t> hits{0};
@@ -561,7 +562,7 @@ struct probe_session {
     // profilers do) -- undoing our resume state (an INT3 hit resumed one byte into the
     // instruction, a hw hit without RF reported twice). Such a thread is held by us as well
     // until the target resumes it; then whatever it wrote back gets our changes re-applied.
-    struct CtxWatch { DWORD tid = 0; HANDLE t = nullptr; CONTEXT before{}, after{}; };
+    struct CtxWatch { DWORD tid = 0; HANDLE t = nullptr; CONTEXT before{}, after{}; ULONGLONG deadline = 0; };
     std::vector<std::unique_ptr<CtxWatch>> ctx_watch;
 };
 

@@ -47,7 +47,7 @@ EST = {
     "check_api_contract": (45, 55), "check_api_threadfull": (60, 75),
     "check_session_agentipc": (20, 25),
     "check_logsite_review": (22, 28),
-    "check_agent_safety": (25, 30), "check_agent_crt": (1, 1), "check_agent_review": (1, 1), "check_agent_unwind": (3, 3), "check_attach": (9, 13), "check_attach_new": (0, 0),
+    "check_agent_safety": (35, 40), "check_agent_crt": (1, 1), "check_agent_review": (1, 1), "check_agent_unwind": (3, 3), "check_attach": (9, 13), "check_attach_new": (0, 0),
     "check_blog_pwsh_attach": (20, 25), "check_blog_replicas": (12, 13), "check_breakage": (21, 21),
     "check_callconv": (1, 1), "check_callfunc_registry": (1, 1), "check_callorig": (65, 71),
     "check_callorig_hunt": (0, 0), "check_callorig_deep": (5, 5), "check_cdx_review": (1, 2), "check_cet": (6, 6), "check_cet_sde": (194, 1),

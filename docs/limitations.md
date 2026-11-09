@@ -138,8 +138,9 @@ data) prints on all backends.
 ## Coverage and timing
 
 - **A mapped inline addition from a callback waits at most 5 s for installation.** It
-  returns 1 only once installed, or 0 on failure/timeout and releases the caller. A pending
-  install may still complete later. A symbol in an unloaded module returns 1 pending load.
+  returns 1 once installed, or 0 on agent failure/timeout and releases the caller.
+  Deferred site-safety refusal preserves accepted-submission semantics: 1, a diagnostic,
+  and a retired inactive probe with no hits. A pending install may still complete later. A symbol in an unloaded module returns 1 pending load.
 
 - **On launch, inline probes go live at the loader breakpoint** (Hunter A6): the target's
   main thread loads the agent there, after the static imports are mapped and before any DLL
@@ -257,7 +258,9 @@ data) prints on all backends.
 - **Inline memory checks and stack capture cache protection verdicts.** The calling
   thread's committed stack (`StackLimit..StackBase`, guard below `StackLimit`) needs no
   query. Image-region verdicts survive callbacks until module unload; private/mapped
-  verdicts last one callback. Protection changes by other threads during a callback are
+  verdicts last one callback. x86 speculative return-address scanning instead re-queries
+  image regions once per capture, so newly guarded candidate pages are never touched.
+  Protection changes by other threads during a callback are
   an accepted race: they can invalidate a checked range before access, including adding
   a guard. Keep loaded image-section protections stable while probing. A callback that
   changes protection must do so through `call_func`; target-call returns invalidate both
@@ -293,13 +296,21 @@ data) prints on all backends.
   If the old channel still counts a possibly surviving callback (including a suspended one),
   reattach uses a fresh channel instead; that rare fallback retains the old storage until
   process exit so the callback's config and accounting pointers remain valid. The epoch is
-  captured once at callback entry and checked once per log attempt. Callback accounting remains
+  captured before session data at hit entry, checked after accounting admits the callback,
+  and checked once per log attempt. Callback accounting remains
   running through the final shared-state access, so ordinary API reads need no epoch check.
   Inline SSE restoration uses the hook stub's complete XMM snapshot; MXCSR is saved separately,
   irrespective of XINUSE[1] (Intel SDM Vol. 1, 13.6/13.8: that bit need not describe MXCSR).
   Newly activated AVX uppers use VZEROUPPER. On x86, newly activated x87 state is reset to
   architectural INIT (FCW=037F, empty tags and zero physical registers), not Windows' FCW=027F;
   FNINIT alone would leave stale physical registers. Other supported components retain XRSTOR.
+- **x64 inline callback contract: leave x87/MMX unchanged**, including any helpers the
+  callback calls. Ordinary MSVC x64 C/C++ and x64 CRT math use SSE; `long double` is
+  `double`, and MSVC x64 supports neither `__m64` intrinsics nor inline assembly. The inline
+  hot path therefore takes no x87/MMX snapshot. Assembly callbacks/helpers that use these
+  registers, or code explicitly restoring extended state, must save and restore x87/MMX
+  themselves on every exit. This keeps the target's live state intact without imposing a
+  snapshot on every compiled callback. x86 still preserves x87 automatically.
 - **x86 inline stack walks** are a verified return-address scan, not PDB-based; a frameless
   function reached by an indirect call can lose its immediate caller
   ([symbols.md](symbols.md#stacks-per-backend-send_log_stack)).

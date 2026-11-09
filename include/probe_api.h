@@ -33,6 +33,12 @@
      target tid instead. Inline recursion tracking has 4096 primary + 256 overflow slots,
      then uses per-thread TLS. Before TLS exists, a hit with both tables full is counted
      but its callback is refused with a warning (never run without a recursion guard).
+   - x64 inline callbacks must leave x87/MMX state unchanged, including any helpers they
+     call. Ordinary MSVC x64 C/C++ and CRT math use SSE: long double == double, no __m64
+     intrinsics or inline assembly. UHH therefore takes no x87/MMX snapshot on this path.
+     Assembly callbacks/helpers using x87/MMX, or code explicitly restoring extended state,
+     must save and restore that state themselves on every exit. x86 inline callbacks retain
+     automatic x87 preservation because compiled x86 C/C++ uses x87.
    - A callback that faults or throws is abandoned on every backend (the hit counts, its
      register changes are discarded, set_mem writes already made stay, the program runs on).
      After a successful call_original it returns the requested return_from value (or the
@@ -130,7 +136,9 @@ enum probe_register {
 /* ---- Control plane: take a SESSION. Symbol additions are valid before probe_launch;
    probe_add_address and probe_watch need a running target. Adds are also valid from any
    callback via get_session(c). Breakpoint/hw additions arm before the target resumes;
-   a mapped inline addition returns 1 only once installed. It waits at most 5 s, then
+   a mapped inline addition waits for installation, except that a deferred site-safety
+   refusal returns 1 for the accepted submission and retires it with a diagnostic.
+   An agent installation failure returns 0. It waits at most 5 s, then
    returns 0 and releases the caller (the pending install may still complete later).
    A symbol in an unloaded module returns 1 pending that module's load. */
 probe_session *probe_session_create(void);

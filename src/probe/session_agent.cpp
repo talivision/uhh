@@ -998,10 +998,12 @@ bool kick_agent(probe_session *s) {
     if (!s->remote_agent) return start_agent_load(s);
     return start_agent_init(s);
 }
-// A mapped runtime add must return the installation result, not merely a successful kick.
+// A mapped runtime add waits for the installation result; deferred safety refusals retain
+// accepted-submission semantics (diagnosed, retired, no hook), as before.
 // Continue its event with the calling thread suspended, as call_func does, so the service
 // thread can install while this callback's stack and IPC request remain live.
 bool confirm_runtime_inline(probe_session *s, Probe &p) {
+    if (p.deferred_site_refused) return true; // submission accepted; refusal was diagnosed by vet_pending_inline
     if (!(p.flags & PROBE_INLINE) || !p.address || !s->cb_tid || GetCurrentThreadId() != s->debug_tid) return true;
     EventFiber *const f = s->cur_fiber;
     if (!f || !s->shared) { set_error(s, "cannot wait for runtime inline installation"); return false; }
@@ -1027,6 +1029,8 @@ bool confirm_runtime_inline(probe_session *s, Probe &p) {
     const ULONGLONG until = GetTickCount64() + 5000;
     while (!s->exited && !s->stop_requested && GetTickCount64() < until) {
         MemoryBarrier();
+        if (p.deferred_site_refused) return true;
+        if (!(p.flags & PROBE_INLINE)) return p.active; // deferred vetting selected hardware fallback
         const LONG status = s->shared->requests[p.agent_index].status;
         if (status == PROBE_AGENT_INSTALLED) return true;
         if (p.retired || (status != PROBE_AGENT_PENDING && status != PROBE_AGENT_INSTALLING)) {
@@ -1411,6 +1415,7 @@ static bool vet_pending_inline(probe_session *s) {
         p.vetted = true;
         bool moved = false;
         if (!vet_site(s, p, moved)) {
+            p.deferred_site_refused = p.runtime;
             if (p.runtime) { std::fprintf(stderr, "probe: %s\n", s->error.c_str()); s->error.clear(); }
             InterlockedExchange(&request.status, PROBE_AGENT_BAD_REQUEST); p.retired = true;
             if (!p.runtime) return false;
