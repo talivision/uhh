@@ -10452,7 +10452,7 @@ def check_trace_cli():
     else:
         for suffix in ("", ":x"):
             loc = "flagfeature.dll!Feature::IsEnabled"
-            r, o = run([t, "-p", loc + suffix, "--", a, "--threads", "1", "--calls", "2"])
+            r, o = run([t, "-p", loc + suffix, "--", a, "--threads", "1", "--calls", "2"], timeout=180)
             pr = next((p for p in probes(o) if p.get("location") == loc), {})
             record(f"trace-cli-cpp-{suffix or 'default'}",
                    r.returncode == 0 and pr.get("hits") == 4 and pr.get("active") is True,
@@ -10463,7 +10463,7 @@ def check_trace_cli():
     system = "SysWOW64" if bin_machine() == "x86" and (windows / "SysWOW64").exists() else "System32"
     for backend in ("breakpoint", "hw", "inline"):
         r, o = run([t, "--backend", backend, "-p", "kernel32.dll!ExitProcess:d", "--",
-                    windows / system / "cmd.exe", "/d", "/c", "exit -1"])
+                    windows / system / "cmd.exe", "/d", "/c", "exit -1"], timeout=180)
         logs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
         record(f"trace-cli-signed-{bin_machine()}-{backend}",
                r.returncode == 1 and "ExitProcess(-1)" in logs and "uhh_trace:" in r.stderr,
@@ -10471,22 +10471,20 @@ def check_trace_cli():
     target_exe = exe("hunt_target.exe")
     if not target_exe:
         return missing_bin("trace-cli-exit", "hunt_target")
-    for mode in ("attach", "attach-new", "detach"):
+    for mode in ("attach", "attach-new"):
         target = tracer = None
         try:
-            args = [str(t), "--backend", "inline" if mode == "detach" else "breakpoint", *spec]
+            args = [str(t), "--backend", "breakpoint", *spec]
             if mode == "attach-new":
                 tracer = subprocess.Popen([*args, "--attach-new", "hunt_target.exe", "--timeout", "30000"],
                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 tout, terr = Lines(tracer.stdout), Lines(tracer.stderr)
                 if not terr.wait_for(lambda l: l.startswith("probe: waiting for a new hunt_target.exe"), 30):
                     raise RuntimeError("attach-new never took snapshot")
-            env = dict(os.environ, UHH_TEST_INIT_STALL_MS="30000") if mode == "detach" else None
-            target = subprocess.Popen([str(target_exe), "exit-process", "--n", "8000"], env=env,
+            target = subprocess.Popen([str(target_exe), "exit-process", "--n", "8000"],
                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if mode != "attach-new":
-                extra = ["--detach-after-ms", "12000"] if mode == "detach" else []
-                r, o = run([*args, "--attach", target.pid, *extra], timeout=90)
+                r, o = run([*args, "--attach", target.pid], timeout=90)
                 rc, err = r.returncode, r.stderr
             else:
                 tracer.wait(timeout=90)
@@ -10494,7 +10492,6 @@ def check_trace_cli():
             target.wait(timeout=30)
             record(f"trace-cli-exit-{mode}", rc == 1 and "uhh_trace:" in err and
                    not any(x.get("kind") == "detached" for x in o) and
-                   (mode != "detach" or bool(report(o).get("error"))) and
                    report(o).get("app_exit") == 6,
                    f"rc={rc} report={report(o)} stderr={err[-500:]}")
         except Exception as e:
@@ -10504,6 +10501,63 @@ def check_trace_cli():
                 if proc and proc.poll() is None:
                     proc.kill()
                     proc.wait(timeout=30)
+
+    # Aim inside BndLeaf's fixed ten-byte MOV (same layout on x86 and x64).
+    # Registration and attach succeed; probe_run refuses the site while replaying
+    # modules. The old detach path discarded that failure and returned 0.
+    boundary = exe("boundary_target.exe")
+    if not boundary:
+        return missing_bin("trace-cli-exit-detach", "boundary_target")
+    target = tracer = None
+    try:
+        code = pe_export_bytes(boundary, "BndLeaf", 10) or b""
+        if code[:2] != b"\xc7\x05" or len(code) != 10:
+            raise RuntimeError(f"BndLeaf MOV fixture changed: {code.hex()}")
+        target = subprocess.Popen([str(boundary), "--gate", "--iters", "1"],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True)
+        tout, terr = Lines(target.stdout), Lines(target.stderr)
+        if not tout.wait_for(lambda l: '"kind":"waiting"' in l, 30):
+            raise RuntimeError(f"boundary target never reached gate: {terr.lines}")
+        tracer = subprocess.Popen([str(t), "--backend", "breakpoint", "-p",
+                                   "boundary_target.exe!BndLeaf+0x3:-", "--attach", str(target.pid),
+                                   "--detach-on-stdin"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True)
+        trace_out, trace_err = Lines(tracer.stdout), Lines(tracer.stderr)
+        # Synchronize on the actual run-time failure, not an elapsed-time guess.
+        if not trace_err.wait_for(lambda l: "site is inside an instruction" in l, 60):
+            raise RuntimeError(f"probe_run never refused operand site: {trace_err.lines}")
+        tracer.stdin.write("\n"); tracer.stdin.flush()
+        tracer.wait(timeout=90)
+        o = trace_out.objs()
+        trace_err.t.join(timeout=30)
+        err = "\n".join(trace_err.lines)
+        rc = tracer.returncode
+        rep = report(o)
+        attached = any(x.get("kind") == "attached" and x.get("pid") == target.pid for x in o)
+        error = str(rep.get("error") or "")
+        alive = target.poll() is None
+        # Release only after tracing ends: instrumentation failure must leave the target
+        # alive and its original instructions intact. Both pipe readers drain throughout.
+        target.stdin.write("\n"); target.stdin.flush()
+        target.wait(timeout=30)
+        good_target = any(x.get("kind") == "target" and x.get("ok") is True for x in tout.objs())
+        record("trace-cli-exit-detach",
+               attached and alive and "probe: pending boundary_target.exe!BndLeaf+0x3" in err and
+               "site is inside an instruction" in error and rc == 1 and
+               "uhh_trace: tracing session failed" in err and
+               not any(x.get("kind") == "detached" for x in o) and
+               target.returncode == 0 and good_target,
+               f"rc={rc} attached={attached} target_alive={alive} "
+               f"target_rc={target.returncode} target_ok={good_target} "
+               f"report={rep} stderr={err[-500:]}")
+    except Exception as e:
+        record("trace-cli-exit-detach", False, repr(e))
+    finally:
+        for proc in (tracer, target):
+            if proc and proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=30)
 
 
 def check_quickstart():
