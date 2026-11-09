@@ -1226,6 +1226,15 @@ def check_stream_filefail():
         except Exception as e:
             record(name, False, repr(e))
     for bk in ("breakpoint", "inline"):
+        name = f"stream-filefail-partial-{bk}"
+        try:
+            env = dict(base, UHH_TEST_FILE_PARTIAL_AT="3")
+            res = _filefail_run([tr, "--backend", bk, "-p", "logstream_target.exe!LogSite:d", "--", ls], env, 120)
+            judge(name, res, "write probe log file", need_more_on_stdout=True,
+                  extra=lambda r: [] if r[4].get("logs_written") == 2 else ["partial append did not stop at record 2"])
+        except Exception as e:
+            record(name, False, repr(e))
+    for bk in ("breakpoint", "inline"):
         name = f"stream-filefail-deferred-{bk}"
         try:
             env = dict(base, UHH_TEST_FILE_FAIL_AT="1")
@@ -8081,6 +8090,26 @@ def check_cdx_review():
             cf = [m for m in logs if m.startswith("cf ")]
             if cf != want_cf: bad.append(f"calls={cf} (want {want_cf})")
             record(name, not bad, " ".join(bad) or f"{cf} {res}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    # A failed absolute-address image pin must refuse without entering the callee.
+    # Control run proves the same addresses are callable; the injected failure previously
+    # proceeded into CfrValue (ok=1) because only named resolutions retried a failed pin.
+    for fail in (False, True):
+        name = "cdx-cfabs-pin-fail" if fail else "cdx-cfabs-pin-control"
+        try:
+            env = dict(os.environ)
+            env.pop("UHH_TEST_CF_PIN_FAIL", None)
+            if fail: env["UHH_TEST_CF_PIN_FAIL"] = "1"
+            res, logs, rows, bad = go("cfabs", "inline", [], env=env)
+            if res.get("loaded") != 1: bad.append(f"DLLs not loaded: {res}")
+            cf = [m for m in logs if m.startswith("cf ")]
+            expected = (["cf phase=6 ok=0 r=-1"] * 3 + ["cf phase=2 ok=0 r=-1"] +
+                        ["cf phase=6 ok=0 r=-1"] * 3) if fail else (
+                        ["cf phase=6 ok=1 r=1"] * 3 + ["cf phase=2 ok=0 r=-1"] + ["cf phase=6 ok=1 r=2"] * 3)
+            if cf != expected: bad.append(f"calls={cf}, want {expected}")
+            record(name, not bad, "; ".join(bad) or str(cf))
         except Exception as e:
             record(name, False, repr(e))
 
