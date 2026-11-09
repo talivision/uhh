@@ -301,7 +301,42 @@ int run(int argc, char **argv) {
             dr_require(handle_hw(s, d.ev, handled) && handled, "new access handled");
             dr_require(callbacks == before + 1 && p->hits == hits + 1, "new access callback and hit");
         };
-        if (mode == "release") {
+        if (mode == "live-report") {
+            // A live report holds this mutex while traversing the vector.
+            s->debug_dispatch_addr = resolve_symbol(s, "ntdll.dll!KiUserExceptionDispatcher");
+            dr_require(s->debug_dispatch_addr != 0, "resolve dispatcher before report");
+            std::atomic<bool> entered{false}, finished{false};
+            bool queued = false;
+            std::unique_lock<std::mutex> report(s->probes_mu);
+            std::thread writer([&] {
+                entered.store(true);
+                queued = queue_debug_delivery(s, d.pi.dwThreadId, site, 1, 0);
+                finished.store(true);
+            });
+            while (!entered.load()) Sleep(1);
+            Sleep(200);
+            const bool waited = !finished.load();
+            report.unlock(); writer.join();
+            dr_require(waited && queued && s->debug_dispatch_probe, "dispatcher insertion waits for live report");
+        } else if (mode == "gate-mixed") {
+            // Real simultaneous execute causes: gate B0 and target-owned B1.
+            p->active = false; s->hw_active = 0;
+            c.Dr0 = c.Dr1 = (decltype(c.Dr0))(site + 4);
+            c.Dr7 = 5; d.put(c);
+            s->gates.emplace_back(site + 4, 0);
+            s->hw_armed_ever.insert(site + 4);
+            d.resume(); d.wait(EXCEPTION_SINGLE_STEP, site + 4);
+            dr_require((d.get().Dr6 & 0xE003u) == 3, "combined gate and target execute causes");
+            bool handled = false;
+            dr_require(handle_gate(s, d.ev, handled) && !handled, "combined gate forwarded");
+            release_held(s, "test");
+            d.resume(DBG_EXCEPTION_NOT_HANDLED); d.wait(EXCEPTION_BREAKPOINT, done);
+            const auto result = d.result(); print_veh("gate", result);
+            dr_require(result.seen == 1 && result.ip == site + 4 &&
+                       result.exception_address == site + 4 && (result.dr6 & 0xE003u) == 2 &&
+                       result.dr1 == site + 4 && (result.dr7 & 0xF0000Cu) == 4 &&
+                       s->debug_delivery.empty(), "target VEH sees only its own execute cause");
+        } else if (mode == "release") {
             c.Dr0 = (decltype(c.Dr0))target_address; c.Dr1 = (decltype(c.Dr1))(target_address + 4);
             c.Dr2 = (decltype(c.Dr2))(target_address + 8); c.Dr3 = (decltype(c.Dr3))(target_address + 12);
             c.Dr7 = 0xDDDD0055; d.put(c);

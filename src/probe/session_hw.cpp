@@ -495,7 +495,8 @@ bool queue_debug_delivery(probe_session *s, DWORD tid, uint64_t ip, DWORD64 clea
             auto p = std::make_unique<Probe>();
             p->location = "<debug-delivery>"; p->rva = s->debug_dispatch_addr;
             p->internal = true; p->callback = debug_delivery_noop;
-            Probe *raw = p.get(); s->probes.push_back(std::move(p)); s->debug_dispatch_probe = raw;
+            Probe *raw = p.get(); { std::lock_guard<std::mutex> lock(s->probes_mu); s->probes.push_back(std::move(p)); }
+            s->debug_dispatch_probe = raw;
         }
         auto &p = *s->debug_dispatch_probe;
         p.flags = PROBE_BREAKPOINT; p.retired = false;

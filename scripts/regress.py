@@ -7358,6 +7358,19 @@ def check_logsite_review():
             except Exception as e:
                 record(name, False, repr(e))
 
+    name = "logsite-live-report-dispatcher"
+    try:
+        dr = exe("ctrl_dr_review.exe")
+        if not dr:
+            record(name, False, "missing ctrl_dr_review")
+        else:
+            r, o = run([dr, "live-report"], timeout=30)
+            res = next((x for x in o if x.get("kind") == "dr_review"), {})
+            record(name, r.returncode == 0 and res.get("ok") == 1,
+                   f"exit={r.returncode} result={res} stderr={r.stderr[-1000:]}")
+    except Exception as e:
+        record(name, False, repr(e))
+
     name = "logsite-live-report"
     try:
         r, o = go("livereport", "breakpoint", ["int3cap", "--n", 1000])
@@ -7777,7 +7790,7 @@ def check_ctrl_own_debug():
     d = exe("ctrl_dr_review.exe")
     if not d:
         return missing_bin("ctrl-own-debug", "ctrl_dr_review")
-    for case in ("release", "queued", "queued-same", "queued-rearm", "deferred", "deferred-reused", "deferred-carried-reused", "watch-tf", "watch-tf-carried", "gate", "step-entry", "step-own", "step-own-detach", "step-mixed", "step-tf", "detach-dr", "detach-tf"):
+    for case in ("release", "queued", "queued-same", "queued-rearm", "deferred", "deferred-reused", "deferred-carried-reused", "watch-tf", "watch-tf-carried", "gate", "gate-mixed", "step-entry", "step-own", "step-own-detach", "step-mixed", "step-tf", "detach-dr", "detach-tf"):
         name = f"ctrl-own-debug-{case}"
         try:
             r, o = run([d, case], timeout=30)

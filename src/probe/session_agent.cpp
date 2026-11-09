@@ -929,22 +929,29 @@ static void clear_gates(probe_session *s) {
 }
 
 // A gate fired: hold this thread at the site until the hook is confirmed.
-bool handle_gate(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
+bool handle_gate(probe_session *s, const DEBUG_EVENT &event, bool &handled, bool *failed) {
+    if (failed) *failed = false;
     handled = false;
     if (s->gates.empty()) return false;
     HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
     if (!thread) return false;
     CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS;
     bool hit = false;
+    DWORD64 consumed = 0;
     if (GetThreadContext(thread, &c)) {
         c.Dr6 |= dr6_carried(s, event.dwThreadId);
         for (auto &g : s->gates)
             if ((c.Dr6 & (1u << g.second)) && dr_address(c, g.second) == g.first &&
-                ((c.Dr7 >> (g.second * 2)) & 3) && (uint64_t)EMU_IP(c) == g.first) { hit = true; c.Dr6 &= ~(DWORD64)(1u << g.second); }
+                ((c.Dr7 >> (g.second * 2)) & 3) && (uint64_t)EMU_IP(c) == g.first) { hit = true; consumed |= (DWORD64)1 << g.second; c.Dr6 &= ~(DWORD64)(1u << g.second); }
         if (hit) { handled = !(c.Dr6 & 0xE00Fu); c.EFlags |= 0x10000u; SetThreadContext(thread, &c); }   // RF: run the site once resumed
     }
     CloseHandle(thread);
     if (hit) {
+        if (!handled && event.u.Exception.dwFirstChance &&
+            !queue_debug_delivery(s, event.dwThreadId, (uint64_t)EMU_IP(c), consumed, c.Dr6 & 0xE00Fu)) {
+            if (failed) *failed = true;
+            return false;
+        }
         hold_thread(s, event.dwThreadId);
 #if defined(_WIN64)
         const uint64_t pc = c.Rip;
