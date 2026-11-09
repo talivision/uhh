@@ -13,7 +13,7 @@
 #include <intrin.h>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 30;   /* 30: reusable channel epoch and target mapping handle; 29: init receives a per-session mapping handle (layout unchanged); 28: init_returns (x86hunt); 27: ring record's header and text start on one cache line, log_head on a line of its own (perf5); 26: tblock retired on a line of its own, drain wake-up (drain_wait); 25: per-thread hit blocks (tblocks); 24: huntaudit early_init (on top of 23: runfix1 log carry + running count; 21: held_floor) */
+constexpr uint32_t PROBE_AGENT_VERSION = 31;   /* 31: inline install failure stage; 30: reusable channel epoch and target mapping handle; 29: init receives a per-session mapping handle (layout unchanged); 28: init_returns (x86hunt); 27: ring record's header and text start on one cache line, log_head on a line of its own (perf5); 26: tblock retired on a line of its own, drain wake-up (drain_wait); 25: per-thread hit blocks (tblocks); 24: huntaudit early_init (on top of 23: runfix1 log carry + running count; 21: held_floor) */
 constexpr uint32_t PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH = 1u << 9;   /* agent side only needs this one */   /* == PROBE_UNSAFE_FAST_PATCH (asserted in session.cpp) */
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 128;   /* inline probes per session; the 129th is refused */
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
@@ -31,6 +31,11 @@ enum probe_agent_status : LONG {
     PROBE_AGENT_HOOK_FAILED = -3
 };
 
+enum probe_agent_install_failure : uint32_t {
+    PROBE_INSTALL_NONE, PROBE_INSTALL_BUILD, PROBE_INSTALL_FREEZE,
+    PROBE_INSTALL_SITE, PROBE_INSTALL_WRITE, PROBE_INSTALL_VERIFY, PROBE_INSTALL_CONTROLLER_GONE
+};
+
 struct probe_agent_request {
     uint64_t site;
     uint32_t flags;
@@ -38,6 +43,7 @@ struct probe_agent_request {
     char callback[PROBE_AGENT_EXPORT_CAP];
     unsigned char config[PROBE_AGENT_CONFIG_CAP];
     volatile LONG status;
+    uint32_t install_failure;      /* published before terminal status */
     uint32_t patch_len;            /* agent: bytes the hook overwrites at site (set before a freeze) */
     uint64_t config_remote;        /* config_len > PROBE_AGENT_CONFIG_CAP: the config lives in a block
                                       the controller allocated in the target (else in config[]) */

@@ -3190,3 +3190,15 @@ these changes must not yet be described as a confirmed fix of the CI failures.
   in scratch_blocks until session cleanup, after finish_calls/detach; failed writes free
   immediately. Existing conformance, transparency, reuse, concurrent-call and CET checks
   remain unchanged and must pass on Windows before this follow-up is considered verified.
+
+### Inline install failure diagnostics (ntdll-churn CI follow-up)
+
+A terminal inline install failure is not an accepted silent attach outcome. The common
+acceptance path now also runs from the run loop, final result, and detach before agent
+stop; detach preserves an existing session error. Each failed probe prints its location,
+status and agent failure stage once and is retired (also exposed in the probe report).
+Pre-run probes fail the session; the existing runtime-add retirement policy is unchanged.
+The agent records the stage before publishing HOOK_FAILED. Shared request layout changed:
+PROBE_AGENT_VERSION 31. `inline-install-failure-{launch,attach}` forces a freeze-stage
+failure with UHH_TEST_HOOK_FAIL and checks stderr, report, nonzero exit, and attached
+target survival. Windows x64/x86 validation pending.

@@ -8615,6 +8615,45 @@ def check_agent_unwind():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def check_inline_install_failure():
+    """A terminal agent install failure must retire the probe and fail either session path."""
+    d, t = exe("ar_driver.exe"), exe("ar_target.exe")
+    if not d or not t:
+        return missing_bin("inline-install-failure", "ar_driver/ar_target")
+    for mode in ("launch", "attach"):
+        name = f"inline-install-failure-{mode}"
+        target = None
+        try:
+            env = dict(os.environ, UHH_TEST_HOOK_FAIL="1")
+            if mode == "attach":
+                target = subprocess.Popen([str(t), "review-shared"], stdin=subprocess.PIPE,
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=BIN, env=env)
+                ready = Lines(target.stdout).wait_for(lambda l: '"kind":"ready"' in l, 10)
+                if not ready: raise RuntimeError("target not ready")
+                cmd = [d, "--review-hookfail", str(json.loads(ready)["pid"]), "1"]
+                feed = "\n"
+            else:
+                cmd = [d, "--backend", "inline", "--probe",
+                       "ar_target.exe!ar_shared_write_site=ar_on_empty", "--", t, "review-shared"]
+                feed = "q\n"
+            r, o = run(cmd, feed=feed, env=env, timeout=20)
+            rep = report(o)
+            rows = probes(o)
+            diagnostic = "inline agent failed to install ar_target.exe!ar_shared_write_site (status=-3): freeze"
+            ok = (r.returncode != 0 and rep.get("error") and diagnostic in rep["error"] and
+                  r.stderr.count("probe: " + diagnostic + "\n") == 1 and len(rows) == 1 and
+                  rows[0].get("retired") is True and rows[0].get("active") is False and rows[0].get("hits") == 0)
+            if target:
+                out, err = target.communicate("x\nq\n", timeout=10)
+                ok = ok and target.returncode == 0 and '"n":1' in out
+            record(name, bool(ok), f"rc={r.returncode} report={rep} probes={rows} stderr={r.stderr[-1200:]!r}")
+        except Exception as e:
+            record(name, False, repr(e))
+        finally:
+            if target and target.poll() is None:
+                target.kill(); target.communicate()
+
+
 def check_session_agentipc():
     """cxr7 agent #1/#2/#4, lifecycle #1/#4 and call #1/#2/#3.
     Retained images, mixed shared sections, failed safe freezes/stops, retry handles,
@@ -13185,6 +13224,7 @@ def main():
     if want(check_callorig_deep): check_callorig_deep()
     if want(check_callconv): check_callconv()
     if want(check_agent_review): check_agent_review()
+    if want(check_inline_install_failure): check_inline_install_failure()
     if want(check_session_agentipc): check_session_agentipc()
     if want(check_agent_safety): check_agent_safety()
     if want(check_agent_unwind): check_agent_unwind()

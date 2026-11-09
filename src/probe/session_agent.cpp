@@ -768,8 +768,6 @@ bool create_agent_channel(probe_session *s) {
     for (const auto &p : s->probes) if (p->flags & PROBE_INLINE) fill_request(s, *p);
     return true;
 }
-static bool accept_agent_install(probe_session *s);
-
 // An inline probe added while the target runs (from a callback). It gets the next free
 // request slot -- creating the channel on first use -- and is installed by the agent on
 // a FRESH remote thread, never inside the calling callback: the installer freezes other
@@ -1227,10 +1225,10 @@ bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
         }
         if (n == offsetof(probe_ipc_request, address) && head.op == PROBE_IPC_INSTALL_DONE) {
             // Harmless if forged: acceptance re-checks every request status itself.
-            if (!accept_agent_install(s)) { std::fprintf(stderr, "probe: %s\n", s->error.c_str()); }
+            const bool accepted = accept_agent_install(s); // prints each failure once
             // This thread runs: the guard is up (see arm_module) -- breakpoint/hw probes go
             // active with the inline ones, not when the init thread returns.
-            else if (guard_pending(s) && s->shared->service_ready && !guard_set_ready(s, nullptr))
+            if (accepted && guard_pending(s) && s->shared->service_ready && !guard_set_ready(s, nullptr))
                 std::fprintf(stderr, "probe: %s\n", s->error.c_str());
             // Still pending after a round: its site is not installable YET (a relocated DLL's
             // code is not executable until the loader has finished relocating it). Asking again
@@ -1495,15 +1493,30 @@ bool agent_has_pending(const probe_session *s) {
     return false;
 }
 
-static bool accept_agent_install(probe_session *s) {
+bool accept_agent_install(probe_session *s) {
     MemoryBarrier();
+    if (!s->shared) return true;
     std::string first_failure;      // every probe is accepted or retired, THEN a boot-time failure is reported
     for (auto &p : s->probes) if ((p->flags & PROBE_INLINE) && p->address && !p->active && !p->retired) {
         LONG status = s->shared->requests[p->agent_index].status;
         if (status == PROBE_AGENT_PENDING || status == PROBE_AGENT_INSTALLING) continue;   // next round
         if (status != PROBE_AGENT_INSTALLED) {
+            const auto &request = s->shared->requests[p->agent_index];
+            const char *reason = status == PROBE_AGENT_BAD_REQUEST ? "bad request" :
+                status == PROBE_AGENT_CALLBACK_MISSING ? "callback missing" : "unexpected install status";
+            if (status == PROBE_AGENT_HOOK_FAILED) {
+                switch (request.install_failure) {
+                case PROBE_INSTALL_BUILD: reason = "trampoline build"; break;
+                case PROBE_INSTALL_FREEZE: reason = "freeze"; break;
+                case PROBE_INSTALL_SITE: reason = "site check"; break;
+                case PROBE_INSTALL_WRITE: reason = "patch write"; break;
+                case PROBE_INSTALL_VERIFY: reason = "verification"; break;
+                case PROBE_INSTALL_CONTROLLER_GONE: reason = "controller gone"; break;
+                default: reason = "hook failure (stage unavailable)"; break;
+                }
+            }
             std::string why = "inline agent failed to install " + p->location +
-                              " (status=" + std::to_string(status) + ")";
+                              " (status=" + std::to_string(status) + "): " + reason;
             std::fprintf(stderr, "probe: %s\n", why.c_str());
             p->retired = true;
             if (!p->runtime && first_failure.empty()) first_failure = why;

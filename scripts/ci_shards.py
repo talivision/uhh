@@ -44,6 +44,7 @@ REGRESS = ROOT / "scripts" / "regress.py"
 # Seconds per check function on a windows-2022 runner (x64, x86), measured by CI run 42180029465
 # (2026-11-06; a grouped unit's time sits on its selector). Refresh from `summarize`'s measured table.
 EST = {
+    "check_inline_install_failure": (5, 5),
     "check_session_agentipc": (20, 25),
     "check_logsite_review": (23, 29),
     "check_agent_safety": (35, 40), "check_agent_crt": (1, 1), "check_agent_review": (1, 1), "check_agent_unwind": (3, 3), "check_attach": (9, 13), "check_attach_new": (0, 0),
