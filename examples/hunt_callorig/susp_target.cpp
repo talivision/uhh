@@ -132,25 +132,25 @@ static bool read_gate() {
 // A data-watch trap reports the instruction AFTER this write, not the data address.
 extern "C" { __declspec(dllexport) volatile LONG co_watch_value = 0; }
 static volatile LONG g_watch_exceptions, g_own_hits, g_own_value;
-static DWORD g_own_slot, g_stale_slots;
+static DWORD g_own_slot, g_stale_slots, g_stale_addresses;
 static DWORD WINAPI watchdeath_own_dr(void *main_thread) {
     HANDLE t = (HANDLE)main_thread;
     if (SuspendThread(t) == (DWORD)-1) return 1;
     CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     bool ok = GetThreadContext(t, &c) != 0;
     if (ok) {
-        g_stale_slots = (DWORD)c.Dr7 & 0xFF;
-        int slot = 0;
-        while (slot < 4 && ((c.Dr7 >> (slot * 2)) & 3)) ++slot;
-        ok = slot < 4;
-        if (ok) {
-            g_own_slot = 1u << slot;
-            const DWORD_PTR address = (DWORD_PTR)&g_own_value;
-            switch (slot) { case 0: c.Dr0 = address; break; case 1: c.Dr1 = address; break;
-                            case 2: c.Dr2 = address; break; default: c.Dr3 = address; }
-            c.Dr7 &= ~((decltype(c.Dr7))0xF << (16 + slot * 4));
-            c.Dr7 |= ((decltype(c.Dr7))0xD << (16 + slot * 4)) | ((decltype(c.Dr7))1 << (slot * 2));
-            ok = SetThreadContext(t, &c) != 0;
+        if (g_own_slot) {                      // post-death inspection; foreign slot is DR3
+            g_stale_slots = (DWORD)c.Dr7 & 0x3F;
+            g_stale_addresses = c.Dr0 || c.Dr1 || c.Dr2;
+        } else {
+            ok = !(c.Dr7 & (3u << 6));
+            if (ok) {
+                g_own_slot = 1u << 3;
+                c.Dr3 = (DWORD_PTR)&g_own_value;
+                c.Dr7 &= ~((decltype(c.Dr7))0xF << 28);
+                c.Dr7 |= ((decltype(c.Dr7))0xD << 28) | (1u << 6);
+                ok = SetThreadContext(t, &c) != 0;
+            }
         }
     }
     ResumeThread(t);
@@ -165,32 +165,36 @@ static LONG CALLBACK watchdeath_veh(EXCEPTION_POINTERS *ep) {
     ep->ContextRecord->Dr6 = 0;
     return EXCEPTION_CONTINUE_EXECUTION;
 }
-static int run_watchdeath() {
-    if (!AddVectoredExceptionHandler(1, watchdeath_veh)) return 4;
-    printf("{\"kind\":\"waiting\",\"pid\":%lu}\n", GetCurrentProcessId()); fflush(stdout);
-    if (!read_gate()) return 3;                 // the controller died with the watch armed
-    BOOL dbg = TRUE;
-    for (int i = 0; i < 3000 && CheckRemoteDebuggerPresent(GetCurrentProcess(), &dbg) && dbg; ++i) Sleep(10);
-    Sleep(1500);                               // exercise the lazy path AFTER guard cleanup
-    // Inspect the still-armed stale UHH slot and add a foreign slot from another thread.
+static bool watchdeath_context() {
     HANDLE main_thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT,
                                    FALSE, GetCurrentThreadId());
-    if (!main_thread) return 4;
+    if (!main_thread) return false;
     HANDLE setup = CreateThread(nullptr, 0, watchdeath_own_dr, main_thread, 0, nullptr);
-    if (!setup) { CloseHandle(main_thread); return 4; }
+    if (!setup) { CloseHandle(main_thread); return false; }
     const DWORD done = WaitForSingleObject(setup, 30000);
     DWORD setup_rc = 1;
     GetExitCodeThread(setup, &setup_rc);
     CloseHandle(setup); CloseHandle(main_thread);
-    if (done != WAIT_OBJECT_0 || setup_rc != 0) return 4;
+    return done == WAIT_OBJECT_0 && setup_rc == 0;
+}
+static int run_watchdeath() {
+    if (!AddVectoredExceptionHandler(1, watchdeath_veh)) return 4;
+    // Arm the target's own DR3 BEFORE attachment: active cleanup must preserve it.
+    if (!watchdeath_context()) return 4;
+    printf("{\"kind\":\"waiting\",\"pid\":%lu}\n", GetCurrentProcessId()); fflush(stdout);
+    if (!read_gate()) return 3;                 // the controller died with the watch armed
+    BOOL dbg = TRUE;
+    for (int i = 0; i < 3000 && CheckRemoteDebuggerPresent(GetCurrentProcess(), &dbg) && dbg; ++i) Sleep(10);
+    Sleep(1500);                               // inspect AFTER guard cleanup
+    if (!watchdeath_context()) return 4;        // x64: cleared; x86: still armed, handled lazily
     co_watch_value = 41;
     co_watch_value += 1;                        // the UHH slot must now be disabled
     const LONG leaked = g_watch_exceptions;
     g_own_value = 7;                            // the guard must preserve the foreign DR slot
     RaiseException(EXCEPTION_SINGLE_STEP, 0, 0, nullptr); // unrelated target exception passes through
     printf("{\"kind\":\"co\",\"case\":\"watchdeath\",\"value\":%ld,\"exceptions\":%ld,"
-           "\"target_exceptions\":%ld,\"own_hits\":%ld,\"stale_slots\":%lu,\"debugger\":%d}\n",
-           co_watch_value, leaked, g_watch_exceptions - leaked, g_own_hits, g_stale_slots, (int)dbg);
+           "\"target_exceptions\":%ld,\"own_hits\":%ld,\"stale_slots\":%lu,\"stale_addresses\":%lu,\"debugger\":%d}\n",
+           co_watch_value, leaked, g_watch_exceptions - leaked, g_own_hits, g_stale_slots, g_stale_addresses, (int)dbg);
     fflush(stdout);
     return 0;
 }

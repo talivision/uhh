@@ -2802,6 +2802,16 @@ static void restore_byte(uint64_t at, unsigned char original) {
         FlushInstructionCache(GetCurrentProcess(), (void *)p, 1);
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
+// Change only our slot enables and addresses; DR6, foreign slots and all other state
+// are preserved by an active update. The VEH separately consumes our exception status.
+static void clear_orphan_dr(CONTEXT &c, DWORD mask) {
+    for (int slot = 0; slot < 4; ++slot) {
+        if (!(mask & (1u << slot))) continue;
+        c.Dr7 &= ~((decltype(c.Dr7))3 << (slot * 2));
+        switch (slot) { case 0: c.Dr0 = 0; break; case 1: c.Dr1 = 0; break;
+                        case 2: c.Dr2 = 0; break; default: c.Dr3 = 0; }
+    }
+}
 // The program's byte under one of our armed INT3s (the INT3 table, sorted by address). The
 // controller may have died in the middle of a rewrite (int3_seq left odd): then a plain scan.
 static bool int3_original(uint64_t at, unsigned char &original) {
@@ -2881,11 +2891,10 @@ static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
     // A live controller consumes our traps before the VEH. This orphaned hit can precede
     // the service thread's death notification, even while the debug port is being torn down.
     if (!g_lazy_dr) InterlockedExchange(&g_lazy_dr, 1);
-    // Use the exception context: Get/SetThreadContext on the running current thread is
-    // not a register snapshot/restore. Data watchpoints report the address AFTER the
-    // access, so ownership comes from DR6, not the exception IP. Leave foreign slots intact.
-    for (int slot = 0; slot < 4; ++slot)
-        if (mask & (1u << slot)) cx->Dr7 &= ~((decltype(cx->Dr7))3 << (slot * 2));
+    // Use the exception's saved status rather than querying the current thread again.
+    // Data watchpoints report the address AFTER the access, so ownership comes from DR6,
+    // not the exception IP. Leave foreign slots intact.
+    clear_orphan_dr(*cx, mask);
     cx->Dr6 &= ~(decltype(cx->Dr6))mask;
     if (step) { cx->Dr6 &= ~(decltype(cx->Dr6))(1u << 14); cx->EFlags &= ~0x100u; }
     if (g_guard_wake) SetEvent(g_guard_wake);
@@ -2921,20 +2930,41 @@ static void guard_cleanup() {
     if (n < 0) n = 0;
     if (n > (LONG)PROBE_AGENT_INT3_CAP) n = PROBE_AGENT_INT3_CAP;
     for (LONG i = 0; i < n; ++i) if (shared->int3[i].address) restore_byte(shared->int3[i].address, shared->int3[i].original);
-    // No context sweep: it would expose our temporary SuspendThread count to running
-    // program threads. A stale DR that never fires needs no work (including on this thread).
-    InterlockedExchange(&g_lazy_dr, 1);
+    InterlockedExchange(&g_lazy_dr, 1);                         // fallback if an update fails
     const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snap != INVALID_HANDLE_VALUE) {
+#if defined(_WIN64)
+    // Native context calls use a kernel APC without increasing the suspend count. Touch
+    // DEBUG_REGISTERS only: never write a running thread's control/integer state back.
+    const DWORD mask = (DWORD)g.dr_mask & 0xF;
+    const int passes = mask ? 2 : 1;
+#else
+    // WOW64 Get/SetThreadContext implicitly suspends (ROADMAP R2). Leave those slots to
+    // the VEH rather than exposing a temporary suspension to the program.
+    constexpr int passes = 1;
+#endif
+    for (int pass = 0; pass < passes; ++pass) {
+        // A pending debug event can restore its old DRs after the first pass.
+        if (pass) Sleep(200);
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap == INVALID_HANDLE_VALUE) continue;
         THREADENTRY32 te{}; te.dwSize = sizeof(te);
         for (BOOL more = Thread32First(snap, &te); more; more = Thread32Next(snap, &te)) {
-            if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
-            HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
-                                  FALSE, te.th32ThreadID);
+            if (te.th32OwnerProcessID != pid) continue;
+            DWORD access = THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION;
+#if defined(_WIN64)
+            access |= THREAD_GET_CONTEXT | THREAD_SET_CONTEXT;
+#endif
+            HANDLE t = OpenThread(access, FALSE, te.th32ThreadID);
             if (!t) continue;
+#if defined(_WIN64)
+            CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (mask && GetThreadContext(t, &c)) {
+                clear_orphan_dr(c, mask);
+                SetThreadContext(t, &c);                        // failure: lazy VEH backstop
+            }
+#endif
             // Only release recorded controller holds, once per entry.
-            resume_holds(g, t, te.th32ThreadID);
+            if (!pass && te.th32ThreadID != self) resume_holds(g, t, te.th32ThreadID);
             CloseHandle(t);
         }
         CloseHandle(snap);

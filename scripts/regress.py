@@ -9405,8 +9405,8 @@ class LcTarget:
 
 
 def lc_clean(c, attached_ok=False, orphaned_dr=False):
-    """A clean target; controller death alone permits dormant DR slots, never a trap flag."""
-    # Only controller death permits dormant DRs: orphaned slots are disabled at their next hit.
+    """A clean target; x86 controller death permits dormant slots, never a trap flag."""
+    # WOW64 controller death permits dormant DRs: context calls would implicitly suspend.
     # (late / stuck: the quit report -- worker threads that did not end, threads left suspended)
     return (not c.get("dead") and not c.get("hung") and c.get("code_diff") == 0 and (c.get("tf_dirty") == 0 if orphaned_dr else c.get("dr_dirty") == 0) and
             c.get("dr_unknown") == 0 and
@@ -9762,7 +9762,8 @@ def lc_controller_killed(cfgname, cfg):
     Sessions with an inline probe (inline, mixed) carry the agent and its controller-death guard
     (Lifecycle L1): the TARGET must survive -- keep running, never fault, never hang, make no
     error -- and, once the controller is gone, be left with no live hook / INT3. Unused stale
-    hardware slots may remain armed; their next hit is handled lazily in the target thread.
+    hardware slots may remain armed on x86; x64 clears them actively without suspension.
+    The VEH handles an orphaned hit if active clearing is unavailable or fails.
     breakpoint/hw-only sessions (owner decision 2026-11-07: the agent is injected only for inline
     probes; "controller-crash self-unhook: not worth the cost") inject nothing: while attached the
     target must have NO probe_api_agent.dll loaded, and a killed controller leaves its INT3s/DRs
@@ -9815,7 +9816,7 @@ def lc_controller_killed(cfgname, cfg):
             time.sleep(1.0)
             c2 = tg.check()
             progressed = (c2.get("iterations") or 0) > (c.get("iterations") or 0)
-            if not lc_clean(c2, orphaned_dr=True) or not progressed:
+            if not lc_clean(c2, orphaned_dr=pe_is_x86(exe("lifecycle_target.exe"))) or not progressed:
                 bad.append(f"kill@{when}: progressed={progressed} {lc_brief(c2)} unhandled={tg.unhandled()}")
             first_susp = c.get("susp_info") if c.get("susp") else ""
             a = tg.quit()
@@ -11785,7 +11786,9 @@ def check_cx2_review():
         row = next((x for x in tout.objs() if x.get("kind") == "co"), {})
         ok = (att.returncode == 99 and tgt.returncode == 0 and row.get("value") == 42
               and row.get("exceptions") == 0 and row.get("target_exceptions") == 1
-              and row.get("own_hits") == 1 and row.get("stale_slots", 0) != 0
+              and row.get("own_hits") == 1
+              and (row.get("stale_slots", 0) != 0 if pe_is_x86(st) else
+                   row.get("stale_slots") == 0 and row.get("stale_addresses") == 0)
               and row.get("debugger") == 0 and not any("guard unavailable" in l for l in aerr.lines))
         record(name, ok, f"controller_rc={att.returncode} (99: died after arming) target_rc={tgt.returncode} row={row}"
                         + ("" if ok else f" ctl_err={aerr.lines[-4:]}"))
