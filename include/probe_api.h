@@ -31,6 +31,12 @@
      be correct inline. thread_local is per TARGET thread inline but per controller thread
      (one for all target threads) on breakpoint/hw: keep per-thread state keyed by the
      target tid instead.
+   - x64 inline callbacks must leave x87/MMX state unchanged, including any helpers they
+     call. Ordinary MSVC x64 C/C++ and CRT math use SSE: long double == double, no __m64
+     intrinsics or inline assembly. UHH therefore takes no x87/MMX snapshot on this path.
+     Assembly callbacks/helpers using x87/MMX, or code explicitly restoring extended state,
+     must save and restore that state themselves on every exit. x86 inline callbacks retain
+     automatic x87 preservation because compiled x86 C/C++ uses x87.
    - A callback that faults or throws is abandoned on every backend (the hit counts, its
      register changes are discarded, set_mem writes already made stay, the program runs on).
      Inline the exception is raised in the target, so the program's vectored exception

@@ -1144,7 +1144,10 @@ overflows its stack. Every backend, x64 and x86.
 - ✅ (TR7, review b) **x86 inline: the x87 state was not saved** (default mask = AVX only). x86
   code returns floats in ST0, so any callback/CRT float call changes the x87 status/tag/stack a
   mid-function site may have live. The gated mask now includes x87 on x86 when it is in use.
-  (x64: not included -- MSVC x64 code never touches x87 -- so x64 hits keep the cheap path.)
+  Owner decision after cxr9 VM perf A/B: x64 keeps no x87/MMX snapshot. MSVC x64 C/C++
+  uses SSE; assembly callbacks/helpers using x87/MMX must restore it themselves (the callback
+  contract in probe_api.h and limitations.md). XINUSE[0] normally stays set on Windows:
+  gated XSAVE added ~62 ns/hit, and the FXSAVE alternative still added ~48 ns/hit.
 - ✅ (TR8, review c) **inline get_mem trusted a per-thread region cache ACROSS hits**: a page the
   target decommitted / NOACCESSed / guarded later faulted (a first-chance AV its vectored
   handler saw) or silently consumed its PAGE_GUARD. The cache now lives for one hit (reset at
@@ -1494,6 +1497,14 @@ INT3"); nothing shipped links it. `--only cxlib`.
   detach,interrupt,conformance,transparency,agent_review,gated` 146/146 on x64 and 146/146 on x86.
 
 ## hw ONCE / ntdll-churn findings (2026-11-06, regress `hw-once-slots-*`, `ntdll-churn-*`, `cdx-owndrx-*`, `ctrl-owndr-*`)
+- 🔧 Inline zero-hit cycle investigation (2026-11-09): a clean detach does not prove hooks were
+  live during the cycle. `uhh_trace` starts its 300 ms timer after `probe_attach` returns,
+  before `probe_run` processes module replay / agent init; detach can cancel setup cleanly.
+  No stale-channel or skipped-init cause established by static inspection. Churn now prints
+  attach-to-active timing, whether activation preceded the detach request, report-time
+  active/hits, and each inline request's pre-stop status / hits / epoch / init / service state.
+  Status values: 0 pending, 1 installing, 2 installed (negative values are failures).
+  Assertions, cycle counts and timer durations unchanged; Windows CI verification pending.
 - ✅ (H1) hw: **target killed by STATUS_SINGLE_STEP after a PROBE_ONCE hw probe retired** (`hw-once-slots`
   failed on every run since the Codex controller review, x64 and x86: the ONCE probes fired once, then a
   worker died at HwSite / after the `lock inc` on g_w1). Cause: a thread still STARTING (in
@@ -1657,6 +1668,14 @@ then fixed. Fixtures: `ctrl_target faultmix`, `co_target susp / many / manydead`
   armed without the guard; `--only cxlib` 3 x 9/9 on reruns.
 
 ## Follow-ups (2026-11-07, branch `followups`, regress `stream-live-*`, `realbig-robocopy-detach-*`, `lifecycle-target-dies-*`, `cx2-evsusp-*` / `cx2-cosusp-*`)
+- Test calibration follow-up: `stream-live-*` and `stream-latency-*` now retry a latency-only
+  failure once when >= 100 sampler points show >= 20 ms scheduler noise (including the
+  20-50 ms range below citune's subtraction threshold). The fresh run must pass the same
+  strict quiet bounds / window-local noise subtraction; raw p99 >= 1 s fails immediately
+  on either attempt. Missing samples, delivery/order/clock/count failures and inline wake
+  failures do not qualify. Disk stalls do not qualify or increase the allowance;
+  `stream-filestall-*` and its injected 400 ms stall are unchanged. Quiet-machine writer
+  stalls still fail the original 100/250 ms bounds. Static review only; not run here.
 - ✅ (F1, test-side) **`stream-live-*` absolute p99 bound vs a loaded machine.** Same build, VM under load:
   p99 0.7-253 ms over 18 runs with every log delivered; one FAIL at 253 ms (x86 breakpoint), earlier 1102 ms
   (x64 hw). Fix: the stream-latency calibration (citune) applied -- an uninstrumented writer (logstream_target,

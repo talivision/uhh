@@ -171,6 +171,12 @@ AR_CB void ar_on_guarantee(probe_context *c) {
     uint64_t r = 0;
     call_original(c, 0, &r);                           // unwinds to the program's own handler
 }
+AR_CB void ar_on_logged(probe_context *c) {
+    auto *control = (ArEpochControl *)(uintptr_t)get_func_arg(c, 0);
+    send_log(c, "ar delivered");
+    SetEvent(control->entered);
+    WaitForSingleObject(control->release, 30000);
+}
 AR_CB void ar_on_epoch(probe_context *c) {
     auto *control = (ArEpochControl *)(uintptr_t)get_func_arg(c, 0);
     const auto *config = (const LONG *)get_config(c);
@@ -181,6 +187,17 @@ AR_CB void ar_on_epoch(probe_context *c) {
 }
 AR_CB void ar_on_vector(probe_context *c) {
     send_log(c, "ar vector");
+#if !defined(_WIN64)
+    if (get_func_arg(c, 0)) {
+        // Payload-only MMX corruption: CW/SW/tags/pointers are identical before/after.
+        // Comparing only those fields cannot decide whether restoration is necessary.
+        alignas(16) unsigned char legacy[512];
+        _fxsave(legacy);
+        for (int reg = 0; reg < 8; ++reg) legacy[32 + reg * 16] ^= 0x5A;
+        _fxrstor(legacy);
+        return;
+    }
+#endif
     int cp[4]; __cpuid(cp, 1);
     if (!(cp[2] & (1 << 27))) return;
     const uint64_t enabled = _xgetbv(0);

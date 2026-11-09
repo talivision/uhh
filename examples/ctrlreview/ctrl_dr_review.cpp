@@ -14,6 +14,7 @@ struct ChildState {
 };
 static ChildState child_state{};
 static uint64_t child_done = 0;
+static uint64_t child_gate_nop = 0;
 static unsigned callbacks = 0;
 static void hit(probe_context *) { ++callbacks; }
 static DWORD WINAPI exit_freeze_thread(void *) { return 0; }
@@ -45,6 +46,14 @@ static LONG CALLBACK child_veh(EXCEPTION_POINTERS *e) {
         if ((e->ContextRecord->Dr6 & (1u << slot)) &&
             !((e->ContextRecord->Dr7 >> (16 + slot * 4)) & 3u))
             e->ContextRecord->Dr7 &= ~((decltype(e->ContextRecord->Dr7))3 << (slot * 2));
+    // gate-mixed stops BEFORE this known one-byte NOP. Resume after it explicitly:
+    // debug-register edits in an exception context need not suppress a new execute
+    // fault when Windows restores the thread. The snapshot above still records the
+    // original PC and every delivered status/control bit, before this continuation.
+    if (child_gate_nop && child_state.ip == child_gate_nop &&
+        (child_state.dr6 & 2u) && child_state.dr1 == child_gate_nop &&
+        (child_state.dr7 & 0xF0000Cu) == 4)
+        EMU_IP(*e->ContextRecord) = (decltype(EMU_IP(*e->ContextRecord)))(child_gate_nop + 1);
     e->ContextRecord->EFlags &= ~0x100u;
     e->ContextRecord->Dr6 = 0;
     return EXCEPTION_CONTINUE_EXECUTION;
@@ -57,6 +66,7 @@ static int child(bool linger) {
     void *mem = VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
     if (!mem || !AddVectoredExceptionHandler(1, child_veh)) return 3;
     if (linger) child_done = (uint64_t)(uintptr_t)mem + 10;
+    child_gate_nop = (uint64_t)(uintptr_t)mem + 9;
     std::memcpy(mem, code, sizeof(code));
     FlushInstructionCache(GetCurrentProcess(), mem, sizeof(code));
     const ULONG_PTR info[] = {(ULONG_PTR)mem, (ULONG_PTR)&child_state};
@@ -137,6 +147,12 @@ struct Debuggee {
                         std::fprintf(stderr, "dr-review: unexpected code=0x%lx at=0x%llx wanted=0x%lx at=0x%llx\n",
                                      (unsigned long)ex.ExceptionCode, (unsigned long long)at, (unsigned long)wanted,
                                      (unsigned long long)(address ? address : code + 4));
+                    if (code && ex.ExceptionCode != EXCEPTION_BREAKPOINT) {
+                        const auto observed = result();
+                        std::fprintf(stderr, "dr-review: first=%lu VEH seen=%ld delivered_dr6=0x%llx pending_repair=%zu\n",
+                                     (unsigned long)ev.u.Exception.dwFirstChance, (long)observed.seen,
+                                     (unsigned long long)observed.dr6, session ? session->debug_delivery.size() : size_t{0});
+                    }
                     dr_require(!code && ex.ExceptionCode == EXCEPTION_BREAKPOINT, "expected exception address/code");
                 }
             }

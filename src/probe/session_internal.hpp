@@ -560,7 +560,7 @@ struct probe_session {
     // profilers do) -- undoing our resume state (an INT3 hit resumed one byte into the
     // instruction, a hw hit without RF reported twice). Such a thread is held by us as well
     // until the target resumes it; then whatever it wrote back gets our changes re-applied.
-    struct CtxWatch { DWORD tid = 0; HANDLE t = nullptr; CONTEXT before{}, after{}; };
+    struct CtxWatch { DWORD tid = 0; HANDLE t = nullptr; CONTEXT before{}, after{}; ULONGLONG deadline = 0; };
     std::vector<std::unique_ptr<CtxWatch>> ctx_watch;
 };
 

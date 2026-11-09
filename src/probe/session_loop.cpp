@@ -156,7 +156,8 @@ static int our_suspends(const probe_session *s, DWORD tid) {
     return n;
 }
 // The thread's suspend count (THREAD_SUSPEND_RESUME), -1 = unknown. (Not ThreadSuspendCount:
-// it reads one higher for a thread stopped at a debug event.)
+// it includes a debug freeze that can outlive ContinueDebugEvent on a held thread.
+// An "event pending" boolean cannot reliably subtract that contribution.)
 static long suspend_count(HANDLE t) {
     const DWORD prev = SuspendThread(t);
     if (prev == (DWORD)-1) return -1;
@@ -653,12 +654,24 @@ static void ctx_watch_end(probe_session *s, std::unique_ptr<probe_session::CtxWa
     }
     guard_note_hold(s, w->tid);
     if (SuspendThread(w->t) == (DWORD)-1) { CloseHandle(w->t); return; }
+    w->deadline = GetTickCount64() + 2000;
     if (trace_enabled()) std::fprintf(stderr, "  ctx-watch tid=%lu\n", (unsigned long)w->tid);
     try { s->ctx_watch.push_back(std::move(w)); } catch (...) { ResumeThread(w->t); CloseHandle(w->t); }
 }
 void ctx_watch_poll(probe_session *s, bool all) {
     for (size_t i = 0; i < s->ctx_watch.size(); ) {
         auto &w = *s->ctx_watch[i];
+        // A count query failure, a debug freeze, or a target that never resumes its hold
+        // must not keep OUR suspension forever. Release only our one increment; the
+        // program's hold remains. Do not touch the context on this fail-open path.
+        if (!all && GetTickCount64() >= w.deadline) {
+            std::fprintf(stderr, "probe: warning: context repair timed out on thread %lu; controller hold released\n",
+                         (unsigned long)w.tid);
+            ResumeThread(w.t); CloseHandle(w.t);
+            s->ctx_watch.erase(s->ctx_watch.begin() + (ptrdiff_t)i);
+            guard_resync(s);
+            continue;
+        }
         const long n = suspend_count(w.t);
         if (!all && n > our_suspends(s, w.tid)) { ++i; continue; }    // the target still holds it
         CONTEXT cur{}; cur.ContextFlags = CONTEXT_ALL;
@@ -675,6 +688,7 @@ void ctx_watch_poll(probe_session *s, bool all) {
         if (!all && suspend_count(w.t) > our_suspends(s, w.tid)) { ++i; continue; }
         ResumeThread(w.t); CloseHandle(w.t);
         s->ctx_watch.erase(s->ctx_watch.begin() + (ptrdiff_t)i);
+        guard_resync(s);
     }
 }
 static void forget_thread_holds(probe_session *s, DWORD tid) {
