@@ -2470,7 +2470,9 @@ static void enable_hook(void *p) {
     auto &h = hooks[op->index];
     auto &pb = g_patch[op->index];
     pb.len = 0;
+    shared->requests[op->index].install_failure = PROBE_INSTALL_WRITE;
     op->ok = h.enable().has_value();
+    if (op->ok) shared->requests[op->index].install_failure = PROBE_INSTALL_VERIFY;
     const size_t n = h.original_bytes().size();
     if (op->ok && n && n <= sizeof(pb.b)) {
         std::memcpy(pb.b, (const void *)h.target_address(), n);    // read back what was written (SEH-guarded by seh_run)
@@ -2677,6 +2679,12 @@ static void install_pending_locked() {
         if (!site_mapped(request.site)) continue;          // its module is going away: stays pending
         if (InterlockedCompareExchange(&request.status, PROBE_AGENT_INSTALLING, PROBE_AGENT_PENDING) != PROBE_AGENT_PENDING)
             continue;
+        request.install_failure = PROBE_INSTALL_BUILD;
+        char fail_install[8]{};
+        if (GetEnvironmentVariableA("UHH_TEST_HOOK_FAIL", fail_install, sizeof(fail_install)) && fail_install[0] == '1') {
+            request.install_failure = PROBE_INSTALL_FREEZE;
+            InterlockedExchange(&request.status, PROBE_AGENT_HOOK_FAILED); continue;
+        }
         sites[i] = request.site;
         if (g_shadow[i].lo) { g_shadow[i].lo = 0; InterlockedDecrement(&g_shadow_count); }
         if (hooks[i]) {
@@ -2701,7 +2709,8 @@ static void install_pending_locked() {
     auto enable = [&](const slot_set &which) {
         for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i) {
             if (!which[i]) continue;
-            if (shared->controller_gone) { InterlockedExchange(&shared->requests[i].status, PROBE_AGENT_HOOK_FAILED); continue; }
+            if (shared->controller_gone) { shared->requests[i].install_failure = PROBE_INSTALL_CONTROLLER_GONE; InterlockedExchange(&shared->requests[i].status, PROBE_AGENT_HOOK_FAILED); continue; }
+            shared->requests[i].install_failure = PROBE_INSTALL_SITE;
             HookOp op{i, 0, false};
             if (!site_mapped(sites[i])) { InterlockedExchange(&shared->requests[i].status, PROBE_AGENT_PENDING); continue; }
             if (!seh_run(enable_hook, &op)) {            // unmapped mid-write: abandon that hook object
@@ -2742,7 +2751,10 @@ static void install_pending_locked() {
     const slot_set safe = enabling & ~unsafe;
     if (safe.any() && !frozen(safe, [&] { enable(safe); }))
         for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i)      // built, never written: nobody to install for
-            if (safe[i]) InterlockedExchange(&shared->requests[i].status, PROBE_AGENT_HOOK_FAILED);
+            if (safe[i]) {
+                shared->requests[i].install_failure = PROBE_INSTALL_FREEZE;
+                InterlockedExchange(&shared->requests[i].status, PROBE_AGENT_HOOK_FAILED);
+            }
 }
 
 // Tell the controller an install round finished (synchronous: the controller services

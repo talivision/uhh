@@ -702,6 +702,7 @@ HANDLE create_remote_thread_boosted(HANDLE process, LPTHREAD_START_ROUTINE entry
 bool start_agent_load(probe_session *s);
 bool start_agent_init(probe_session *s);
 bool early_agent(probe_session *s, const DEBUG_EVENT &event, bool &ok);
+bool accept_agent_install(probe_session *s, bool completed_round = true);
 bool agent_has_pending(const probe_session *s);
 bool complete_remote_thread(probe_session *s, DWORD result);
 // session_bp.cpp

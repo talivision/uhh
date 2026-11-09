@@ -613,6 +613,7 @@ extern "C" int probe_run(probe_session *s) {
         }
         s->run_phase = "draining the log ring";
         drain_agent_logs(s);
+        if (!accept_agent_install(s, false)) break;
         s->run_phase = "in the debug loop";
         if (guard_pending(s) && s->guard_since && GetTickCount64() - s->guard_since > 5000 &&
             !guard_set_ready(s, "agent not ready within 5 s")) break;
@@ -676,6 +677,7 @@ extern "C" int probe_run(probe_session *s) {
     flush_log_writer(s);
     if (!s->exited && s->pi.hProcess && !s->attached) TerminateProcess(s->pi.hProcess, 3);
     if (s->exited && has_inline(s) && !s->inline_ready) set_error(s, "target exited before inline probes were ready");
+    accept_agent_install(s, false);
     int result = (s->exited || s->detached) && s->error.empty();
     fibers.end();
     if (g_ctrl_runs.fetch_sub(1) == 1 && g_runs_done) SetEvent(g_runs_done);   // a closing console may go on
@@ -756,9 +758,9 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
             ? probe_agent_hits(s->shared, index) : p->hits.load();
         hits += count; active += armed; ++visible;
         std::fputs("{\"kind\":\"probe\",\"location\":", out); json_string(out, p->location);
-        std::fprintf(out, ",\"backend\":\"%s\",\"active\":%s,\"hits\":%llu}\n",
+        std::fprintf(out, ",\"backend\":\"%s\",\"active\":%s,\"hits\":%llu,\"retired\":%s}\n",
                      flags & PROBE_INLINE ? "inline" : flags & PROBE_HW ? "hw" : "breakpoint",
-                     armed ? "true" : "false", (unsigned long long)count);
+                     armed ? "true" : "false", (unsigned long long)count, p->retired ? "true" : "false");
     }
     PROCESS_MEMORY_COUNTERS memory{}; memory.cb = (DWORD)sizeof(memory);
     uint64_t peak_mb = GetProcessMemoryInfo(GetCurrentProcess(), &memory, (DWORD)sizeof(memory))

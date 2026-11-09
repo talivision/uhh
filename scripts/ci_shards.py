@@ -45,6 +45,7 @@ REGRESS = ROOT / "scripts" / "regress.py"
 # (2026-11-06; a grouped unit's time sits on its selector). Refresh from `summarize`'s measured table.
 EST = {
     "check_api_contract": (45, 55), "check_api_threadfull": (60, 75),
+    "check_inline_install_failure": (5, 5),
     "check_session_agentipc": (20, 25),
     "check_logsite_review": (23, 29),
     "check_agent_safety": (35, 40), "check_agent_crt": (1, 1), "check_agent_review": (1, 1), "check_agent_unwind": (3, 3), "check_attach": (9, 13), "check_attach_new": (0, 0),

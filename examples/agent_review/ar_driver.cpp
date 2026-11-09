@@ -82,7 +82,10 @@ static int review_attach(DWORD pid, LONG config, const char *mode = nullptr) {
         return after <= before + 2 ? 0 : 4;
     }
     bool added = false;
-    if (mode && !strcmp(mode, "--review-stub")) {
+    const bool hookfail = mode && !strcmp(mode, "--review-hookfail");
+    if (hookfail) {
+        added = probe_add_symbol(s, "ar_target.exe!ar_shared_write_site", ar_on_shared_write, PROBE_INLINE) != 0;
+    } else if (mode && !strcmp(mode, "--review-stub")) {
         added = probe_add_symbol(s, "ar_target.exe!ar_shared_read_site", ar_on_vector_call, PROBE_BREAKPOINT) != 0;
     } else if (mode && !strcmp(mode, "--review-shared")) {
         added = probe_add_symbol(s, "ar_target.exe!ar_shared_write_site", ar_on_shared_write, PROBE_INLINE) &&
@@ -95,17 +98,24 @@ static int review_attach(DWORD pid, LONG config, const char *mode = nullptr) {
     HANDLE attached = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     bool ok = false;
     std::atomic<int> phase{0};
+    int run_ok = 0;
     std::thread runner([&] {
         ok = probe_attach(s, pid);
         SetEvent(attached);
         if (ok) {
             printf("{\"kind\":\"attached\"}\n"); fflush(stdout);
-            probe_run(s);
+            run_ok = probe_run(s);
             int idle = 0;
             if (phase.compare_exchange_strong(idle, 1)) { probe_report(s, stdout); phase = 2; }
         }
     });
     WaitForSingleObject(attached, INFINITE); CloseHandle(attached);
+    if (hookfail) {
+        runner.join();
+        if (!ok) probe_report(s, stdout);
+        probe_close(s);
+        return ok && run_ok ? 0 : 3;
+    }
     if (ok) { char line[8]; if (!fgets(line, sizeof(line), stdin)) {} }
     int idle = 0;
     if (!phase.compare_exchange_strong(idle, 3)) while (phase.load() != 2) Sleep(1);
