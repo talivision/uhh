@@ -1976,8 +1976,8 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     // the callback under SEH so an access violation (or any exception) inside user code
     // cannot take down the target. On a fault we skip register write-back, leaving the
     // target's registers untouched (the callback behaves as a no-op mutation).
-    // A hit is a callback run: while being unhooked the hook passes straight through and
-    // that pass is NOT counted (else a detach would report hits that have no callback/log).
+    // Live detach passes straight through without counting a callback. Orphan cleanup
+    // instead counts/drops each still-hooked call, since nobody can receive its callback.
     if (g_agent_threads.has(c.tid) || g_sweeper == (LONG)c.tid) return finish_hit(false, teb.error, teb.status);   // the agent's own work: see g_agent_threads, take_dead_slot
     const probe_callback cb = callbacks[index];
     if (!cb) return finish_hit(false, teb.error, teb.status);
@@ -2015,6 +2015,15 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     // the count ran its callback after the detach (its IPC then raised an exception nobody
     // handled, visible to the target).
     if (g_stopping || state->shared != shared || epoch != load_epoch(state->shared)) {
+        // A dead controller cannot receive callbacks, but a hook still installed during
+        // orphan cleanup must account its calls until the bytes are actually restored.
+        // Normal detach / an old channel still use the rollback below.
+        if (g_stopping && state->shared == shared && epoch == load_epoch(state->shared) &&
+            state->shared->controller_gone) {
+            InterlockedIncrement(&state->shared->log_dropped);
+            hit_settle(acct, false);                        // keep the hit, settle its unit/running
+            return finish_hit(false, teb.error, teb.status);
+        }
         if (probe_agent_tblock *b = acct.blk) {
             probe_agent_store64(&b->hits[index], probe_agent_load64(&b->hits[index]) - 1);
             b->running = b->running - 1;
@@ -2802,6 +2811,26 @@ static void restore_byte(uint64_t at, unsigned char original) {
         FlushInstructionCache(GetCurrentProcess(), (void *)p, 1);
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
+#if defined(_WIN64)
+// Active clearing can erase the status/address of a #DB already queued at debugger death.
+// Remember only UHH execute sites: a status-less data trap cannot be identified by its IP.
+static volatile LONG64 g_cleared[64];
+static volatile LONG g_cleared_n;
+static void remember_orphan_dr(const CONTEXT &c, DWORD mask) {
+    const uint64_t address[4] = {c.Dr0, c.Dr1, c.Dr2, c.Dr3};
+    for (int slot = 0; slot < 4; ++slot) {
+        if (!(mask & (1u << slot)) || !((c.Dr7 >> (slot * 2)) & 3) ||
+            ((c.Dr7 >> (16 + slot * 4)) & 3) || !address[slot]) continue;
+        const LONG n = g_cleared_n;
+        bool found = false;
+        for (LONG i = 0; i < n; ++i) if ((uint64_t)g_cleared[i] == address[slot]) found = true;
+        if (!found && n < 64) {
+            g_cleared[n] = (LONG64)address[slot];
+            InterlockedExchange(&g_cleared_n, n + 1);     // publish AFTER the address (one cleanup writer)
+        }
+    }
+}
+#endif
 // Change only our slot enables and addresses; DR6, foreign slots and all other state
 // are preserved by an active update. The VEH separately consumes our exception status.
 static void clear_orphan_dr(CONTEXT &c, DWORD mask) {
@@ -2887,7 +2916,15 @@ static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
     const bool step = (cx->Dr6 & (1u << 14)) && tid_listed(g.step_tids, g.step_count, GetCurrentThreadId());
     if ((hits & ~mask) || (cx->Dr6 & (1u << 13)) || ((cx->Dr6 & (1u << 14)) && !step))
         return EXCEPTION_CONTINUE_SEARCH;
-    if (!(hits & mask) && !step) return EXCEPTION_CONTINUE_SEARCH;
+    bool cleared_execute = false;
+#if defined(_WIN64)
+    if (!hits && !(cx->Dr6 & (1u << 14)) && g_lazy_dr) {
+        const LONG n = g_cleared_n;
+        for (LONG i = 0; i < n && !cleared_execute; ++i)
+            cleared_execute = (uint64_t)g_cleared[i] == at || (uint64_t)g_cleared[i] == get_ip(cx);
+    }
+#endif
+    if (!(hits & mask) && !step && !cleared_execute) return EXCEPTION_CONTINUE_SEARCH;
     // A live controller consumes our traps before the VEH. This orphaned hit can precede
     // the service thread's death notification, even while the debug port is being torn down.
     if (!g_lazy_dr) InterlockedExchange(&g_lazy_dr, 1);
@@ -2936,15 +2973,19 @@ static void guard_cleanup() {
     // Native context calls use a kernel APC without increasing the suspend count. Touch
     // DEBUG_REGISTERS only: never write a running thread's control/integer state back.
     const DWORD mask = (DWORD)g.dr_mask & 0xF;
-    const int passes = mask ? 2 : 1;
 #else
     // WOW64 Get/SetThreadContext implicitly suspends (ROADMAP R2). Leave those slots to
     // the VEH rather than exposing a temporary suspension to the program.
-    constexpr int passes = 1;
 #endif
-    for (int pass = 0; pass < passes; ++pass) {
-        // A pending debug event can restore its old DRs after the first pass.
-        if (pass) Sleep(200);
+    // Preserve the original two 200 ms grace intervals on EVERY backend. Inline hooks
+    // keep counting/dropping orphaned calls until removal; a no-DR session needs this too.
+    for (int pass = 0; pass < 2; ++pass, Sleep(200)) {
+        // Only native DR cleanup needs another scan for pending-event restoration.
+#if defined(_WIN64)
+        if (pass && !mask) continue;
+#else
+        if (pass) continue;
+#endif
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (snap == INVALID_HANDLE_VALUE) continue;
         THREADENTRY32 te{}; te.dwSize = sizeof(te);
@@ -2959,6 +3000,7 @@ static void guard_cleanup() {
 #if defined(_WIN64)
             CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
             if (mask && GetThreadContext(t, &c)) {
+                remember_orphan_dr(c, mask);               // before either DR7 or the addresses go away
                 clear_orphan_dr(c, mask);
                 SetThreadContext(t, &c);                        // failure: lazy VEH backstop
             }
@@ -3164,6 +3206,9 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *channel) {
     }
     InterlockedExchange(&g_orphan_cleaned, 0);   // a new session: guard it afresh
     InterlockedExchange(&g_lazy_dr, 0);
+#if defined(_WIN64)
+    InterlockedExchange(&g_cleared_n, 0);
+#endif
     if (g_guard_wake) SetEvent(g_guard_wake);    // the service thread takes the new controller handle
     InterlockedIncrement(&g_tblock_gen);   // a new (zeroed) channel: every thread claims a hit block again
     InterlockedExchange(&g_stopping, 0);   // a new session after a detach: callbacks run again
