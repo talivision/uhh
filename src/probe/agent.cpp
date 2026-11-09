@@ -3207,9 +3207,6 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *channel) {
     }
     InterlockedExchange(&g_orphan_cleaned, 0);   // a new session: guard it afresh
     InterlockedExchange(&g_lazy_dr, 0);
-#if defined(_WIN64)
-    InterlockedExchange(&g_cleared_n, 0);
-#endif
     if (g_guard_wake) SetEvent(g_guard_wake);    // the service thread takes the new controller handle
     InterlockedIncrement(&g_tblock_gen);   // a new (zeroed) channel: every thread claims a hit block again
     InterlockedExchange(&g_stopping, 0);   // a new session after a detach: callbacks run again
