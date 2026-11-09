@@ -8009,6 +8009,41 @@ def check_ctrl_call_hw_review():
 
 
 
+def check_image_verdict_review():
+    """cx15: image protection changes between hits; query a departing image after
+    the agent's unload notification, then reuse its address for a guarded private page.
+    Also require atomic retirement state (a runtime stress cannot prove race freedom)."""
+    d, t, dr = exe("ar_driver.exe"), exe("ar_target.exe"), exe("ctrl_dr_review.exe")
+    if not d or not t or not dr or not exe("ctrl_dll.dll"):
+        return missing_bin("image-verdict-review", "ar_driver/ar_target/ctrl_dr_review/ctrl_dll")
+    for case in ("imageprot", "imageunload"):
+        name = f"image-verdict-{case}"
+        try:
+            r, o = run([d, "--backend", "inline", "--probe", "ar_target.exe!ar_image_site=ar_on_image",
+                        "--", t, case], timeout=45)
+            logs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
+            res = next((x for x in o if x.get("kind") == "image_result"), {})
+            rep = report(o)
+            expected = (["ar image phase=0 read=1 write=1", "ar image phase=1 read=1 write=0",
+                         "ar image phase=2 read=0 write=0", "ar image phase=3 read=0 write=0"]
+                        if case == "imageprot" else
+                        ["ar image phase=0 read=1 write=0", "ar image phase=1 read=1 write=0",
+                         "ar image phase=2 read=0 write=0"])
+            record(name, r.returncode == 0 and res.get("bad") == res.get("faults") == 0 and
+                   logs == expected and rep.get("hits") == rep.get("logs_written") == len(expected) and
+                   rep.get("log_dropped") == 0 and rep.get("error") is None,
+                   f"rc={r.returncode} result={res} logs={logs} report={rep} stderr={r.stderr[-500:]}")
+        except Exception as e:
+            record(name, False, repr(e))
+    name = "report-retired-atomic"
+    try:
+        r, o = run([dr, name], timeout=10)
+        res = next((x for x in o if x.get("kind") == "retired_atomic"), {})
+        record(name, r.returncode == 0 and res.get("ok") == 1, f"rc={r.returncode} result={res}")
+    except Exception as e:
+        record(name, False, repr(e))
+
+
 def check_cdx_review():
     """Codex review of the controller (docs/ROADMAP.md "Codex controller review"), fixture
     examples/ctrlreview, ONE callback source per check, every backend:
@@ -13449,6 +13484,7 @@ def main():
     if want(check_ctrl_own_debug): check_ctrl_own_debug()
     if want(check_session_loop_review): check_session_loop_review()
     if want(check_ctrl_call_hw_review): check_ctrl_call_hw_review()
+    if want(check_image_verdict_review): check_image_verdict_review()
     if want(check_cdx_review): check_cdx_review()
     if want(check_api_contract): check_api_contract()
     if want(check_api_threadfull): check_api_threadfull()

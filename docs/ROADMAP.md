@@ -3244,3 +3244,18 @@ slots remain visible until hit. Removed the persistent cleared-execute-address e
 fallback and require an armed UHH address as well as a slot bit. Shared guard layout version
 32 publishes the address filter. Checks: `cx2-killwatch-hw`, `cx2-killwatch-reuse-hw`
 (target reuses DR0 for its own execute breakpoint). Windows validation pending.
+
+### cx15 image verdicts and live retirement reporting
+
+- Image protection verdicts now last one callback, like private/mapped memory. The
+  unload notification precedes unmapping: a query during notification can otherwise
+  cache the departing image under the new generation. Clear the image cache lazily on
+  the first region query after callback entry; own-stack reads and callbacks without
+  memory queries retain their existing path. Image reads cost one VirtualQuery per
+  distinct region per callback while it fits the existing 16-entry cache. Concurrent
+  protection changes within a callback remain the documented race.
+- `Probe::retired` uses the same atomic report value as the other live report fields.
+  Checks: `image-verdict-imageprot`, `image-verdict-imageunload`, and
+  `report-retired-atomic` (`check_image_verdict_review`, both architectures). The last
+  checks the atomic representation deterministically, rather than relying on a data
+  race to manifest in a timed stress run. Windows execution pending.
