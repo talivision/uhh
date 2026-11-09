@@ -3004,7 +3004,7 @@ static void guard_cleanup() {
             HANDLE t = OpenThread(access, FALSE, te.th32ThreadID);
             if (!t) continue;
 #if defined(_WIN64)
-            if (mask && te.th32ThreadID != self) clear_thread_dr(t);
+            if (mask) clear_thread_dr(t);       // the guard's own thread too: the controller armed it like any other
 #endif
             // Only release recorded controller holds, once per entry.
             if (!pass && te.th32ThreadID != self) resume_holds(g, t, te.th32ThreadID);
