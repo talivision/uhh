@@ -15,10 +15,11 @@
 #include <atomic>
 
 #define CB(n) extern "C" void n(probe_context *);
-CB(ar_on_shared_write) CB(ar_on_shared_read) CB(ar_on_vector_call) CB(ar_on_config_late)
+CB(ar_on_image) CB(ar_on_shared_write) CB(ar_on_shared_read) CB(ar_on_vector_call) CB(ar_on_config_late)
 CB(ar_on_logged) CB(ar_on_empty) CB(ar_on_cache) CB(ar_on_guarantee) CB(ar_on_epoch) CB(ar_on_vector)
 CB(ar_on_site) CB(ar_on_fault_ret) CB(ar_on_fault_noret) CB(ar_on_alloc) CB(ar_on_jump) CB(ar_on_after) CB(ar_on_prot) CB(ar_on_cf) CB(ar_on_cf_inner) CB(ar_on_dr_arm) CB(ar_on_d5_callee) CB(ar_on_d5_callee_fb) CB(ar_on_cfw_setup) CB(ar_on_cob) CB(ar_on_cfwl_setup) CB(ar_on_dr2_arm)
 static const struct { const char *name; probe_callback fn; } k_callbacks[] = {
+    {"ar_on_image", ar_on_image},
     {"ar_on_vector_call", ar_on_vector_call},
     {"ar_on_empty", ar_on_empty}, {"ar_on_cache", ar_on_cache}, {"ar_on_guarantee", ar_on_guarantee},
     {"ar_on_logged", ar_on_logged}, {"ar_on_epoch", ar_on_epoch}, {"ar_on_vector", ar_on_vector},

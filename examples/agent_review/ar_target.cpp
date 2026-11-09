@@ -353,10 +353,72 @@ static int wait_gate() {
     return ReadFile(GetStdHandle(STD_INPUT_HANDLE), &b, 1, &n, nullptr) && n == 1;
 }
 
+// Protection verdicts must not survive hits, even when queried during unload.
+#pragma section("arpage", read, write)
+__declspec(allocate("arpage")) __declspec(align(4096)) static unsigned char ar_image_page[8192] = {42};
+static void *ar_test_page;
+static volatile LONG ar_page_faults;
+AR_EXPORT intptr_t ar_image_site(void *p, intptr_t phase) {
+    return p ? phase + (intptr_t)g_zero : 0;
+}
+static LONG CALLBACK ar_page_veh(EXCEPTION_POINTERS *e) {
+    const auto *r = e->ExceptionRecord;
+    if ((r->ExceptionCode == EXCEPTION_GUARD_PAGE || r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) &&
+        r->NumberParameters >= 2 && r->ExceptionInformation[1] == (ULONG_PTR)ar_test_page)
+        InterlockedIncrement(&ar_page_faults);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+struct ArUnloadData { ULONG flags; const void *full, *name; void *base; ULONG size; };
+static VOID CALLBACK ar_page_unload(ULONG reason, const void *data, void *) {
+    if (reason == 2 && ((const ArUnloadData *)data)->base == ar_test_page)
+        ar_image_site(ar_test_page, 1); // agent's earlier notification already advanced its generation
+}
+static int ar_image_case(bool unload) {
+    int bad = 0;
+    HMODULE dll = unload ? LoadLibraryW(L"ctrl_dll.dll") : nullptr;
+    ar_test_page = unload ? (void *)dll : ar_image_page;
+    if (!ar_test_page) return 4;
+    void *veh = AddVectoredExceptionHandler(1, ar_page_veh);
+    if (!veh) return 5;
+    ar_image_site(ar_test_page, 0);
+    DWORD old = 0;
+    if (unload) {
+        using Register = LONG (NTAPI *)(ULONG, VOID (CALLBACK *)(ULONG, const void *, void *), void *, void **);
+        using Unregister = LONG (NTAPI *)(void *);
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        auto reg = (Register)GetProcAddress(nt, "LdrRegisterDllNotification");
+        auto unreg = (Unregister)GetProcAddress(nt, "LdrUnregisterDllNotification");
+        void *cookie = nullptr;
+        if (!reg || !unreg || reg(0, ar_page_unload, nullptr, &cookie) < 0) return 6;
+        if (!FreeLibrary(dll)) ++bad;
+        unreg(cookie);
+        void *p = VirtualAlloc(ar_test_page, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (p != ar_test_page) return 7;
+        if (!VirtualProtect(p, 4096, PAGE_READWRITE | PAGE_GUARD, &old)) ++bad;
+        ar_image_site(p, 2);
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(p, &mbi, sizeof(mbi)) || !(mbi.Protect & PAGE_GUARD)) ++bad;
+        VirtualFree(p, 0, MEM_RELEASE);
+    } else {
+        const DWORD protections[] = {PAGE_READONLY, PAGE_NOACCESS, PAGE_READWRITE | PAGE_GUARD};
+        for (int i = 0; i < 3; ++i) {
+            if (!VirtualProtect(ar_test_page, 4096, protections[i], &old)) ++bad;
+            ar_image_site(ar_test_page, i + 1);
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!VirtualQuery(ar_test_page, &mbi, sizeof(mbi)) || mbi.Protect != protections[i]) ++bad;
+            if (!VirtualProtect(ar_test_page, 4096, PAGE_READWRITE, &old)) ++bad;
+        }
+    }
+    RemoveVectoredExceptionHandler(veh);
+    printf("{\"kind\":\"image_result\",\"bad\":%d,\"faults\":%ld}\n", bad, ar_page_faults);
+    return bad || ar_page_faults ? 8 : 0;
+}
+
 int ar_review_case(const char *k);
 int main(int argc, char **argv) {
     const char *k = argc > 1 ? argv[1] : "";
     if (argc > 2 && !strcmp(argv[2], "--wait") && !wait_gate()) return 3;
+    if (!strcmp(k, "imageprot") || !strcmp(k, "imageunload")) return ar_image_case(!strcmp(k, "imageunload"));
     const int review = ar_review_case(k);
     if (review >= 0) return review;
     if (!strcmp(k, "where")) {
