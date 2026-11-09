@@ -351,9 +351,15 @@ convention:
 Copy target memory into `buffer`, or `buffer` into target memory. Return 1 only if the
 whole range was transferred.
 
-- The whole range is checked on every call (committed, readable / writable, no guard page); if
-  any part fails, nothing is read or written and the call returns 0. A guard page stays
-  armed; a read-only page (code included) is not made writable.
+- The whole range must be committed, readable / writable and free of guard pages. A
+  failed check returns 0 without transferring bytes or consuming a guard; read-only pages
+  (code included) are not made writable. Inline uses the calling thread's TEB committed
+  stack bounds without a query, caches image-region protection verdicts until module unload,
+  and queries other private/mapped regions once per region per callback. Stack capture uses
+  the same policy. `call_func` / `call_original` invalidate protection verdicts on return.
+  Protection changes by another thread during a callback are an accepted race with these
+  checks. Keep cached image-section protections stable while probing; callbacks changing
+  protection must use `call_func` before accessing that memory again.
 - `get_mem` of code under a probe returns the **program's** bytes, not UHH's INT3 or hook
   jump (on every backend, also for another backend's probe).
 - Target pointers are only meaningful through these functions: a breakpoint/hw callback

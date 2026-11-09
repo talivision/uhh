@@ -930,7 +930,14 @@ static int run_apicontract(const std::string &sc, int mode) {
     void *page = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!page) return 1;
     PVOID veh = AddVectoredExceptionHandler(1, api_veh);
-    CtrlApi((uintptr_t)mode, sc == "apiguard" ? page : (void *)&CtrlTock, page);
+    if (sc == "apiguard") {
+        void *pid = (void *)(uintptr_t)GetCurrentProcessId();
+        CtrlApi(0, page, pid);                       // warm this thread's private-region verdict
+        DWORD old = 0, ignored = 0;
+        if (!VirtualProtect(page, 4096, PAGE_READWRITE | PAGE_GUARD, &old)) return 1;
+        CtrlApi(1, page, pid);                       // next callback must re-query and refuse
+        VirtualProtect(page, 4096, old, &ignored);
+    } else CtrlApi((uintptr_t)mode, (void *)&CtrlTock, page);
     const int value = CtrlTock(5);                    // the very next instruction path must see a successful add
     if (veh) RemoveVectoredExceptionHandler(veh);
     VirtualFree(page, 0, MEM_RELEASE);

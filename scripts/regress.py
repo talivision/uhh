@@ -7864,7 +7864,8 @@ def check_api_contract():
                 if rep.get("error") is not None or rep.get("log_dropped") != 0 or rep.get("callbacks_interrupted", 0) != 0:
                     bad.append(f"report={rep}")
                 if sc == "apiguard":
-                    expected = "apiguard warm=1 armed=1 read=0 kept=1"
+                    expected = "apiguard read=0 kept=1"
+                    if "apiwarm warm=1" not in logs: bad.append(f"warm read failed: {logs}")
                 elif sc == "apiforeign":
                     expected = f"apiforeign mode={mode} found=1 add=0"
                 else:

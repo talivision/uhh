@@ -136,22 +136,21 @@ CTRL_EXPORT void ctrl_on_modforwardarm(probe_context *c) {
     send_log(c, "modforward arm=%d", ok);
 }
 
-// API-contract review: re-protect a region after a warm read in the SAME callback.
+// Warm a private-region verdict, then revisit it on a separate hit after the TARGET
+// guards it. A callback-local cache must expire before this second access.
 CTRL_EXPORT void ctrl_on_apiguard(probe_context *c) {
-    uint64_t pid = 0;
     const uint64_t addr = get_func_arg(c, 1);
-    call_func(c, "kernel32.dll!GetCurrentProcessId", &pid, 0);
-    HANDLE h = OpenProcess(PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION, FALSE, (DWORD)pid);
     unsigned char byte = 0;
-    const int warm = get_mem(c, addr, &byte, 1);
-    DWORD old = 0, ignored = 0;
-    const BOOL armed = h && VirtualProtectEx(h, (void *)(uintptr_t)addr, 4096, PAGE_READWRITE | PAGE_GUARD, &old);
+    if (get_func_arg(c, 0) == 0) {
+        send_log(c, "apiwarm warm=%d", get_mem(c, addr, &byte, 1));
+        return;
+    }
     const int read = get_mem(c, addr, &byte, 1);
+    HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, (DWORD)get_func_arg(c, 2));
     MEMORY_BASIC_INFORMATION mbi{};
     const int kept = h && VirtualQueryEx(h, (void *)(uintptr_t)addr, &mbi, sizeof(mbi)) && (mbi.Protect & PAGE_GUARD);
-    if (armed) VirtualProtectEx(h, (void *)(uintptr_t)addr, 4096, old, &ignored);
     if (h) CloseHandle(h);
-    send_log(c, "apiguard warm=%d armed=%d read=%d kept=%d", warm, armed != FALSE, read, kept);
+    send_log(c, "apiguard read=%d kept=%d", read, kept);
 }
 
 // Both modules export ctrl_on_tock, so name-only forwarding used to select ours silently.

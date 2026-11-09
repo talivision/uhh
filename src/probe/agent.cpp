@@ -36,12 +36,21 @@ static __forceinline LONG load_epoch(const probe_agent_shared *sh) {
 
 /* Callback memory helpers fail closed on bad target addresses. They never change
    page protections: executable writes belong to the hook installer, not hits. */
-/* A bad pointer must fail cleanly WITHOUT raising an exception the target could observe
-   (its vectored handlers see first-chance faults before our __except). Re-query on every
-   access: even within one callback, direct VirtualProtect calls can invalidate an earlier
-   check. The __try stays only for a region freed concurrently. */
-struct RegionCache { uintptr_t lo = 0, hi = 0; bool writable = false; };
+/* Own committed stack needs no query. Image-region verdicts survive hits until a DLL
+   unload; other regions are trusted only within this callback. Protection changes racing
+   those verdicts are outside the guarantee (see limitations.md). Target calls invalidate
+   protection verdicts too, so a callback can change protection through call_func safely. */
+struct RegionCache {
+    uintptr_t lo = 0, hi = 0;
+    LONG gen = 0;
+    bool writable = false, readable = false, executable = false, image = false;
+};
 static thread_local RegionCache t_region;
+// Loader unload notifications invalidate image-region and symbol-resolution caches.
+static volatile LONG g_unload_gen;
+static void *g_dll_cookie;
+struct ImageRegions { RegionCache r[16]; LONG gen = 0; uint32_t used = 0, next = 0; };
+static thread_local ImageRegions t_images;
 
 // The per-thread cache is implicit TLS -- which does not exist yet on a thread that is
 // still in its loader initialisation: LdrpInitializeThread allocates the thread's TLS
@@ -61,29 +70,58 @@ static bool tls_ready() {             // this module's implicit TLS exists on th
 }
 static RegionCache *region_cache() { return tls_ready() ? &t_region : nullptr; }
 
+// Shared by get_mem/set_mem and stack capture: no loader calls or allocations on a hit.
+static bool query_region(uintptr_t a, RegionCache &out) {
+    ImageRegions *images = tls_ready() && g_dll_cookie ? &t_images : nullptr;
+    const LONG gen = g_unload_gen;
+    if (images) {
+        if (images->gen != gen) { images->used = images->next = 0; images->gen = gen; }
+        for (uint32_t i = 0; i < images->used; ++i)
+            if (a >= images->r[i].lo && a < images->r[i].hi) { out = images->r[i]; return true; }
+    }
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery((void *)a, &mbi, sizeof(mbi))) return false;
+    out.lo = (uintptr_t)mbi.BaseAddress; out.hi = out.lo + mbi.RegionSize; out.gen = gen;
+    if (out.hi <= out.lo) out.hi = ~(uintptr_t)0;
+    const DWORD prot = mbi.Protect & 0xFF;
+    const bool committed = mbi.State == MEM_COMMIT && !(mbi.Protect & PAGE_GUARD);
+    out.writable = committed && (prot == PAGE_READWRITE || prot == PAGE_WRITECOPY ||
+                                prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY);
+    out.readable = out.writable || (committed && (prot == PAGE_READONLY || prot == PAGE_EXECUTE_READ));
+    out.image = mbi.Type == MEM_IMAGE;
+    out.executable = out.readable && out.image && (prot == PAGE_EXECUTE_READ ||
+                     prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY);
+    if (images && out.image && out.readable && g_unload_gen == gen) {
+        const uint32_t slot = images->used < 16 ? images->used++ : (images->next++ & 15);
+        images->r[slot] = out;
+    }
+    return true;
+}
 static bool range_ok(uintptr_t a, size_t n, bool write) {
     if (!n) return true;
     if (a + n < a) return false;
+    const NT_TIB *tib = reinterpret_cast<const NT_TIB *>(NtCurrentTeb());
+    if (a >= (uintptr_t)tib->StackLimit && a + n <= (uintptr_t)tib->StackBase) return true;
     RegionCache scratch, *cache = region_cache();
     if (!cache) cache = &scratch;
-    uintptr_t end = a + n;
+    const uintptr_t end = a + n;
     while (a < end) {
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (!VirtualQuery((void *)a, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
-        DWORD prot = mbi.Protect & 0xFF;
-        if ((mbi.Protect & PAGE_GUARD) || prot == PAGE_NOACCESS || prot == 0) return false;
-        bool w = prot == PAGE_READWRITE || prot == PAGE_WRITECOPY || prot == PAGE_EXECUTE_READWRITE ||
-                 prot == PAGE_EXECUTE_WRITECOPY;
-        bool r = w || prot == PAGE_READONLY || prot == PAGE_EXECUTE_READ;
-        if (!r || (write && !w)) return false;
-        cache->lo = (uintptr_t)mbi.BaseAddress;
-        cache->hi = cache->lo + mbi.RegionSize;
-        cache->writable = w;
+        if (a >= cache->lo && a < cache->hi &&
+            (!cache->image || (g_dll_cookie && cache->gen == g_unload_gen))) {
+            if (!cache->readable || (write && !cache->writable)) return false;
+            a = cache->hi; continue;
+        }
+        if (!query_region(a, *cache) || !cache->readable || (write && !cache->writable)) return false;
         a = cache->hi;
     }
     return true;
 }
-static void forget_region() { if (RegionCache *cache = region_cache()) *cache = {}; }
+static void forget_region(bool images = false) {
+    if (RegionCache *cache = region_cache()) {
+        *cache = {};
+        if (images) t_images.used = t_images.next = 0;
+    }
+}
 // The bytes each installed hook overwrote, so a callback reading code sees the PROGRAM's
 // bytes (as the breakpoint backend shows the original byte under its INT3 and hw changes
 // nothing), not the hook's jump. Published after the jump is written, withdrawn before it
@@ -156,7 +194,7 @@ static int local_read(void *, uint64_t address, void *buffer, size_t size, size_
     if (size && !addressable(address, size)) return 0;
     if (!range_ok((uintptr_t)address, size, false)) return 0;
     __try { std::memcpy(buffer, (const void *)(uintptr_t)address, size); *done = size; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { forget_region(); return 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { forget_region(true); return 0; }
     if (g_shadow_count) overlay_original((uintptr_t)address, buffer, size);
     if (shared && shared->int3_count) overlay_int3(address, buffer, size);
     return 1;
@@ -166,7 +204,7 @@ static int local_write(void *, uint64_t address, const void *buffer, size_t size
     if (size && !addressable(address, size)) return 0;
     if (!range_ok((uintptr_t)address, size, true)) return 0;
     __try { std::memcpy((void *)(uintptr_t)address, buffer, size); *done = size; return 1; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { forget_region(); return 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { forget_region(true); return 0; }
 }
 static const probe_ops local_ops{local_read, local_write};
 
@@ -275,11 +313,6 @@ extern "C" uint64_t get_func_arg(probe_context *c, size_t index) {
 #endif
 }
 
-// Module-unload generation (the loader's DLL notification, registered at init: watch_unloads)
-// and its registration cookie: caches of module-derived facts are valid while it is unchanged.
-static volatile LONG g_unload_gen;
-static void *g_dll_cookie;
-
 #if !defined(_WIN64)
 // True when addr follows a call instruction: E8 rel32, or FF /2 (call r/m32) in its
 // 2/3/6/7-byte forms. Caller holds an SEH guard (addr may be unmapped).
@@ -311,17 +344,9 @@ static bool looks_like_return(uint32_t addr) {
 // UNKNOWN, then the lowest OTHER. EBP is kept or
 // recovered (an EBP-framed or EBP-saving callee leaves the caller's EBP just below its
 // return slot) as a bound and tie-break only.
-// No-fault rule: every stack read is inside the hit thread's TEB stack bounds, and every
-// code/data read is inside a region VirtualQuery reported committed and readable -- a
-// per-capture cache, never trusted across captures. A value inside the thread's own stack is
-// classified from the TEB bounds (committed read/write by construction, never a guard or
-// no-access page: the guard page sits below StackLimit) without a query, the one shortcut that
-// is safe to keep across hits (perf6). Module code is NOT cached across captures: the program
-// can VirtualProtect its own still-loaded code to NO_ACCESS/NX/GUARD between hits, so each
-// capture re-queries it -- a changed protection then reads as unreadable and the bytes are
-// never touched (a cached "readable" verdict would fault, which the target's vectored handlers
-// would see, and touching a guard page would consume it). Scans are bounded (16 KiB per frame,
-// 128 queries). Nothing here can raise an exception the target's vectored handlers would see.
+// Stack reads use TEB committed-stack bounds. Other reads share query_region's image
+// cache and retain private/mapped verdicts only for this capture. Scans are bounded
+// (16 KiB per frame, 128 region lookups); the same protection-race policy as get_mem applies.
 struct X86Mem {
     struct Region { uint32_t lo, hi; bool read, exec; };
     Region r[16]{}; uint32_t used = 0, next = 0; int budget = 128;
@@ -337,18 +362,12 @@ struct X86Mem {
         if (a >= slo && a < shi) return keep(Region{slo, shi, true, false});
         if (budget <= 0) return nullptr;
         --budget;
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (!VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof(mbi))) return nullptr;
+        RegionCache region{};
+        if (!query_region((uintptr_t)a, region)) return nullptr;
         Region g{};
-        g.lo = (uint32_t)(uintptr_t)mbi.BaseAddress;
-        const uint64_t end = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-        g.hi = end > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)end;
-        const DWORD prot = mbi.Protect & 0xFF;
-        g.read = mbi.State == MEM_COMMIT && !(mbi.Protect & PAGE_GUARD) &&
-                 (prot == PAGE_READONLY || prot == PAGE_READWRITE || prot == PAGE_WRITECOPY ||
-                  prot == PAGE_EXECUTE_READ || prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY);
-        g.exec = g.read && mbi.Type == MEM_IMAGE &&
-                 (prot == PAGE_EXECUTE_READ || prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY);
+        g.lo = (uint32_t)region.lo;
+        g.hi = (uint32_t)region.hi;
+        g.read = region.readable; g.exec = region.executable;
         return keep(g);
     }
     // [a, a+n) lies in ONE readable region (and in executable image code when exec).
@@ -1098,7 +1117,7 @@ extern "C" int call_func(probe_context *c, const char *symbol, uint64_t *ret, in
 #else
     const int ok = call_raw(fn, a, ret, nargs) ? 1 : 0;
 #endif
-    forget_region();                                   // the callee may have changed protections
+    forget_region(true);                               // the callee may have changed protections
     return ok;
 }
 
@@ -1611,7 +1630,7 @@ extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
     scope->orig_ret = r;
     std::memcpy(scope->seen, seen, sizeof(seen));
     scope->orig_ran = true;
-    forget_region();                                   // the original may have changed protections
+    forget_region(true);                               // the original may have changed protections
     c->called_original = 1;
     if (out) *out = r;
     return 1;

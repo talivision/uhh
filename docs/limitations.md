@@ -254,6 +254,15 @@ data) prints on all backends.
   `inline-safe nearby` offsets when it finds some.
   *Workaround:* `PROBE_FALLBACK_HW`, breakpoint/hw on that site, a suggested nearby offset, or
   `PROBE_ALLOW_UNSAFE_SITE` if you are sure nothing reaches those bytes.
+- **Inline memory checks and stack capture cache protection verdicts.** The calling
+  thread's committed stack (`StackLimit..StackBase`, guard below `StackLimit`) needs no
+  query. Image-region verdicts survive callbacks until module unload; private/mapped
+  verdicts last one callback. Protection changes by other threads during a callback are
+  an accepted race: they can invalidate a checked range before access, including adding
+  a guard. Keep loaded image-section protections stable while probing. A callback that
+  changes protection must do so through `call_func`; target-call returns invalidate both
+  caches before another access. No guarantee covers re-protecting the committed stack or
+  a cached image section behind these checks.
 - **The callback runs on the target thread's stack** (📄 Transparency findings): several KiB
   per hit, so a thread close to its stack limit can overflow where it would not have, and
   committing deeper stack moves the TEB's StackLimit. A callback's own heap calls change heap
