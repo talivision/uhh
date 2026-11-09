@@ -132,6 +132,7 @@ void guard_sync(probe_session *s) {
     for (const auto &e : s->inplace_suspended) hold(e.first);   // an in-place step window's suspensions
     for (DWORD tid : s->detach_frozen) hold(tid);
     for (const auto &e : s->parked) hold(e.first);          // fairness parking (suspended by us)
+    for (const auto &w : s->ctx_watch) hold(w->tid);        // context round-trips (suspended by us)
     // The threads whose events are being handled: a 32-bit (WOW64) controller's
     // Get/SetThreadContext on another thread is an implicit suspend + resume inside the call,
     // so a controller killed in the middle of one leaves that thread suspended once with

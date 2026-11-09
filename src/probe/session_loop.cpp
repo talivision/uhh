@@ -152,6 +152,7 @@ static int our_suspends(const probe_session *s, DWORD tid) {
     for (const auto &e : s->inplace_suspended) n += e.first == tid;
     for (const auto &e : s->parked) n += e.first == tid;
     for (DWORD d : s->detach_frozen) n += d == tid;
+    for (const auto &w : s->ctx_watch) n += w->tid == tid;
     return n;
 }
 // The thread's suspend count (THREAD_SUSPEND_RESUME), -1 = unknown. (Not ThreadSuspendCount:
@@ -566,7 +567,7 @@ DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blocked, b
                          (int)s->parking, s->fair_period_ms, s->quiet_rounds);
         s->fair_window = now; s->fair_gaps = {};
     }
-    // 1 ms timer resolution only while an agent re-kick waits on this loop:
+    // 1 ms timer resolution only while a parked thread or a context watch waits on this loop:
     // process-wide, it also makes every Sleep(1) of the controller's own threads (the log
     // drainer) wake 15x as often -- a writer that never sees its queue empty kept a mid-run
     // probe_report (flush) waiting for the target to finish.
@@ -581,7 +582,7 @@ DWORD fair_tick(probe_session *s, std::chrono::steady_clock::duration blocked, b
     // measured), it only made this loop's own waits finer, and kept on through the dense events
     // it cost a lone hot thread ~30% on the VM (hw 144 -> 110 us/hit, breakpoint 90 -> 72). The
     // quiet time is sampled by polling (below); the stubs time themselves.
-    const bool fine = s->rekick_at;
+    const bool fine = !s->ctx_watch.empty() || s->rekick_at;
     if (fine != s->fine_timer) { if (fine) timeBeginPeriod(1); else timeEndPeriod(1); s->fine_timer = fine; }
     // A round's quiet time (its yielders spin until round_wake, no timer involved) is sampled
     // without the 1 ms timer: the loop polls (no wait) until it ends -- ~4 ms per round.
@@ -642,37 +643,38 @@ static std::unique_ptr<probe_session::CtxWatch> ctx_watch_begin(probe_session *s
     if (!GetThreadContext(t, &w->before)) { CloseHandle(t); return nullptr; }
     return w;
 }
-// Remember our changes until this thread's next exception event. Never hold a suspension
-// across ContinueDebugEvent: the program must observe only its own suspend count.
+// After the event was handled, before it is continued: if we changed the thread's context, hold
+// it (one suspension of ours) until the target has resumed it, then repair (ctx_watch_poll).
 static void ctx_watch_end(probe_session *s, std::unique_ptr<probe_session::CtxWatch> w) {
     if (!w) return;
     w->after.ContextFlags = CONTEXT_ALL;
     if (s->skip_continue || s->exited || s->detaching || !GetThreadContext(w->t, &w->after) || same_context(w->before, w->after)) {
         CloseHandle(w->t); return;
     }
+    guard_note_hold(s, w->tid);
+    if (SuspendThread(w->t) == (DWORD)-1) { CloseHandle(w->t); return; }
     if (trace_enabled()) std::fprintf(stderr, "  ctx-watch tid=%lu\n", (unsigned long)w->tid);
-    try { s->ctx_watch.push_back(std::move(w)); } catch (...) { CloseHandle(w->t); }
+    try { s->ctx_watch.push_back(std::move(w)); } catch (...) { ResumeThread(w->t); CloseHandle(w->t); }
 }
-// Idle polls never touch running threads; teardown only drops snapshots.
 void ctx_watch_poll(probe_session *s, bool all) {
-    if (!all) return;
-    for (const auto &w : s->ctx_watch) CloseHandle(w->t);
-    s->ctx_watch.clear();
-}
-static void ctx_watch_repair(probe_session *s, DWORD tid) {
-    for (auto it = s->ctx_watch.begin(); it != s->ctx_watch.end(); ) {
-        auto &w = **it;
-        if (w.tid != tid) { ++it; continue; }
+    for (size_t i = 0; i < s->ctx_watch.size(); ) {
+        auto &w = *s->ctx_watch[i];
+        const long n = suspend_count(w.t);
+        if (!all && n > our_suspends(s, w.tid)) { ++i; continue; }    // the target still holds it
         CONTEXT cur{}; cur.ContextFlags = CONTEXT_ALL;
-        if (GetThreadContext(w.t, &cur) && merge_context(cur, w.before, w.after)) {
-            if (s->dr_ever) enforce_owned_drs(s, tid, cur, false);
+        if (n >= 0 && GetThreadContext(w.t, &cur) && merge_context(cur, w.before, w.after)) {
+            // The target wrote back the context it captured during our event: ours again.
+            if (s->dr_ever) enforce_owned_drs(s, w.tid, cur, false);
             cur.ContextFlags = CONTEXT_ALL;
-            GuardTouch touch(s, tid);
+            GuardTouch touch(s, w.tid);
             SetThreadContext(w.t, &cur);
-            if (trace_enabled()) std::fprintf(stderr, "  ctx-repaired tid=%lu\n", (unsigned long)tid);
+            if (trace_enabled()) std::fprintf(stderr, "  ctx-repaired tid=%lu\n", (unsigned long)w.tid);
         }
-        CloseHandle(w.t);
-        it = s->ctx_watch.erase(it);
+        // Suspended again by the target meanwhile: it may have captured the context before our
+        // repair, to write it back later -- keep holding, look again after its resume.
+        if (!all && suspend_count(w.t) > our_suspends(s, w.tid)) { ++i; continue; }
+        ResumeThread(w.t); CloseHandle(w.t);
+        s->ctx_watch.erase(s->ctx_watch.begin() + (ptrdiff_t)i);
     }
 }
 static void forget_thread_holds(probe_session *s, DWORD tid) {
@@ -1623,10 +1625,7 @@ bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposition) {
     s->event_tid = event.dwThreadId;
     guard_note_hold(s, event.dwThreadId);            // see guard_sync: until the event is continued
     std::unique_ptr<probe_session::CtxWatch> watch;
-    if (event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
-        ctx_watch_repair(s, event.dwThreadId);
-        watch = ctx_watch_begin(s, event.dwThreadId);
-    }
+    if (event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) watch = ctx_watch_begin(s, event.dwThreadId);
     const bool ok = dispatch_event_impl(s, event, disposition);
     ctx_watch_end(s, std::move(watch));
     // Threads that raise events are the HOT ones (fairness rounds are for the others; one not yet
