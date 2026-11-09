@@ -362,11 +362,15 @@ data) prints on all backends.
   agent stop did not complete and hooks may admit new callbacks; stderr says so.
 - **Controller death:** an **attached** target in a session with **inline probes** is
   protected by the agent's controller-death guard (Lifecycle L1): the agent restores
-  breakpoints, resumes held threads and removes inline hooks. On both architectures the
-  VEH clears an orphaned DR slot at its next hit, after checking its address against UHH's
-  armed sites. An unused UHH slot remains armed and visible to the program's own debug-register
-  reads until it fires. Running-thread context updates cannot atomically preserve concurrent
-  target DR changes; WOW64 context calls also implicitly suspend (ROADMAP R2).
+  breakpoints, resumes held threads and removes inline hooks. On native x64 it also clears
+  UHH's DR slots actively, without suspending threads: per thread it reads the debug registers,
+  clears only slots that still hold the address UHH armed, writes them back, then re-reads and
+  restores any non-UHH change the thread made meanwhile. **Remaining race:** a thread that
+  changes its own DRs in the microseconds between the first read and the write can have that
+  change overwritten. On x86 / WOW64, context calls implicitly
+  suspend (ROADMAP R2), so cleanup is lazy only: the VEH clears an orphaned slot at its next
+  hit (also the backstop on x64), after checking its address against UHH's armed sites, and
+  an unused UHH slot stays armed and visible to the program's own debug-register reads.
   Guarded attach sessions retain at most 256 distinct hardware addresses (including return
   catches and install gates). Further new hardware addresses / return catches are refused;
   an inline install uses its thread-hold fallback. Already represented addresses remain usable.

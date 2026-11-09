@@ -2823,11 +2823,41 @@ static DWORD orphan_dr_mask(const CONTEXT &c) {
 static void clear_orphan_dr(CONTEXT &c, DWORD mask) {
     for (int slot = 0; slot < 4; ++slot) {
         if (!(mask & (1u << slot))) continue;
-        c.Dr7 &= ~((decltype(c.Dr7))3 << (slot * 2));
+        c.Dr7 &= ~(((decltype(c.Dr7))3 << (slot * 2)) | ((decltype(c.Dr7))0xF << (16 + slot * 4)));
         switch (slot) { case 0: c.Dr0 = 0; break; case 1: c.Dr1 = 0; break;
                         case 2: c.Dr2 = 0; break; default: c.Dr3 = 0; }
     }
 }
+#if defined(_WIN64)
+// Native x64 only: Get/SetThreadContext(DEBUG_REGISTERS) are kernel APCs that do not suspend
+// the thread (WOW64 calls do, so x86 keeps the lazy VEH clearing). Clears only slots that still
+// hold what UHH armed; a thread that changed its own DRs meanwhile has them written back.
+static DWORD64 dr7_slot_bits(DWORD mask) {
+    DWORD64 bits = 0;
+    for (int slot = 0; slot < 4; ++slot)
+        if (mask & (1u << slot)) bits |= ((DWORD64)3 << (slot * 2)) | ((DWORD64)0xF << (16 + slot * 4));
+    return bits;
+}
+static void clear_thread_dr(HANDLE t) {
+    CONTEXT before{}; before.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (!GetThreadContext(t, &before)) return;
+    const DWORD mask = orphan_dr_mask(before);
+    if (!mask) return;
+    CONTEXT w = before; clear_orphan_dr(w, mask);
+    if (!SetThreadContext(t, &w)) return;                       // failure: lazy VEH backstop
+    CONTEXT after{}; after.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (!GetThreadContext(t, &after)) return;
+    const DWORD64 ours = dr7_slot_bits(mask);
+    const uint64_t a0[4] = {before.Dr0, before.Dr1, before.Dr2, before.Dr3};
+    const uint64_t a1[4] = {after.Dr0, after.Dr1, after.Dr2, after.Dr3};
+    bool changed = (before.Dr7 & ~ours) != (after.Dr7 & ~ours);
+    for (int slot = 0; slot < 4; ++slot) if (!(mask & (1u << slot)) && a0[slot] != a1[slot]) changed = true;
+    if (!changed) return;
+    // The thread edited its own DRs concurrently: write its current values back, ours cleared.
+    clear_orphan_dr(after, orphan_dr_mask(after) & mask);
+    SetThreadContext(t, &after);
+}
+#endif
 // The program's byte under one of our armed INT3s (the INT3 table, sorted by address). The
 // controller may have died in the middle of a rewrite (int3_seq left odd): then a plain scan.
 static bool int3_original(uint64_t at, unsigned char &original) {
@@ -2948,20 +2978,31 @@ static void guard_cleanup() {
     for (LONG i = 0; i < n; ++i) if (shared->int3[i].address) restore_byte(shared->int3[i].address, shared->int3[i].original);
     InterlockedExchange(&g_lazy_dr, 1);                         // fallback if an update fails
     const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
-    // Context reads/writes are not atomic, even on native x64. Leave dormant
-    // slots to the VEH rather than overwriting concurrent target DR changes.
+#if defined(_WIN64)
+    const DWORD mask = (DWORD)g.dr_mask & 0xF;
+#endif
     // Preserve the original two 200 ms grace intervals on EVERY backend. Inline hooks
     // keep counting/dropping orphaned calls until removal; a no-DR session needs this too.
     for (int pass = 0; pass < 2; ++pass, Sleep(200)) {
-        if (pass) continue;
+#if defined(_WIN64)
+        if (pass && !mask) continue;          // only DR cleanup needs another scan
+#else
+        if (pass) continue;                   // WOW64: context calls suspend; lazy VEH only
+#endif
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (snap == INVALID_HANDLE_VALUE) continue;
         THREADENTRY32 te{}; te.dwSize = sizeof(te);
         for (BOOL more = Thread32First(snap, &te); more; more = Thread32Next(snap, &te)) {
             if (te.th32OwnerProcessID != pid) continue;
             DWORD access = THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION;
+#if defined(_WIN64)
+            access |= THREAD_GET_CONTEXT | THREAD_SET_CONTEXT;
+#endif
             HANDLE t = OpenThread(access, FALSE, te.th32ThreadID);
             if (!t) continue;
+#if defined(_WIN64)
+            if (mask && te.th32ThreadID != self) clear_thread_dr(t);
+#endif
             // Only release recorded controller holds, once per entry.
             if (!pass && te.th32ThreadID != self) resume_holds(g, t, te.th32ThreadID);
             CloseHandle(t);

@@ -205,7 +205,7 @@ static int run_watchdeath() {
     BOOL dbg = TRUE;
     for (int i = 0; i < 3000 && CheckRemoteDebuggerPresent(GetCurrentProcess(), &dbg) && dbg; ++i) Sleep(10);
     Sleep(1500);                               // inspect AFTER guard cleanup
-    if (!watchdeath_context()) return 4;        // both architectures: still armed, handled lazily
+    if (!watchdeath_context()) return 4;        // x64: cleared; x86: still armed, handled lazily
     co_watch_value = 41;
     co_watch_value += 1;                        // the UHH slot must now be disabled
     if (g_watch_reuse) watchdeath_execute();    // re-used DR0 must reach the program's VEH
