@@ -10,7 +10,7 @@
 #define AR_EXPORT extern "C" __declspec(dllexport) __declspec(noinline)
 static volatile LONG review_sink;
 AR_EXPORT void ar_pressure_site() { InterlockedIncrement(&review_sink); }
-AR_EXPORT void ar_vector_site() { InterlockedIncrement(&review_sink); }
+AR_EXPORT void ar_vector_site(int) { InterlockedIncrement(&review_sink); }
 AR_EXPORT void ar_epoch_site(ArEpochControl *) { InterlockedIncrement(&review_sink); }
 AR_EXPORT void ar_cache_site(void *) { InterlockedIncrement(&review_sink); }
 AR_EXPORT uint64_t ar_guard_buffer(void *p) {
@@ -267,12 +267,12 @@ int ar_review_case(const char *k) {
 #if defined(_WIN64)
             _xrstor64(area, state_mask);
             _xsave64(before, state_mask);                 // canonical baseline, including INIT bits
-            ar_vector_site();
+            ar_vector_site(phase == checks - 1 ? 1 : 0);
             _xsave64(area, state_mask);
 #else
             _xrstor(area, state_mask);
             _xsave(before, state_mask);
-            ar_vector_site();
+            ar_vector_site(phase == checks - 1 ? 1 : 0);
             _xsave(area, state_mask);
 #endif
             if (memcmp(area + 24, before + 24, 4) ||

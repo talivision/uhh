@@ -187,6 +187,23 @@ AR_CB void ar_on_epoch(probe_context *c) {
 }
 AR_CB void ar_on_vector(probe_context *c) {
     send_log(c, "ar vector");
+    if (get_func_arg(c, 0)) {
+        // Payload-only MMX corruption: CW/SW/tags/pointers are identical before/after.
+        // Comparing only those fields cannot decide whether restoration is necessary.
+        alignas(16) unsigned char legacy[512];
+#if defined(_WIN64)
+        _fxsave64(legacy);
+#else
+        _fxsave(legacy);
+#endif
+        for (int reg = 0; reg < 8; ++reg) legacy[32 + reg * 16] ^= 0x5A;
+#if defined(_WIN64)
+        _fxrstor64(legacy);
+#else
+        _fxrstor(legacy);
+#endif
+        return;
+    }
     int cp[4]; __cpuid(cp, 1);
     if (!(cp[2] & (1 << 27))) return;
     const uint64_t enabled = _xgetbv(0);
