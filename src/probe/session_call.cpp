@@ -539,6 +539,11 @@ void warn_record(probe_context *c, Probe *probe, const char *text, bool *warned)
 // After a callback: apply return_from (resume at the gadget, SP = the hit's) and return
 // true; or warn once when call_original ran but the hit will fall through into the body.
 bool apply_return_from(probe_session *s, Probe *probe, const probe_context &c, CONTEXT &native) {
+    // A target handler reached inside the original may have changed its stepping state.
+    // Do not resurrect the entry's TF when the callback finishes.
+    const auto *post_state = static_cast<const CallbackState *>(c.controller);
+    if (c.called_original && post_state && post_state->have_post)
+        native.EFlags = (native.EFlags & ~0x100u) | (post_state->post.EFlags & 0x100u);
     if (!c.returned) {
         if (c.called_original) warn_record(const_cast<probe_context *>(&c), probe,
                                            "call_original without return_from -- the original runs again on fall-through");
@@ -1108,7 +1113,6 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
 #else
     w.Eip = (DWORD)probe->address; w.Esp = (DWORD)c->hit_sp;
 #endif
-    w.EFlags &= ~0x100u;
     if (probe->flags & PROBE_HW) w.EFlags |= 0x10000u;                 // RF: the entry's own DR stays quiet once
     w.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS;
     if (!SetThreadContext(thread, &w)) { CloseHandle(thread); return 0; }
@@ -1125,11 +1129,16 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
     auto clear_slot = [&](bool running) {
         if (running) guard_note_hold(s, st->tid);
         if (running && SuspendThread(thread) == (DWORD)-1) return;
-        if (borrowed) {                                                // the probe's own DR, back at its site
+        CONTEXT live{}; live.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        // Only undo our execute return catch. The original may have installed the
+        // program's own breakpoint in this slot while it ran.
+        const bool ours = GetThreadContext(thread, &live) && dr_address(live, slot) == ret_addr &&
+                          !((live.Dr7 >> (16 + slot * 4)) & 0xFu);
+        if (ours && borrowed) {                                        // the probe's own DR, back at its site
             uint32_t rw = 0, len = 0; hw_rw_len(probe->flags, rw, len);
             set_dr_on_thread(thread, slot, probe->address, probe->active, rw, len);
-        } else {
-            set_dr_on_thread(thread, slot, 0, false);
+        } else if (ours) {
+            clear_dr_on_thread(thread, slot, ret_addr);
         }
         if (running) { ResumeThread(thread); guard_resync(s); }
     };
@@ -1258,14 +1267,16 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
         if (GetThreadContext(thread, &cur)) {          // keep any DR armed meanwhile, drop ours
             const DWORD64 mask = ((DWORD64)3 << (slot * 2)) | ((DWORD64)0xF << (16 + slot * 4));
             const auto keep = slot == 0 ? saved.Dr0 : slot == 1 ? saved.Dr1 : slot == 2 ? saved.Dr2 : saved.Dr3;
-            cur.Dr7 = (decltype(cur.Dr7))(cur.Dr7 & ~mask);
-            if (borrowed) {                            // the probe's own DR: as it was at the hit
+            const bool ours = dr_address(cur, slot) == ret_addr && !((cur.Dr7 >> (16 + slot * 4)) & 0xFu);
+            if (ours) cur.Dr7 = (decltype(cur.Dr7))(cur.Dr7 & ~mask);
+            if (ours && borrowed) {                            // the probe's own DR: as it was at the hit
                 cur.Dr7 = (decltype(cur.Dr7))(cur.Dr7 | (saved.Dr7 & mask));
                 (slot == 0 ? cur.Dr0 : slot == 1 ? cur.Dr1 : slot == 2 ? cur.Dr2 : cur.Dr3) = keep;
             }
             saved.Dr0 = cur.Dr0; saved.Dr1 = cur.Dr1; saved.Dr2 = cur.Dr2; saved.Dr3 = cur.Dr3; saved.Dr7 = cur.Dr7;
         }
         saved.Dr6 = 0;
+        saved.EFlags = (saved.EFlags & ~0x100u) | (st->post.EFlags & 0x100u);
         saved.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | UHH_CONTEXT_FP | CONTEXT_DEBUG_REGISTERS;
         SetThreadContext(thread, &saved);              // exactly as it was at the hit (CET: SSP stays popped,
                                                        // see apply_return_from / cet_after_original)

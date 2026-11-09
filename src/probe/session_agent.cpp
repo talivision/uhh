@@ -890,7 +890,7 @@ bool arm_gates_for_pending(probe_session *s) {
         for (DWORD tid : s->threads) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
             GuardTouch touch(s, tid);
-            if (t) { keep_queued_dr6(s, tid, t); set_dr_on_thread(t, slot, sites[i], true, 0, 0, s); CloseHandle(t); }
+            if (t) { keep_queued_dr6(s, tid, t); set_dr_on_thread(t, slot, sites[i], true, 0, 0, s, tid); CloseHandle(t); }
         }
         s->dr_used |= (uint8_t)(1u << slot); s->dr_ever |= (uint8_t)(1u << slot);
         s->gates.push_back({sites[i], slot});
@@ -1493,7 +1493,7 @@ bool agent_has_pending(const probe_session *s) {
     return false;
 }
 
-bool accept_agent_install(probe_session *s) {
+bool accept_agent_install(probe_session *s, bool completed_round) {
     MemoryBarrier();
     if (!s->shared) return true;
     std::string first_failure;      // every probe is accepted or retired, THEN a boot-time failure is reported
@@ -1522,12 +1522,16 @@ bool accept_agent_install(probe_session *s) {
             if (!p->runtime && first_failure.empty()) first_failure = why;
             continue;
         }
+        // INSTALLED is published inside the frozen write, before THAW/INSTALL_DONE.
+        // Polling may consume failures, but must not announce readiness or let callers
+        // run the target before the install round has released its holds.
+        if (!completed_round) continue;
         p->active = true;
         std::fprintf(stderr, "probe: active %s -> addr=0x%llx (inline)\n",
                      p->location.c_str(), (unsigned long long)p->address);
     }
     if (!first_failure.empty()) { set_error(s, first_failure); return false; }
-    s->inline_ready = true;
+    if (completed_round) s->inline_ready = true;
     return true;
 }
 
