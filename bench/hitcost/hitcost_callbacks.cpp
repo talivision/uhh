@@ -28,17 +28,23 @@ extern "C" __declspec(dllexport) void hitcost_empty(probe_context *c) {
     switch (m) {
     case M_GET_REG: g_sink += get_reg(c, PROBE_REG_CX); break;
     case M_GET_ARG: g_sink += get_func_arg(c, 0); break;
-    case M_GET_MEM: { uint8_t b[64]; if (get_mem(c, get_reg(c, PROBE_REG_SP), b, sizeof(b))) g_sink += b[0]; break; }
+    case M_GET_MEM: { uint8_t b[64]; if (get_mem(c, get_reg(c, PROBE_REG_SP), b, sizeof(b))) g_sink += b[0];
+                      else send_log(c, "FAIL get_mem"); break; }
     case M_SET_MEM: { uint64_t v = 0; uint64_t sp = get_reg(c, PROBE_REG_SP);
-                      if (get_mem(c, sp, &v, sizeof(void *))) set_mem(c, sp, &v, sizeof(void *)); break; }
+                      if (!get_mem(c, sp, &v, sizeof(void *)) || !set_mem(c, sp, &v, sizeof(void *)))
+                          send_log(c, "FAIL set_mem/read prerequisite"); break; }
     case M_SEND_LOG: send_log(c, "hit %llu", (unsigned long long)get_func_arg(c, 0)); break;
     case M_SEND_LOG_STACK: send_log_stack(c, "hit"); break;
-    case M_CALL_FUNC: { uint64_t r = 0; call_func(c, "kernel32.dll!GetCurrentProcessId", &r, 0); g_sink += r; break; }
+    case M_CALL_FUNC: { uint64_t r = 0;
+                       if (!call_func(c, "kernel32.dll!GetCurrentProcessId", &r, 0) || !r)
+                           send_log(c, "FAIL call_func");
+                       g_sink += r; break; }
     case M_COUNTER_PLAIN: g_plain_counter.fetch_add(1, std::memory_order_relaxed); break;
     case M_COUNTER_SHARED: g_shared_counter.fetch_add(1, std::memory_order_relaxed); break;
     // Detours-style replacement: run the original now and return its result (hit_site is
     // cdecl with one argument: x86 caller pops, so return_from nargs = 0).
-    case M_CALL_ORIGINAL: { uint64_t r = 0; if (call_original(c, 1, &r)) return_from(c, r, 0); break; }
+    case M_CALL_ORIGINAL: { uint64_t r = 0; if (call_original(c, 1, &r)) return_from(c, r, 0);
+                           else send_log(c, "FAIL call_original"); break; }
     // Every other call logs: the carried first records are retired by the controller while
     // the same thread goes on counting hits that end without a log (regress carry-exact).
     case M_LOG_ALT: { const uint64_t a = get_func_arg(c, 0); if (!(a & 1)) send_log(c, "hit %llu", (unsigned long long)a); break; }
@@ -47,8 +53,10 @@ extern "C" __declspec(dllexport) void hitcost_empty(probe_context *c) {
     case M_SET_REG: set_reg(c, PROBE_REG_AX, ++g_sink); break;
     // Control op: the documented return-hook idiom -- read the return address at the entry and
     // add a one-shot breakpoint probe there (it fires once on the return and retires).
-    case M_ADD_ONCE: { uint64_t ret = 0; if (get_mem(c, get_reg(c, PROBE_REG_SP), &ret, sizeof(void *)))
-                           probe_add_address(get_session(c), ret, hitcost_ret, PROBE_BREAKPOINT | PROBE_ONCE); break; }
+    case M_ADD_ONCE: { uint64_t ret = 0;
+                      if (!get_mem(c, get_reg(c, PROBE_REG_SP), &ret, sizeof(void *)) ||
+                          !probe_add_address(get_session(c), ret, hitcost_ret, PROBE_BREAKPOINT | PROBE_ONCE))
+                          send_log(c, "FAIL add_once"); break; }
     default: break;
     }
 }

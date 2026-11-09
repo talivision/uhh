@@ -1120,8 +1120,27 @@ def _filefail_run(args, env, timeout):
         out, err = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
-        subprocess.run(["taskkill", "/f", "/t", "/pid", str(p.pid)], capture_output=True)
-        out, err = p.communicate()
+        try:
+            killer = subprocess.Popen(["taskkill", "/f", "/t", "/pid", str(p.pid)],
+                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL)
+            try:
+                killer.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                killer.kill()
+                killer.wait(timeout=5)
+                p.kill()
+            if killer.returncode != 0 and p.poll() is None:
+                p.kill()
+        except (OSError, subprocess.TimeoutExpired):
+            if p.poll() is None:
+                p.kill()
+        try:
+            out, err = p.communicate(timeout=10)
+        except subprocess.TimeoutExpired as e:
+            p.kill()
+            # A surviving descendant may still own the pipes. Never wait for EOF here.
+            raise RuntimeError("controller timeout: pipes did not close after bounded cleanup") from e
     recs, text, _ = stdout_split(out)
     errtext = err.decode("utf-8", "replace")
     m = re.search(r"^probe: logs -> (.+?)\r?$", errtext, re.M)
@@ -1136,8 +1155,10 @@ def _filefail_run(args, env, timeout):
                     except ValueError:
                         file_recs.append({})
             path.unlink()
-        except OSError:
-            pass
+        except OSError as e:
+            raise RuntimeError(f"session file unreadable or cleanup failed: {path}") from e
+    else:
+        raise RuntimeError("controller did not identify a session file")
     logs = [r for r in recs if r.get("kind") == "probe_log"]
     rep = next((r for r in recs if r.get("kind") == "probe_report"), {})
     return p.returncode, timed_out, logs, text, rep, file_recs, errtext
@@ -4085,8 +4106,8 @@ def check_hitcost_methods():
     it says: every hitcost method on every backend, small runs. hitcost-methods-<b>: per method,
     exit 0, the target's timing line, hits == calls, logs == calls for send_log/send_log_stack
     (else 0), nothing dropped, and for add_once (a one-shot breakpoint probe added from the
-    callback at each hit's return address) the one-shot probes' hits sum to calls -- each fired
-    exactly once. hitcost-shared-<b>: the same for empty/counter_plain/counter_shared with
+    callback at each hit's return address) exactly calls retired one-shot probes, each with
+    one hit. Method failures emit unexpected logs. hitcost-shared-<b>: the same for empty/counter_plain/counter_shared with
     hitcost_driver_shared (the callbacks module opted in to UHH_SHARED: breakpoint/hw callbacks run
     from the controller's copy of the agent DLL). An unknown --method is refused (exit 2)."""
     d, ds, t = exe("hitcost_driver.exe"), exe("hitcost_driver_shared.exe"), exe("hitcost_target.exe")
@@ -4104,12 +4125,19 @@ def check_hitcost_methods():
                     ps = probes(o)
                     hits = ps[0].get("hits") if ps else None
                     once = sum(p.get("hits") or 0 for p in ps[1:])
+                    once_ok = (len(ps[1:]) == n and all(
+                        p.get("hits") == 1 and p.get("backend") == "breakpoint" and
+                        p.get("active") is False for p in ps[1:])) if m == "add_once" else not ps[1:]
                     logs = sum(1 for x in o if x.get("kind") == "probe_log")
                     tl = next((x for x in o if x.get("kind") == "target"), {})
                     want_logs = n if m.startswith("send_log") else 0
                     if not (r.returncode == 0 and tl.get("ns_per_call") is not None and hits == n and logs == want_logs
-                            and report(o).get("log_dropped") == 0 and once == (n if m == "add_once" else 0)):
+                            and report(o).get("log_dropped") == 0 and once_ok
+                            and report(o).get("callbacks_interrupted") == 0
+                            and report(o).get("error") is None and report(o).get("app_exit") == 0
+                            and once == (n if m == "add_once" else 0)):
                         bad.append(f"{m}: rc={r.returncode} hits={hits} logs={logs} once={once} "
+                                   f"once_probes={len(ps[1:])} once_ok={once_ok} "
                                    f"dropped={report(o).get('log_dropped')} timing={tl.get('ns_per_call')}")
                     else:
                         seen += 1
@@ -7474,7 +7502,7 @@ def check_logsite_review():
             rc, timeout, logs, text, rep, file_logs, err = _filefail_run(
                 [trace, "--backend", bk, "-p", "logstream_target.exe!LogSite:d", "--", stream], env, 90)
             record(name, not timeout and rep.get("log_dropped", 0) > 0 and
-                   rep.get("logs_written") == len(file_logs) and
+                   rep.get("logs_written") == len(file_logs) and len(file_logs) >= 7 and
                    [x.get("seq") for x in file_logs] == list(range(len(file_logs))) and
                    rep.get("hits") == rep.get("logs_written", 0) + rep.get("log_dropped", 0) +
                    rep.get("callbacks_interrupted", 0) and "incomplete" in (rep.get("error") or ""),
@@ -8006,13 +8034,32 @@ def check_cdx_review():
     for bk in ("breakpoint", "hw", "inline"):
         name = f"cdx-codeprot-{bk}"
         try:
-            res, logs, rows, bad = go("codeprot", bk, [])
+            r, o = run([d, "--scenario", "codeprot", "--backend", bk, "--", t, "codeprot"], timeout=180)
+            res = next((x for x in o if x.get("kind") == "ctrl_result"), {})
+            rep = report(o)
+            leaf_logs = [x for x in o if x.get("kind") == "probe_log" and x.get("message") == "leaf"]
+            bad = []
+            if r.returncode != 0 or rep.get("app_exit") != 0 or rep.get("error") is not None:
+                bad.append(f"rc={r.returncode} report={rep}")
+            if rep.get("log_dropped") != 0 or rep.get("callbacks_interrupted") != 0:
+                bad.append(f"lost captures: {rep}")
+            fails = [x.get("message") for x in o if x.get("kind") == "probe_log" and
+                     "FAIL" in str(x.get("message", ""))]
+            if fails: bad.append(f"callback_fail={fails[:2]}")
             if res.get("guard_set") != 1: bad.append(f"guard_set={res.get('guard_set')}")
             if res.get("guard_intact") != 1: bad.append(f"guard_intact={res.get('guard_intact')} (a touch consumed the guard page)")
             if res.get("guard_faults") != 0: bad.append(f"guard_faults={res.get('guard_faults')}")
             if res.get("na_faults") != 0: bad.append(f"na_faults={res.get('na_faults')}")
-            leaf = sum(1 for m in logs if m == "leaf")
-            if leaf != res.get("hits"): bad.append(f"stack logs={leaf} (want {res.get('hits')})")
+            if res.get("na_set") != 1: bad.append(f"na_set={res.get('na_set')}")
+            leaf = len(leaf_logs)
+            if leaf != 450 or res.get("hits") != 450 or rep.get("hits") != 450:
+                bad.append(f"stack logs={leaf} target={res.get('hits')} report_hits={rep.get('hits')} (want 450)")
+            for i, log in enumerate(leaf_logs):
+                stack = log.get("stack")
+                if (not isinstance(stack, list) or not stack or "CtrlCodeLeaf" not in str(stack[0]) or
+                        not any("CtrlCodeMid" in str(f) for f in stack[1:])):
+                    bad.append(f"capture {i}: missing leaf/caller frames: {stack!r}")
+                    break
             record(name, not bad, " ".join(bad) or f"guard intact, no fault, {leaf} honest stack logs")
         except Exception as e:
             record(name, False, repr(e))
@@ -11086,7 +11133,7 @@ def check_gated_guardwin(threads=4, rounds=4):
     close/read probes -- so the session has the agent, and the attach arms its breakpoint/hw
     probes only once the agent's controller-death guard is up. A module that LOADS meanwhile
     must still be probed before its code runs: exactly one flag hit and one override, reads on.
-      stall-<b>: the agent's init returns 1.5 s after its service thread runs (agent test knob
+      stall-<b>: the agent's init returns 30 s after its service thread runs (agent test knob
         UHH_TEST_INIT_STALL_MS, the target's environment). The service thread's INSTALL_DONE
         reports the inline probes active, the gate is released and configparse.dll loads
         before the init returns. Full gated-e2e judge. Was: the flag probe was skipped at the
@@ -11096,6 +11143,8 @@ def check_gated_guardwin(threads=4, rounds=4):
       early-<b>: the gate is released as soon as the attach returns, before the agent is
         loaded: configparse.dll loads while the guard is not up. The inline probes go active
         whenever they do, so only the flag, the program's result and stderr are judged.
+    Both rows require target channel snapshots bracketing LoadLibrary: no init return,
+    service ready throughout stall, unavailable throughout early. Missing the window FAILS.
     UHH_GUARDWIN_N=N runs each row N times (default 3)."""
     g, a, p = exe("gated_config.exe"), exe("uhh_attach.exe"), exe("probe_app.exe")
     if not g or not a or not p:
@@ -11113,7 +11162,11 @@ def check_gated_guardwin(threads=4, rounds=4):
             for fb in ("breakpoint", "hw"):
                 name = f"gated-guardwin-{when}-{E2E_SHORT[fb]}"
                 combo = (fb, "inline", "inline", "inline")
-                env = dict(os.environ, UHH_TEST_INIT_STALL_MS="1500") if when == "stall" else None
+                env = dict(os.environ, UHH_GUARDWIN_CHECK=when)
+                if when == "stall":
+                    env["UHH_TEST_INIT_STALL_MS"] = "30000"
+                else:
+                    env.pop("UHH_TEST_INIT_STALL_MS", None)
                 for _ in range(n):
                     truth_path = tmp / "truth.jsonl"
                     try:
@@ -11144,7 +11197,14 @@ def check_gated_guardwin(threads=4, rounds=4):
                             ok = not bad
                             detail = (f"flag={fl.get('hits')}/{rep.get('overrides')} reads_enabled={ap.get('reads_enabled')} "
                                       f"reads={ap.get('successful_reads')}" + ("" if ok else " BAD: " + " | ".join(bad)))
-                        record(name, ok, detail)
+                        windows = [x for x in t_objs if x.get("kind") == "guardwin"]
+                        want_ready = 1 if when == "stall" else 0
+                        window_ok = (len(windows) == 1 and
+                                     windows[0].get("ready_before") == want_ready and
+                                     windows[0].get("ready_after") == want_ready and
+                                     windows[0].get("returns_before") == 0 and
+                                     windows[0].get("returns_after") == 0)
+                        record(name, ok and window_ok, detail + f" window={windows} verified={window_ok}")
                     except Exception as e:
                         record(name, False, repr(e)[:300])
     except Exception as e:

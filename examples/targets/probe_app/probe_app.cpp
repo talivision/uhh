@@ -66,6 +66,7 @@
 #include <vector>
 #include <safetyhook.hpp>
 #include "configparse.h"
+#include "../../../include/probe_agent_shared.hpp"
 
 using NtRead = LONG (NTAPI *)(HANDLE, const void *, void *, SIZE_T, SIZE_T *);
 struct ObjectAttributes { ULONG Length; HANDLE RootDirectory; void *ObjectName; ULONG Attributes;
@@ -501,7 +502,36 @@ int main(int argc, char **argv) try {
 
     // 3. Late-load the config library and parse the shipped config.
     require(parse_early || GetModuleHandleA("configparse.dll") == nullptr, "configparse.dll loaded before the gate");
+    // Guard-window regression only: inspect the actual channel on BOTH sides of the
+    // load. Read monotonic readiness/return counters, not wall-clock scheduling guesses.
+    char guardwin[16]{};
+    const bool check_window = GetEnvironmentVariableA("UHH_GUARDWIN_CHECK", guardwin, sizeof(guardwin)) != 0;
+    struct WindowState { LONG ready, returns; };
+    const auto window_state = [&]() -> WindowState {
+        if (!check_window) return {-1, -1};
+        wchar_t name[64]; probe_agent_mapping_name(GetCurrentProcessId(), name);
+        HANDLE channel = OpenFileMappingW(FILE_MAP_READ, FALSE, name);
+        if (!channel) {
+            require(GetLastError() == ERROR_FILE_NOT_FOUND, "guardwin open channel");
+            return {0, 0}; // No channel yet means no agent/guard can be running.
+        }
+        const auto *view = static_cast<const probe_agent_shared *>(
+            MapViewOfFile(channel, FILE_MAP_READ, 0, 0, sizeof(probe_agent_shared)));
+        require(view && view->magic == PROBE_AGENT_MAGIC && view->version == PROBE_AGENT_VERSION,
+                "guardwin channel unavailable");
+        WindowState state{view->service_ready, view->init_returns};
+        UnmapViewOfFile(view); CloseHandle(channel);
+        return state;
+    };
+    const auto before = window_state();
     HMODULE dll = LoadLibraryA((exe_directory() + "configparse.dll").c_str());
+    const auto after = window_state();
+    if (check_window) {
+        std::printf("{\"kind\":\"guardwin\",\"ready_before\":%ld,\"ready_after\":%ld,"
+                    "\"returns_before\":%ld,\"returns_after\":%ld}\n",
+                    before.ready, after.ready, before.returns, after.returns);
+        std::fflush(stdout);
+    }
     require(dll != nullptr, "load configparse.dll");
     auto parse = (parse_config_fn)GetProcAddress(dll, "ParseConfig"); require(parse != nullptr, "ParseConfig");
     parsed_config parsed{};
