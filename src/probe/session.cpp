@@ -331,7 +331,10 @@ extern "C" int probe_add_symbol_cfg(probe_session *s, const char *location, prob
                     if (!arm_probe(s, *raw, kv.second)) { raw->retired = true; return scope.done(0); }
                     break;
                 }
-            if (type == PROBE_INLINE && raw->address && !kick_agent(s)) { raw->retired = true; return scope.done(0); }
+            if (type == PROBE_INLINE && raw->address) {
+                if (!kick_agent(s)) { raw->retired = true; return scope.done(0); }
+                if (!confirm_runtime_inline(s, *raw)) return scope.done(0);
+            }
         }
         return 1;
     } catch (const std::exception &e) { set_error(s, e.what()); return scope.done(0); }
@@ -365,6 +368,7 @@ static int add_absolute(probe_session *s, uint64_t address, probe_callback cb, u
         bool ok = (flags & PROBE_INLINE) ? register_runtime_inline(s, *raw) && resolve_inline(s, *raw, 0) && kick_agent(s)
                 : (flags & PROBE_HW)     ? arm_hw(s, *raw, 0) : arm_breakpoint(s, *raw, 0);
         if (!ok) raw->retired = true;
+        if (ok && (flags & PROBE_INLINE)) ok = confirm_runtime_inline(s, *raw);
         return scope.done(ok ? 1 : 0);
     } catch (const std::exception &e) { set_error(s, e.what()); return scope.done(0); }
 }
@@ -556,9 +560,17 @@ static void test_die_after_hit(probe_session *s, const DEBUG_EVENT &ev) {
     std::string listed;
     for (LONG i = 0; g && i < g->held_count && i < (LONG)PROBE_AGENT_GUARD_TIDS; ++i)
         listed += (listed.empty() ? "" : ",") + std::to_string((unsigned long)g->held_tids[i]);
-    std::fprintf(stderr, "probe: test: dying %ld ms after continuing thread %lu (guard enabled=%ld held=[%s]) continued_tick=%llu dying_tick=%llu\n",
+    // Diagnose a debug freeze during this deliberately unserviced delay. Dequeue only
+    // immediately before death: continuing it would change the test's no-event window.
+    DEBUG_EVENT pending{};
+    const BOOL queued = WaitForDebugEvent(&pending, 0);
+    std::fprintf(stderr, "probe: test: dying %ld ms after continuing thread %lu (guard enabled=%ld held=[%s]) continued_tick=%llu dying_tick=%llu "
+                         "path=probe_run/test_die_after_hit/Sleep pending=%lu pending_tid=%lu exception=0x%lx at=0x%llx\n",
                  ms, (unsigned long)ev.dwThreadId, g ? (long)g->enabled : -1L, listed.c_str(),
-                 (unsigned long long)continued_tick, (unsigned long long)GetTickCount64());
+                 (unsigned long long)continued_tick, (unsigned long long)GetTickCount64(),
+                 queued ? (unsigned long)pending.dwDebugEventCode : 0UL, (unsigned long)pending.dwThreadId,
+                 queued && pending.dwDebugEventCode == EXCEPTION_DEBUG_EVENT ? (unsigned long)pending.u.Exception.ExceptionRecord.ExceptionCode : 0UL,
+                 queued && pending.dwDebugEventCode == EXCEPTION_DEBUG_EVENT ? (unsigned long long)(uintptr_t)pending.u.Exception.ExceptionRecord.ExceptionAddress : 0ULL);
     std::fflush(nullptr);
     TerminateProcess(GetCurrentProcess(), 96);
 }
@@ -601,6 +613,7 @@ extern "C" int probe_run(probe_session *s) {
         }
         s->run_phase = "draining the log ring";
         drain_agent_logs(s);
+        if (!accept_agent_install(s, false)) break;
         s->run_phase = "in the debug loop";
         if (guard_pending(s) && s->guard_since && GetTickCount64() - s->guard_since > 5000 &&
             !guard_set_ready(s, "agent not ready within 5 s")) break;
@@ -664,6 +677,7 @@ extern "C" int probe_run(probe_session *s) {
     flush_log_writer(s);
     if (!s->exited && s->pi.hProcess && !s->attached) TerminateProcess(s->pi.hProcess, 3);
     if (s->exited && has_inline(s) && !s->inline_ready) set_error(s, "target exited before inline probes were ready");
+    accept_agent_install(s, false);
     int result = (s->exited || s->detached) && s->error.empty();
     fibers.end();
     if (g_ctrl_runs.fetch_sub(1) == 1 && g_runs_done) SetEvent(g_runs_done);   // a closing console may go on
@@ -744,9 +758,9 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
             ? probe_agent_hits(s->shared, index) : p->hits.load();
         hits += count; active += armed; ++visible;
         std::fputs("{\"kind\":\"probe\",\"location\":", out); json_string(out, p->location);
-        std::fprintf(out, ",\"backend\":\"%s\",\"active\":%s,\"hits\":%llu}\n",
+        std::fprintf(out, ",\"backend\":\"%s\",\"active\":%s,\"hits\":%llu,\"retired\":%s}\n",
                      flags & PROBE_INLINE ? "inline" : flags & PROBE_HW ? "hw" : "breakpoint",
-                     armed ? "true" : "false", (unsigned long long)count);
+                     armed ? "true" : "false", (unsigned long long)count, p->retired ? "true" : "false");
     }
     PROCESS_MEMORY_COUNTERS memory{}; memory.cb = (DWORD)sizeof(memory);
     uint64_t peak_mb = GetProcessMemoryInfo(GetCurrentProcess(), &memory, (DWORD)sizeof(memory))

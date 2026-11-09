@@ -81,6 +81,7 @@ struct Probe {
     std::vector<unsigned char> follow;
     struct Probe *alias_of = nullptr;
     bool runtime = false;      // added after launch: an install failure is reported, not fatal
+    bool deferred_site_refused = false; // accepted runtime submission retired by deferred safety vetting
     bool vetted = false;       // pre-hook check done for this inline install
     uint64_t rva = 0, base = 0, address = 0;
     ReportValue<uint64_t> hits{0};
@@ -374,9 +375,8 @@ struct probe_session {
     // since is the target's own. A released address is never the target's otherwise-forever.
     struct HwUnsettled { CONTEXT regs{}; bool have_regs = false; std::unordered_set<uint64_t> addrs; };
     std::unordered_map<DWORD, HwUnsettled> hw_unsettled;
-    // Every address we ever put in a debug register (probes, gates, call_original's return
-    // catch): an enabled slot of ours holding any OTHER address was written by the target
-    // itself (its own hardware breakpoint, ROADMAP A7) -- we move our probe out of its way.
+    // Historical addresses for stale-event/cleanup recognition. Live ownership also
+    // requires an active arm or an unsettled release on that thread (ROADMAP A7).
     std::unordered_set<uint64_t> hw_armed_ever;
     bool warned_dr_full = false;
     DWORD hw_stale_tid = 0;                    // the thread of the event being handled, if it was unsettled
@@ -411,6 +411,7 @@ struct probe_session {
     int shadow_stack = -1;                     // target has hardware shadow stacks (CET): -1 unknown, 0/1
     uint64_t ret_gadgets = 0;                  // return_from: `ret` / `ret N` gadgets in the target
     bool warned_cb_fault = false;              // one stderr warning for a faulting controller-side callback
+    DWORD inline_add_wait_tid = 0;              // hold this callback while a runtime inline add confirms
     DWORD cb_tid = 0;                          // thread whose callback / IPC is being serviced (0 = none)
     const uhh_session::Probe *cb_probe = nullptr;           // whose callback runs (an IPC add: its inline origin probe)
     std::wstring agent_copy;                   // per-session copy of the agent DLL (UHH_SHARED), deleted at close
@@ -684,12 +685,13 @@ void release_unclaimed_agent_mapping(probe_session *s);
 bool create_agent_channel(probe_session *s);
 bool register_runtime_inline(probe_session *s, Probe &p);
 bool inline_hold_needed(const probe_session *s);
-bool agent_thread(probe_session *s, DWORD tid);
+bool agent_thread(const probe_session *s, DWORD tid);
 void hold_thread(probe_session *s, DWORD tid);
 bool arm_gates_for_pending(probe_session *s);
-bool handle_gate(probe_session *s, const DEBUG_EVENT &event, bool &handled);
+bool handle_gate(probe_session *s, const DEBUG_EVENT &event, bool &handled, bool *failed = nullptr);
 void release_held(probe_session *s, const char *why);
 bool kick_agent(probe_session *s);
+bool confirm_runtime_inline(probe_session *s, Probe &p);
 bool reuse_target_agent(probe_session *s);
 bool bind_pending_shared(probe_session *s);
 void retarget_pending(probe_session *s);
@@ -700,6 +702,7 @@ HANDLE create_remote_thread_boosted(HANDLE process, LPTHREAD_START_ROUTINE entry
 bool start_agent_load(probe_session *s);
 bool start_agent_init(probe_session *s);
 bool early_agent(probe_session *s, const DEBUG_EVENT &event, bool &ok);
+bool accept_agent_install(probe_session *s, bool completed_round = true);
 bool agent_has_pending(const probe_session *s);
 bool complete_remote_thread(probe_session *s, DWORD result);
 // session_bp.cpp
@@ -733,6 +736,7 @@ uint64_t syscall_trampoline(probe_session *s, Probe &p);
 void hw_rw_len(uint32_t flags, uint32_t &rw, uint32_t &len);
 uint64_t dr_address(const CONTEXT &c, int slot);
 bool hw_released_on(const probe_session *s, DWORD tid, uint64_t address);
+bool hw_slot_is_ours(const probe_session *s, DWORD tid, const CONTEXT &c, int slot);
 bool target_owns_slot(const probe_session *s, DWORD tid, const CONTEXT &c, int slot);
 uint8_t target_slots_any(const probe_session *s);
 void keep_queued_dr6(probe_session *s, DWORD tid, HANDLE t);
@@ -804,15 +808,15 @@ uint64_t resolve_symbol(probe_session *s, const char *symbol);
 
 // Program debug register `slot` for execute (rw=0,len=0) or a data watchpoint. rw:
 // 0=execute, 1=write, 3=read/write. len: 0=1,1=2,3=4,2=8 bytes (Intel DR7 LEN encoding).
-// With `s`: never over a slot the target itself has armed there (an enabled image of an address
-// we never armed: its own hardware breakpoint, see hw_yield_to_target) -- left as it is.
+// With `s` and `tid`: never over a slot the target itself has armed there; a past
+// address alone does not prove ownership (see hw_yield_to_target).
 inline bool set_dr_on_thread(HANDLE thread, int slot, uint64_t addr, bool enable,
-                             uint32_t rw = 0, uint32_t len = 0, const probe_session *s = nullptr) {
+                             uint32_t rw = 0, uint32_t len = 0, const probe_session *s = nullptr, DWORD tid = 0) {
     CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     if (!GetThreadContext(thread, &c)) return false;
     if (s && slot >= 0 && slot < 4 && ((c.Dr7 >> (slot * 2)) & 3)) {
         const uint64_t cur = slot == 0 ? c.Dr0 : slot == 1 ? c.Dr1 : slot == 2 ? c.Dr2 : c.Dr3;
-        if (cur != addr && !s->hw_armed_ever.count(cur)) return true;
+        if (cur != addr && !hw_slot_is_ours(s, tid, c, slot)) return true;
     }
     switch (slot) { case 0: c.Dr0 = addr; break; case 1: c.Dr1 = addr; break;
                     case 2: c.Dr2 = addr; break; case 3: c.Dr3 = addr; break; default: return false; }

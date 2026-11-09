@@ -99,7 +99,8 @@ bool call_resume(probe_session *s, DWORD tid, EventFiber::Outcome how, const DEB
 // A thread running a call_func or call_original callee: its own probe hits are counted
 // without a callback (no re-entry, as inline).
 bool thread_in_call(const probe_session *s, DWORD tid) {
-    return tid && (tid == s->in_call_tid || s->calls.count(tid));
+    return tid && (tid == s->in_call_tid || s->calls.count(tid) ||
+                   (s->inline_add_wait_tid && (tid == s->remote_tid || agent_thread(s, tid))));
 }
 // Other threads' probe hits while a call_func or call_original is in flight are held back
 // (defer_hit_during_call) and replayed when no call is left: breakpoint/hw callbacks never
@@ -110,9 +111,10 @@ bool thread_in_call(const probe_session *s, DWORD tid) {
 // hit) waits for the 5 s timeout (documented; owner decision: no hardening).
 static void resume_deferred_hits(probe_session *s);
 static void release_deferred(probe_session *s) {
-    if (!s->in_call_tid && s->calls.empty()) resume_deferred_hits(s);
+    if (!s->in_call_tid && s->calls.empty() && !s->inline_add_wait_tid) resume_deferred_hits(s);
 }
 bool defer_hits_now(const probe_session *s, DWORD tid) {
+    if (s->inline_add_wait_tid) return tid != s->inline_add_wait_tid && !thread_in_call(s, tid);
     if (s->in_call_tid) return tid != s->in_call_tid;                  // call_original
     return !s->calls.empty() && !s->calls.count(tid);                  // call_func (not the callee's own)
 }
@@ -157,6 +159,7 @@ bool poll_calls(probe_session *s) {
             again = true; break;
         }
     }
+    if (!s->cur_fiber) release_deferred(s);      // runtime inline waits can also defer hits
     replay_held_watches(s);
     return ok;
 }
@@ -539,6 +542,11 @@ void warn_record(probe_context *c, Probe *probe, const char *text, bool *warned)
 // After a callback: apply return_from (resume at the gadget, SP = the hit's) and return
 // true; or warn once when call_original ran but the hit will fall through into the body.
 bool apply_return_from(probe_session *s, Probe *probe, const probe_context &c, CONTEXT &native) {
+    // A target handler reached inside the original may have changed its stepping state.
+    // Do not resurrect the entry's TF when the callback finishes.
+    const auto *post_state = static_cast<const CallbackState *>(c.controller);
+    if (c.called_original && post_state && post_state->have_post)
+        native.EFlags = (native.EFlags & ~0x100u) | (post_state->post.EFlags & 0x100u);
     if (!c.returned) {
         if (c.called_original) warn_record(const_cast<probe_context *>(&c), probe,
                                            "call_original without return_from -- the original runs again on fall-through");
@@ -953,6 +961,14 @@ int run_call(probe_session *s, CallbackState *st, uint64_t fn, uint64_t *ret, in
         handling_running(s, st->tid, false); guard_resync(s);
         s->calls.erase(st->tid); SetThreadContext(thread, &saved); CloseHandle(thread); return 0;
     }
+    // A watch callback can call us while completing a software step. The callee's
+    // traps belong to the call, not that outer instruction. Keep its node off the
+    // live map until the original context is restored below.
+    auto outer_step = s->stepping.extract(st->tid);
+    // inplace_sync may release the step's window while this fiber is parked.
+    // Keep the site armed before allowing any of those other threads to run.
+    if (!outer_step.empty() && !outer_step.mapped().displaced)
+        end_inplace_step(s, st->tid, outer_step.mapped().site);
     fiber_park(s, f);                       // the loop runs on; resumed by service_event / poll_calls
     // The outcome. TRAPPED / FAULTED: the thread is stopped at that event -- or, if it came
     // while a call_original ran, suspended by us (call_held) -- and it now stands in for the
@@ -1001,6 +1017,7 @@ int run_call(probe_session *s, CallbackState *st, uint64_t fn, uint64_t *ret, in
         break;
     }
     if (thread) CloseHandle(thread);
+    if (!outer_step.empty() && !st->released) s->stepping.insert(std::move(outer_step));
     release_deferred(s);                                               // held hits replay now
     return result;
 }
@@ -1099,7 +1116,6 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
 #else
     w.Eip = (DWORD)probe->address; w.Esp = (DWORD)c->hit_sp;
 #endif
-    w.EFlags &= ~0x100u;
     if (probe->flags & PROBE_HW) w.EFlags |= 0x10000u;                 // RF: the entry's own DR stays quiet once
     w.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS;
     if (!SetThreadContext(thread, &w)) { CloseHandle(thread); return 0; }
@@ -1116,15 +1132,27 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
     auto clear_slot = [&](bool running) {
         if (running) guard_note_hold(s, st->tid);
         if (running && SuspendThread(thread) == (DWORD)-1) return;
-        if (borrowed) {                                                // the probe's own DR, back at its site
+        CONTEXT live{}; live.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        // Only undo our execute return catch. The original may have installed the
+        // program's own breakpoint in this slot while it ran.
+        const bool ours = GetThreadContext(thread, &live) && dr_address(live, slot) == ret_addr &&
+                          !((live.Dr7 >> (16 + slot * 4)) & 0xFu);
+        if (ours && borrowed) {                                        // the probe's own DR, back at its site
             uint32_t rw = 0, len = 0; hw_rw_len(probe->flags, rw, len);
             set_dr_on_thread(thread, slot, probe->address, probe->active, rw, len);
-        } else {
-            set_dr_on_thread(thread, slot, 0, false);
+        } else if (ours) {
+            clear_dr_on_thread(thread, slot, ret_addr);
         }
         if (running) { ResumeThread(thread); guard_resync(s); }
     };
-    if (!ContinueDebugEvent(st->pid, st->tid, DBG_CONTINUE)) {
+    EventFiber *const f = s->cur_fiber;
+    bool continued = false;
+    if (f && f->stop_suspended) {
+        continued = ResumeThread(f->resume_after) != (DWORD)-1;
+        if (continued) { CloseHandle(f->resume_after); f->resume_after = nullptr; f->stop_suspended = false; }
+        guard_resync(s);
+    } else continued = !!ContinueDebugEvent(st->pid, st->tid, DBG_CONTINUE);
+    if (!continued) {
         if (!borrowed) s->dr_used &= (uint8_t)~(1u << slot);
         s->in_call_tid = 0; s->co_addr = 0; s->co_borrowed_slot = -1;
         handling_running(s, st->tid, false); guard_sync(s);            // still at its event: listed again
@@ -1249,14 +1277,16 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
         if (GetThreadContext(thread, &cur)) {          // keep any DR armed meanwhile, drop ours
             const DWORD64 mask = ((DWORD64)3 << (slot * 2)) | ((DWORD64)0xF << (16 + slot * 4));
             const auto keep = slot == 0 ? saved.Dr0 : slot == 1 ? saved.Dr1 : slot == 2 ? saved.Dr2 : saved.Dr3;
-            cur.Dr7 = (decltype(cur.Dr7))(cur.Dr7 & ~mask);
-            if (borrowed) {                            // the probe's own DR: as it was at the hit
+            const bool ours = dr_address(cur, slot) == ret_addr && !((cur.Dr7 >> (16 + slot * 4)) & 0xFu);
+            if (ours) cur.Dr7 = (decltype(cur.Dr7))(cur.Dr7 & ~mask);
+            if (ours && borrowed) {                            // the probe's own DR: as it was at the hit
                 cur.Dr7 = (decltype(cur.Dr7))(cur.Dr7 | (saved.Dr7 & mask));
                 (slot == 0 ? cur.Dr0 : slot == 1 ? cur.Dr1 : slot == 2 ? cur.Dr2 : cur.Dr3) = keep;
             }
             saved.Dr0 = cur.Dr0; saved.Dr1 = cur.Dr1; saved.Dr2 = cur.Dr2; saved.Dr3 = cur.Dr3; saved.Dr7 = cur.Dr7;
         }
         saved.Dr6 = 0;
+        saved.EFlags = (saved.EFlags & ~0x100u) | (st->post.EFlags & 0x100u);
         saved.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMENTS | UHH_CONTEXT_FP | CONTEXT_DEBUG_REGISTERS;
         SetThreadContext(thread, &saved);              // exactly as it was at the hit (CET: SSP stays popped,
                                                        // see apply_return_from / cet_after_original)
@@ -1290,7 +1320,7 @@ extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
     }
     if (st->probe->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) return 0;
     if (st->session->in_call_tid) return 0;                            // no nesting
-    if (st->session->cur_fiber && st->session->cur_fiber->resume_after) return 0;   // held after a call_func timeout
+    if (st->session->cur_fiber && st->session->cur_fiber->resume_after && !st->session->cur_fiber->stop_suspended) return 0;   // held after a call_func timeout
     return call_original_in_place(st->session, st, c, out);
 }
 extern "C" void return_from(probe_context *c, uint64_t value, int nargs) {

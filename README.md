@@ -36,8 +36,9 @@ Two nouns, two prefixes, and the compiler keeps them apart (both are opaque type
 `get_session(c)` is the bridge: **probes can be added from inside any callback** —
 breakpoint, hardware or inline (`probe_add_symbol[_cfg]`, `probe_add_address`,
 `probe_watch`; the new probe's callback must be exported by the calling callback's module). A breakpoint/hw probe added there
-is armed before the target resumes; an inline one holds the calling thread until its hook
-is in. From an inline callback (which runs inside the target) the call is forwarded to the
+is armed before the target resumes; a mapped inline addition waits up to 5 s for
+installation. Agent failure or timeout returns 0; deferred safety refusal returns 1
+for the accepted submission and retires the probe with a diagnostic. From an inline callback (which runs inside the target) the call is forwarded to the
 controller synchronously; the callback source does not change.
 
 ```c

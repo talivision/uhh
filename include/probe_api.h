@@ -26,13 +26,23 @@
      use call_func(c, "kernel32.dll!GetCurrentProcessId" / "...!GetCurrentThreadId", &v, 0);
      for target memory get_mem/set_mem (a target pointer cannot be dereferenced on
      breakpoint/hw, nor printed with %s).
-   - Concurrency: inline callbacks of any number of target threads run at the same time;
+   - Concurrency: inline callbacks of different target threads run at the same time;
      breakpoint/hw callbacks never overlap. Plain static state must be atomic (or locked) to
      be correct inline. thread_local is per TARGET thread inline but per controller thread
      (one for all target threads) on breakpoint/hw: keep per-thread state keyed by the
-     target tid instead.
+     target tid instead. Inline recursion tracking has 4096 primary + 256 overflow slots,
+     then uses per-thread TLS. Before TLS exists, a hit with both tables full is counted
+     but its callback is refused with a warning (never run without a recursion guard).
+   - x64 inline callbacks must leave x87/MMX state unchanged, including any helpers they
+     call. Ordinary MSVC x64 C/C++ and CRT math use SSE: long double == double, no __m64
+     intrinsics or inline assembly. UHH therefore takes no x87/MMX snapshot on this path.
+     Assembly callbacks/helpers using x87/MMX, or code explicitly restoring extended state,
+     must save and restore that state themselves on every exit. x86 inline callbacks retain
+     automatic x87 preservation because compiled x86 C/C++ uses x87.
    - A callback that faults or throws is abandoned on every backend (the hit counts, its
      register changes are discarded, set_mem writes already made stay, the program runs on).
+     After a successful call_original it returns the requested return_from value (or the
+     original result), discarding other register edits, so the original never runs twice.
      Inline the exception is raised in the target, so the program's vectored exception
      handlers see it first (first chance); on breakpoint/hw the program never sees it. */
 #if defined(_MSC_VER)
@@ -61,11 +71,14 @@ enum probe_flags {
        from the callback: probe_add_address(get_session(c), ret, on_return, flags). It
        fires on every return to that site, on any backend, without touching the stack. */
     PROBE_AT_RETURN       = 1u << 3,
+    /* Inline: permit chaining an existing hook. Breakpoint reports prehooks but refuses
+       an existing INT3; hardware skips prehook detection. */
     PROBE_ALLOW_PREHOOKED = 1u << 4,
     PROBE_FALLBACK_HW     = 1u << 5,
     /* Hardware DATA watchpoints (PROBE_HW only): the callback fires when the probed
-       ADDRESS is written (or read+written). No code is modified and no execution is
-       hooked -- this observes DATA access, which inline/trampoline hooking cannot do.
+       ADDRESS is written (or read+written). The watched address is not patched: this
+       observes DATA access, which inline/trampoline hooking cannot do. Hardware sessions
+       can install internal INT3s at ntdll!NtContinue, NtContinueEx and RtlUserThreadStart.
        The address is a data location (module+RVA of a variable), 4-byte aligned; one
        dword is watched on both x64 and x86. Exactly one of WRITE/RW; absent = an
        ordinary execute breakpoint. */
@@ -120,9 +133,14 @@ enum probe_register {
 /* probe_context is OPAQUE: callbacks reach everything through the accessors below,
    so a context can never be mistaken for a session (distinct incomplete types). */
 
-/* ---- Control plane: take a SESSION. Valid before probe_launch, and from inside any
-   callback via get_session(c). From a callback, breakpoint/hw probes arm before the
-   target resumes; an inline probe holds the calling thread until its hook is in. */
+/* ---- Control plane: take a SESSION. Symbol additions are valid before probe_launch;
+   probe_add_address and probe_watch need a running target. Adds are also valid from any
+   callback via get_session(c). Breakpoint/hw additions arm before the target resumes;
+   a mapped inline addition waits for installation, except that a deferred site-safety
+   refusal returns 1 for the accepted submission and retires it with a diagnostic.
+   An agent installation failure returns 0. It waits at most 5 s, then
+   returns 0 and releases the caller (the pending install may still complete later).
+   A symbol in an unloaded module returns 1 pending that module's load. */
 probe_session *probe_session_create(void);
 /* "module+0xRVA" or "module!Export[+0xOFF]" -- resolved when the module loads (an export,
    else a PDB symbol). The grammar is call_func's, on every backend: the module is matched by
@@ -162,8 +180,10 @@ int probe_launch(probe_session *, char *const argv[]);
 /* Attach to an already-running process instead of launching one. Probes resolve against
    the modules already loaded (and any loaded later). probe_run returns when the target
    exits; probe_close on a still-running target DETACHES (restores breakpoints, clears
-   UHH-owned debug registers, removes inline hooks) instead of terminating it. The target keeps
-   running while the probes arm: each one counts from its "probe: active" line on (an
+   UHH-owned debug registers, requests inline unhooking) instead of terminating it.
+   The agent stop wait is bounded to 5 s: unconfirmed unhooking can finish later, after detach. Running
+   inline callbacks are drained for at most 15 s; later logs are lost (accounted as
+   running/in-flight). The target keeps running while the probes arm: each one counts from its "probe: active" line on (an
    inline hook once the injected agent confirms it; every hook write briefly suspends
    all threads so none is ever mid-patch). */
 int probe_attach(probe_session *, uint32_t pid);
@@ -173,7 +193,7 @@ int probe_attach(probe_session *, uint32_t pid);
    milliseconds before the attach lands: instrument what it does after start-up. */
 int probe_attach_new(probe_session *, const char *image_name, uint32_t timeout_ms);
 /* Ctrl+C / Ctrl+Break while probe_run (through probe_wait_for_exit) runs ends the SESSION,
-   not the tool: an attached target is detached (probes removed, it keeps running), a
+   not the tool: an attached target is detached (cleanup as above, it keeps running), a
    launched one is ended, and probe_run returns normally -- so the caller still flushes the
    logs and writes its report. A second press gets the default handling. */
 int probe_run(probe_session *);
@@ -189,6 +209,7 @@ int probe_wait_for_exit(probe_session *);
 /* Catches the stdout tail up first, then writes only prehook/probe/probe_report records
    to out. File-backed logs are never replayed, including on repeated calls. */
 void probe_report(probe_session *, FILE *);
+/* Attached targets detach with the bounded cleanup described at probe_attach. */
 void probe_close(probe_session *);
 
 /* ---- Data plane: take a CONTEXT (this hit's registers and memory). ---- */

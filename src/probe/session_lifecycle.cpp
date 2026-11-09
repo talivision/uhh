@@ -377,7 +377,8 @@ namespace uhh_session {
 // and no thread left mid single-step. Events keep being dispatched while that happens
 // (a thread may hit a breakpoint or finish a step in the meantime).
 void detach(probe_session *s) {
-    s->error.clear();
+    // Detaching must not erase an install/session failure already reported.
+    accept_agent_install(s, false);
     FiberHost fibers(s);
     // Callbacks inside call_func: let their callees return first (bounded by their timeout).
     for (ULONGLONG until = GetTickCount64() + 6000; !s->calls.empty() && !s->exited && GetTickCount64() < until; )
@@ -408,6 +409,7 @@ void detach(probe_session *s) {
     // exit waits on the loader) would otherwise leave them live. If the stop cannot run within
     // the wait either, it runs whenever the target lets it -- then without us (the agent
     // freezes in-process for a session that is over).
+    accept_agent_install(s, false); // a completed install may not have delivered INSTALL_DONE
     // Snapshot BEFORE stop changes the channel/hooks. A clean detach alone does not imply
     // this cycle ever installed anything (its timer can expire before init even starts).
     if (s->shared) {

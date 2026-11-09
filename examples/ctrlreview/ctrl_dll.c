@@ -21,3 +21,6 @@ __declspec(dllexport) __declspec(noinline) LONG CtrlDllRecurse(LONG depth) {
 }
 
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) { (void)h; (void)reason; (void)r; return TRUE; }
+
+/* A foreign-module export colliding with the callbacks module's name (api-foreign). */
+__declspec(dllexport) void ctrl_on_tock(void *c) { (void)c; }

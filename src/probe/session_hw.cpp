@@ -222,7 +222,7 @@ bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
         ++tried;
         GuardTouch touch(s, tid);
         keep_queued_dr6(s, tid, t);
-        if (set_dr_on_thread(t, slot, address, true, rw, len, s)) ++set_ok;
+        if (set_dr_on_thread(t, slot, address, true, rw, len, s, tid)) ++set_ok;
         CloseHandle(t);
     }
 #if defined(UHH_TEST_HOOKS)
@@ -253,9 +253,13 @@ bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
 // first: move our probe to a slot no thread of the target uses, on every thread (keeping the
 // target's value where it has one). With no slot left, ours yields on that thread (its hits
 // there are not seen; warned) -- never the program's breakpoint.
-static bool hw_slot_is_ours(const probe_session *s, const CONTEXT &c, int slot) {
+bool hw_slot_is_ours(const probe_session *s, DWORD tid, const CONTEXT &c, int slot) {
     if (!((c.Dr7 >> (slot * 2)) & 3)) return true;                       // disabled: nothing to keep
-    return s->hw_armed_ever.count(dr_address(c, slot)) != 0;
+    const uint64_t address = dr_address(c, slot);
+    if (hw_active_at(s, address) || hw_released_on(s, tid, address)) return true;
+    if (s->in_call_tid && tid == s->in_call_tid && address == s->co_ret) return true;
+    for (const auto &g : s->gates) if (g.second == slot && g.first == address) return true;
+    return false;
 }
 static void migrate_hw(probe_session *s, Probe &p, DWORD tid) {
     const int old = p.dr_slot;
@@ -309,14 +313,14 @@ void hw_yield_to_target(probe_session *s, DWORD tid, HANDLE t) {
     CONTEXT c{}; c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     { GuardTouch touch(s, tid); if (!GetThreadContext(t, &c)) return; }
     for (int slot = 0; slot < 4; ++slot) {
-        if (!(s->dr_used & (1u << slot)) || hw_slot_is_ours(s, c, slot)) continue;
+        if (!(s->dr_used & (1u << slot)) || hw_slot_is_ours(s, tid, c, slot)) continue;
         for (auto &p : s->probes)
             if (p->active && (p->flags & PROBE_HW) && p->dr_slot == slot) { migrate_hw(s, *p, tid); break; }
     }
 }
 // A slot of ours the target claimed on this thread and that we could not move away from.
-static bool hw_yielded(const probe_session *s, const CONTEXT &c, int slot) {
-    return (s->dr_used & (1u << slot)) && !hw_slot_is_ours(s, c, slot);
+static bool hw_yielded(const probe_session *s, DWORD tid, const CONTEXT &c, int slot) {
+    return (s->dr_used & (1u << slot)) && !hw_slot_is_ours(s, tid, c, slot);
 }
 
 // The loader finishes process initialisation with NtContinue on the initial thread's
@@ -336,7 +340,7 @@ void reapply_all_hw(probe_session *s) {
         for (DWORD tid : s->threads) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
             GuardTouch touch(s, tid);
-            if (t) { keep_queued_dr6(s, tid, t); set_dr_on_thread(t, p->dr_slot, p->address, true, rw, len, s); CloseHandle(t); }
+            if (t) { keep_queued_dr6(s, tid, t); set_dr_on_thread(t, p->dr_slot, p->address, true, rw, len, s, tid); CloseHandle(t); }
         }
     }
 }
@@ -396,9 +400,9 @@ void reapply_hw_thread(probe_session *s, DWORD tid) {
     for (auto &p : s->probes) {
         if (!p->active || !(p->flags & PROBE_HW)) continue;
         uint32_t rw = 0, len = 0; hw_rw_len(p->flags, rw, len);
-        set_dr_on_thread(t, p->dr_slot, p->address, true, rw, len, s);
+        set_dr_on_thread(t, p->dr_slot, p->address, true, rw, len, s, tid);
     }
-    for (auto &g : s->gates) set_dr_on_thread(t, g.second, g.first, true, 0, 0, s);   // inline install gates too
+    for (auto &g : s->gates) set_dr_on_thread(t, g.second, g.first, true, 0, 0, s, tid);   // inline install gates too
     CloseHandle(t);
 }
 
@@ -463,7 +467,7 @@ void enforce_owned_drs(const probe_session *s, DWORD tid, CONTEXT &c, bool clear
         if (!owner) for (const auto &g : s->gates) if (g.second == slot) { want = g.first; break; }
         const DWORD64 ln = (DWORD64)1 << (slot * 2), fieldmask = (DWORD64)0xF << (16 + slot * 4);
         DWORD64 dr7 = c.Dr7;
-        if (want && hw_yielded(s, c, slot)) continue;            // the program's own breakpoint: left alone
+        if (want && hw_yielded(s, tid, c, slot)) continue;            // the program's own breakpoint: left alone
         if (want) {
             uint32_t rw = 0, len = 0;
             if (owner) hw_rw_len(owner->flags, rw, len);
@@ -495,7 +499,8 @@ bool queue_debug_delivery(probe_session *s, DWORD tid, uint64_t ip, DWORD64 clea
             auto p = std::make_unique<Probe>();
             p->location = "<debug-delivery>"; p->rva = s->debug_dispatch_addr;
             p->internal = true; p->callback = debug_delivery_noop;
-            Probe *raw = p.get(); s->probes.push_back(std::move(p)); s->debug_dispatch_probe = raw;
+            Probe *raw = p.get(); { std::lock_guard<std::mutex> lock(s->probes_mu); s->probes.push_back(std::move(p)); }
+            s->debug_dispatch_probe = raw;
         }
         auto &p = *s->debug_dispatch_probe;
         p.flags = PROBE_BREAKPOINT; p.retired = false;
@@ -564,7 +569,7 @@ bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
     // Then the live image again: the move rewrote this thread's debug registers (not DR6).
     if (s->dr_used & 0xF) {
         bool claimed = false;
-        for (int slot = 0; slot < 4; ++slot) claimed = claimed || hw_yielded(s, native, slot);
+        for (int slot = 0; slot < 4; ++slot) claimed = claimed || hw_yielded(s, event.dwThreadId, native, slot);
         if (claimed) {
             hw_yield_to_target(s, event.dwThreadId, thread);
             CONTEXT dr{}; dr.ContextFlags = CONTEXT_DEBUG_REGISTERS;
@@ -575,7 +580,7 @@ bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
     }
     uint8_t theirs = target_slots(s, event.dwThreadId, native);             // the target's own slots on this thread
     for (int slot = 0; slot < 4; ++slot)                                     // ... incl. ones ours yielded to it
-        if (hw_yielded(s, native, slot)) theirs |= (uint8_t)(1u << slot);
+        if (hw_yielded(s, event.dwThreadId, native, slot)) theirs |= (uint8_t)(1u << slot);
     if (!(native.Dr6 & 0xF & s->dr_used) && !(native.Dr6 & 0xF & theirs) && !(native.Dr6 & 0x4000) &&
         !(native.EFlags & 0x100u)) {
         // A #DB that is neither a trap-flag step (BS clear, TF clear) nor flagged in DR6 for
@@ -648,6 +653,15 @@ bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
         if (!(fired & (1u << slot)) || (theirs & (1u << slot))) continue;
         Probe *probe = nullptr;
         for (auto &p : s->probes) if (p->active && (p->flags & PROBE_HW) && p->dr_slot == slot) { probe = p.get(); break; }
+        // A queued/held watch belongs to the arm at the access, even if that probe
+        // has moved and another probe now occupies its old slot.
+        if (dr6_carried(s, event.dwThreadId) & (1u << slot)) {
+            for (auto &p : s->probes)
+                if (p->active && (p->flags & PROBE_HW) && (p->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) &&
+                    p->address == s->dr6_carry_address[slot] && p->hw_generation == s->dr6_carry_generation[slot]) {
+                    probe = p.get(); break;
+                }
+        }
         if (!probe && (s->dr_ever & (1u << slot)) && !(theirs & (1u << slot))) {
             // Our image in a slot the probe has since left (moved off a slot the program uses,
             // see migrate_hw; the clear was lost on this thread): still that probe's hit.
@@ -749,10 +763,11 @@ bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
     // suppress an execute breakpoint on the very next instruction.
     // Execute hits resume in the site's trampoline when the instruction can run there (no RF
     // to lose, see hw_trampoline) -- not for a #DB that is also the target's own (it sees this
-    // context) nor if a callback moved the thread.
+    // context), with any target-owned slot (the access may fire a data watch), nor
+    // if a callback moved the thread.
     if (exec_hit) {
         uint64_t tr = 0;
-        if (!(native.Dr6 & 0xF & theirs) && !(native.EFlags & 0x100u) && !served.empty()) {
+        if (!theirs && !(native.EFlags & 0x100u) && !served.empty()) {
             Probe *first = const_cast<Probe *>(served.front());
             bool same = true;
             for (const Probe *q : served)

@@ -768,14 +768,11 @@ bool create_agent_channel(probe_session *s) {
     for (const auto &p : s->probes) if (p->flags & PROBE_INLINE) fill_request(s, *p);
     return true;
 }
-static bool accept_agent_install(probe_session *s);
-
 // An inline probe added while the target runs (from a callback). It gets the next free
 // request slot -- creating the channel on first use -- and is installed by the agent on
 // a FRESH remote thread, never inside the calling callback: the installer freezes other
 // threads, and the caller may hold locks (heap, loader) a frozen thread is waiting on.
-// The calling thread is held until the agent confirms the hook (see pending_hold), so
-// from the caller's point of view the add is synchronous.
+// confirm_runtime_inline holds the caller while a mapped installation confirms.
 bool register_runtime_inline(probe_session *s, Probe &p) {
     if (!s->shared && !open_agent_section(s, 0)) return false;
     uint32_t idx = s->shared->request_count;
@@ -789,10 +786,8 @@ bool register_runtime_inline(probe_session *s, Probe &p) {
     fill_request(s, p);
     MemoryBarrier();
     s->shared->request_count = idx + 1;
-    // Synchronous for the caller: the thread whose callback added the probe is held
-    // (after its event is handled) until the agent confirms the hook, so its next call
-    // through the new site is seen. Other threads run on; they were never promised it.
-    if (s->cb_tid) s->pending_hold.push_back(s->cb_tid);
+    // The add waits in confirm_runtime_inline before returning to its callback. Do not
+    // queue another post-callback hold: confirmation may already have released the others.
     return true;
 }
 
@@ -820,7 +815,7 @@ bool inline_hold_needed(const probe_session *s) {
 
 // A thread of OUR agent (its service thread, started from the agent image): never hold it
 // -- it may own the agent's install lock or be the one that must do the install.
-bool agent_thread(probe_session *s, DWORD tid) {
+bool agent_thread(const probe_session *s, DWORD tid) {
     if (!s->remote_agent) return false;
     using QueryFn = LONG(NTAPI *)(HANDLE, ULONG, PVOID, ULONG, PULONG);
     static auto query = reinterpret_cast<QueryFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
@@ -892,7 +887,7 @@ bool arm_gates_for_pending(probe_session *s) {
         for (DWORD tid : s->threads) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
             GuardTouch touch(s, tid);
-            if (t) { keep_queued_dr6(s, tid, t); set_dr_on_thread(t, slot, sites[i], true, 0, 0, s); CloseHandle(t); }
+            if (t) { keep_queued_dr6(s, tid, t); set_dr_on_thread(t, slot, sites[i], true, 0, 0, s, tid); CloseHandle(t); }
         }
         s->dr_used |= (uint8_t)(1u << slot); s->dr_ever |= (uint8_t)(1u << slot);
         s->gates.push_back({sites[i], slot});
@@ -929,22 +924,29 @@ static void clear_gates(probe_session *s) {
 }
 
 // A gate fired: hold this thread at the site until the hook is confirmed.
-bool handle_gate(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
+bool handle_gate(probe_session *s, const DEBUG_EVENT &event, bool &handled, bool *failed) {
+    if (failed) *failed = false;
     handled = false;
     if (s->gates.empty()) return false;
     HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
     if (!thread) return false;
     CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS;
     bool hit = false;
+    DWORD64 consumed = 0;
     if (GetThreadContext(thread, &c)) {
         c.Dr6 |= dr6_carried(s, event.dwThreadId);
         for (auto &g : s->gates)
             if ((c.Dr6 & (1u << g.second)) && dr_address(c, g.second) == g.first &&
-                ((c.Dr7 >> (g.second * 2)) & 3) && (uint64_t)EMU_IP(c) == g.first) { hit = true; c.Dr6 &= ~(DWORD64)(1u << g.second); }
+                ((c.Dr7 >> (g.second * 2)) & 3) && (uint64_t)EMU_IP(c) == g.first) { hit = true; consumed |= (DWORD64)1 << g.second; c.Dr6 &= ~(DWORD64)(1u << g.second); }
         if (hit) { handled = !(c.Dr6 & 0xE00Fu); c.EFlags |= 0x10000u; SetThreadContext(thread, &c); }   // RF: run the site once resumed
     }
     CloseHandle(thread);
     if (hit) {
+        if (!handled && event.u.Exception.dwFirstChance &&
+            !queue_debug_delivery(s, event.dwThreadId, (uint64_t)EMU_IP(c), consumed, c.Dr6 & 0xE00Fu)) {
+            if (failed) *failed = true;
+            return false;
+        }
         hold_thread(s, event.dwThreadId);
 #if defined(_WIN64)
         const uint64_t pc = c.Rip;
@@ -1000,6 +1002,57 @@ bool kick_agent(probe_session *s) {
     if (s->remote_work != probe_session::REMOTE_NONE) return true;   // picked up when it finishes
     if (!s->remote_agent) return start_agent_load(s);
     return start_agent_init(s);
+}
+// A mapped runtime add waits for the installation result; deferred safety refusals retain
+// accepted-submission semantics (diagnosed, retired, no hook), as before.
+// Continue its event with the calling thread suspended, as call_func does, so the service
+// thread can install while this callback's stack and IPC request remain live.
+bool confirm_runtime_inline(probe_session *s, Probe &p) {
+    if (p.deferred_site_refused) return true; // submission accepted; refusal was diagnosed by vet_pending_inline
+    if (!(p.flags & PROBE_INLINE) || !p.address || !s->cb_tid || GetCurrentThreadId() != s->debug_tid) return true;
+    EventFiber *const f = s->cur_fiber;
+    if (!f || !s->shared) { set_error(s, "cannot wait for runtime inline installation"); return false; }
+    if (!f->resume_after) {
+        HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION, FALSE, s->cb_tid);
+        guard_note_hold(s, s->cb_tid);
+        if (!t || SuspendThread(t) == (DWORD)-1) {
+            if (t) CloseHandle(t);
+            set_error(s, win_error("hold runtime inline caller")); return false;
+        }
+        f->resume_after = t; f->stop_suspended = true;
+        if (!ContinueDebugEvent(f->ev.dwProcessId, f->ev.dwThreadId, DBG_CONTINUE)) {
+            const std::string why = win_error("continue runtime inline add");
+            ResumeThread(t); CloseHandle(t); f->resume_after = nullptr; f->stop_suspended = false;
+            set_error(s, why); return false;
+        }
+    }
+    struct WaitScope {
+        probe_session *s; DWORD prev;
+        ~WaitScope() { s->inline_add_wait_tid = prev; }
+    } wait{s, s->inline_add_wait_tid};
+    s->inline_add_wait_tid = s->cb_tid;
+    const ULONGLONG until = GetTickCount64() + 5000;
+    while (!s->exited && !s->stop_requested && GetTickCount64() < until) {
+        MemoryBarrier();
+        if (p.deferred_site_refused) return true;
+        if (!(p.flags & PROBE_INLINE)) return p.active; // deferred vetting selected hardware fallback
+        const LONG status = s->shared->requests[p.agent_index].status;
+        if (status == PROBE_AGENT_INSTALLED) return true;
+        if (p.retired || (status != PROBE_AGENT_PENDING && status != PROBE_AGENT_INSTALLING)) {
+            set_error(s, "runtime inline installation failed (status=" + std::to_string(status) + ")");
+            return false;
+        }
+        drain_agent_logs(s);
+        if (!poll_calls(s)) return false;
+        DEBUG_EVENT event{};
+        if (WaitForDebugEvent(&event, 20) && !continue_foreign_event(s, event) && !service_event(s, event)) return false;
+        if (s->rekick_at && GetTickCount64() >= s->rekick_at) {
+            s->rekick_at = 0;
+            if (agent_has_pending(s) && !kick_agent(s)) return false;
+        }
+    }
+    set_error(s, "runtime inline installation not confirmed within 5 s");
+    return false;
 }
 // UHH_SHARED callbacks still waiting for the agent (a session without inline probes opens no
 // channel, which is where the agent is otherwise loaded): load it and bind them now.
@@ -1057,9 +1110,24 @@ bool ipc_freeze_thread(probe_session *s, DWORD tid) {
         CloseHandle(t); std::fprintf(stderr, "probe: test: freeze denied\n"); return false;
     }
 #endif
-    if (!t) return false;
+    if (!t) {
+        // An EXIT_THREAD event can still be queued behind the agent's FREEZE.
+        const auto it = s->thread_handle.find(tid);
+        if (it != s->thread_handle.end() && thread_terminating(it->second)) return true;
+        std::fprintf(stderr, "probe: freeze: open thread %lu failed (%lu)\n",
+                     (unsigned long)tid, (unsigned long)GetLastError());
+        return false;
+    }
+    if (thread_terminating(t)) { CloseHandle(t); return true; }
     guard_note_hold(s, tid);
-    if (SuspendThread(t) == (DWORD)-1) { CloseHandle(t); return false; }
+    if (SuspendThread(t) == (DWORD)-1) {
+        const DWORD error = GetLastError();
+        const bool gone = thread_terminating(t);
+        CloseHandle(t);
+        if (!gone) std::fprintf(stderr, "probe: freeze: suspend thread %lu failed (%lu)\n",
+                                (unsigned long)tid, (unsigned long)error);
+        return gone;
+    }
     try { s->ipc_frozen.push_back(t); }
     catch (...) { ResumeThread(t); CloseHandle(t); return false; }
     return true;
@@ -1077,7 +1145,7 @@ static bool move_into_trampoline(probe_session *s, HANDLE t) {
         std::fprintf(stderr, "probe: test: freeze context denied\n"); return false;
     }
 #endif
-    if (!GetThreadContext(t, &c)) return false;
+    if (!GetThreadContext(t, &c)) return thread_terminating(t);
 #if defined(_WIN64)
     uint64_t ip = c.Rip;
 #else
@@ -1133,7 +1201,12 @@ static int32_t ipc_freeze(probe_session *s, DWORD self, uint64_t mask) {
     if (mask) {
         for (size_t i = 0; i < before.size(); ++i) {
             before[i].ContextFlags = CONTEXT_CONTROL;
-            if (!GetThreadContext(s->ipc_frozen[i], &before[i])) { ipc_thaw(s); return 0; }
+            if (!GetThreadContext(s->ipc_frozen[i], &before[i])) {
+                if (thread_terminating(s->ipc_frozen[i])) continue;
+                std::fprintf(stderr, "probe: freeze: get context thread %lu failed (%lu)\n",
+                             (unsigned long)GetThreadId(s->ipc_frozen[i]), (unsigned long)GetLastError());
+                ipc_thaw(s); return 0;
+            }
         }
         for (size_t i = 0; i < before.size(); ++i) if (!move_into_trampoline(s, s->ipc_frozen[i])) {
             for (size_t j = 0; j < i; ++j) SetThreadContext(s->ipc_frozen[j], &before[j]);
@@ -1200,10 +1273,10 @@ bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
         }
         if (n == offsetof(probe_ipc_request, address) && head.op == PROBE_IPC_INSTALL_DONE) {
             // Harmless if forged: acceptance re-checks every request status itself.
-            if (!accept_agent_install(s)) { std::fprintf(stderr, "probe: %s\n", s->error.c_str()); }
+            const bool accepted = accept_agent_install(s); // prints each failure once
             // This thread runs: the guard is up (see arm_module) -- breakpoint/hw probes go
             // active with the inline ones, not when the init thread returns.
-            else if (guard_pending(s) && s->shared->service_ready && !guard_set_ready(s, nullptr))
+            if (accepted && guard_pending(s) && s->shared->service_ready && !guard_set_ready(s, nullptr))
                 std::fprintf(stderr, "probe: %s\n", s->error.c_str());
             // Still pending after a round: its site is not installable YET (a relocated DLL's
             // code is not executable until the loader has finished relocating it). Asking again
@@ -1367,6 +1440,7 @@ static bool vet_pending_inline(probe_session *s) {
         p.vetted = true;
         bool moved = false;
         if (!vet_site(s, p, moved)) {
+            p.deferred_site_refused = p.runtime;
             if (p.runtime) { std::fprintf(stderr, "probe: %s\n", s->error.c_str()); s->error.clear(); }
             InterlockedExchange(&request.status, PROBE_AGENT_BAD_REQUEST); p.retired = true;
             if (!p.runtime) return false;
@@ -1468,26 +1542,45 @@ bool agent_has_pending(const probe_session *s) {
     return false;
 }
 
-static bool accept_agent_install(probe_session *s) {
+bool accept_agent_install(probe_session *s, bool completed_round) {
     MemoryBarrier();
+    if (!s->shared) return true;
     std::string first_failure;      // every probe is accepted or retired, THEN a boot-time failure is reported
     for (auto &p : s->probes) if ((p->flags & PROBE_INLINE) && p->address && !p->active && !p->retired) {
         LONG status = s->shared->requests[p->agent_index].status;
         if (status == PROBE_AGENT_PENDING || status == PROBE_AGENT_INSTALLING) continue;   // next round
         if (status != PROBE_AGENT_INSTALLED) {
+            const auto &request = s->shared->requests[p->agent_index];
+            const char *reason = status == PROBE_AGENT_BAD_REQUEST ? "bad request" :
+                status == PROBE_AGENT_CALLBACK_MISSING ? "callback missing" : "unexpected install status";
+            if (status == PROBE_AGENT_HOOK_FAILED) {
+                switch (request.install_failure) {
+                case PROBE_INSTALL_BUILD: reason = "trampoline build"; break;
+                case PROBE_INSTALL_FREEZE: reason = "freeze"; break;
+                case PROBE_INSTALL_SITE: reason = "site check"; break;
+                case PROBE_INSTALL_WRITE: reason = "patch write"; break;
+                case PROBE_INSTALL_VERIFY: reason = "verification"; break;
+                case PROBE_INSTALL_CONTROLLER_GONE: reason = "controller gone"; break;
+                default: reason = "hook failure (stage unavailable)"; break;
+                }
+            }
             std::string why = "inline agent failed to install " + p->location +
-                              " (status=" + std::to_string(status) + ")";
+                              " (status=" + std::to_string(status) + "): " + reason;
             std::fprintf(stderr, "probe: %s\n", why.c_str());
             p->retired = true;
             if (!p->runtime && first_failure.empty()) first_failure = why;
             continue;
         }
+        // INSTALLED is published inside the frozen write, before THAW/INSTALL_DONE.
+        // Polling may consume failures, but must not announce readiness or let callers
+        // run the target before the install round has released its holds.
+        if (!completed_round) continue;
         p->active = true;
         std::fprintf(stderr, "probe: active %s -> addr=0x%llx (inline)\n",
                      p->location.c_str(), (unsigned long long)p->address);
     }
     if (!first_failure.empty()) { set_error(s, first_failure); return false; }
-    s->inline_ready = true;
+    if (completed_round) s->inline_ready = true;
     return true;
 }
 

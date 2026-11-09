@@ -61,8 +61,8 @@ extern "C" __declspec(dllexport) __declspec(noinline) void CtrlOp(const void *ad
     sink[0] = (uintptr_t)addr; sink[1] = n; sink[2] = mode;
 }
 // The probe's callback call_funcs "cfr.dll!CfrValue" and logs phase / result (cdx-cfreuse).
-extern "C" __declspec(dllexport) __declspec(noinline) void CtrlCall(uintptr_t phase) {
-    static volatile uintptr_t sink; sink = phase;
+extern "C" __declspec(dllexport) __declspec(noinline) void CtrlCall(uintptr_t phase, uintptr_t address = 0) {
+    static volatile uintptr_t sink[2]; sink[0] = phase; sink[1] = address;
 }
 extern "C" __declspec(dllexport) __declspec(noinline) void CtrlWatchOnce(volatile LONG *var) {
     static volatile void *sink; sink = (void *)var;
@@ -80,6 +80,11 @@ extern "C" __declspec(dllexport) __declspec(noinline) int CtrlTock(int x) {
 }
 extern "C" __declspec(dllexport) __declspec(noinline) int CtrlTick(void *tock) {
     static volatile void *sink; sink = tock; return 1;
+}
+
+extern "C" __declspec(dllexport) __declspec(noinline) void CtrlApi(uintptr_t mode, void *addr, void *data) {
+    static volatile uintptr_t sink[3];
+    sink[0] = mode; sink[1] = (uintptr_t)addr; sink[2] = (uintptr_t)data;
 }
 
 static int arg_int(int argc, char **argv, const char *name, int def) {
@@ -441,7 +446,7 @@ static int run_absreuse() {
 // may come from a cache); phase 2: nothing named cfr.dll loaded (call_func must fail, not call
 // into the unmapped image); phase 3: B loaded at A's base (CfrValue = 2; A's address in B is
 // CfrDecoy = 99).
-static int run_cfreuse() {
+static int run_cfreuse(bool absolute = false) {
     wchar_t self[MAX_PATH], tmp[MAX_PATH];
     if (!GetModuleFileNameW(nullptr, self, MAX_PATH) || !GetTempPathW(MAX_PATH, tmp)) return 1;
     std::wstring dir(self); dir.resize(dir.find_last_of(L'\\') + 1);
@@ -455,13 +460,13 @@ static int run_cfreuse() {
     }
     HMODULE ma = LoadLibraryW(a.c_str());
     const uintptr_t base_a = (uintptr_t)ma;
-    for (int i = 0; i < 3 && ma; ++i) CtrlCall(1);
+    for (int i = 0; i < 3 && ma; ++i) CtrlCall(absolute ? 6 : 1, absolute ? (uintptr_t)GetProcAddress(ma, "CfrValue") : 0);
     if (ma) FreeLibrary(ma);
     const bool gone = GetModuleHandleW(L"cfr.dll") == nullptr;
     CtrlCall(2);
     HMODULE mb = LoadLibraryW(b.c_str());
     const uintptr_t base_b = (uintptr_t)mb;
-    for (int i = 0; i < 3 && mb; ++i) CtrlCall(3);
+    for (int i = 0; i < 3 && mb; ++i) CtrlCall(absolute ? 6 : 3, absolute ? (uintptr_t)GetProcAddress(mb, "CfrValue") : 0);
     if (mb) FreeLibrary(mb);
     DeleteFileW(a.c_str()); DeleteFileW(b.c_str());
     RemoveDirectoryW((root + L"\\a").c_str()); RemoveDirectoryW((root + L"\\b").c_str()); RemoveDirectoryW(root.c_str());
@@ -484,18 +489,25 @@ static bool image_at(uintptr_t base) {
     return base && VirtualQuery((void *)base, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
            mbi.Type == MEM_IMAGE && (uintptr_t)mbi.AllocationBase == base;
 }
-struct CfRace { HANDLE at, go; HMODULE ma, mb; const wchar_t *b; bool pin; int stalled, held; };
+struct CfRace { HANDLE at, go; HMODULE ma, mb; const wchar_t *b; bool pin, private_code; SIZE_T size; uintptr_t offset; void *replacement; int stalled, held; };
 static DWORD WINAPI cfrace_thread(void *p) {
     CfRace &x = *(CfRace *)p;
     x.stalled = WaitForSingleObject(x.at, 30000) == WAIT_OBJECT_0;   // the call_func is stopped
     FreeLibrary(x.ma);
     x.held = image_at((uintptr_t)x.ma);                  // still mapped: a reference outlived ours
-    if (!x.pin) x.mb = LoadLibraryW(x.b);                // B at A's base (fixed base, A is gone)
+    if (x.private_code) {
+        x.replacement = VirtualAlloc(x.ma, x.size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (x.replacement) {
+            const unsigned char code[] = {0xB8, 99, 0, 0, 0, 0xC3};
+            memcpy((unsigned char *)x.replacement + x.offset, code, sizeof(code));
+            FlushInstructionCache(GetCurrentProcess(), x.replacement, x.size);
+        }
+    } else if (!x.pin) x.mb = LoadLibraryW(x.b);                // B at A's base (fixed base, A is gone)
     SetEvent(x.go);
     return 0;
 }
-static int run_cfrace(bool pin) {
-    const char *sc = pin ? "cfpin" : "cfrace";
+static int run_cfrace(bool pin, bool private_code = false) {
+    const char *sc = private_code ? "cfprivate" : pin ? "cfpin" : "cfrace";
     wchar_t self[MAX_PATH], tmp[MAX_PATH];
     if (!GetModuleFileNameW(nullptr, self, MAX_PATH) || !GetTempPathW(MAX_PATH, tmp)) return 1;
     std::wstring dir(self); dir.resize(dir.find_last_of(L'\\') + 1);
@@ -514,6 +526,12 @@ static int run_cfrace(bool pin) {
     CfRace r{};
     r.at = at; r.go = go; r.b = b.c_str(); r.pin = pin;
     r.ma = LoadLibraryW(a.c_str());
+    r.private_code = private_code;
+    if (r.ma) {
+        const auto *dos = (const IMAGE_DOS_HEADER *)r.ma;
+        r.size = ((const IMAGE_NT_HEADERS *)((const unsigned char *)r.ma + dos->e_lfanew))->OptionalHeader.SizeOfImage;
+        r.offset = (uintptr_t)GetProcAddress(r.ma, "CfrValue") - (uintptr_t)r.ma;
+    }
     const uintptr_t base_a = (uintptr_t)r.ma;
     if (!at || !go || !r.ma) {
         std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"%s\",\"error\":\"setup\"}\n", sc); return 1;
@@ -524,11 +542,12 @@ static int run_cfrace(bool pin) {
     const int gone_after = !image_at(base_a) || (r.mb && (uintptr_t)r.mb == base_a);
     CtrlCall(5);
     if (r.mb) FreeLibrary(r.mb);
+    if (r.replacement) VirtualFree(r.replacement, 0, MEM_RELEASE);
     CloseHandle(at); CloseHandle(go);
     DeleteFileW(a.c_str()); DeleteFileW(b.c_str());
     RemoveDirectoryW((root + L"\\a").c_str()); RemoveDirectoryW((root + L"\\b").c_str()); RemoveDirectoryW(root.c_str());
     std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"%s\",\"stalled\":%d,\"held\":%d,\"gone_after\":%d,"
-                "\"same_base\":%d}\n", sc, r.stalled, r.held, gone_after, r.mb && (uintptr_t)r.mb == base_a ? 1 : 0);
+                "\"same_base\":%d}\n", sc, r.stalled, r.held, gone_after, (r.private_code ? r.replacement && (uintptr_t)r.replacement == base_a : r.mb && (uintptr_t)r.mb == base_a) ? 1 : 0);
     return 0;
 }
 
@@ -621,15 +640,16 @@ static int run_codeprot() {
     VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &old);
     const LONG guard_faults = g_codeprot_fault;
     g_codeprot_fault = 0;
-    VirtualProtect(page, 4096, PAGE_NOACCESS, &old);
+    const int na_set = VirtualProtect(page, 4096, PAGE_NOACCESS, &old) &&
+                       VirtualQuery(page, &mbi, sizeof(mbi)) && mbi.Protect == PAGE_NOACCESS;
     for (int i = 0; i < 200; ++i) CtrlCodeMid(planted);
     VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &old);
     const LONG na_faults = g_codeprot_fault;
     if (h) RemoveVectoredExceptionHandler(h);
     FreeLibrary(m);
     std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"codeprot\",\"guard_set\":%d,\"guard_intact\":%d,"
-                "\"guard_faults\":%ld,\"na_faults\":%ld,\"hits\":%d}\n",
-                guard_set, guard_intact, guard_faults, na_faults, 450);
+                "\"guard_faults\":%ld,\"na_set\":%d,\"na_faults\":%ld,\"hits\":%d}\n",
+                guard_set, guard_intact, guard_faults, na_set, na_faults, 450);
     return 0;
 }
 
@@ -889,11 +909,65 @@ static int run_logsite_code(bool callpair, bool whole = false) {
     return bad ? 1 : 0;
 }
 
+// Keep every thread alive after its hit so the recursion tables really exhaust on both arches.
+static HANDLE api_go;
+static volatile LONG api_called;
+static DWORD WINAPI api_thread(void *) {
+    CtrlTock(5);
+    InterlockedIncrement(&api_called);
+    WaitForSingleObject(api_go, INFINITE);
+    return 0;
+}
+static int run_apithread() {
+    api_go = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!api_go) return 1;
+    std::vector<HANDLE> threads;
+    for (int i = 0; i < 4354; ++i) {
+        HANDLE t = CreateThread(nullptr, 64 * 1024, api_thread, nullptr, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+        if (!t) break;
+        threads.push_back(t);
+    }
+    const ULONGLONG until = GetTickCount64() + 120000;
+    while (api_called < (LONG)threads.size() && GetTickCount64() < until) Sleep(5);
+    const LONG called = api_called;
+    SetEvent(api_go);
+    for (HANDLE t : threads) { WaitForSingleObject(t, 60000); CloseHandle(t); }
+    CloseHandle(api_go);
+    std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"apithread\",\"created\":%zu,\"called\":%ld}\n", threads.size(), called);
+    return threads.size() == 4354 && called == 4354 ? 0 : 1;
+}
+static volatile LONG api_guards;
+static LONG CALLBACK api_veh(EXCEPTION_POINTERS *e) {
+    if (e->ExceptionRecord->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) InterlockedIncrement(&api_guards);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+static int run_apicontract(const std::string &sc, int mode) {
+    void *page = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!page) return 1;
+    PVOID veh = AddVectoredExceptionHandler(1, api_veh);
+    if (sc == "apiguard") {
+        void *pid = (void *)(uintptr_t)GetCurrentProcessId();
+        CtrlApi(0, page, pid);                       // warm this thread's private-region verdict
+        DWORD old = 0, ignored = 0;
+        if (!VirtualProtect(page, 4096, PAGE_READWRITE | PAGE_GUARD, &old)) return 1;
+        CtrlApi(1, page, pid);                       // next callback must re-query and refuse
+        VirtualProtect(page, 4096, old, &ignored);
+    } else CtrlApi((uintptr_t)mode, (void *)&CtrlTock, page);
+    const int value = CtrlTock(5);                    // the very next instruction path must see a successful add
+    if (veh) RemoveVectoredExceptionHandler(veh);
+    VirtualFree(page, 0, MEM_RELEASE);
+    std::printf("{\"kind\":\"ctrl_result\",\"scenario\":\"%s\",\"guards\":%ld,\"value\":%d}\n", sc.c_str(), api_guards, value);
+    return value == 6 && api_guards == 0 ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: ctrl_target <scenario> [opts]\n"); return 2; }
     const std::string sc = argv[1];
     int rc = 2;
-    if (sc == "modforward" || sc == "modcall" || sc == "modhistory" || sc == "modreload")
+    if (sc == "apiguard" || sc == "apiforeign" || sc == "apiinstall")
+        rc = run_apicontract(sc, arg_int(argc, argv, "--mode", 0));
+    else if (sc == "apithread") rc = run_apithread();
+    else if (sc == "modforward" || sc == "modcall" || sc == "modhistory" || sc == "modreload")
         rc = run_modmodules(sc, arg_str(argc, argv, "--dll", "low"));
     else if (sc == "modreloc") rc = run_modreloc();
     else if (sc == "siteempty") rc = 0;
@@ -909,10 +983,11 @@ int main(int argc, char **argv) {
     else if (sc == "faultmix") rc = run_faultmix(arg_int(argc, argv, "--n", 300));
     else if (sc == "owndrx") rc = run_owndrx(arg_int(argc, argv, "--n", 50));
     else if (sc == "absreuse") rc = run_absreuse();
-    else if (sc == "cfreuse") rc = run_cfreuse();
+    else if (sc == "cfreuse" || sc == "cfabs") rc = run_cfreuse(sc == "cfabs");
     else if (sc == "cfnx") rc = run_cfnx();
     else if (sc == "cfrace") rc = run_cfrace(false);
     else if (sc == "cfpin") rc = run_cfrace(true);
+    else if (sc == "cfprivate") rc = run_cfrace(false, true);
     else if (sc == "codeprot") rc = run_codeprot();
     else if (sc == "int3cap") rc = run_int3cap(arg_int(argc, argv, "--n", 1200));
     else if (sc == "bigcfg") rc = run_bigcfg();

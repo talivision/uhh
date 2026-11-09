@@ -169,10 +169,34 @@ static bool append_log_file(probe_session *s, const char *bytes, size_t size, st
         return false;
     }
 #endif
-    DWORD wrote = 0;
+    LARGE_INTEGER start{}, zero{};
     if (s->log_file == nullptr || s->log_file == INVALID_HANDLE_VALUE || size > MAXDWORD ||
-        !WriteFile(s->log_file, bytes, (DWORD)size, &wrote, nullptr) || (size_t)wrote != size) {
+        !SetFilePointerEx(s->log_file, zero, &start, FILE_CURRENT)) {
         if (error) *error = win_error("write probe log file");
+        return false;
+    }
+    DWORD requested = (DWORD)size;
+#if defined(UHH_TEST_HOOKS)
+    // Write a real partial batch (regress stream-filefail-partial-*).
+    static const long at = [] { const char *v = std::getenv("UHH_TEST_FILE_PARTIAL_AT"); return v ? std::atol(v) : 0L; }();
+    static std::atomic<long> n{0};
+    if (at > 0 && ++n == at && requested) --requested;
+#endif
+    DWORD wrote = 0;
+    const BOOL ok = WriteFile(s->log_file, bytes, requested, &wrote, nullptr);
+    if (!ok || (size_t)wrote != size) {
+        const DWORD failure = ok ? ERROR_WRITE_FAULT : GetLastError();
+        // Accounting rejects the whole batch; remove its bytes from the file too.
+        const bool rolled_back = SetFilePointerEx(s->log_file, start, nullptr, FILE_BEGIN) && SetEndOfFile(s->log_file);
+        const DWORD rollback_error = GetLastError();
+        SetLastError(failure);
+        if (error) {
+            *error = win_error("write probe log file");
+            if (!rolled_back) {
+                SetLastError(rollback_error);
+                *error += "; " + win_error("truncate partial probe log batch");
+            }
+        }
         return false;
     }
     g_diag_file_writes++; g_diag_file_bytes += size;

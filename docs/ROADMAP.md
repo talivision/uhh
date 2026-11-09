@@ -200,7 +200,10 @@ reads, a slow (50 ms) callback under 32 threads.
   field the target set itself keeps the target's (exact for a plain write-back); debug registers
   are not merged but rewritten from the CURRENT probe state by enforce_owned_drs -- the one place
   that re-applies DRs, as at NtContinue (cfnest's restore_fixup). Re-checked after
-  the repair: a thread the target suspended again meanwhile stays held. (2) hw execute hits no
+  the repair: a thread the target suspended again meanwhile stays held. Controller loop review:
+  the two-second context-watch deadline now warns once and retains the repair until the target
+  releases its suspension; dropping it allowed a later write-back to resume mid-instruction.
+  Regression: `session-loop-ctx-timeout` (expiry followed by a late write-back). (2) hw execute hits no
   longer resume at the site with RF (RF only lives until the instruction ran, and a round-trip in
   that window comes back without it): they resume in the site's displaced trampoline (A5), whose
   copy is checked against the live code at every hit; non-displaceable sites keep RF.
@@ -1144,7 +1147,10 @@ overflows its stack. Every backend, x64 and x86.
 - ✅ (TR7, review b) **x86 inline: the x87 state was not saved** (default mask = AVX only). x86
   code returns floats in ST0, so any callback/CRT float call changes the x87 status/tag/stack a
   mid-function site may have live. The gated mask now includes x87 on x86 when it is in use.
-  (x64: not included -- MSVC x64 code never touches x87 -- so x64 hits keep the cheap path.)
+  Owner decision after cxr9 VM perf A/B: x64 keeps no x87/MMX snapshot. MSVC x64 C/C++
+  uses SSE; assembly callbacks/helpers using x87/MMX must restore it themselves (the callback
+  contract in probe_api.h and limitations.md). XINUSE[0] normally stays set on Windows:
+  gated XSAVE added ~62 ns/hit, and the FXSAVE alternative still added ~48 ns/hit.
 - ✅ (TR8, review c) **inline get_mem trusted a per-thread region cache ACROSS hits**: a page the
   target decommitted / NOACCESSed / guarded later faulted (a first-chance AV its vectored
   handler saw) or silently consumed its PAGE_GUARD. The cache now lives for one hit (reset at
@@ -3184,3 +3190,48 @@ these changes must not yet be described as a confirmed fix of the CI failures.
   in scratch_blocks until session cleanup, after finish_calls/detach; failed writes free
   immediately. Existing conformance, transparency, reuse, concurrent-call and CET checks
   remain unchanged and must pass on Windows before this follow-up is considered verified.
+
+### Inline install failure diagnostics (ntdll-churn CI follow-up)
+
+A terminal inline install failure is not an accepted silent attach outcome. The common
+acceptance path now also runs from the run loop, final result, and detach before agent
+stop; detach preserves an existing session error. Each failed probe prints its location,
+status and agent failure stage once and is retired (also exposed in the probe report).
+Pre-run probes fail the session; the existing runtime-add retirement policy is unchanged.
+The agent records the stage before publishing HOOK_FAILED. Shared request layout changed:
+PROBE_AGENT_VERSION 31. `inline-install-failure-{launch,attach}` forces a freeze-stage
+failure with UHH_TEST_HOOK_FAIL and checks stderr, report, nonzero exit, and attached
+target survival. Windows x64/x86 validation pending.
+
+CI 42606827681 follow-up: background reconciliation must consume failures only.
+INSTALLED is visible before the round's THAW/INSTALL_DONE and service readiness;
+publishing active from polling released attach fixtures too early (guardwin stall
+saw ready_before=0). Successful activation stays on the original completion paths.
+Pending/installing requests remain pending. Existing attach-inline, gated-e2e and
+guardwin checks retain their assertions. The forced-failure attach survival check
+now uses its existing Lines reader instead of racing communicate() for stdout.
+Windows rerun pending.
+
+### Controller call / hardware review (cxr14)
+
+- call #1: real. Return-catch cleanup now verifies the address and execute encoding
+  before clearing a reserved slot or restoring a borrowed slot. The original may have
+  replaced it with a target-owned watch. `ctrl-call-hw-original-owned-{free,borrowed}`
+  has a target VEH replace the catch, then waits for the 5 s release and checks its DR.
+- call #2: real. In-place call_original retains target TF; completion also retains a
+  handler's TF change instead of restoring the entry's stepping state.
+  `ctrl-call-hw-original-tf` requires a real target VEH step inside the original.
+- call #3 / hw #3: real, shared root. Queued and held data watches resolve their saved
+  address and arm generation across slot migration. `ctrl-call-hw-queued-migrated` and
+  `ctrl-call-hw-deferred-migrated` require exactly one callback and counted access.
+- hw #1: real. Hardware displacement now requires no target-owned slots, since the
+  copied instruction can trigger a target watch even when the entry trap did not.
+  `ctrl-call-hw-execute-own-watch` checks the callback, real code PC and target VEH.
+- hw #2: real. Lifetime address history alone no longer establishes live ownership;
+  only active arms, gates, the live return catch and thread-unsettled releases do.
+  The guarded DR writer uses the same rule. `ctrl-call-hw-historical-owned` requires
+  both repair preservation and migration away from a target's reused old address.
+
+These extend the existing real-Windows-#DB fixture; registered under
+`check_ctrl_call_hw_review` on both architectures. Static review only here; Windows
+build/runtime validation remains pending. Shared agent layout/version unchanged.

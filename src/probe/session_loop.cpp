@@ -146,7 +146,7 @@ void pump(probe_session *s, DWORD ms) {
 // ---- Suspensions of our own, fairness, context round-trips ----------------------------
 // How many suspensions of thread `tid` are ours right now (every list we suspend into).
 static int our_suspends(const probe_session *s, DWORD tid) {
-    int n = 0;
+    int n = s->inline_add_wait_tid == tid ? 1 : 0;
     for (const auto *list : {&s->held, &s->ipc_frozen, &s->call_deferred})
         for (HANDLE t : *list) n += GetThreadId(t) == tid;
     for (const auto &e : s->inplace_suspended) n += e.first == tid;
@@ -195,11 +195,6 @@ static uint64_t interrupt_time_now() {
 static uint64_t yield_stub(probe_session *s, DWORD tid) {
     if (auto it = s->yield_stubs.find(tid); it != s->yield_stubs.end()) return it->second;
     if (s->yield_unusable) return 0;
-    if (!s->yield_fn) {
-        s->yield_fn = resolve_symbol(s, "ntdll.dll!NtDelayExecution");
-        s->yield_spin_fn = resolve_symbol(s, "ntdll.dll!NtYieldExecution");
-        if (!s->yield_fn || !s->yield_spin_fn) { s->yield_unusable = true; return 0; }
-    }
     if (s->yield_next + 256 > s->yield_end) {
         void *m = VirtualAllocEx(s->pi.hProcess, nullptr, 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
         if (!m) { s->yield_unusable = true; return 0; }
@@ -297,9 +292,14 @@ static void park_thread(probe_session *s, DWORD tid, DWORD disposition) {
         return;
     // Not when the program probes NtDelayExecution / NtYieldExecution itself (the stub's call
     // would be its hit).
-    if (s->yield_fn)
-        for (const auto &p : s->probes)
-            if (p->active && (p->address == s->yield_fn || p->address == s->yield_spin_fn)) return;
+    if (s->yield_unusable) return;
+    if (!s->yield_fn) {
+        s->yield_fn = resolve_symbol(s, "ntdll.dll!NtDelayExecution");
+        s->yield_spin_fn = resolve_symbol(s, "ntdll.dll!NtYieldExecution");
+        if (!s->yield_fn || !s->yield_spin_fn) { s->yield_unusable = true; return; }
+    }
+    for (const auto &p : s->probes)
+        if (p->active && (p->address == s->yield_fn || p->address == s->yield_spin_fn)) return;
     if (!s->yielded_round.insert(tid).second) return;          // once per round
     HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
     if (!t) return;
@@ -661,16 +661,13 @@ static void ctx_watch_end(probe_session *s, std::unique_ptr<probe_session::CtxWa
 void ctx_watch_poll(probe_session *s, bool all) {
     for (size_t i = 0; i < s->ctx_watch.size(); ) {
         auto &w = *s->ctx_watch[i];
-        // A count query failure, a debug freeze, or a target that never resumes its hold
-        // must not keep OUR suspension forever. Release only our one increment; the
-        // program's hold remains. Do not touch the context on this fail-open path.
+        // The target may write its captured trap context back at ANY time during its
+        // suspension. Keep the repair until it resumes; a timeout cannot make that
+        // stale resume address safe. Detach drains the watch explicitly (all=true).
         if (!all && GetTickCount64() >= w.deadline) {
-            std::fprintf(stderr, "probe: warning: context repair timed out on thread %lu; controller hold released\n",
+            std::fprintf(stderr, "probe: warning: context repair waiting for target suspension on thread %lu\n",
                          (unsigned long)w.tid);
-            ResumeThread(w.t); CloseHandle(w.t);
-            s->ctx_watch.erase(s->ctx_watch.begin() + (ptrdiff_t)i);
-            guard_resync(s);
-            continue;
+            w.deadline = ~ULONGLONG{0};
         }
         const long n = suspend_count(w.t);
         if (!all && n > our_suspends(s, w.tid)) { ++i; continue; }    // the target still holds it
@@ -1047,7 +1044,10 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
                      (unsigned long)event.u.Exception.dwFirstChance);
     if (code == EXCEPTION_SINGLE_STEP && step == stepping.end() && !s->gates.empty()) {
         bool handled = false;
-        if (handle_gate(s, event, handled)) {
+        bool failed = false;
+        const bool gate = handle_gate(s, event, handled, &failed);
+        if (failed) return false;
+        if (gate) {
             if (handled) disposition = DBG_CONTINUE;
             return true;
         }
@@ -1074,7 +1074,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             if (t && GetThreadContext(t, &w)) {
                 for (int slot = 0; slot < 4; ++slot) {
                     if (!(s->dr_ever & (1u << slot)) || (s->dr_used & (1u << slot)) || !((w.Dr7 >> (slot * 2)) & 3) ||
-                        dr_address(w, slot) != address) continue;
+                        dr_address(w, slot) != address || target_owns_slot(s, event.dwThreadId, w, slot)) continue;
                     w.Dr7 &= ~((DWORD64)3 << (slot * 2)) & ~((DWORD64)0xF << (16 + slot * 4));
                     ours = true;
                 }
@@ -1321,7 +1321,11 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             CONTEXT dr{}; dr.ContextFlags = CONTEXT_DEBUG_REGISTERS;
             if (GetThreadContext(thread, &dr) && ((dr.Dr6 | dr6_carried(s, event.dwThreadId)) & 0xF)) {
                 bool handled = false;
-                if (!handle_hw(s, event, handled)) { return false; }
+                const bool hw_ok = handle_hw(s, event, handled);
+                // call_func parks this fiber; other events can rehash the map.
+                step = stepping.find(event.dwThreadId);
+                if (!hw_ok) { return false; }
+                if (step == stepping.end()) return true; // the thread exited during the call
                 hw_hit = handled; target_hw = !handled;
             }
         }
@@ -1792,12 +1796,12 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
         if (s->dr_used && event.u.CreateThread.hThread && !s->detaching)
             hw_yield_to_target(s, event.dwThreadId, event.u.CreateThread.hThread);
         if (event.u.CreateThread.hThread && !s->detaching)     // new thread inherits the gates
-            for (auto &g : s->gates) set_dr_on_thread(event.u.CreateThread.hThread, g.second, g.first, true, 0, 0, s);
+            for (auto &g : s->gates) set_dr_on_thread(event.u.CreateThread.hThread, g.second, g.first, true, 0, 0, s, event.dwThreadId);
         if (s->hw_active && event.u.CreateThread.hThread)     // new thread inherits the DRs
             for (auto &p : s->probes)
                 if (p->active && (p->flags & PROBE_HW)) {
                     uint32_t rw = 0, len = 0; hw_rw_len(p->flags, rw, len);
-                    set_dr_on_thread(event.u.CreateThread.hThread, p->dr_slot, p->address, true, rw, len, s);
+                    set_dr_on_thread(event.u.CreateThread.hThread, p->dr_slot, p->address, true, rw, len, s, event.dwThreadId);
                 }
         // A launched target's thread born while inline installs are outstanding (e.g. started
         // by a TLS callback or a static DLL's DllMain(PROCESS_ATTACH) during process init,
