@@ -2,6 +2,7 @@
 // (and a never-started thread's flags) on context writes: do not fabricate exception status.
 #include "../../src/probe/session_internal.hpp"
 #include <stdexcept>
+#include <type_traits>
 
 namespace dr_review_fixture {
 using namespace uhh_session;
@@ -295,6 +296,13 @@ int run(int argc, char **argv) {
     if (argc == 2 && !std::strcmp(argv[1], "--dr-child")) return child(false);
     if (argc == 2 && !std::strcmp(argv[1], "--dr-child-detach")) return child(true);
     if (argc != 2) return 2;
+    if (!std::strcmp(argv[1], "report-retired-atomic")) {
+        // A stress test cannot prove absence of a C++ data race. Require the same
+        // atomic representation as adjacent live-report fields, on both arches.
+        constexpr bool safe = std::is_base_of_v<std::atomic<bool>, decltype(Probe::retired)>;
+        std::printf("{\"kind\":\"retired_atomic\",\"ok\":%d}\n", safe ? 1 : 0);
+        return safe ? 0 : 1;
+    }
     const std::string mode = argv[1];
     bool ok = false;
     std::string failed;

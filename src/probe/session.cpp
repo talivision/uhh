@@ -760,7 +760,7 @@ extern "C" void probe_report(probe_session *s, FILE *out) {
         std::fputs("{\"kind\":\"probe\",\"location\":", out); json_string(out, p->location);
         std::fprintf(out, ",\"backend\":\"%s\",\"active\":%s,\"hits\":%llu,\"retired\":%s}\n",
                      flags & PROBE_INLINE ? "inline" : flags & PROBE_HW ? "hw" : "breakpoint",
-                     armed ? "true" : "false", (unsigned long long)count, p->retired ? "true" : "false");
+                     armed ? "true" : "false", (unsigned long long)count, p->retired.load() ? "true" : "false");
     }
     PROCESS_MEMORY_COUNTERS memory{}; memory.cb = (DWORD)sizeof(memory);
     uint64_t peak_mb = GetProcessMemoryInfo(GetCurrentProcess(), &memory, (DWORD)sizeof(memory))

@@ -249,3 +249,12 @@ AR_CB void ar_on_config_late(probe_context *c) {
     const auto *cfg = (const unsigned char *)get_config(c);
     return_from(c, cfg ? cfg[4095] : 0, 0);
 }
+
+AR_CB void ar_on_image(probe_context *c) {
+    const uint64_t p = get_func_arg(c, 0);
+    unsigned char byte = 0;
+    const int read = get_mem(c, p, &byte, 1);
+    // Write the original byte: test protection validation without changing target data.
+    const int write = read ? set_mem(c, p, &byte, 1) : 0;
+    send_log(c, "ar image phase=%d read=%d write=%d", (int)get_func_arg(c, 1), read, write);
+}

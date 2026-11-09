@@ -73,7 +73,7 @@ struct Probe {
     // The location named its module without an extension ("kernel32!X"): module is then
     // "<name>.dll" (module_of_location); warned once if only "<name>.<other ext>" loads.
     bool bare_module = false, warned_bare = false;
-    bool retired = false;      // PROBE_ONCE probe that already fired (kept for the report)
+    ReportValue<bool> retired{false}; // PROBE_ONCE probe that already fired (kept for the report)
     bool internal = false;     // library-owned (not reported)
     // Breakpoint probes: the original bytes that followed the INT3 (to recognise a copy of the
     // site another hooking tool relocated into its trampoline), and for such an adopted copy,

@@ -36,8 +36,8 @@ static __forceinline LONG load_epoch(const probe_agent_shared *sh) {
 
 /* Callback memory helpers fail closed on bad target addresses. They never change
    page protections: executable writes belong to the hook installer, not hits. */
-/* Own committed stack needs no query. Image-region verdicts survive hits until a DLL
-   unload; other regions are trusted only within this callback. Protection changes racing
+/* Own committed stack needs no query. All other protection verdicts last only one
+   callback, including image regions. Protection changes racing
    those verdicts are outside the guarantee (see limitations.md). Target calls invalidate
    protection verdicts too, so a callback can change protection through call_func safely. */
 struct RegionCache {
@@ -48,7 +48,7 @@ struct RegionCache {
 // constinit is required on every hit-path TLS object: MSVC must not emit an
 // on-demand TLS initializer (and its calls) before the recursion guard is established.
 static constinit thread_local RegionCache t_region{};
-// Loader unload notifications invalidate image-region and symbol-resolution caches.
+// Loader unload notifications invalidate region and symbol-resolution caches.
 static volatile LONG g_unload_gen;
 static void *g_dll_cookie;
 struct ImageRegions { RegionCache r[16]; LONG gen = 0; uint32_t used = 0, next = 0; };
@@ -77,7 +77,10 @@ static bool query_region(uintptr_t a, RegionCache &out, bool cached_image = true
     ImageRegions *images = cached_image && tls_ready() && g_dll_cookie ? &t_images : nullptr;
     const LONG gen = g_unload_gen;
     if (images) {
-        if (images->gen != gen) { images->used = images->next = 0; images->gen = gen; }
+        // forget_region clears t_region at callback entry. Clear lazily here so hits
+        // that never query memory pay no extra cost. Unload notifications precede
+        // unmapping, so their generation alone cannot validate later callbacks.
+        if (!t_region.lo || images->gen != gen) { images->used = images->next = 0; images->gen = gen; }
         for (uint32_t i = 0; i < images->used; ++i)
             if (a >= images->r[i].lo && a < images->r[i].hi) { out = images->r[i]; return true; }
     }
@@ -376,7 +379,7 @@ struct X86Mem {
         --budget;
         RegionCache region{};
         // These are speculative stack values, not known module frames. A still-loaded
-        // image can be guarded between captures: never trust its persistent verdict here.
+        // image can be guarded between captures: use this capture's own cache here.
         if (!query_region((uintptr_t)a, region, false)) return nullptr;
         Region g{};
         g.lo = (uint32_t)region.lo;
