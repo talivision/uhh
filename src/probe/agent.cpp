@@ -45,12 +45,14 @@ struct RegionCache {
     LONG gen = 0;
     bool writable = false, readable = false, executable = false, image = false;
 };
-static thread_local RegionCache t_region;
+// constinit is required on every hit-path TLS object: MSVC must not emit an
+// on-demand TLS initializer (and its calls) before the recursion guard is established.
+static constinit thread_local RegionCache t_region{};
 // Loader unload notifications invalidate image-region and symbol-resolution caches.
 static volatile LONG g_unload_gen;
 static void *g_dll_cookie;
 struct ImageRegions { RegionCache r[16]; LONG gen = 0; uint32_t used = 0, next = 0; };
-static thread_local ImageRegions t_images;
+static constinit thread_local ImageRegions t_images{};
 
 // The per-thread cache is implicit TLS -- which does not exist yet on a thread that is
 // still in its loader initialisation: LdrpInitializeThread allocates the thread's TLS
@@ -991,6 +993,7 @@ static ldr_unload_fn g_ldr_unload;
 // resolved its callee (before the module pin) or right after the pin: it signals
 // Local\uhh_test_cf_<pid> and waits for Local\uhh_test_cf_go_<pid> while the target unloads
 // (and replaces) the callee's DLL. Off: one load and compare per call.
+static bool g_test_cf_pin_fail;       // UHH_TEST_CF_PIN_FAIL: refuse absolute image pins
 static volatile LONG g_test_cf_stall;    // 0 off, 1 resolved, 2 pinned
 static void test_cf_point(LONG where) {
     if (g_test_cf_stall != where || InterlockedCompareExchange(&g_test_cf_stall, 0, where) != where) return;
@@ -1010,6 +1013,7 @@ static void watch_unloads() {
     char knob[16] = {};
     if (GetEnvironmentVariableA("UHH_TEST_CF_STALL", knob, sizeof(knob)))
         g_test_cf_stall = !strcmp(knob, "resolved") ? 1 : !strcmp(knob, "pinned") ? 2 : 0;
+    g_test_cf_pin_fail = GetEnvironmentVariableA("UHH_TEST_CF_PIN_FAIL", knob, sizeof(knob)) != 0;
     using reg_fn = LONG(NTAPI *)(ULONG, ldr_notify_fn, void *, void **);
     auto reg = reinterpret_cast<reg_fn>(GetProcAddress(nt, "LdrRegisterDllNotification"));
     void *cookie = nullptr;
@@ -1071,12 +1075,13 @@ static uint64_t resolve_callee(const char *symbol, CalleePin &pin) {
         if (!addressable(fn, 1)) return 0;
         MEMORY_BASIC_INFORMATION mbi{};
         if (!VirtualQuery((const void *)(uintptr_t)fn, &mbi, sizeof(mbi))) return 0;
-        if (can_pin && mbi.State == MEM_COMMIT && mbi.Type == MEM_IMAGE) {
-            if (g_ldr_addref(0, mbi.AllocationBase) >= 0) pin.module = mbi.AllocationBase;
-            else if (!absolute) continue;                   // resolved through a module now going away
+        if (mbi.State == MEM_COMMIT && mbi.Type == MEM_IMAGE) {
+            if (!can_pin) return 0;
+            if (!(absolute && g_test_cf_pin_fail) && g_ldr_addref(0, mbi.AllocationBase) >= 0) pin.module = mbi.AllocationBase;
+            else continue;                   // resolved through a module now going away
         }
         // Private memory replacing an unloaded image must not bypass generation validation.
-        if (can_pin && g_unload_gen != gen) {
+        if (can_pin && g_unload_gen != gen) {   // an unload since the resolution: again
             if (pin.module) { g_ldr_unload(pin.module); pin.module = nullptr; }
             continue;
         }
@@ -1332,16 +1337,18 @@ static ThreadSlot *own_thread_slot(DWORD tid) {
 // A thread still in its loader initialisation has no TLS block yet (tls_ready): it looks the
 // slot up every time. A slot passes to another thread only from a dead owner, so a cached
 // slot stays this thread's.
-static thread_local ThreadSlot *t_slot;
-static thread_local ThreadSlot t_fallback;
+static constinit thread_local ThreadSlot *t_slot = nullptr;
+static constinit thread_local ThreadSlot t_fallback{};
 static bool private_slot(const ThreadSlot *ts) { return ts && ts->blk_gen == -1; }
 static inline ThreadSlot *cached_slot() { return tls_ready() ? t_slot : nullptr; }
 static inline void cache_slot(ThreadSlot *ts) { if (tls_ready()) t_slot = ts; }
 static bool g_test_slotless, g_test_preaccount;
 static ThreadSlot *my_slot(DWORD tid) {
-    if (g_test_slotless) return nullptr;                   // regress: both slot tables exhausted
     ThreadSlot *ts = cached_slot();
-    if (!ts && (ts = own_thread_slot(tid)) != nullptr) cache_slot(ts);
+    if (g_test_slotless && !private_slot(ts)) ts = nullptr; // never borrow a shared accounting block in this test
+    // The test exhausts the shared tables, not this thread's TLS. Keep a private guard
+    // while using stripes, including codex9's first-log carry when the thread is killed.
+    if (!ts && !g_test_slotless && (ts = own_thread_slot(tid)) != nullptr) cache_slot(ts);
     if (!ts && tls_ready()) {
         ts = &t_fallback;
         ts->tid = (LONG)tid; ts->blk_gen = -1;

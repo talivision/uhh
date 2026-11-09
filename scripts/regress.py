@@ -1226,6 +1226,15 @@ def check_stream_filefail():
         except Exception as e:
             record(name, False, repr(e))
     for bk in ("breakpoint", "inline"):
+        name = f"stream-filefail-partial-{bk}"
+        try:
+            env = dict(base, UHH_TEST_FILE_PARTIAL_AT="3")
+            res = _filefail_run([tr, "--backend", bk, "-p", "logstream_target.exe!LogSite:d", "--", ls], env, 120)
+            judge(name, res, "write probe log file", need_more_on_stdout=True,
+                  extra=lambda r: [] if r[4].get("logs_written") == 2 else ["partial append did not stop at record 2"])
+        except Exception as e:
+            record(name, False, repr(e))
+    for bk in ("breakpoint", "inline"):
         name = f"stream-filefail-deferred-{bk}"
         try:
             env = dict(base, UHH_TEST_FILE_FAIL_AT="1")
@@ -7978,6 +7987,28 @@ def check_api_threadfull():
         record(name, False, repr(e))
 
 
+def check_ctrl_call_hw_review():
+    """Controller return catches, target TF/DR ownership and migrated watch replay.
+    Real Windows exceptions in the existing self-hosted x64/x86 debuggee fixture.
+    """
+    d = exe("ctrl_dr_review.exe")
+    if not d:
+        return missing_bin("ctrl-call-hw", "ctrl_dr_review")
+    for case in ("original-owned-free", "original-owned-borrowed", "original-tf",
+                 "execute-own-watch", "historical-owned", "queued-migrated", "deferred-migrated"):
+        name = f"ctrl-call-hw-{case}"
+        try:
+            r, o = run([d, case], timeout=30)
+            res = next((x for x in o if x.get("kind") == "dr_review"), {})
+            good = r.returncode == 0 and res.get("ok") == 1 and res.get("case") == case
+            detail = f"exit={r.returncode} result={res}"
+            if not good: detail += f" stderr={r.stderr[-2400:]!r}"
+            record(name, good, detail)
+        except Exception as e:
+            record(name, False, repr(e))
+
+
+
 def check_cdx_review():
     """Codex review of the controller (docs/ROADMAP.md "Codex controller review"), fixture
     examples/ctrlreview, ONE callback source per check, every backend:
@@ -8123,6 +8154,26 @@ def check_cdx_review():
             cf = [m for m in logs if m.startswith("cf ")]
             if cf != want_cf: bad.append(f"calls={cf} (want {want_cf})")
             record(name, not bad, " ".join(bad) or f"{cf} {res}")
+        except Exception as e:
+            record(name, False, repr(e))
+
+    # A failed absolute-address image pin must refuse without entering the callee.
+    # Control run proves the same addresses are callable; the injected failure previously
+    # proceeded into CfrValue (ok=1) because only named resolutions retried a failed pin.
+    for fail in (False, True):
+        name = "cdx-cfabs-pin-fail" if fail else "cdx-cfabs-pin-control"
+        try:
+            env = dict(os.environ)
+            env.pop("UHH_TEST_CF_PIN_FAIL", None)
+            if fail: env["UHH_TEST_CF_PIN_FAIL"] = "1"
+            res, logs, rows, bad = go("cfabs", "inline", [], env=env)
+            if res.get("loaded") != 1: bad.append(f"DLLs not loaded: {res}")
+            cf = [m for m in logs if m.startswith("cf ")]
+            expected = (["cf phase=6 ok=0 r=-1"] * 3 + ["cf phase=2 ok=0 r=-1"] +
+                        ["cf phase=6 ok=0 r=-1"] * 3) if fail else (
+                        ["cf phase=6 ok=1 r=1"] * 3 + ["cf phase=2 ok=0 r=-1"] + ["cf phase=6 ok=1 r=2"] * 3)
+            if cf != expected: bad.append(f"calls={cf}, want {expected}")
+            record(name, not bad, "; ".join(bad) or str(cf))
         except Exception as e:
             record(name, False, repr(e))
 
@@ -13306,6 +13357,7 @@ def main():
     if want(check_ctrl_symload): check_ctrl_symload()
     if want(check_ctrl_own_debug): check_ctrl_own_debug()
     if want(check_session_loop_review): check_session_loop_review()
+    if want(check_ctrl_call_hw_review): check_ctrl_call_hw_review()
     if want(check_cdx_review): check_cdx_review()
     if want(check_api_contract): check_api_contract()
     if want(check_api_threadfull): check_api_threadfull()

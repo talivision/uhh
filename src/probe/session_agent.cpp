@@ -889,7 +889,7 @@ bool arm_gates_for_pending(probe_session *s) {
         for (DWORD tid : s->threads) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
             GuardTouch touch(s, tid);
-            if (t) { keep_queued_dr6(s, tid, t); set_dr_on_thread(t, slot, sites[i], true, 0, 0, s); CloseHandle(t); }
+            if (t) { keep_queued_dr6(s, tid, t); set_dr_on_thread(t, slot, sites[i], true, 0, 0, s, tid); CloseHandle(t); }
         }
         s->dr_used |= (uint8_t)(1u << slot); s->dr_ever |= (uint8_t)(1u << slot);
         s->gates.push_back({sites[i], slot});

@@ -61,8 +61,8 @@ extern "C" __declspec(dllexport) __declspec(noinline) void CtrlOp(const void *ad
     sink[0] = (uintptr_t)addr; sink[1] = n; sink[2] = mode;
 }
 // The probe's callback call_funcs "cfr.dll!CfrValue" and logs phase / result (cdx-cfreuse).
-extern "C" __declspec(dllexport) __declspec(noinline) void CtrlCall(uintptr_t phase) {
-    static volatile uintptr_t sink; sink = phase;
+extern "C" __declspec(dllexport) __declspec(noinline) void CtrlCall(uintptr_t phase, uintptr_t address = 0) {
+    static volatile uintptr_t sink[2]; sink[0] = phase; sink[1] = address;
 }
 extern "C" __declspec(dllexport) __declspec(noinline) void CtrlWatchOnce(volatile LONG *var) {
     static volatile void *sink; sink = (void *)var;
@@ -446,7 +446,7 @@ static int run_absreuse() {
 // may come from a cache); phase 2: nothing named cfr.dll loaded (call_func must fail, not call
 // into the unmapped image); phase 3: B loaded at A's base (CfrValue = 2; A's address in B is
 // CfrDecoy = 99).
-static int run_cfreuse() {
+static int run_cfreuse(bool absolute = false) {
     wchar_t self[MAX_PATH], tmp[MAX_PATH];
     if (!GetModuleFileNameW(nullptr, self, MAX_PATH) || !GetTempPathW(MAX_PATH, tmp)) return 1;
     std::wstring dir(self); dir.resize(dir.find_last_of(L'\\') + 1);
@@ -460,13 +460,13 @@ static int run_cfreuse() {
     }
     HMODULE ma = LoadLibraryW(a.c_str());
     const uintptr_t base_a = (uintptr_t)ma;
-    for (int i = 0; i < 3 && ma; ++i) CtrlCall(1);
+    for (int i = 0; i < 3 && ma; ++i) CtrlCall(absolute ? 6 : 1, absolute ? (uintptr_t)GetProcAddress(ma, "CfrValue") : 0);
     if (ma) FreeLibrary(ma);
     const bool gone = GetModuleHandleW(L"cfr.dll") == nullptr;
     CtrlCall(2);
     HMODULE mb = LoadLibraryW(b.c_str());
     const uintptr_t base_b = (uintptr_t)mb;
-    for (int i = 0; i < 3 && mb; ++i) CtrlCall(3);
+    for (int i = 0; i < 3 && mb; ++i) CtrlCall(absolute ? 6 : 3, absolute ? (uintptr_t)GetProcAddress(mb, "CfrValue") : 0);
     if (mb) FreeLibrary(mb);
     DeleteFileW(a.c_str()); DeleteFileW(b.c_str());
     RemoveDirectoryW((root + L"\\a").c_str()); RemoveDirectoryW((root + L"\\b").c_str()); RemoveDirectoryW(root.c_str());
@@ -983,7 +983,7 @@ int main(int argc, char **argv) {
     else if (sc == "faultmix") rc = run_faultmix(arg_int(argc, argv, "--n", 300));
     else if (sc == "owndrx") rc = run_owndrx(arg_int(argc, argv, "--n", 50));
     else if (sc == "absreuse") rc = run_absreuse();
-    else if (sc == "cfreuse") rc = run_cfreuse();
+    else if (sc == "cfreuse" || sc == "cfabs") rc = run_cfreuse(sc == "cfabs");
     else if (sc == "cfnx") rc = run_cfnx();
     else if (sc == "cfrace") rc = run_cfrace(false);
     else if (sc == "cfpin") rc = run_cfrace(true);
