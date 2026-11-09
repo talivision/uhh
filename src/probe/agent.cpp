@@ -345,17 +345,27 @@ static bool looks_like_return(uint32_t addr) {
 // 128 queries). Nothing here can raise an exception the target's vectored handlers would see.
 struct X86Mem {
     struct Region { uint32_t lo, hi; bool read, exec; };
-    Region r[16]{}; uint32_t used = 0, next = 0; int budget = 128;
+    // Retain every query in this capture: scanning stack data can encounter more than
+    // 16 regions, and evicting code/IAT regions paid for the same WOW64 query again.
+    Region r[128]; uint32_t used = 0, last = 0; int budget = 128;
+    Region stack;
+    X86Mem() {
+        const NT_TIB *tib = reinterpret_cast<const NT_TIB *>(NtCurrentTeb());
+        stack = Region{(uint32_t)(uintptr_t)tib->StackLimit,
+                       (uint32_t)(uintptr_t)tib->StackBase, true, false};
+    }
     const Region *keep(const Region &g) {
-        const uint32_t slot = used < 16 ? used++ : (next++ & 15);
-        r[slot] = g;
-        return &r[slot];
+        // At most one entry per query, so the query budget also bounds this array.
+        last = used++;
+        r[last] = g;
+        return &r[last];
     }
     const Region *find(uint32_t a) {
-        for (uint32_t i = 0; i < used; ++i) if (a >= r[i].lo && a < r[i].hi) return &r[i];
-        const NT_TIB *tib = reinterpret_cast<const NT_TIB *>(NtCurrentTeb());
-        const uint32_t slo = (uint32_t)(uintptr_t)tib->StackLimit, shi = (uint32_t)(uintptr_t)tib->StackBase;
-        if (a >= slo && a < shi) return keep(Region{slo, shi, true, false});
+        if (a >= stack.lo && a < stack.hi) return &stack;
+        if (used && a >= r[last].lo && a < r[last].hi) return &r[last];
+        for (uint32_t i = 0; i < used; ++i) {
+            if (a >= r[i].lo && a < r[i].hi) { last = i; return &r[i]; }
+        }
         if (budget <= 0) return nullptr;
         --budget;
         MEMORY_BASIC_INFORMATION mbi{};
@@ -447,8 +457,17 @@ static uint32_t walk_x86(const probe_context *c, uint64_t *frames, uint32_t n, u
         uint32_t end = (limit - sp < WINDOW) ? limit : sp + WINDOW;
         if (anchored && bp + 4 < end) end = bp + 4;
         uint32_t exact = 0, unknown = 0, other = 0;
+        // A stack often repeats a return address (saved registers, stale slots).
+        // Classification includes scanning target bytes for padding; reuse it only
+        // for this pc, within this capture. Collisions simply replace an entry.
+        struct Candidate { uint32_t ret; X86Ret kind; };
+        Candidate candidates[32]{};
         for (uint32_t a = sp; a <= end; a += 4) {
-            const X86Ret k = x86_classify(m, rd(a), pc);
+            const uint32_t ret = rd(a);
+            if (ret < 0x10000) continue;
+            Candidate &cached = candidates[((ret >> 2) ^ (ret >> 9)) & 31];
+            const X86Ret k = cached.ret == ret ? cached.kind : x86_classify(m, ret, pc);
+            cached = Candidate{ret, k};
             if (k == X86Ret::EXACT) { exact = a; break; }
             if (k == X86Ret::UNKNOWN && !unknown) unknown = a;
             if (k == X86Ret::OTHER && !other) other = a;
@@ -1058,10 +1077,11 @@ static uint64_t resolve_callee(const char *symbol, CalleePin &pin) {
             if (!can_pin) return 0;
             if (!(absolute && g_test_cf_pin_fail) && g_ldr_addref(0, mbi.AllocationBase) >= 0) pin.module = mbi.AllocationBase;
             else continue;                   // resolved through a module now going away
-            if (g_unload_gen != gen) {                      // an unload since the resolution: again
-                if (pin.module) { g_ldr_unload(pin.module); pin.module = nullptr; }
-                continue;
-            }
+        }
+        // Private memory replacing an unloaded image must not bypass generation validation.
+        if (can_pin && g_unload_gen != gen) {   // an unload since the resolution: again
+            if (pin.module) { g_ldr_unload(pin.module); pin.module = nullptr; }
+            continue;
         }
         test_cf_point(2);
         if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD)) return 0;
@@ -1318,7 +1338,9 @@ static ThreadSlot *own_thread_slot(DWORD tid) {
 static thread_local ThreadSlot *t_slot;
 static inline ThreadSlot *cached_slot() { return tls_ready() ? t_slot : nullptr; }
 static inline void cache_slot(ThreadSlot *ts) { if (tls_ready()) t_slot = ts; }
+static bool g_test_slotless, g_test_preaccount;
 static ThreadSlot *my_slot(DWORD tid) {
+    if (g_test_slotless) return nullptr;                   // regress: both slot tables exhausted
     ThreadSlot *ts = cached_slot();
     if (!ts && (ts = own_thread_slot(tid)) != nullptr) cache_slot(ts);
     return ts;
@@ -1751,8 +1773,7 @@ static void hit_scope_abandon(HitScope *h) {
     hit_settle(h->acct, h->logged);
 }
 // The hit a record from c may carry: c's own, on its own thread while its callback runs (the
-// slot names it), and only for its first record. A thread without a slot (the table is full)
-// carries nothing: its unit leaves when the callback returns, as before v23.
+// slot names it), and only for its first record. Slotless hits carry their striped unit too.
 static __forceinline bool log_epoch_current(probe_context *c, const probe_agent_shared *sh) {
     const auto *h = static_cast<const HitScope *>(c->hit_scope);
     return h && h->epoch == load_epoch(sh);
@@ -1761,7 +1782,7 @@ static __forceinline HitScope *log_carrier(probe_context *c) {
     if (!c || !c->hit_scope) return nullptr;
     auto *h = static_cast<HitScope *>(c->hit_scope);
     ThreadSlot *const ts = h->slot;
-    if (!ts || (DWORD)ts->tid != current_tid() || ts->active != h) return nullptr;
+    if (c->tid != current_tid() || (ts && ((DWORD)ts->tid != c->tid || ts->active != h))) return nullptr;
     return h->logged ? nullptr : h;
 }
 // The block a carried record names (probe_agent_log::reserved): index + 1, 0 = the stripes.
@@ -1789,7 +1810,7 @@ static bool any_inflight() {
 // size = the save area THOSE components need (standard or compacted layout), not CPUID(0xD,0)
 // .EBX, which covers every XCR0 feature -- with AMX tiles (~11 KB) that exceeded the buffer,
 // and the hit then saved nothing at all (a callback's VZEROUPPER wiped the live YMM state).
-// x86: the gated mask also keeps the x87 state when it is live -- 32-bit C code returns
+// x86: the gated mask also keeps live x87/MMX. 32-bit C code returns
 // floating-point values in ST0, so any callback (or CRT) float call pushes/pops the x87 stack
 // and changes its status word, which a mid-function site may have live.
 static struct XState { bool ok = false, compact = false, xinuse = false; uint64_t mask = 0, avx_mask = 0; uint32_t size = 0, full = 0; } g_xs = [] {
@@ -1803,7 +1824,7 @@ static struct XState { bool ok = false, compact = false, xinuse = false; uint64_
     x.mask = _xgetbv(0) & supported & 0xE7ull;              // CPUID and XGETBV can differ under emulation
     x.avx_mask = x.mask & 0xE4ull;                         // AVX upper + AVX-512 (opmask, ZMM) only
 #if !defined(_WIN64)
-    x.avx_mask |= x.mask & 1ull;                           // x87 (see above)
+    x.avx_mask |= x.mask & 1ull;                           // x86 callbacks use x87; x64 contract: probe_api.h
 #endif
     char knob[8] = {};                                     // regress: a CPU with AMX tiles in XCR0
     if (GetEnvironmentVariableA("UHH_BENCH_XSTATE", knob, sizeof(knob)) && !strcmp(knob, "amx")) x.full += 8192;
@@ -1920,6 +1941,7 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
         __forceinline void restore() const { *teb_last_status() = status; *teb_last_error() = error; }
     } teb;
     AgentState *const state = &states[index];
+    const LONG epoch = load_epoch(state->shared);         // before capturing session-owned data
     probe_context c;
     load_regs(c.regs, native);
 #if !defined(_WIN64)
@@ -1941,6 +1963,14 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     if (g_agent_threads.has(c.tid) || g_sweeper == (LONG)c.tid) return finish_hit(false, teb.error, teb.status);   // the agent's own work: see g_agent_threads, take_dead_slot
     const probe_callback cb = callbacks[index];
     if (!cb) return finish_hit(false, teb.error, teb.status);
+    if (g_test_preaccount) {
+        g_test_preaccount = false;
+        const LONG stall = g_test_cf_stall;
+        g_test_cf_stall = 1;
+        test_cf_point(1);                                 // regress: paused before running is visible
+        g_test_cf_stall = stall;
+        g_test_preaccount = false;
+    }
     ThreadSlot *const ts = my_slot(c.tid);
     if (ts && ts->busy) return finish_hit(false, teb.error, teb.status);                      // the agent's own query: see ThreadSlot
     // Count the hit and its unaccounted unit FIRST (a thread killed at any later instant leaves
@@ -1961,10 +1991,12 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     // g_stopping is checked only once this hit is running: probe_agent_stop sets it, then
     // FlushProcessWriteBuffers (every processor's pending stores land: an asymmetric fence --
     // the block's plain stores need no LOCK here), then waits for running callbacks. So a hit is
-    // either seen by that wait or sees the flag. Checked first, a thread between the check and
+    // either seen by that wait or sees the flag. The entry epoch also rejects a hit paused
+    // before accounting across detach AND reattach (which clears g_stopping).
+    // Checked first, a thread between the check and
     // the count ran its callback after the detach (its IPC then raised an exception nobody
     // handled, visible to the target).
-    if (g_stopping) {
+    if (g_stopping || state->shared != shared || epoch != load_epoch(state->shared)) {
         if (probe_agent_tblock *b = acct.blk) {
             probe_agent_store64(&b->hits[index], probe_agent_load64(&b->hits[index]) - 1);
             b->running = b->running - 1;
@@ -1997,7 +2029,7 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     // Extended state (MXCSR, AVX/AVX-512) and DF are handled in mid_entry, BEFORE any of
     // this C code runs -- see there.
     forget_region();     // validated regions are trusted within ONE hit only (see RegionCache)
-    HitScope scope{acct, ts, load_epoch(state->shared)};  // one relaxed snapshot at callback entry
+    HitScope scope{acct, ts, epoch};                       // retain the admission epoch for logging
     scope.canary = (uintptr_t)&scope ^ HIT_CANARY;
 #if defined(_WIN64)
     scope.xmm6 = &native.xmm6;
@@ -2178,7 +2210,8 @@ static __declspec(noinline) bool mid_entry_saved(safetyhook::Context &native, ui
     return x87;
 }
 
-// No usable XSAVE (no OSXSAVE, or a save area past the buffer): FXSAVE keeps the x87 state
+// No usable XSAVE (no OSXSAVE, or a save area past the buffer): x64 keeps MXCSR only
+// (see the callback contract in probe_api.h). On x86, FXSAVE keeps the x87 state
 // (ST0-7, control/status/tag words) and MXCSR around the callback, as XSAVE's x87 component
 // does on the gated path. MXCSR alone let a callback's (or the CRT's) float code change a live
 // x87 stack / status word at a mid-function site (x86 returns floats in ST0, so any float call
@@ -2186,13 +2219,13 @@ static __declspec(noinline) bool mid_entry_saved(safetyhook::Context &native, ui
 // afterwards anyway; without OSXSAVE there is no AVX state to keep.
 static __declspec(noinline) bool mid_entry_fx(safetyhook::Context &native, uint32_t index, unsigned char *x87_post,
                                               uint64_t saved = ~0ull) {
-    alignas(16) unsigned char fx[512];
 #if defined(_WIN64)
-    _fxsave64(fx);
+    const unsigned int mxcsr = _mm_getcsr();             // x87/MMX is the callback's responsibility on x64
     const bool x87 = call_mid(native, index, x87_post);
     restore_new_xstate(saved);
-    _fxrstor64(fx);
+    _mm_setcsr(mxcsr);
 #else
+    alignas(16) unsigned char fx[512];
     _fxsave(fx);
     const bool x87 = call_mid(native, index, x87_post);
     restore_new_xstate(saved);
@@ -2268,10 +2301,7 @@ static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
     }
 #endif
 #if !defined(_WIN64)
-    // x86, only the x87 state live (the usual case: Windows' x87 control word is not the INIT
-    // one, so XINUSE always reports it): FXSAVE / FXRSTOR keeps exactly what XSAVE's x87
-    // component would (plus MXCSR and XMM0-7, which the hook stub reloads anyway) -- measured
-    // ~20 ns a hit cheaper than XSAVEC / XRSTOR into the save area (154 vs 174 ns).
+    // x86, only x87/MMX live: FXSAVE / FXRSTOR avoids the larger XSAVE frame.
     if (xmode == 0 && mask == 1) {
         x87 = mid_entry_fx(native, index, x87_post, mask);
         if (x87) x87_restore(x87_post);
@@ -2283,7 +2313,7 @@ static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
         x87 = mid_entry_noxsave_sim(native, index, g_xs.mask & 0xE4ull, x87_post);
     else if (mask) x87 = g_xs.size <= 1024 ? mid_entry_saved<1024>(native, index, mask, x87_post)
                                            : mid_entry_saved<4096>(native, index, mask, x87_post);
-    else if (!xs_ok) x87 = mid_entry_fx(native, index, x87_post);   // no XSAVE: x87 + MXCSR by FXSAVE
+    else if (!xs_ok) x87 = mid_entry_fx(native, index, x87_post);   // no XSAVE: x86 x87 + MXCSR; x64 MXCSR only
     else {
         unsigned int mxcsr = _mm_getcsr();                 // the common case: nothing live but MXCSR
         x87 = call_mid(native, index, x87_post);
@@ -3071,6 +3101,9 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *channel) {
     if (!shared) return 1;
     if (shared->request_count > PROBE_AGENT_MAX_PROBES) return 3;
     g_xmode = shared->xstate_mode;
+    char review_knob[8] = {};
+    g_test_slotless = GetEnvironmentVariableA("UHH_TEST_SLOTLESS", review_knob, sizeof(review_knob)) != 0;
+    g_test_preaccount = GetEnvironmentVariableA("UHH_TEST_PREACCOUNT", review_knob, sizeof(review_knob)) != 0;
     // The drain event, opened once and never closed (a producer may be signalling it): the handle
     // keeps the named object alive, so a later controller (attach after a detach) creating the
     // same name gets this same event.

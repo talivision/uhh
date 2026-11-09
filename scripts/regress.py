@@ -1120,8 +1120,27 @@ def _filefail_run(args, env, timeout):
         out, err = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
-        subprocess.run(["taskkill", "/f", "/t", "/pid", str(p.pid)], capture_output=True)
-        out, err = p.communicate()
+        try:
+            killer = subprocess.Popen(["taskkill", "/f", "/t", "/pid", str(p.pid)],
+                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL)
+            try:
+                killer.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                killer.kill()
+                killer.wait(timeout=5)
+                p.kill()
+            if killer.returncode != 0 and p.poll() is None:
+                p.kill()
+        except (OSError, subprocess.TimeoutExpired):
+            if p.poll() is None:
+                p.kill()
+        try:
+            out, err = p.communicate(timeout=10)
+        except subprocess.TimeoutExpired as e:
+            p.kill()
+            # A surviving descendant may still own the pipes. Never wait for EOF here.
+            raise RuntimeError("controller timeout: pipes did not close after bounded cleanup") from e
     recs, text, _ = stdout_split(out)
     errtext = err.decode("utf-8", "replace")
     m = re.search(r"^probe: logs -> (.+?)\r?$", errtext, re.M)
@@ -1136,8 +1155,10 @@ def _filefail_run(args, env, timeout):
                     except ValueError:
                         file_recs.append({})
             path.unlink()
-        except OSError:
-            pass
+        except OSError as e:
+            raise RuntimeError(f"session file unreadable or cleanup failed: {path}") from e
+    else:
+        raise RuntimeError("controller did not identify a session file")
     logs = [r for r in recs if r.get("kind") == "probe_log"]
     rep = next((r for r in recs if r.get("kind") == "probe_report"), {})
     return p.returncode, timed_out, logs, text, rep, file_recs, errtext
@@ -4094,8 +4115,8 @@ def check_hitcost_methods():
     it says: every hitcost method on every backend, small runs. hitcost-methods-<b>: per method,
     exit 0, the target's timing line, hits == calls, logs == calls for send_log/send_log_stack
     (else 0), nothing dropped, and for add_once (a one-shot breakpoint probe added from the
-    callback at each hit's return address) the one-shot probes' hits sum to calls -- each fired
-    exactly once. hitcost-shared-<b>: the same for empty/counter_plain/counter_shared with
+    callback at each hit's return address) exactly calls retired one-shot probes, each with
+    one hit. Method failures emit unexpected logs. hitcost-shared-<b>: the same for empty/counter_plain/counter_shared with
     hitcost_driver_shared (the callbacks module opted in to UHH_SHARED: breakpoint/hw callbacks run
     from the controller's copy of the agent DLL). An unknown --method is refused (exit 2)."""
     d, ds, t = exe("hitcost_driver.exe"), exe("hitcost_driver_shared.exe"), exe("hitcost_target.exe")
@@ -4113,12 +4134,19 @@ def check_hitcost_methods():
                     ps = probes(o)
                     hits = ps[0].get("hits") if ps else None
                     once = sum(p.get("hits") or 0 for p in ps[1:])
+                    once_ok = (len(ps[1:]) == n and all(
+                        p.get("hits") == 1 and p.get("backend") == "breakpoint" and
+                        p.get("active") is False for p in ps[1:])) if m == "add_once" else not ps[1:]
                     logs = sum(1 for x in o if x.get("kind") == "probe_log")
                     tl = next((x for x in o if x.get("kind") == "target"), {})
                     want_logs = n if m.startswith("send_log") else 0
                     if not (r.returncode == 0 and tl.get("ns_per_call") is not None and hits == n and logs == want_logs
-                            and report(o).get("log_dropped") == 0 and once == (n if m == "add_once" else 0)):
+                            and report(o).get("log_dropped") == 0 and once_ok
+                            and report(o).get("callbacks_interrupted") == 0
+                            and report(o).get("error") is None and report(o).get("app_exit") == 0
+                            and once == (n if m == "add_once" else 0)):
                         bad.append(f"{m}: rc={r.returncode} hits={hits} logs={logs} once={once} "
+                                   f"once_probes={len(ps[1:])} once_ok={once_ok} "
                                    f"dropped={report(o).get('log_dropped')} timing={tl.get('ns_per_call')}")
                     else:
                         seen += 1
@@ -5494,7 +5522,8 @@ def check_init_cutoff():
             # init thread was the process's LAST thread to exit, whose exit the kernel reports as
             # EXIT_PROCESS (from that thread) with no EXIT_THREAD of its own -- VM, PROBE_TRACE, 30
             # runs: 4 such. The session now reports a pending init at EXIT_PROCESS too (XH3 notes).
-            ok = target.returncode == code and rep.get("app_exit") == code and not rep.get("error") and cut
+            ok = (target.returncode == code and r.returncode == 1 and "uhh_trace:" in r.stderr and
+                  rep.get("app_exit") == code and not rep.get("error") and cut)
             record(name, ok, f"app_exit={rep.get('app_exit')} target_rc={target.returncode} cut_said={cut} "
                              f"cut_line={cut_line[len('probe: '):][:120]!r} "
                              f"error={(rep.get('error') or '')[:160]}")
@@ -7429,6 +7458,19 @@ def check_logsite_review():
             except Exception as e:
                 record(name, False, repr(e))
 
+    name = "logsite-live-report-dispatcher"
+    try:
+        dr = exe("ctrl_dr_review.exe")
+        if not dr:
+            record(name, False, "missing ctrl_dr_review")
+        else:
+            r, o = run([dr, "live-report"], timeout=30)
+            res = next((x for x in o if x.get("kind") == "dr_review"), {})
+            record(name, r.returncode == 0 and res.get("ok") == 1,
+                   f"exit={r.returncode} result={res} stderr={r.stderr[-1000:]}")
+    except Exception as e:
+        record(name, False, repr(e))
+
     name = "logsite-live-report"
     try:
         r, o = go("livereport", "breakpoint", ["int3cap", "--n", 1000])
@@ -7483,7 +7525,7 @@ def check_logsite_review():
             rc, timeout, logs, text, rep, file_logs, err = _filefail_run(
                 [trace, "--backend", bk, "-p", "logstream_target.exe!LogSite:d", "--", stream], env, 90)
             record(name, not timeout and rep.get("log_dropped", 0) > 0 and
-                   rep.get("logs_written") == len(file_logs) and
+                   rep.get("logs_written") == len(file_logs) and len(file_logs) >= 7 and
                    [x.get("seq") for x in file_logs] == list(range(len(file_logs))) and
                    rep.get("hits") == rep.get("logs_written", 0) + rep.get("log_dropped", 0) +
                    rep.get("callbacks_interrupted", 0) and "incomplete" in (rep.get("error") or ""),
@@ -7838,6 +7880,27 @@ def check_ctrl_symload():
         record(name, False, repr(e))
 
 
+def check_session_loop_review():
+    """Controller loop review: nested watch call_func during step completion, delayed
+    context write-back after watchdog expiry, target execute DR at a released inline
+    gate, and the first fairness park with either helper probed. Real Windows events
+    in ctrl_dr_review; expiry and first-round state are set deterministically.
+    """
+    d = exe("ctrl_dr_review.exe")
+    if not d:
+        return missing_bin("session-loop-review", "ctrl_dr_review")
+    for case in ("step-call", "ctx-timeout", "stale-gate-own", "yield-delay", "yield-spin"):
+        name = f"session-loop-{case}"
+        try:
+            r, o = run([d, case], timeout=30)
+            res = next((x for x in o if x.get("kind") == "dr_review"), {})
+            good = r.returncode == 0 and res.get("ok") == 1 and res.get("case") == case
+            record(name, good, f"exit={r.returncode} result={res}" +
+                   (f" stderr={r.stderr[-2400:]!r}" if not good else ""))
+        except Exception as e:
+            record(name, False, repr(e))
+
+
 def check_ctrl_own_debug():
     """Real Windows #DB events from an eight-byte store and target TF, passed through
     controller handlers. Slot reuse and held-watch replay must reject stale accesses
@@ -7848,7 +7911,7 @@ def check_ctrl_own_debug():
     d = exe("ctrl_dr_review.exe")
     if not d:
         return missing_bin("ctrl-own-debug", "ctrl_dr_review")
-    for case in ("release", "queued", "queued-same", "queued-rearm", "deferred", "deferred-reused", "deferred-carried-reused", "watch-tf", "watch-tf-carried", "gate", "step-entry", "step-own", "step-own-detach", "step-mixed", "step-tf", "detach-dr", "detach-tf"):
+    for case in ("release", "queued", "queued-same", "queued-rearm", "deferred", "deferred-reused", "deferred-carried-reused", "watch-tf", "watch-tf-carried", "gate", "gate-mixed", "freeze-exited", "step-entry", "step-own", "step-own-detach", "step-mixed", "step-tf", "detach-dr", "detach-tf"):
         name = f"ctrl-own-debug-{case}"
         try:
             r, o = run([d, case], timeout=30)
@@ -8035,13 +8098,32 @@ def check_cdx_review():
     for bk in ("breakpoint", "hw", "inline"):
         name = f"cdx-codeprot-{bk}"
         try:
-            res, logs, rows, bad = go("codeprot", bk, [])
+            r, o = run([d, "--scenario", "codeprot", "--backend", bk, "--", t, "codeprot"], timeout=180)
+            res = next((x for x in o if x.get("kind") == "ctrl_result"), {})
+            rep = report(o)
+            leaf_logs = [x for x in o if x.get("kind") == "probe_log" and x.get("message") == "leaf"]
+            bad = []
+            if r.returncode != 0 or rep.get("app_exit") != 0 or rep.get("error") is not None:
+                bad.append(f"rc={r.returncode} report={rep}")
+            if rep.get("log_dropped") != 0 or rep.get("callbacks_interrupted") != 0:
+                bad.append(f"lost captures: {rep}")
+            fails = [x.get("message") for x in o if x.get("kind") == "probe_log" and
+                     "FAIL" in str(x.get("message", ""))]
+            if fails: bad.append(f"callback_fail={fails[:2]}")
             if res.get("guard_set") != 1: bad.append(f"guard_set={res.get('guard_set')}")
             if res.get("guard_intact") != 1: bad.append(f"guard_intact={res.get('guard_intact')} (a touch consumed the guard page)")
             if res.get("guard_faults") != 0: bad.append(f"guard_faults={res.get('guard_faults')}")
             if res.get("na_faults") != 0: bad.append(f"na_faults={res.get('na_faults')}")
-            leaf = sum(1 for m in logs if m == "leaf")
-            if leaf != res.get("hits"): bad.append(f"stack logs={leaf} (want {res.get('hits')})")
+            if res.get("na_set") != 1: bad.append(f"na_set={res.get('na_set')}")
+            leaf = len(leaf_logs)
+            if leaf != 450 or res.get("hits") != 450 or rep.get("hits") != 450:
+                bad.append(f"stack logs={leaf} target={res.get('hits')} report_hits={rep.get('hits')} (want 450)")
+            for i, log in enumerate(leaf_logs):
+                stack = log.get("stack")
+                if (not isinstance(stack, list) or not stack or "CtrlCodeLeaf" not in str(stack[0]) or
+                        not any("CtrlCodeMid" in str(f) for f in stack[1:])):
+                    bad.append(f"capture {i}: missing leaf/caller frames: {stack!r}")
+                    break
             record(name, not bad, " ".join(bad) or f"guard intact, no fault, {leaf} honest stack logs")
         except Exception as e:
             record(name, False, repr(e))
@@ -8753,7 +8835,7 @@ def check_session_agentipc():
 
 
 def check_agent_safety():
-    """Seven inline-agent review reproductions; fixtures assert their pressure/preconditions.
+    """Ten inline-agent review reproductions; fixtures assert their pressure/preconditions.
     256 live owners fill the hit-block table before the dead/denied-owner sweeps.
     No CPU support is needed except for the explicitly reported vector subcases."""
     d, t = exe("ar_driver.exe"), exe("ar_target.exe")
@@ -8766,11 +8848,13 @@ def check_agent_safety():
         ("guarantee", "ar_target.exe!ar_guarantee_throw", "ar_on_guarantee", {"caught": 1}, 1),
         ("cache", "ar_target.exe!ar_cache_site", "ar_on_cache", {"guard_intact": 1}, 1),
         ("vector", "ar_target.exe!ar_vector_site", "ar_on_vector", {"clean": 1}, None),
+        ("slotless", "ar_target.exe!ar_epoch_site", "ar_on_logged", {"killed": 1}, 1),
     ]
     for case, symbol, callback, want_row, want_hits in cases:
         name = f"cdx-agent-{case}-inline"
         try:
-            r, o = run([d, "--probe", f"{symbol}={callback}", "--", t, f"review-{case}"])
+            r, o = run([d, "--probe", f"{symbol}={callback}", "--", t, f"review-{case}"],
+                       env=dict(os.environ, UHH_TEST_SLOTLESS="1") if case == "slotless" else None)
             row = next((x for x in o if x.get("kind") == "ar"), {})
             rep = report(o)
             bad = []
@@ -8781,22 +8865,40 @@ def check_agent_safety():
                 bad.append(f"dropped/intr={rep.get('log_dropped')}/{rep.get('callbacks_interrupted')}")
             hits = sum(p.get("hits") or 0 for p in probes(o))
             if case == "vector":
-                want_hits = 0 if not row.get("avx") else (4 if pe_is_x86(t) else 5) if row.get("opmask") else 2
+                want_hits = 0 if not row.get("avx") else (6 if pe_is_x86(t) else 5) if row.get("opmask") else (4 if pe_is_x86(t) else 2)
                 if row.get("checks") != want_hits: bad.append(f"vector phases={row.get('checks')} want={want_hits}")
             if hits != want_hits: bad.append(f"hits={hits} want={want_hits}")
             logs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
             expected_logs = {"cache": ["ar cache first=1 called=1 guarded=1 second=0"],
-                             "guarantee": ["ar guarantee"], "vector": ["ar vector"] * want_hits if row.get("avx") else []}.get(case, [])
+                             "guarantee": ["ar guarantee"], "slotless": ["ar delivered"], "vector": ["ar vector"] * want_hits if row.get("avx") else []}.get(case, [])
             if logs != expected_logs: bad.append(f"logs={logs} want={expected_logs}")
             if case == "guarantee" and row.get("before") != row.get("after"): bad.append(f"guarantee changed: {row}")
             detail = str(row)
             if case == "vector":
-                if row.get("avx"): detail += "; XMM + INIT/non-INIT MXCSR checked; " + ("x87 INIT checked" if pe_is_x86(t) else "x87 uses existing x64 policy")
+                if row.get("avx"): detail += "; XMM + INIT/non-INIT MXCSR checked; " + ("x87 INIT/live and MMX checked" if pe_is_x86(t) else "x87/MMX unchanged by callback contract")
                 detail += "; " + ("INIT + live YMM checked" if row.get("avx") else "AVX skipped: CPU/OS support absent")
                 detail += "; " + ("mixed INIT/live opmask + YMM/ZMM checked" if row.get("opmask") else "AVX-512 skipped: CPU/OS support absent")
             record(name, not bad, "; ".join(bad) or detail)
         except Exception as e:
             record(name, False, repr(e))
+
+    name = "cdx-agent-cfprivate-inline"
+    try:
+        cd, ct = exe("ctrl_driver.exe"), exe("ctrl_target.exe")
+        if not cd or not ct: raise RuntimeError("missing ctrl_driver/ctrl_target")
+        r, o = run([cd, "--scenario", "cfprivate", "--backend", "inline", "--", ct, "cfprivate"],
+                   timeout=120, env=dict(os.environ, UHH_TEST_CF_STALL="resolved"))
+        row = next((x for x in o if x.get("kind") == "ctrl_result"), {})
+        logs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
+        cf = [m for m in logs if m.startswith("cf ")]
+        rep = report(o)
+        good = (r.returncode == 0 and rep.get("app_exit") == 0 and not rep.get("error")
+                and row.get("stalled") == 1 and row.get("same_base") == 1 and row.get("held") == 0
+                and cf == ["cf phase=4 ok=0 r=-1", "cf phase=5 ok=0 r=-1"]
+                and rep.get("log_dropped") == 0 and rep.get("callbacks_interrupted", 0) == 0)
+        record(name, good, f"result={row} calls={cf} exit={r.returncode}")
+    except Exception as e:
+        record(name, False, repr(e))
 
     # A callback suspended past detach keeps the OLD config and never publishes into the
     # second channel. The new session has exactly one hit/log and no interrupted unit.
@@ -8850,6 +8952,66 @@ def check_agent_safety():
         if rep.get("callbacks_interrupted", 0) != 0 or rep.get("log_dropped") != 0 or rep.get("error") is not None:
             bad.append(f"new report={rep}")
         record(name, not bad, "; ".join(bad) or "old hit interrupted=1; config retained=1; new hits=logs=1, dropped=intr=0")
+    except Exception as e:
+        record(name, False, repr(e))
+    finally:
+        for p, _, _ in drivers:
+            if p.poll() is None: p.kill()
+        if target and target.poll() is None: target.kill()
+
+
+    # A suspended hit before running is visible must not cross the session epoch.
+    name = "cdx-agent-preaccount-inline"
+    target = None
+    drivers = []
+    try:
+        target = subprocess.Popen([str(t), "review-preaccount"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                  env=dict(os.environ, UHH_TEST_PREACCOUNT="1"))
+        out, err = Lines(target.stdout), Lines(target.stderr)
+        ready = out.wait_for(lambda l: '"kind":"ready"' in l, 30)
+        if not ready: raise RuntimeError("epoch target not ready")
+        pid = json.loads(ready)["pid"]
+        def attach(config):
+            p = subprocess.Popen([str(d), "--review-attach", str(pid), str(config)], stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            po, pe = Lines(p.stdout), Lines(p.stderr)
+            drivers.append((p, po, pe))
+            if not po.wait_for(lambda l: '"kind":"attached"' in l, 60): raise RuntimeError(f"attach {config} failed: {pe.lines}")
+            if not pe.wait_for(lambda l: l.startswith("probe: active "), 60): raise RuntimeError(f"hook {config} not active: {pe.lines}")
+            return p, po, pe
+        def cue(p, text):
+            p.stdin.write(text); p.stdin.flush()
+        p1, o1, e1 = attach(1)
+        cue(target, "s")
+        if not out.wait_for(lambda l: '"kind":"parked"' in l, 30): raise RuntimeError("callback not parked")
+        cue(p1, "\n"); p1.wait(timeout=90)
+        o1.objs()
+        p2, o2, e2 = attach(2)
+        cue(target, "r")
+        line = out.wait_for(lambda l: '"kind":"ar"' in l, 30)
+        if not line: raise RuntimeError(f"old callback did not return: {out.lines} {err.lines}")
+        row = json.loads(line)
+        # Exit normally so the second session prints a full probe_report.
+        cue(target, "q"); target.wait(timeout=30)
+        if not o2.wait_for(lambda l: '"kind":"probe_report"' in l, 30): raise RuntimeError("no second report")
+        cue(p2, "\n"); p2.wait(timeout=90)
+        second = o2.objs()
+        rep = report(second)
+        hits = sum(p.get("hits") or 0 for p in probes(second))
+        logs = [x.get("message") for x in second if x.get("kind") == "probe_log"]
+        # No log was published, so stdout need not have a probe_final; the detach line
+        # is the authoritative accounting for the first (still suspended) callback.
+        e1.t.join(timeout=10)
+        final = re.search(r"probe: detached: hits=(\d+) logs_written=(\d+) log_dropped=(\d+) in_flight=(\d+) running=(\d+)", "\n".join(e1.lines))
+        bad = []
+        if p1.returncode or p2.returncode or target.returncode: bad.append(f"rc={p1.returncode}/{p2.returncode}/{target.returncode}")
+        if row.get("old_config") != 0 or row.get("new_config") != 2: bad.append(f"configs={row}")
+        if not final or tuple(map(int, final.groups())) != (0, 0, 0, 0, 0): bad.append(f"first detach={e1.lines}")
+        if hits != 1 or logs != ["ar epoch 2"]: bad.append(f"new hits/logs={hits}/{logs}")
+        if rep.get("callbacks_interrupted", 0) != 0 or rep.get("log_dropped") != 0 or rep.get("error") is not None:
+            bad.append(f"new report={rep}")
+        record(name, not bad, "; ".join(bad) or "old callback refused before config access; new hits=logs=1, dropped=intr=0")
     except Exception as e:
         record(name, False, repr(e))
     finally:
@@ -10492,6 +10654,164 @@ def check_symbols_grammar():
             record(name, False, repr(e))
 
 
+def check_trace_cli():
+    """uhh_trace review: option errors, scoped names, int32 formatting, and exit status.
+    Run against both x86 and x64 build directories, like the rest of this suite.
+    """
+    t = exe("uhh_trace.exe")
+    if not t:
+        return missing_bin("trace-cli", "uhh_trace")
+    spec = ["-p", "ntdll.dll!NtClose:-"]
+    launch = ["--", "unused.exe"]
+    cases = [
+        (["--attach", "1", "--attach-new", "unused.exe"], "target mode"),
+        (["--attach", "1", *launch], "target mode"),
+        (["--attach-new", "unused.exe", *launch], "target mode"),
+        (["--backend", "inlne", *launch], "--backend"),
+        (["--timeout", "0", *launch], "--timeout"),
+        (["--timeout", "1", "--attach", "1"], "--timeout"),
+        (["--attach", "1", "--detach-after-ms", "0", "--detach-on-stdin"], "mutually exclusive"),
+    ]
+    for flag in ("--fallback-hw", "--allow-prehooked", "--unsafe-fast-patch"):
+        for backend in ("breakpoint", "hw"):
+            cases.append((["--backend", backend, flag, *launch], "require --backend inline"))
+    for detach in (["--detach-after-ms", "0"], ["--detach-on-stdin"]):
+        for mode in (launch, ["--attach-new", "unused.exe"]):
+            cases.append(([*detach, *mode], "detach options require --attach"))
+    for n in (16, 32):
+        cases.append((["-p", "ntdll.dll!NtClose:" + "x" * n, *launch], "at most 15"))
+    for i, (args, diagnostic) in enumerate(cases):
+        r, _ = run([t, *spec, *args], timeout=10)
+        record(f"trace-cli-invalid-{i}", r.returncode == 2 and diagnostic in r.stderr,
+               f"args={args} rc={r.returncode} stderr={r.stderr[:250]}")
+    g = exe("gated_config.exe")
+    if not g:
+        missing_bin("trace-cli-gated", "gated_config")
+    else:
+        for role in ("flag", "read", "open", "close"):
+            r, _ = run([g, f"--{role}-backend", "bogus", "a!b", "c!d", *launch], timeout=10)
+            record(f"trace-cli-gated-{role}", r.returncode == 2 and f"--{role}-backend" in r.stderr,
+                   f"rc={r.returncode} stderr={r.stderr[:250]}")
+    # Valid options must reach launch, where the deliberately absent image fails with 1.
+    for backend in ("breakpoint", "hw", "inline"):
+        r, _ = run([t, "--backend", backend, "--allow-unsafe-site", "-p",
+                    "ntdll.dll!NtClose:" + "x" * 15, *launch], timeout=30)
+        record(f"trace-cli-valid-{backend}", r.returncode == 1 and "debug launch" in r.stderr,
+               f"15 args / unsafe-site: rc={r.returncode} stderr={r.stderr[:250]}")
+    a = exe("flagflip_target.exe")
+    if not a:
+        missing_bin("trace-cli-cpp", "flagflip_target")
+    else:
+        for suffix in ("", ":x"):
+            loc = "flagfeature.dll!Feature::IsEnabled"
+            r, o = run([t, "-p", loc + suffix, "--", a, "--threads", "1", "--calls", "2"], timeout=180)
+            pr = next((p for p in probes(o) if p.get("location") == loc), {})
+            record(f"trace-cli-cpp-{suffix or 'default'}",
+                   r.returncode == 0 and pr.get("hits") == 4 and pr.get("active") is True,
+                   f"rc={r.returncode} probe={pr}")
+    # ExitProcess receives a 32-bit -1 bit pattern. Use a target matching the build,
+    # including SysWOW64 cmd for an x86 tracer running on 64-bit Windows.
+    windows = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    system = "SysWOW64" if bin_machine() == "x86" and (windows / "SysWOW64").exists() else "System32"
+    for backend in ("breakpoint", "hw", "inline"):
+        r, o = run([t, "--backend", backend, "-p", "kernel32.dll!ExitProcess:d", "--",
+                    windows / system / "cmd.exe", "/d", "/c", "exit -1"], timeout=180)
+        logs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
+        record(f"trace-cli-signed-{bin_machine()}-{backend}",
+               r.returncode == 1 and "ExitProcess(-1)" in logs and "uhh_trace:" in r.stderr,
+               f"rc={r.returncode} logs={logs}")
+    target_exe = exe("hunt_target.exe")
+    if not target_exe:
+        return missing_bin("trace-cli-exit", "hunt_target")
+    for mode in ("attach", "attach-new"):
+        target = tracer = None
+        try:
+            args = [str(t), "--backend", "breakpoint", *spec]
+            if mode == "attach-new":
+                tracer = subprocess.Popen([*args, "--attach-new", "hunt_target.exe", "--timeout", "30000"],
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                tout, terr = Lines(tracer.stdout), Lines(tracer.stderr)
+                if not terr.wait_for(lambda l: l.startswith("probe: waiting for a new hunt_target.exe"), 30):
+                    raise RuntimeError("attach-new never took snapshot")
+            target = subprocess.Popen([str(target_exe), "exit-process", "--n", "8000"],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if mode != "attach-new":
+                r, o = run([*args, "--attach", target.pid], timeout=90)
+                rc, err = r.returncode, r.stderr
+            else:
+                tracer.wait(timeout=90)
+                rc, err, o = tracer.returncode, "\n".join(terr.lines), tout.objs()
+            target.wait(timeout=30)
+            record(f"trace-cli-exit-{mode}", rc == 1 and "uhh_trace:" in err and
+                   not any(x.get("kind") == "detached" for x in o) and
+                   report(o).get("app_exit") == 6,
+                   f"rc={rc} report={report(o)} stderr={err[-500:]}")
+        except Exception as e:
+            record(f"trace-cli-exit-{mode}", False, repr(e))
+        finally:
+            for proc in (tracer, target):
+                if proc and proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=30)
+
+    # Aim inside BndLeaf's fixed ten-byte MOV (same layout on x86 and x64).
+    # Registration and attach succeed; probe_run refuses the site while replaying
+    # modules. The old detach path discarded that failure and returned 0.
+    boundary = exe("boundary_target.exe")
+    if not boundary:
+        return missing_bin("trace-cli-exit-detach", "boundary_target")
+    target = tracer = None
+    try:
+        code = pe_export_bytes(boundary, "BndLeaf", 10) or b""
+        if code[:2] != b"\xc7\x05" or len(code) != 10:
+            raise RuntimeError(f"BndLeaf MOV fixture changed: {code.hex()}")
+        target = subprocess.Popen([str(boundary), "--gate", "--iters", "1"],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True)
+        tout, terr = Lines(target.stdout), Lines(target.stderr)
+        if not tout.wait_for(lambda l: '"kind":"waiting"' in l, 30):
+            raise RuntimeError(f"boundary target never reached gate: {terr.lines}")
+        tracer = subprocess.Popen([str(t), "--backend", "breakpoint", "-p",
+                                   "boundary_target.exe!BndLeaf+0x3:-", "--attach", str(target.pid),
+                                   "--detach-on-stdin"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True)
+        trace_out, trace_err = Lines(tracer.stdout), Lines(tracer.stderr)
+        # Synchronize on the actual run-time failure, not an elapsed-time guess.
+        if not trace_err.wait_for(lambda l: "site is inside an instruction" in l, 60):
+            raise RuntimeError(f"probe_run never refused operand site: {trace_err.lines}")
+        tracer.stdin.write("\n"); tracer.stdin.flush()
+        tracer.wait(timeout=90)
+        o = trace_out.objs()
+        trace_err.t.join(timeout=30)
+        err = "\n".join(trace_err.lines)
+        rc = tracer.returncode
+        rep = report(o)
+        attached = any(x.get("kind") == "attached" and x.get("pid") == target.pid for x in o)
+        error = str(rep.get("error") or "")
+        alive = target.poll() is None
+        # Release only after tracing ends: instrumentation failure must leave the target
+        # alive and its original instructions intact. Both pipe readers drain throughout.
+        target.stdin.write("\n"); target.stdin.flush()
+        target.wait(timeout=30)
+        good_target = any(x.get("kind") == "target" and x.get("ok") is True for x in tout.objs())
+        record("trace-cli-exit-detach",
+               attached and alive and "probe: pending boundary_target.exe!BndLeaf+0x3" in err and
+               "site is inside an instruction" in error and rc == 1 and
+               "uhh_trace: tracing session failed" in err and
+               not any(x.get("kind") == "detached" for x in o) and
+               target.returncode == 0 and good_target,
+               f"rc={rc} attached={attached} target_alive={alive} "
+               f"target_rc={target.returncode} target_ok={good_target} "
+               f"report={rep} stderr={err[-500:]}")
+    except Exception as e:
+        record("trace-cli-exit-detach", False, repr(e))
+    finally:
+        for proc in (tracer, target):
+            if proc and proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=30)
+
+
 def check_quickstart():
     """docs/quickstart.md section 4, compiled and run: examples/quickstart (my_tool) launches
     probe_app with its config DISABLED; the breakpoint at configparse.dll!ParseConfig+0x16
@@ -11115,7 +11435,7 @@ def check_gated_guardwin(threads=4, rounds=4):
     close/read probes -- so the session has the agent, and the attach arms its breakpoint/hw
     probes only once the agent's controller-death guard is up. A module that LOADS meanwhile
     must still be probed before its code runs: exactly one flag hit and one override, reads on.
-      stall-<b>: the agent's init returns 1.5 s after its service thread runs (agent test knob
+      stall-<b>: the agent's init returns 30 s after its service thread runs (agent test knob
         UHH_TEST_INIT_STALL_MS, the target's environment). The service thread's INSTALL_DONE
         reports the inline probes active, the gate is released and configparse.dll loads
         before the init returns. Full gated-e2e judge. Was: the flag probe was skipped at the
@@ -11125,6 +11445,8 @@ def check_gated_guardwin(threads=4, rounds=4):
       early-<b>: the gate is released as soon as the attach returns, before the agent is
         loaded: configparse.dll loads while the guard is not up. The inline probes go active
         whenever they do, so only the flag, the program's result and stderr are judged.
+    Both rows require target channel snapshots bracketing LoadLibrary: no init return,
+    service ready throughout stall, unavailable throughout early. Missing the window FAILS.
     UHH_GUARDWIN_N=N runs each row N times (default 3)."""
     g, a, p = exe("gated_config.exe"), exe("uhh_attach.exe"), exe("probe_app.exe")
     if not g or not a or not p:
@@ -11142,7 +11464,11 @@ def check_gated_guardwin(threads=4, rounds=4):
             for fb in ("breakpoint", "hw"):
                 name = f"gated-guardwin-{when}-{E2E_SHORT[fb]}"
                 combo = (fb, "inline", "inline", "inline")
-                env = dict(os.environ, UHH_TEST_INIT_STALL_MS="1500") if when == "stall" else None
+                env = dict(os.environ, UHH_GUARDWIN_CHECK=when)
+                if when == "stall":
+                    env["UHH_TEST_INIT_STALL_MS"] = "30000"
+                else:
+                    env.pop("UHH_TEST_INIT_STALL_MS", None)
                 for _ in range(n):
                     truth_path = tmp / "truth.jsonl"
                     try:
@@ -11173,7 +11499,14 @@ def check_gated_guardwin(threads=4, rounds=4):
                             ok = not bad
                             detail = (f"flag={fl.get('hits')}/{rep.get('overrides')} reads_enabled={ap.get('reads_enabled')} "
                                       f"reads={ap.get('successful_reads')}" + ("" if ok else " BAD: " + " | ".join(bad)))
-                        record(name, ok, detail)
+                        windows = [x for x in t_objs if x.get("kind") == "guardwin"]
+                        want_ready = 1 if when == "stall" else 0
+                        window_ok = (len(windows) == 1 and
+                                     windows[0].get("ready_before") == want_ready and
+                                     windows[0].get("ready_after") == want_ready and
+                                     windows[0].get("returns_before") == 0 and
+                                     windows[0].get("returns_after") == 0)
+                        record(name, ok and window_ok, detail + f" window={windows} verified={window_ok}")
                     except Exception as e:
                         record(name, False, repr(e)[:300])
     except Exception as e:
@@ -12938,6 +13271,7 @@ def main():
     if want(check_stream_filefail): check_stream_filefail()
     if want(check_ctrl_symload): check_ctrl_symload()
     if want(check_ctrl_own_debug): check_ctrl_own_debug()
+    if want(check_session_loop_review): check_session_loop_review()
     if want(check_cdx_review): check_cdx_review()
     if want(check_newapp_files): check_newapp_files()
     if want(check_newapp_flag): check_newapp_flag()
@@ -12955,6 +13289,7 @@ def main():
     if want(check_cxlib): check_cxlib()
     if want(check_cx2_review): check_cx2_review()
     if want(check_symbols_grammar): check_symbols_grammar()
+    if want(check_trace_cli): check_trace_cli()
     if want(check_quickstart): check_quickstart()
     if want(check_callfunc_concurrent): check_callfunc_concurrent()
     if want(check_hw_dr_restore): check_hw_dr_restore()

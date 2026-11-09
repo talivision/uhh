@@ -953,6 +953,14 @@ int run_call(probe_session *s, CallbackState *st, uint64_t fn, uint64_t *ret, in
         handling_running(s, st->tid, false); guard_resync(s);
         s->calls.erase(st->tid); SetThreadContext(thread, &saved); CloseHandle(thread); return 0;
     }
+    // A watch callback can call us while completing a software step. The callee's
+    // traps belong to the call, not that outer instruction. Keep its node off the
+    // live map until the original context is restored below.
+    auto outer_step = s->stepping.extract(st->tid);
+    // inplace_sync may release the step's window while this fiber is parked.
+    // Keep the site armed before allowing any of those other threads to run.
+    if (!outer_step.empty() && !outer_step.mapped().displaced)
+        end_inplace_step(s, st->tid, outer_step.mapped().site);
     fiber_park(s, f);                       // the loop runs on; resumed by service_event / poll_calls
     // The outcome. TRAPPED / FAULTED: the thread is stopped at that event -- or, if it came
     // while a call_original ran, suspended by us (call_held) -- and it now stands in for the
@@ -1001,6 +1009,7 @@ int run_call(probe_session *s, CallbackState *st, uint64_t fn, uint64_t *ret, in
         break;
     }
     if (thread) CloseHandle(thread);
+    if (!outer_step.empty() && !st->released) s->stepping.insert(std::move(outer_step));
     release_deferred(s);                                               // held hits replay now
     return result;
 }
