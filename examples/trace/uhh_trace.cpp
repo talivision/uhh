@@ -174,9 +174,15 @@ static int list_symbols(int argc, char **argv) {
     return ok ? 0 : 1;
 }
 
+static int option_error(const char *message) {
+    std::fprintf(stderr, "uhh_trace: %s\n", message);
+    return 2;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && !std::strcmp(argv[1], "--list")) return list_symbols(argc, argv);
     uint32_t backend = PROBE_BREAKPOINT; bool stack = false, unsafe_fast_patch = false, fallback_hw = false, allow_unsafe_site = false, allow_prehooked = false; unsigned long attach_pid = 0, detach_ms = 0; bool detach_stdin = false;
+    bool attach_set = false, detach_set = false, timeout_set = false;
     const char *attach_new = nullptr; unsigned long attach_timeout = 0;
     std::vector<trace_config> cfgs; std::vector<std::string> locs;
     int i = 1;
@@ -187,21 +193,28 @@ int main(int argc, char **argv) {
         if (!std::strcmp(argv[i], "--fallback-hw")) { fallback_hw = true; continue; }
         if (!std::strcmp(argv[i], "--allow-unsafe-site")) { allow_unsafe_site = true; continue; }
         if (!std::strcmp(argv[i], "--allow-prehooked")) { allow_prehooked = true; continue; }
-        if (!std::strcmp(argv[i], "--attach") && i + 1 < argc) { attach_pid = std::strtoul(argv[++i], nullptr, 0); continue; }
-        if (!std::strcmp(argv[i], "--detach-after-ms") && i + 1 < argc) { detach_ms = std::strtoul(argv[++i], nullptr, 0); continue; }
+        if (!std::strcmp(argv[i], "--attach") && i + 1 < argc) { attach_set = true; attach_pid = std::strtoul(argv[++i], nullptr, 0); continue; }
+        if (!std::strcmp(argv[i], "--detach-after-ms") && i + 1 < argc) { detach_set = true; detach_ms = std::strtoul(argv[++i], nullptr, 0); continue; }
         if (!std::strcmp(argv[i], "--detach-on-stdin")) { detach_stdin = true; continue; }   // a line (or EOF) on stdin
         if (!std::strcmp(argv[i], "--attach-new") && i + 1 < argc) { attach_new = argv[++i]; continue; }
-        if (!std::strcmp(argv[i], "--timeout") && i + 1 < argc) { attach_timeout = std::strtoul(argv[++i], nullptr, 0); continue; }
+        if (!std::strcmp(argv[i], "--timeout") && i + 1 < argc) { timeout_set = true; attach_timeout = std::strtoul(argv[++i], nullptr, 0); continue; }
         if (!std::strcmp(argv[i], "--backend") && i + 1 < argc) {
             const char *b = argv[++i];
+            if (std::strcmp(b, "inline") && std::strcmp(b, "hw") && std::strcmp(b, "breakpoint"))
+                return option_error("--backend must be inline, breakpoint, or hw");
             backend = !std::strcmp(b, "inline") ? PROBE_INLINE : !std::strcmp(b, "hw") ? PROBE_HW : PROBE_BREAKPOINT;
             continue;
         }
         if (!std::strcmp(argv[i], "-p") && i + 1 < argc) {
             std::string spec = argv[++i]; size_t colon = spec.rfind(':');
+            // A scope operator is part of the C++ name, never a format separator.
+            if (colon != std::string::npos && colon > 0 && spec[colon - 1] == ':')
+                colon = std::string::npos;
             std::string where = colon == std::string::npos ? spec : spec.substr(0, colon);
             std::string fmt = colon == std::string::npos ? "xxxx" : spec.substr(colon + 1);
             trace_config c{};
+            if (fmt.size() >= sizeof(c.fmt))
+                return option_error("argument format supports at most 15 arguments");
             size_t bang = where.find('!');
             std::snprintf(c.name, sizeof(c.name), "%s", bang == std::string::npos ? where.c_str() : where.c_str() + bang + 1);
             std::snprintf(c.fmt, sizeof(c.fmt), "%s", fmt.c_str());
@@ -210,14 +223,29 @@ int main(int argc, char **argv) {
         }
         std::fprintf(stderr, "uhh_trace: unknown option %s\n", argv[i]); return 2;
     }
+    if (static_cast<int>(attach_set) + static_cast<int>(attach_new != nullptr) + static_cast<int>(i < argc) > 1)
+        return option_error("choose exactly one target mode: --attach, --attach-new, or -- program");
+    if (attach_set && !attach_pid) return option_error("--attach requires a nonzero PID");
+    if (backend != PROBE_INLINE && (fallback_hw || allow_prehooked || unsafe_fast_patch))
+        return option_error("--fallback-hw, --allow-prehooked, and --unsafe-fast-patch require --backend inline");
+    if ((detach_set || detach_stdin) && !attach_set)
+        return option_error("detach options require --attach");
+    if (detach_set && detach_stdin)
+        return option_error("--detach-after-ms and --detach-on-stdin are mutually exclusive");
+    if (timeout_set && !attach_new) return option_error("--timeout requires --attach-new");
     if (cfgs.empty() || (!attach_pid && !attach_new && i >= argc)) {
         std::fprintf(stderr, "usage: uhh_trace [--backend inline|breakpoint|hw] [--stack] [--allow-unsafe-site] -p mod!Export[:fmt] ... -- prog [args]\n"
                              "       uhh_trace --list <module.dll|path> [--mask *pattern*]\n"
+                             "       uhh_trace [options] -p mod!Symbol[:fmt] --attach PID [--detach-after-ms N | --detach-on-stdin]\n"
+                             "       uhh_trace [options] -p mod!Symbol[:fmt] --attach-new image [--timeout ms]\n"
+                             "       fmt: at most 15 arguments; default xxxx; d = signed 32-bit int; C++ :: names supported\n"
+                             "       --fallback-hw, --allow-prehooked, --unsafe-fast-patch require --backend inline\n"
+                             "       target modes and detach alternatives are mutually exclusive\n"
                              "       --allow-unsafe-site: override boundary checks on all execute backends and inline site checks\n");
         return 2;
     }
     probe_session *s = probe_session_create();
-    if (!s) return 1;
+    if (!s) { std::fprintf(stderr, "uhh_trace: session creation failed\n"); return 1; }
     // Exactly the backend asked for; --fallback-hw lets an inline probe on a site that is
     // already hooked by someone else (or otherwise not inline-safe) move to a debug register.
     uint32_t flags = backend | (backend == PROBE_INLINE && fallback_hw ? static_cast<uint32_t>(PROBE_FALLBACK_HW) : 0u);
@@ -235,8 +263,8 @@ int main(int argc, char **argv) {
         std::printf("{\"kind\":\"waiting_for\",\"image\":\"%s\"}\n", attach_new); std::fflush(stdout);
         ok = ok && probe_attach_new(s, attach_new, (uint32_t)attach_timeout);
         if (ok) { std::printf("{\"kind\":\"attached\"}\n"); std::fflush(stdout); }
-        ok = ok && probe_run(s);
-    } else if (attach_pid && (detach_ms || detach_stdin)) {
+        ok = ok && probe_run(s) && probe_wait_for_exit(s);
+    } else if (attach_pid && (detach_set || detach_stdin)) {
         // Detach while the target keeps running: attach AND run on a worker thread (the debug
         // object belongs to the thread that attached), probe_close from this one after the
         // delay. The target must carry on exactly as before.
@@ -244,31 +272,34 @@ int main(int argc, char **argv) {
         // probe_attach is still running on the other thread is not allowed.
         HANDLE attached = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         bool attach_ok = false;
+        int run_ok = 0;
         std::thread runner([&] {
             attach_ok = ok && probe_attach(s, (uint32_t)attach_pid);
             SetEvent(attached);
             if (attach_ok) {
                 std::printf("{\"kind\":\"attached\",\"pid\":%lu}\n", attach_pid); std::fflush(stdout);
-                probe_run(s);
+                run_ok = probe_run(s);
             }
         });
         WaitForSingleObject(attached, INFINITE);
         CloseHandle(attached);
-        if (!attach_ok) { runner.join(); probe_report(s, stdout); probe_close(s); return 1; }
+        if (!attach_ok) { std::fprintf(stderr, "uhh_trace: attach failed\n"); runner.join(); probe_report(s, stdout); probe_close(s); return 1; }
         if (detach_stdin) { char line[64]; if (!std::fgets(line, sizeof(line), stdin)) {} }
         else Sleep(detach_ms);
         probe_report(s, stdout);              // what was observed before letting go
         probe_close(s);                       // detach: hooks removed, INT3s restored, DRs cleared
         runner.join();
-        std::printf("{\"kind\":\"detached\",\"pid\":%lu}\n", attach_pid);
-        return ok ? 0 : 1;
+        if (!run_ok) std::fprintf(stderr, "uhh_trace: tracing session failed\n");
+        else std::printf("{\"kind\":\"detached\",\"pid\":%lu}\n", attach_pid);
+        return run_ok ? 0 : 1;
     } else if (attach_pid) {
         ok = ok && probe_attach(s, (uint32_t)attach_pid);
         if (ok) { std::printf("{\"kind\":\"attached\",\"pid\":%lu}\n", attach_pid); std::fflush(stdout); }
-        ok = ok && probe_run(s);
+        ok = ok && probe_run(s) && probe_wait_for_exit(s);
     } else {
         ok = ok && probe_launch(s, child.data()) && probe_run(s) && probe_wait_for_exit(s);
     }
+    if (!ok) std::fprintf(stderr, "uhh_trace: tracing session or target failed\n");
     probe_report(s, stdout);
     probe_close(s);
     return ok ? 0 : 1;

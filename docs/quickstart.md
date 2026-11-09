@@ -224,7 +224,7 @@ and the target keeps running.
 ## 3. Tracing any export: `uhh_trace`
 
 `uhh_trace` (examples/trace) logs calls to any function without writing code. One format
-character per argument: `x` hex, `d` signed, `s` ANSI string, `W` wide string,
+character per argument (at most 15): `x` hex, `d` signed 32-bit int, `s` ANSI string, `W` wide string,
 `S` sockaddr, `O` OBJECT_ATTRIBUTES name, `-` skip; `:-` counts hits without logging.
 
 ```bat
@@ -244,6 +244,19 @@ or a line on stdin; the target runs on), `--attach-new <image> [--timeout ms]`,
 `--fallback-hw`, `--allow-unsafe-site`, `--allow-prehooked`, `--unsafe-fast-patch` (see the
 flags in [api.md](api.md#probe-flags)). The default backend is `breakpoint`. `--list` takes
 exactly `--list <module> [--mask <pattern>]`.
+
+Choose exactly one target mode: launch after `--`, `--attach`, or `--attach-new`.
+Detach options require `--attach` and cannot be combined; `--timeout` requires
+`--attach-new`. `--fallback-hw`, `--allow-prehooked`, and `--unsafe-fast-patch`
+require `--backend inline`. `--allow-unsafe-site` is valid on all three execute backends.
+Unknown backend names and invalid option combinations produce a diagnostic on stderr
+and exit 2 (including unknown backend names in `gated_config`). Session failures and
+nonzero target exits in launch or ordinary attach modes produce a diagnostic on stderr
+and exit 1; detach mode also exits 1 if instrumentation fails.
+
+The `:fmt` suffix is optional (default `xxxx`); C++ scope operators remain part of the
+symbol name, for example `-p "flagfeature.dll!Feature::IsEnabled"`.
+Formats longer than 15 characters are rejected with exit 2 rather than truncated.
 
 ## 4. Your own tool
 

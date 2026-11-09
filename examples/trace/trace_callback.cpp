@@ -61,7 +61,7 @@ extern "C" __declspec(dllexport) void uhh_trace_call(probe_context *c) {
         char item[260];
         uint64_t v = get_func_arg(c, i);
         switch (cfg->fmt[i]) {
-        case 'd': snprintf(item, sizeof(item), "%lld", (long long)(int64_t)v); break;
+        case 'd': snprintf(item, sizeof(item), "%lld", (long long)(int32_t)(uint32_t)v); break;
         case 's': read_string(c, v, false, item, sizeof(item)); break;
         case 'W': read_string(c, v, true, item, sizeof(item)); break;
         case 'S': read_sockaddr(c, v, item, sizeof(item)); break;

@@ -5423,7 +5423,8 @@ def check_init_cutoff():
             # init thread was the process's LAST thread to exit, whose exit the kernel reports as
             # EXIT_PROCESS (from that thread) with no EXIT_THREAD of its own -- VM, PROBE_TRACE, 30
             # runs: 4 such. The session now reports a pending init at EXIT_PROCESS too (XH3 notes).
-            ok = target.returncode == code and rep.get("app_exit") == code and not rep.get("error") and cut
+            ok = (target.returncode == code and r.returncode == 1 and "uhh_trace:" in r.stderr and
+                  rep.get("app_exit") == code and not rep.get("error") and cut)
             record(name, ok, f"app_exit={rep.get('app_exit')} target_rc={target.returncode} cut_said={cut} "
                              f"cut_line={cut_line[len('probe: '):][:120]!r} "
                              f"error={(rep.get('error') or '')[:160]}")
@@ -10401,6 +10402,110 @@ def check_symbols_grammar():
             record(name, False, repr(e))
 
 
+def check_trace_cli():
+    """uhh_trace review: option errors, scoped names, int32 formatting, and exit status.
+    Run against both x86 and x64 build directories, like the rest of this suite.
+    """
+    t = exe("uhh_trace.exe")
+    if not t:
+        return missing_bin("trace-cli", "uhh_trace")
+    spec = ["-p", "ntdll.dll!NtClose:-"]
+    launch = ["--", "unused.exe"]
+    cases = [
+        (["--attach", "1", "--attach-new", "unused.exe"], "target mode"),
+        (["--attach", "1", *launch], "target mode"),
+        (["--attach-new", "unused.exe", *launch], "target mode"),
+        (["--backend", "inlne", *launch], "--backend"),
+        (["--timeout", "0", *launch], "--timeout"),
+        (["--timeout", "1", "--attach", "1"], "--timeout"),
+        (["--attach", "1", "--detach-after-ms", "0", "--detach-on-stdin"], "mutually exclusive"),
+    ]
+    for flag in ("--fallback-hw", "--allow-prehooked", "--unsafe-fast-patch"):
+        for backend in ("breakpoint", "hw"):
+            cases.append((["--backend", backend, flag, *launch], "require --backend inline"))
+    for detach in (["--detach-after-ms", "0"], ["--detach-on-stdin"]):
+        for mode in (launch, ["--attach-new", "unused.exe"]):
+            cases.append(([*detach, *mode], "detach options require --attach"))
+    for n in (16, 32):
+        cases.append((["-p", "ntdll.dll!NtClose:" + "x" * n, *launch], "at most 15"))
+    for i, (args, diagnostic) in enumerate(cases):
+        r, _ = run([t, *spec, *args], timeout=10)
+        record(f"trace-cli-invalid-{i}", r.returncode == 2 and diagnostic in r.stderr,
+               f"args={args} rc={r.returncode} stderr={r.stderr[:250]}")
+    g = exe("gated_config.exe")
+    if not g:
+        missing_bin("trace-cli-gated", "gated_config")
+    else:
+        for role in ("flag", "read", "open", "close"):
+            r, _ = run([g, f"--{role}-backend", "bogus", "a!b", "c!d", *launch], timeout=10)
+            record(f"trace-cli-gated-{role}", r.returncode == 2 and f"--{role}-backend" in r.stderr,
+                   f"rc={r.returncode} stderr={r.stderr[:250]}")
+    # Valid options must reach launch, where the deliberately absent image fails with 1.
+    for backend in ("breakpoint", "hw", "inline"):
+        r, _ = run([t, "--backend", backend, "--allow-unsafe-site", "-p",
+                    "ntdll.dll!NtClose:" + "x" * 15, *launch], timeout=30)
+        record(f"trace-cli-valid-{backend}", r.returncode == 1 and "debug launch" in r.stderr,
+               f"15 args / unsafe-site: rc={r.returncode} stderr={r.stderr[:250]}")
+    a = exe("flagflip_target.exe")
+    if not a:
+        missing_bin("trace-cli-cpp", "flagflip_target")
+    else:
+        for suffix in ("", ":x"):
+            loc = "flagfeature.dll!Feature::IsEnabled"
+            r, o = run([t, "-p", loc + suffix, "--", a, "--threads", "1", "--calls", "2"])
+            pr = next((p for p in probes(o) if p.get("location") == loc), {})
+            record(f"trace-cli-cpp-{suffix or 'default'}",
+                   r.returncode == 0 and pr.get("hits") == 4 and pr.get("active") is True,
+                   f"rc={r.returncode} probe={pr}")
+    # ExitProcess receives a 32-bit -1 bit pattern. Use a target matching the build,
+    # including SysWOW64 cmd for an x86 tracer running on 64-bit Windows.
+    windows = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    system = "SysWOW64" if bin_machine() == "x86" and (windows / "SysWOW64").exists() else "System32"
+    for backend in ("breakpoint", "hw", "inline"):
+        r, o = run([t, "--backend", backend, "-p", "kernel32.dll!ExitProcess:d", "--",
+                    windows / system / "cmd.exe", "/d", "/c", "exit -1"])
+        logs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
+        record(f"trace-cli-signed-{bin_machine()}-{backend}",
+               r.returncode == 1 and "ExitProcess(-1)" in logs and "uhh_trace:" in r.stderr,
+               f"rc={r.returncode} logs={logs}")
+    target_exe = exe("hunt_target.exe")
+    if not target_exe:
+        return missing_bin("trace-cli-exit", "hunt_target")
+    for mode in ("attach", "attach-new", "detach"):
+        target = tracer = None
+        try:
+            args = [str(t), "--backend", "inline" if mode == "detach" else "breakpoint", *spec]
+            if mode == "attach-new":
+                tracer = subprocess.Popen([*args, "--attach-new", "hunt_target.exe", "--timeout", "30000"],
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                tout, terr = Lines(tracer.stdout), Lines(tracer.stderr)
+                if not terr.wait_for(lambda l: l.startswith("probe: waiting for a new hunt_target.exe"), 30):
+                    raise RuntimeError("attach-new never took snapshot")
+            env = dict(os.environ, UHH_TEST_INIT_STALL_MS="30000") if mode == "detach" else None
+            target = subprocess.Popen([str(target_exe), "exit-process", "--n", "8000"], env=env,
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if mode != "attach-new":
+                extra = ["--detach-after-ms", "12000"] if mode == "detach" else []
+                r, o = run([*args, "--attach", target.pid, *extra], timeout=90)
+                rc, err = r.returncode, r.stderr
+            else:
+                tracer.wait(timeout=90)
+                rc, err, o = tracer.returncode, "\n".join(terr.lines), tout.objs()
+            target.wait(timeout=30)
+            record(f"trace-cli-exit-{mode}", rc == 1 and "uhh_trace:" in err and
+                   not any(x.get("kind") == "detached" for x in o) and
+                   (mode != "detach" or bool(report(o).get("error"))) and
+                   report(o).get("app_exit") == 6,
+                   f"rc={rc} report={report(o)} stderr={err[-500:]}")
+        except Exception as e:
+            record(f"trace-cli-exit-{mode}", False, repr(e))
+        finally:
+            for proc in (tracer, target):
+                if proc and proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=30)
+
+
 def check_quickstart():
     """docs/quickstart.md section 4, compiled and run: examples/quickstart (my_tool) launches
     probe_app with its config DISABLED; the breakpoint at configparse.dll!ParseConfig+0x16
@@ -12860,6 +12965,7 @@ def main():
     if want(check_cxlib): check_cxlib()
     if want(check_cx2_review): check_cx2_review()
     if want(check_symbols_grammar): check_symbols_grammar()
+    if want(check_trace_cli): check_trace_cli()
     if want(check_quickstart): check_quickstart()
     if want(check_callfunc_concurrent): check_callfunc_concurrent()
     if want(check_hw_dr_restore): check_hw_dr_restore()

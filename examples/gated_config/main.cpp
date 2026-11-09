@@ -20,7 +20,7 @@
 static int usage() {
     std::fprintf(stderr, "usage: gated_config [--flag-backend b] [--read-backend b] [--open-backend b] [--close-backend b] [--no-log] "
                          "[--pid P] [--range BASE:SIZE ...] <flag_location> <read_location> -- <target.exe> [args]\n"
-                         "       b = breakpoint | hw | inline\n");
+                         "       b = breakpoint | hw | inline; invalid names are rejected with exit 2\n");
     return 2;
 }
 
@@ -30,10 +30,20 @@ int main(int argc, char **argv) {
     const char *locations[2] = {}; int nloc = 0, i = 1;
     for (; i < argc && std::strcmp(argv[i], "--"); ++i) {
         if (!std::strcmp(argv[i], "--no-log")) log = 0;
-        else if (!std::strcmp(argv[i], "--flag-backend") && i + 1 < argc) flag_backend = backend_flag(argv[++i]);
-        else if (!std::strcmp(argv[i], "--read-backend") && i + 1 < argc) read_backend = backend_flag(argv[++i]);
-        else if (!std::strcmp(argv[i], "--open-backend") && i + 1 < argc) open_backend = backend_flag(argv[++i]);
-        else if (!std::strcmp(argv[i], "--close-backend") && i + 1 < argc) close_backend = backend_flag(argv[++i]);
+        else if (!std::strcmp(argv[i], "--flag-backend") || !std::strcmp(argv[i], "--read-backend") ||
+                 !std::strcmp(argv[i], "--open-backend") || !std::strcmp(argv[i], "--close-backend")) {
+            const char *option = argv[i];
+            if (i + 1 >= argc) return usage();
+            uint32_t value = backend_flag(argv[++i]);
+            if (!value) {
+                std::fprintf(stderr, "gated_config: %s must be breakpoint, hw, or inline (got %s)\n", option, argv[i]);
+                return 2;
+            }
+            if (!std::strcmp(option, "--flag-backend")) flag_backend = value;
+            else if (!std::strcmp(option, "--read-backend")) read_backend = value;
+            else if (!std::strcmp(option, "--open-backend")) open_backend = value;
+            else close_backend = value;
+        }
         else if (!std::strcmp(argv[i], "--pid") && i + 1 < argc) cfg.pid = std::strtoull(argv[++i], nullptr, 0);
         else if (!std::strcmp(argv[i], "--range") && i + 1 < argc) { if (!add_read_range(&cfg, argv[++i])) return usage(); }
         else if (nloc < 2) locations[nloc++] = argv[i];
