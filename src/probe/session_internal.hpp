@@ -689,7 +689,7 @@ bool inline_hold_needed(const probe_session *s);
 bool agent_thread(const probe_session *s, DWORD tid);
 void hold_thread(probe_session *s, DWORD tid);
 bool arm_gates_for_pending(probe_session *s);
-bool handle_gate(probe_session *s, const DEBUG_EVENT &event, bool &handled);
+bool handle_gate(probe_session *s, const DEBUG_EVENT &event, bool &handled, bool *failed = nullptr);
 void release_held(probe_session *s, const char *why);
 bool kick_agent(probe_session *s);
 bool confirm_runtime_inline(probe_session *s, Probe &p);

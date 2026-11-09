@@ -200,7 +200,10 @@ reads, a slow (50 ms) callback under 32 threads.
   field the target set itself keeps the target's (exact for a plain write-back); debug registers
   are not merged but rewritten from the CURRENT probe state by enforce_owned_drs -- the one place
   that re-applies DRs, as at NtContinue (cfnest's restore_fixup). Re-checked after
-  the repair: a thread the target suspended again meanwhile stays held. (2) hw execute hits no
+  the repair: a thread the target suspended again meanwhile stays held. Controller loop review:
+  the two-second context-watch deadline now warns once and retains the repair until the target
+  releases its suspension; dropping it allowed a later write-back to resume mid-instruction.
+  Regression: `session-loop-ctx-timeout` (expiry followed by a late write-back). (2) hw execute hits no
   longer resume at the site with RF (RF only lives until the instruction ran, and a round-trip in
   that window comes back without it): they resume in the site's displaced trampoline (A5), whose
   copy is checked against the live code at every hit; non-displaceable sites keep RF.

@@ -349,17 +349,27 @@ static bool looks_like_return(uint32_t addr) {
 // (16 KiB per frame, 128 region lookups); the same protection-race policy as get_mem applies.
 struct X86Mem {
     struct Region { uint32_t lo, hi; bool read, exec; };
-    Region r[16]{}; uint32_t used = 0, next = 0; int budget = 128;
+    // Retain every query in this capture: scanning stack data can encounter more than
+    // 16 regions, and evicting code/IAT regions paid for the same WOW64 query again.
+    Region r[128]; uint32_t used = 0, last = 0; int budget = 128;
+    Region stack;
+    X86Mem() {
+        const NT_TIB *tib = reinterpret_cast<const NT_TIB *>(NtCurrentTeb());
+        stack = Region{(uint32_t)(uintptr_t)tib->StackLimit,
+                       (uint32_t)(uintptr_t)tib->StackBase, true, false};
+    }
     const Region *keep(const Region &g) {
-        const uint32_t slot = used < 16 ? used++ : (next++ & 15);
-        r[slot] = g;
-        return &r[slot];
+        // At most one entry per query, so the query budget also bounds this array.
+        last = used++;
+        r[last] = g;
+        return &r[last];
     }
     const Region *find(uint32_t a) {
-        for (uint32_t i = 0; i < used; ++i) if (a >= r[i].lo && a < r[i].hi) return &r[i];
-        const NT_TIB *tib = reinterpret_cast<const NT_TIB *>(NtCurrentTeb());
-        const uint32_t slo = (uint32_t)(uintptr_t)tib->StackLimit, shi = (uint32_t)(uintptr_t)tib->StackBase;
-        if (a >= slo && a < shi) return keep(Region{slo, shi, true, false});
+        if (a >= stack.lo && a < stack.hi) return &stack;
+        if (used && a >= r[last].lo && a < r[last].hi) return &r[last];
+        for (uint32_t i = 0; i < used; ++i) {
+            if (a >= r[i].lo && a < r[i].hi) { last = i; return &r[i]; }
+        }
         if (budget <= 0) return nullptr;
         --budget;
         RegionCache region{};
@@ -447,8 +457,17 @@ static uint32_t walk_x86(const probe_context *c, uint64_t *frames, uint32_t n, u
         uint32_t end = (limit - sp < WINDOW) ? limit : sp + WINDOW;
         if (anchored && bp + 4 < end) end = bp + 4;
         uint32_t exact = 0, unknown = 0, other = 0;
+        // A stack often repeats a return address (saved registers, stale slots).
+        // Classification includes scanning target bytes for padding; reuse it only
+        // for this pc, within this capture. Collisions simply replace an entry.
+        struct Candidate { uint32_t ret; X86Ret kind; };
+        Candidate candidates[32]{};
         for (uint32_t a = sp; a <= end; a += 4) {
-            const X86Ret k = x86_classify(m, rd(a), pc);
+            const uint32_t ret = rd(a);
+            if (ret < 0x10000) continue;
+            Candidate &cached = candidates[((ret >> 2) ^ (ret >> 9)) & 31];
+            const X86Ret k = cached.ret == ret ? cached.kind : x86_classify(m, ret, pc);
+            cached = Candidate{ret, k};
             if (k == X86Ret::EXACT) { exact = a; break; }
             if (k == X86Ret::UNKNOWN && !unknown) unknown = a;
             if (k == X86Ret::OTHER && !other) other = a;

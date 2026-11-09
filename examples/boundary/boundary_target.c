@@ -10,8 +10,9 @@
 //   BndSmc    returns the imm32 of its own `mov eax, imm32`, which --smc rewrites (a data
 //             watchpoint on that operand, inside an instruction in .text, is a valid site).
 //   BndOverlap jumps indirectly into a MOV immediate: hidden INC EAX returns 1 per call.
-// Prints ONE JSON row; the values never change under any probe (a refused probe included).
-//   boundary_target [--iters K]
+// Prints one result JSON row (plus readiness under --gate); the values never change
+// under any probe (a refused probe included).
+//   boundary_target [--iters K] [--gate]   wait on stdin before running (attach checks)
 //   boundary_target --smc K      rewrite BndSmc's immediate to 1..K, calling it after each
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -49,10 +50,18 @@ static int run_smc(int k) {
 }
 
 int main(int argc, char **argv) {
-    int iters = 100;
-    for (int i = 1; i + 1 < argc; ++i) {
+    int iters = 100, gate = 0;
+    for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "--gate")) { gate = 1; continue; }
+        if (i + 1 >= argc) break;
         if (!strcmp(argv[i], "--iters")) iters = atoi(argv[i + 1]);
         if (!strcmp(argv[i], "--smc")) return run_smc(atoi(argv[i + 1]));
+    }
+    if (gate) {
+        char line[16];
+        printf("{\"kind\":\"waiting\"}\n");
+        fflush(stdout);
+        if (!fgets(line, sizeof(line), stdin)) return 2;
     }
     unsigned frame = 0, leaf = 0, hidden = 0, noret = 0, overlap = 0;
     for (int i = 0; i < iters; ++i) {

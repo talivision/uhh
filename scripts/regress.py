@@ -5513,7 +5513,8 @@ def check_init_cutoff():
             # init thread was the process's LAST thread to exit, whose exit the kernel reports as
             # EXIT_PROCESS (from that thread) with no EXIT_THREAD of its own -- VM, PROBE_TRACE, 30
             # runs: 4 such. The session now reports a pending init at EXIT_PROCESS too (XH3 notes).
-            ok = target.returncode == code and rep.get("app_exit") == code and not rep.get("error") and cut
+            ok = (target.returncode == code and r.returncode == 1 and "uhh_trace:" in r.stderr and
+                  rep.get("app_exit") == code and not rep.get("error") and cut)
             record(name, ok, f"app_exit={rep.get('app_exit')} target_rc={target.returncode} cut_said={cut} "
                              f"cut_line={cut_line[len('probe: '):][:120]!r} "
                              f"error={(rep.get('error') or '')[:160]}")
@@ -7448,6 +7449,19 @@ def check_logsite_review():
             except Exception as e:
                 record(name, False, repr(e))
 
+    name = "logsite-live-report-dispatcher"
+    try:
+        dr = exe("ctrl_dr_review.exe")
+        if not dr:
+            record(name, False, "missing ctrl_dr_review")
+        else:
+            r, o = run([dr, "live-report"], timeout=30)
+            res = next((x for x in o if x.get("kind") == "dr_review"), {})
+            record(name, r.returncode == 0 and res.get("ok") == 1,
+                   f"exit={r.returncode} result={res} stderr={r.stderr[-1000:]}")
+    except Exception as e:
+        record(name, False, repr(e))
+
     name = "logsite-live-report"
     try:
         r, o = go("livereport", "breakpoint", ["int3cap", "--n", 1000])
@@ -7857,6 +7871,27 @@ def check_ctrl_symload():
         record(name, False, repr(e))
 
 
+def check_session_loop_review():
+    """Controller loop review: nested watch call_func during step completion, delayed
+    context write-back after watchdog expiry, target execute DR at a released inline
+    gate, and the first fairness park with either helper probed. Real Windows events
+    in ctrl_dr_review; expiry and first-round state are set deterministically.
+    """
+    d = exe("ctrl_dr_review.exe")
+    if not d:
+        return missing_bin("session-loop-review", "ctrl_dr_review")
+    for case in ("step-call", "ctx-timeout", "stale-gate-own", "yield-delay", "yield-spin"):
+        name = f"session-loop-{case}"
+        try:
+            r, o = run([d, case], timeout=30)
+            res = next((x for x in o if x.get("kind") == "dr_review"), {})
+            good = r.returncode == 0 and res.get("ok") == 1 and res.get("case") == case
+            record(name, good, f"exit={r.returncode} result={res}" +
+                   (f" stderr={r.stderr[-2400:]!r}" if not good else ""))
+        except Exception as e:
+            record(name, False, repr(e))
+
+
 def check_ctrl_own_debug():
     """Real Windows #DB events from an eight-byte store and target TF, passed through
     controller handlers. Slot reuse and held-watch replay must reject stale accesses
@@ -7867,7 +7902,7 @@ def check_ctrl_own_debug():
     d = exe("ctrl_dr_review.exe")
     if not d:
         return missing_bin("ctrl-own-debug", "ctrl_dr_review")
-    for case in ("release", "queued", "queued-same", "queued-rearm", "deferred", "deferred-reused", "deferred-carried-reused", "watch-tf", "watch-tf-carried", "gate", "step-entry", "step-own", "step-own-detach", "step-mixed", "step-tf", "detach-dr", "detach-tf"):
+    for case in ("release", "queued", "queued-same", "queued-rearm", "deferred", "deferred-reused", "deferred-carried-reused", "watch-tf", "watch-tf-carried", "gate", "gate-mixed", "freeze-exited", "step-entry", "step-own", "step-own-detach", "step-mixed", "step-tf", "detach-dr", "detach-tf"):
         name = f"ctrl-own-debug-{case}"
         try:
             r, o = run([d, case], timeout=30)
@@ -10653,6 +10688,164 @@ def check_symbols_grammar():
             record(name, False, repr(e))
 
 
+def check_trace_cli():
+    """uhh_trace review: option errors, scoped names, int32 formatting, and exit status.
+    Run against both x86 and x64 build directories, like the rest of this suite.
+    """
+    t = exe("uhh_trace.exe")
+    if not t:
+        return missing_bin("trace-cli", "uhh_trace")
+    spec = ["-p", "ntdll.dll!NtClose:-"]
+    launch = ["--", "unused.exe"]
+    cases = [
+        (["--attach", "1", "--attach-new", "unused.exe"], "target mode"),
+        (["--attach", "1", *launch], "target mode"),
+        (["--attach-new", "unused.exe", *launch], "target mode"),
+        (["--backend", "inlne", *launch], "--backend"),
+        (["--timeout", "0", *launch], "--timeout"),
+        (["--timeout", "1", "--attach", "1"], "--timeout"),
+        (["--attach", "1", "--detach-after-ms", "0", "--detach-on-stdin"], "mutually exclusive"),
+    ]
+    for flag in ("--fallback-hw", "--allow-prehooked", "--unsafe-fast-patch"):
+        for backend in ("breakpoint", "hw"):
+            cases.append((["--backend", backend, flag, *launch], "require --backend inline"))
+    for detach in (["--detach-after-ms", "0"], ["--detach-on-stdin"]):
+        for mode in (launch, ["--attach-new", "unused.exe"]):
+            cases.append(([*detach, *mode], "detach options require --attach"))
+    for n in (16, 32):
+        cases.append((["-p", "ntdll.dll!NtClose:" + "x" * n, *launch], "at most 15"))
+    for i, (args, diagnostic) in enumerate(cases):
+        r, _ = run([t, *spec, *args], timeout=10)
+        record(f"trace-cli-invalid-{i}", r.returncode == 2 and diagnostic in r.stderr,
+               f"args={args} rc={r.returncode} stderr={r.stderr[:250]}")
+    g = exe("gated_config.exe")
+    if not g:
+        missing_bin("trace-cli-gated", "gated_config")
+    else:
+        for role in ("flag", "read", "open", "close"):
+            r, _ = run([g, f"--{role}-backend", "bogus", "a!b", "c!d", *launch], timeout=10)
+            record(f"trace-cli-gated-{role}", r.returncode == 2 and f"--{role}-backend" in r.stderr,
+                   f"rc={r.returncode} stderr={r.stderr[:250]}")
+    # Valid options must reach launch, where the deliberately absent image fails with 1.
+    for backend in ("breakpoint", "hw", "inline"):
+        r, _ = run([t, "--backend", backend, "--allow-unsafe-site", "-p",
+                    "ntdll.dll!NtClose:" + "x" * 15, *launch], timeout=30)
+        record(f"trace-cli-valid-{backend}", r.returncode == 1 and "debug launch" in r.stderr,
+               f"15 args / unsafe-site: rc={r.returncode} stderr={r.stderr[:250]}")
+    a = exe("flagflip_target.exe")
+    if not a:
+        missing_bin("trace-cli-cpp", "flagflip_target")
+    else:
+        for suffix in ("", ":x"):
+            loc = "flagfeature.dll!Feature::IsEnabled"
+            r, o = run([t, "-p", loc + suffix, "--", a, "--threads", "1", "--calls", "2"], timeout=180)
+            pr = next((p for p in probes(o) if p.get("location") == loc), {})
+            record(f"trace-cli-cpp-{suffix or 'default'}",
+                   r.returncode == 0 and pr.get("hits") == 4 and pr.get("active") is True,
+                   f"rc={r.returncode} probe={pr}")
+    # ExitProcess receives a 32-bit -1 bit pattern. Use a target matching the build,
+    # including SysWOW64 cmd for an x86 tracer running on 64-bit Windows.
+    windows = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    system = "SysWOW64" if bin_machine() == "x86" and (windows / "SysWOW64").exists() else "System32"
+    for backend in ("breakpoint", "hw", "inline"):
+        r, o = run([t, "--backend", backend, "-p", "kernel32.dll!ExitProcess:d", "--",
+                    windows / system / "cmd.exe", "/d", "/c", "exit -1"], timeout=180)
+        logs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
+        record(f"trace-cli-signed-{bin_machine()}-{backend}",
+               r.returncode == 1 and "ExitProcess(-1)" in logs and "uhh_trace:" in r.stderr,
+               f"rc={r.returncode} logs={logs}")
+    target_exe = exe("hunt_target.exe")
+    if not target_exe:
+        return missing_bin("trace-cli-exit", "hunt_target")
+    for mode in ("attach", "attach-new"):
+        target = tracer = None
+        try:
+            args = [str(t), "--backend", "breakpoint", *spec]
+            if mode == "attach-new":
+                tracer = subprocess.Popen([*args, "--attach-new", "hunt_target.exe", "--timeout", "30000"],
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                tout, terr = Lines(tracer.stdout), Lines(tracer.stderr)
+                if not terr.wait_for(lambda l: l.startswith("probe: waiting for a new hunt_target.exe"), 30):
+                    raise RuntimeError("attach-new never took snapshot")
+            target = subprocess.Popen([str(target_exe), "exit-process", "--n", "8000"],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if mode != "attach-new":
+                r, o = run([*args, "--attach", target.pid], timeout=90)
+                rc, err = r.returncode, r.stderr
+            else:
+                tracer.wait(timeout=90)
+                rc, err, o = tracer.returncode, "\n".join(terr.lines), tout.objs()
+            target.wait(timeout=30)
+            record(f"trace-cli-exit-{mode}", rc == 1 and "uhh_trace:" in err and
+                   not any(x.get("kind") == "detached" for x in o) and
+                   report(o).get("app_exit") == 6,
+                   f"rc={rc} report={report(o)} stderr={err[-500:]}")
+        except Exception as e:
+            record(f"trace-cli-exit-{mode}", False, repr(e))
+        finally:
+            for proc in (tracer, target):
+                if proc and proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=30)
+
+    # Aim inside BndLeaf's fixed ten-byte MOV (same layout on x86 and x64).
+    # Registration and attach succeed; probe_run refuses the site while replaying
+    # modules. The old detach path discarded that failure and returned 0.
+    boundary = exe("boundary_target.exe")
+    if not boundary:
+        return missing_bin("trace-cli-exit-detach", "boundary_target")
+    target = tracer = None
+    try:
+        code = pe_export_bytes(boundary, "BndLeaf", 10) or b""
+        if code[:2] != b"\xc7\x05" or len(code) != 10:
+            raise RuntimeError(f"BndLeaf MOV fixture changed: {code.hex()}")
+        target = subprocess.Popen([str(boundary), "--gate", "--iters", "1"],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True)
+        tout, terr = Lines(target.stdout), Lines(target.stderr)
+        if not tout.wait_for(lambda l: '"kind":"waiting"' in l, 30):
+            raise RuntimeError(f"boundary target never reached gate: {terr.lines}")
+        tracer = subprocess.Popen([str(t), "--backend", "breakpoint", "-p",
+                                   "boundary_target.exe!BndLeaf+0x3:-", "--attach", str(target.pid),
+                                   "--detach-on-stdin"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True)
+        trace_out, trace_err = Lines(tracer.stdout), Lines(tracer.stderr)
+        # Synchronize on the actual run-time failure, not an elapsed-time guess.
+        if not trace_err.wait_for(lambda l: "site is inside an instruction" in l, 60):
+            raise RuntimeError(f"probe_run never refused operand site: {trace_err.lines}")
+        tracer.stdin.write("\n"); tracer.stdin.flush()
+        tracer.wait(timeout=90)
+        o = trace_out.objs()
+        trace_err.t.join(timeout=30)
+        err = "\n".join(trace_err.lines)
+        rc = tracer.returncode
+        rep = report(o)
+        attached = any(x.get("kind") == "attached" and x.get("pid") == target.pid for x in o)
+        error = str(rep.get("error") or "")
+        alive = target.poll() is None
+        # Release only after tracing ends: instrumentation failure must leave the target
+        # alive and its original instructions intact. Both pipe readers drain throughout.
+        target.stdin.write("\n"); target.stdin.flush()
+        target.wait(timeout=30)
+        good_target = any(x.get("kind") == "target" and x.get("ok") is True for x in tout.objs())
+        record("trace-cli-exit-detach",
+               attached and alive and "probe: pending boundary_target.exe!BndLeaf+0x3" in err and
+               "site is inside an instruction" in error and rc == 1 and
+               "uhh_trace: tracing session failed" in err and
+               not any(x.get("kind") == "detached" for x in o) and
+               target.returncode == 0 and good_target,
+               f"rc={rc} attached={attached} target_alive={alive} "
+               f"target_rc={target.returncode} target_ok={good_target} "
+               f"report={rep} stderr={err[-500:]}")
+    except Exception as e:
+        record("trace-cli-exit-detach", False, repr(e))
+    finally:
+        for proc in (tracer, target):
+            if proc and proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=30)
+
+
 def check_quickstart():
     """docs/quickstart.md section 4, compiled and run: examples/quickstart (my_tool) launches
     probe_app with its config DISABLED; the breakpoint at configparse.dll!ParseConfig+0x16
@@ -13112,6 +13305,7 @@ def main():
     if want(check_stream_filefail): check_stream_filefail()
     if want(check_ctrl_symload): check_ctrl_symload()
     if want(check_ctrl_own_debug): check_ctrl_own_debug()
+    if want(check_session_loop_review): check_session_loop_review()
     if want(check_cdx_review): check_cdx_review()
     if want(check_api_contract): check_api_contract()
     if want(check_api_threadfull): check_api_threadfull()
@@ -13131,6 +13325,7 @@ def main():
     if want(check_cxlib): check_cxlib()
     if want(check_cx2_review): check_cx2_review()
     if want(check_symbols_grammar): check_symbols_grammar()
+    if want(check_trace_cli): check_trace_cli()
     if want(check_quickstart): check_quickstart()
     if want(check_callfunc_concurrent): check_callfunc_concurrent()
     if want(check_hw_dr_restore): check_hw_dr_restore()
