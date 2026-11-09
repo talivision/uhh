@@ -14,8 +14,10 @@ struct ChildState {
 };
 static ChildState child_state{};
 static uint64_t child_done = 0;
+static uint64_t child_gate_nop = 0;
 static unsigned callbacks = 0;
 static void hit(probe_context *) { ++callbacks; }
+static DWORD WINAPI exit_freeze_thread(void *) { return 0; }
 static void dr_require(bool ok, const char *stage) {
     if (!ok) {
         std::fprintf(stderr, "dr-review: %s failed (Win32=%lu)\n", stage, (unsigned long)GetLastError());
@@ -38,6 +40,20 @@ static LONG CALLBACK child_veh(EXCEPTION_POINTERS *e) {
     child_state.exception_address = (ULONG_PTR)e->ExceptionRecord->ExceptionAddress;
     child_state.exception_code = e->ExceptionRecord->ExceptionCode;
     child_state.parameters = e->ExceptionRecord->NumberParameters;
+    // Execute breakpoints fault before the instruction. Retire the program's fired
+    // execute slots after recording their delivered state so returning cannot retrap.
+    for (unsigned slot = 0; slot < 4; ++slot)
+        if ((e->ContextRecord->Dr6 & (1u << slot)) &&
+            !((e->ContextRecord->Dr7 >> (16 + slot * 4)) & 3u))
+            e->ContextRecord->Dr7 &= ~((decltype(e->ContextRecord->Dr7))3 << (slot * 2));
+    // gate-mixed stops BEFORE this known one-byte NOP. Resume after it explicitly:
+    // debug-register edits in an exception context need not suppress a new execute
+    // fault when Windows restores the thread. The snapshot above still records the
+    // original PC and every delivered status/control bit, before this continuation.
+    if (child_gate_nop && child_state.ip == child_gate_nop &&
+        (child_state.dr6 & 2u) && child_state.dr1 == child_gate_nop &&
+        (child_state.dr7 & 0xF0000Cu) == 4)
+        EMU_IP(*e->ContextRecord) = (decltype(EMU_IP(*e->ContextRecord)))(child_gate_nop + 1);
     e->ContextRecord->EFlags &= ~0x100u;
     e->ContextRecord->Dr6 = 0;
     return EXCEPTION_CONTINUE_EXECUTION;
@@ -50,6 +66,7 @@ static int child(bool linger) {
     void *mem = VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
     if (!mem || !AddVectoredExceptionHandler(1, child_veh)) return 3;
     if (linger) child_done = (uint64_t)(uintptr_t)mem + 10;
+    child_gate_nop = (uint64_t)(uintptr_t)mem + 9;
     std::memcpy(mem, code, sizeof(code));
     FlushInstructionCache(GetCurrentProcess(), mem, sizeof(code));
     const ULONG_PTR info[] = {(ULONG_PTR)mem, (ULONG_PTR)&child_state};
@@ -130,6 +147,12 @@ struct Debuggee {
                         std::fprintf(stderr, "dr-review: unexpected code=0x%lx at=0x%llx wanted=0x%lx at=0x%llx\n",
                                      (unsigned long)ex.ExceptionCode, (unsigned long long)at, (unsigned long)wanted,
                                      (unsigned long long)(address ? address : code + 4));
+                    if (code && ex.ExceptionCode != EXCEPTION_BREAKPOINT) {
+                        const auto observed = result();
+                        std::fprintf(stderr, "dr-review: first=%lu VEH seen=%ld delivered_dr6=0x%llx pending_repair=%zu\n",
+                                     (unsigned long)ev.u.Exception.dwFirstChance, (long)observed.seen,
+                                     (unsigned long long)observed.dr6, session ? session->debug_delivery.size() : size_t{0});
+                    }
                     dr_require(!code && ex.ExceptionCode == EXCEPTION_BREAKPOINT, "expected exception address/code");
                 }
             }
@@ -301,7 +324,52 @@ int run(int argc, char **argv) {
             dr_require(handle_hw(s, d.ev, handled) && handled, "new access handled");
             dr_require(callbacks == before + 1 && p->hits == hits + 1, "new access callback and hit");
         };
-        if (mode == "release") {
+        if (mode == "freeze-exited") {
+            DWORD tid = 0;
+            HANDLE exited = CreateThread(nullptr, 0, exit_freeze_thread, nullptr, 0, &tid);
+            dr_require(exited != nullptr, "create exiting freeze thread");
+            const bool ended = WaitForSingleObject(exited, 10000) == WAIT_OBJECT_0;
+            s->thread_handle[tid] = exited; // retain identity while its exit event is pending
+            const bool frozen = ended && ipc_freeze_thread(s, tid);
+            s->thread_handle.erase(tid);
+            CloseHandle(exited);
+            dr_require(frozen && s->ipc_frozen.empty(), "terminated thread does not refuse install freeze");
+        } else if (mode == "live-report") {
+            // A live report holds this mutex while traversing the vector.
+            s->debug_dispatch_addr = resolve_symbol(s, "ntdll.dll!KiUserExceptionDispatcher");
+            dr_require(s->debug_dispatch_addr != 0, "resolve dispatcher before report");
+            std::atomic<bool> entered{false}, finished{false};
+            bool queued = false;
+            std::unique_lock<std::mutex> report(s->probes_mu);
+            std::thread writer([&] {
+                entered.store(true);
+                queued = queue_debug_delivery(s, d.pi.dwThreadId, site, 1, 0);
+                finished.store(true);
+            });
+            while (!entered.load()) Sleep(1);
+            Sleep(200);
+            const bool waited = !finished.load();
+            report.unlock(); writer.join();
+            dr_require(waited && queued && s->debug_dispatch_probe, "dispatcher insertion waits for live report");
+        } else if (mode == "gate-mixed") {
+            // Real simultaneous execute causes: gate B0 and target-owned B1.
+            p->active = false; s->hw_active = 0;
+            c.Dr0 = c.Dr1 = (decltype(c.Dr0))(site + 4);
+            c.Dr7 = 5; d.put(c);
+            s->gates.emplace_back(site + 4, 0);
+            s->hw_armed_ever.insert(site + 4);
+            d.resume(); d.wait(EXCEPTION_SINGLE_STEP, site + 4);
+            dr_require((d.get().Dr6 & 0xE003u) == 3, "combined gate and target execute causes");
+            bool handled = false;
+            dr_require(handle_gate(s, d.ev, handled) && !handled, "combined gate forwarded");
+            release_held(s, "test");
+            d.resume(DBG_EXCEPTION_NOT_HANDLED); d.wait(EXCEPTION_BREAKPOINT, done);
+            const auto result = d.result(); print_veh("gate", result);
+            dr_require(result.seen == 1 && result.ip == site + 4 &&
+                       result.exception_address == site + 4 && (result.dr6 & 0xE003u) == 2 &&
+                       result.dr1 == site + 4 && (result.dr7 & 0xF0000Cu) == 4 &&
+                       s->debug_delivery.empty(), "target VEH sees only its own execute cause");
+        } else if (mode == "release") {
             c.Dr0 = (decltype(c.Dr0))target_address; c.Dr1 = (decltype(c.Dr1))(target_address + 4);
             c.Dr2 = (decltype(c.Dr2))(target_address + 8); c.Dr3 = (decltype(c.Dr3))(target_address + 12);
             c.Dr7 = 0xDDDD0055; d.put(c);

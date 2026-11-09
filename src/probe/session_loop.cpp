@@ -1047,7 +1047,10 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
                      (unsigned long)event.u.Exception.dwFirstChance);
     if (code == EXCEPTION_SINGLE_STEP && step == stepping.end() && !s->gates.empty()) {
         bool handled = false;
-        if (handle_gate(s, event, handled)) {
+        bool failed = false;
+        const bool gate = handle_gate(s, event, handled, &failed);
+        if (failed) return false;
+        if (gate) {
             if (handled) disposition = DBG_CONTINUE;
             return true;
         }
