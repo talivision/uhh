@@ -1024,8 +1024,12 @@ reproduced on x64 before the fix (baseline numbers quoted) and has a `logs-*` ch
   inversions in 16000. Fix: a controller-side send_log first drains the ring (the hit thread is
   stopped, so its earlier inline records are all published). It also delivers past one unfinished slot
   of another thread (frozen mid-record by the debug event). After the fix: 0 inversions.
-  Residual (documented): a record behind TWO unfinished slots of other threads at the same instant
-  can still be overtaken.
+  Residual (found by `logs-order-*` failing ~1 run in 40, fixed 2026-11-10): `deliver_past_stall`
+  stopped at the second unfinished slot of other threads, so a record of this thread behind TWO
+  such slots (4 threads, 3 others mid-record) was overtaken by its controller-side record. Now
+  `log_common` runs `deliver_thread_past_stall`: when the drain is stuck behind an unpublished slot it
+  delivers THIS thread's published records past any number of foreign unfinished slots (the thread
+  is stopped, so all its own records are published). Scans only when stuck; inline hot path unchanged.
 - ✅ **Silent content loss in log text.** An embedded NUL (`%c` of 0) cut the message there; tab, CR
   and other control characters were deleted by the JSON writer; invalid UTF-8 bytes were written raw
   (the line was not valid UTF-8 JSON -- a strict reader rejects it); an `[unformattable]` copy of a

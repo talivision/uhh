@@ -1477,6 +1477,35 @@ void deliver_past_stall(probe_session *s, bool all_published) {
     }
 }
 
+// A controller-side log of thread `tid` (stopped at its hit, so every record its callbacks put in
+// the ring is published): move THAT thread's published records out of the ring now, in ring order,
+// past any number of unfinished slots of OTHER threads (those producers are still running; their
+// records come later, in their own order). deliver_past_stall stops at the second unfinished slot --
+// with 3+ producers a record of this thread behind two of them was overtaken by the controller-side
+// record (regress logs-order-*, ~1 run in 40). Marked delivered like deliver_past_stall does
+// (seq = -(pos + 1)); drain_agent_logs frees the slot when the tail gets there. Only called after
+// a drain, and scans only when the ring is stuck behind an unpublished slot (the inline hot path is
+// untouched). Returns true when the tail slot turned out to be published meanwhile: drain again.
+static bool deliver_thread_past_stall(probe_session *s, uint32_t tid) {
+    auto *sh = s->shared;
+    auto consume = lock_drain(s);
+    LONG64 tail = sh->log_tail, head = sh->log_head;
+    if ((uint64_t)head - (uint64_t)tail > PROBE_AGENT_LOG_CAP)
+        head = (LONG64)((uint64_t)tail + PROBE_AGENT_LOG_CAP);
+    if (head <= tail) return false;
+    const LONG64 tseq = probe_agent_load64(&sh->logs[(uint64_t)tail % PROBE_AGENT_LOG_CAP].seq);
+    if (tseq != tail) return tseq == tail + 1;            // not stuck at an unpublished slot (published since: drain)
+    for (LONG64 pos = tail + 1; pos < head; ++pos) {
+        auto &rec = sh->logs[(uint64_t)pos % PROBE_AGENT_LOG_CAP];
+        if (probe_agent_load64(&rec.seq) != pos + 1) continue;      // unfinished, or delivered already
+        _ReadWriteBarrier();
+        if (rec.tid != tid) continue;
+        enqueue_agent_record(s, rec);
+        InterlockedExchange64(&rec.seq, -(pos + 1));
+    }
+    return false;
+}
+
 // The drainer found nothing to move. If that is because the slot at the tail is CLAIMED (its
 // owner set) but not published, the ring cannot move until its producer publishes:
 //  - producer dead (TerminateThread / ExitProcess mid-send_log): skip the slot. Its callback
@@ -1754,9 +1783,13 @@ static void log_common(probe_context *c, bool stack, const char *format, va_list
     if (!state || !state->session) { std::fprintf(stderr, "probe: %s\n", line); return; }
     // Per-thread order across backends: this thread's earlier INLINE logs are already in the
     // ring (it is stopped here, so its send_log calls have returned) -- move them to the
-    // queue before this one. (Only a record behind another thread's unfinished slot can
-    // still come later; see docs/ROADMAP.md, "Log delivery findings".)
-    if (state->session->shared) { drain_agent_logs(state->session); deliver_past_stall(state->session); }
+    // queue before this one -- also when another thread's unfinished slot stops the drain (that
+    // thread's records come later; this thread's own never do). See docs/ROADMAP.md, "Log delivery findings".
+    if (state->session->shared)
+        for (int k = 0; k < 4; ++k) {
+            drain_agent_logs(state->session);
+            if (!deliver_thread_past_stall(state->session, (uint32_t)c->tid)) break;
+        }
     try {
         LogRecord r; r.text.assign(line, (size_t)len); r.tid = c->tid; r.probe = c->site; r.has_stack = stack;
         if (stack) capture_stack(state->session, c, r.frames);

@@ -8390,6 +8390,7 @@ def check_logs_order(threads=4, count=2000):
         try:
             r, o, bad = logs_run(a, b, ["--mode", "order", "--threads", threads, "--count", count], timeout=600)
             by, nostack, foreign, delivered = {}, 0, [], 0
+            pos_of = {}                              # tid -> output line index of each of its records (diagnostics)
             for x in o:
                 if x.get("kind") != "probe_log":
                     continue
@@ -8400,12 +8401,19 @@ def check_logs_order(threads=4, count=2000):
                     continue
                 v = int(m.group(1))
                 by.setdefault(x.get("tid"), []).append(v)
+                pos_of.setdefault(x.get("tid"), []).append(delivered)
                 nostack += bool(v % 2) and not x.get("stack")
             wrong = {tid: seq for tid, seq in by.items() if seq != want_seq}
             first_wrong = ""
             for tid, seq in list(wrong.items())[:1]:
                 i = next((j for j, (p, q) in enumerate(zip(seq, want_seq)) if p != q), min(len(seq), len(want_seq)))
                 first_wrong = f" tid {tid}: len={len(seq)} first diff @{i}: got {seq[i:i + 3]} want {want_seq[i:i + 3]}"
+                # the out-of-order pair: seq (even = {a}, odd = {b} record) at its delivered line index
+                pr = pos_of.get(tid, [])
+                first_wrong += (f" pair: seq {seq[i - 1] if i else None}[{a if i and seq[i - 1] % 2 == 0 else b}]"
+                                f"@line{pr[i - 1] if i else None} then seq {seq[i]}[{a if seq[i] % 2 == 0 else b}]@line{pr[i]}"
+                                f" (a={a} b={b}); all inversions of the thread: "
+                                f"{[(seq[j - 1], seq[j]) for j in range(1, len(seq)) if seq[j] < seq[j - 1]][:6]}")
             total = sum(map(len, by.values()))
             calls = 2 * threads * count
             rep = report(o)
