@@ -1104,6 +1104,8 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
         co_warn(s->co_warned_dr, probe, "call_original refused: needs one free debug register (all 4 in use)");
         return 0;
     }
+    const uint64_t call_sp = c->regs.rsp;
+    if (!get_mem(c, call_sp, &ret_addr, sizeof(void *))) { CloseHandle(thread); return 0; }
     CONTEXT w = saved;
     to_context(*c, w);                                                 // the callback's registers
     if (!guard_dr_available(s, ret_addr)) {
@@ -1117,16 +1119,16 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
     w.Dr7 = (decltype(w.Dr7))((w.Dr7 & ~((DWORD64)0xF << (16 + slot * 4))) | ((DWORD64)1 << (slot * 2)));   // execute, local
     w.Dr6 = 0;
 #if defined(_WIN64)
-    w.Rip = probe->address; w.Rsp = c->hit_sp;
+    w.Rip = probe->address; w.Rsp = call_sp;
 #else
-    w.Eip = (DWORD)probe->address; w.Esp = (DWORD)c->hit_sp;
+    w.Eip = (DWORD)probe->address; w.Esp = (DWORD)call_sp;
 #endif
     if (probe->flags & PROBE_HW) w.EFlags |= 0x10000u;                 // RF: the entry's own DR stays quiet once
     w.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS;
     if (!SetThreadContext(thread, &w)) { CloseHandle(thread); return 0; }
     s->dr_used |= (uint8_t)(1u << slot);                               // reserved: no probe arms it meanwhile
     s->dr_ever |= (uint8_t)(1u << slot);                               // ours: detach / the guard clear it too
-    s->in_call_tid = st->tid; s->co_addr = probe->address; s->co_sp = c->hit_sp; s->co_ret = ret_addr; s->co_exc_sp = 0;
+    s->in_call_tid = st->tid; s->co_addr = probe->address; s->co_sp = call_sp; s->co_ret = ret_addr; s->co_exc_sp = 0;
     s->co_borrowed_slot = borrowed ? slot : -1;
     s->co_entry_pending = !(probe->flags & PROBE_HW); s->co_left = false;
     // Mirrored BEFORE the thread runs with it (the slot) -- and the thread off the guard's list

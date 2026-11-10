@@ -92,7 +92,80 @@ static int stop_guarded() {
     __try { fn(nullptr); return 1; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
+AR_EXPORT int ar_resolve_low() { return 42; }
+AR_EXPORT void ar_resolve_site(uintptr_t, uintptr_t, uintptr_t) { InterlockedIncrement(&review_sink); }
+AR_EXPORT uintptr_t ar_stackcopy_site(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t a, uintptr_t b) { return a + b; }
+AR_EXPORT void ar_install_saved_site(void *) { InterlockedIncrement(&review_sink); }
+static HANDLE saved_entered, saved_release;
+static unsigned char *saved_code;
+static int saved_value = 37;
+static LONG CALLBACK saved_handler(EXCEPTION_POINTERS *ep) {
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
+        ep->ExceptionRecord->ExceptionAddress != saved_code + 2) return EXCEPTION_CONTINUE_SEARCH;
+    SetEvent(saved_entered);
+    if (WaitForSingleObject(saved_release, 15000) != WAIT_OBJECT_0) return EXCEPTION_CONTINUE_SEARCH;
+#if defined(_WIN64)
+    ep->ContextRecord->Rax = (DWORD64)(uintptr_t)&saved_value;
+#else
+    ep->ContextRecord->Eax = (DWORD)(uintptr_t)&saved_value;
+#endif
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+static DWORD WINAPI saved_thread(void *) { return (DWORD)reinterpret_cast<int (*)()>(saved_code)(); }
+static int oversized_ipc(uint32_t origin) {
+    probe_ipc_request req{};
+    req.op = PROBE_IPC_ADD_SYMBOL; req.origin_site = origin; req.result = -1;
+    req.config_len = UINT32_MAX; req.config = 1;
+    ULONG_PTR arg = (ULONG_PTR)&req;
+    __try { RaiseException(PROBE_IPC_CODE, 0, 1, &arg); }
+    __except (GetExceptionCode() == PROBE_IPC_CODE ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) { return 1; }
+    return req.result == 0 ? 0 : 2;
+}
+
 int ar_review_case(const char *k) {
+    if (!strcmp(k, "review-wrapresolve")) {
+        HMODULE m = GetModuleHandleW(L"kernel32.dll");
+        const uintptr_t base = (uintptr_t)m, high = (uintptr_t)GetProcAddress(m, "GetCurrentProcessId");
+        const uintptr_t low = (uintptr_t)&ar_resolve_low;
+        if (low >= base || low >= high) return 2; // both additions MUST overflow
+        ar_resolve_site(base, high, low);
+        printf("{\"kind\":\"ar\",\"wraps\":2}\n"); return 0;
+    }
+    if (!strcmp(k, "review-stackcopy")) {
+        alignas(16) uintptr_t alternate[512] = {};
+        const uintptr_t r = ar_stackcopy_site((uintptr_t)(alternate + 256) + 8, 2, 3, 4, 5, 6);
+        // +8 keeps x64 entry SP == 8 (mod 16); x86 has no alignment requirement.
+        printf("{\"kind\":\"ar\",\"result\":%llu}\n", (unsigned long long)r);
+        return r == 110 ? 0 : 3;
+    }
+    if (!strcmp(k, "review-saved-context")) {
+        saved_code = (unsigned char *)VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (!saved_code) return 2;
+        // xor eax,eax; mov eax,[rax/eax]; nop; ret. The fault is strictly inside the 5-byte patch.
+        const unsigned char code[] = {0x31, 0xC0, 0x8B, 0x00, 0x90, 0xC3};
+        memcpy(saved_code, code, sizeof(code)); FlushInstructionCache(GetCurrentProcess(), saved_code, sizeof(code));
+        saved_entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        saved_release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        void *veh = AddVectoredExceptionHandler(1, saved_handler);
+        HANDLE thread = CreateThread(nullptr, 0, saved_thread, nullptr, 0, nullptr);
+        if (!veh || !thread || WaitForSingleObject(saved_entered, 15000) != WAIT_OBJECT_0) return 2;
+        ar_install_saved_site(saved_code);
+        const int patched = saved_code[0] != code[0];
+        SetEvent(saved_release);
+        DWORD result = 0;
+        if (WaitForSingleObject(thread, 15000) != WAIT_OBJECT_0 || !GetExitCodeThread(thread, &result)) return 3;
+        RemoveVectoredExceptionHandler(veh);
+        CloseHandle(thread); CloseHandle(saved_entered); CloseHandle(saved_release);
+        // Leave the hooked mapping alive until the agent removes its hook at shutdown.
+        printf("{\"kind\":\"ar\",\"result\":%lu,\"patched\":%d}\n", result, patched);
+        return result == 37 && patched ? 0 : 4;
+    }
+    if (!strcmp(k, "review-oversized-ipc")) {
+        ar_pressure_site(); // ensures the one originating inline probe is installed
+        const int valid = oversized_ipc(0), invalid = oversized_ipc(UINT32_MAX);
+        printf("{\"kind\":\"ar\",\"valid\":%d,\"invalid\":%d}\n", valid, invalid);
+        return valid == 0 && invalid == 1 ? 0 : 3;
+    }
     if (!strcmp(k, "review-epoch")) return epoch_case();
     if (!strcmp(k, "review-preaccount")) return epoch_case(true);
     if (!strcmp(k, "review-slotless")) {

@@ -4,6 +4,7 @@
 #include <windows.h>
 #include "probe_api.h"
 #include <stdint.h>
+#include <cstdio>
 
 #define AR_CB extern "C" __declspec(dllexport)
 
@@ -257,4 +258,32 @@ AR_CB void ar_on_image(probe_context *c) {
     // Write the original byte: test protection validation without changing target data.
     const int write = read ? set_mem(c, p, &byte, 1) : 0;
     send_log(c, "ar image phase=%d read=%d write=%d", (int)get_func_arg(c, 1), read, write);
+}
+
+// cxr17: use target addresses supplied by the fixture, on every backend.
+AR_CB void ar_on_wrapresolve(probe_context *c) {
+    const uint64_t base = get_func_arg(c, 0), high = get_func_arg(c, 1), low = get_func_arg(c, 2);
+    char symbol[160]; uint64_t r = 123;
+    sprintf_s(symbol, "kernel32.dll+0x%llx", (unsigned long long)(low - base));
+    const int a = call_func(c, symbol, &r, 0);
+    sprintf_s(symbol, "kernel32.dll!GetCurrentProcessId+0x%llx", (unsigned long long)(low - high));
+    const int b = call_func(c, symbol, &r, 0);
+    send_log(c, "ar wrapresolve %d %d r=%llu", a, b, (unsigned long long)r);
+}
+AR_CB void ar_on_stackcopy(probe_context *c) {
+    const uint64_t sp = get_reg(c, PROBE_REG_SP), alternate = get_func_arg(c, 0);
+    uintptr_t args[40] = {};
+    if (!get_mem(c, sp, args, sizeof(args))) { send_log(c, "ar stack read failed"); return; }
+    args[5] = 50; args[6] = 60;
+    const int wrote = set_mem(c, alternate, args, sizeof(args));
+    set_reg(c, PROBE_REG_SP, alternate);
+    uint64_t r = 0;
+    const int ok = wrote && call_original(c, 0, &r);
+    set_reg(c, PROBE_REG_SP, sp);
+    return_from(c, r, 0);
+    send_log(c, "ar stackcopy %d r=%llu", ok, (unsigned long long)r);
+}
+AR_CB void ar_on_install_saved(probe_context *c) {
+    const int ok = probe_add_address(get_session(c), get_func_arg(c, 0), ar_on_site, PROBE_INLINE);
+    send_log(c, "ar install saved %d", ok);
 }
