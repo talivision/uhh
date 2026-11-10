@@ -764,7 +764,19 @@ static bool controller_dead(const probe_agent_shared *sh) {
 // record pays one byte compare.
 static void test_wedge_point(const probe_agent_log &rec) {
     static const char tag[] = "UHH_TEST_WEDGE ";
-    if (rec.text_len < sizeof(tag) - 1 || rec.text[0] != 'U' || std::memcmp(rec.text, tag, sizeof(tag) - 1)) return;
+    if (rec.text_len < sizeof(tag) - 1 || rec.text[0] != 'U') return;
+    // logs-order-tail: delay publication AFTER reserving a real inline slot. Only
+    // test-tagged records inspect the knob; ordinary logs retain the byte-compare path.
+    static const char delay_tag[] = "UHH_TEST_DELAY ";
+    if (!std::memcmp(rec.text, delay_tag, sizeof(delay_tag) - 1)) {
+        char ms[16] = {};
+        if (GetEnvironmentVariableA("UHH_TEST_LOG_PUBLISH_DELAY_MS", ms, sizeof(ms))) {
+            const unsigned long delay = strtoul(ms, nullptr, 10);
+            if (delay && delay <= 1000) Sleep((DWORD)delay);
+        }
+        return;
+    }
+    if (std::memcmp(rec.text, tag, sizeof(tag) - 1)) return;
     char on[4] = {};
     if (!GetEnvironmentVariableA("UHH_TEST_LOG_WEDGE", on, sizeof(on)) || on[0] != '1') return;
     wchar_t at[64], go[64];

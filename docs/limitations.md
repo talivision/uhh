@@ -328,8 +328,8 @@ data) prints on all backends.
   its hit, so a thread killed after publishing it is a delivered log, not interrupted. One
   inherent edge (Log delivery findings): a producer that claims a slot in the few instructions
   after the final drain at detach/close loses that record uncounted.
-- **Per-thread order** is kept across backends, except that a record behind two unfinished
-  ring slots of other threads at the same instant can be overtaken (Log delivery findings).
+- **Per-thread order** is kept across backends, including records behind unfinished
+  ring slots of other threads (ROADMAP, "Log delivery findings" and "Overnight controller follow-up").
 - **Inline callbacks killed by process exit** (ExitProcess/TerminateProcess) before their
   first log are reported as `callbacks_interrupted`; their logs never existed (Hunter A3). A
   stderr line names the probe and thread of each callback cut off while running.

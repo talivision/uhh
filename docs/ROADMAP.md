@@ -3263,3 +3263,47 @@ fallback and require an armed UHH address as well as a slot bit. Shared guard la
   `report-retired-atomic` (`check_image_verdict_review`, both architectures). The last
   checks the atomic representation deterministically, rather than relying on a data
   race to manifest in a timed stress run. Windows execution pending.
+
+## Overnight controller follow-up (2026-11-11)
+
+Windows validation pending; no IPC layout change or PROBE_AGENT_VERSION bump.
+
+- **Mixed log order:** real, beyond the earlier multiple-hole fix. Between the drain
+  and `deliver_thread_past_stall`, the tail can become published, or can be marked
+  already delivered by the drainer's `deliver_past_stall`. The latter made the helper
+  return false without scanning this thread's later records; repeated publication
+  transitions could also exhaust the four retries. Scan the entire bounded outstanding
+  range under `drain_mu`, including the tail, irrespective of its state. Each matching
+  record is enqueued before releasing that lock, as in the ordinary drain. Earlier
+  ordinary callbacks on the hit thread have returned, so their slots are published;
+  waiting on that stopped thread to publish would not help. Ordinary inline-only producers
+  keep their existing publication path. `check_logs_order_tail` holds consumption
+  until the per-thread scan (`UHH_TEST_LOG_ORDER_TAIL`, testhooks controller only),
+  making a published tail deterministic on every scan. Test-tagged inline records
+  also delay publication after reserving their slot (`UHH_TEST_LOG_PUBLISH_DELAY_MS`);
+  the former four retries
+  enqueue the breakpoint/hw record first. It retains the full sequence, stack and
+  accounting assertions of `check_logs_order`.
+- **Agent identity fixture:** real fixture problem, not an identity-policy change.
+  Replace PE timestamp byte patching with a CMake-built `probe_api_agent_identity.dll`
+  from the same sources plus an extra exported function. Its export table differs
+  even under reproducible builds. `session-agentipc-identity` still demands refusal
+  of a different build and checks the retained target remains alive.
+- **File-monitor attach permissions:** a real isolation defect remains despite unique
+  child names: each invocation recursively removed the shared `uhh_famous` parent,
+  including other invocations' live workloads. Allocate a unique parent per invocation;
+  `check_famous_files_isolation` starts a second allocation while the first workload
+  file is open and requires that file to survive. Attach-row exceptions now report
+  the operation, path and traceback. The supplied PermissionError has no call site,
+  so this race is not proven to be the overnight failure's cause. No speculative
+  process-launch retry or blanket PermissionError suppression was added; a subsequent
+  failure will identify whether a specific file operation needs bounded retry.
+- **x86 cosample:** documented WOW64 residual, not a new all-thread polling defect.
+  `call_original` reads only its own running call thread's context once per 20 ms;
+  `poll_calls` does not sample every thread's context per event. WOW64 performs an
+  implicit suspension inside that read. Full-suite Windows 10 observations were
+  16,255 / 1,004,825 (1.62%) and 13,068 / 1,012,905 (1.29%). Raise the x86 allowance
+  in existing `cx2-cosample-{breakpoint,hw}` to 2%, with headroom over those measured
+  peaks. x64 still requires exactly zero; minimum samples, in-original, completion,
+  return-value and exact callback-log assertions stay unchanged. The earlier 1%
+  calibration in "CI residuals" describes the initial measurements, not this bound.
