@@ -92,7 +92,35 @@ static int stop_guarded() {
     __try { fn(nullptr); return 1; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
+struct EntryControl { HANDLE ready, release; };
+static DWORD WINAPI entry_thread(void *p) {
+    auto *control = static_cast<EntryControl *>(p);
+    (void)GetTickCount64();
+    SetEvent(control->ready);
+    return WaitForSingleObject(control->release, 60000) == WAIT_OBJECT_0 ? 0 : 1;
+}
 int ar_review_case(const char *k) {
+    if (!strcmp(k, "review-entry")) {
+        // Each thread's first hit needs accounting. The agent's exhausted-block
+        // path queries this very API before its callback guard used to be armed.
+        EntryControl control{CreateEventW(nullptr, FALSE, FALSE, nullptr), CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        if (!control.ready || !control.release) return 2;
+        HANDLE threads[PROBE_AGENT_TBLOCKS + 1] = {};
+        for (uint32_t i = 0; i < _countof(threads); ++i) {
+            threads[i] = CreateThread(nullptr, 0, entry_thread, &control, 0, nullptr);
+            if (!threads[i] || WaitForSingleObject(control.ready, 10000) != WAIT_OBJECT_0) return 3;
+        }
+        // All owners are still alive, so accounting cannot reclaim their blocks.
+        SetEvent(control.release);
+        for (HANDLE t : threads) {
+            DWORD code = 1;
+            if (WaitForSingleObject(t, 10000) != WAIT_OBJECT_0 || !GetExitCodeThread(t, &code) || code) return 4;
+            CloseHandle(t);
+        }
+        CloseHandle(control.ready); CloseHandle(control.release);
+        printf("{\"kind\":\"ar\",\"done\":%u}\n", PROBE_AGENT_TBLOCKS + 1);
+        return 0;
+    }
     if (!strcmp(k, "review-epoch")) return epoch_case();
     if (!strcmp(k, "review-preaccount")) return epoch_case(true);
     if (!strcmp(k, "review-slotless")) {

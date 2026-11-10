@@ -9240,6 +9240,29 @@ def check_agent_safety():
         if target and target.poll() is None: target.kill()
 
 
+def check_agent_entry_guard():
+    """Force the exhausted-accounting path to re-enter a GetTickCount64 hook on
+    fresh threads, before HitScope exists. No CET or CPU feature is required."""
+    d, t = exe("ar_driver.exe"), exe("ar_target.exe")
+    if not d or not t:
+        return missing_bin("agent-entry-guard", "ar_driver/ar_target")
+    name = "agent-entry-guard-inline"
+    try:
+        r, o = run([d, "--probe", "kernel32.dll!GetTickCount64=ar_on_site",
+                    "--", t, "review-entry"], timeout=90)
+        rep = report(o)
+        row = next((x for x in o if x.get("kind") == "ar"), {})
+        hits = sum(p.get("hits") or 0 for p in probes(o))
+        logs = [x for x in o if x.get("kind") == "probe_log" and x.get("message") == "ar site"]
+        ok = (r.returncode == 0 and rep.get("app_exit") == 0 and row.get("done") == 257
+              and hits >= 257 and len(logs) == hits and rep.get("log_dropped") == 0
+              and rep.get("callbacks_interrupted", 0) == 0 and rep.get("error") is None)
+        record(name, ok, f"row={row} hits={hits} logs={len(logs)} exit={rep.get('app_exit')} "
+               f"dropped={rep.get('log_dropped')} interrupted={rep.get('callbacks_interrupted', 0)}")
+    except Exception as e:
+        record(name, False, repr(e))
+
+
 def check_agent_review():
     """Inline-agent static review (examples/agent_review), one reproduction per finding
     (agent-unwind: check_agent_unwind). agent-faultafter: a callback that ran the
@@ -13480,6 +13503,7 @@ def main():
     if want(check_callorig_hunt): check_callorig_hunt()
     if want(check_callorig_deep): check_callorig_deep()
     if want(check_callconv): check_callconv()
+    if want(check_agent_entry_guard): check_agent_entry_guard()
     if want(check_agent_review): check_agent_review()
     if want(check_inline_install_failure): check_inline_install_failure()
     if want(check_session_agentipc): check_session_agentipc()

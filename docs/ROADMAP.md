@@ -3307,3 +3307,25 @@ Windows validation pending; no IPC layout change or PROBE_AGENT_VERSION bump.
   peaks. x64 still requires exactly zero; minimum samples, in-original, completion,
   return-value and exact callback-log assertions stay unchanged. The earlier 1%
   calibration in "CI residuals" describes the initial measurements, not this bound.
+
+### Inline first-hit admission (cetso)
+
+- Static review found Windows calls before `ThreadSlot::active` is installed:
+  implicit-TLS access in `my_slot`, slot identity queries, dead-owner sweeps, and
+  accounting-block retries (`GetTickCount64`). `busy` is tested only after `my_slot`,
+  and `active` only after `slot_block`; neither protects the whole admission path.
+  With accounting blocks exhausted, a probe on `GetTickCount64` re-enters
+  `slot_block` indefinitely. This is a bug, not the documented callback-recursion rule.
+- A TLS-free admission table now protects bookkeeping from `mid_entry`, before
+  extended-state save/stack probes and TLS access. It releases admission after the
+  HitScope guard is installed, so recursive calls from callbacks still count without
+  running another callback. Agent bookkeeping calls pass through without counting.
+  The CET resume stub already jumps instead of returning to a fabricated address;
+  shadow-stack policy/RDSSP detection runs at agent init, outside the hit path.
+- `agent-entry-guard-inline` (`check_agent_entry_guard`, x64/x86, no CET required)
+  probes `kernel32!GetTickCount64` and keeps 257 fresh threads alive at once,
+  exhausting the 256 accounting blocks without a test knob. It requires target completion,
+  at least 257 hits, logs == hits, no dropped/interrupted callbacks, and no session error.
+  Existing CET checks are unchanged. No Windows build or runtime validation here.
+  The CI stack-overflow rows are consistent with pre-guard recursion, but do not identify
+  the recursive callee: this reproduction does not establish their exact cause.

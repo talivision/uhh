@@ -1375,6 +1375,42 @@ static ThreadSlot *thread_slot(DWORD tid, bool claim) {
     if (ThreadSlot *s = slot_in(g_overflow, AGENT_OVERFLOW_SLOTS, tid, true)) return s;
     return take_dead_slot(g_overflow, AGENT_OVERFLOW_SLOTS, tid);   // null: g_untracked_running
 }
+// Admission precedes implicit TLS and slot/accounting setup: even GetTickCount64
+// can itself be probed. This TLS-free guard covers only agent bookkeeping;
+// HitScope takes over before user code (whose recursive hits still count).
+struct EntrySlot { volatile LONG tid; uintptr_t frame; };
+static EntrySlot g_entries[AGENT_THREAD_SLOTS + AGENT_OVERFLOW_SLOTS];
+static __forceinline EntrySlot *entry_begin(DWORD tid, uintptr_t frame, bool &full) {
+    for (;;) {
+        EntrySlot *available = nullptr;
+        for (uint32_t n = 0; n < _countof(g_entries); ++n) {
+            EntrySlot &e = g_entries[((tid >> 2) + n) % _countof(g_entries)];
+            const LONG owner = e.tid;
+            if (owner == (LONG)tid) {
+                // A nested entry is below its owner's frame. A non-unwinding
+                // escape can leave an old admission above the next hit's SP.
+                if (frame < e.frame) return nullptr;
+                e.frame = frame;
+                return &e;
+            }
+            if (!available && (!owner || owner == SLOT_MOVING)) available = &e;
+            if (!owner) break;
+        }
+        if (!available) { full = true; return nullptr; } // never run bookkeeping without protection
+        const LONG owner = available->tid;
+        if (owner != 0 && owner != SLOT_MOVING) continue;
+        if (InterlockedCompareExchange(&available->tid, (LONG)tid, owner) != owner) continue;
+        available->frame = frame;
+        return available;
+    }
+}
+static __forceinline void entry_end(DWORD tid) {
+    for (uint32_t n = 0; n < _countof(g_entries); ++n) {
+        EntrySlot &e = g_entries[((tid >> 2) + n) % _countof(g_entries)];
+        if (e.tid == (LONG)tid) { InterlockedExchange(&e.tid, SLOT_MOVING); return; }
+        if (!e.tid) return;
+    }
+}
 // The current thread's creation time (0: unknown). Hits it causes (a probe on
 // NtQueryInformationThread) pass straight through: see ThreadSlot::busy.
 using nt_qit_fn = LONG (NTAPI *)(HANDLE, ULONG, void *, ULONG, ULONG *);
@@ -2146,6 +2182,7 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     if (!ts || private_slot(ts)) InterlockedIncrement(&g_untracked_running);
     c.hit_scope = &scope;
     teb.restore();                                      // bookkeeping must not reach the callback/target
+    entry_end(c.tid);                                     // HitScope now guards callback re-entry
     bool callback_ok = run_callback(cb, &c, teb.error, teb.status);
     if (ts) ts->active = nullptr;
     if (!ts || private_slot(ts)) InterlockedDecrement(&g_untracked_running);
@@ -2383,6 +2420,29 @@ static __declspec(noinline) bool mid_entry_noxsave_sim(safetyhook::Context &nati
 static LONG g_xmode;
 static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
     clear_df();                                            // DF=0 before ANY C code
+    const DWORD tid = current_tid();
+    // No TLS, CRT or Windows calls before admission. The save routines below
+    // use intrinsics only; their stack probes also run under this guard.
+    bool full = false;
+    EntrySlot *const entry = entry_begin(tid, (uintptr_t)&native, full);
+    if (!entry) {
+        // Nested agent work is invisible. Exhaustion on a real target call must
+        // instead retain its hit and account the refused callback, without APIs/TLS.
+        if (full && !g_stopping && callbacks[index] && !g_agent_threads.has(tid) && g_sweeper != (LONG)tid) {
+            probe_agent_shared *const sh = states[index].shared;
+            if (sh == shared) {
+                auto &line = sh->hit_stripes[index][(tid >> 2) & (PROBE_AGENT_STRIPES - 1)];
+                InterlockedExchangeAdd64(&line.value, 1);
+                InterlockedIncrement(&sh->log_dropped);
+            }
+        }
+        return;
+    }
+    struct Admission {
+        EntrySlot *entry;
+        DWORD tid;
+        ~Admission() { if (entry->tid == (LONG)tid) InterlockedExchange(&entry->tid, SLOT_MOVING); }
+    } admission{entry, tid};
 #if defined(_WIN64)
     unsigned char *x87_post = nullptr;                     // x64 returns floating point in XMM0 only
 #else
