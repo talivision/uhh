@@ -128,6 +128,14 @@ static void replay_held_watches(probe_session *s) {
     while (!s->watch_deferred.empty() && s->calls.empty() && !s->in_call_tid && !s->cur_fiber) {
         probe_session::WatchHeld h = s->watch_deferred.front();
         if (s->exited) { drop_held_watch(s, h); s->watch_deferred.erase(s->watch_deferred.begin()); CloseHandle(h.thread); continue; }
+        if (h.reply_later) {
+            // Keep the kernel event for a mixed target-TF trap. Replaying a saved
+            // callback after DBG_CONTINUE would lose the program's exception.
+            if (ResumeThread(h.thread) == (DWORD)-1) break;
+            s->watch_deferred.erase(s->watch_deferred.begin());
+            CloseHandle(h.thread); guard_resync(s);
+            continue;
+        }
 #if defined(UHH_TEST_HOOKS)
         static bool failed = false;
         const bool fail = !failed && std::getenv("UHH_TEST_WATCH_FIBER_FAIL");
@@ -383,14 +391,15 @@ static void resume_deferred_hits(probe_session *s) {
 // has happened), but its callback can wait: the thread is held (suspended) right after the
 // access, its status bits kept for its event (dr6_lost: it has not run since), and the event
 // is handled again -- callback, call_func and all -- once no call is left (replay_held_watches).
-// Only a hit that is ours alone: every status bit one of our data watches (none of the
-// target's own slots, no execute probe sharing it).
+// Every B-bit must be one of our data watches (no target slots or execute probe).
+// With target BS, DBG_REPLY_LATER retains the kernel event for exception delivery.
 bool hold_watch_hit(probe_session *s, const DEBUG_EVENT &event, const CONTEXT &native, uint8_t theirs) {
     const DWORD64 fired = native.Dr6 & 0xF;
-    if (!fired || (fired & theirs) || (native.Dr6 & 0xE000u)) return false;
+    if (!fired || (fired & theirs) || (native.Dr6 & 0xA000u)) return false;
     probe_session::Dr6Lost saved{};
-    saved.regs = native; saved.bits = fired;
+    saved.regs = native; saved.bits = native.Dr6 & 0xE00Fu;
     probe_session::WatchHeld held; held.ev = event;
+    held.reply_later = (native.Dr6 & 0x4000u) != 0;
     for (int slot = 0; slot < 4; ++slot) {
         if (!(fired & (1u << slot))) continue;
         Probe *p = nullptr;
@@ -1178,8 +1187,14 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
                 ev.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP &&
                 (uint64_t)(uintptr_t)ev.u.Exception.ExceptionRecord.ExceptionAddress == ret_addr) {
                 guard_note_hold(s, st->tid);                               // stopped at its event: listed meanwhile
-                CONTEXT &r = st->post; r.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | UHH_CONTEXT_FP;
-                if (GetThreadContext(thread, &r)) {
+                CONTEXT &r = st->post; r.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | UHH_CONTEXT_FP | CONTEXT_DEBUG_REGISTERS;
+                const bool got_return = !!GetThreadContext(thread, &r);
+                DWORD64 status_mask = 0xE000u;
+                for (int k = 0; k < 4; ++k) if ((r.Dr7 >> (k * 2)) & 3u) status_mask |= (DWORD64)1 << k;
+                // A RET data-watch or the program's TF trap arrives at this same PC
+                // before our execute catch. Dispatch it normally; the catch comes later.
+                if (got_return && (r.Dr6 & status_mask) == ((DWORD64)1 << slot) &&
+                    dr_address(r, slot) == ret_addr && !((r.Dr7 >> (16 + slot * 4)) & 0xFu)) {
 #if defined(_WIN64)
                     const uint64_t sp = r.Rsp, rax = r.Rax;
 #else
@@ -1197,10 +1212,10 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
                         break;
                     }
                     r.EFlags |= 0x10000u; SetThreadContext(thread, &r);    // some other return there: run on
+                    guard_resync(s);                                       // runs on: off the guard's list
+                    ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
+                    continue;
                 }
-                guard_resync(s);                                           // runs on: off the guard's list
-                ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
-                continue;
             }
             if (ev.dwThreadId == st->tid && ev.dwDebugEventCode == EXIT_THREAD_DEBUG_EVENT) {
                 thread_gone = true; why = "the thread exited inside the original";

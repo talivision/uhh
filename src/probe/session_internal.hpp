@@ -161,6 +161,8 @@ struct StepState {
     bool syscall_insn = false; // SYSCALL stepped in place: the CPU copies OUR trap flag into R11
     bool pushf_insn = false;   // PUSHF stepped in place: the pushed image carries OUR trap flag
     bool prog_tf = false;      // ... unless the program had TF set itself
+    bool popf_tf = false;      // flags popped by POPF, sampled before execution
+    bool popf_insn = false;    // POPF supplies its own post-instruction TF
     bool windowed = false;     // in place under the in-place window (other threads held, see inplace_begin)
     bool refire = false;       // the in-place step faulted: re-running the instruction WITHOUT our trap flag
 };
@@ -466,7 +468,7 @@ struct probe_session {
     std::unordered_map<DWORD, LateCall> call_late;
     // Data-watch hits held while a call is in flight (callbacks never overlap): the thread is
     // suspended right after the access, its callback replayed once no call is left.
-    struct WatchHeld { HANDLE thread = nullptr; DEBUG_EVENT ev{}; uhh_session::Probe *probes[4]{}; };
+    struct WatchHeld { bool reply_later = false; HANDLE thread = nullptr; DEBUG_EVENT ev{}; uhh_session::Probe *probes[4]{}; };
     std::vector<WatchHeld> watch_deferred;
     // call_original in flight (breakpoint/hw, see call_original): the probe address the call
     // starts at, the hit's SP, whether the breakpoint entry pass is still pending (the call's
@@ -582,13 +584,14 @@ namespace uhh_session {
 // every thread (arm_hw) -- the window its checks are about, whatever other touches (an inline
 // install's freeze, with --guard's inline probe in the session) come first.
 inline bool g_test_in_arm_hw = false;
+bool test_fault_retried(probe_session *, const CONTEXT &, uint64_t, DWORD);
 #endif
 struct GuardTouch {
 #if !defined(_WIN64)
     probe_agent_guard *g = nullptr;
     LONG n = 0;
     GuardTouch(const probe_session *s, DWORD tid);
-    ~GuardTouch() { if (g && g->held_count == n + 1) { MemoryBarrier(); g->held_count = n; } }
+    ~GuardTouch() { if (g) { g->held_tids[n] = 0; MemoryBarrier(); if (g->held_count == n + 1) g->held_count = n; } }
 #else
     GuardTouch(const probe_session *, DWORD) {}
 #endif

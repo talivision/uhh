@@ -7908,6 +7908,28 @@ def check_session_loop_review():
             record(name, False, repr(e))
 
 
+def check_session_r17_review():
+    """Controller review: fault-record overflow, POPF TF, RET watch delivery,
+    deferred mixed watch/TF events, crash-safe hold publication, untrusted DR-site
+    counts, and remote handle cleanup after a missing-agent attach failure.
+    Uses real Windows events in ctrl_dr_review; no synthetic DR6 writes.
+    """
+    d = exe("ctrl_dr_review_testhooks.exe")
+    if not d:
+        return missing_bin("session-r17", "ctrl_dr_review_testhooks")
+    for case in ("fault-pointer", "popf-tf", "original-ret-watch", "deferred-tf",
+                 "guard-holds", "guard-count", "attach-handle"):
+        name = f"session-r17-{case}"
+        try:
+            r, o = run([d, case], timeout=30)
+            res = next((x for x in o if x.get("kind") == "dr_review"), {})
+            good = r.returncode == 0 and res.get("ok") == 1 and res.get("case") == case
+            record(name, good, f"exit={r.returncode} result={res}" +
+                   (f" stderr={r.stderr[-2400:]!r}" if not good else ""))
+        except Exception as e:
+            record(name, False, repr(e))
+
+
 def check_ctrl_own_debug():
     """Real Windows #DB events from an eight-byte store and target TF, passed through
     controller handlers. Slot reuse and held-watch replay must reject stale accesses
@@ -13497,6 +13519,7 @@ def main():
     if want(check_stream_filefail): check_stream_filefail()
     if want(check_ctrl_symload): check_ctrl_symload()
     if want(check_ctrl_own_debug): check_ctrl_own_debug()
+    if want(check_session_r17_review): check_session_r17_review()
     if want(check_session_loop_review): check_session_loop_review()
     if want(check_ctrl_call_hw_review): check_ctrl_call_hw_review()
     if want(check_image_verdict_review): check_image_verdict_review()

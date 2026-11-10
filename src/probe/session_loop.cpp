@@ -904,7 +904,7 @@ static bool fault_retried(probe_session *s, const CONTEXT &now, uint64_t site, D
         for (size_t q = o > 0x1000 ? o - 0x1000 : 0; q + 8 <= o; q += 4) {
             uint32_t pr = 0, pc = 0;
             std::memcpy(&pr, buf.data() + q, 4); std::memcpy(&pc, buf.data() + q + 4, 4);
-            if (pc != at || pr < lo || pr + sizeof(EXCEPTION_RECORD) > sp) continue;
+            if (pc != at || pr < lo || (uint64_t)pr + sizeof(EXCEPTION_RECORD) > sp) continue;
             EXCEPTION_RECORD r;
             std::memcpy(&r, buf.data() + (pr - lo), sizeof(r));
             if (r.ExceptionCode == code && (uint64_t)(uintptr_t)r.ExceptionAddress == site &&
@@ -918,6 +918,12 @@ static bool fault_retried(probe_session *s, const CONTEXT &now, uint64_t site, D
     }
     return false;
 }
+
+#if defined(UHH_TEST_HOOKS)
+bool test_fault_retried(probe_session *s, const CONTEXT &now, uint64_t site, DWORD code) {
+    return fault_retried(s, now, site, code);
+}
+#endif
 
 static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
                              std::unordered_map<DWORD, StepState> &stepping,
@@ -1055,7 +1061,12 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     if (code == EXCEPTION_SINGLE_STEP && step == stepping.end() && (s->hw_active || s->dr_ever)) {
         bool handled = false;
         if (!handle_hw(s, event, handled)) return false;
-        if (handled) { disposition = DBG_CONTINUE; return true; }   // else fall through (not our DR)
+        if (handled) {
+            disposition = DBG_CONTINUE;
+            for (const auto &h : s->watch_deferred)
+                if (h.reply_later && h.ev.dwThreadId == event.dwThreadId) disposition = DBG_REPLY_LATER;
+            return true;
+        }   // else fall through (not our DR)
         // A trap at the address of a hardware probe we have RELEASED, raised before the
         // release reached this thread (its debug status no longer names the slot): ours,
         // stale. Clear our slots on the thread, step over with RF, and swallow it.
@@ -1373,7 +1384,9 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             }
         }
         if (!step->second.prog_tf) {
-            native.EFlags &= ~0x100u;
+            if (step->second.popf_insn && (uint64_t)EMU_IP(native) == step->second.site + step->second.insn_len)
+                native.EFlags = (native.EFlags & ~0x100u) | (step->second.popf_tf ? 0x100u : 0u);
+            else native.EFlags &= ~0x100u;
             native.Dr6 &= ~(decltype(native.Dr6))0x4000u; // BS came from our step, not the target
         }
 #if defined(_WIN64)
@@ -1611,6 +1624,20 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     const bool is_syscall = probe->orig_insn.size() == 2 && probe->orig_insn[0] == 0x0F && probe->orig_insn[1] == 0x05;
     StepState st{probe, displaced, probe->address, probe->insn_len, displaced ? scratch_addr : 0,
                  tail, probe->rep_string, is_syscall};
+    for (size_t i = 0; i < probe->orig_insn.size(); ++i) {
+        const unsigned char b = probe->orig_insn[i];
+        if (b == 0x66 || b == 0x67 || b == 0xF2 || b == 0xF3 || b == 0x2E || b == 0x36 ||
+            b == 0x3E || b == 0x26 || b == 0x64 || b == 0x65) continue;
+#if defined(_WIN64)
+        if (b >= 0x40 && b <= 0x4F) continue;
+#endif
+        if (b == 0x9D) {
+            uint16_t flags = 0; size_t got = 0;
+            st.popf_insn = remote_read(s->pi.hProcess, (uint64_t)EMU_SP(native), &flags, sizeof(flags), &got) && got == sizeof(flags);
+            st.popf_tf = (flags & 0x100u) != 0;
+        }
+        break;
+    }
     st.prog_tf = prog_tf;          // (also kept for a displaced copy that faults and re-runs in place)
 #if defined(UHH_TEST_HOOKS)
     if (tail && !probe->internal) test_note_repcopy();
