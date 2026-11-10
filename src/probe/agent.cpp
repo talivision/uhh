@@ -51,6 +51,10 @@ static constinit thread_local RegionCache t_region{};
 // Loader unload notifications invalidate region and symbol-resolution caches.
 static volatile LONG g_unload_gen;
 static void *g_dll_cookie;
+// K32QueryWorkingSetEx (resolved with the unload notification): the x86 stack capture's
+// one-page protection probe (see X86Mem::fast_image).
+using qwsex_fn = BOOL(WINAPI *)(HANDLE, PVOID, DWORD);
+static qwsex_fn g_qwsex;
 struct ImageRegions { RegionCache r[16]; LONG gen = 0; uint32_t used = 0, next = 0; };
 static constinit thread_local ImageRegions t_images{};
 
@@ -352,6 +356,18 @@ static bool looks_like_return(uint32_t addr) {
 // Stack reads use TEB committed-stack bounds. Speculative code/data reads re-query each
 // region once per capture, including images (cdx-codeprot). Scans are bounded
 // (16 KiB per frame, 128 region lookups); the same protection-race policy as get_mem applies.
+
+// Large image runs seen by this thread's stack captures (VirtualQuery answers), valid until a DLL
+// unloads. VirtualQuery's cost grows with the pages from the queried address to the END of its run
+// (WOW64 measured: 3.8 us at the start of ntdll's 176-page .text, 0.45 us for one page), so for an
+// address in such a run the capture asks QueryWorkingSetEx about just the page(s) it will read:
+// a page it reports VALID is hardware-accessible (PAGE_GUARD / PAGE_NOACCESS pages are never valid:
+// measured, and that is how the OS traps them) with its exact protection. Any other answer (not
+// resident, guarded, no access) takes the VirtualQuery path, so the verdicts are the same. Only the
+// "this range is an image" part is remembered; a section unmapped outside the loader (no
+// notification) could keep an image verdict for non-image code until the next unload.
+struct ImageRuns { uintptr_t lo[8], hi[8]; LONG gen = 0; uint32_t used = 0, next = 0; };
+static constinit thread_local ImageRuns t_image_runs{};
 struct X86Mem {
     struct Region { uint32_t lo, hi; bool read, exec; };
     // Retain every query in this capture: scanning stack data can encounter more than
@@ -369,7 +385,33 @@ struct X86Mem {
         r[last] = g;
         return &r[last];
     }
-    const Region *find(uint32_t a) {
+    // [a, a+n) within one remembered image run, every page valid and readable (and executable when
+    // exec): one QueryWorkingSetEx call. False = ask VirtualQuery.
+    static bool fast_image(uint32_t a, uint32_t n, bool exec, Region &g) {
+        if (!g_qwsex || !g_dll_cookie || !tls_ready() || !n) return false;
+        const ImageRuns &runs = t_image_runs;
+        const uint32_t first = a & ~0xFFFu, last = (a + n - 1) & ~0xFFFu;
+        if (a + n < a || last < first || (last - first) / 0x1000 >= 8 || runs.gen != g_unload_gen) return false;
+        uint32_t i = 0;
+        while (i < runs.used && !(first >= runs.lo[i] && (uintptr_t)last + 0x1000 <= runs.hi[i])) ++i;
+        if (i == runs.used) return false;
+        const uint32_t pages = (last - first) / 0x1000 + 1;
+        struct { PVOID va; ULONG_PTR flags; } w[8];
+        for (uint32_t k = 0; k < pages; ++k) { w[k].va = (PVOID)(uintptr_t)(first + k * 0x1000); w[k].flags = 0; }
+        if (!g_qwsex(GetCurrentProcess(), w, pages * sizeof(w[0]))) return false;
+        bool all_exec = true;
+        for (uint32_t k = 0; k < pages; ++k) {
+            if (!(w[k].flags & 1)) return false;                                  // not valid: VirtualQuery decides
+            const DWORD prot = (DWORD)(w[k].flags >> 4) & 0xFF;   // Valid:1, ShareCount:3, Win32Protection:11
+            const bool x = prot == PAGE_EXECUTE_READ || prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY;
+            if (!x && prot != PAGE_READONLY && prot != PAGE_READWRITE && prot != PAGE_WRITECOPY) return false;
+            all_exec = all_exec && x;
+        }
+        if (exec && !all_exec) return false;
+        g.lo = first; g.hi = last + 0x1000; g.read = true; g.exec = all_exec;
+        return true;
+    }
+    const Region *find(uint32_t a, uint32_t n, bool exec) {
         if (a >= stack.lo && a < stack.hi) return &stack;
         if (used && a >= r[last].lo && a < r[last].hi) return &r[last];
         for (uint32_t i = 0; i < used; ++i) {
@@ -377,10 +419,22 @@ struct X86Mem {
         }
         if (budget <= 0) return nullptr;
         --budget;
+        { Region f{}; if (fast_image(a, n, exec, f)) return keep(f); }
         RegionCache region{};
+        const LONG ugen = g_unload_gen;
         // These are speculative stack values, not known module frames. A still-loaded
         // image can be guarded between captures: use this capture's own cache here.
         if (!query_region((uintptr_t)a, region, false)) return nullptr;
+        if (region.image && region.readable && region.hi - region.lo >= 0x8000 && g_dll_cookie && tls_ready() &&
+            ugen == g_unload_gen) {
+            ImageRuns &runs = t_image_runs;
+            if (runs.gen != ugen) { runs.gen = ugen; runs.used = runs.next = 0; }
+            uint32_t at = 0;                                   // a run seen again (from a lower address) is widened
+            while (at < runs.used && runs.hi[at] != region.hi) ++at;
+            const uintptr_t lo = at < runs.used && runs.lo[at] < region.lo ? runs.lo[at] : region.lo;
+            if (at == runs.used) at = runs.used < 8 ? runs.used++ : (runs.next++ & 7);
+            runs.lo[at] = lo; runs.hi[at] = region.hi;
+        }
         Region g{};
         g.lo = (uint32_t)region.lo;
         g.hi = (uint32_t)region.hi;
@@ -390,7 +444,7 @@ struct X86Mem {
     // [a, a+n) lies in ONE readable region (and in executable image code when exec).
     bool ok(uint32_t a, uint32_t n, bool exec) {
         if (!n || a + n < a) return false;
-        const Region *g = find(a);
+        const Region *g = find(a, n, exec);
         return g && g->read && (!exec || g->exec) && a + n <= g->hi;
     }
 };
@@ -1013,6 +1067,7 @@ static void watch_unloads() {
     const HMODULE nt = GetModuleHandleW(L"ntdll.dll");
     g_ldr_addref = reinterpret_cast<ldr_ref_fn>(GetProcAddress(nt, "LdrAddRefDll"));
     g_ldr_unload = reinterpret_cast<ldr_unload_fn>(GetProcAddress(nt, "LdrUnloadDll"));
+    g_qwsex = reinterpret_cast<qwsex_fn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "K32QueryWorkingSetEx"));
     char knob[16] = {};
     if (GetEnvironmentVariableA("UHH_TEST_CF_STALL", knob, sizeof(knob)))
         g_test_cf_stall = !strcmp(knob, "resolved") ? 1 : !strcmp(knob, "pinned") ? 2 : 0;

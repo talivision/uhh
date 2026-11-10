@@ -24,3 +24,10 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) { (void)h; (void)reason
 
 /* A foreign-module export colliding with the callbacks module's name (api-foreign). */
 __declspec(dllexport) void ctrl_on_tock(void *c) { (void)c; }
+
+/* 36 KiB of executable padding in its own (r-x) section right after .text: the loader maps both as
+   ONE run of equal protection, so a stack capture's code reads here are in a run of 8+ pages -- the
+   size at which the x86 agent asks QueryWorkingSetEx instead of VirtualQuery (cdx-codeprot must hold
+   on that path too: a guarded / no-access page is never "valid"). */
+#pragma section(".uhhpad", read, execute)
+__declspec(allocate(".uhhpad")) __declspec(dllexport) const unsigned char CtrlDllPad[0x9000] = {0xCC};
