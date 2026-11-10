@@ -860,18 +860,39 @@ static int run_modreloc() {
     code = (unsigned char *)VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
     if (!code) return mod_failure("allocate-branch-code", 6, GetLastError());
 #endif
-    void *low = VirtualAlloc((void *)(uintptr_t)0x20000, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    if (!low) return mod_failure("allocate-low-pointer", 7, GetLastError());
+    // The pointer pages need a free low page L (below 4 GB) and, on x64, a free page at
+    // L + 4 GB: the wrapped and the unwrapped effective address then read different pointers.
+    // The addresses are not fixed (a loader/heap region may already own 0x20000 or 0x100020000,
+    // ERROR_INVALID_ADDRESS): scan 64 KB-aligned candidates from 0x20000 up, bounded.
+    void *low = nullptr, *high = nullptr;
+    uintptr_t base = 0;
+    DWORD last_error = 0;
+    for (uintptr_t cand = 0x20000; cand < 0x70000000 && !low; cand += 0x10000) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery((void *)cand, &mbi, sizeof(mbi)) || mbi.State != MEM_FREE) continue;
+        void *l = VirtualAlloc((void *)cand, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!l) { last_error = GetLastError(); continue; }
 #if defined(_WIN64)
-    void *high = VirtualAlloc((void *)(uintptr_t)0x100020000ull, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    if (!high) return mod_failure("allocate-high-pointer", 8, GetLastError());
+        void *h = VirtualAlloc((void *)(cand + 0x100000000ull), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!h) { last_error = GetLastError(); VirtualFree(l, 0, MEM_RELEASE); continue; }
+        high = h;
 #endif
-    // mov eax,fffffff0; [addr32] jmp [eax+20020] -> pointer at 20010.
+        low = l; base = cand;
+    }
+    if (!low) {
+        // Practically never: no suitable address pair exists. The check reports a skip, never a pass.
+        std::printf("{\"kind\":\"ctrl_result\",\"skip\":\"no free low/high pointer pages\",\"win32\":%lu}\n",
+                    (unsigned long)last_error);
+        std::fflush(stdout);
+        return 0;
+    }
+    // mov eax,fffffff0; [addr32] jmp [eax+base+20] -> (32-bit wrapped) pointer at base+10.
+    const uint32_t disp = (uint32_t)(base + 0x20);
     const unsigned char branch[] = {0xb8, 0xf0, 0xff, 0xff, 0xff,
 #if defined(_WIN64)
         0x67,
 #endif
-        0xff, 0xa0, 0x20, 0x00, 0x02, 0x00};
+        0xff, 0xa0, (unsigned char)disp, (unsigned char)(disp >> 8), (unsigned char)(disp >> 16), (unsigned char)(disp >> 24)};
     std::memcpy(code, branch, sizeof(branch));
     const unsigned char good[] = {0xb8, 0x2a, 0, 0, 0, 0xc3};
     const unsigned char wrong[] = {0xb8, 0x63, 0, 0, 0, 0xc3};

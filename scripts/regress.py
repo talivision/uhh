@@ -3951,6 +3951,9 @@ def check_module_review():
         try:
             r, o = run([d, "--scenario", sc, "--shape", side, "--backend", bk, "--", t, sc, "--dll", side], timeout=180)
             res = next((x for x in o if x.get("kind") == "ctrl_result"), {})
+            if res.get("skip"):  # fixture found no free address pair (practically never): a visible skip
+                skip(name, f"fixture unavailable: {res['skip']} (win32={res.get('win32')})")
+                continue
             rows = [x for x in o if x.get("kind") == "probe"]
             logs = [x for x in famous_objs(r, o) if x.get("kind") == "probe_log"]
             rep = report(o)
