@@ -5132,12 +5132,16 @@ def check_famous_files(threads=3, chunks=20):
     if not d or not t:
         return missing_bin("famous-files", "famous_driver/famous_file_target")
     root = Path(os.environ.get("TEMP", ".")) / "uhh_famous"
+    shutil.rmtree(root, ignore_errors=True)            # earlier runs' directories (names are unique)
     root.mkdir(exist_ok=True)
 
     def fresh(tag):
         # Created here, so the target's own CreateDirectory is skipped: with the hardware
         # backend's single spare debug register only one NtCreateFile call site can be armed.
-        p = root / f"files_{os.getpid()}_{tag}"
+        # A unique name per call: re-creating a just-deleted directory can fail with "Access is
+        # denied" while its deletion is still pending (a handle the previous run's target or the
+        # virus scanner has not closed yet).
+        p = root / f"files_{os.getpid()}_{tag}_{time.monotonic_ns()}"
         shutil.rmtree(p, ignore_errors=True)
         p.mkdir(parents=True)
         return p
