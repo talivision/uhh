@@ -9749,6 +9749,50 @@ def lc_logs_ok(d):
     return f is not None and f[1] == d.logs and f[2] == 0, f
 
 
+def lc_queued_return(cfgname, cfg):
+    """Real NtOpenProcess returns with live DR6 cleared by a context write, but
+    status saved by keep_queued_dr6. Both controller backends in a mixed session;
+    runs unchanged on x64 and x86 (including the stdcall return stack check).
+    The marker is mandatory: a run that misses the conflicting condition fails.
+    """
+    if cfgname != "mixed":
+        return
+    for backend in ("breakpoint", "hw"):
+        name = f"lifecycle-queued-return-{backend}-mixed"
+        if not lc_selected(name):
+            continue
+        if not exe("lifecycle_driver_th.exe"):
+            missing_bin(name, "lifecycle_driver_th")
+            continue
+        tg = d = None
+        try:
+            tg = LcTarget("--threads", 4, "--dll", "--churn")
+            d = LcDriver(tg.pid, dict(cfg, open=backend), "--detach-on-stdin",
+                         driver="lifecycle_driver_th.exe",
+                         env={"UHH_TEST_CO_QUEUED_RETURN": "1"})
+            marker = "probe: test: NtOpenProcess return DR6 recovered from queue"
+            forced = d.err.wait_for(lambda line: marker in line, timeout=30) is not None
+            active = d.wait_active() if forced else False
+            logged = d.wait_logs(10) if active else False
+            d.detach()
+            finished = d.finish(timeout=30)
+            logs_ok, final = lc_logs_ok(d)
+            clean = tg.check()
+            tg.reset(); time.sleep(0.3); after = tg.check()
+            exited = tg.quit()
+            ok = (forced and active and logged and finished and d.p.returncode == 0 and
+                  logs_ok and not d.errors() and lc_clean(clean) and after.get("flips") == 0 and
+                  lc_clean(exited) and exited.get("rc") == 0)
+            record(name, ok, f"forced={forced} active={active} logged={logged} finished={finished} "
+                             f"logs={d.logs} final={final} {lc_brief(clean)} "
+                             f"flips_after={after.get('flips')} exit={exited.get('rc')} err={d.errors()}")
+        except Exception as e:
+            record(name, False, repr(e))
+        finally:
+            if d: d.kill()
+            if tg: tg.kill()
+
+
 def lc_reattach(cfgname, cfg, cycles=20):
     """attach -> detach -> re-attach, `cycles` times, to the same busy process (4 workers + a
     thread-churner: threads are born while attached). After EVERY detach: the code bytes of
@@ -10386,10 +10430,10 @@ def check_lifecycle():
     if not exe("lifecycle_driver.exe") or not exe("lifecycle_target.exe") or not exe("hunt_dll.dll"):
         return missing_bin("lifecycle", "lifecycle_driver / lifecycle_target / hunt_dll")
     for cfgname, cfg in LC_CONFIGS.items():
-        for fn in (lc_reattach, lc_detach_cases, lc_target_dies, lc_two_controllers, lc_interrupt, lc_controller_killed,
+        for fn in (lc_queued_return, lc_reattach, lc_detach_cases, lc_target_dies, lc_two_controllers, lc_interrupt, lc_controller_killed,
                    lc_killed_in_freeze, lc_agent_refused, lc_install_stuck, lc_unload_unseen, lc_unload_reused):
             tag = fn.__name__[3:].replace("_", "-")
-            if fn is lc_detach_cases or lc_selected(f"lifecycle-{tag}-{cfgname}"):
+            if fn in (lc_detach_cases, lc_queued_return) or lc_selected(f"lifecycle-{tag}-{cfgname}"):
                 fn(cfgname, cfg)
 
 

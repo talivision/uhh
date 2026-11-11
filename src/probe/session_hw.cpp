@@ -105,6 +105,12 @@ void keep_queued_dr6(probe_session *s, DWORD tid, HANDLE t) {
 DWORD64 dr6_carried(const probe_session *s, DWORD tid) {
     return s->dr6_carry_tid == tid ? s->dr6_carry : 0;
 }
+// Non-consuming lookup for call_original's private wait loop, before dispatch has
+// settled this event. Do not use the previous event's dr6_carry here.
+DWORD64 queued_dr6(const probe_session *s, DWORD tid, const CONTEXT &now) {
+    const auto it = s->dr6_lost.find(tid);
+    return it != s->dr6_lost.end() && same_thread_regs(it->second.regs, now) ? it->second.bits : 0;
+}
 // A hardware probe at `address` was just released (its DR cleared on every thread): until
 // each thread reports an event, an image of it there may be our stale one. A thread that has
 // run since an earlier release settled that one (our clear reached it): only the new counts.

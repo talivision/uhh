@@ -1192,7 +1192,31 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
                 (uint64_t)(uintptr_t)ev.u.Exception.ExceptionRecord.ExceptionAddress == ret_addr) {
                 guard_note_hold(s, st->tid);                               // stopped at its event: listed meanwhile
                 CONTEXT &r = st->post; r.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | UHH_CONTEXT_FP | CONTEXT_DEBUG_REGISTERS;
-                const bool got_return = !!GetThreadContext(thread, &r);
+                bool got_return = !!GetThreadContext(thread, &r);
+#if defined(UHH_TEST_HOOKS)
+                // Force a real return #DB through the queued-status path: another
+                // event's DR write can clear live DR6 before this wait dequeues it.
+                static bool tested_queued_return = false;
+                if (got_return && !tested_queued_return && std::getenv("UHH_TEST_CO_QUEUED_RETURN") &&
+                    probe->location == "ntdll.dll!NtOpenProcess" && (r.Dr6 & (1u << slot))) {
+                    const DWORD outer_event = s->event_tid;
+                    s->event_tid = 0;
+                    keep_queued_dr6(s, st->tid, thread);
+                    s->event_tid = outer_event;
+                    CONTEXT cleared = r; cleared.ContextFlags = CONTEXT_DEBUG_REGISTERS; cleared.Dr6 = 0;
+                    got_return = !!SetThreadContext(thread, &cleared) && !!GetThreadContext(thread, &r);
+                    if (got_return && !(r.Dr6 & (1u << slot)) &&
+                        (queued_dr6(s, st->tid, r) & (1u << slot))) {
+                        tested_queued_return = true;
+                        std::fprintf(stderr, "probe: test: NtOpenProcess return DR6 recovered from queue\n");
+                    }
+                }
+#endif
+                // Unlike dispatch_event, this wait has not called settle_hw_thread.
+                // A mixed session's gate/probe DR writes can have saved this very
+                // #DB's status and cleared live DR6. Recover it only if the integer
+                // registers, PC, SP and flags prove that the thread has not run.
+                if (got_return) r.Dr6 |= queued_dr6(s, st->tid, r);
                 // Other UHH execute probes at this PC are replayable when the callback
                 // resumes the caller. Never exempt a data watch, target DR, or BS/BD/BT.
                 const DWORD64 catch_bit = (DWORD64)1 << slot;
@@ -1215,6 +1239,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
                     const uint64_t sp = r.Esp, rax = r.Eax;
 #endif
                     if (sp > s->co_sp && sp <= s->co_sp + ptr + 1024) {   // x86 stdcall: ret N popped the args
+                        s->dr6_lost.erase(st->tid);                        // this event consumed the saved status
                         result = rax; done = true;                         // this event now stands in for the hit
                         handling_running(s, st->tid, false);               // stopped there: listed (guard_sync)
                         st->have_post = true;
@@ -1226,6 +1251,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
                         break;
                     }
                     r.EFlags |= 0x10000u; SetThreadContext(thread, &r); // some other return there: run on
+                    s->dr6_lost.erase(st->tid);
                     guard_resync(s);
                     ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
                     continue;

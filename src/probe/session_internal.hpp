@@ -745,6 +745,7 @@ bool target_owns_slot(const probe_session *s, DWORD tid, const CONTEXT &c, int s
 uint8_t target_slots_any(const probe_session *s);
 void keep_queued_dr6(probe_session *s, DWORD tid, HANDLE t);
 DWORD64 dr6_carried(const probe_session *s, DWORD tid);
+DWORD64 queued_dr6(const probe_session *s, DWORD tid, const CONTEXT &now);
 void retire_hw_address(probe_session *s, uint64_t address);
 void settle_hw_thread(probe_session *s, DWORD tid);
 bool arm_hw(probe_session *s, Probe &p, uint64_t base);
