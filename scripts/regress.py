@@ -8925,7 +8925,7 @@ def check_session_agentipc():
 
     # Fresh controller processes on every cycle: this also tests shared sections across
     # different local DLL mappings. Keep the target alive until all memory queries finish.
-    for case in ("shared", "identity", "config", "retry", "stub", "freeze", "freeze-context", "unknown-image"):
+    for case in ("shared", "identity", "identity-loader", "identity-unreadable", "config", "retry", "stub", "freeze", "freeze-context", "unknown-image"):
         name = f"session-agentipc-{case}"
         target = None
         drivers = []
@@ -8939,7 +8939,7 @@ def check_session_agentipc():
             pid = json.loads(ready)["pid"]
             if json.loads(ready).get("distinct") != 1: raise RuntimeError("fixture sites were folded")
             driver = d
-            if case == "identity":
+            if case.startswith("identity"):
                 # Only the agent changes between controllers; its retained per-session
                 # target copy remains untouched. The alternate DLL is separately built by CMake.
                 shutil.copy2(d, tmp / d.name)
@@ -8968,26 +8968,33 @@ def check_session_agentipc():
                 if not line: raise RuntimeError(f"no hit {n}: {out.lines} {err.lines}")
                 return json.loads(line)
 
-            if case in ("shared", "identity"):
+            if case == "shared" or case.startswith("identity"):
                 for n in range(1, 4 if case == "shared" else 2):
-                    p, po, pe = attach("shared", 1 if n % 2 else 2, active=2)
+                    p, po, pe = attach("shared", 1 if n % 2 else 2, active=2,
+                                       env={"UHH_TEST_REUSE_NO_MODULE_NAME": "1"} if n > 1 else None)
                     hit(n)
                     if not po.wait_for(lambda l: l.startswith("{") and json.loads(l).get("message") == f"ar shared {n}", 10):
                         raise RuntimeError(f"shared value missing: {po.lines}")
                     detach(p)
-                if case == "identity":
+                if case.startswith("identity"):
                     agent = tmp / "probe_api_agent.dll"
                     alternate = exe("probe_api_agent_identity.dll")
                     if not alternate:
                         raise RuntimeError("missing project-built probe_api_agent_identity.dll")
                     shutil.copy2(alternate, agent)
+                    env = dict(os.environ)
+                    if case == "identity-loader":
+                        env["UHH_TEST_REUSE_NO_MODULE_NAME"] = "1"
+                    elif case == "identity-unreadable":
+                        env["UHH_TEST_REUSE_AGENT_UNREADABLE"] = "1"
                     p = subprocess.Popen([str(driver), "--review-shared", str(pid), "1"], stdin=subprocess.PIPE,
-                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=BIN)
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=BIN, env=env)
                     po, pe = Lines(p.stdout), Lines(p.stderr)
                     drivers.append((p, po, pe))
                     # Do not feed the detach newline before asynchronous installs run.
                     # A clean close with pending probes says nothing about identity.
-                    refusal = "retained inline agent differs"
+                    refusal = ("retained inline agent unknown-image" if case == "identity-unreadable"
+                               else "retained inline agent differs")
                     decision = pe.wait_for(lambda l: refusal in l or
                                            sum(x.startswith("probe: active ") for x in pe.lines) >= 2, 10)
                     if not decision:

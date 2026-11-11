@@ -497,25 +497,60 @@ bool reuse_target_agent(probe_session *s) {
     bool needed = false;
     for (const auto &p : s->probes) if ((p->flags & PROBE_INLINE) || !p->shared_export.empty()) needed = true;
     if (!needed) return true;
-    HMODULE mods[1024]; DWORD need = 0;
-    // Enumeration is only an opportunity to reuse an identified agent. Detours and
-    // loader activity can expose unnamed/transient mappings; they are not evidence
-    // of an incompatible UHH image and must not prevent an ordinary fresh attach.
-    if (!K32EnumProcessModulesEx(s->pi.hProcess, mods, sizeof(mods), &need, LIST_MODULES_ALL)) return true;
-    for (DWORD i = 0; i < std::min<size_t>(need, sizeof(mods)) / sizeof(HMODULE); ++i) {
-        wchar_t path[32768];
-        DWORD n = K32GetModuleFileNameExW(s->pi.hProcess, mods[i], path, (DWORD)(sizeof(path) / sizeof(path[0])));
+    auto unknown = [&]() {
+        set_error(s, "retained inline agent unknown-image: cannot establish target agent identity; restart the target before attaching");
+        return false;
+    };
+    // The loader list can be incomplete during loader activity (including WOW64).
+    // Inspect image allocations independently; overlooking an agent must not
+    // authorize fresh injection. A missing loader name can use the mapped name.
+    std::vector<std::wstring> agents;
 #if defined(UHH_TEST_HOOKS)
-        if (!i && std::getenv("UHH_TEST_REUSE_UNKNOWN")) {
-            n = 0; std::fprintf(stderr, "probe: test: unrelated image unidentified\n");
-        }
+    bool first = true;
 #endif
-        if (!n || n >= sizeof(path) / sizeof(path[0])) continue;
-        const wchar_t *base = wcsrchr(path, L'\\');
-        if (_wcsicmp(base ? base + 1 : path, L"probe_api_agent.dll")) continue;
+    for (uintptr_t at = 0; ; ) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQueryEx(s->pi.hProcess, reinterpret_cast<void *>(at), &mbi, sizeof(mbi))) {
+            if (!at || GetLastError() != ERROR_INVALID_PARAMETER) return unknown();
+            break;                                      // end of address space
+        }
+        const uintptr_t next = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        if (mbi.Type == MEM_IMAGE && mbi.BaseAddress == mbi.AllocationBase) {
+            wchar_t path[32768];
+            DWORD n = K32GetModuleFileNameExW(s->pi.hProcess, reinterpret_cast<HMODULE>(mbi.AllocationBase),
+                                            path, (DWORD)(sizeof(path) / sizeof(path[0])));
+#if defined(UHH_TEST_HOOKS)
+            if (std::getenv("UHH_TEST_REUSE_NO_MODULE_NAME")) n = 0;
+            if (first && std::getenv("UHH_TEST_REUSE_UNKNOWN")) {
+                n = 0; std::fprintf(stderr, "probe: test: unrelated image unidentified\n");
+            }
+            first = false;
+#endif
+            std::wstring file;
+            if (n && n < sizeof(path) / sizeof(path[0])) file.assign(path, n);
+            else {
+                n = K32GetMappedFileNameW(s->pi.hProcess, mbi.AllocationBase, path,
+                                         (DWORD)(sizeof(path) / sizeof(path[0])));
+                if (!n || n >= sizeof(path) / sizeof(path[0])) return unknown();
+                // Open the kernel's NT device path without depending on drive aliases.
+                file = L"\\\\?\\GLOBALROOT" + std::wstring(path, n);
+            }
+            const size_t slash = file.find_last_of(L'\\');
+            if (!_wcsicmp(file.c_str() + (slash == std::wstring::npos ? 0 : slash + 1), L"probe_api_agent.dll"))
+                agents.push_back(file);
+        }
+        if (next <= at) break;
+        at = next;
+    }
+    if (agents.size() > 1) return unknown();
+    for (const auto &file : agents) {
+        const wchar_t *path = file.c_str();
+#if defined(UHH_TEST_HOOKS)
+        if (std::getenv("UHH_TEST_REUSE_AGENT_UNREADABLE")) return unknown();
+#endif
         std::unordered_set<std::string> exports;
         if (!read_file_exports(path, exports) || !exports.count("probe_agent_init") ||
-            !exports.count("probe_agent_stop") || !exports.count("probe_agent_bind_controller")) continue;
+            !exports.count("probe_agent_stop") || !exports.count("probe_agent_bind_controller")) return unknown();
         if (!ensure_local_agent(s)) return false;
         auto read = [](const std::wstring &file, std::vector<unsigned char> &bytes) {
             HANDLE f = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
@@ -526,7 +561,7 @@ bool reuse_target_agent(probe_session *s) {
             return ok;
         };
         std::vector<unsigned char> want, have;
-        if (!read(s->agent_path, want) || !read(path, have)) continue;
+        if (!read(s->agent_path, want) || !read(path, have)) return unknown();
         if (want != have) {
             set_error(s, "retained inline agent differs from this build; restart the target before attaching"); return false;
         }

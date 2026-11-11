@@ -255,6 +255,9 @@ Attaches to a running process instead of launching one.
   reuses an identified retained agent only when its normalized file contents match
   this build, and maps that same file in the controller to reconnect `UHH_SHARED`.
   A different build is refused; restart the target to use it.
+  Discovery scans mapped images even if the loader list is incomplete. An image
+  that cannot be named, or an unreadable/unidentifiable retained agent, refuses
+  attach with `retained inline agent unknown-image`; it never authorizes fresh injection.
 - `probe_run` returns when the target exits. `probe_close` on a still-running target
   **detaches**: requests inline unhooking, restores breakpoints and clears UHH-owned debug registers;
   the target keeps running. The agent stop wait is bounded to 5 s. If it cannot finish in
