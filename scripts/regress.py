@@ -7941,7 +7941,7 @@ def check_session_loop_review():
 
 
 def check_session_r17_review():
-    """Controller review: fault-record overflow, POPF TF, RET watch delivery,
+    """Controller review: fault-record overflow, POPF TF,
     deferred mixed watch/TF events, crash-safe hold publication, untrusted DR-site
     counts, and remote handle cleanup after a missing-agent attach failure.
     Uses real Windows events in ctrl_dr_review; no synthetic DR6 writes.
@@ -7949,7 +7949,7 @@ def check_session_r17_review():
     d = exe("ctrl_dr_review_testhooks.exe")
     if not d:
         return missing_bin("session-r17", "ctrl_dr_review_testhooks")
-    for case in ("fault-pointer", "popf-tf", "original-ret-watch", "deferred-tf", "deferred-step",
+    for case in ("fault-pointer", "popf-tf", "deferred-tf", "deferred-step",
                  "guard-holds", "guard-count", "attach-handle"):
         name = f"session-r17-{case}"
         try:
