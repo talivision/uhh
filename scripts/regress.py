@@ -10090,16 +10090,21 @@ def lc_controller_killed(cfgname, cfg):
             else:
                 time.sleep(float(when.split("-")[1]))
             if when == "death-receipt":
-                tg._cmd("receipt-arm", "receipt_arm")
+                armed = tg._cmd("receipt-arm", "receipt_arm")
+                if armed.get("armed") != 1:
+                    raise RuntimeError(f"receipt handshake not armed: {armed}")
             d.kill()
             if when == "death-receipt":
                 # Wait for kernel detach before the armed main thread calls NtOpenProcess.
-                # The guard delays cleanup; the agent erases this real fault's saved
-                # status after lazy clearing. Requires receipt-only attribution on
-                # x64 AND x86, independent of kernel dispatch/cleanup scheduling.
+                # receipt-fire waits for the guard to cache the runtime knob; the guard
+                # holds active DR clearing until this call finishes. The agent erases
+                # this real fault's saved status after lazy clearing. Requires receipt-only
+                # attribution on x64 AND x86, independent of dispatch/cleanup scheduling.
                 d.p.wait(timeout=30)
                 fired = tg._cmd("receipt-fire", "receipt_fire")
                 main_tid = fired.get("tid")
+                if fired.get("ready") != 1:
+                    raise RuntimeError(f"receipt cleanup handshake not reached: {fired}")
                 if (not main_tid or tg.out.wait_for(
                         lambda l: '"kind":"death_receipt"' in l and
                         json.loads(l).get("tid") == main_tid, 10) is None):

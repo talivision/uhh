@@ -3286,9 +3286,18 @@ static void guard_cleanup() {
         InterlockedExchange(&g_test_death_receipt,
                             GetEnvironmentVariableA("UHH_TEST_DEATH_RECEIPT", v, sizeof(v)) && v[0] == '1');
     }
-    char delay[16]{};
-    if (GetEnvironmentVariableA("UHH_TEST_GUARD_CLEAR_DELAY_MS", delay, sizeof(delay)))
-        Sleep((DWORD)strtoul(delay, nullptr, 10));
+    HANDLE test_ready = nullptr, test_done = nullptr;
+    if (g_test_death_receipt) {
+        // receipt-arm creates these before acknowledging the command. Publish readiness
+        // only AFTER caching the knob, then keep the main thread's execute slot armed
+        // until receipt-fire finishes its call. A fixed sleep races the test runner.
+        wchar_t name[96];
+        _snwprintf_s(name, _countof(name), _TRUNCATE, L"Local\\UHHDeathReceiptReady.%lu", GetCurrentProcessId());
+        test_ready = OpenEventW(EVENT_MODIFY_STATE, FALSE, name);
+        _snwprintf_s(name, _countof(name), _TRUNCATE, L"Local\\UHHDeathReceiptDone.%lu", GetCurrentProcessId());
+        test_done = OpenEventW(SYNCHRONIZE, FALSE, name);
+    }
+    const bool test_handshake = test_ready && test_done;
     LONG n = shared->int3_count;                                // every INT3 of ours: original byte back
     if (n < 0) n = 0;
     if (n > (LONG)PROBE_AGENT_INT3_CAP) n = PROBE_AGENT_INT3_CAP;
@@ -3318,14 +3327,22 @@ static void guard_cleanup() {
             HANDLE t = OpenThread(access, FALSE, te.th32ThreadID);
             if (!t) continue;
 #if defined(_WIN64)
-            if (mask) clear_thread_dr(t, te.th32ThreadID);       // the guard's own thread too: the controller armed it like any other
+            // In the test's first pass, release controller holds before waiting for
+            // receipt-fire, but leave DRs armed. The second pass clears them as usual.
+            if (mask && (!test_handshake || pass)) clear_thread_dr(t, te.th32ThreadID);
 #endif
             // Only release recorded controller holds, once per entry.
             if (!pass && te.th32ThreadID != self) resume_holds(g, t, te.th32ThreadID);
             CloseHandle(t);
         }
         CloseHandle(snap);
+        if (!pass && test_handshake) {
+            SetEvent(test_ready);
+            WaitForSingleObject(test_done, 30000); // bounded if the test target never fires
+        }
     }
+    if (test_done) CloseHandle(test_done);
+    if (test_ready) CloseHandle(test_ready);
     InterlockedExchange(&g_self_freeze, 1);                     // no controller to freeze for us
     probe_agent_stop(nullptr);                                  // inline hooks out (no-op without any)
     InterlockedExchange(&g_self_freeze, 0);
