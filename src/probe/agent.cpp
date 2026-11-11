@@ -2979,7 +2979,7 @@ struct ExecuteReceipt {
     uint64_t created, address;
 };
 static ExecuteReceipt g_execute_receipts[PROBE_AGENT_GUARD_TIDS * 4];
-static volatile LONG g_test_death_receipt;   // UHH_TEST_DEATH_RECEIPT=1, read once at init (never in the VEH)
+static volatile LONG g_test_death_receipt;   // UHH_TEST_DEATH_RECEIPT=1, read once in guard_cleanup (never in the VEH)
 static uint64_t thread_created(HANDLE t) {
     FILETIME created{}, exited{}, kernel{}, user{};
     if (!GetThreadTimes(t, &created, &exited, &kernel, &user)) return 0;
@@ -3279,7 +3279,13 @@ static void guard_cleanup() {
     if (InterlockedExchange(&g_orphan_cleaned, 1)) return;
     auto &g = shared->guard;
     InterlockedExchange(&shared->controller_gone, 1);          // logs: nobody will read them
-    // Test-only: leave the execute slot armed for the target's post-kill cue.
+    // Test-only knobs, read once here (the target sets them at runtime, before the kill):
+    // the execute slot stays armed for the target's post-kill cue; the death-receipt seam.
+    {
+        char v[2]{};
+        InterlockedExchange(&g_test_death_receipt,
+                            GetEnvironmentVariableA("UHH_TEST_DEATH_RECEIPT", v, sizeof(v)) && v[0] == '1');
+    }
     char delay[16]{};
     if (GetEnvironmentVariableA("UHH_TEST_GUARD_CLEAR_DELAY_MS", delay, sizeof(delay)))
         Sleep((DWORD)strtoul(delay, nullptr, 10));
@@ -3516,11 +3522,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *channel) {
     if (!guard_handler) guard_handler = AddVectoredExceptionHandler(1, guard_veh);
     if (!guard_handler) return 4;
     InterlockedExchange(&shared->debug_delivery_ready, 1);
-    {
-        char v[2]{};
-        InterlockedExchange(&g_test_death_receipt,
-                            GetEnvironmentVariableA("UHH_TEST_DEATH_RECEIPT", v, sizeof(v)) && v[0] == '1');
-    }
+    InterlockedExchange(&g_test_death_receipt, 0);
     InterlockedExchange(&g_orphan_cleaned, 0);   // a new session: guard it afresh
     InterlockedExchange(&g_lazy_dr, 0);
     for (auto &entry : g_orphan_bs_tids) InterlockedExchange(&entry, 0);
