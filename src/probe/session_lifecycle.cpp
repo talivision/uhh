@@ -498,15 +498,34 @@ void detach(probe_session *s) {
     // INT3 or debug register just before it is removed, and an event still queued at
     // DebugActiveProcessStop would reach the target as an unhandled exception.
     std::vector<HANDLE> frozen;
-    for (DWORD tid : s->threads) {
-        HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT |
-                              THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
-        if (!t) continue;
-        guard_note_hold(s, tid);
-        if (SuspendThread(t) == (DWORD)-1) { CloseHandle(t); continue; }
-        frozen.push_back(t);
-        s->detach_frozen.push_back(tid);
-    }
+    auto freeze_threads = [&](const char *phase) {
+        for (DWORD tid : s->threads) {
+            HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT |
+                                  THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+            if (!t) {
+                if (trace_enabled())
+                    std::fprintf(stderr, "probe: detach-freeze %s tid=%lu openfail=%lu\n",
+                                 phase, (unsigned long)tid, (unsigned long)GetLastError());
+                continue;
+            }
+            guard_note_hold(s, tid);
+            if (SuspendThread(t) == (DWORD)-1) {
+                const DWORD why = GetLastError();
+                if (trace_enabled())
+                    std::fprintf(stderr, "probe: detach-freeze %s tid=%lu suspendfail=%lu terminating=%d\n",
+                                 phase, (unsigned long)tid, (unsigned long)why, (int)thread_terminating(t));
+                CloseHandle(t); continue;
+            }
+            frozen.push_back(t);
+            s->detach_frozen.push_back(tid);
+        }
+    };
+#if defined(UHH_TEST_HOOKS)
+    if (std::getenv("UHH_TEST_DETACH_REFRESH"))
+        std::fprintf(stderr, "probe: test: detach initial freeze omitted\n");
+    else
+#endif
+    freeze_threads("initial");
     for (auto &p : s->probes) {
         if (!p->active) continue;
         // A forwarded #DB still has to pass its repaired context to VEH/SEH. Keep the
@@ -527,7 +546,8 @@ void detach(probe_session *s) {
     // first processed by the 64-bit layer in user mode -- and such an event would only
     // surface after we let go. With every probe already removed nothing new can trap, so
     // run until the queue has been quiet for 200 ms: everything in flight lands here.
-    for (HANDLE t : frozen) ResumeThread(t);
+    for (HANDLE t : frozen) { ResumeThread(t); CloseHandle(t); }
+    frozen.clear();
     s->detach_frozen.clear(); guard_sync(s);
     // Only EXCEPTIONS are what this waits for: a target that keeps creating threads or
     // loading DLLs never goes quiet in thread/module events (that kept a detach busy for
@@ -552,12 +572,19 @@ void detach(probe_session *s) {
         service_event(s, ev);
     }
     finish_calls(s);                                         // a call started while draining
-    for (HANDLE t : frozen) {                                // freeze again for the fix-ups below
-        const DWORD tid = GetThreadId(t);
-        guard_note_hold(s, tid);
-        SuspendThread(t);
-        s->detach_frozen.push_back(tid);
-    }
+    // The drain can report new threads (or retire every handle in the initial
+    // snapshot). Reopen the CURRENT set, including threads whose first freeze
+    // failed transiently. Reusing the old handles skipped their DR/trampoline
+    // cleanup entirely, and even resumed handles whose second suspend failed.
+    freeze_threads("final");
+    auto clear_step_tf = [](const StepState &st, CONTEXT &w) {
+        // REP tail catches and fault replays never installed TF. POPF may have
+        // supplied the program's own TF by the time the freeze observes it.
+        if (st.prog_tf || st.tail_int3 || st.refire) return;
+        const bool popped_tf = st.popf_insn && st.popf_tf &&
+            (uint64_t)EMU_IP(w) == st.site + st.insn_len;
+        if (!popped_tf) w.EFlags &= ~0x100u;
+    };
     // A thread still mid single-step: put it on the real instruction stream (the INT3 is
     // gone) with the trap flag clear.
     for (auto &kv : s->stepping) {
@@ -578,12 +605,12 @@ void detach(probe_session *s) {
 #else
             w.Eip = (DWORD)ip;
 #endif
-            if (!kv.second.prog_tf) w.EFlags &= ~0x100u;
+            clear_step_tf(kv.second, w);
             SetThreadContext(t, &w);
         }
         if (t) CloseHandle(t);
     }
-    s->stepping.clear();
+    // Keep step ownership through the final context write below.
     // A thread inside a displaced trampoline (not yet run: at its start; run: at the jump
     // back): onto the real code. The trampolines are freed at close.
     for (HANDLE t : frozen) {
@@ -630,6 +657,12 @@ void detach(probe_session *s) {
             if (!gone) report_tids += " " + std::to_string(GetThreadId(t)) + ":getfail=" + std::to_string(why);
             continue;
         }
+        const auto step = s->stepping.find(GetThreadId(t));
+        if (step != s->stepping.end()) {
+            clear_step_tf(step->second, w);
+            if (!step->second.prog_tf && !step->second.tail_int3 && !step->second.refire)
+                w.Dr6 &= ~(decltype(w.Dr6))0x4000u;
+        }
         for (int slot = 0; slot < 4; ++slot) {
             if (!(s->dr_ever & (1u << slot)) || !s->hw_armed_ever.count(dr_address(w, slot)) ||
                 target_owns_slot(s, GetThreadId(t), w, slot)) continue;
@@ -649,6 +682,7 @@ void detach(probe_session *s) {
             report_tids += " " + std::to_string(GetThreadId(t)) + ":dr7=" + std::to_string((unsigned long long)v.Dr7) +
                            (set_ok ? "" : ":setfail=" + std::to_string(set_err));
     }
+    s->stepping.clear();
     {   // threads the debugger knows about but could not freeze
         std::unordered_set<DWORD> fz;
         for (HANDLE t : frozen) fz.insert(GetThreadId(t));
