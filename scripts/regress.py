@@ -12069,7 +12069,10 @@ def check_cx2_review():
             baseline = subprocess.run([str(st), "stray-baseline"], capture_output=True, text=True, timeout=25)
         except subprocess.TimeoutExpired as e:
             raise RuntimeError(f"stray fixture hangs WITHOUT UHH: stdout={e.stdout!r} stderr={e.stderr!r}") from e
-        if baseline.returncode != 0:
+        baseline_row = next((json.loads(l) for l in baseline.stdout.splitlines()
+                             if l.startswith('{"kind":"co"')), {})
+        if (baseline.returncode != 0 or baseline_row.get("seen") != 2 or baseline_row.get("seh") != 2
+                or baseline_row.get("bad") != 0 or baseline_row.get("watchdog_stopped") != 1):
             raise RuntimeError(f"stray fixture failed WITHOUT UHH: rc={baseline.returncode} "
                                f"stdout={baseline.stdout[-1500:]!r} stderr={baseline.stderr[-1500:]!r}")
         tgt = subprocess.Popen([str(st), "stray"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -12107,7 +12110,8 @@ def check_cx2_review():
                                f"stages={tout.lines[-8:]} target_err={terr.lines[-8:]}") from e
         terr.t.join(timeout=2)
         row = next((x for x in tout.objs() if x.get("kind") == "co"), {})
-        ok = tgt.returncode == 0 and row.get("seen") == 2 and row.get("bad") == 0 and row.get("debugger") == 0
+        ok = (tgt.returncode == 0 and row.get("seen") == 2 and row.get("seh") == 2
+              and row.get("bad") == 0 and row.get("watchdog_stopped") == 1 and row.get("debugger") == 0)
         record(name, ok, f"target_rc={tgt.returncode} row={row} target_err={terr.lines[-8:]} stages={tout.lines[-8:]}")
     except Exception as e:
         record(name, False, f"{e!r} target_out={tout.lines[-8:] if tout else []} "

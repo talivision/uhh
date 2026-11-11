@@ -3585,3 +3585,22 @@ and report the phase/counters on failure; a 25 s runner fallback kills/reaps the
 target and reports its last phases instead of a bare TimeoutExpired. Production
 guard code is unchanged. Static inspection / diff checks only; Windows x64 and
 WOW64 validation is pending the orchestrator.
+
+ctlkill stray-fixture x86 baseline follow-up (b26bea1): phase 5 with seen=2,
+bad=0 means one valid delivery for EACH of the two deliberate raises, not two
+reports for a single raise. The observed failure was the subsequent watchdog
+join. Moving only the synthetic inputs/sentinel to globals left successful
+execution using a manual RtlCaptureContext/NtContinue replay, with live caller
+locals (including watchdog handles) across that unsupported C++ continuation.
+The old unchecked SetEvent also hid whether signaling failed; CI did not record
+the handle values or wait result, so the precise clobbered state is unproven.
+
+Successful fixture delivery now goes through the program VEH (exactly one report
+per raise) followed by its __except handler, using the compiler-supported unwind
+path. It never replays the captured context on success. A consumed exception still
+replays capture and immediately fails with the persistent sentinel, preserving
+the post-controller-kill test of statusless program exception delivery. Require
+two VEH reports and two SEH catches in both baseline and guarded runs. Check
+SetEvent, the watchdog join result and exit code, and publish watchdog_stopped=1
+only after a successful join. No library changes. Diff checks only here; x64 and
+x86/WOW64 execution remains pending CI.

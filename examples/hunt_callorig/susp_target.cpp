@@ -225,7 +225,7 @@ static int run_watchdeath() {
 // Explicit software #DB at a historical data-watch address, on a thread that
 // completed a UHH TF step before death. NtRaiseException preserves our record's
 // address (RaiseException supplies its own PC). No payload or debug status.
-static volatile LONG g_stray_seen, g_stray_bad, g_stray_resumed, g_stray_before, g_stray_phase;
+static volatile LONG g_stray_seen, g_stray_bad, g_stray_resumed, g_stray_before, g_stray_phase, g_stray_seh;
 static void *g_stray_address;
 static CONTEXT g_stray_context;
 static EXCEPTION_RECORD g_stray_record;
@@ -256,7 +256,15 @@ static LONG CALLBACK stray_veh(EXCEPTION_POINTERS *ep) {
     }
     if (InterlockedIncrement(&g_stray_seen) != g_stray_before + 1)
         stray_abort("program #DB delivered repeatedly");
-    return EXCEPTION_CONTINUE_EXECUTION;
+    // Let our SEH handler finish delivery through the compiler's unwind path.
+    // Continuing the manually captured context replays ordinary C++ code outside
+    // the compiler's returns-twice model, including live caller locals on x86.
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+static LONG stray_filter(EXCEPTION_POINTERS *ep) {
+    return ep->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP &&
+        ep->ExceptionRecord->ExceptionAddress == g_stray_address ?
+        EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
 }
 static __declspec(noinline) bool stray_raise(void *address) {
     using RaiseFn = LONG (NTAPI *)(EXCEPTION_RECORD *, CONTEXT *, BOOLEAN);
@@ -264,25 +272,29 @@ static __declspec(noinline) bool stray_raise(void *address) {
     if (!raise) stray_abort("NtRaiseException unavailable");
     g_stray_address = address;
     g_stray_before = g_stray_seen;
-    // NtContinue resumes AFTER RtlCaptureContext. The compiler does not know this
-    // is a returns-twice operation: automatic locals (even a volatile sentinel)
-    // can have dead/reused stack slots by the time exception dispatch resumes it.
-    // Keep the sentinel AND both input buffers outside the rewound stack frame.
+    // A valid delivery exits via __except, never via a context rewind. Keep
+    // synthetic input and the swallowed-delivery sentinel out of the stack frame:
+    // if a guard consumes the exception, NtContinue resumes after capture below.
     InterlockedExchange(&g_stray_resumed, 0);
     memset(&g_stray_context, 0, sizeof(g_stray_context));
     memset(&g_stray_record, 0, sizeof(g_stray_record));
     g_stray_record.ExceptionCode = EXCEPTION_SINGLE_STEP;
     g_stray_record.ExceptionAddress = address;
-    RtlCaptureContext(&g_stray_context);
-    if (!InterlockedExchange(&g_stray_resumed, 1)) {
+    __try {
+        RtlCaptureContext(&g_stray_context);
+        if (InterlockedExchange(&g_stray_resumed, 1))
+            stray_abort("program #DB swallowed: captured context replayed instead of program SEH");
         g_stray_context.Dr0 = g_stray_context.Dr1 = g_stray_context.Dr2 =
             g_stray_context.Dr3 = g_stray_context.Dr6 = g_stray_context.Dr7 = 0;
         g_stray_context.EFlags &= ~0x100u;
         const LONG status = raise(&g_stray_record, &g_stray_context, TRUE);
         fprintf(stderr, "stray: NtRaiseException returned status=0x%08lx\n", (unsigned long)status);
-        stray_abort("NtRaiseException returned instead of resuming the context");
+        stray_abort("NtRaiseException returned instead of reaching program SEH");
+    } __except (stray_filter(GetExceptionInformation())) {
+        if (g_stray_seen != g_stray_before + 1)
+            stray_abort("program SEH did not receive exactly one program VEH delivery");
+        InterlockedIncrement(&g_stray_seh);
     }
-    if (g_stray_seen != g_stray_before + 1) stray_abort("program #DB swallowed: context resumed without program handler");
     return true;
 }
 static int run_stray(bool baseline = false) {
@@ -314,12 +326,24 @@ static int run_stray(bool baseline = false) {
     stray_stage(4);
     const bool b = stray_raise((void *)&co_add);
     stray_stage(5);
-    SetEvent(stop);
-    if (WaitForSingleObject(watchdog, 5000) != WAIT_OBJECT_0) stray_abort("watchdog did not stop");
+    if (!SetEvent(stop)) {
+        fprintf(stderr, "stray: SetEvent(stop=%p) failed error=%lu\n", stop, GetLastError());
+        stray_abort("cannot signal watchdog stop event");
+    }
+    const DWORD joined = WaitForSingleObject(watchdog, 5000);
+    if (joined != WAIT_OBJECT_0) {
+        const DWORD error = GetLastError();
+        fprintf(stderr, "stray: watchdog join result=0x%08lx error=%lu stop_state=0x%08lx\n",
+                joined, error, WaitForSingleObject(stop, 0));
+        stray_abort("watchdog did not stop");
+    }
+    DWORD watchdog_rc = 1;
+    if (!GetExitCodeThread(watchdog, &watchdog_rc) || watchdog_rc != 0)
+        stray_abort("watchdog exit code was not zero");
     CloseHandle(watchdog); CloseHandle(stop);
-    printf("{\"kind\":\"co\",\"case\":\"stray\",\"seen\":%ld,\"bad\":%ld,\"debugger\":%d}\n",
-           g_stray_seen, g_stray_bad, (int)dbg); fflush(stdout);
-    return a && b && result == 5 && !dbg && g_stray_seen == 2 && !g_stray_bad ? 0 : 5;
+    printf("{\"kind\":\"co\",\"case\":\"stray\",\"seen\":%ld,\"bad\":%ld,\"seh\":%ld,\"watchdog_stopped\":1,\"debugger\":%d}\n",
+           g_stray_seen, g_stray_bad, g_stray_seh, (int)dbg); fflush(stdout);
+    return a && b && result == 5 && !dbg && g_stray_seen == 2 && g_stray_seh == 2 && !g_stray_bad ? 0 : 5;
 }
 
 int main(int argc, char **argv) {
