@@ -7796,7 +7796,8 @@ def check_ctrl_warm():
       ctrl-warm-identity: (a) a copy named for this agent's size and write time but made from another
         build (the agent with one DOS-stub byte changed) must not be used; (b) a copy under this
         agent's full version stamp (volume, file id, size, write time, change time) that is not a
-        complete trimmed image of it (here: the untrimmed agent with that byte changed) is rejected
+        complete trimmed image of it (here: another image with matching PE fields and a valid
+        recomputed checksum, but a changed DOS-stub byte) is rejected
         and deleted; the first session makes a new copy (agent_copy_kind new) and works; a later
         session takes the genuine warm copy the first one left (agent_copy_kind warm: perf5's gain).
       ctrl-warm-acl: under a %TEMP% whose ACL lets Everyone write, no warm copy is made or taken
@@ -7848,6 +7849,14 @@ def check_ctrl_warm():
         try:
             tmp = base / "id"; warm = tmp / "uhh" / "warm"
             img = bytearray(Path(agent).read_bytes()); img[0x50] ^= 0x01
+            # A self-consistent checksum must not authenticate different source bytes.
+            nt = struct.unpack_from("<I", img, 0x3c)[0]
+            checksum_at = nt + 24 + 64       # OptionalHeader.CheckSum, PE32 and PE32+
+            struct.pack_into("<I", img, checksum_at, 0)
+            checksum = sum(x[0] for x in struct.iter_unpack("<H", img[:len(img) & ~1]))
+            if len(img) & 1: checksum += img[-1]
+            while checksum >> 16: checksum = (checksum & 0xffff) + (checksum >> 16)
+            struct.pack_into("<I", img, checksum_at, checksum + len(img))
             stale, corrupt = warm / f"{old_sig}-1-1-1", warm / f"{sig}-1-1-2"
             for d in (stale, corrupt):
                 d.mkdir(parents=True)
@@ -8993,6 +9002,12 @@ def check_session_agentipc():
                     alternate = exe("probe_api_agent_identity.dll")
                     if not alternate:
                         raise RuntimeError("missing project-built probe_api_agent_identity.dll")
+                    before, replacement = agent.read_bytes(), Path(alternate).read_bytes()
+                    def image_version(data):
+                        nt = struct.unpack_from("<I", data, 0x3c)[0]
+                        return struct.unpack_from("<HH", data, nt + 24 + 44)
+                    if before == replacement or image_version(before) == image_version(replacement):
+                        raise RuntimeError("identity fixture: alternate DLL must differ in contents and PE image version")
                     shutil.copy2(alternate, agent)
                     env = dict(case_env)
                     if case == "identity-loader":

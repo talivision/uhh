@@ -3182,6 +3182,17 @@ are implemented but await Windows x64/x86 rerun. Existing Detours checks are unc
   that read fails/crosses an unreadable page. `UHH_TEST_REUSE_TRACE` is enabled
   for shared/identity cases: scan candidates, PE magic/internal name/control
   exports, identification method, both PE identities and compared paths/results.
+  Follow-up to bcbcd0a: discovery and retained-file comparison worked, but the
+  controller had selected the original build for its own copy. The metadata-keyed
+  warm cache verified PE fields and the candidate's own checksum, not equality to
+  the current source. Takes now compare every byte to a freshly trimmed source
+  snapshot read under the metadata handle (deny-write). The key remains a lookup
+  hint; publication's metadata recheck cannot bypass this content check. One
+  sequential source read/trim per take preserves the pre-scanned-image benefit;
+  no new timings are claimed. `ctrl-warm-identity` plants changed bytes with valid
+  PE fields/checksum. The alternate DLL uses image version 1.1 versus default 0.0;
+  PE comparisons include that version, and the fixture checks the distinction.
+  Reuse trace now includes source path, signature and warm/new selection.
 - The shared fixture's write/read sites had identical `InterlockedIncrement` bodies and
   were eligible for MSVC /OPT:ICF folding, placing inline and breakpoint probes on one
   instruction. The writer now exchanges its argument into the sink; the fixture also

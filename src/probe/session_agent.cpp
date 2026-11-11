@@ -169,15 +169,16 @@ static bool trim_agent_image(std::vector<unsigned char> &img) {
 // write time and change time (NTFS moves the change time on every change to the file, and a
 // rebuilt file is a new file id; the old sig, size + write time, matched a different build with the
 // same size and time: regress ctrl-warm-identity). A taken copy must also be a complete, unaltered
-// trimmed image of that build: its PE header fields (TimeDateStamp, SizeOfImage, entry point,
-// sections) equal the source's and its PE checksum (written by write_trimmed_agent) matches its
-// bytes; anything else is deleted and a fresh copy made. Warm copies are made and taken only while
+// trimmed image of that build: compare all bytes against a freshly trimmed source snapshot,
+// not just PE fields and the copy's own checksum. Metadata can survive an in-place overwrite.
+// Anything else is deleted and a fresh copy made. Warm copies are made and taken only while
 // the uhh directory and its warm\ are private to this user (owner and DACL: nobody else can write
 // there -- e.g. a SYSTEM controller's C:\Windows\Temp, where Users may create directories, gets
 // none: regress ctrl-warm-acl). The verified copy stays open, deny-write, until the controller's
-// LoadLibrary of it is done. Cost (VM x64): ~1 ms per launch on top of perf5's take.
+// LoadLibrary of it is done. A hit reads/trims the source once and compares bytes;
+// it still avoids creating/scanning a new image file on the critical path.
 static constexpr unsigned WARM_KEEP = 2;
-struct AgentId { DWORD stamp = 0, size_of_image = 0, entry = 0; WORD sections = 0; };
+struct AgentId { DWORD stamp = 0, size_of_image = 0, entry = 0; WORD sections = 0, major = 0, minor = 0; };
 static bool image_id(const unsigned char *img, size_t n, AgentId &id, DWORD *checksum = nullptr, size_t *checksum_at = nullptr) {
     if (n < sizeof(IMAGE_DOS_HEADER)) return false;
     auto dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(img);
@@ -186,12 +187,14 @@ static bool image_id(const unsigned char *img, size_t n, AgentId &id, DWORD *che
     if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR_MAGIC) return false;
     id.stamp = nt->FileHeader.TimeDateStamp; id.size_of_image = nt->OptionalHeader.SizeOfImage;
     id.entry = nt->OptionalHeader.AddressOfEntryPoint; id.sections = nt->FileHeader.NumberOfSections;
+    id.major = nt->OptionalHeader.MajorImageVersion; id.minor = nt->OptionalHeader.MinorImageVersion;
     if (checksum) *checksum = nt->OptionalHeader.CheckSum;
     if (checksum_at) *checksum_at = (size_t)((const unsigned char *)&nt->OptionalHeader.CheckSum - img);
     return true;
 }
 static bool same_id(const AgentId &a, const AgentId &b) {
-    return a.stamp == b.stamp && a.size_of_image == b.size_of_image && a.entry == b.entry && a.sections == b.sections;
+    return a.stamp == b.stamp && a.size_of_image == b.size_of_image && a.entry == b.entry &&
+           a.sections == b.sections && a.major == b.major && a.minor == b.minor;
 }
 // The PE checksum (as CheckSumMappedFile, and as write_trimmed_agent computes it) of img; its
 // CheckSum field is zeroed first. A ones'-complement sum: folding once at the end gives the same
@@ -267,13 +270,20 @@ static bool dir_private(const std::wstring &path) {
     return ok;
 }
 // The source agent's version stamp (the warm copies' name) and its build identity (headers).
-static std::wstring agent_signature(const std::wstring &path, AgentId *id = nullptr) {
+static std::wstring agent_signature(const std::wstring &path, AgentId *id = nullptr,
+                                   std::vector<unsigned char> *source = nullptr) {
     HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) return {};
     BY_HANDLE_FILE_INFORMATION bi{}; FILE_BASIC_INFO basic{};
     unsigned char head[4096]; DWORD got = 0;
-    const bool ok = GetFileInformationByHandle(f, &bi) && GetFileInformationByHandleEx(f, FileBasicInfo, &basic, sizeof(basic)) &&
-                    (!id || (ReadFile(f, head, sizeof(head), &got, nullptr) && image_id(head, got, *id)));
+    bool ok = GetFileInformationByHandle(f, &bi) && GetFileInformationByHandleEx(f, FileBasicInfo, &basic, sizeof(basic));
+    if (ok && source) {
+        // One sequential read, under the same deny-write handle as the metadata.
+        ok = read_whole_file(f, *source) && (!id || image_id(source->data(), source->size(), *id));
+        if (ok) trim_agent_image(*source); // already trimmed/unsupported: keep the original bytes
+    } else if (ok && id) {
+        ok = ReadFile(f, head, sizeof(head), &got, nullptr) && image_id(head, got, *id);
+    }
     CloseHandle(f);
     if (!ok) return {};
     wchar_t sig[96];
@@ -296,7 +306,7 @@ static void remove_copy_dir(const std::wstring &d) {
 // content against `want`; `hold` is then the file, open deny-write (close it once loaded). A copy
 // that is not exactly ours is deleted (it is in our own directory by then). False: none.
 static bool take_warm_copy(const std::wstring &root, const std::wstring &sig, const std::wstring &dir,
-                           const AgentId &want, HANDLE &hold) {
+                           const AgentId &want, const std::vector<unsigned char> &source, HANDLE &hold) {
     const std::wstring warm = root + L"\\warm";
     hold = INVALID_HANDLE_VALUE;
     if (!dir_private(warm)) return false;
@@ -315,11 +325,15 @@ static bool take_warm_copy(const std::wstring &root, const std::wstring &sig, co
             // One link only: a hard link to a file elsewhere could be changed through its other name.
             if (GetFileInformationByHandle(f, &bi) && bi.nNumberOfLinks == 1 && !(bi.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
                 read_whole_file(f, img) && image_id(img.data(), img.size(), have, &sum, &sum_at) && same_id(have, want) &&
-                sum != 0 && pe_checksum(img, sum_at) == sum) {
+                img == source && sum != 0 && pe_checksum(img, sum_at) == sum) {
                 hold = f; got = true; break;
             }
             CloseHandle(f);
         }
+#if defined(UHH_TEST_HOOKS)
+        if (std::getenv("UHH_TEST_REUSE_TRACE"))
+            std::fprintf(stderr, "probe: test: reuse warm rejected path=%ls sig=%ls\n", dir.c_str(), sig.c_str());
+#endif
         bench_phase("agent_warm_rejected", nullptr);
         remove_copy_dir(dir);                              // not exactly ours (or an empty leftover)
         if (GetFileAttributesW(dir.c_str()) != INVALID_FILE_ATTRIBUTES) {   // could not delete it: out of the way
@@ -433,10 +447,21 @@ static void prepare_local_agent(probe_session *s) {
                 bench_phase("agent_copy", nullptr);
                 static const bool no_warm = std::getenv("UHH_BENCH_NO_WARM") != nullptr;   // bench knob, not API
                 AgentId want;
-                if (!no_warm && dir_private(root)) warm_sig = agent_signature(s->agent_path, &want);
+                std::vector<unsigned char> source;
+                if (!no_warm && dir_private(root)) warm_sig = agent_signature(s->agent_path, &want, &source);
+#if defined(UHH_TEST_HOOKS)
+                if (std::getenv("UHH_TEST_REUSE_TRACE"))
+                    std::fprintf(stderr, "probe: test: reuse source=%ls sig=%ls normalized_bytes=%zu\n",
+                                 s->agent_path.c_str(), warm_sig.c_str(), source.size());
+#endif
                 bench_phase("agent_copy_checked", nullptr);
                 warm_root = root; warm_src = s->agent_path;
-                const bool warm = !warm_sig.empty() && take_warm_copy(root, warm_sig, dir, want, warm_hold);
+                const bool warm = !warm_sig.empty() && take_warm_copy(root, warm_sig, dir, want, source, warm_hold);
+#if defined(UHH_TEST_HOOKS)
+                if (std::getenv("UHH_TEST_REUSE_TRACE"))
+                    std::fprintf(stderr, "probe: test: reuse source=%ls sig=%ls selected=%s copy=%ls\n",
+                                 warm_src.c_str(), warm_sig.c_str(), warm ? "content-verified warm" : "new", copy.c_str());
+#endif
                 bench_phase("agent_copy_kind", warm ? "warm" : "new");
                 if (warm || (CreateDirectoryW(dir.c_str(), nullptr) &&
                              (write_trimmed_agent(s->agent_path, copy) || CopyFileW(s->agent_path.c_str(), copy.c_str(), TRUE)))) {
@@ -643,10 +668,11 @@ bool reuse_target_agent(probe_session *s) {
         if (reuse_trace) {
             auto headers = [&](const char *which, uintptr_t base, const IMAGE_NT_HEADERS &nt) {
                 std::fprintf(stderr, "probe: test: reuse %s base=0x%llx via=%s magic=0x%x machine=0x%x "
-                             "stamp=0x%lx sections=%u size=0x%lx entry=0x%lx checksum=0x%lx\n",
+                             "stamp=0x%lx sections=%u size=0x%lx entry=0x%lx version=%u.%u checksum=0x%lx\n",
                              which, (unsigned long long)base, agent.how, nt.OptionalHeader.Magic,
                              nt.FileHeader.Machine, nt.FileHeader.TimeDateStamp, nt.FileHeader.NumberOfSections,
-                             nt.OptionalHeader.SizeOfImage, nt.OptionalHeader.AddressOfEntryPoint, nt.OptionalHeader.CheckSum);
+                             nt.OptionalHeader.SizeOfImage, nt.OptionalHeader.AddressOfEntryPoint,
+                             nt.OptionalHeader.MajorImageVersion, nt.OptionalHeader.MinorImageVersion, nt.OptionalHeader.CheckSum);
             };
             headers("target", agent.base, have_nt);
             headers("controller", reinterpret_cast<uintptr_t>(s->local_agent), *local_nt);
@@ -656,6 +682,8 @@ bool reuse_target_agent(probe_session *s) {
             have_nt.FileHeader.NumberOfSections == local_nt->FileHeader.NumberOfSections &&
             have_nt.OptionalHeader.SizeOfImage == local_nt->OptionalHeader.SizeOfImage &&
             have_nt.OptionalHeader.AddressOfEntryPoint == local_nt->OptionalHeader.AddressOfEntryPoint &&
+            have_nt.OptionalHeader.MajorImageVersion == local_nt->OptionalHeader.MajorImageVersion &&
+            have_nt.OptionalHeader.MinorImageVersion == local_nt->OptionalHeader.MinorImageVersion &&
             have_nt.OptionalHeader.CheckSum == local_nt->OptionalHeader.CheckSum;
         if (reuse_trace) std::fprintf(stderr, "probe: test: reuse headers %s\n", same ? "match" : "differ");
         if (!same) {

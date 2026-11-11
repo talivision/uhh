@@ -618,7 +618,9 @@ UHH_SHARED OpenRecord g_by_handle[kHandleSlots];   // examples/gated_config/call
   sessions never share. To keep that copy off the launch's critical path, a controller
   prepares the next session's copy in `%TEMP%\uhh\warm`; one is used only while `%TEMP%\uhh`
   is writable by this user alone (plus SYSTEM / Administrators) and only if it is exactly
-  this build's agent (version stamp, PE identity and checksum), else a fresh copy is made.
+  this build's agent (version stamp, PE identity, checksum, and exact byte comparison
+  against a freshly normalized source snapshot), else a fresh copy is made. The
+  metadata stamp alone never authenticates a warm copy.
 - A breakpoint/hw callback of a module with `UHH_SHARED` globals must be an export that the
   agent DLL also has (it is run from there): otherwise `callback uses UHH_SHARED state but
   is not a named export ...` or `UHH_SHARED callback '<name>' is not exported by the agent

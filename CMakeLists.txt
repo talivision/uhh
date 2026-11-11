@@ -237,6 +237,9 @@ foreach(prop INCLUDE_DIRECTORIES COMPILE_DEFINITIONS COMPILE_OPTIONS LINK_OPTION
     endif()
 endforeach()
 target_link_libraries(probe_api_agent_identity PRIVATE safetyhook)
+# Normal agent image version is the linker default 0.0. Make PE identity
+# distinct even when timestamps, entry points and rounded image sizes coincide.
+target_link_options(probe_api_agent_identity PRIVATE /VERSION:1.1)
 target_compile_options(probe_api_agent_identity PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
 target_compile_definitions(probe_api_agent_identity PRIVATE _CRT_SECURE_NO_WARNINGS)
 
