@@ -3173,6 +3173,15 @@ are implemented but await Windows x64/x86 rerun. Existing Detours checks are unc
   a reference. Mapped-file paths prefer their DOS drive spelling for reuse, and
   unknown-image diagnostics distinguish multiple agents, mapped-name failure, and
   controller/retained backing-file read failures. Windows revalidation pending.
+  Follow-up to 99fd403: keep normalized file comparison and the retained file's
+  shared section. Device-prefix conversion already checks drive aliases and a
+  following backslash; a failed mapped-file path now falls back to the module
+  snapshot path for the exact memory-identified base (warm image sections can
+  retain a pre-rename name). Shared round 3 forces a stale-path failure. The
+  40-byte export lookup keeps its fast read, with bounded byte reads only if
+  that read fails/crosses an unreadable page. `UHH_TEST_REUSE_TRACE` is enabled
+  for shared/identity cases: scan candidates, PE magic/internal name/control
+  exports, identification method, both PE identities and compared paths/results.
 - The shared fixture's write/read sites had identical `InterlockedIncrement` bodies and
   were eligible for MSVC /OPT:ICF folding, placing inline and breakpoint probes on one
   instruction. The writer now exchanges its argument into the sink; the fixture also

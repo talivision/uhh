@@ -502,25 +502,41 @@ bool reuse_target_agent(probe_session *s) {
                      "; restart the target before attaching");
         return false;
     };
+#if defined(UHH_TEST_HOOKS)
+    const bool reuse_trace = std::getenv("UHH_TEST_REUSE_TRACE") != nullptr;
+#else
+    const bool reuse_trace = false;
+#endif
     // Identify UHH from mapped PE exports, never from the loader list or filename.
     // Unreadable/unrelated images are not evidence of a retained agent.
-    struct Retained { uintptr_t base; IMAGE_NT_HEADERS nt; };
+    struct Retained { uintptr_t base; IMAGE_NT_HEADERS nt; const char *how; };
     std::vector<Retained> agents;
     for (uintptr_t at = 0; ; ) {
         MEMORY_BASIC_INFORMATION mbi{};
-        if (!VirtualQueryEx(s->pi.hProcess, reinterpret_cast<void *>(at), &mbi, sizeof(mbi))) break;
+        if (!VirtualQueryEx(s->pi.hProcess, reinterpret_cast<void *>(at), &mbi, sizeof(mbi))) {
+            if (reuse_trace) std::fprintf(stderr, "probe: test: reuse scan end at=0x%llx error=%lu\n",
+                                         (unsigned long long)at, GetLastError());
+            break;
+        }
         const uintptr_t next = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
         if (mbi.Type == MEM_IMAGE && mbi.BaseAddress == mbi.AllocationBase) {
             const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.AllocationBase);
             IMAGE_NT_HEADERS nt{};
+            const char *how = "headers";
+            DWORD export_names = 0;
+            char dll_name[64] = {};
             auto identify = [&]() {
                 uint64_t limit = 1u << 20; // bound header reads before SizeOfImage is known
                 auto read = [&](uint64_t rva, void *dst, size_t n) {
                     SIZE_T got = 0;
-                    return rva <= limit && n <= limit - rva && rva <= UINTPTR_MAX - base &&
+                    const bool ok = rva <= limit && n <= limit - rva && rva <= UINTPTR_MAX - base &&
                         n <= UINTPTR_MAX - base - rva &&
                         ReadProcessMemory(s->pi.hProcess, reinterpret_cast<void *>(base + (uintptr_t)rva),
                                           dst, n, &got) && got == n;
+                    if (!ok && reuse_trace) std::fprintf(stderr,
+                        "probe: test: reuse read failed base=0x%llx rva=0x%llx bytes=%zu got=%zu error=%lu\n",
+                        (unsigned long long)base, (unsigned long long)rva, n, (size_t)got, GetLastError());
+                    return ok;
                 };
                 IMAGE_DOS_HEADER dos{};
                 if (!read(0, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0 ||
@@ -539,12 +555,18 @@ bool reuse_target_agent(probe_session *s) {
                     }
                 }
 #endif
+                how = "export directory";
                 limit = nt.OptionalHeader.SizeOfImage;
                 if (!limit || limit > (256u << 20) ||
                     nt.OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXPORT) return false;
                 const auto &dir = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
                 IMAGE_EXPORT_DIRECTORY exp{};
                 if (!dir.VirtualAddress || !read(dir.VirtualAddress, &exp, sizeof(exp))) return false;
+                export_names = exp.NumberOfNames;
+                if (reuse_trace && exp.Name) {
+                    read(exp.Name, dll_name, sizeof(dll_name) - 1);
+                    dll_name[sizeof(dll_name) - 1] = 0;
+                }
                 auto named = [&](DWORD rva, const char *want) {
                     char name[64] = {};
                     const size_t n = strlen(want) + 1;
@@ -555,7 +577,10 @@ bool reuse_target_agent(probe_session *s) {
 #else
                 const bool no_dll_name = false;
 #endif
-                if (!no_dll_name && exp.Name && named(exp.Name, "probe_api_agent.dll")) return true;
+                if (!no_dll_name && exp.Name && named(exp.Name, "probe_api_agent.dll")) {
+                    how = "DLL name"; return true;
+                }
+                how = "control exports";
                 // Export names are sorted. The agent includes all callback exports
                 // (far more than 64), so search instead of capping the name count.
                 if (exp.NumberOfNames > limit / sizeof(DWORD)) return false;
@@ -571,24 +596,34 @@ bool reuse_target_agent(probe_session *s) {
                         unsigned char name[40] = {};       // longer than every name we look for
                         if (rva >= limit) return false;
                         const size_t len = (size_t)std::min<uint64_t>(sizeof(name), limit - rva);
-                        if (!read(rva, name, len)) return false;
+                        const bool bulk = read(rva, name, len);
                         int cmp = 0;
-                        size_t k = 0;
-                        for (; k < len; ++k) {             // strcmp; want's NUL ends it in time
-                            cmp = (int)name[k] - (unsigned char)want[k];
+                        for (size_t k = 0; ; ++k) {        // want's NUL ends it in time
+                            unsigned char ch = 0;
+                            if (bulk && k < len) ch = name[k];
+                            else if (!read((uint64_t)rva + k, &ch, 1)) return false;
+                            cmp = (int)ch - (unsigned char)want[k];
                             if (cmp || !want[k]) break;
                         }
-                        if (k == len) return false;        // name runs off the image: malformed
                         if (!cmp) return true;
                         if (cmp < 0) lo = mid + 1;
                         else hi = mid;
                     }
                     return false;
                 };
-                return exported("probe_agent_init") && exported("probe_agent_stop") &&
-                       exported("probe_agent_bind_controller");
+                const bool init = exported("probe_agent_init"), stop = exported("probe_agent_stop"),
+                           bind = exported("probe_agent_bind_controller");
+                if (reuse_trace) std::fprintf(stderr,
+                    "probe: test: reuse controls base=0x%llx init=%d stop=%d bind=%d\n",
+                    (unsigned long long)base, (int)init, (int)stop, (int)bind);
+                return init && stop && bind;
             };
-            if (identify()) agents.push_back({base, nt});
+            const bool identified = identify();
+            if (reuse_trace) std::fprintf(stderr,
+                "probe: test: reuse image base=0x%llx %s via=%s magic=0x%x machine=0x%x names=%lu DLL=%s\n",
+                (unsigned long long)base, identified ? "identified" : "skip", how,
+                nt.OptionalHeader.Magic, nt.FileHeader.Machine, export_names, dll_name);
+            if (identified) agents.push_back({base, nt, how});
         }
         if (next <= at) break;
         at = next;
@@ -605,12 +640,24 @@ bool reuse_target_agent(probe_session *s) {
         const auto *local_nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(
             reinterpret_cast<const unsigned char *>(s->local_agent) + local_dos->e_lfanew);
         const auto &have_nt = agent.nt;
+        if (reuse_trace) {
+            auto headers = [&](const char *which, uintptr_t base, const IMAGE_NT_HEADERS &nt) {
+                std::fprintf(stderr, "probe: test: reuse %s base=0x%llx via=%s magic=0x%x machine=0x%x "
+                             "stamp=0x%lx sections=%u size=0x%lx entry=0x%lx checksum=0x%lx\n",
+                             which, (unsigned long long)base, agent.how, nt.OptionalHeader.Magic,
+                             nt.FileHeader.Machine, nt.FileHeader.TimeDateStamp, nt.FileHeader.NumberOfSections,
+                             nt.OptionalHeader.SizeOfImage, nt.OptionalHeader.AddressOfEntryPoint, nt.OptionalHeader.CheckSum);
+            };
+            headers("target", agent.base, have_nt);
+            headers("controller", reinterpret_cast<uintptr_t>(s->local_agent), *local_nt);
+        }
         const bool same = have_nt.FileHeader.TimeDateStamp == local_nt->FileHeader.TimeDateStamp &&
             have_nt.FileHeader.Machine == local_nt->FileHeader.Machine &&
             have_nt.FileHeader.NumberOfSections == local_nt->FileHeader.NumberOfSections &&
             have_nt.OptionalHeader.SizeOfImage == local_nt->OptionalHeader.SizeOfImage &&
             have_nt.OptionalHeader.AddressOfEntryPoint == local_nt->OptionalHeader.AddressOfEntryPoint &&
             have_nt.OptionalHeader.CheckSum == local_nt->OptionalHeader.CheckSum;
+        if (reuse_trace) std::fprintf(stderr, "probe: test: reuse headers %s\n", same ? "match" : "differ");
         if (!same) {
             set_error(s, "retained inline agent differs from this build; restart the target before attaching"); return false;
         }
@@ -626,6 +673,7 @@ bool reuse_target_agent(probe_session *s) {
             n = K32GetMappedFileNameW(s->pi.hProcess, reinterpret_cast<void *>(agent.base), path,
                                      (DWORD)(sizeof(path) / sizeof(path[0])));
             if (!n || n >= sizeof(path) / sizeof(path[0])) return unknown(win_error("mapped agent filename").c_str());
+            if (reuse_trace) std::fprintf(stderr, "probe: test: reuse mapped path=%ls\n", path);
             file = L"\\\\?\\GLOBALROOT" + std::wstring(path, n);
             // Prefer the DOS spelling for the retained file (also used by the
             // loader). Keep GLOBALROOT only for volumes with no drive alias.
@@ -642,17 +690,53 @@ bool reuse_target_agent(probe_session *s) {
                 }
             }
         }
+#if defined(UHH_TEST_HOOKS)
+        if (std::getenv("UHH_TEST_REUSE_STALE_MAPPED_NAME")) file += L".missing";
+#endif
         auto read = [](const std::wstring &file, std::vector<unsigned char> &bytes) {
             HANDLE f = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
                                    nullptr, OPEN_EXISTING, 0, nullptr);
             if (f == INVALID_HANDLE_VALUE) return false;
-            const bool ok = read_whole_file(f, bytes); CloseHandle(f);
+            const bool ok = read_whole_file(f, bytes);
+            const DWORD error = GetLastError(); CloseHandle(f);
+            if (!ok) SetLastError(error);
             if (ok) trim_agent_image(bytes);
             return ok;
         };
         std::vector<unsigned char> want, have;
         if (!read(s->agent_path, want)) return unknown(win_error("read controller agent file").c_str());
-        if (!read(file, have)) return unknown(win_error("read retained agent file").c_str());
+        if (reuse_trace) std::fprintf(stderr, "probe: test: reuse files controller=%ls target=%ls\n",
+                                     s->agent_path.c_str(), file.c_str());
+        if (!read(file, have)) {
+            DWORD error = GetLastError();
+            if (reuse_trace) std::fprintf(stderr, "probe: test: reuse retained file read failed error=%lu\n", error);
+            // A warmed image section can retain its pre-rename filename. Find
+            // the current loader path for this exact, memory-identified base;
+            // this lookup cannot authorize fresh injection or select another DLL.
+            HANDLE snap = INVALID_HANDLE_VALUE;
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetProcessId(s->pi.hProcess));
+                if (snap != INVALID_HANDLE_VALUE || GetLastError() != ERROR_BAD_LENGTH) break;
+            }
+            bool recovered = false;
+            if (snap != INVALID_HANDLE_VALUE) {
+                MODULEENTRY32W entry{}; entry.dwSize = sizeof(entry);
+                if (Module32FirstW(snap, &entry)) do {
+                    if (reinterpret_cast<uintptr_t>(entry.modBaseAddr) != agent.base) continue;
+                    file = entry.szExePath;
+                    if (reuse_trace) std::fprintf(stderr, "probe: test: reuse snapshot path=%ls\n", file.c_str());
+                    recovered = read(file, have);
+                    if (!recovered) error = GetLastError();
+                    break;
+                } while (Module32NextW(snap, &entry));
+                CloseHandle(snap);
+            }
+            if (!recovered) {
+                SetLastError(error); return unknown(win_error("read retained agent file").c_str());
+            }
+        }
+        if (reuse_trace) std::fprintf(stderr, "probe: test: reuse normalized files %s controller=%ls target=%ls\n",
+                                     want == have ? "match" : "differ", s->agent_path.c_str(), file.c_str());
         if (want != have) {
             set_error(s, "retained inline agent differs from this build; restart the target before attaching"); return false;
         }

@@ -8946,10 +8946,14 @@ def check_session_agentipc():
                 shutil.copy2(BIN / "probe_api_agent.dll", tmp / "probe_api_agent.dll")
                 driver = tmp / d.name
 
+            case_env = dict(os.environ)
+            if case == "shared" or case.startswith("identity"):
+                case_env["UHH_TEST_REUSE_TRACE"] = "1"
+
             def attach(mode, cfg=1, env=None, active=1):
                 p = subprocess.Popen([str(driver), "--review-" + mode, str(pid), str(cfg)],
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                     text=True, cwd=BIN, env=dict(os.environ, **(env or {})))
+                                     text=True, cwd=BIN, env=dict(case_env, **(env or {})))
                 po, pe = Lines(p.stdout), Lines(p.stderr)
                 drivers.append((p, po, pe))
                 if not po.wait_for(lambda l: '"kind":"attached"' in l, 10):
@@ -8972,7 +8976,9 @@ def check_session_agentipc():
                 for n in range(1, 4 if case == "shared" else 2):
                     p, po, pe = attach("shared", 1 if n % 2 else 2, active=2,
                                        env={"UHH_TEST_REUSE_NO_MODULE_NAME": "1",
-                                            "UHH_TEST_REUSE_NO_EXPORT_DLL_NAME": "1"} if n > 1 else None)
+                                            "UHH_TEST_REUSE_NO_EXPORT_DLL_NAME": "1",
+                                            **({"UHH_TEST_REUSE_STALE_MAPPED_NAME": "1"} if n == 3 else {})}
+                                       if n > 1 else None)
                     hit(n)
                     if not po.wait_for(lambda l: l.startswith("{") and json.loads(l).get("message") == f"ar shared {n}", 10):
                         raise RuntimeError(f"shared value missing: {po.lines}")
@@ -8988,7 +8994,7 @@ def check_session_agentipc():
                     if not alternate:
                         raise RuntimeError("missing project-built probe_api_agent_identity.dll")
                     shutil.copy2(alternate, agent)
-                    env = dict(os.environ)
+                    env = dict(case_env)
                     if case == "identity-loader":
                         env["UHH_TEST_REUSE_NO_MODULE_NAME"] = "1"
                         env["UHH_TEST_REUSE_NO_EXPORT_DLL_NAME"] = "1"
