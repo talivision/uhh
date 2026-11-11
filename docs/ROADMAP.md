@@ -3352,3 +3352,22 @@ replying to the step event, with step membership retained or retired respectivel
 The existing cleanliness, progress, unhandled-exception and shutdown checks apply.
 Existing cx2-killwatch-reuse-hw covers target reuse of an orphaned hardware slot.
 Static review only here; x64/x86 Windows build and execution are pending CI.
+
+ctlkill CI follow-up (fe035b3): pending-step/held timed out on both architectures
+because the mixed fixture's ordinary NtClose breakpoint uses displaced_trampoline:
+the copy jumps back without TF, so no single-step completion event reaches the hook.
+The environment already reaches lifecycle_driver_th via LcDriver's Popen(env), and
+that executable links probe_api_testhooks. The knob now bypasses the no-TF trampoline
+for ordinary, non-internal, non-REP instructions once the attached guard is enabled.
+NtClose therefore executes the existing displaced TF-step path on x64 and x86;
+REP tail INT3, emulation and syscall trampoline paths are unchanged. Completion still
+requires no target hardware hit or program TF (including a restored POPF TF).
+
+Before terminating, the hook writes DR6=0 as well as the normal completed PC/TF
+context, retaining either step or held attribution with the debug event outstanding.
+The pre-ctlkill agent rejects this exception: hits=0 and BS=0 make both its hardware
+and step ownership predicates false, even if the tid is listed. It passes #DB to the
+lifecycle target, which reports an unhandled exception and dies; the regression
+requires survival, progress, clean state, no unhandled report, and clean shutdown.
+The runner requires the exact mode marker and exit 98, and includes recent stderr
+on a hook timeout. No Windows build or execution here; CI validation remains pending.

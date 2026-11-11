@@ -9986,9 +9986,10 @@ def lc_controller_killed(cfgname, cfg):
                          driver="lifecycle_driver_th.exe" if pending else "lifecycle_driver.exe",
                          env={"UHH_TEST_DIE_PENDING_STEP": when.split("-", 1)[1]} if pending else None)
             if pending:
-                marker = "probe: test: dying with statusless step outstanding"
+                marker = f"probe: test: dying with statusless step outstanding ({when.split('-', 1)[1]})"
                 if d.err.wait_for(lambda l: marker in l, 30) is None:
-                    raise RuntimeError("pending-step death hook not reached")
+                    raise RuntimeError(f"pending-step death hook not reached: rc={d.p.poll()} "
+                                       f"stderr={d.err.lines[-8:]}")
                 d.p.wait(timeout=30)
                 if d.p.returncode != 98:
                     bad.append(f"kill@{when}: hook exit={d.p.returncode}, want 98")
@@ -10026,7 +10027,8 @@ def lc_controller_killed(cfgname, cfg):
             time.sleep(1.0)
             c2 = tg.check()
             progressed = (c2.get("iterations") or 0) > (c.get("iterations") or 0)
-            if not lc_clean(c2, orphaned_dr=pe_is_x86(exe("lifecycle_target.exe"))) or not progressed:
+            if (not lc_clean(c2, orphaned_dr=pe_is_x86(exe("lifecycle_target.exe"))) or
+                    not progressed or (pending and tg.unhandled())):
                 bad.append(f"kill@{when}: progressed={progressed} {lc_brief(c2)} unhandled={tg.unhandled()}")
             first_susp = c.get("susp_info") if c.get("susp") else ""
             a = tg.quit()

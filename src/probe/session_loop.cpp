@@ -1409,8 +1409,13 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
 #if defined(UHH_TEST_HOOKS)
         const char *die_step = std::getenv("UHH_TEST_DIE_PENDING_STEP");
         const bool test_step = die_step && s->attached && s->shared && s->shared->guard.enabled &&
-            !target_hw && !step->second.prog_tf;
-        if (test_step) guard_sync(s); // publish before clearing BS/TF
+            !target_hw && !step->second.prog_tf && !(native.EFlags & 0x100u);
+        if (test_step) {
+            guard_sync(s); // publish before clearing BS/TF
+            // Make the old VEH's failure deterministic: neither B0..B3 nor BS
+            // can attribute this outstanding #DB after the context write.
+            native.Dr6 = 0;
+        }
 #endif
         if (ok) ok = !!SetThreadContext(thread, &native);
 
@@ -1561,7 +1566,17 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     // trampoline, which jumps back by itself (one event per hit, see displaced_trampoline).
     // Target-owned debug exceptions must arise at the real instruction, so their exception
     // address as well as their context remains the program's own.
-    if (probe->displaced_ok && !target_debug) {
+    bool force_pending_step = false;
+#if defined(UHH_TEST_HOOKS)
+    // lifecycle mixed's NtClose normally uses the no-TF trampoline, so there
+    // would be no completion #DB at which DIE_PENDING_STEP could terminate us.
+    // Force an ordinary instruction through the existing displaced TF step;
+    // leave REP's tail INT3 and program-owned debug state on their normal paths.
+    force_pending_step = std::getenv("UHH_TEST_DIE_PENDING_STEP") &&
+        s->attached && s->shared && s->shared->guard.enabled &&
+        !probe->internal && !probe->rep_string;
+#endif
+    if (probe->displaced_ok && !target_debug && !force_pending_step) {
         if (const uint64_t tr = displaced_trampoline(s, *probe)) {
             EMU_IP(native) = (decltype(EMU_IP(native)))tr;
             native.ContextFlags = CONTEXT_FULL;               // keep any DRs the callback armed
