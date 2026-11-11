@@ -9005,10 +9005,31 @@ def check_session_agentipc():
                     shutil.copy2(alternate, agent)
                     p = subprocess.Popen([str(driver), "--review-shared", str(pid), "1"], stdin=subprocess.PIPE,
                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=BIN)
-                    drivers.append((p, None, None))
-                    output, error = p.communicate("\n", timeout=20)
-                    if p.returncode == 0 or "retained inline agent differs" not in output + error:
-                        raise RuntimeError(f"different image was accepted: rc={p.returncode} {error}")
+                    po, pe = Lines(p.stdout), Lines(p.stderr)
+                    drivers.append((p, po, pe))
+                    # Do not feed the detach newline before asynchronous installs run.
+                    # A clean close with pending probes says nothing about identity.
+                    refusal = "retained inline agent differs"
+                    decision = pe.wait_for(lambda l: refusal in l or
+                                           sum(x.startswith("probe: active ") for x in pe.lines) >= 2, 10)
+                    if not decision:
+                        raise RuntimeError(f"identity fixture: no refusal or active probes; agent never came up "
+                                           f"or identity decision was not observed: rc={p.poll()} "
+                                           f"stdout={po.lines} stderr={pe.lines}")
+                    if not any(refusal in l for l in pe.lines):
+                        hit(2)
+                        if not po.wait_for(lambda l: l.startswith("{") and
+                                           json.loads(l).get("message") == "ar shared 2", 10):
+                            raise RuntimeError(f"identity fixture: probes active but no wrong-image callback hit: "
+                                               f"stdout={po.lines} stderr={pe.lines}")
+                        raise RuntimeError(f"different image was accepted: wrong-image callback hit; {pe.lines}")
+                    try:
+                        p.stdin.write("\n"); p.stdin.flush()   # a controller still waiting for detach
+                    except OSError:
+                        pass                                   # already gone after the refusal
+                    p.wait(timeout=20)
+                    if p.returncode == 0:
+                        raise RuntimeError("identity refusal reported but controller exited successfully")
                     hit(2)                         # still alive and executing its original code
             elif case == "unknown-image":
                 p, po, pe = attach("shared", env={"UHH_TEST_REUSE_UNKNOWN": "1"}, active=2)
