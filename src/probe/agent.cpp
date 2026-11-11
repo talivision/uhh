@@ -2969,6 +2969,68 @@ static DWORD orphan_dr_mask(const CONTEXT &c) {
     }
     return mask;
 }
+// Death-time receipts are agent-local and never reissued within a session. A consumed
+// tuple remains a tombstone, so concurrent cleanup/VEH clearing cannot grant it twice.
+// No locks: context APCs can interrupt a publisher. An in-progress hash collision or
+// a full table fails closed rather than waiting in an exception handler.
+struct ExecuteReceipt {
+    volatile LONG state;                 // 0 empty, -1 publishing, 1 available, 2 consumed
+    DWORD tid;
+    uint64_t created, address;
+};
+static ExecuteReceipt g_execute_receipts[PROBE_AGENT_GUARD_TIDS * 4];
+static volatile LONG g_test_death_receipt;   // UHH_TEST_DEATH_RECEIPT=1, read once at init (never in the VEH)
+static uint64_t thread_created(HANDLE t) {
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (!GetThreadTimes(t, &created, &exited, &kernel, &user)) return 0;
+    return ((uint64_t)created.dwHighDateTime << 32) | created.dwLowDateTime;
+}
+static ExecuteReceipt *execute_receipt(DWORD tid, uint64_t created, uint64_t address, bool publish) {
+    if (!created) return nullptr;
+    const size_t count = sizeof(g_execute_receipts) / sizeof(g_execute_receipts[0]);
+    const size_t hash = (size_t)((address >> 4) ^ created ^ tid) % count;
+    for (size_t i = 0; i < count; ++i) {
+        auto &r = g_execute_receipts[(hash + i) % count];
+        LONG state = InterlockedCompareExchange(&r.state, 0, 0);
+        if (!state && publish) {
+            state = InterlockedCompareExchange(&r.state, -1, 0);
+            if (!state) {
+                r.tid = tid; r.created = created; r.address = address;
+                InterlockedExchange(&r.state, 1);
+                return &r;
+            }
+        }
+        if (!state || state == -1) return nullptr;
+        if (r.tid == tid && r.created == created && r.address == address) return &r;
+    }
+    return nullptr;
+}
+static DWORD orphan_execute_mask(const CONTEXT &c, DWORD mask) {
+    const uint64_t address[4] = {c.Dr0, c.Dr1, c.Dr2, c.Dr3};
+    const auto &g = shared->guard;
+    const LONG n = g.execute_site_count;
+    if (n < 0 || n > (LONG)PROBE_AGENT_GUARD_DR_SITES) return 0;
+    DWORD execute = 0;
+    for (int slot = 0; slot < 4; ++slot) {
+        if (!(mask & (1u << slot)) || !((c.Dr7 >> (slot * 2)) & 3) ||
+            ((c.Dr7 >> (16 + slot * 4)) & 3)) continue;
+        for (LONG i = 0; i < n; ++i)
+            if (g.execute_sites[i] == address[slot]) { execute |= 1u << slot; break; }
+    }
+    return execute;
+}
+static void record_execute_receipts(HANDLE t, DWORD tid, const CONTEXT &c, DWORD mask) {
+    const DWORD execute = orphan_execute_mask(c, mask);
+    if (!execute) return;
+    const uint64_t created = thread_created(t);
+    const uint64_t address[4] = {c.Dr0, c.Dr1, c.Dr2, c.Dr3};
+    for (int slot = 0; slot < 4; ++slot)
+        if (execute & (1u << slot)) execute_receipt(tid, created, address[slot], true);
+}
+static bool consume_execute_receipt(DWORD tid, uint64_t at) {
+    auto *r = execute_receipt(tid, thread_created(GetCurrentThread()), at, false);
+    return r && InterlockedCompareExchange(&r->state, 2, 1) == 1;
+}
 // Change only our slots in the saved exception context. The VEH separately consumes
 // our exception status; foreign slots and all other state are preserved.
 static void clear_orphan_dr(CONTEXT &c, DWORD mask) {
@@ -2989,11 +3051,12 @@ static DWORD64 dr7_slot_bits(DWORD mask) {
         if (mask & (1u << slot)) bits |= ((DWORD64)3 << (slot * 2)) | ((DWORD64)0xF << (16 + slot * 4));
     return bits;
 }
-static void clear_thread_dr(HANDLE t) {
+static void clear_thread_dr(HANDLE t, DWORD tid) {
     CONTEXT before{}; before.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     if (!GetThreadContext(t, &before)) return;
     const DWORD mask = orphan_dr_mask(before);
     if (!mask) return;
+    record_execute_receipts(t, tid, before, mask);       // publish BEFORE erasing kernel status
     CONTEXT w = before; clear_orphan_dr(w, mask);
     if (!SetThreadContext(t, &w)) return;                       // failure: lazy VEH backstop
     CONTEXT after{}; after.ContextFlags = CONTEXT_DEBUG_REGISTERS;
@@ -3005,7 +3068,9 @@ static void clear_thread_dr(HANDLE t) {
     for (int slot = 0; slot < 4; ++slot) if (!(mask & (1u << slot)) && a0[slot] != a1[slot]) changed = true;
     if (!changed) return;
     // The thread edited its own DRs concurrently: write its current values back, ours cleared.
-    clear_orphan_dr(after, orphan_dr_mask(after) & mask);
+    const DWORD again = orphan_dr_mask(after) & mask;
+    record_execute_receipts(t, tid, after, again);
+    clear_orphan_dr(after, again);
     SetThreadContext(t, &after);
 }
 #endif
@@ -3125,7 +3190,23 @@ static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
     // Hardware traps carry no arguments. In particular, RaiseException(SINGLE_STEP)
     // with a program payload must not be consumed using stale thread ownership.
     if (ep->ExceptionRecord->NumberParameters) return EXCEPTION_CONTINUE_SEARCH;
-    const DWORD mask = orphan_dr_mask(*cx);
+    DWORD mask = orphan_dr_mask(*cx);
+    // Deterministic delivery-erasure test: a REAL orphan execute fault goes through
+    // the lazy clear, then presents the statusless image Windows can deliver after
+    // active cleanup. Both architectures exercise the same receipt-only decision.
+    DWORD test_enabled = 0;
+    for (int slot = 0; slot < 4; ++slot)
+        if ((cx->Dr7 >> (slot * 2)) & 3) test_enabled |= 1u << slot;
+    const bool test_receipt = g_test_death_receipt && no_debug_port() && !(cx->EFlags & 0x100u) &&
+        !(cx->Dr6 & 0xE000u) && ((cx->Dr6 & 0xF) & orphan_execute_mask(*cx, mask)) &&
+        !((cx->Dr6 & 0xF) & ~mask) && !(test_enabled & ~mask) &&
+        !orphan_claim(GetCurrentThreadId(), at);
+    if (test_receipt) {
+        record_execute_receipts(GetCurrentThread(), GetCurrentThreadId(), *cx, mask);
+        clear_orphan_dr(*cx, mask);
+        cx->Dr6 &= ~(decltype(cx->Dr6))mask;
+        mask = 0;
+    }
     const DWORD hits = (DWORD)cx->Dr6 & 0xF;
     const DWORD tid = GetCurrentThreadId();
     const bool stepping = tid_listed(g.step_tids, g.step_count, tid);
@@ -3143,8 +3224,10 @@ static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
     DWORD enabled = 0;
     for (int slot = 0; slot < 4; ++slot)
         if ((cx->Dr7 >> (slot * 2)) & 3) enabled |= 1u << slot;
-    const bool stray = !hits && !(cx->Dr6 & 0xE000u) && !(cx->EFlags & 0x100u) &&
-        !(enabled & ~mask) && claim && no_debug_port();
+    const bool statusless = !hits && !(cx->Dr6 & 0xE000u) && !(cx->EFlags & 0x100u) &&
+        !(enabled & ~mask) && no_debug_port();
+    const bool receipt = statusless && !claim && consume_execute_receipt(tid, at);
+    const bool stray = statusless && (claim || receipt);
     if (!(hits & mask) && !step && !stray) return EXCEPTION_CONTINUE_SEARCH;
     // A live controller consumes our traps before the VEH. This orphaned hit can precede
     // the service thread's death notification, even while the debug port is being torn down.
@@ -3153,8 +3236,18 @@ static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
     // Use the exception's saved status rather than querying the current thread again.
     // Data watchpoints report the address AFTER the access, so ownership comes from DR6,
     // not the exception IP. Leave foreign slots intact.
+    record_execute_receipts(GetCurrentThread(), tid, *cx, mask); // WOW64 lazy path, before clear
+    // This fault already has its ordinary attribution; do not leave a second credit.
+    if (!receipt && (claim || (hits & orphan_execute_mask(*cx, mask)))) consume_execute_receipt(tid, at);
     clear_orphan_dr(*cx, mask);
     cx->Dr6 &= ~(decltype(cx->Dr6))mask;
+    if (test_receipt && receipt) {
+        char marker[96];
+        const int n = _snprintf_s(marker, sizeof(marker), _TRUNCATE,
+                                  "{\"kind\":\"death_receipt\",\"tid\":%lu}\n", tid);
+        DWORD written = 0;
+        if (n > 0) WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), marker, (DWORD)n, &written, nullptr);
+    }
     if (scratch_step) set_ip(cx, resume);
     if (step) { cx->Dr6 &= ~(decltype(cx->Dr6))(1u << 14); cx->EFlags &= ~0x100u; }
     if (g_guard_wake) SetEvent(g_guard_wake);
@@ -3186,6 +3279,10 @@ static void guard_cleanup() {
     if (InterlockedExchange(&g_orphan_cleaned, 1)) return;
     auto &g = shared->guard;
     InterlockedExchange(&shared->controller_gone, 1);          // logs: nobody will read them
+    // Test-only: leave the execute slot armed for the target's post-kill cue.
+    char delay[16]{};
+    if (GetEnvironmentVariableA("UHH_TEST_GUARD_CLEAR_DELAY_MS", delay, sizeof(delay)))
+        Sleep((DWORD)strtoul(delay, nullptr, 10));
     LONG n = shared->int3_count;                                // every INT3 of ours: original byte back
     if (n < 0) n = 0;
     if (n > (LONG)PROBE_AGENT_INT3_CAP) n = PROBE_AGENT_INT3_CAP;
@@ -3215,7 +3312,7 @@ static void guard_cleanup() {
             HANDLE t = OpenThread(access, FALSE, te.th32ThreadID);
             if (!t) continue;
 #if defined(_WIN64)
-            if (mask) clear_thread_dr(t);       // the guard's own thread too: the controller armed it like any other
+            if (mask) clear_thread_dr(t, te.th32ThreadID);       // the guard's own thread too: the controller armed it like any other
 #endif
             // Only release recorded controller holds, once per entry.
             if (!pass && te.th32ThreadID != self) resume_holds(g, t, te.th32ThreadID);
@@ -3419,9 +3516,15 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *channel) {
     if (!guard_handler) guard_handler = AddVectoredExceptionHandler(1, guard_veh);
     if (!guard_handler) return 4;
     InterlockedExchange(&shared->debug_delivery_ready, 1);
+    {
+        char v[2]{};
+        InterlockedExchange(&g_test_death_receipt,
+                            GetEnvironmentVariableA("UHH_TEST_DEATH_RECEIPT", v, sizeof(v)) && v[0] == '1');
+    }
     InterlockedExchange(&g_orphan_cleaned, 0);   // a new session: guard it afresh
     InterlockedExchange(&g_lazy_dr, 0);
     for (auto &entry : g_orphan_bs_tids) InterlockedExchange(&entry, 0);
+    for (auto &r : g_execute_receipts) InterlockedExchange(&r.state, 0);
     if (g_guard_wake) SetEvent(g_guard_wake);    // the service thread takes the new controller handle
     InterlockedIncrement(&g_tblock_gen);   // a new (zeroed) channel: every thread claims a hit block again
     InterlockedExchange(&g_stopping, 0);   // a new session after a detach: callbacks run again

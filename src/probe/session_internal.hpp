@@ -381,6 +381,7 @@ struct probe_session {
     // Historical addresses for stale-event/cleanup recognition. Live ownership also
     // requires an active arm or an unsettled release on that thread (ROADMAP A7).
     std::unordered_set<uint64_t> hw_armed_ever;
+    std::unordered_set<uint64_t> hw_execute_ever;
     bool warned_dr_full = false;
     DWORD hw_stale_tid = 0;                    // the thread of the event being handled, if it was unsettled
     std::unordered_set<uint64_t> hw_stale;     // ...and the released addresses still ours on it

@@ -19,6 +19,7 @@
  *             trap flag of EVERY thread (a thread that could not be inspected and did not
  *             exit is counted in dr_unknown, never as clean), IsDebuggerPresent, whether
  *             probe_api_agent.dll is loaded, iteration/error/flip counts.
+ *   receipt-arm / receipt-fire -> deterministic controller-death execute receipt regression
  *   reset  -> zero the flip counter (after a detach, nothing may flip any more)
  *   lock N -> a thread holds the LOADER LOCK for N ms ({"kind":"locked"} once held): a tool's
  *             remote thread (agent load / init) cannot even start meanwhile
@@ -476,6 +477,18 @@ int main(int argc, char **argv) {
     while (fgets(line, sizeof(line), stdin)) {
         if (!strncmp(line, "check", 5)) check("check");
         else if (!strncmp(line, "reset", 5)) { InterlockedExchange(&g_flips, 0); printf("{\"kind\":\"reset\"}\n"); fflush(stdout); }
+        else if (!strncmp(line, "receipt-arm", 11)) {
+            /* Only this regression enables the agent's delivery-erasure test seam. */
+            SetEnvironmentVariableA("UHH_TEST_DEATH_RECEIPT", "1");
+            SetEnvironmentVariableA("UHH_TEST_GUARD_CLEAR_DELAY_MS", "2000");
+            printf("{\"kind\":\"receipt_arm\"}\n"); fflush(stdout);
+        }
+        else if (!strncmp(line, "receipt-fire", 12)) {
+            /* Main thread is already armed, and has never called this site while
+               attached: no dequeued-event claim can cover its post-kill fault. */
+            hunt_read();
+            printf("{\"kind\":\"receipt_fire\",\"tid\":%lu}\n", GetCurrentThreadId()); fflush(stdout);
+        }
         else if (!strncmp(line, "lock ", 5)) {
             HANDLE t = CreateThread(NULL, 0, hold_loader_lock, (void *)(ULONG_PTR)atol(line + 5), 0, NULL);
             if (t) CloseHandle(t);

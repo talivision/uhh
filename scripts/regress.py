@@ -10055,7 +10055,7 @@ def lc_controller_killed(cfgname, cfg):
         # pending-hw leaves production delivery repair pending at controller death:
         # no test-only dispatcher byte restore. The first agent VEH repairs saved
         # DR6 before the orphan guard claims the resulting statusless execute fault.
-        timings += ["pending-step", "pending-held", "pending-hw"]
+        timings += ["pending-step", "pending-held", "pending-hw", "death-receipt"]
     for when in timings:
         n += 1
         tg = d = None
@@ -10079,7 +10079,7 @@ def lc_controller_killed(cfgname, cfg):
                 d.p.wait(timeout=30)
                 if d.p.returncode != 98:
                     bad.append(f"kill@{when}: hook exit={d.p.returncode}, want 98")
-            elif when.startswith("active"):
+            elif when.startswith("active") or when == "death-receipt":
                 d.wait_attached(); d.wait_active(timeout=30)
                 d.wait_logs(200, timeout=10)
                 time.sleep(float(when.split("+")[1]) if "+" in when else 0.0)
@@ -10089,7 +10089,22 @@ def lc_controller_killed(cfgname, cfg):
                         bad.append(f"kill@{when}: agent module in a breakpoint/hw-only target: {lc_brief(c0)}")
             else:
                 time.sleep(float(when.split("-")[1]))
-            d.kill(); d.finish(timeout=30)
+            if when == "death-receipt":
+                tg._cmd("receipt-arm", "receipt_arm")
+            d.kill()
+            if when == "death-receipt":
+                # Wait for kernel detach before the armed main thread calls NtOpenProcess.
+                # The guard delays cleanup; the agent erases this real fault's saved
+                # status after lazy clearing. Requires receipt-only attribution on
+                # x64 AND x86, independent of kernel dispatch/cleanup scheduling.
+                d.p.wait(timeout=30)
+                fired = tg._cmd("receipt-fire", "receipt_fire")
+                main_tid = fired.get("tid")
+                if (not main_tid or tg.out.wait_for(
+                        lambda l: '"kind":"death_receipt"' in l and
+                        json.loads(l).get("tid") == main_tid, 10) is None):
+                    bad.append(f"kill@{when}: receipt-only path not reached")
+            d.finish(timeout=30)
             steps = [f"fin={time.time() - t0:.0f}"]
             time.sleep(3.0)                                    # the target runs on, alone
             c = tg.check()

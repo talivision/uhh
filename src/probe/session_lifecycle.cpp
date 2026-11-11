@@ -298,6 +298,17 @@ void guard_sync(probe_session *s) {
             g.dr_site_count = site_count + 1;
         }
     }
+    for (uint64_t address : s->hw_execute_ever) {
+        const LONG count = g.execute_site_count;
+        if (count < 0 || count > (LONG)PROBE_AGENT_GUARD_DR_SITES) continue;
+        bool found = false;
+        for (LONG i = 0; i < count; ++i) if (g.execute_sites[i] == address) found = true;
+        if (!found && count < (LONG)PROBE_AGENT_GUARD_DR_SITES) {
+            g.execute_sites[count] = address;
+            MemoryBarrier();
+            g.execute_site_count = count + 1;
+        }
+    }
     g.dr_mask = s->dr_ever | s->dr_used;          // incl. a call_original's return-catch slot
     MemoryBarrier();
     g.enabled = 1;

@@ -1127,6 +1127,9 @@ bool arm_gates_for_pending(probe_session *s) {
     for (size_t i = 0; i < sites.size(); ++i) {
         const int slot = slots[i];
         s->hw_armed_ever.insert(sites[i]);
+        s->hw_execute_ever.insert(sites[i]);
+        s->dr_ever |= (uint8_t)(1u << slot);
+        guard_sync(s);
         for (DWORD tid : s->threads) {
             HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, tid);
             GuardTouch touch(s, tid);

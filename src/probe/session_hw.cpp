@@ -221,6 +221,7 @@ bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
     const uint8_t ever_before = s->dr_ever;
     s->dr_ever |= (uint8_t)(1u << slot);
     s->hw_armed_ever.insert(address);
+    if (!rw) s->hw_execute_ever.insert(address);
     guard_sync(s);
     size_t tried = 0, set_ok = 0;
 #if defined(UHH_TEST_HOOKS)
