@@ -468,7 +468,7 @@ struct probe_session {
     std::unordered_map<DWORD, LateCall> call_late;
     // Data-watch hits held while a call is in flight (callbacks never overlap): the thread is
     // suspended right after the access, its callback replayed once no call is left.
-    struct WatchHeld { HANDLE thread = nullptr; DEBUG_EVENT ev{}; uhh_session::Probe *probes[4]{}; };
+    struct WatchHeld { bool reply_later = false; HANDLE thread = nullptr; DEBUG_EVENT ev{}; uhh_session::Probe *probes[4]{}; };
     std::vector<WatchHeld> watch_deferred;
     // call_original in flight (breakpoint/hw, see call_original): the probe address the call
     // starts at, the hit's SP, whether the breakpoint entry pass is still pending (the call's
@@ -479,6 +479,7 @@ struct probe_session {
     uint64_t co_addr = 0, co_sp = 0, co_ret = 0;
     uint64_t co_exc_sp = 0;                    // the SP of the last exception raised on the call's thread (co_unwound)
     bool co_entry_pending = false, co_left = false;
+    bool co_return_pending = false;           // RET completed; its debug exception is still being dispatched
     int co_borrowed_slot = -1;                 // a hw probe's own DR lent to the call_original thread's return catch
     bool co_warned_entry = false, co_warned_dr = false, co_warned_left = false, co_warned_nargs = false;
     bool initial_break = false;

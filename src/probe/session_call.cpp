@@ -17,9 +17,8 @@ namespace uhh_session {
 // the event, parks the fiber and returns to whichever loop resumed it; the callee's return
 // trap (or its fault, the 5 s timeout, the thread's or the process's end) resumes it.
 // Other threads' code-probe hits are held back meanwhile (callbacks never overlap, see
-// defer_hits_now); a hit that cannot be held back (a data watch, a thread mid-step) runs its
-// callback during the call on its own fiber -- its call_func parks too, and the calls finish
-// in any order. (The former single nested wait refused that call: it returned 0.)
+// defer_hits_now); completed data accesses wait in watch_deferred, including the
+// kernel event when target TF or a software step must be delivered afterwards.
 // Only one event is outstanding per process at any time: a fiber parks only after
 // continuing its own, and is resumed only at the event that ends its call.
 static void WINAPI event_fiber_main(void *p) {
@@ -105,8 +104,7 @@ bool thread_in_call(const probe_session *s, DWORD tid) {
 // Other threads' probe hits while a call_func or call_original is in flight are held back
 // (defer_hit_during_call) and replayed when no call is left: breakpoint/hw callbacks never
 // overlap (the documented contract), so a callback may hold a lock of its own across
-// call_func. Only a hit that cannot be replayed (a data watch, a thread mid-step) runs its
-// callback during the call -- on its own fiber, with its own call_func. The price, as
+// call_func. Data-watch events are held after their access. The price, as
 // before: a callee that waits for one of the held threads (a lock it holds at its probe
 // hit) waits for the 5 s timeout (documented; owner decision: no hardening).
 static void resume_deferred_hits(probe_session *s);
@@ -128,6 +126,14 @@ static void replay_held_watches(probe_session *s) {
     while (!s->watch_deferred.empty() && s->calls.empty() && !s->in_call_tid && !s->cur_fiber) {
         probe_session::WatchHeld h = s->watch_deferred.front();
         if (s->exited) { drop_held_watch(s, h); s->watch_deferred.erase(s->watch_deferred.begin()); CloseHandle(h.thread); continue; }
+        if (h.reply_later) {
+            // Keep the kernel event for a mixed target-TF trap. Replaying a saved
+            // callback after DBG_CONTINUE would lose the program's exception.
+            if (ResumeThread(h.thread) == (DWORD)-1) break;
+            s->watch_deferred.erase(s->watch_deferred.begin());
+            CloseHandle(h.thread); guard_resync(s);
+            continue;
+        }
 #if defined(UHH_TEST_HOOKS)
         static bool failed = false;
         const bool fail = !failed && std::getenv("UHH_TEST_WATCH_FIBER_FAIL");
@@ -267,7 +273,7 @@ void arm_restore_fixup(probe_session *s) {
 // frame whose slot was not reused yet): such a hit stays counted without a callback, as
 // before, until the thread is seen above, the slot changes, or the 5 s release.
 bool co_slot_gone(probe_session *s, uint64_t sp) {
-    if (!s->co_addr || !s->co_ret || sp >= s->co_sp) return false;
+    if (!s->co_addr || !s->co_ret || s->co_return_pending || sp >= s->co_sp) return false;
     const size_t w = sizeof(void *);
     uint64_t v = 0; size_t n = 0;
     if (!remote_read(s->pi.hProcess, s->co_sp, &v, w, &n) || n != w || v == s->co_ret) return false;
@@ -301,7 +307,7 @@ bool co_slot_gone(probe_session *s, uint64_t sp) {
 // original keeps its own). A walk that stops early decides nothing (inside, as before).
 static uint64_t thread_teb(HANDLE thread, const CONTEXT &ctx);
 bool co_unwound(probe_session *s, DWORD tid, const CONTEXT &at, uint64_t pc) {
-    if (!s->co_addr || !s->co_ret || !s->co_exc_sp || !s->sym_ready) return false;
+    if (!s->co_addr || !s->co_ret || s->co_return_pending || !s->co_exc_sp || !s->sym_ready) return false;
     CONTEXT w = at;
 #if defined(_WIN64)
     w.Rip = pc;
@@ -383,19 +389,23 @@ static void resume_deferred_hits(probe_session *s) {
 // has happened), but its callback can wait: the thread is held (suspended) right after the
 // access, its status bits kept for its event (dr6_lost: it has not run since), and the event
 // is handled again -- callback, call_func and all -- once no call is left (replay_held_watches).
-// Only a hit that is ours alone: every status bit one of our data watches (none of the
-// target's own slots, no execute probe sharing it).
+// Every B-bit must be one of our data watches (no target slots or execute probe).
+// With target BS or a software step, retain the kernel event with DBG_REPLY_LATER:
+// completing either the exception or StepState before replay would lose ordering.
 bool hold_watch_hit(probe_session *s, const DEBUG_EVENT &event, const CONTEXT &native, uint8_t theirs) {
     const DWORD64 fired = native.Dr6 & 0xF;
-    if (!fired || (fired & theirs) || (native.Dr6 & 0xE000u)) return false;
+    if (!fired || (fired & theirs) || (native.Dr6 & 0xA000u)) return false;
     probe_session::Dr6Lost saved{};
-    saved.regs = native; saved.bits = fired;
+    saved.regs = native; saved.bits = native.Dr6 & 0xE00Fu;
     probe_session::WatchHeld held; held.ev = event;
+    held.reply_later = (native.Dr6 & 0x4000u) != 0 || s->stepping.count(event.dwThreadId) != 0;
     for (int slot = 0; slot < 4; ++slot) {
         if (!(fired & (1u << slot))) continue;
         Probe *p = nullptr;
         for (auto &q : s->probes) if (q->active && (q->flags & PROBE_HW) && q->dr_slot == slot) { p = q.get(); break; }
         if (!p || p->internal || !(p->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW))) return false;
+        if (!(dr6_carried(s, event.dwThreadId) & (1u << slot)) &&
+            (dr_address(native, slot) != p->address || !((native.Dr7 >> (16 + slot * 4)) & 3u))) return false;
         // Replayed watches use the same ownership check as queued #DBs. Preserve the
         // identity at the access, including an older identity already carried here.
         const bool carried = (dr6_carried(s, event.dwThreadId) & (1u << slot)) != 0;
@@ -1130,7 +1140,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
     s->dr_ever |= (uint8_t)(1u << slot);                               // ours: detach / the guard clear it too
     s->in_call_tid = st->tid; s->co_addr = probe->address; s->co_sp = call_sp; s->co_ret = ret_addr; s->co_exc_sp = 0;
     s->co_borrowed_slot = borrowed ? slot : -1;
-    s->co_entry_pending = !(probe->flags & PROBE_HW); s->co_left = false;
+    s->co_entry_pending = !(probe->flags & PROBE_HW); s->co_left = false; s->co_return_pending = false;
     // Mirrored BEFORE the thread runs with it (the slot) -- and the thread off the guard's list
     // while it runs the original: a suspension of ours (the polls below) or its stop at the
     // return catch lists it for exactly that long.
@@ -1168,6 +1178,8 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
         CloseHandle(thread); return 0;
     }
     bool done = false, thread_gone = false;
+    Probe *return_breakpoint = nullptr;
+    bool return_int3 = false;
     const char *why = "the original left without returning (exception or longjmp)";
     uint64_t result = 0;
     ULONGLONG until = GetTickCount64() + 5000, next_poll = GetTickCount64() + 20;
@@ -1177,11 +1189,21 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
         if (WaitForDebugEvent(&ev, s->ctx_watch.empty() ? 20 : 1)) {
             if (continue_foreign_event(s, ev)) continue;
             if (ev.dwThreadId == st->tid && ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT &&
-                ev.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP &&
+                (ev.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP ||
+                 ev.u.Exception.ExceptionRecord.ExceptionCode == 0x4000001Eu ||
+                 (return_int3 && (ev.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_BREAKPOINT ||
+                                  ev.u.Exception.ExceptionRecord.ExceptionCode == 0x4000001Fu))) &&
                 (uint64_t)(uintptr_t)ev.u.Exception.ExceptionRecord.ExceptionAddress == ret_addr) {
                 guard_note_hold(s, st->tid);                               // stopped at its event: listed meanwhile
-                CONTEXT &r = st->post; r.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | UHH_CONTEXT_FP;
-                if (GetThreadContext(thread, &r)) {
+                CONTEXT &r = st->post; r.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | UHH_CONTEXT_FP | CONTEXT_DEBUG_REGISTERS;
+                const bool got_return = !!GetThreadContext(thread, &r);
+                const DWORD code = ev.u.Exception.ExceptionRecord.ExceptionCode;
+                const bool int3 = code == EXCEPTION_BREAKPOINT || code == 0x4000001Fu;
+                // A RET data-watch or the program's TF trap arrives at this same PC
+                // before our execute catch. Dispatch it normally; the catch comes later.
+                if (got_return && (int3 || ((r.Dr6 & ((DWORD64)1 << slot)) && !(r.Dr6 & (0xE00Fu & ~((DWORD64)1 << slot))) &&
+                    ((r.Dr7 >> (slot * 2)) & 3u) && dr_address(r, slot) == ret_addr && !((r.Dr7 >> (16 + slot * 4)) & 0xFu)))) {
+                    if (int3) EMU_IP(r) = (decltype(EMU_IP(r)))ret_addr;
 #if defined(_WIN64)
                     const uint64_t sp = r.Rsp, rax = r.Rax;
 #else
@@ -1198,11 +1220,38 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
 #endif
                         break;
                     }
-                    r.EFlags |= 0x10000u; SetThreadContext(thread, &r);    // some other return there: run on
+                    if (!int3) {
+                        r.EFlags |= 0x10000u; SetThreadContext(thread, &r); // some other return there: run on
+                        guard_resync(s);
+                        ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
+                        continue;
+                    } // a recursive INT3 is stepped normally below
                 }
-                guard_resync(s);                                           // runs on: off the guard's list
-                ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
-                continue;
+                if (got_return && !int3 && ev.u.Exception.dwFirstChance &&
+                    (uint64_t)EMU_SP(r) > s->co_sp && (uint64_t)EMU_SP(r) <= s->co_sp + ptr + 1024) {
+                    // RET has popped the slot. Exception dispatch may now reuse it:
+                    // that is not evidence of an unwind/longjmp out of the original.
+                    s->co_return_pending = true;
+                }
+                if (got_return && !int3 && s->co_return_pending && !return_int3 && ev.u.Exception.dwFirstChance) {
+                    // Exception continuation may set RF: an execute DR at this PC
+                    // need not fire again. INT3 catches the continuation even with RF.
+                    Probe *bp = nullptr;
+                    for (const auto &p : s->probes)
+                        if (p->active && (p->flags & PROBE_BREAKPOINT) && p->address == ret_addr) bp = p.get();
+                    if (!bp) {
+                        auto p = std::make_unique<Probe>();
+                        p->location = "<original-return>"; p->rva = ret_addr;
+                        p->flags = PROBE_BREAKPOINT; p->internal = true;
+                        p->callback = [](probe_context *) {};
+                        bp = p.get();
+                        { std::lock_guard<std::mutex> lock(s->probes_mu); s->probes.push_back(std::move(p)); }
+                        const std::string error = s->error;
+                        if (arm_breakpoint(s, *bp, 0)) return_breakpoint = bp;
+                        else { bp->retired = true; bp = nullptr; s->error = error; }
+                    }
+                    return_int3 = bp != nullptr;
+                }
             }
             if (ev.dwThreadId == st->tid && ev.dwDebugEventCode == EXIT_THREAD_DEBUG_EVENT) {
                 thread_gone = true; why = "the thread exited inside the original";
@@ -1249,7 +1298,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
                 // co_slot_gone reads two stack words of the running thread: the slot at co_sp only
                 // changes once the original's frame is gone (a thunk moving its return address down
                 // writes the copy first, and the copy is read after the slot).
-                if ((sp >= s->co_sp + ptr && pc != ret_addr) || co_slot_gone(s, sp)) {
+                if ((!s->co_return_pending && sp >= s->co_sp + ptr && pc != ret_addr) || co_slot_gone(s, sp)) {
                     s->co_left = true;
                 } else if (s->co_exc_sp && sp < s->co_exc_sp && s->sym_ready) {
                     // co_unwound walks the thread's stack: only on a stopped thread (frames that do not
@@ -1264,7 +1313,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
 #else
                             const uint64_t qsp = q.Esp, qpc = q.Eip;
 #endif
-                            if ((qsp >= s->co_sp + ptr && qpc != ret_addr) || co_slot_gone(s, qsp) ||
+                            if ((!s->co_return_pending && qsp >= s->co_sp + ptr && qpc != ret_addr) || co_slot_gone(s, qsp) ||
                                 co_unwound(s, st->tid, q, qpc))
                                 s->co_left = true;
                         }
@@ -1278,7 +1327,12 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
             s->co_left = true; why = "the original did not return within 5 s (released, it runs on)";
         }
     }
-    s->in_call_tid = 0; s->co_addr = 0; s->co_ret = 0; s->co_exc_sp = 0; s->co_entry_pending = false; s->co_left = false; s->co_borrowed_slot = -1;
+    if (return_breakpoint) {
+        if (!s->exited) restore_original(s->pi.hProcess, ret_addr, return_breakpoint->original);
+        return_breakpoint->active = false; return_breakpoint->retired = true;
+        s->retired_bps.insert(ret_addr); sync_int3_table(s);
+    }
+    s->in_call_tid = 0; s->co_addr = 0; s->co_ret = 0; s->co_exc_sp = 0; s->co_entry_pending = false; s->co_left = false; s->co_return_pending = false; s->co_borrowed_slot = -1;
     if (done) {
         CONTEXT cur{}; cur.ContextFlags = CONTEXT_DEBUG_REGISTERS;
         if (GetThreadContext(thread, &cur)) {          // keep any DR armed meanwhile, drop ours

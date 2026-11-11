@@ -934,6 +934,23 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     if (code == 0x4000001Eu /*STATUS_WX86_SINGLE_STEP*/) code = EXCEPTION_SINGLE_STEP;
     else if (code == 0x4000001Fu /*STATUS_WX86_BREAKPOINT*/) code = EXCEPTION_BREAKPOINT;
     disposition = DBG_EXCEPTION_NOT_HANDLED;
+    // Defer before completing a software step: replay must see both the watch
+    // and its original StepState, and must not enter another callback meanwhile.
+    if (code == EXCEPTION_SINGLE_STEP && (s->in_call_tid || !s->calls.empty()) &&
+        defer_hits_now(s, event.dwThreadId)) {
+        CONTEXT dr{}; dr.ContextFlags = CONTEXT_ALL;
+        HANDLE t = event_thread(s, event.dwThreadId);
+        if (t && GetThreadContext(t, &dr)) {
+            dr.Dr6 |= dr6_carried(s, event.dwThreadId);
+            uint8_t theirs = 0;
+            for (int k = 0; k < 4; ++k)
+                if (target_owns_slot(s, event.dwThreadId, dr, k)) theirs |= (uint8_t)(1u << k);
+            if (hold_watch_hit(s, event, dr, theirs)) {
+                disposition = s->watch_deferred.back().reply_later ? DBG_REPLY_LATER : DBG_CONTINUE;
+                return true;
+            }
+        }
+    }
     // A REP string instruction ran out-of-line to completion and reached the INT3 placed
     // after its copy: land on the instruction after the probe site (no trap flag was used).
     if (code == EXCEPTION_BREAKPOINT) {

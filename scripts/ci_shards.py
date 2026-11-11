@@ -56,7 +56,7 @@ EST = {
     "check_cx2_review": (30, 40),  # includes guarded death + DR0 reuse
     "check_conformance": (1, 1), "check_crash_logs": (7, 13), "check_ctrl_review": (12, 23), "check_ctrl_warm": (25, 25), "check_ctrl_symload": (3, 3), "check_ctrl_pack_oom": (10, 10),
     "check_ctrl_own_debug": (16, 16),
-    "check_session_r17_review": (12, 12),
+    "check_session_r17_review": (14, 14),
     "check_session_loop_review": (5, 7),
     "check_image_verdict_review": (2, 2),
     "check_ctrl_call_hw_review": (18, 20),
