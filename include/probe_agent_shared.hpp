@@ -13,7 +13,7 @@
 #include <intrin.h>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 35;   /* 35: saved debug-register delivery repair; 34: explicit orphan event claims; 33: agent debug-delivery repair; 32: guard DR address ownership; 31: inline install failure stage; 30: reusable channel epoch and target mapping handle; 29: init receives a per-session mapping handle (layout unchanged); 28: init_returns (x86hunt); 27: ring record's header and text start on one cache line, log_head on a line of its own (perf5); 26: tblock retired on a line of its own, drain wake-up (drain_wait); 25: per-thread hit blocks (tblocks); 24: huntaudit early_init (on top of 23: runfix1 log carry + running count; 21: held_floor) */
+constexpr uint32_t PROBE_AGENT_VERSION = 36;   /* 36: separate guard execute sites (exreceipt); 35: saved debug-register delivery repair; 34: explicit orphan event claims; 33: agent debug-delivery repair; 32: guard DR address ownership; 31: inline install failure stage; 30: reusable channel epoch and target mapping handle; 29: init receives a per-session mapping handle (layout unchanged); 28: init_returns (x86hunt); 27: ring record's header and text start on one cache line, log_head on a line of its own (perf5); 26: tblock retired on a line of its own, drain wake-up (drain_wait); 25: per-thread hit blocks (tblocks); 24: huntaudit early_init (on top of 23: runfix1 log carry + running count; 21: held_floor) */
 constexpr uint32_t PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH = 1u << 9;   /* agent side only needs this one */   /* == PROBE_UNSAFE_FAST_PATCH (asserted in session.cpp) */
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 128;   /* inline probes per session; the 129th is refused */
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
@@ -181,6 +181,8 @@ struct probe_agent_guard {
                                                           includes -- subtracted from a held_floor reading */
     volatile LONG dr_site_count;          /* published after addresses */
     uint64_t dr_sites[PROBE_AGENT_GUARD_DR_SITES]; /* addresses UHH actually armed */
+    volatile LONG execute_site_count;
+    uint64_t execute_sites[PROBE_AGENT_GUARD_DR_SITES]; /* excludes data watches */
 };
 constexpr uint32_t PROBE_AGENT_HOLD_OURS = 0xFFFFFFFFu;
 

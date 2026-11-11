@@ -19,6 +19,7 @@
  *             trap flag of EVERY thread (a thread that could not be inspected and did not
  *             exit is counted in dr_unknown, never as clean), IsDebuggerPresent, whether
  *             probe_api_agent.dll is loaded, iteration/error/flip counts.
+ *   receipt-arm / receipt-fire -> deterministic controller-death execute receipt regression
  *   reset  -> zero the flip counter (after a detach, nothing may flip any more)
  *   lock N -> a thread holds the LOADER LOCK for N ms ({"kind":"locked"} once held): a tool's
  *             remote thread (agent load / init) cannot even start meanwhile
@@ -60,6 +61,7 @@ static unsigned char *g_reuse;                 /* dllreuse: the executable range
 static SIZE_T g_reuse_len;
 static volatile LONG64 g_iters;
 static char g_first_error[160];
+static HANDLE g_receipt_ready, g_receipt_done; /* test-only cleanup/call handshake */
 static LONG g_slow_every = 0, g_slow_ms = 50, g_pace_ms = 0;
 
 static void error(const char *what) {
@@ -476,6 +478,29 @@ int main(int argc, char **argv) {
     while (fgets(line, sizeof(line), stdin)) {
         if (!strncmp(line, "check", 5)) check("check");
         else if (!strncmp(line, "reset", 5)) { InterlockedExchange(&g_flips, 0); printf("{\"kind\":\"reset\"}\n"); fflush(stdout); }
+        else if (!strncmp(line, "receipt-arm", 11)) {
+            /* Create the handshake BEFORE enabling the seam and acknowledging arm. */
+            wchar_t name[96];
+            _snwprintf_s(name, _countof(name), _TRUNCATE, L"Local\\UHHDeathReceiptReady.%lu", GetCurrentProcessId());
+            g_receipt_ready = CreateEventW(NULL, TRUE, FALSE, name);
+            _snwprintf_s(name, _countof(name), _TRUNCATE, L"Local\\UHHDeathReceiptDone.%lu", GetCurrentProcessId());
+            g_receipt_done = CreateEventW(NULL, TRUE, FALSE, name);
+            int armed = g_receipt_ready && g_receipt_done && SetEnvironmentVariableA("UHH_TEST_DEATH_RECEIPT", "1");
+            printf("{\"kind\":\"receipt_arm\",\"armed\":%d}\n", armed); fflush(stdout);
+        }
+        else if (!strncmp(line, "receipt-fire", 12)) {
+            /* Main thread is already armed, and has never called this site while
+               attached: no dequeued-event claim can cover its post-kill fault. */
+            /* The agent has cached the runtime knob and is holding active DR cleanup.
+               Its ordinary VEH clearing path also runs on x64 for this armed fault. */
+            int ready = g_receipt_ready && WaitForSingleObject(g_receipt_ready, 30000) == WAIT_OBJECT_0;
+            if (ready) hunt_read();
+            if (g_receipt_done) SetEvent(g_receipt_done);
+            printf("{\"kind\":\"receipt_fire\",\"tid\":%lu,\"ready\":%d}\n", GetCurrentThreadId(), ready); fflush(stdout);
+            if (g_receipt_ready) CloseHandle(g_receipt_ready);
+            if (g_receipt_done) CloseHandle(g_receipt_done);
+            g_receipt_ready = g_receipt_done = NULL;
+        }
         else if (!strncmp(line, "lock ", 5)) {
             HANDLE t = CreateThread(NULL, 0, hold_loader_lock, (void *)(ULONG_PTR)atol(line + 5), 0, NULL);
             if (t) CloseHandle(t);

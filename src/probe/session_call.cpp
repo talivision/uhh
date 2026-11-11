@@ -1124,6 +1124,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
         return 0;
     }
     s->hw_armed_ever.insert(ret_addr);
+    s->hw_execute_ever.insert(ret_addr);
     auto *dr = slot == 0 ? &w.Dr0 : slot == 1 ? &w.Dr1 : slot == 2 ? &w.Dr2 : &w.Dr3;   // DWORD64 / DWORD
     *dr = (std::remove_reference_t<decltype(*dr)>)ret_addr;
     w.Dr7 = (decltype(w.Dr7))((w.Dr7 & ~((DWORD64)0xF << (16 + slot * 4))) | ((DWORD64)1 << (slot * 2)));   // execute, local
