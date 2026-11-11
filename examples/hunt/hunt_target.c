@@ -96,9 +96,11 @@ static void diagnostic_modules(void) {
         fflush(stderr);
         return;
     }
-    MODULEENTRY32A m; memset(&m, 0, sizeof(m)); m.dwSize = sizeof(m);
-    for (BOOL more = Module32FirstA(snap, &m); more; more = Module32NextA(snap, &m)) {
-        printf("{\"kind\":\"target_module\",\"name\":"); json_string(m.szModule);
+    MODULEENTRY32W m; memset(&m, 0, sizeof(m)); m.dwSize = sizeof(m);
+    for (BOOL more = Module32FirstW(snap, &m); more; more = Module32NextW(snap, &m)) {
+        char name[MAX_MODULE_NAME32 * 3 + 1];   /* tlhelp32 has no ...A names: wide API, UTF-8 out */
+        if (!WideCharToMultiByte(CP_UTF8, 0, m.szModule, -1, name, (int)sizeof(name), NULL, NULL)) name[0] = 0;
+        printf("{\"kind\":\"target_module\",\"name\":"); json_string(name);
         printf(",\"base\":%llu,\"size\":%lu}\n", (unsigned long long)(ULONG_PTR)m.modBaseAddr, m.modBaseSize);
     }
     printf("{\"kind\":\"target_addresses\",\"pattern\":%llu,\"ntread\":%llu}\n",
