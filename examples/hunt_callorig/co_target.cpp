@@ -12,6 +12,7 @@
 #include <vector>
 #include <atomic>
 #include <algorithm>
+#include <intrin.h>
 #include "../review_fault.hpp"
 
 #define CO_EXPORT extern "C" __declspec(dllexport) __declspec(noinline)
@@ -45,7 +46,27 @@ CO_EXPORT intptr_t co_jump(jmp_buf *env, intptr_t x) {
     return x * 5;
 }
 CO_EXPORT intptr_t co_add(intptr_t a, intptr_t b) { g_body++; return a * 3 + b; }
+static bool g_return_tf = false;
+static void *g_tf_return = nullptr;
+static volatile LONG g_tf_returns = 0;
+static volatile LONG g_tf_bad = 0;
+static LONG CALLBACK return_tf_handler(EXCEPTION_POINTERS *e) {
+    if (!g_return_tf || e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP ||
+        !(e->ContextRecord->Dr6 & 0x4000u)) return EXCEPTION_CONTINUE_SEARCH;
+    if (e->ExceptionRecord->ExceptionAddress == g_tf_return) {
+        InterlockedIncrement(&g_tf_returns);
+        if (e->ContextRecord->Dr6 & 0xA00Fu) InterlockedIncrement(&g_tf_bad);
+        e->ContextRecord->EFlags &= ~0x100u;
+    }
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
 CO_EXPORT intptr_t co_ret(intptr_t a) { g_body++; return a + 11; }
+CO_EXPORT intptr_t co_rettf(intptr_t a) {
+    g_body++;
+    g_tf_return = _ReturnAddress();
+    __writeeflags(__readeflags() | 0x100u); // step through the epilogue and its real RET
+    return a + 11;
+}
 CO_EXPORT intptr_t co_args8(intptr_t a, intptr_t b, intptr_t c, intptr_t d, intptr_t e, intptr_t f,
                             intptr_t g, intptr_t h) {
     g_body++;
@@ -221,6 +242,10 @@ static int run_susp(bool gate) {
 
 int main(int argc, char **argv) {
     const char *k = argc > 1 ? argv[1] : "";
+    if (!strcmp(k, "rettf")) {
+        g_return_tf = true;
+        AddVectoredExceptionHandler(1, return_tf_handler);
+    }
     if (!strcmp(k, "retaddr")) {
         review_fault_tag = "co_retaddr_fault";
         AddVectoredExceptionHandler(1, review_fault_report);
@@ -301,6 +326,11 @@ int main(int argc, char **argv) {
         }
         printf("{\"kind\":\"co\",\"case\":\"conv\",\"fast\":%lld,\"fast_sp\":%d,\"this\":%lld,\"this_sp\":%d,\"args8\":%lld,\"body\":%ld}\n",
                (long long)fast, fast_sp, (long long)thisv, this_sp, (long long)args8, g_body.load());
+    } else if (!strcmp(k, "rettf")) {
+        for (int i = 0; i < 6; ++i) sum += co_rettf(i);
+        printf("{\"kind\":\"co\",\"case\":\"rettf\",\"sum\":%lld,\"body\":%ld,\"delivered\":%ld}\n",
+               (long long)sum, g_body.load(), (long)g_tf_returns);
+        if (g_tf_returns != 6 || g_tf_bad) return 5;
     } else if (!strcmp(k, "retaddr")) {
         for (int i = 0; i < 6; ++i) sum += co_ret(i);
         printf("{\"kind\":\"co\",\"case\":\"retaddr\",\"sum\":%lld,\"body\":%ld}\n", (long long)sum, g_body.load());

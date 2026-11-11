@@ -26,7 +26,7 @@
 CB(co_on_fact) CB(co_on_throw) CB(co_on_seh) CB(co_on_jump) CB(co_on_add) CB(co_on_outer) CB(co_on_slow)
 CB(co_on_after) CB(co_on_inner) CB(co_on_nargs) CB(co_on_fast) CB(co_on_this) CB(co_on_args8) CB(co_on_mid)
 CB(co_on_prologue) CB(co_on_ret) CB(co_on_vslow) CB(co_on_cbf) CB(co_on_late) CB(co_on_spin) CB(co_on_hold)
-CB(co_on_idle) CB(co_on_lazy) CB(co_on_innerco)
+CB(co_on_idle) CB(co_on_lazy) CB(co_on_innerco) CB(co_on_rettf)
 struct co_cfg { uint32_t backend; };
 struct co_bigcfg { uint32_t backend, n; unsigned char pat[1000]; };   // see co_callbacks.cpp
 
@@ -74,6 +74,7 @@ int main(int argc, char **argv) {
         ok = ok && add("CoThis", co_on_this, bk);
 #endif
     }
+    else if (k == "rettf") ok = add("co_rettf", co_on_rettf, bk);
     else if (k == "retaddr") ok = add("co_ret", co_on_ret, bk);
     else if (k == "prologue") ok = add("CoPrologue", co_on_prologue, bk);
     else if (k == "nested") ok = add("co_outer", co_on_outer, bk) && add("co_inner", co_on_inner, inner);

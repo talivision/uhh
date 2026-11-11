@@ -1682,7 +1682,7 @@ def check_portability():
 
 
 CO_CASES = ("recurse", "cppthrow", "seh", "longjmp", "threads", "mid", "nargs", "conv", "retaddr",
-            "prologue", "nested", "vslow")
+            "prologue", "nested", "vslow", "rettf")
 
 
 def co_expect(case, base, x86):
@@ -1713,6 +1713,8 @@ def co_expect(case, base, x86):
         if x86:
             row["this"] = base["this"] + 5
             hits["CoThis"] = 5; logs.update({"co this": 5, "co this-done": 5})
+    elif case == "rettf":
+        hits = {"co_rettf": 6}; logs = {"co rettf": 6, "co rettf-done": 6}
     elif case == "retaddr":
         hits = {"co_ret": 6}; logs = {"co ret": 6, "co ret-done": 6}
     elif case == "prologue":
@@ -1766,7 +1768,8 @@ def check_callorig_hunt():
     for case in CO_CASES + ("slow",):
         r, o = run([t, case], timeout=60)
         bases[case] = co_row(o)
-    runs = [(c, bk, bk) for c in CO_CASES for bk in ("breakpoint", "hw", "inline")]
+    runs = [(c, bk, bk) for c in CO_CASES for bk in ("breakpoint", "hw", "inline")
+            if c != "rettf" or bk != "inline"]
     runs += [("nested", a, b) for a, b in (("breakpoint", "inline"), ("inline", "breakpoint"), ("hw", "inline"))]
     for case, bk, inner in runs:
         name = f"callorig-hunt-{case}-{bk}" + (f"+{inner}" if inner != bk else "")

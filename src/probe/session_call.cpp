@@ -1154,12 +1154,21 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
         // program's own breakpoint in this slot while it ran.
         const bool ours = GetThreadContext(thread, &live) && dr_address(live, slot) == ret_addr &&
                           !((live.Dr7 >> (16 + slot * 4)) & 0xFu);
-        if (ours && borrowed) {                                        // the probe's own DR, back at its site
-            uint32_t rw = 0, len = 0; hw_rw_len(probe->flags, rw, len);
-            set_dr_on_thread(thread, slot, probe->address, probe->active, rw, len);
-        } else if (ours) {
-            clear_dr_on_thread(thread, slot, ret_addr);
+        if (ours) {
+            const DWORD64 mask = ((DWORD64)3 << (slot * 2)) | ((DWORD64)0xF << (16 + slot * 4));
+            live.Dr7 = (decltype(live.Dr7))((live.Dr7 & ~mask) | (saved.Dr7 & mask));
+            (slot == 0 ? live.Dr0 : slot == 1 ? live.Dr1 : slot == 2 ? live.Dr2 : live.Dr3) =
+                slot == 0 ? saved.Dr0 : slot == 1 ? saved.Dr1 : slot == 2 ? saved.Dr2 : saved.Dr3;
+            // An unload/release during the call must not resurrect a borrowed probe.
+            if (borrowed && !probe->active) live.Dr7 &= ~((decltype(live.Dr7))3 << (slot * 2));
+            live.Dr6 &= ~((decltype(live.Dr6))1 << slot);
+            SetThreadContext(thread, &live);
         }
+        // DR writes can queue status again; none of this catch may survive release.
+        s->dr6_lost.erase(st->tid);
+        if (s->dr6_carry_tid == st->tid) s->dr6_carry = 0;
+        if (s->shared) for (auto &claim : s->shared->guard.claims)
+            if ((DWORD)claim.tid == st->tid) InterlockedExchange(&claim.tid, 0);
         if (running) { ResumeThread(thread); guard_resync(s); }
     };
     EventFiber *const f = s->cur_fiber;
@@ -1218,22 +1227,20 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
                 // #DB's status and cleared live DR6. Recover it only if the integer
                 // registers, PC, SP and flags prove that the thread has not run.
                 if (got_return) r.Dr6 |= queued_dr6(s, st->tid, r);
-                // Other UHH execute probes at this PC are replayable when the callback
-                // resumes the caller. Never exempt a data watch, target DR, or BS/BD/BT.
-                const DWORD64 catch_bit = (DWORD64)1 << slot;
-                DWORD64 foreign = r.Dr6 & (0xE00Fu & ~catch_bit);
-                if (got_return) for (int k = 0; k < 4; ++k) {
-                    const DWORD64 bit = (DWORD64)1 << k;
-                    if (!(foreign & bit) || !((r.Dr7 >> (k * 2)) & 3u) ||
-                        dr_address(r, k) != ret_addr || ((r.Dr7 >> (16 + k * 4)) & 0xFu)) continue;
-                    for (const auto &p : s->probes)
-                        if (p->active && (p->flags & PROBE_HW) &&
-                            !(p->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) &&
-                            p->dr_slot == k && p->address == ret_addr) { foreign &= ~bit; break; }
-                }
-                if (got_return && (r.Dr6 & catch_bit) && !foreign &&
-                    ((r.Dr7 >> (slot * 2)) & 3u) && dr_address(r, slot) == ret_addr &&
-                    !((r.Dr7 >> (16 + slot * 4)) & 0xFu)) {
+                // Return identity is the thread, return PC and popped frame, never DR6.
+                // Status ownership determines delivery separately from call completion.
+                DWORD64 foreign = got_return ? r.Dr6 & 0xE000u : 0;
+                if (got_return) {
+                    const auto step = s->stepping.find(st->tid);
+                    if (step != s->stepping.end() && !step->second.tail_int3 && !step->second.prog_tf)
+                        foreign &= ~0x4000u;
+                    for (int k = 0; k < 4; ++k) {
+                        const bool catch_owned = k == slot && dr_address(r, k) == ret_addr &&
+                            !((r.Dr7 >> (16 + k * 4)) & 0xFu);
+                        if (!catch_owned && (target_owns_slot(s, st->tid, r, k) ||
+                            ((s->dr_used & (1u << k)) && !hw_slot_is_ours(s, st->tid, r, k))))
+                            foreign |= r.Dr6 & (1u << k);
+                    }
 #if defined(_WIN64)
                     const uint64_t sp = r.Rsp, rax = r.Rax;
 #else
@@ -1241,6 +1248,10 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
 #endif
                     if (sp > s->co_sp && sp <= s->co_sp + ptr + 1024) {   // x86 stdcall: ret N popped the args
                         s->dr6_lost.erase(st->tid);                        // this event consumed the saved status
+                        if (foreign) {
+                            CONTEXT delivery = r; delivery.Dr6 = (decltype(delivery.Dr6))foreign;
+                            s->co_delivery[st->tid] = delivery;
+                        }
                         result = rax; done = true;                         // this event now stands in for the hit
                         handling_running(s, st->tid, false);               // stopped there: listed (guard_sync)
                         st->have_post = true;
@@ -1251,6 +1262,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
 #endif
                         break;
                     }
+                    if (foreign) { service_event(s, ev); continue; }
                     r.EFlags |= 0x10000u; SetThreadContext(thread, &r); // some other return there: run on
                     s->dr6_lost.erase(st->tid);
                     guard_resync(s);

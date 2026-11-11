@@ -1741,6 +1741,22 @@ bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposition) {
         arm_thread_start_fixup(s);
     }
     inplace_sync(s, event);
+    const auto delivery = s->co_delivery.find(event.dwThreadId);
+    if (delivery != s->co_delivery.end()) {
+        // call_original retained a real return event, also owned by the program.
+        // Callback write-back is finished: deliver at the real return PC/SP rather
+        // than the entry or return gadget, with only the program's debug status.
+        HANDLE thread = event_thread(s, event.dwThreadId);
+        CONTEXT live{}; live.ContextFlags = CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS;
+        const CONTEXT returned = delivery->second;
+        s->co_delivery.erase(delivery);
+        if (!thread || !GetThreadContext(thread, &live)) return false;
+        EMU_IP(live) = EMU_IP(returned); EMU_SP(live) = EMU_SP(returned);
+        live.Dr6 = returned.Dr6;
+        if (!SetThreadContext(thread, &live) ||
+            !queue_debug_delivery(s, event.dwThreadId, (uint64_t)EMU_IP(returned), 0xE00Fu, returned.Dr6)) return false;
+        disposition = DBG_EXCEPTION_NOT_HANDLED;
+    }
     // The guard's mirror, after EVERYTHING this event changed (an in-place window's holds are
     // taken / handed over just above) and before the thread runs again. The event's thread
     // stays listed until its event is continued (service_event / fiber_step re-sync just

@@ -399,6 +399,8 @@ struct probe_session {
     // old data access into a hit on a replacement probe (even at the same address).
     struct Dr6Lost { CONTEXT regs{}; DWORD64 bits = 0; uint64_t address[4]{}; uint64_t generation[4]{}; };
     std::unordered_map<DWORD, Dr6Lost> dr6_lost;
+    // Mixed return #DB: finish the callback before passing the retained kernel event.
+    std::unordered_map<DWORD, CONTEXT> co_delivery;
     DWORD dr6_carry_tid = 0;
     DWORD64 dr6_carry = 0;
     uint64_t dr6_carry_address[4]{};

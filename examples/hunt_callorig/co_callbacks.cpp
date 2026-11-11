@@ -66,6 +66,7 @@ CO_CB void co_on_prologue(probe_context *c) { send_log(c, "co prologue"); return
 // A probe on the hit's return-to address, added from the first hit.
 static std::atomic<int> g_ret_added{0};
 CO_CB void co_on_retsite(probe_context *c) { send_log(c, "co retsite"); }
+CO_CB void co_on_rettf(probe_context *c) { wrap(c, "rettf", 1, 0, 0); }
 CO_CB void co_on_ret(probe_context *c) {
     if (!g_ret_added.exchange(1)) {
         uint64_t ret = 0;
