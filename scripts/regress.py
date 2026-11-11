@@ -11927,6 +11927,8 @@ def check_cx2_review():
         (x86: dormant until its hit), while foreign exceptions pass through.
       cx2-killwatch-reuse-hw: target reuses UHH's DR0 for an execute breakpoint after death;
         its exception must reach the target handler rather than being consumed as UHH's.
+      cx2-kill-stray-history: after a real UHH TF step and controller death, statusless
+        software #DBs at a historical data-watch address and the stepped site reach the program.
       touchprog / evsusp / cosusp / killwatch run co_driver --guard (a never-called inline
         probe beside the breakpoint/hw one): the agent and its guard exist only in sessions with an inline probe
         (owner decision 2026-11-07)."""
@@ -12055,6 +12057,48 @@ def check_cx2_review():
             for q in procs:
                 if q.poll() is None:
                     q.kill()
+
+    # Completed steps and historical data-watch addresses confer no orphan ownership.
+    name = "cx2-kill-stray-history"
+    procs = []
+    try:
+        if not st:
+            raise RuntimeError("missing susp_target.exe")
+        tgt = subprocess.Popen([str(st), "stray"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, text=True)
+        procs.append(tgt)
+        tout = Lines(tgt.stdout)
+        w = tout.wait_for(lambda l: '"kind":"waiting"' in l, 30)
+        if not w:
+            raise RuntimeError("stray target never reached gate")
+        att = subprocess.Popen([str(dth), "--backend", "breakpoint", "--guard", "--case", "stray",
+                                "--module", "susp_target.exe", "--attach", str(json.loads(w)["pid"])],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                               env=dict(os.environ, UHH_TEST_FORCE_GUARD_STEP="1"))
+        procs.append(att)
+        aerr = Lines(att.stderr)
+        for symbol in ("co_add", "co_watch_value"):
+            if not aerr.wait_for(lambda l: l.startswith("probe: active ") and symbol in l, 60):
+                raise RuntimeError(f"stray probe {symbol} inactive: {aerr.lines[-8:]}")
+        if any("guard unavailable" in l for l in aerr.lines):
+            raise RuntimeError("stray controller guard unavailable")
+        tgt.stdin.write("x"); tgt.stdin.flush()
+        if not tout.wait_for(lambda l: '"kind":"stepped"' in l, 30):
+            raise RuntimeError(f"stray step did not complete: {aerr.lines[-8:]}")
+        if not aerr.wait_for(lambda l: "guard step completed tid=" in l, 30):
+            raise RuntimeError(f"no real TF step: {aerr.lines[-8:]}")
+        att.kill(); att.wait(timeout=30)
+        tgt.stdin.write("x"); tgt.stdin.flush()
+        tgt.wait(timeout=60)
+        row = next((x for x in tout.objs() if x.get("kind") == "co"), {})
+        ok = tgt.returncode == 0 and row.get("seen") == 2 and row.get("bad") == 0 and row.get("debugger") == 0
+        record(name, ok, f"target_rc={tgt.returncode} row={row}")
+    except Exception as e:
+        record(name, False, repr(e))
+    finally:
+        for q in procs:
+            if q.poll() is None:
+                q.kill()
 
     def susp_after(case, bk):
         """susp_target evsusp / cosusp: the program suspends its worker right after the controller let

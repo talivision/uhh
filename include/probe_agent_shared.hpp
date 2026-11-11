@@ -13,7 +13,7 @@
 #include <intrin.h>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 33;   /* 33: agent debug-delivery repair; 32: guard DR address ownership; 31: inline install failure stage; 30: reusable channel epoch and target mapping handle; 29: init receives a per-session mapping handle (layout unchanged); 28: init_returns (x86hunt); 27: ring record's header and text start on one cache line, log_head on a line of its own (perf5); 26: tblock retired on a line of its own, drain wake-up (drain_wait); 25: per-thread hit blocks (tblocks); 24: huntaudit early_init (on top of 23: runfix1 log carry + running count; 21: held_floor) */
+constexpr uint32_t PROBE_AGENT_VERSION = 34;   /* 34: explicit orphan event claims; 33: agent debug-delivery repair; 32: guard DR address ownership; 31: inline install failure stage; 30: reusable channel epoch and target mapping handle; 29: init receives a per-session mapping handle (layout unchanged); 28: init_returns (x86hunt); 27: ring record's header and text start on one cache line, log_head on a line of its own (perf5); 26: tblock retired on a line of its own, drain wake-up (drain_wait); 25: per-thread hit blocks (tblocks); 24: huntaudit early_init (on top of 23: runfix1 log carry + running count; 21: held_floor) */
 constexpr uint32_t PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH = 1u << 9;   /* agent side only needs this one */   /* == PROBE_UNSAFE_FAST_PATCH (asserted in session.cpp) */
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 128;   /* inline probes per session; the 129th is refused */
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
@@ -148,6 +148,17 @@ struct probe_ipc_request {
 constexpr uint32_t PROBE_AGENT_GUARD_TIDS = 256;
 constexpr uint32_t PROBE_AGENT_GUARD_BLOCKS = 64;
 constexpr uint32_t PROBE_AGENT_GUARD_DR_SITES = 256;
+// Stable slots: payload, barrier, tid last; retire tid first. Never compact.
+constexpr uint32_t PROBE_AGENT_ORPHAN_CLAIMS = 256;
+enum : uint32_t {
+    PROBE_ORPHAN_STEP = 1, PROBE_ORPHAN_EXECUTE = 2,
+    PROBE_ORPHAN_SCRATCH = 3, PROBE_ORPHAN_WATCH = 4
+};
+struct probe_agent_orphan_claim {
+    volatile LONG tid;
+    uint32_t kind;
+    uint64_t created, address, resume;
+};
 struct probe_agent_guard {
     volatile LONG64 controller_process; /* handle IN THE TARGET (SYNCHRONIZE) to the controller; the agent takes it (-> 0) */
     volatile LONG enabled;              /* tables are live: a session is attached (0 after a clean detach) */
@@ -163,6 +174,7 @@ struct probe_agent_guard {
                                                           the thread's suspend count before a call that may
                                                           suspend it implicitly (x86 controller, GuardTouch):
                                                           resumed once only if its count is above that */
+    probe_agent_orphan_claim claims[PROBE_AGENT_ORPHAN_CLAIMS];
     volatile LONG service_tid;                         /* the agent's service thread (no one suspends it): its
                                                           suspend count as read by NtQueryInformationThread is
                                                           the debug freeze alone (0 / 1), which that count

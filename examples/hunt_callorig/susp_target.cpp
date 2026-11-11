@@ -222,8 +222,58 @@ static int run_watchdeath() {
     return 0;
 }
 
+// Explicit software #DB at a historical data-watch address, on a thread that
+// completed a UHH TF step before death. NtRaiseException preserves our record's
+// address (RaiseException supplies its own PC). No payload or debug status.
+static volatile LONG g_stray_seen, g_stray_bad;
+static void *g_stray_address;
+static LONG CALLBACK stray_veh(EXCEPTION_POINTERS *ep) {
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+    if (ep->ExceptionRecord->ExceptionAddress != g_stray_address ||
+        ep->ExceptionRecord->NumberParameters || (ep->ContextRecord->Dr6 & 0xE00Fu) ||
+        (ep->ContextRecord->EFlags & 0x100u)) InterlockedIncrement(&g_stray_bad);
+    InterlockedIncrement(&g_stray_seen);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+static bool stray_raise(void *address) {
+    using RaiseFn = LONG (NTAPI *)(EXCEPTION_RECORD *, CONTEXT *, BOOLEAN);
+    const auto raise = (RaiseFn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtRaiseException");
+    if (!raise) return false;
+    g_stray_address = address;
+    volatile LONG raised = 0;
+    CONTEXT cx{};
+    RtlCaptureContext(&cx);
+    if (!raised) {
+        raised = 1;
+        cx.Dr0 = cx.Dr1 = cx.Dr2 = cx.Dr3 = cx.Dr6 = cx.Dr7 = 0;
+        cx.EFlags &= ~0x100u;
+        EXCEPTION_RECORD er{};
+        er.ExceptionCode = EXCEPTION_SINGLE_STEP; er.ExceptionAddress = address;
+        raise(&er, &cx, TRUE);
+        return false; // a successful delivery resumes the captured context above
+    }
+    return true;
+}
+static int run_stray() {
+    if (!AddVectoredExceptionHandler(1, stray_veh)) return 4;
+    printf("{\"kind\":\"waiting\",\"pid\":%lu}\n", GetCurrentProcessId()); fflush(stdout);
+    if (!read_gate()) return 3;
+    const intptr_t result = co_add(1, 2); // same thread as both later software exceptions
+    printf("{\"kind\":\"stepped\",\"result\":%lld}\n", (long long)result); fflush(stdout);
+    if (!read_gate()) return 3; // orchestrator kills the controller before this gate
+    BOOL dbg = TRUE;
+    for (int i = 0; i < 3000 && CheckRemoteDebuggerPresent(GetCurrentProcess(), &dbg) && dbg; ++i) Sleep(10);
+    Sleep(1500);
+    const bool a = stray_raise((void *)&co_watch_value);
+    const bool b = stray_raise((void *)&co_add);
+    printf("{\"kind\":\"co\",\"case\":\"stray\",\"seen\":%ld,\"bad\":%ld,\"debugger\":%d}\n",
+           g_stray_seen, g_stray_bad, (int)dbg); fflush(stdout);
+    return a && b && result == 5 && !dbg && g_stray_seen == 2 && !g_stray_bad ? 0 : 5;
+}
+
 int main(int argc, char **argv) {
     const char *k = argc > 1 ? argv[1] : "";
+    if (!strcmp(k, "stray")) return run_stray();
     if (!strcmp(k, "watchdeath") || !strcmp(k, "watchreuse")) {
         g_watch_reuse = !strcmp(k, "watchreuse");
         return run_watchdeath();

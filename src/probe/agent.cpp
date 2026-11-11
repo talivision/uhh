@@ -2930,7 +2930,7 @@ static NtQipFn g_ntqip;
 static HANDLE g_guard_wake;           // auto-reset: re-check (new session / a trap was taken)
 static HANDLE g_ctl;                  // the controller process (owned here once taken)
 static volatile LONG g_orphan_cleaned;
-static volatile LONG g_stray_tids[PROBE_AGENT_GUARD_TIDS]; // one statusless orphan trap per thread
+static volatile LONG g_orphan_bs_tids[PROBE_AGENT_GUARD_TIDS]; // existing one-shot BS attribution per thread
 static volatile LONG g_lazy_dr;        // orphaned DRs are cleared by their own thread's VEH
 static bool no_debug_port() {         // nobody is debugging us (any more)
     ULONG_PTR port = 1;
@@ -3045,44 +3045,35 @@ static LONG tid_count(const uint32_t *list, LONG count, DWORD tid) {
     return n;
 }
 static bool tid_listed(const uint32_t *list, LONG count, DWORD tid) { return tid_count(list, count, tid) != 0; }
-// Context writes or debugger teardown can erase BS/B0..B3 after #DB was raised.
-// A frozen ownership table must not become a permanent exception exemption.
-static bool claim_stray_step(DWORD tid) {
-    for (auto &entry : g_stray_tids) {
+// Limit the existing listed-step BS path to one orphan completion per thread.
+static bool claim_orphan_bs(DWORD tid) {
+    for (auto &entry : g_orphan_bs_tids) {
         const LONG before = InterlockedCompareExchange(&entry, (LONG)tid, 0);
         if ((DWORD)before == tid) return false;
         if (!before) return true;
     }
     return false;
 }
-// A displaced TF copy ends at a jump back, within its controller-owned 64-byte
-// slot. Validate both the block and the original INT3 site before trusting it.
-// This survives StepState retirement: Windows may dispatch the trap-time context,
-// ignoring the completed PC written by the controller before it died.
-static uint64_t orphan_scratch_resume(uint64_t at) {
-    const auto &g = shared->guard;
-    const uint64_t len = at & 63u;
-    if (!len || len > 15) return 0;
-    bool owned = false;
-    const LONG n = g.block_count;
-    if (n < 0 || n > (LONG)PROBE_AGENT_GUARD_BLOCKS) return 0;
-    for (LONG i = 0; i < n; ++i)
-        if (g.blocks[i] && at - g.blocks[i] < 0x10000) { owned = true; break; }
-    if (!owned) return 0;
-    uint64_t back = 0;
-    __try {
-        const unsigned char *p = (const unsigned char *)(uintptr_t)at;
-#if defined(_WIN64)
-        if (p[0] != 0xFF || p[1] != 0x25 || p[2] || p[3] || p[4] || p[5]) return 0;
-        std::memcpy(&back, p + 6, sizeof(back));
-#else
-        if (p[0] != 0xE9) return 0;
-        int32_t rel = 0; std::memcpy(&rel, p + 1, sizeof(rel));
-        back = (uint32_t)(at + 5 + rel);
-#endif
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
-    unsigned char original = 0;
-    return back >= len && int3_original(back - len, original) ? back : 0;
+// The event receipt identifies a thread lifetime, never frozen membership/history.
+// The controller cannot run concurrently once the debug port is gone; acquire tid
+// before reading its immutable payload, and consume tid before applying the action.
+static probe_agent_orphan_claim *orphan_claim(DWORD tid, uint64_t at) {
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) return nullptr;
+    const uint64_t lifetime = ((uint64_t)created.dwHighDateTime << 32) | created.dwLowDateTime;
+    for (auto &c : shared->guard.claims) {
+        if ((DWORD)InterlockedCompareExchange(&c.tid, 0, 0) != tid) continue;
+        if (c.created != lifetime || c.address != at) continue;
+        switch (c.kind) {
+        case PROBE_ORPHAN_STEP: case PROBE_ORPHAN_EXECUTE: case PROBE_ORPHAN_WATCH:
+            if (!c.resume) return &c;
+            break;
+        case PROBE_ORPHAN_SCRATCH:
+            if (c.resume) return &c;
+            break;
+        }
+    }
+    return nullptr;
 }
 // Repair Windows' saved image before either the orphan guard or target handlers see it.
 // A forwarded combined #DB is also the target's exception: do not consume it here.
@@ -3138,9 +3129,9 @@ static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
     const DWORD hits = (DWORD)cx->Dr6 & 0xF;
     const DWORD tid = GetCurrentThreadId();
     const bool stepping = tid_listed(g.step_tids, g.step_count, tid);
-    const bool held = tid_listed(g.held_tids, g.held_count, tid);
-    const uint64_t resume = orphan_scratch_resume(at);
-    const bool scratch_step = resume && (stepping || held);
+    auto *claim = orphan_claim(tid, at);
+    const bool scratch_step = claim && claim->kind == PROBE_ORPHAN_SCRATCH;
+    const uint64_t resume = scratch_step ? claim->resume : 0;
     const bool step = (cx->Dr6 & (1u << 14)) && (stepping || scratch_step);
     // Foreign B bits always win, including a slot UHH never armed or one whose
     // address the program has replaced. BD/BT and unowned BS also pass through.
@@ -3148,26 +3139,16 @@ static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
         return EXCEPTION_CONTINUE_SEARCH;
     // Retire BS attribution too: the frozen step table cannot exempt a later
     // program single-step on this same thread after our orphan was completed.
-    if (step && !claim_stray_step(tid)) return EXCEPTION_CONTINUE_SEARCH;
+    if (step && !claim_orphan_bs(tid)) return EXCEPTION_CONTINUE_SEARCH;
     DWORD enabled = 0;
     for (int slot = 0; slot < 4; ++slot)
         if ((cx->Dr7 >> (slot * 2)) & 3) enabled |= 1u << slot;
-    unsigned char original = 0;
-    const bool held_site = held && int3_original(at, original);
-    bool execute_site = false;
-    const LONG site_count = g.dr_site_count;
-    if (site_count >= 0 && site_count <= (LONG)PROBE_AGENT_GUARD_DR_SITES)
-        for (LONG i = 0; i < site_count; ++i)
-            if (g.dr_sites[i] == at) { execute_site = true; break; }
-    // An execute DR faults AT its site, unlike a data watch (which traps after
-    // the access). Teardown may erase every register bit before delivery. The
-    // published address then attributes the fault even without a step/hold.
     const bool stray = !hits && !(cx->Dr6 & 0xE000u) && !(cx->EFlags & 0x100u) &&
-        !(enabled & ~mask) && (stepping || scratch_step || held_site || execute_site) &&
-        no_debug_port() && claim_stray_step(tid);
+        !(enabled & ~mask) && claim && no_debug_port();
     if (!(hits & mask) && !step && !stray) return EXCEPTION_CONTINUE_SEARCH;
     // A live controller consumes our traps before the VEH. This orphaned hit can precede
     // the service thread's death notification, even while the debug port is being torn down.
+    if (claim) InterlockedExchange(&claim->tid, 0);
     if (!g_lazy_dr) InterlockedExchange(&g_lazy_dr, 1);
     // Use the exception's saved status rather than querying the current thread again.
     // Data watchpoints report the address AFTER the access, so ownership comes from DR6,
@@ -3440,7 +3421,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *channel) {
     InterlockedExchange(&shared->debug_delivery_ready, 1);
     InterlockedExchange(&g_orphan_cleaned, 0);   // a new session: guard it afresh
     InterlockedExchange(&g_lazy_dr, 0);
-    for (auto &entry : g_stray_tids) InterlockedExchange(&entry, 0);
+    for (auto &entry : g_orphan_bs_tids) InterlockedExchange(&entry, 0);
     if (g_guard_wake) SetEvent(g_guard_wake);    // the service thread takes the new controller handle
     InterlockedIncrement(&g_tblock_gen);   // a new (zeroed) channel: every thread claims a hit block again
     InterlockedExchange(&g_stopping, 0);   // a new session after a detach: callbacks run again

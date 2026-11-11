@@ -1263,7 +1263,7 @@ bool confirm_runtime_inline(probe_session *s, Probe &p) {
             set_error(s, win_error("hold runtime inline caller")); return false;
         }
         f->resume_after = t; f->stop_suspended = true;
-        if (!ContinueDebugEvent(f->ev.dwProcessId, f->ev.dwThreadId, DBG_CONTINUE)) {
+        if (!guard_continue(s, f->ev.dwProcessId, f->ev.dwThreadId, DBG_CONTINUE)) {
             const std::string why = win_error("continue runtime inline add");
             ResumeThread(t); CloseHandle(t); f->resume_after = nullptr; f->stop_suspended = false;
             set_error(s, why); return false;

@@ -795,6 +795,8 @@ int call_func_args(probe_context *c, const char *symbol, uint64_t *ret, int narg
 bool guard_pending(const probe_session *s);
 void guard_note_hold(probe_session *s, DWORD tid);
 bool guard_set_ready(probe_session *s, const char *why);
+bool guard_claim_event(probe_session *s, const DEBUG_EVENT &event);
+bool guard_continue(probe_session *s, DWORD pid, DWORD tid, DWORD disposition);
 void guard_sync(probe_session *s);
 void guard_resync(probe_session *s);
 void handling_running(probe_session *s, DWORD tid, bool running);
