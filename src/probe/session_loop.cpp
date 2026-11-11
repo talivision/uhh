@@ -1756,6 +1756,10 @@ bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposition) {
         if (!SetThreadContext(thread, &live) ||
             !queue_debug_delivery(s, event.dwThreadId, (uint64_t)EMU_IP(returned), 0xE00Fu, returned.Dr6)) return false;
         disposition = DBG_EXCEPTION_NOT_HANDLED;
+        if (trace_enabled())
+            std::fprintf(stderr, "  co-delivery tid=%lu pc=0x%llx dr6=0x%llx pass\n",
+                         (unsigned long)event.dwThreadId, (unsigned long long)EMU_IP(returned),
+                         (unsigned long long)returned.Dr6);
     }
     // The guard's mirror, after EVERYTHING this event changed (an in-place window's holds are
     // taken / handed over just above) and before the thread runs again. The event's thread

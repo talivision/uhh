@@ -21,6 +21,7 @@ static std::atomic<long> g_body{0};      // how many times an original body real
 static volatile long g_sink;
 
 extern "C" intptr_t CoMidPush(intptr_t a);
+extern "C" intptr_t CoCallRetTf(intptr_t a);
 extern "C" intptr_t CoCallPrologue(intptr_t a, intptr_t *out);
 extern "C" void CoRepFill(void *dst, size_t n, int v);
 #if !defined(_WIN64)
@@ -51,13 +52,29 @@ static void *g_tf_return = nullptr;
 static volatile LONG g_tf_returns = 0;
 static volatile LONG g_tf_bad = 0;
 static LONG CALLBACK return_tf_handler(EXCEPTION_POINTERS *e) {
-    if (!g_return_tf || e->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP ||
-        !(e->ContextRecord->Dr6 & 0x4000u)) return EXCEPTION_CONTINUE_SEARCH;
-    if (e->ExceptionRecord->ExceptionAddress == g_tf_return) {
+    const DWORD code = e->ExceptionRecord->ExceptionCode;
+    if (!g_return_tf || !g_tf_return ||
+        (code != EXCEPTION_SINGLE_STEP && code != 0x4000001Eu /* STATUS_WX86_SINGLE_STEP */))
+        return EXCEPTION_CONTINUE_SEARCH;
+    // The program explicitly armed this step. Windows need not supply debug
+    // registers in a VEH CONTEXT for a TF-only trap (notably without a debugger),
+    // so BS is evidence when present, not a prerequisite for accepting the step.
+    const uintptr_t at = (uintptr_t)e->ExceptionRecord->ExceptionAddress;
+    const bool have_dr = (e->ContextRecord->ContextFlags & CONTEXT_DEBUG_REGISTERS) == CONTEXT_DEBUG_REGISTERS;
+    // CoCallRetTf puts a one-byte NOP at the return site. A step can arrive
+    // after RET, or separately after that NOP if the execute catch arrived first.
+    if (at == (uintptr_t)g_tf_return || at == (uintptr_t)g_tf_return + 1) {
         InterlockedIncrement(&g_tf_returns);
-        if (e->ContextRecord->Dr6 & 0xA00Fu) InterlockedIncrement(&g_tf_bad);
+        if (have_dr && (e->ContextRecord->Dr6 & 0xA00Fu)) InterlockedIncrement(&g_tf_bad);
         e->ContextRecord->EFlags &= ~0x100u;
+        g_tf_return = nullptr; // any duplicate now escapes this handler and fails
+    } else {
+        // Continue stepping the epilogue. Exception delivery may clear TF;
+        // accepting the first step alone does not arrange a step after RET.
+        e->ContextRecord->EFlags |= 0x100u;
     }
+    // Status is sticky; do not carry a prior epilogue step into the return catch.
+    if (have_dr) e->ContextRecord->Dr6 = 0;
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 CO_EXPORT intptr_t co_ret(intptr_t a) { g_body++; return a + 11; }
@@ -327,7 +344,7 @@ int main(int argc, char **argv) {
         printf("{\"kind\":\"co\",\"case\":\"conv\",\"fast\":%lld,\"fast_sp\":%d,\"this\":%lld,\"this_sp\":%d,\"args8\":%lld,\"body\":%ld}\n",
                (long long)fast, fast_sp, (long long)thisv, this_sp, (long long)args8, g_body.load());
     } else if (!strcmp(k, "rettf")) {
-        for (int i = 0; i < 6; ++i) sum += co_rettf(i);
+        for (int i = 0; i < 6; ++i) sum += CoCallRetTf(i);
         printf("{\"kind\":\"co\",\"case\":\"rettf\",\"sum\":%lld,\"body\":%ld,\"delivered\":%ld}\n",
                (long long)sum, g_body.load(), (long)g_tf_returns);
         if (g_tf_returns != 6 || g_tf_bad) return 5;

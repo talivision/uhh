@@ -500,6 +500,10 @@ void enforce_owned_drs(const probe_session *s, DWORD tid, CONTEXT &c, bool clear
 static void debug_delivery_noop(probe_context *) {}
 bool queue_debug_delivery(probe_session *s, DWORD tid, uint64_t ip, DWORD64 clear_bits, DWORD64 set_bits) {
     if (!clear_bits && !set_bits) return true;
+    if (trace_enabled())
+        std::fprintf(stderr, "  debug-delivery-queue tid=%lu pc=0x%llx clear=0x%llx set=0x%llx agent=%d\n",
+                     (unsigned long)tid, (unsigned long long)ip, (unsigned long long)clear_bits,
+                     (unsigned long long)set_bits, !!(s->shared && s->shared->debug_delivery_ready));
     if (s->shared && s->shared->debug_delivery_ready) {
         probe_agent_debug_delivery *free = nullptr;
         for (auto &d : s->shared->debug_delivery) {
@@ -600,6 +604,10 @@ bool repair_debug_delivery(probe_session *s, DWORD tid, const CONTEXT &native) {
         if (!remote_write(s->pi.hProcess, rec + offsetof(CONTEXT, Dr6), &dr6, sizeof(dr6), &n) || n != sizeof(dr6)) {
             set_error(s, "write debug exception status"); return false;
         }
+        if (trace_enabled())
+            std::fprintf(stderr, "  debug-delivery tid=%lu pc=0x%llx dr6=0x%llx -> 0x%llx\n",
+                         (unsigned long)tid, (unsigned long long)EMU_IP(img),
+                         (unsigned long long)img.Dr6, (unsigned long long)dr6);
         s->debug_delivery.erase(it);
     }
     // Last delivery: the ordinary one-shot path restores the byte and runs at the real

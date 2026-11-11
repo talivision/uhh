@@ -1,6 +1,9 @@
 ; call_original / return_from hunt: exact code shapes the C compiler would not guarantee.
 PUBLIC CoMidPush, CoPrologue, CoCallPrologue, CoRepFill, CoRepSite
 
+EXTERN co_rettf:PROC
+PUBLIC CoCallRetTf
+
 .code
 ; intptr_t CoMidPush(intptr_t a) = a + 1. A probe at CoMidPush+1 is MID-function: [rsp] is
 ; the saved rbx, not a return address -- call_original / return_from must refuse there.
@@ -77,4 +80,13 @@ CoRepSite::
     pop rdi
     ret
 CoRepFill ENDP
+; Known instruction immediately after the real return: the target's TF trap
+; must reach its VEH at the NOP or immediately after it, exactly once per call.
+CoCallRetTf PROC
+    sub rsp, 28h
+    call co_rettf
+    nop
+    add rsp, 28h
+    ret
+CoCallRetTf ENDP
 END

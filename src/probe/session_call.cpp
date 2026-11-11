@@ -1247,6 +1247,10 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
                     const uint64_t sp = r.Esp, rax = r.Eax;
 #endif
                     if (sp > s->co_sp && sp <= s->co_sp + ptr + 1024) {   // x86 stdcall: ret N popped the args
+                        if (trace_enabled())
+                            std::fprintf(stderr, "  co-return tid=%lu pc=0x%llx dr6=0x%llx flags=0x%lx foreign=0x%llx\n",
+                                         (unsigned long)st->tid, (unsigned long long)ret_addr,
+                                         (unsigned long long)r.Dr6, (unsigned long)r.EFlags, (unsigned long long)foreign);
                         s->dr6_lost.erase(st->tid);                        // this event consumed the saved status
                         if (foreign) {
                             CONTEXT delivery = r; delivery.Dr6 = (decltype(delivery.Dr6))foreign;

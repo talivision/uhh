@@ -1714,6 +1714,8 @@ def co_expect(case, base, x86):
             row["this"] = base["this"] + 5
             hits["CoThis"] = 5; logs.update({"co this": 5, "co this-done": 5})
     elif case == "rettf":
+        # A missing/broken reference must not define away the exactly-once check.
+        row = {"kind": "co", "case": "rettf", "sum": 81, "body": 6, "delivered": 6}
         hits = {"co_rettf": 6}; logs = {"co rettf": 6, "co rettf-done": 6}
     elif case == "retaddr":
         hits = {"co_ret": 6}; logs = {"co ret": 6, "co ret-done": 6}
@@ -1764,10 +1766,11 @@ def check_callorig_hunt():
             out[loc.split("!", 1)[-1] if "!" in loc else loc] = p.get("hits")
         return out
 
-    bases = {}
+    bases, base_rc = {}, {}
     for case in CO_CASES + ("slow",):
         r, o = run([t, case], timeout=60)
         bases[case] = co_row(o)
+        base_rc[case] = r.returncode
     runs = [(c, bk, bk) for c in CO_CASES for bk in ("breakpoint", "hw", "inline")
             if c != "rettf" or bk != "inline"]
     runs += [("nested", a, b) for a, b in (("breakpoint", "inline"), ("inline", "breakpoint"), ("hw", "inline"))]
@@ -1785,14 +1788,16 @@ def check_callorig_hunt():
             row.pop("kind", None); want_row.pop("kind", None)
             got_logs = {k: logs.get(k, 0) for k in want_logs}
             extra = sorted(k for k in logs if k not in want_logs and not (case == "retaddr" and k == "co retsite"))
-            ok = (bool(base) and row == want_row and all(hb.get(k) == v for k, v in want_hits.items()) and
+            reference_ok = case != "rettf" or (base_rc[case] == 0 and base == dict(want_row, kind="co"))
+            ok = (bool(base) and reference_ok and row == want_row and all(hb.get(k) == v for k, v in want_hits.items()) and
                   got_logs == want_logs and not extra and rep.get("log_dropped") == 0 and
                   rep.get("callbacks_interrupted", 0) == 0 and rep.get("error") is None and
                   rep.get("app_exit") == 0 and r.returncode == 0)
             if case == "retaddr":   # the return-site probe: one log per hit, every return after it arms
                 rs = next((v for k, v in hb.items() if k.startswith("0x") or k not in ("co_ret",)), None)
                 ok = ok and rs is not None and rs == logs.get("co retsite", 0) and rs >= 5
-            record(name, ok, f"row={row} want={want_row} hits={hb} logs={got_logs} extra={extra[:3]} "
+            record(name, ok, f"row={row} want={want_row} reference_ok={reference_ok} base_rc={base_rc[case]} "
+                             f"hits={hb} logs={got_logs} extra={extra[:3]} "
                              f"dropped={rep.get('log_dropped')} intr={rep.get('callbacks_interrupted')} "
                              f"err={rep.get('error')} rc={r.returncode}")
         except Exception as e:

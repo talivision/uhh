@@ -5,6 +5,9 @@ OPTION CASEMAP:NONE
 
 PUBLIC CoMidPush, CoPrologue, CoCallPrologue, CoThis, CoRepFill, CoRepSite
 
+EXTERN co_rettf:PROC
+PUBLIC CoCallRetTf
+
 .code
 ; int CoMidPush(int a) = a + 1; a probe at CoMidPush+1 is mid-function ([esp] = saved ebx).
 CoMidPush PROC
@@ -83,4 +86,13 @@ CoRepSite::
     pop edi
     ret
 CoRepFill ENDP
+; Known instruction immediately after the real return: the target's TF trap
+; must reach its VEH at the NOP or immediately after it, exactly once per call.
+CoCallRetTf PROC
+    push dword ptr [esp+4]
+    call co_rettf
+    nop
+    add esp, 4
+    ret
+CoCallRetTf ENDP
 END
