@@ -497,8 +497,9 @@ bool reuse_target_agent(probe_session *s) {
     bool needed = false;
     for (const auto &p : s->probes) if ((p->flags & PROBE_INLINE) || !p->shared_export.empty()) needed = true;
     if (!needed) return true;
-    auto unknown = [&]() {
-        set_error(s, "retained inline agent unknown-image: cannot establish target agent identity; restart the target before attaching");
+    auto unknown = [&](const char *why) {
+        set_error(s, std::string("retained inline agent unknown-image: ") + why +
+                     "; restart the target before attaching");
         return false;
     };
     // Identify UHH from mapped PE exports, never from the loader list or filename.
@@ -549,31 +550,53 @@ bool reuse_target_agent(probe_session *s) {
                     const size_t n = strlen(want) + 1;
                     return n <= sizeof(name) && read(rva, name, n) && !memcmp(name, want, n);
                 };
-                if (exp.Name && named(exp.Name, "probe_api_agent.dll")) return true;
-                // Alternate project builds can have another internal DLL name.
-                // The agent exports a handful of names: skip big export tables (system DLLs)
-                // instead of thousands of remote reads per attach.
-                if (exp.NumberOfNames > 64) return false;
-                unsigned found = 0;
-                for (DWORD i = 0; i < exp.NumberOfNames; ++i) {
-                    DWORD rva = 0;
-                    if (!read((uint64_t)exp.AddressOfNames + i * sizeof(DWORD), &rva, sizeof(rva))) return false;
-                    if (named(rva, "probe_agent_init")) found |= 1;
-                    if (named(rva, "probe_agent_stop")) found |= 2;
-                    if (named(rva, "probe_agent_bind_controller")) found |= 4;
-                    if (found == 7) return true;
-                }
-                return false;
+#if defined(UHH_TEST_HOOKS)
+                const bool no_dll_name = std::getenv("UHH_TEST_REUSE_NO_EXPORT_DLL_NAME") != nullptr;
+#else
+                const bool no_dll_name = false;
+#endif
+                if (!no_dll_name && exp.Name && named(exp.Name, "probe_api_agent.dll")) return true;
+                // Export names are sorted. The agent includes all callback exports
+                // (far more than 64), so search instead of capping the name count.
+                if (exp.NumberOfNames > limit / sizeof(DWORD)) return false;
+                auto exported = [&](const char *want) {
+                    DWORD lo = 0, hi = exp.NumberOfNames;
+                    while (lo < hi) {
+                        const DWORD mid = lo + (hi - lo) / 2;
+                        DWORD rva = 0;
+                        if (!read((uint64_t)exp.AddressOfNames + (uint64_t)mid * sizeof(DWORD), &rva, sizeof(rva))) return false;
+                        // One remote read per probe (inside the image: read() bounds it by
+                        // SizeOfImage); names longer than the buffer compare by their prefix,
+                        // which decides against our short names exactly as a full compare would.
+                        unsigned char name[40] = {};       // longer than every name we look for
+                        if (rva >= limit) return false;
+                        const size_t len = (size_t)std::min<uint64_t>(sizeof(name), limit - rva);
+                        if (!read(rva, name, len)) return false;
+                        int cmp = 0;
+                        size_t k = 0;
+                        for (; k < len; ++k) {             // strcmp; want's NUL ends it in time
+                            cmp = (int)name[k] - (unsigned char)want[k];
+                            if (cmp || !want[k]) break;
+                        }
+                        if (k == len) return false;        // name runs off the image: malformed
+                        if (!cmp) return true;
+                        if (cmp < 0) lo = mid + 1;
+                        else hi = mid;
+                    }
+                    return false;
+                };
+                return exported("probe_agent_init") && exported("probe_agent_stop") &&
+                       exported("probe_agent_bind_controller");
             };
             if (identify()) agents.push_back({base, nt});
         }
         if (next <= at) break;
         at = next;
     }
-    if (agents.size() > 1) return unknown();
+    if (agents.size() > 1) return unknown("multiple retained agents");
     for (const auto &agent : agents) {
 #if defined(UHH_TEST_HOOKS)
-        if (std::getenv("UHH_TEST_REUSE_AGENT_UNREADABLE")) return unknown();
+        if (std::getenv("UHH_TEST_REUSE_AGENT_UNREADABLE")) return unknown("test: agent identity unreadable");
 #endif
         if (!ensure_local_agent(s)) return false;
         // The same PE build fields/checksum used for warm-copy identity, read
@@ -602,8 +625,22 @@ bool reuse_target_agent(probe_session *s) {
         else {
             n = K32GetMappedFileNameW(s->pi.hProcess, reinterpret_cast<void *>(agent.base), path,
                                      (DWORD)(sizeof(path) / sizeof(path[0])));
-            if (!n || n >= sizeof(path) / sizeof(path[0])) return unknown();
+            if (!n || n >= sizeof(path) / sizeof(path[0])) return unknown(win_error("mapped agent filename").c_str());
             file = L"\\\\?\\GLOBALROOT" + std::wstring(path, n);
+            // Prefer the DOS spelling for the retained file (also used by the
+            // loader). Keep GLOBALROOT only for volumes with no drive alias.
+            wchar_t drives[512];
+            const DWORD count = GetLogicalDriveStringsW(_countof(drives), drives);
+            if (count && count < _countof(drives)) {
+                for (const wchar_t *drive = drives; *drive; drive += wcslen(drive) + 1) {
+                    wchar_t letter[3] = {drive[0], L':', 0}, device[512];
+                    if (!QueryDosDeviceW(letter, device, _countof(device))) continue;
+                    const size_t len = wcslen(device);
+                    if (len < n && path[len] == L'\\' && !_wcsnicmp(path, device, len)) {
+                        file = std::wstring(letter) + (path + len); break;
+                    }
+                }
+            }
         }
         auto read = [](const std::wstring &file, std::vector<unsigned char> &bytes) {
             HANDLE f = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
@@ -614,7 +651,8 @@ bool reuse_target_agent(probe_session *s) {
             return ok;
         };
         std::vector<unsigned char> want, have;
-        if (!read(s->agent_path, want) || !read(file, have)) return unknown();
+        if (!read(s->agent_path, want)) return unknown(win_error("read controller agent file").c_str());
+        if (!read(file, have)) return unknown(win_error("read retained agent file").c_str());
         if (want != have) {
             set_error(s, "retained inline agent differs from this build; restart the target before attaching"); return false;
         }

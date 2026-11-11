@@ -8953,7 +8953,7 @@ def check_session_agentipc():
                 po, pe = Lines(p.stdout), Lines(p.stderr)
                 drivers.append((p, po, pe))
                 if not po.wait_for(lambda l: '"kind":"attached"' in l, 10):
-                    raise RuntimeError(f"not attached: {pe.lines}")
+                    raise RuntimeError(f"not attached: {pe.lines}; target={out.lines}")
                 if active and not pe.wait_for(lambda l: sum(x.startswith("probe: active ") for x in pe.lines) >= active, 10):
                     raise RuntimeError(f"not active: {pe.lines}")
                 return p, po, pe
@@ -8971,11 +8971,17 @@ def check_session_agentipc():
             if case == "shared" or case.startswith("identity"):
                 for n in range(1, 4 if case == "shared" else 2):
                     p, po, pe = attach("shared", 1 if n % 2 else 2, active=2,
-                                       env={"UHH_TEST_REUSE_NO_MODULE_NAME": "1"} if n > 1 else None)
+                                       env={"UHH_TEST_REUSE_NO_MODULE_NAME": "1",
+                                            "UHH_TEST_REUSE_NO_EXPORT_DLL_NAME": "1"} if n > 1 else None)
                     hit(n)
                     if not po.wait_for(lambda l: l.startswith("{") and json.loads(l).get("message") == f"ar shared {n}", 10):
                         raise RuntimeError(f"shared value missing: {po.lines}")
                     detach(p)
+                    cue(target, "a\n")
+                    retained = out.wait_for(lambda l: '"kind":"agent"' in l and
+                                            json.loads(l).get("n") == n, 10)
+                    if not retained or not json.loads(retained).get("base"):
+                        raise RuntimeError(f"fixture did not retain its agent after detach: {out.lines}")
                 if case.startswith("identity"):
                     agent = tmp / "probe_api_agent.dll"
                     alternate = exe("probe_api_agent_identity.dll")
@@ -8985,6 +8991,7 @@ def check_session_agentipc():
                     env = dict(os.environ)
                     if case == "identity-loader":
                         env["UHH_TEST_REUSE_NO_MODULE_NAME"] = "1"
+                        env["UHH_TEST_REUSE_NO_EXPORT_DLL_NAME"] = "1"
                     elif case == "identity-unreadable":
                         env["UHH_TEST_REUSE_AGENT_UNREADABLE"] = "1"
                     p = subprocess.Popen([str(driver), "--review-shared", str(pid), "1"], stdin=subprocess.PIPE,
@@ -9007,7 +9014,8 @@ def check_session_agentipc():
                                            json.loads(l).get("message") == "ar shared 2", 10):
                             raise RuntimeError(f"identity fixture: probes active but no wrong-image callback hit: "
                                                f"stdout={po.lines} stderr={pe.lines}")
-                        raise RuntimeError(f"different image was accepted: wrong-image callback hit; {pe.lines}")
+                        raise RuntimeError(f"different image was accepted: wrong-image callback hit; "
+                                           f"retained={retained}; {pe.lines}")
                     try:
                         p.stdin.write("\n"); p.stdin.flush()   # a controller still waiting for detach
                     except OSError:

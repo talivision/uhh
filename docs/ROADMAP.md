@@ -3166,6 +3166,13 @@ are implemented but await Windows x64/x86 rerun. Existing Detours checks are unc
   verifies preserved shared state. `session-agentipc-unknown-image` and
   `session-agentipc-unknown-image-unreadable` require fresh mixed callbacks despite
   an unnamed/unreadable non-agent image. No shared-layout or agent-version change.
+  Follow-up to 885e169: the linked sources declare 188 distinct exported names
+  (plus possible x86 aliases), so a 64-name fallback cap was invalid. Search the
+  sorted remote export table instead; shared/identity-loader force that fallback.
+  The fixture now queries the target's retained module after detach without taking
+  a reference. Mapped-file paths prefer their DOS drive spelling for reuse, and
+  unknown-image diagnostics distinguish multiple agents, mapped-name failure, and
+  controller/retained backing-file read failures. Windows revalidation pending.
 - The shared fixture's write/read sites had identical `InterlockedIncrement` bodies and
   were eligible for MSVC /OPT:ICF folding, placing inline and breakpoint probes on one
   instruction. The writer now exchanges its argument into the sink; the fixture also
