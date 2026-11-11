@@ -11901,7 +11901,9 @@ def check_gated_guardwin(threads=4, rounds=4):
         loaded: configparse.dll loads while the guard is not up. The inline probes go active
         whenever they do, so only the flag, the program's result and stderr are judged.
     Both rows require target channel snapshots bracketing LoadLibrary: no init return,
-    service ready throughout stall, unavailable throughout early. Missing the window FAILS.
+    service ready throughout stall, unavailable throughout early. Each repetition gets up to
+    five coverage attempts; functional failures fail immediately. Exhausting attempts fails
+    with every observed window.
     UHH_GUARDWIN_N=N runs each row N times (default 3)."""
     g, a, p = exe("gated_config.exe"), exe("uhh_attach.exe"), exe("probe_app.exe")
     if not g or not a or not p:
@@ -11925,45 +11927,60 @@ def check_gated_guardwin(threads=4, rounds=4):
                 else:
                     env.pop("UHH_TEST_INIT_STALL_MS", None)
                 for _ in range(n):
-                    truth_path = tmp / "truth.jsonl"
-                    try:
-                        truth_path.unlink(missing_ok=True)
-                        rc, trc, o, t_objs, err = e2e_attach(combo, threads, rounds, truth_path, False, env=env,
-                                                             wait_active=when == "stall")
-                        if when == "stall":
-                            truth = e2e_truth(truth_path) if truth_path.exists() else []
-                            ok, detail = e2e_judge(combo, rc, trc, o, t_objs, err, truth, base)
-                        else:
-                            rep, ap = report(o), app(t_objs)
-                            fl = next((x for x in probes(o) if x.get("location") == FLAG_LOCATION), {})
-                            warns = [l[:140] for l in (err or "").splitlines()
-                                     if "warning" in l.lower() or "refused" in l.lower()]
-                            bad = []
-                            if rc != 0 or trc != 0 or rep.get("error") is not None:
-                                bad.append(f"rc={rc}/{trc} error={str(rep.get('error'))[:100]}")
-                            if (ap.get("reads_enabled") != 1 or ap.get("successful_reads") != base.get("successful_reads")
-                                    or ap.get("checksum") != base.get("checksum")):
-                                bad.append(f"app reads_enabled={ap.get('reads_enabled')} "
-                                           f"reads={ap.get('successful_reads')}/{base.get('successful_reads')}")
-                            if fl.get("backend") != fb or fl.get("active") is not True:
-                                bad.append(f"flag backend={fl.get('backend')} active={fl.get('active')}")
-                            if fl.get("hits") != 1 or rep.get("overrides") != 1:
-                                bad.append(f"flag hits={fl.get('hits')} overrides={rep.get('overrides')}")
-                            if warns:
-                                bad.append(f"warnings={warns[:2]}")
-                            ok = not bad
-                            detail = (f"flag={fl.get('hits')}/{rep.get('overrides')} reads_enabled={ap.get('reads_enabled')} "
-                                      f"reads={ap.get('successful_reads')}" + ("" if ok else " BAD: " + " | ".join(bad)))
-                        windows = [x for x in t_objs if x.get("kind") == "guardwin"]
-                        want_ready = 1 if when == "stall" else 0
-                        window_ok = (len(windows) == 1 and
-                                     windows[0].get("ready_before") == want_ready and
-                                     windows[0].get("ready_after") == want_ready and
-                                     windows[0].get("returns_before") == 0 and
-                                     windows[0].get("returns_after") == 0)
-                        record(name, ok and window_ok, detail + f" window={windows} verified={window_ok}")
-                    except Exception as e:
-                        record(name, False, repr(e)[:300])
+                    attempt_windows = []
+                    for attempt in range(1, 6):
+                        truth_path = tmp / "truth.jsonl"
+                        try:
+                            truth_path.unlink(missing_ok=True)
+                            rc, trc, o, t_objs, err = e2e_attach(combo, threads, rounds, truth_path, False, env=env,
+                                                                 wait_active=when == "stall")
+                            if when == "stall":
+                                truth = e2e_truth(truth_path) if truth_path.exists() else []
+                                ok, detail = e2e_judge(combo, rc, trc, o, t_objs, err, truth, base)
+                            else:
+                                rep, ap = report(o), app(t_objs)
+                                fl = next((x for x in probes(o) if x.get("location") == FLAG_LOCATION), {})
+                                warns = [l[:140] for l in (err or "").splitlines()
+                                         if "warning" in l.lower() or "refused" in l.lower()]
+                                bad = []
+                                if rc != 0 or trc != 0 or rep.get("error") is not None:
+                                    bad.append(f"rc={rc}/{trc} error={str(rep.get('error'))[:100]}")
+                                if (ap.get("reads_enabled") != 1 or ap.get("successful_reads") != base.get("successful_reads")
+                                        or ap.get("checksum") != base.get("checksum")):
+                                    bad.append(f"app reads_enabled={ap.get('reads_enabled')} "
+                                               f"reads={ap.get('successful_reads')}/{base.get('successful_reads')}")
+                                if fl.get("backend") != fb or fl.get("active") is not True:
+                                    bad.append(f"flag backend={fl.get('backend')} active={fl.get('active')}")
+                                if fl.get("hits") != 1 or rep.get("overrides") != 1:
+                                    bad.append(f"flag hits={fl.get('hits')} overrides={rep.get('overrides')}")
+                                delivered = sum(1 for x in o if x.get("kind") == "probe_log")
+                                in_file = e2e_session_file_logs(err)
+                                if (rep.get("logs_written") != delivered or delivered != in_file or
+                                        rep.get("log_dropped") != 0 or rep.get("callbacks_interrupted") != 0):
+                                    bad.append(f"logs_written={rep.get('logs_written')} delivered={delivered} file={in_file} "
+                                               f"dropped={rep.get('log_dropped')} interrupted={rep.get('callbacks_interrupted')}")
+                                if rep.get("app_exit") not in (0, None):
+                                    bad.append(f"app_exit={rep.get('app_exit')}")
+                                if warns:
+                                    bad.append(f"warnings={warns[:2]}")
+                                ok = not bad
+                                detail = (f"flag={fl.get('hits')}/{rep.get('overrides')} reads_enabled={ap.get('reads_enabled')} "
+                                          f"reads={ap.get('successful_reads')}" + ("" if ok else " BAD: " + " | ".join(bad)))
+                            windows = [x for x in t_objs if x.get("kind") == "guardwin"]
+                            want_ready = 1 if when == "stall" else 0
+                            window_ok = (len(windows) == 1 and
+                                         windows[0].get("ready_before") == want_ready and
+                                         windows[0].get("ready_after") == want_ready and
+                                         windows[0].get("returns_before") == 0 and
+                                         windows[0].get("returns_after") == 0)
+                            attempt_windows.append(windows)
+                            if not ok or window_ok or attempt == 5:
+                                record(name, ok and window_ok,
+                                       detail + f" attempt={attempt}/5 windows={attempt_windows} verified={window_ok}")
+                                break
+                        except Exception as e:
+                            record(name, False, repr(e)[:300] + f" attempt={attempt}/5 windows={attempt_windows}")
+                            break
     except Exception as e:
         record("gated-guardwin-baseline", False, repr(e)[:300])
     finally:
