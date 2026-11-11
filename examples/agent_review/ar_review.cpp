@@ -212,6 +212,20 @@ int ar_review_case(const char *k) {
         if (!distinct) return 2;
         int n = 0;
         for (int ch; (ch = getchar()) != EOF && ch != 'q'; ) {
+            if (ch == 'a') {
+                // Query without taking a reference: detach itself must retain it.
+                HMODULE agent = GetModuleHandleW(L"probe_api_agent.dll");
+                DWORD names = 0;
+                if (agent) {
+                    const auto *base = reinterpret_cast<const unsigned char *>(agent);
+                    const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
+                    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(base + dos->e_lfanew);
+                    const DWORD rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+                    if (rva) names = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY *>(base + rva)->NumberOfNames;
+                }
+                printf("{\"kind\":\"agent\",\"n\":%d,\"base\":%llu,\"exports\":%lu}\n",
+                       n, (unsigned long long)(uintptr_t)agent, names); fflush(stdout);
+            }
             if (ch == 'm') {
                 char text[64] = {}; if (!fgets(text, sizeof(text), stdin)) return 2;
                 MEMORY_BASIC_INFORMATION mbi{};

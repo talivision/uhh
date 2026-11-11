@@ -3152,6 +3152,47 @@ are implemented but await Windows x64/x86 rerun. Existing Detours checks are unc
   existing fresh-injection path. `session-agentipc-unknown-image` deterministically
   suppresses one unrelated image's filename and requires fresh mixed callbacks to run;
   `session-agentipc-identity` still requires a changed retained agent to be refused.
+- Identity follow-up (idfix): the fallthrough above could overlook a retained agent
+  and inject the replacement build (intermittent x86 CI, merge-frida b64aca7).
+  Discovery walks MEM_IMAGE allocations and identifies UHH by the in-memory export
+  directory's DLL name or its init/stop/controller-bind exports. Unreadable/unrelated
+  images are skipped (the earlier name-based fail-closed walk wrongly refused
+  Detours/fresh attaches in 0615fa0). Only positively identified agents require an
+  in-memory PE build-fields/checksum match and normalized backing-file comparison;
+  inability to complete that identity/reuse check refuses with unknown-image.
+  `session-agentipc-identity-loader` forces missing loader names and requires the
+  different-build refusal; `session-agentipc-identity-unreadable` requires unknown-image
+  refusal. `session-agentipc-shared` also forces missing loader names on reuse and
+  verifies preserved shared state. `session-agentipc-unknown-image` and
+  `session-agentipc-unknown-image-unreadable` require fresh mixed callbacks despite
+  an unnamed/unreadable non-agent image. No shared-layout or agent-version change.
+  Follow-up to 885e169: the linked sources declare 188 distinct exported names
+  (plus possible x86 aliases), so a 64-name fallback cap was invalid. Search the
+  sorted remote export table instead; shared/identity-loader force that fallback.
+  The fixture now queries the target's retained module after detach without taking
+  a reference. Mapped-file paths prefer their DOS drive spelling for reuse, and
+  unknown-image diagnostics distinguish multiple agents, mapped-name failure, and
+  controller/retained backing-file read failures. Windows revalidation pending.
+  Follow-up to 99fd403: keep normalized file comparison and the retained file's
+  shared section. Device-prefix conversion already checks drive aliases and a
+  following backslash; a failed mapped-file path now falls back to the module
+  snapshot path for the exact memory-identified base (warm image sections can
+  retain a pre-rename name). Shared round 3 forces a stale-path failure. The
+  40-byte export lookup keeps its fast read, with bounded byte reads only if
+  that read fails/crosses an unreadable page. `UHH_TEST_REUSE_TRACE` is enabled
+  for shared/identity cases: scan candidates, PE magic/internal name/control
+  exports, identification method, both PE identities and compared paths/results.
+  Follow-up to bcbcd0a: discovery and retained-file comparison worked, but the
+  controller had selected the original build for its own copy. The metadata-keyed
+  warm cache verified PE fields and the candidate's own checksum, not equality to
+  the current source. Takes now compare every byte to a freshly trimmed source
+  snapshot read under the metadata handle (deny-write). The key remains a lookup
+  hint; publication's metadata recheck cannot bypass this content check. One
+  sequential source read/trim per take preserves the pre-scanned-image benefit;
+  no new timings are claimed. `ctrl-warm-identity` plants changed bytes with valid
+  PE fields/checksum. The alternate DLL uses image version 1.1 versus default 0.0;
+  PE comparisons include that version, and the fixture checks the distinction.
+  Reuse trace now includes source path, signature and warm/new selection.
 - The shared fixture's write/read sites had identical `InterlockedIncrement` bodies and
   were eligible for MSVC /OPT:ICF folding, placing inline and breakpoint probes on one
   instruction. The writer now exchanges its argument into the sink; the fixture also

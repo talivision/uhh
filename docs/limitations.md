@@ -296,6 +296,11 @@ data) prints on all backends.
   stopped. A later attach to the same process reuses it.
   Reattach maps the retained agent file in the controller to preserve `UHH_SHARED`
   across backends. A different build is refused; restart the target to use it.
+  Attach identifies retained agents from mapped PE export names, independently of
+  loader lists and filenames. Unreadable/unrelated images are skipped. Only a
+  positively identified agent whose identity or backing file cannot be read causes
+  `retained inline agent unknown-image`. Its in-memory PE build fields/checksum
+  and normalized backing-file contents must match before reuse.
   A callback surviving detach retains its old config and channel storage until process exit.
 - **x64 inline callback contract: leave x87/MMX unchanged**, including any helpers the
   callback calls. Ordinary MSVC x64 C/C++ and x64 CRT math use SSE; `long double` is

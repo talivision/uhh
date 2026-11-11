@@ -169,15 +169,16 @@ static bool trim_agent_image(std::vector<unsigned char> &img) {
 // write time and change time (NTFS moves the change time on every change to the file, and a
 // rebuilt file is a new file id; the old sig, size + write time, matched a different build with the
 // same size and time: regress ctrl-warm-identity). A taken copy must also be a complete, unaltered
-// trimmed image of that build: its PE header fields (TimeDateStamp, SizeOfImage, entry point,
-// sections) equal the source's and its PE checksum (written by write_trimmed_agent) matches its
-// bytes; anything else is deleted and a fresh copy made. Warm copies are made and taken only while
+// trimmed image of that build: compare all bytes against a freshly trimmed source snapshot,
+// not just PE fields and the copy's own checksum. Metadata can survive an in-place overwrite.
+// Anything else is deleted and a fresh copy made. Warm copies are made and taken only while
 // the uhh directory and its warm\ are private to this user (owner and DACL: nobody else can write
 // there -- e.g. a SYSTEM controller's C:\Windows\Temp, where Users may create directories, gets
 // none: regress ctrl-warm-acl). The verified copy stays open, deny-write, until the controller's
-// LoadLibrary of it is done. Cost (VM x64): ~1 ms per launch on top of perf5's take.
+// LoadLibrary of it is done. A hit reads/trims the source once and compares bytes;
+// it still avoids creating/scanning a new image file on the critical path.
 static constexpr unsigned WARM_KEEP = 2;
-struct AgentId { DWORD stamp = 0, size_of_image = 0, entry = 0; WORD sections = 0; };
+struct AgentId { DWORD stamp = 0, size_of_image = 0, entry = 0; WORD sections = 0, major = 0, minor = 0; };
 static bool image_id(const unsigned char *img, size_t n, AgentId &id, DWORD *checksum = nullptr, size_t *checksum_at = nullptr) {
     if (n < sizeof(IMAGE_DOS_HEADER)) return false;
     auto dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(img);
@@ -186,12 +187,14 @@ static bool image_id(const unsigned char *img, size_t n, AgentId &id, DWORD *che
     if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR_MAGIC) return false;
     id.stamp = nt->FileHeader.TimeDateStamp; id.size_of_image = nt->OptionalHeader.SizeOfImage;
     id.entry = nt->OptionalHeader.AddressOfEntryPoint; id.sections = nt->FileHeader.NumberOfSections;
+    id.major = nt->OptionalHeader.MajorImageVersion; id.minor = nt->OptionalHeader.MinorImageVersion;
     if (checksum) *checksum = nt->OptionalHeader.CheckSum;
     if (checksum_at) *checksum_at = (size_t)((const unsigned char *)&nt->OptionalHeader.CheckSum - img);
     return true;
 }
 static bool same_id(const AgentId &a, const AgentId &b) {
-    return a.stamp == b.stamp && a.size_of_image == b.size_of_image && a.entry == b.entry && a.sections == b.sections;
+    return a.stamp == b.stamp && a.size_of_image == b.size_of_image && a.entry == b.entry &&
+           a.sections == b.sections && a.major == b.major && a.minor == b.minor;
 }
 // The PE checksum (as CheckSumMappedFile, and as write_trimmed_agent computes it) of img; its
 // CheckSum field is zeroed first. A ones'-complement sum: folding once at the end gives the same
@@ -267,13 +270,20 @@ static bool dir_private(const std::wstring &path) {
     return ok;
 }
 // The source agent's version stamp (the warm copies' name) and its build identity (headers).
-static std::wstring agent_signature(const std::wstring &path, AgentId *id = nullptr) {
+static std::wstring agent_signature(const std::wstring &path, AgentId *id = nullptr,
+                                   std::vector<unsigned char> *source = nullptr) {
     HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) return {};
     BY_HANDLE_FILE_INFORMATION bi{}; FILE_BASIC_INFO basic{};
     unsigned char head[4096]; DWORD got = 0;
-    const bool ok = GetFileInformationByHandle(f, &bi) && GetFileInformationByHandleEx(f, FileBasicInfo, &basic, sizeof(basic)) &&
-                    (!id || (ReadFile(f, head, sizeof(head), &got, nullptr) && image_id(head, got, *id)));
+    bool ok = GetFileInformationByHandle(f, &bi) && GetFileInformationByHandleEx(f, FileBasicInfo, &basic, sizeof(basic));
+    if (ok && source) {
+        // One sequential read, under the same deny-write handle as the metadata.
+        ok = read_whole_file(f, *source) && (!id || image_id(source->data(), source->size(), *id));
+        if (ok) trim_agent_image(*source); // already trimmed/unsupported: keep the original bytes
+    } else if (ok && id) {
+        ok = ReadFile(f, head, sizeof(head), &got, nullptr) && image_id(head, got, *id);
+    }
     CloseHandle(f);
     if (!ok) return {};
     wchar_t sig[96];
@@ -296,7 +306,7 @@ static void remove_copy_dir(const std::wstring &d) {
 // content against `want`; `hold` is then the file, open deny-write (close it once loaded). A copy
 // that is not exactly ours is deleted (it is in our own directory by then). False: none.
 static bool take_warm_copy(const std::wstring &root, const std::wstring &sig, const std::wstring &dir,
-                           const AgentId &want, HANDLE &hold) {
+                           const AgentId &want, const std::vector<unsigned char> &source, HANDLE &hold) {
     const std::wstring warm = root + L"\\warm";
     hold = INVALID_HANDLE_VALUE;
     if (!dir_private(warm)) return false;
@@ -315,11 +325,15 @@ static bool take_warm_copy(const std::wstring &root, const std::wstring &sig, co
             // One link only: a hard link to a file elsewhere could be changed through its other name.
             if (GetFileInformationByHandle(f, &bi) && bi.nNumberOfLinks == 1 && !(bi.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
                 read_whole_file(f, img) && image_id(img.data(), img.size(), have, &sum, &sum_at) && same_id(have, want) &&
-                sum != 0 && pe_checksum(img, sum_at) == sum) {
+                img == source && sum != 0 && pe_checksum(img, sum_at) == sum) {
                 hold = f; got = true; break;
             }
             CloseHandle(f);
         }
+#if defined(UHH_TEST_HOOKS)
+        if (std::getenv("UHH_TEST_REUSE_TRACE"))
+            std::fprintf(stderr, "probe: test: reuse warm rejected path=%ls sig=%ls\n", dir.c_str(), sig.c_str());
+#endif
         bench_phase("agent_warm_rejected", nullptr);
         remove_copy_dir(dir);                              // not exactly ours (or an empty leftover)
         if (GetFileAttributesW(dir.c_str()) != INVALID_FILE_ATTRIBUTES) {   // could not delete it: out of the way
@@ -433,10 +447,21 @@ static void prepare_local_agent(probe_session *s) {
                 bench_phase("agent_copy", nullptr);
                 static const bool no_warm = std::getenv("UHH_BENCH_NO_WARM") != nullptr;   // bench knob, not API
                 AgentId want;
-                if (!no_warm && dir_private(root)) warm_sig = agent_signature(s->agent_path, &want);
+                std::vector<unsigned char> source;
+                if (!no_warm && dir_private(root)) warm_sig = agent_signature(s->agent_path, &want, &source);
+#if defined(UHH_TEST_HOOKS)
+                if (std::getenv("UHH_TEST_REUSE_TRACE"))
+                    std::fprintf(stderr, "probe: test: reuse source=%ls sig=%ls normalized_bytes=%zu\n",
+                                 s->agent_path.c_str(), warm_sig.c_str(), source.size());
+#endif
                 bench_phase("agent_copy_checked", nullptr);
                 warm_root = root; warm_src = s->agent_path;
-                const bool warm = !warm_sig.empty() && take_warm_copy(root, warm_sig, dir, want, warm_hold);
+                const bool warm = !warm_sig.empty() && take_warm_copy(root, warm_sig, dir, want, source, warm_hold);
+#if defined(UHH_TEST_HOOKS)
+                if (std::getenv("UHH_TEST_REUSE_TRACE"))
+                    std::fprintf(stderr, "probe: test: reuse source=%ls sig=%ls selected=%s copy=%ls\n",
+                                 warm_src.c_str(), warm_sig.c_str(), warm ? "content-verified warm" : "new", copy.c_str());
+#endif
                 bench_phase("agent_copy_kind", warm ? "warm" : "new");
                 if (warm || (CreateDirectoryW(dir.c_str(), nullptr) &&
                              (write_trimmed_agent(s->agent_path, copy) || CopyFileW(s->agent_path.c_str(), copy.c_str(), TRUE)))) {
@@ -497,36 +522,249 @@ bool reuse_target_agent(probe_session *s) {
     bool needed = false;
     for (const auto &p : s->probes) if ((p->flags & PROBE_INLINE) || !p->shared_export.empty()) needed = true;
     if (!needed) return true;
-    HMODULE mods[1024]; DWORD need = 0;
-    // Enumeration is only an opportunity to reuse an identified agent. Detours and
-    // loader activity can expose unnamed/transient mappings; they are not evidence
-    // of an incompatible UHH image and must not prevent an ordinary fresh attach.
-    if (!K32EnumProcessModulesEx(s->pi.hProcess, mods, sizeof(mods), &need, LIST_MODULES_ALL)) return true;
-    for (DWORD i = 0; i < std::min<size_t>(need, sizeof(mods)) / sizeof(HMODULE); ++i) {
-        wchar_t path[32768];
-        DWORD n = K32GetModuleFileNameExW(s->pi.hProcess, mods[i], path, (DWORD)(sizeof(path) / sizeof(path[0])));
+    auto unknown = [&](const char *why) {
+        set_error(s, std::string("retained inline agent unknown-image: ") + why +
+                     "; restart the target before attaching");
+        return false;
+    };
 #if defined(UHH_TEST_HOOKS)
-        if (!i && std::getenv("UHH_TEST_REUSE_UNKNOWN")) {
-            n = 0; std::fprintf(stderr, "probe: test: unrelated image unidentified\n");
-        }
+    const bool reuse_trace = std::getenv("UHH_TEST_REUSE_TRACE") != nullptr;
+#else
+    const bool reuse_trace = false;
 #endif
-        if (!n || n >= sizeof(path) / sizeof(path[0])) continue;
-        const wchar_t *base = wcsrchr(path, L'\\');
-        if (_wcsicmp(base ? base + 1 : path, L"probe_api_agent.dll")) continue;
-        std::unordered_set<std::string> exports;
-        if (!read_file_exports(path, exports) || !exports.count("probe_agent_init") ||
-            !exports.count("probe_agent_stop") || !exports.count("probe_agent_bind_controller")) continue;
+    // Identify UHH from mapped PE exports, never from the loader list or filename.
+    // Unreadable/unrelated images are not evidence of a retained agent.
+    struct Retained { uintptr_t base; IMAGE_NT_HEADERS nt; const char *how; };
+    std::vector<Retained> agents;
+    for (uintptr_t at = 0; ; ) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQueryEx(s->pi.hProcess, reinterpret_cast<void *>(at), &mbi, sizeof(mbi))) {
+            if (reuse_trace) std::fprintf(stderr, "probe: test: reuse scan end at=0x%llx error=%lu\n",
+                                         (unsigned long long)at, GetLastError());
+            break;
+        }
+        const uintptr_t next = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        if (mbi.Type == MEM_IMAGE && mbi.BaseAddress == mbi.AllocationBase) {
+            const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.AllocationBase);
+            IMAGE_NT_HEADERS nt{};
+            const char *how = "headers";
+            DWORD export_names = 0;
+            char dll_name[64] = {};
+            auto identify = [&]() {
+                uint64_t limit = 1u << 20; // bound header reads before SizeOfImage is known
+                auto read = [&](uint64_t rva, void *dst, size_t n) {
+                    SIZE_T got = 0;
+                    const bool ok = rva <= limit && n <= limit - rva && rva <= UINTPTR_MAX - base &&
+                        n <= UINTPTR_MAX - base - rva &&
+                        ReadProcessMemory(s->pi.hProcess, reinterpret_cast<void *>(base + (uintptr_t)rva),
+                                          dst, n, &got) && got == n;
+                    if (!ok && reuse_trace) std::fprintf(stderr,
+                        "probe: test: reuse read failed base=0x%llx rva=0x%llx bytes=%zu got=%zu error=%lu\n",
+                        (unsigned long long)base, (unsigned long long)rva, n, (size_t)got, GetLastError());
+                    return ok;
+                };
+                IMAGE_DOS_HEADER dos{};
+                if (!read(0, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0 ||
+                    !read(dos.e_lfanew, &nt, sizeof(nt)) || nt.Signature != IMAGE_NT_SIGNATURE ||
+                    nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR_MAGIC) return false;
+#if defined(UHH_TEST_HOOKS)
+                if (!(nt.FileHeader.Characteristics & IMAGE_FILE_DLL)) {
+                    if (std::getenv("UHH_TEST_REUSE_UNKNOWN")) {
+                        // No filename is available for this non-agent. Discovery
+                        // must use memory alone, so no name lookup is needed.
+                        std::fprintf(stderr, "probe: test: unrelated image unidentified\n");
+                    }
+                    if (std::getenv("UHH_TEST_REUSE_UNREADABLE_NON_AGENT")) {
+                        // Simulate failure of its remaining PE/export reads.
+                        std::fprintf(stderr, "probe: test: unrelated image headers unreadable\n"); return false;
+                    }
+                }
+#endif
+                how = "export directory";
+                limit = nt.OptionalHeader.SizeOfImage;
+                if (!limit || limit > (256u << 20) ||
+                    nt.OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXPORT) return false;
+                const auto &dir = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+                IMAGE_EXPORT_DIRECTORY exp{};
+                if (!dir.VirtualAddress || !read(dir.VirtualAddress, &exp, sizeof(exp))) return false;
+                export_names = exp.NumberOfNames;
+                if (reuse_trace && exp.Name) {
+                    read(exp.Name, dll_name, sizeof(dll_name) - 1);
+                    dll_name[sizeof(dll_name) - 1] = 0;
+                }
+                auto named = [&](DWORD rva, const char *want) {
+                    char name[64] = {};
+                    const size_t n = strlen(want) + 1;
+                    return n <= sizeof(name) && read(rva, name, n) && !memcmp(name, want, n);
+                };
+#if defined(UHH_TEST_HOOKS)
+                const bool no_dll_name = std::getenv("UHH_TEST_REUSE_NO_EXPORT_DLL_NAME") != nullptr;
+#else
+                const bool no_dll_name = false;
+#endif
+                if (!no_dll_name && exp.Name && named(exp.Name, "probe_api_agent.dll")) {
+                    how = "DLL name"; return true;
+                }
+                how = "control exports";
+                // Export names are sorted. The agent includes all callback exports
+                // (far more than 64), so search instead of capping the name count.
+                if (exp.NumberOfNames > limit / sizeof(DWORD)) return false;
+                auto exported = [&](const char *want) {
+                    DWORD lo = 0, hi = exp.NumberOfNames;
+                    while (lo < hi) {
+                        const DWORD mid = lo + (hi - lo) / 2;
+                        DWORD rva = 0;
+                        if (!read((uint64_t)exp.AddressOfNames + (uint64_t)mid * sizeof(DWORD), &rva, sizeof(rva))) return false;
+                        // One remote read per probe (inside the image: read() bounds it by
+                        // SizeOfImage); names longer than the buffer compare by their prefix,
+                        // which decides against our short names exactly as a full compare would.
+                        unsigned char name[40] = {};       // longer than every name we look for
+                        if (rva >= limit) return false;
+                        const size_t len = (size_t)std::min<uint64_t>(sizeof(name), limit - rva);
+                        const bool bulk = read(rva, name, len);
+                        int cmp = 0;
+                        for (size_t k = 0; ; ++k) {        // want's NUL ends it in time
+                            unsigned char ch = 0;
+                            if (bulk && k < len) ch = name[k];
+                            else if (!read((uint64_t)rva + k, &ch, 1)) return false;
+                            cmp = (int)ch - (unsigned char)want[k];
+                            if (cmp || !want[k]) break;
+                        }
+                        if (!cmp) return true;
+                        if (cmp < 0) lo = mid + 1;
+                        else hi = mid;
+                    }
+                    return false;
+                };
+                const bool init = exported("probe_agent_init"), stop = exported("probe_agent_stop"),
+                           bind = exported("probe_agent_bind_controller");
+                if (reuse_trace) std::fprintf(stderr,
+                    "probe: test: reuse controls base=0x%llx init=%d stop=%d bind=%d\n",
+                    (unsigned long long)base, (int)init, (int)stop, (int)bind);
+                return init && stop && bind;
+            };
+            const bool identified = identify();
+            if (reuse_trace) std::fprintf(stderr,
+                "probe: test: reuse image base=0x%llx %s via=%s magic=0x%x machine=0x%x names=%lu DLL=%s\n",
+                (unsigned long long)base, identified ? "identified" : "skip", how,
+                nt.OptionalHeader.Magic, nt.FileHeader.Machine, export_names, dll_name);
+            if (identified) agents.push_back({base, nt, how});
+        }
+        if (next <= at) break;
+        at = next;
+    }
+    if (agents.size() > 1) return unknown("multiple retained agents");
+    for (const auto &agent : agents) {
+#if defined(UHH_TEST_HOOKS)
+        if (std::getenv("UHH_TEST_REUSE_AGENT_UNREADABLE")) return unknown("test: agent identity unreadable");
+#endif
         if (!ensure_local_agent(s)) return false;
+        // The same PE build fields/checksum used for warm-copy identity, read
+        // from the loaded image before consulting its backing file.
+        const auto *local_dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(s->local_agent);
+        const auto *local_nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(
+            reinterpret_cast<const unsigned char *>(s->local_agent) + local_dos->e_lfanew);
+        const auto &have_nt = agent.nt;
+        if (reuse_trace) {
+            auto headers = [&](const char *which, uintptr_t base, const IMAGE_NT_HEADERS &nt) {
+                std::fprintf(stderr, "probe: test: reuse %s base=0x%llx via=%s magic=0x%x machine=0x%x "
+                             "stamp=0x%lx sections=%u size=0x%lx entry=0x%lx version=%u.%u checksum=0x%lx\n",
+                             which, (unsigned long long)base, agent.how, nt.OptionalHeader.Magic,
+                             nt.FileHeader.Machine, nt.FileHeader.TimeDateStamp, nt.FileHeader.NumberOfSections,
+                             nt.OptionalHeader.SizeOfImage, nt.OptionalHeader.AddressOfEntryPoint,
+                             nt.OptionalHeader.MajorImageVersion, nt.OptionalHeader.MinorImageVersion, nt.OptionalHeader.CheckSum);
+            };
+            headers("target", agent.base, have_nt);
+            headers("controller", reinterpret_cast<uintptr_t>(s->local_agent), *local_nt);
+        }
+        const bool same = have_nt.FileHeader.TimeDateStamp == local_nt->FileHeader.TimeDateStamp &&
+            have_nt.FileHeader.Machine == local_nt->FileHeader.Machine &&
+            have_nt.FileHeader.NumberOfSections == local_nt->FileHeader.NumberOfSections &&
+            have_nt.OptionalHeader.SizeOfImage == local_nt->OptionalHeader.SizeOfImage &&
+            have_nt.OptionalHeader.AddressOfEntryPoint == local_nt->OptionalHeader.AddressOfEntryPoint &&
+            have_nt.OptionalHeader.MajorImageVersion == local_nt->OptionalHeader.MajorImageVersion &&
+            have_nt.OptionalHeader.MinorImageVersion == local_nt->OptionalHeader.MinorImageVersion &&
+            have_nt.OptionalHeader.CheckSum == local_nt->OptionalHeader.CheckSum;
+        if (reuse_trace) std::fprintf(stderr, "probe: test: reuse headers %s\n", same ? "match" : "differ");
+        if (!same) {
+            set_error(s, "retained inline agent differs from this build; restart the target before attaching"); return false;
+        }
+        wchar_t path[32768];
+        DWORD n = K32GetModuleFileNameExW(s->pi.hProcess, reinterpret_cast<HMODULE>(agent.base),
+                                        path, (DWORD)(sizeof(path) / sizeof(path[0])));
+#if defined(UHH_TEST_HOOKS)
+        if (std::getenv("UHH_TEST_REUSE_NO_MODULE_NAME")) n = 0;
+#endif
+        std::wstring file;
+        if (n && n < sizeof(path) / sizeof(path[0])) file.assign(path, n);
+        else {
+            n = K32GetMappedFileNameW(s->pi.hProcess, reinterpret_cast<void *>(agent.base), path,
+                                     (DWORD)(sizeof(path) / sizeof(path[0])));
+            if (!n || n >= sizeof(path) / sizeof(path[0])) return unknown(win_error("mapped agent filename").c_str());
+            if (reuse_trace) std::fprintf(stderr, "probe: test: reuse mapped path=%ls\n", path);
+            file = L"\\\\?\\GLOBALROOT" + std::wstring(path, n);
+            // Prefer the DOS spelling for the retained file (also used by the
+            // loader). Keep GLOBALROOT only for volumes with no drive alias.
+            wchar_t drives[512];
+            const DWORD count = GetLogicalDriveStringsW(_countof(drives), drives);
+            if (count && count < _countof(drives)) {
+                for (const wchar_t *drive = drives; *drive; drive += wcslen(drive) + 1) {
+                    wchar_t letter[3] = {drive[0], L':', 0}, device[512];
+                    if (!QueryDosDeviceW(letter, device, _countof(device))) continue;
+                    const size_t len = wcslen(device);
+                    if (len < n && path[len] == L'\\' && !_wcsnicmp(path, device, len)) {
+                        file = std::wstring(letter) + (path + len); break;
+                    }
+                }
+            }
+        }
+#if defined(UHH_TEST_HOOKS)
+        if (std::getenv("UHH_TEST_REUSE_STALE_MAPPED_NAME")) file += L".missing";
+#endif
         auto read = [](const std::wstring &file, std::vector<unsigned char> &bytes) {
             HANDLE f = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
                                    nullptr, OPEN_EXISTING, 0, nullptr);
             if (f == INVALID_HANDLE_VALUE) return false;
-            const bool ok = read_whole_file(f, bytes); CloseHandle(f);
+            const bool ok = read_whole_file(f, bytes);
+            const DWORD error = GetLastError(); CloseHandle(f);
+            if (!ok) SetLastError(error);
             if (ok) trim_agent_image(bytes);
             return ok;
         };
         std::vector<unsigned char> want, have;
-        if (!read(s->agent_path, want) || !read(path, have)) continue;
+        if (!read(s->agent_path, want)) return unknown(win_error("read controller agent file").c_str());
+        if (reuse_trace) std::fprintf(stderr, "probe: test: reuse files controller=%ls target=%ls\n",
+                                     s->agent_path.c_str(), file.c_str());
+        if (!read(file, have)) {
+            DWORD error = GetLastError();
+            if (reuse_trace) std::fprintf(stderr, "probe: test: reuse retained file read failed error=%lu\n", error);
+            // A warmed image section can retain its pre-rename filename. Find
+            // the current loader path for this exact, memory-identified base;
+            // this lookup cannot authorize fresh injection or select another DLL.
+            HANDLE snap = INVALID_HANDLE_VALUE;
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetProcessId(s->pi.hProcess));
+                if (snap != INVALID_HANDLE_VALUE || GetLastError() != ERROR_BAD_LENGTH) break;
+            }
+            bool recovered = false;
+            if (snap != INVALID_HANDLE_VALUE) {
+                MODULEENTRY32W entry{}; entry.dwSize = sizeof(entry);
+                if (Module32FirstW(snap, &entry)) do {
+                    if (reinterpret_cast<uintptr_t>(entry.modBaseAddr) != agent.base) continue;
+                    file = entry.szExePath;
+                    if (reuse_trace) std::fprintf(stderr, "probe: test: reuse snapshot path=%ls\n", file.c_str());
+                    recovered = read(file, have);
+                    if (!recovered) error = GetLastError();
+                    break;
+                } while (Module32NextW(snap, &entry));
+                CloseHandle(snap);
+            }
+            if (!recovered) {
+                SetLastError(error); return unknown(win_error("read retained agent file").c_str());
+            }
+        }
+        if (reuse_trace) std::fprintf(stderr, "probe: test: reuse normalized files %s controller=%ls target=%ls\n",
+                                     want == have ? "match" : "differ", s->agent_path.c_str(), file.c_str());
         if (want != have) {
             set_error(s, "retained inline agent differs from this build; restart the target before attaching"); return false;
         }
@@ -539,7 +777,7 @@ bool reuse_target_agent(probe_session *s) {
             }
         }
         FreeLibrary(s->local_agent); s->local_agent = nullptr; s->agent_prep_module = nullptr;
-        s->agent_path = path; s->agent_prep_error = 0;
+        s->agent_path = file; s->agent_prep_error = 0;
         return ensure_local_agent(s);
     }
     return true;

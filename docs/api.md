@@ -255,6 +255,10 @@ Attaches to a running process instead of launching one.
   reuses an identified retained agent only when its normalized file contents match
   this build, and maps that same file in the controller to reconnect `UHH_SHARED`.
   A different build is refused; restart the target to use it.
+  Discovery identifies agents by mapped PE export names, independently of loader
+  lists and filenames; unreadable/unrelated images are skipped. For an identified
+  agent, in-memory PE build fields/checksum must also match. An unreadable agent
+  identity or backing file refuses attach with `retained inline agent unknown-image`.
 - `probe_run` returns when the target exits. `probe_close` on a still-running target
   **detaches**: requests inline unhooking, restores breakpoints and clears UHH-owned debug registers;
   the target keeps running. The agent stop wait is bounded to 5 s. If it cannot finish in
@@ -614,7 +618,9 @@ UHH_SHARED OpenRecord g_by_handle[kHandleSlots];   // examples/gated_config/call
   sessions never share. To keep that copy off the launch's critical path, a controller
   prepares the next session's copy in `%TEMP%\uhh\warm`; one is used only while `%TEMP%\uhh`
   is writable by this user alone (plus SYSTEM / Administrators) and only if it is exactly
-  this build's agent (version stamp, PE identity and checksum), else a fresh copy is made.
+  this build's agent (version stamp, PE identity, checksum, and exact byte comparison
+  against a freshly normalized source snapshot), else a fresh copy is made. The
+  metadata stamp alone never authenticates a warm copy.
 - A breakpoint/hw callback of a module with `UHH_SHARED` globals must be an export that the
   agent DLL also has (it is run from there): otherwise `callback uses UHH_SHARED state but
   is not a named export ...` or `UHH_SHARED callback '<name>' is not exported by the agent

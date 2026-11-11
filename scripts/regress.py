@@ -7796,7 +7796,8 @@ def check_ctrl_warm():
       ctrl-warm-identity: (a) a copy named for this agent's size and write time but made from another
         build (the agent with one DOS-stub byte changed) must not be used; (b) a copy under this
         agent's full version stamp (volume, file id, size, write time, change time) that is not a
-        complete trimmed image of it (here: the untrimmed agent with that byte changed) is rejected
+        complete trimmed image of it (here: another image with matching PE fields and a valid
+        recomputed checksum, but a changed DOS-stub byte) is rejected
         and deleted; the first session makes a new copy (agent_copy_kind new) and works; a later
         session takes the genuine warm copy the first one left (agent_copy_kind warm: perf5's gain).
       ctrl-warm-acl: under a %TEMP% whose ACL lets Everyone write, no warm copy is made or taken
@@ -7848,6 +7849,14 @@ def check_ctrl_warm():
         try:
             tmp = base / "id"; warm = tmp / "uhh" / "warm"
             img = bytearray(Path(agent).read_bytes()); img[0x50] ^= 0x01
+            # A self-consistent checksum must not authenticate different source bytes.
+            nt = struct.unpack_from("<I", img, 0x3c)[0]
+            checksum_at = nt + 24 + 64       # OptionalHeader.CheckSum, PE32 and PE32+
+            struct.pack_into("<I", img, checksum_at, 0)
+            checksum = sum(x[0] for x in struct.iter_unpack("<H", img[:len(img) & ~1]))
+            if len(img) & 1: checksum += img[-1]
+            while checksum >> 16: checksum = (checksum & 0xffff) + (checksum >> 16)
+            struct.pack_into("<I", img, checksum_at, checksum + len(img))
             stale, corrupt = warm / f"{old_sig}-1-1-1", warm / f"{sig}-1-1-2"
             for d in (stale, corrupt):
                 d.mkdir(parents=True)
@@ -8947,7 +8956,7 @@ def check_session_agentipc():
 
     # Fresh controller processes on every cycle: this also tests shared sections across
     # different local DLL mappings. Keep the target alive until all memory queries finish.
-    for case in ("shared", "identity", "config", "retry", "stub", "freeze", "freeze-context", "unknown-image"):
+    for case in ("shared", "identity", "identity-loader", "identity-unreadable", "config", "retry", "stub", "freeze", "freeze-context", "unknown-image", "unknown-image-unreadable"):
         name = f"session-agentipc-{case}"
         target = None
         drivers = []
@@ -8961,21 +8970,25 @@ def check_session_agentipc():
             pid = json.loads(ready)["pid"]
             if json.loads(ready).get("distinct") != 1: raise RuntimeError("fixture sites were folded")
             driver = d
-            if case == "identity":
+            if case.startswith("identity"):
                 # Only the agent changes between controllers; its retained per-session
                 # target copy remains untouched. The alternate DLL is separately built by CMake.
                 shutil.copy2(d, tmp / d.name)
                 shutil.copy2(BIN / "probe_api_agent.dll", tmp / "probe_api_agent.dll")
                 driver = tmp / d.name
 
+            case_env = dict(os.environ)
+            if case == "shared" or case.startswith("identity"):
+                case_env["UHH_TEST_REUSE_TRACE"] = "1"
+
             def attach(mode, cfg=1, env=None, active=1):
                 p = subprocess.Popen([str(driver), "--review-" + mode, str(pid), str(cfg)],
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                     text=True, cwd=BIN, env=dict(os.environ, **(env or {})))
+                                     text=True, cwd=BIN, env=dict(case_env, **(env or {})))
                 po, pe = Lines(p.stdout), Lines(p.stderr)
                 drivers.append((p, po, pe))
                 if not po.wait_for(lambda l: '"kind":"attached"' in l, 10):
-                    raise RuntimeError(f"not attached: {pe.lines}")
+                    raise RuntimeError(f"not attached: {pe.lines}; target={out.lines}")
                 if active and not pe.wait_for(lambda l: sum(x.startswith("probe: active ") for x in pe.lines) >= active, 10):
                     raise RuntimeError(f"not active: {pe.lines}")
                 return p, po, pe
@@ -8990,26 +9003,48 @@ def check_session_agentipc():
                 if not line: raise RuntimeError(f"no hit {n}: {out.lines} {err.lines}")
                 return json.loads(line)
 
-            if case in ("shared", "identity"):
+            if case == "shared" or case.startswith("identity"):
                 for n in range(1, 4 if case == "shared" else 2):
-                    p, po, pe = attach("shared", 1 if n % 2 else 2, active=2)
+                    p, po, pe = attach("shared", 1 if n % 2 else 2, active=2,
+                                       env={"UHH_TEST_REUSE_NO_MODULE_NAME": "1",
+                                            "UHH_TEST_REUSE_NO_EXPORT_DLL_NAME": "1",
+                                            **({"UHH_TEST_REUSE_STALE_MAPPED_NAME": "1"} if n == 3 else {})}
+                                       if n > 1 else None)
                     hit(n)
                     if not po.wait_for(lambda l: l.startswith("{") and json.loads(l).get("message") == f"ar shared {n}", 10):
                         raise RuntimeError(f"shared value missing: {po.lines}")
                     detach(p)
-                if case == "identity":
+                    cue(target, "a\n")
+                    retained = out.wait_for(lambda l: '"kind":"agent"' in l and
+                                            json.loads(l).get("n") == n, 10)
+                    if not retained or not json.loads(retained).get("base"):
+                        raise RuntimeError(f"fixture did not retain its agent after detach: {out.lines}")
+                if case.startswith("identity"):
                     agent = tmp / "probe_api_agent.dll"
                     alternate = exe("probe_api_agent_identity.dll")
                     if not alternate:
                         raise RuntimeError("missing project-built probe_api_agent_identity.dll")
+                    before, replacement = agent.read_bytes(), Path(alternate).read_bytes()
+                    def image_version(data):
+                        nt = struct.unpack_from("<I", data, 0x3c)[0]
+                        return struct.unpack_from("<HH", data, nt + 24 + 44)
+                    if before == replacement or image_version(before) == image_version(replacement):
+                        raise RuntimeError("identity fixture: alternate DLL must differ in contents and PE image version")
                     shutil.copy2(alternate, agent)
+                    env = dict(case_env)
+                    if case == "identity-loader":
+                        env["UHH_TEST_REUSE_NO_MODULE_NAME"] = "1"
+                        env["UHH_TEST_REUSE_NO_EXPORT_DLL_NAME"] = "1"
+                    elif case == "identity-unreadable":
+                        env["UHH_TEST_REUSE_AGENT_UNREADABLE"] = "1"
                     p = subprocess.Popen([str(driver), "--review-shared", str(pid), "1"], stdin=subprocess.PIPE,
-                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=BIN)
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=BIN, env=env)
                     po, pe = Lines(p.stdout), Lines(p.stderr)
                     drivers.append((p, po, pe))
                     # Do not feed the detach newline before asynchronous installs run.
                     # A clean close with pending probes says nothing about identity.
-                    refusal = "retained inline agent differs"
+                    refusal = ("retained inline agent unknown-image" if case == "identity-unreadable"
+                               else "retained inline agent differs")
                     decision = pe.wait_for(lambda l: refusal in l or
                                            sum(x.startswith("probe: active ") for x in pe.lines) >= 2, 10)
                     if not decision:
@@ -9022,7 +9057,8 @@ def check_session_agentipc():
                                            json.loads(l).get("message") == "ar shared 2", 10):
                             raise RuntimeError(f"identity fixture: probes active but no wrong-image callback hit: "
                                                f"stdout={po.lines} stderr={pe.lines}")
-                        raise RuntimeError(f"different image was accepted: wrong-image callback hit; {pe.lines}")
+                        raise RuntimeError(f"different image was accepted: wrong-image callback hit; "
+                                           f"retained={retained}; {pe.lines}")
                     try:
                         p.stdin.write("\n"); p.stdin.flush()   # a controller still waiting for detach
                     except OSError:
@@ -9031,13 +9067,16 @@ def check_session_agentipc():
                     if p.returncode == 0:
                         raise RuntimeError("identity refusal reported but controller exited successfully")
                     hit(2)                         # still alive and executing its original code
-            elif case == "unknown-image":
-                p, po, pe = attach("shared", env={"UHH_TEST_REUSE_UNKNOWN": "1"}, active=2)
+            elif case in ("unknown-image", "unknown-image-unreadable"):
+                knob = "UHH_TEST_REUSE_UNKNOWN" if case == "unknown-image" else "UHH_TEST_REUSE_UNREADABLE_NON_AGENT"
+                p, po, pe = attach("shared", env={knob: "1"}, active=2)
                 hit(1)
                 if not po.wait_for(lambda l: l.startswith("{") and json.loads(l).get("message") == "ar shared 1", 10):
                     raise RuntimeError(f"fresh injection did not run callbacks: {po.lines}")
                 detach(p)
-                if not any("probe: test: unrelated image unidentified" in l for l in pe.lines):
+                message = ("probe: test: unrelated image unidentified" if case == "unknown-image"
+                           else "probe: test: unrelated image headers unreadable")
+                if not any(message in l for l in pe.lines):
                     raise RuntimeError("unknown-image path was not exercised")
             elif case == "config":
                 p, po, pe = attach("config", env={"UHH_TEST_STOP_FAIL": "1"})
