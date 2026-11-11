@@ -210,6 +210,8 @@ int ar_review_case(const char *k) {
         const bool distinct = (uintptr_t)&ar_shared_write_site != (uintptr_t)&ar_shared_read_site;
         printf("{\"kind\":\"ready\",\"pid\":%lu,\"distinct\":%d}\n", GetCurrentProcessId(), distinct ? 1 : 0); fflush(stdout);
         if (!distinct) return 2;
+        void *protected_agent = nullptr;
+        DWORD agent_protect = 0;
         int n = 0;
         for (int ch; (ch = getchar()) != EOF && ch != 'q'; ) {
             if (ch == 'a') {
@@ -225,6 +227,11 @@ int ar_review_case(const char *k) {
                 }
                 printf("{\"kind\":\"agent\",\"n\":%d,\"base\":%llu,\"exports\":%lu}\n",
                        n, (unsigned long long)(uintptr_t)agent, names); fflush(stdout);
+                if (getenv("UHH_TEST_REUSE_PROTECT_AGENT")) {
+                    if (!agent || !VirtualProtect(agent, 4096, PAGE_NOACCESS, &agent_protect)) return 2;
+                    protected_agent = agent;
+                    printf("{\"kind\":\"agent-unreadable\"}\n"); fflush(stdout);
+                }
             }
             if (ch == 'm') {
                 char text[64] = {}; if (!fgets(text, sizeof(text), stdin)) return 2;
@@ -239,6 +246,10 @@ int ar_review_case(const char *k) {
                 else value = ar_config_site();
                 printf("{\"kind\":\"ar\",\"n\":%d,\"value\":%d}\n", n, value); fflush(stdout);
             }
+        }
+        if (protected_agent) {
+            DWORD old = 0;
+            if (!VirtualProtect(protected_agent, 4096, agent_protect, &old)) return 2;
         }
         return 0;
     }

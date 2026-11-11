@@ -9002,14 +9002,16 @@ def check_session_agentipc():
 
     # Fresh controller processes on every cycle: this also tests shared sections across
     # different local DLL mappings. Keep the target alive until all memory queries finish.
-    for case in ("shared", "identity", "identity-loader", "identity-unreadable", "config", "retry", "stub", "freeze", "freeze-context", "unknown-image", "unknown-image-unreadable"):
+    for case in ("shared", "agent-unreadable", "identity", "identity-loader", "identity-unreadable", "config", "retry", "stub", "freeze", "freeze-context", "unknown-image", "unknown-image-unreadable"):
         name = f"session-agentipc-{case}"
         target = None
         drivers = []
         tmp = Path(tempfile.mkdtemp(prefix="uhh-agentipc-"))
         try:
             target = subprocess.Popen([str(t), "review-config" if case in ("config", "freeze", "freeze-context") else "review-shared"],
-                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=BIN)
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=BIN,
+                                      env=dict(os.environ, **({"UHH_TEST_REUSE_PROTECT_AGENT": "1"}
+                                                             if case == "agent-unreadable" else {})))
             out, err = Lines(target.stdout), Lines(target.stderr)
             ready = out.wait_for(lambda l: '"kind":"ready"' in l, 10)
             if not ready: raise RuntimeError(f"target not ready: {err.lines}")
@@ -9049,7 +9051,7 @@ def check_session_agentipc():
                 if not line: raise RuntimeError(f"no hit {n}: {out.lines} {err.lines}")
                 return json.loads(line)
 
-            if case == "shared" or case.startswith("identity"):
+            if case in ("shared", "agent-unreadable") or case.startswith("identity"):
                 for n in range(1, 4 if case == "shared" else 2):
                     p, po, pe = attach("shared", 1 if n % 2 else 2, active=2,
                                        env={"UHH_TEST_REUSE_NO_MODULE_NAME": "1",
@@ -9065,6 +9067,26 @@ def check_session_agentipc():
                                             json.loads(l).get("n") == n, 10)
                     if not retained or not json.loads(retained).get("base"):
                         raise RuntimeError(f"fixture did not retain its agent after detach: {out.lines}")
+                if case == "agent-unreadable":
+                    if not out.wait_for(lambda l: '"kind":"agent-unreadable"' in l, 10):
+                        raise RuntimeError(f"agent header protection failed: {out.lines} {err.lines}")
+                    p = subprocess.Popen([str(d), "--review-shared", str(pid), "1"], stdin=subprocess.PIPE,
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=BIN)
+                    po, pe = Lines(p.stdout), Lines(p.stderr)
+                    drivers.append((p, po, pe))
+                    refusal = "retained inline agent unknown-image: agent image unreadable"
+                    if not pe.wait_for(lambda l: refusal in l or l.startswith("probe: active "), 10):
+                        raise RuntimeError(f"no unreadable-agent decision: {pe.lines}")
+                    if not any(refusal in l for l in pe.lines):
+                        raise RuntimeError(f"unreadable retained agent accepted: {pe.lines}")
+                    try:
+                        cue(p, "\n")
+                    except OSError:
+                        pass
+                    p.wait(timeout=20)
+                    if p.returncode == 0:
+                        raise RuntimeError("unreadable-agent refusal exited successfully")
+                    hit(2)
                 if case.startswith("identity"):
                     agent = tmp / "probe_api_agent.dll"
                     alternate = exe("probe_api_agent_identity.dll")

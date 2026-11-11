@@ -532,8 +532,8 @@ bool reuse_target_agent(probe_session *s) {
 #else
     const bool reuse_trace = false;
 #endif
-    // Identify UHH from mapped PE exports, never from the loader list or filename.
-    // Unreadable/unrelated images are not evidence of a retained agent.
+    // Identify UHH from mapped PE exports. A mapped-name fallback after a failed
+    // memory read can refuse attach, but never authorize reuse.
     struct Retained { uintptr_t base; IMAGE_NT_HEADERS nt; const char *how; };
     std::vector<Retained> agents;
     for (uintptr_t at = 0; ; ) {
@@ -550,14 +550,16 @@ bool reuse_target_agent(probe_session *s) {
             const char *how = "headers";
             DWORD export_names = 0;
             char dll_name[64] = {};
+            bool unreadable = false;
             auto identify = [&]() {
                 uint64_t limit = 1u << 20; // bound header reads before SizeOfImage is known
                 auto read = [&](uint64_t rva, void *dst, size_t n) {
                     SIZE_T got = 0;
-                    const bool ok = rva <= limit && n <= limit - rva && rva <= UINTPTR_MAX - base &&
-                        n <= UINTPTR_MAX - base - rva &&
-                        ReadProcessMemory(s->pi.hProcess, reinterpret_cast<void *>(base + (uintptr_t)rva),
+                    if (rva > limit || n > limit - rva || rva > UINTPTR_MAX - base ||
+                        n > UINTPTR_MAX - base - rva) return false;
+                    const bool ok = ReadProcessMemory(s->pi.hProcess, reinterpret_cast<void *>(base + (uintptr_t)rva),
                                           dst, n, &got) && got == n;
+                    if (!ok) unreadable = true;
                     if (!ok && reuse_trace) std::fprintf(stderr,
                         "probe: test: reuse read failed base=0x%llx rva=0x%llx bytes=%zu got=%zu error=%lu\n",
                         (unsigned long long)base, (unsigned long long)rva, n, (size_t)got, GetLastError());
@@ -576,7 +578,8 @@ bool reuse_target_agent(probe_session *s) {
                     }
                     if (std::getenv("UHH_TEST_REUSE_UNREADABLE_NON_AGENT")) {
                         // Simulate failure of its remaining PE/export reads.
-                        std::fprintf(stderr, "probe: test: unrelated image headers unreadable\n"); return false;
+                        std::fprintf(stderr, "probe: test: unrelated image headers unreadable\n");
+                        unreadable = true; return false;
                     }
                 }
 #endif
@@ -589,7 +592,9 @@ bool reuse_target_agent(probe_session *s) {
                 if (!dir.VirtualAddress || !read(dir.VirtualAddress, &exp, sizeof(exp))) return false;
                 export_names = exp.NumberOfNames;
                 if (reuse_trace && exp.Name) {
+                    const bool was_unreadable = unreadable;
                     read(exp.Name, dll_name, sizeof(dll_name) - 1);
+                    unreadable = was_unreadable; // diagnostic reads do not affect identification
                     dll_name[sizeof(dll_name) - 1] = 0;
                 }
                 auto named = [&](DWORD rva, const char *want) {
@@ -649,6 +654,17 @@ bool reuse_target_agent(probe_session *s) {
                 (unsigned long long)base, identified ? "identified" : "skip", how,
                 nt.OptionalHeader.Magic, nt.FileHeader.Machine, export_names, dll_name);
             if (identified) agents.push_back({base, nt, how});
+            else if (unreadable) {
+                wchar_t path[32768];
+                const DWORD n = K32GetMappedFileNameW(s->pi.hProcess, reinterpret_cast<void *>(base),
+                                                     path, _countof(path));
+                if (n && n < _countof(path)) {
+                    path[n] = 0;
+                    const wchar_t *name = wcsrchr(path, L'\\');
+                    if (!_wcsicmp(name ? name + 1 : path, L"probe_api_agent.dll"))
+                        return unknown("agent image unreadable");
+                }
+            }
         }
         if (next <= at) break;
         at = next;
