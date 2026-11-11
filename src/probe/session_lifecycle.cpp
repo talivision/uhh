@@ -178,7 +178,7 @@ bool guard_claim_event(probe_session *s, const DEBUG_EVENT &event) {
         for (int slot = 0; slot < 4; ++slot)
             if ((hits & (1u << slot)) && (s->dr_used & (1u << slot)) &&
                 ((cx.Dr7 >> (2 * slot)) & 3) && dr_address(cx, slot) == s->co_ret &&
-                !(cx.Dr7 & ((decltype(cx.Dr7))0xF << (16 + 4 * slot))) {
+                !(cx.Dr7 & ((decltype(cx.Dr7))0xF << (16 + 4 * slot)))) {
                 owned |= 1u << slot; kind = PROBE_ORPHAN_EXECUTE;
             }
     if (hits & ~owned) return true;
