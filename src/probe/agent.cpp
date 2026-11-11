@@ -3139,10 +3139,16 @@ static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
         if ((cx->Dr7 >> (slot * 2)) & 3) enabled |= 1u << slot;
     unsigned char original = 0;
     const bool held_site = held && int3_original(at, original);
-    // A statusless exception cannot be attributed by a stale TID alone. Require
-    // a live step, or a held thread at an owned PC, and no enabled foreign slot.
+    bool execute_site = false;
+    const LONG site_count = g.dr_site_count;
+    if (site_count >= 0 && site_count <= (LONG)PROBE_AGENT_GUARD_DR_SITES)
+        for (LONG i = 0; i < site_count; ++i)
+            if (g.dr_sites[i] == at) { execute_site = true; break; }
+    // An execute DR faults AT its site, unlike a data watch (which traps after
+    // the access). Teardown may erase every register bit before delivery. The
+    // published address then attributes the fault even without a step/hold.
     const bool stray = !hits && !(cx->Dr6 & 0xE000u) && !(cx->EFlags & 0x100u) &&
-        !(enabled & ~mask) && (stepping || scratch_step || held_site) &&
+        !(enabled & ~mask) && (stepping || scratch_step || held_site || execute_site) &&
         no_debug_port() && claim_stray_step(tid);
     if (!(hits & mask) && !step && !stray) return EXCEPTION_CONTINUE_SEARCH;
     // A live controller consumes our traps before the VEH. This orphaned hit can precede

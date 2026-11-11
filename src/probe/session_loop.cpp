@@ -1408,7 +1408,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
 #endif
 #if defined(UHH_TEST_HOOKS)
         const char *die_step = std::getenv("UHH_TEST_DIE_PENDING_STEP");
-        const bool test_step = die_step && s->attached && s->shared && s->shared->guard.enabled &&
+        const bool test_step = die_step && std::strcmp(die_step, "hw") && s->attached && s->shared && s->shared->guard.enabled &&
             !target_hw && !step->second.prog_tf && !(native.EFlags & 0x100u);
         if (test_step) {
             guard_sync(s); // publish before clearing BS/TF
@@ -1572,7 +1572,8 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     // would be no completion #DB at which DIE_PENDING_STEP could terminate us.
     // Force an ordinary instruction through the existing displaced TF step;
     // leave REP's tail INT3 and program-owned debug state on their normal paths.
-    force_pending_step = std::getenv("UHH_TEST_DIE_PENDING_STEP") &&
+    const char *pending_mode = std::getenv("UHH_TEST_DIE_PENDING_STEP");
+    force_pending_step = pending_mode && std::strcmp(pending_mode, "hw") &&
         s->attached && s->shared && s->shared->guard.enabled &&
         !probe->internal && !probe->rep_string;
 #endif

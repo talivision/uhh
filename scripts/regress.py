@@ -10008,7 +10008,7 @@ def lc_controller_killed(cfgname, cfg):
     bad, n, took, outcomes = [], 0, [], []
     timings = ["active", "active+0.5", "early-0.05", "early-0.3"]
     if cfgname == "mixed":
-        timings += ["pending-step", "pending-held"]
+        timings += ["pending-step", "pending-held", "pending-hw"]
     for when in timings:
         n += 1
         tg = d = None

@@ -543,6 +543,23 @@ bool repair_debug_delivery(probe_session *s, DWORD tid, const CONTEXT &native) {
         }
         if ((img.ContextFlags & CONTEXT_CONTROL) != CONTEXT_CONTROL || (uint64_t)EMU_IP(img) != it->second.ip)
             return true; // another (nested) exception: leave its context entirely alone
+#if defined(UHH_TEST_HOOKS)
+        const char *pending_mode = std::getenv("UHH_TEST_DIE_PENDING_STEP");
+        if (pending_mode && !std::strcmp(pending_mode, "hw")) {
+            // The hardware fault is still awaiting target dispatch. Clear its
+            // SAVED context too: live SetThreadContext alone leaves B bits in
+            // this image, allowing the old agent to pass the test accidentally.
+            img.Dr0 = img.Dr1 = img.Dr2 = img.Dr3 = img.Dr6 = img.Dr7 = 0;
+            img.EFlags &= ~0x100u;
+            if (!remote_write(s->pi.hProcess, rec, &img, sizeof(img), &n) || n != sizeof(img)) {
+                set_error(s, "write test pending hardware exception context"); return false;
+            }
+            std::fprintf(stderr, "probe: test: dying with statusless step outstanding (hw)\n");
+            std::fflush(stderr);
+            TerminateProcess(GetCurrentProcess(), 98);
+            return false;
+        }
+#endif
         const auto dr6 = (decltype(img.Dr6))((img.Dr6 & ~it->second.clear_bits) | it->second.set_bits);
         if (!remote_write(s->pi.hProcess, rec + offsetof(CONTEXT, Dr6), &dr6, sizeof(dr6), &n) || n != sizeof(dr6)) {
             set_error(s, "write debug exception status"); return false;
@@ -585,6 +602,25 @@ bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
     uint8_t theirs = target_slots(s, event.dwThreadId, native);             // the target's own slots on this thread
     for (int slot = 0; slot < 4; ++slot)                                     // ... incl. ones ours yielded to it
         if (hw_yielded(s, event.dwThreadId, native, slot)) theirs |= (uint8_t)(1u << slot);
+#if defined(UHH_TEST_HOOKS)
+    const char *pending_mode = std::getenv("UHH_TEST_DIE_PENDING_STEP");
+    if (pending_mode && !std::strcmp(pending_mode, "hw") && s->attached && s->shared &&
+        s->shared->guard.enabled && !theirs && !(native.Dr6 & 0xE000u) && !(native.EFlags & 0x100u)) {
+        for (const auto &p : s->probes)
+            if (p->active && !p->internal && (p->flags & PROBE_HW) &&
+                !(p->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) && p->dr_slot >= 0 && p->dr_slot < 4 &&
+                p->address == (uint64_t)EMU_IP(native) && (native.Dr6 & (1u << p->dr_slot))) {
+                // Deliver this real execute fault to the existing dispatcher
+                // repair breakpoint, then die before any target handler runs.
+                if (!queue_debug_delivery(s, event.dwThreadId, p->address, 0xE00Fu, 0)) return false;
+                native.Dr0 = native.Dr1 = native.Dr2 = native.Dr3 = native.Dr6 = native.Dr7 = 0;
+                if (!SetThreadContext(thread, &native)) {
+                    set_error(s, win_error("clear test pending hardware context")); return false;
+                }
+                return true; // handled=false: forward to dispatcher, not DBG_CONTINUE
+            }
+    }
+#endif
     if (!(native.Dr6 & 0xF & s->dr_used) && !(native.Dr6 & 0xF & theirs) && !(native.Dr6 & 0x4000) &&
         !(native.EFlags & 0x100u)) {
         // A #DB that is neither a trap-flag step (BS clear, TF clear) nor flagged in DR6 for

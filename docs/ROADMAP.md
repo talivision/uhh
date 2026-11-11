@@ -3432,3 +3432,28 @@ exceptions pass through. killwatch/watchreuse additionally raise a no-payload so
 single-step: both software exceptions and the foreign hardware hit must be delivered.
 The existing pending-step/held checks exercise scratch recovery on both architectures.
 Static diff review only; Windows build/runtime validation remains pending CI.
+
+ctlkill d7d56ec follow-up: the real x64 statusless orphan is at the mixed session's
+NtOpenProcess hardware execute site (ntdll+0xa0820). Execute breakpoints fault before
+the instruction. Debugger teardown/native DR cleanup can erase B0..B3 and DR7 before
+its target dispatch, without leaving step/held attribution. The guard now also
+accepts an exact exception-PC match in its published dr_sites table. All existing
+fallback gates remain: no B bits, BS/BD/BT or TF, no enabled foreign slot, no payload,
+no debugger, and one claim per thread. IP is unchanged; the instruction runs with
+UHH's slots cleared. Shared layout/version unchanged.
+
+`lifecycle-controller-killed-mixed` adds pending-hw on both architectures using
+UHH_TEST_DIE_PENDING_STEP=hw. It selects a real owned execute hit with no target DR
+slots or software step and forwards it to the existing debug-delivery repair
+breakpoint. There it zeros the saved exception's DR0..3/DR6/DR7 and TF and terminates
+the controller before a target handler can run. The outstanding debug event at
+termination is the dispatcher breakpoint; the original hardware exception is pending
+target dispatch. This staging is necessary: live SetThreadContext at the original
+hardware event cannot deterministically erase the trap-time saved B bits. The knob
+is excluded from the software-step forcing/death paths.
+
+The old agent handles the orphan dispatcher INT3, then rejects the saved hardware
+exception: no hits or BS, no step membership, and its PC is the hardware site rather
+than an INT3 site or scratch copy. The target dies with 0x80000004, failing the same
+survival/progress/cleanliness/no-unhandled/shutdown checks as pending-step/held.
+Static diff review only here; Windows x64/x86 build/runtime validation pending CI.
