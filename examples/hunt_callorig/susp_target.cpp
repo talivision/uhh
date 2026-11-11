@@ -129,6 +129,11 @@ static bool read_gate(DWORD timeout_ms = 60000) {
     return false;
 }
 
+// WOW64 may deliver a raised single-step in its WX86 status form.
+static bool is_single_step(DWORD code) {
+    return code == EXCEPTION_SINGLE_STEP || code == 0x4000001Eu /* STATUS_WX86_SINGLE_STEP */;
+}
+
 // A data-watch trap reports the instruction AFTER this write, not the data address.
 extern "C" { __declspec(dllexport) volatile LONG co_watch_value = 0; }
 static volatile LONG g_watch_exceptions, g_target_exceptions, g_own_hits, g_own_value, g_plain_raise;
@@ -168,7 +173,7 @@ static DWORD WINAPI watchdeath_own_dr(void *main_thread) {
     return ok ? 0 : 1;
 }
 static LONG CALLBACK watchdeath_veh(EXCEPTION_POINTERS *ep) {
-    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+    if (!is_single_step(ep->ExceptionRecord->ExceptionCode)) return EXCEPTION_CONTINUE_SEARCH;
     // RaiseException can carry stale DR6 bits from the preceding hardware trap. Identify
     // our software exception by its payload, independently of the saved debug status.
     if (g_plain_raise || (ep->ExceptionRecord->NumberParameters == 1 &&
@@ -247,7 +252,7 @@ static DWORD WINAPI stray_watchdog(void *stop) {
     return 0;
 }
 static LONG CALLBACK stray_veh(EXCEPTION_POINTERS *ep) {
-    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+    if (!is_single_step(ep->ExceptionRecord->ExceptionCode)) return EXCEPTION_CONTINUE_SEARCH;
     if (ep->ExceptionRecord->ExceptionAddress != g_stray_address ||
         ep->ExceptionRecord->NumberParameters || (ep->ContextRecord->Dr6 & 0xE00Fu) ||
         (ep->ContextRecord->EFlags & 0x100u)) {
@@ -262,7 +267,7 @@ static LONG CALLBACK stray_veh(EXCEPTION_POINTERS *ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 static LONG stray_filter(EXCEPTION_POINTERS *ep) {
-    return ep->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP &&
+    return is_single_step(ep->ExceptionRecord->ExceptionCode) &&
         ep->ExceptionRecord->ExceptionAddress == g_stray_address ?
         EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
 }
