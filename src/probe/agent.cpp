@@ -764,7 +764,19 @@ static bool controller_dead(const probe_agent_shared *sh) {
 // record pays one byte compare.
 static void test_wedge_point(const probe_agent_log &rec) {
     static const char tag[] = "UHH_TEST_WEDGE ";
-    if (rec.text_len < sizeof(tag) - 1 || rec.text[0] != 'U' || std::memcmp(rec.text, tag, sizeof(tag) - 1)) return;
+    if (rec.text_len < sizeof(tag) - 1 || rec.text[0] != 'U') return;
+    // logs-order-tail: delay publication AFTER reserving a real inline slot. Only
+    // test-tagged records inspect the knob; ordinary logs retain the byte-compare path.
+    static const char delay_tag[] = "UHH_TEST_DELAY ";
+    if (!std::memcmp(rec.text, delay_tag, sizeof(delay_tag) - 1)) {
+        char ms[16] = {};
+        if (GetEnvironmentVariableA("UHH_TEST_LOG_PUBLISH_DELAY_MS", ms, sizeof(ms))) {
+            const unsigned long delay = strtoul(ms, nullptr, 10);
+            if (delay && delay <= 1000) Sleep((DWORD)delay);
+        }
+        return;
+    }
+    if (std::memcmp(rec.text, tag, sizeof(tag) - 1)) return;
     char on[4] = {};
     if (!GetEnvironmentVariableA("UHH_TEST_LOG_WEDGE", on, sizeof(on)) || on[0] != '1') return;
     wchar_t at[64], go[64];
@@ -946,7 +958,8 @@ static uint64_t agent_resolve(const char *symbol) {
         uint64_t rva = 0;
         if (!plus || plus == symbol || !agent_parse_hex(plus + 1, stop, &rva)) return 0;
         HMODULE m = agent_module(symbol, plus);
-        return m ? (uint64_t)(uintptr_t)m + rva : 0;
+        const uint64_t base = (uint64_t)(uintptr_t)m;
+        return m && rva <= UINT64_MAX - base ? base + rva : 0;
     }
     if (bang == symbol) return 0;
     const char *plus = strchr(bang + 1, '+'), *name_end = plus ? plus : stop;
@@ -958,7 +971,8 @@ static uint64_t agent_resolve(const char *symbol) {
     if (!m) return 0;
     memcpy(name, bang + 1, name_end - bang - 1); name[name_end - bang - 1] = 0;
     FARPROC f = GetProcAddress(m, name);
-    return f ? (uint64_t)(uintptr_t)f + off : 0;
+    const uint64_t base = (uint64_t)(uintptr_t)f;
+    return f && off <= UINT64_MAX - base ? base + off : 0;
 }
 
 #if defined(_WIN64)
@@ -1363,6 +1377,42 @@ static ThreadSlot *thread_slot(DWORD tid, bool claim) {
     if (ThreadSlot *s = slot_in(g_overflow, AGENT_OVERFLOW_SLOTS, tid, true)) return s;
     return take_dead_slot(g_overflow, AGENT_OVERFLOW_SLOTS, tid);   // null: g_untracked_running
 }
+// Admission precedes implicit TLS and slot/accounting setup: even GetTickCount64
+// can itself be probed. This TLS-free guard covers only agent bookkeeping;
+// HitScope takes over before user code (whose recursive hits still count).
+struct EntrySlot { volatile LONG tid; uintptr_t frame; };
+static EntrySlot g_entries[AGENT_THREAD_SLOTS + AGENT_OVERFLOW_SLOTS];
+static __forceinline EntrySlot *entry_begin(DWORD tid, uintptr_t frame, bool &full) {
+    for (;;) {
+        EntrySlot *available = nullptr;
+        for (uint32_t n = 0; n < _countof(g_entries); ++n) {
+            EntrySlot &e = g_entries[((tid >> 2) + n) % _countof(g_entries)];
+            const LONG owner = e.tid;
+            if (owner == (LONG)tid) {
+                // A nested entry is below its owner's frame. A non-unwinding
+                // escape can leave an old admission above the next hit's SP.
+                if (frame < e.frame) return nullptr;
+                e.frame = frame;
+                return &e;
+            }
+            if (!available && (!owner || owner == SLOT_MOVING)) available = &e;
+            if (!owner) break;
+        }
+        if (!available) { full = true; return nullptr; } // never run bookkeeping without protection
+        const LONG owner = available->tid;
+        if (owner != 0 && owner != SLOT_MOVING) continue;
+        if (InterlockedCompareExchange(&available->tid, (LONG)tid, owner) != owner) continue;
+        available->frame = frame;
+        return available;
+    }
+}
+static __forceinline void entry_end(DWORD tid) {
+    for (uint32_t n = 0; n < _countof(g_entries); ++n) {
+        EntrySlot &e = g_entries[((tid >> 2) + n) % _countof(g_entries)];
+        if (e.tid == (LONG)tid) { InterlockedExchange(&e.tid, SLOT_MOVING); return; }
+        if (!e.tid) return;
+    }
+}
 // The current thread's creation time (0: unknown). Hits it causes (a probe on
 // NtQueryInformationThread) pass straight through: see ThreadSlot::busy.
 using nt_qit_fn = LONG (NTAPI *)(HANDLE, ULONG, void *, ULONG, ULONG *);
@@ -1691,9 +1741,9 @@ extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
     // The register arguments always go as the hit had them (as on breakpoint/hw, which run the
     // original in place): a method called with nargs 0 still gets `this` (RCX).
     for (int i = 0; i < (nargs > 4 ? nargs : 4); ++i) a[i] = get_func_arg(c, (size_t)i);
-    const int extra = window(c->hit_sp + 0x28, 8, UHH_ORIG_STACK_ARGS);
+    const int extra = window(c->regs.rsp + 0x28, 8, UHH_ORIG_STACK_ARGS);
     for (int i = 0; i < extra; ++i)
-        if (4 + i >= nargs) a[4 + i] = reinterpret_cast<const uint64_t *>((uintptr_t)(c->hit_sp + 0x28))[i];
+        if (4 + i >= nargs) a[4 + i] = reinterpret_cast<const uint64_t *>((uintptr_t)(c->regs.rsp + 0x28))[i];
     OrigFrame f{};
     f.rip = ret_addr; f.rsp = c->hit_sp + 8;
     f.nv[0] = c->regs.rbx; f.nv[1] = c->regs.rbp; f.nv[2] = c->regs.rsi; f.nv[3] = c->regs.rdi;
@@ -1705,8 +1755,8 @@ extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
     uint32_t a32[64] = {0}, lo = 0;
     int32_t popped = -1;
     for (int i = 0; i < nargs; ++i) a32[i] = (uint32_t)get_func_arg(c, (size_t)i);
-    int n = window(c->hit_sp + 4, 4, 64);
-    for (int i = nargs; i < n; ++i) a32[i] = reinterpret_cast<const uint32_t *>((uintptr_t)(c->hit_sp + 4))[i];
+    int n = window(c->regs.rsp + 4, 4, 64);
+    for (int i = nargs; i < n; ++i) a32[i] = reinterpret_cast<const uint32_t *>((uintptr_t)(c->regs.rsp + 4))[i];
     if (n < nargs) n = nargs;
     call_tramp_x86((uint32_t)tramp, a32, n, (uint32_t)c->regs.rax, (uint32_t)c->regs.rcx, (uint32_t)c->regs.rdx,
                    scope->xmm0, &lo, &popped, &scope->post, scope->x87_post, (uint32_t)c->hit_sp, scope);
@@ -2134,6 +2184,7 @@ static bool call_mid(safetyhook::Context &native, uint32_t index, unsigned char 
     if (!ts || private_slot(ts)) InterlockedIncrement(&g_untracked_running);
     c.hit_scope = &scope;
     teb.restore();                                      // bookkeeping must not reach the callback/target
+    entry_end(c.tid);                                     // HitScope now guards callback re-entry
     bool callback_ok = run_callback(cb, &c, teb.error, teb.status);
     if (ts) ts->active = nullptr;
     if (!ts || private_slot(ts)) InterlockedDecrement(&g_untracked_running);
@@ -2371,6 +2422,29 @@ static __declspec(noinline) bool mid_entry_noxsave_sim(safetyhook::Context &nati
 static LONG g_xmode;
 static inline void mid_entry(safetyhook::Context &native, uint32_t index) {
     clear_df();                                            // DF=0 before ANY C code
+    const DWORD tid = current_tid();
+    // No TLS, CRT or Windows calls before admission. The save routines below
+    // use intrinsics only; their stack probes also run under this guard.
+    bool full = false;
+    EntrySlot *const entry = entry_begin(tid, (uintptr_t)&native, full);
+    if (!entry) {
+        // Nested agent work is invisible. Exhaustion on a real target call must
+        // instead retain its hit and account the refused callback, without APIs/TLS.
+        if (full && !g_stopping && callbacks[index] && !g_agent_threads.has(tid) && g_sweeper != (LONG)tid) {
+            probe_agent_shared *const sh = states[index].shared;
+            if (sh == shared) {
+                auto &line = sh->hit_stripes[index][(tid >> 2) & (PROBE_AGENT_STRIPES - 1)];
+                InterlockedExchangeAdd64(&line.value, 1);
+                InterlockedIncrement(&sh->log_dropped);
+            }
+        }
+        return;
+    }
+    struct Admission {
+        EntrySlot *entry;
+        DWORD tid;
+        ~Admission() { if (entry->tid == (LONG)tid) InterlockedExchange(&entry->tid, SLOT_MOVING); }
+    } admission{entry, tid};
 #if defined(_WIN64)
     unsigned char *x87_post = nullptr;                     // x64 returns floating point in XMM0 only
 #else
@@ -2504,12 +2578,17 @@ static LONG CALLBACK tramp_veh(EXCEPTION_POINTERS *ep) {
     if (g_nt_raise) g_nt_raise(&rec, &ctx, TRUE);                       // does not return
     return EXCEPTION_CONTINUE_SEARCH;
 }
+static bool installed_site_to_tramp(uintptr_t ip, uintptr_t *tramp);
 static LONG CALLBACK tramp_vch(EXCEPTION_POINTERS *ep) {
     ThreadSlot *ts = cached_slot();
     if (!ts) ts = thread_slot(GetCurrentThreadId(), false);
-    if (!ts || !ts->moved_to) return EXCEPTION_CONTINUE_SEARCH;
-    if ((uintptr_t)UHH_IP(ep->ContextRecord) == ts->moved_to) UHH_IP(ep->ContextRecord) = ts->moved_from;
-    ts->moved_to = 0;
+    if (ts && ts->moved_to) {
+        if ((uintptr_t)UHH_IP(ep->ContextRecord) == ts->moved_to) UHH_IP(ep->ContextRecord) = ts->moved_from;
+        ts->moved_to = 0;
+    }
+    // The exception may predate installation: no trampoline VEH ran for that fault.
+    uintptr_t resume = 0;
+    if (installed_site_to_tramp((uintptr_t)UHH_IP(ep->ContextRecord), &resume)) UHH_IP(ep->ContextRecord) = resume;
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -2583,6 +2662,19 @@ static void disable_hook(void *p) {
     if (!site_mapped(h.target_address())) return;
     if (!pb.len || pb.len != h.original_bytes().size() || !bytes_equal((const void *)h.target_address(), pb.b, pb.len)) return;
     op->ok = h.disable().has_value();
+}
+
+static bool installed_site_to_tramp(uintptr_t ip, uintptr_t *tramp) {
+    for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i) {
+        const auto &m = g_tmap[i];
+        const uintptr_t t = m.tramp;
+        const auto &pb = g_patch[i];
+        if (!t || ip <= m.site || ip - m.site >= pb.len ||
+            !bytes_equal((const void *)m.site, pb.b, pb.len)) continue;
+        for (uint32_t k = 0; k < m.n; ++k)
+            if (m.site + m.o_off[k] == ip) { *tramp = t + m.t_off[k]; return true; }
+    }
+    return false;
 }
 
 // Run fn with every other thread of the target suspended by the controller (FREEZE/THAW
@@ -2886,55 +2978,6 @@ static void clear_orphan_dr(CONTEXT &c, DWORD mask) {
                         case 2: c.Dr2 = 0; break; default: c.Dr3 = 0; }
     }
 }
-// Retain ownership evidence before active cleanup erases an execute DR. A thread
-// can take #DB between the cleanup snapshot and SetThreadContext; Windows may
-// deliver that queued exception with the cleared image. One record per thread,
-// protected against concurrent VEH reads and scoped to this session's epoch.
-// A full table uses lazy clearing instead. No shared-channel layout change.
-struct OrphanExecute {
-    DWORD tid;
-    LONG epoch;
-    uint64_t address[4];
-    DWORD mask;
-};
-static OrphanExecute g_orphan_execute[PROBE_AGENT_GUARD_TIDS];
-static SRWLOCK g_orphan_execute_lock = SRWLOCK_INIT;
-struct OrphanExecuteLock {
-    OrphanExecuteLock() { AcquireSRWLockExclusive(&g_orphan_execute_lock); }
-    ~OrphanExecuteLock() { ReleaseSRWLockExclusive(&g_orphan_execute_lock); }
-};
-#if defined(_WIN64)
-static bool remember_orphan_execute(DWORD tid, const CONTEXT &c, DWORD mask) {
-    OrphanExecuteLock lock;
-    const LONG epoch = shared->session_epoch;
-    for (auto &e : g_orphan_execute) if (e.tid == tid && e.epoch == epoch) return true;
-    for (auto &e : g_orphan_execute) {
-        if (e.tid && e.epoch == epoch) continue;
-        e = {};
-        DWORD bits = 0;
-        for (int slot = 0; slot < 4; ++slot) {
-            if (!(mask & (1u << slot)) || ((c.Dr7 >> (16 + slot * 4)) & 0xFu)) continue;
-            e.address[slot] = slot == 0 ? c.Dr0 : slot == 1 ? c.Dr1 : slot == 2 ? c.Dr2 : c.Dr3;
-            bits |= 1L << slot;
-        }
-        e.mask = bits; e.epoch = epoch; e.tid = tid;
-        return true;
-    }
-    return false;
-}
-#endif
-static bool cleared_execute_at(DWORD tid, uint64_t at) {
-    OrphanExecuteLock lock;
-    for (auto &e : g_orphan_execute) {
-        if (e.tid != tid || e.epoch != shared->session_epoch) continue;
-        for (int slot = 0; slot < 4; ++slot) {
-            const DWORD bit = 1u << slot;
-            if (e.address[slot] == at && (e.mask & bit)) { e.mask &= ~bit; return true; }
-        }
-        return false;
-    }
-    return false;
-}
 #if defined(_WIN64)
 // Native x64 only: Get/SetThreadContext(DEBUG_REGISTERS) are kernel APCs that do not suspend
 // the thread (WOW64 calls do, so x86 keeps the lazy VEH clearing). Clears only slots that still
@@ -2946,22 +2989,11 @@ static DWORD64 dr7_slot_bits(DWORD mask) {
     return bits;
 }
 static void clear_thread_dr(HANDLE t) {
-    CONTEXT before{}; before.ContextFlags = CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS;
+    CONTEXT before{}; before.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     if (!GetThreadContext(t, &before)) return;
     const DWORD mask = orphan_dr_mask(before);
     if (!mask) return;
-    // A queued #DB can reach VEH after this scan. SetThreadContext would erase
-    // the DR image that proves it is ours (Windows can also zero its DR6).
-    // Let VEH retire the fired slots instead of turning the pending trap into
-    // an unowned, zero-status single-step exception.
-    if (before.Dr6 & mask) return;
-    const uint64_t pc = (uint64_t)before.Rip;
-    for (int slot = 0; slot < 4; ++slot)
-        if ((mask & (1u << slot)) && !((before.Dr7 >> (16 + slot * 4)) & 0xFu) &&
-            (slot == 0 ? before.Dr0 : slot == 1 ? before.Dr1 : slot == 2 ? before.Dr2 : before.Dr3) == pc)
-            return;
-    if (!remember_orphan_execute(GetThreadId(t), before, mask)) return;
-    CONTEXT w = before; w.ContextFlags = CONTEXT_DEBUG_REGISTERS; clear_orphan_dr(w, mask);
+    CONTEXT w = before; clear_orphan_dr(w, mask);
     if (!SetThreadContext(t, &w)) return;                       // failure: lazy VEH backstop
     CONTEXT after{}; after.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     if (!GetThreadContext(t, &after)) return;
@@ -3049,29 +3081,9 @@ static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
     // Never consume the target's own DR hit, even when one of ours fired too. Likewise a
     // target single-step / debug-register-access exception must reach its own handlers.
     const bool step = (cx->Dr6 & (1u << 14)) && tid_listed(g.step_tids, g.step_count, GetCurrentThreadId());
-    if ((hits & ~mask) || (cx->Dr6 & (1u << 13)) || ((cx->Dr6 & (1u << 14)) && !step)) {
-        // A reply-later watch can outlive its debugger with the program's BS
-        // still pending. Deliver that exception, stripping only our watch bits.
-        // A live controller's forwarded target exception must keep its armed DRs.
-        if (g_orphan_cleaned || guard_orphaned()) {
-            clear_orphan_dr(*cx, mask);
-            cx->Dr6 &= ~(decltype(cx->Dr6))mask;
-            if (g_guard_wake) SetEvent(g_guard_wake);
-        }
+    if ((hits & ~mask) || (cx->Dr6 & (1u << 13)) || ((cx->Dr6 & (1u << 14)) && !step))
         return EXCEPTION_CONTINUE_SEARCH;
-    }
-    bool execute = false;
-    if (!(cx->Dr6 & 0xE00Fu) && !(cx->EFlags & 0x100u)) {
-        // Debugger teardown / context writes can lose DR6 before the queued
-        // execute fault is delivered. Its still-enabled, owned slot and exact
-        // exception PC identify it, just as in the controller's stale-DR path.
-        for (int slot = 0; slot < 4; ++slot)
-            if ((mask & (1u << slot)) && !((cx->Dr7 >> (16 + slot * 4)) & 0xFu) &&
-                (slot == 0 ? cx->Dr0 : slot == 1 ? cx->Dr1 : slot == 2 ? cx->Dr2 : cx->Dr3) == at)
-                execute = true;
-        if (!execute && !(cx->Dr7 & 0xFFu)) execute = cleared_execute_at(GetCurrentThreadId(), at);
-    }
-    if (!(hits & mask) && !step && !execute) return EXCEPTION_CONTINUE_SEARCH;
+    if (!(hits & mask) && !step) return EXCEPTION_CONTINUE_SEARCH;
     // A live controller consumes our traps before the VEH. This orphaned hit can precede
     // the service thread's death notification, even while the debug port is being torn down.
     if (!g_lazy_dr) InterlockedExchange(&g_lazy_dr, 1);

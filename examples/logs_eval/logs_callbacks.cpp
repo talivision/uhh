@@ -18,6 +18,7 @@ extern "C" __declspec(dllexport) void logs_eval_cb(probe_context *c) {
     switch (tag) {
     case 0xA: send_log(c, "o %u", seq); return;
     case 0xB: send_log_stack(c, "o %u", seq); return;
+    case 0xF: send_log(c, "UHH_TEST_DELAY o %u", seq); return;   // delayed ring publication
     case 0xE: send_log(c, "UHH_TEST_WEDGE o %u", seq); return;   // logs-wedge: the agent's test stop (agent.cpp)
     default: break;
     }

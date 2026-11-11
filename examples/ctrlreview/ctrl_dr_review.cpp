@@ -84,11 +84,6 @@ static LONG CALLBACK child_veh(EXCEPTION_POINTERS *e) {
     if (child_gate_nop && child_state.ip == child_gate_nop &&
         (child_state.dr6 & 1u) && child_state.dr0 == child_gate_nop)
         EMU_IP(*e->ContextRecord) = (decltype(EMU_IP(*e->ContextRecord)))(child_gate_nop + 1);
-    if (child_state.data[6] && (e->ContextRecord->Dr6 & 4u)) {
-        e->ContextRecord->Dr7 &= ~((decltype(e->ContextRecord->Dr7))3 << 4);
-        // Keep dispatch live across call_original's 20 ms abandonment poll.
-        Sleep((DWORD)child_state.data[6]);
-    }
     e->ContextRecord->EFlags &= ~0x100u;
     e->ContextRecord->Dr6 = 0;
     return EXCEPTION_CONTINUE_EXECUTION;
@@ -453,31 +448,6 @@ int run(int argc, char **argv) {
             dr_require(dispatch_event(s, d.ev, disposition) && disposition == DBG_EXCEPTION_NOT_HANDLED, "program step follows POPF");
             d.resume(disposition); d.wait(EXCEPTION_BREAKPOINT, site + 3);
             dr_require(d.result().seen == 1 && d.result().ip == site + 2, "program handler receives its step");
-        } else if (mode == "deferred-tf") {
-            watch_event(true);
-            EventFiber parked{}; s->calls[d.pi.dwThreadId + 1] = &parked;
-            DWORD disposition = 0;
-            dr_require(dispatch_event(s, d.ev, disposition) && disposition == DBG_REPLY_LATER && callbacks == 0 &&
-                       s->watch_deferred.size() == 1, "mixed watch waits without callback reentrancy");
-            auto guarded = std::make_unique<probe_agent_shared>();
-            s->shared = guarded.get(); s->attached = true;
-            guard_resync(s); // service_event does this after handling ends, before continuing
-            LONG holds = 0;
-            for (LONG i = 0; i < guarded->guard.held_count; ++i)
-                holds += guarded->guard.held_tids[i] == d.pi.dwThreadId;
-            dr_require(holds == 1, "reply-later suspension published exactly once for controller death");
-            d.resume(disposition); s->calls.clear();
-            { FiberHost fibers(s); dr_require(poll_calls(s), "release deferred kernel event"); }
-            for (LONG i = 0; i < guarded->guard.held_count; ++i)
-                dr_require(guarded->guard.held_tids[i] != d.pi.dwThreadId, "reply-later resume removes guard hold");
-            s->shared = nullptr; s->attached = false;
-            d.wait(EXCEPTION_SINGLE_STEP, site + 4);
-            dr_require((d.get().Dr6 & 0xE00Fu) == 0x4001u && d.result().seen == 0,
-                       "reply-later replays original status before target handler or next instruction");
-            dr_require(dispatch_event(s, d.ev, disposition) && disposition == DBG_EXCEPTION_NOT_HANDLED && callbacks == 1 && p->hits == 1,
-                       "replayed event delivers callback once and forwards target TF");
-            d.resume(disposition); d.wait(EXCEPTION_BREAKPOINT, done);
-            dr_require(d.result().seen == 1 && (d.result().dr6 & 0x4000u), "target TF exception retained");
         } else if (mode == "step-call") {
             // A real store #DB completes an in-place step and fires our watch.
             // Its callback's callee crosses an execute probe on the SAME thread.
@@ -567,8 +537,7 @@ int run(int argc, char **argv) {
             dr_require(dispatch_event(s, d.ev, disposition) && disposition == DBG_CONTINUE, "first parking attempt");
             dr_require(s->yield_stubs.empty() && EMU_IP(d.get()) == EMU_IP(before) && callbacks == 0,
                        "first fairness park excludes probed helper");
-        } else if (mode == "original-tf" || mode == "original-owned-free" || mode == "original-owned-borrowed" || mode == "original-ret-watch") {
-            const bool ret_watch = mode == "original-ret-watch";
+        } else if (mode == "original-tf" || mode == "original-owned-free" || mode == "original-owned-borrowed") {
             const bool tf = mode == "original-tf", borrowed = mode == "original-owned-borrowed";
             // A real CALL supplies the frame call_original requires, on both architectures.
             const unsigned char call[] = {0xE8, 22, 0, 0, 0}; // code+5 -> code+32
@@ -576,15 +545,9 @@ int run(int argc, char **argv) {
             const unsigned char loop[] = {0x0F,0x0B,0xEB,0xFE}; // UD2; jmp $
             SIZE_T n = 0;
             dr_require(!!WriteProcessMemory(d.pi.hProcess, (void *)(uintptr_t)site, call, sizeof(call), &n) && n == sizeof(call), "write original caller");
-            const void *body_bytes = (tf || ret_watch) ? (const void *)body : (const void *)loop;
-            const SIZE_T body_size = (tf || ret_watch) ? sizeof(body) : sizeof(loop);
+            const void *body_bytes = tf ? (const void *)body : (const void *)loop;
+            const SIZE_T body_size = tf ? sizeof(body) : sizeof(loop);
             dr_require(!!WriteProcessMemory(d.pi.hProcess, (void *)(uintptr_t)(d.code + 32), body_bytes, body_size, &n) && n == body_size, "write original body");
-            if (ret_watch) {
-                // The return continuation must be an ordinary instruction. The child
-                // ready/done INT3 is a target exception, not a catch UHH may consume.
-                const unsigned char continuation[] = {0x90, 0xCC};
-                dr_require(!!WriteProcessMemory(d.pi.hProcess, (void *)(uintptr_t)done, continuation, sizeof(continuation), &n), "write original return continuation");
-            }
             FlushInstructionCache(d.pi.hProcess, (void *)(uintptr_t)d.code, 64);
             p->flags = PROBE_HW; p->address = d.code + 32; p->callback = original_hit;
             s->hw_armed_ever.insert(p->address);
@@ -602,38 +565,12 @@ int run(int argc, char **argv) {
             c.Dr0 = (decltype(c.Dr0))p->address; c.Dr7 = 1; d.put(c);
             d.resume(); d.wait(EXCEPTION_SINGLE_STEP, p->address);
             if (tf) { auto entry = d.get(); entry.EFlags |= 0x100u; d.put(entry); }
-            if (ret_watch) {
-                const LONG retire_watch = 50;
-                dr_require(!!WriteProcessMemory(d.pi.hProcess, (void *)(uintptr_t)(old_address + 24), &retire_watch, sizeof(retire_watch), &n), "retire return watch in target handler");
-                auto entry = d.get();
-                entry.Dr2 = (decltype(entry.Dr2))EMU_SP(entry);
-                const unsigned len = sizeof(void *) == 8 ? 2u : 3u;
-                entry.Dr7 |= 16 | ((decltype(entry.Dr7))(3u | (len << 2)) << 24);
-                d.put(entry);
-            }
             CallbackState st{s, p, d.pi.dwProcessId, d.pi.dwThreadId};
             auto entry = d.get();
             auto context = from_context(entry, 0, p->address, &callback_ops, s);
             context.controller = &st; context.tid = d.pi.dwThreadId;
             run_callback(s, p, &context);
-            if (ret_watch) {
-                const auto result = d.result();
-                std::fprintf(stderr, "dr-review: return watch completed=%d post=%d released=%d callbacks=%u seen=%ld "
-                                     "ip=0x%llx at=0x%llx want=0x%llx code=0x%lx dr6=0x%llx\n",
-                             context.called_original ? 1 : 0, st.have_post ? 1 : 0, st.released ? 1 : 0,
-                             callbacks, (long)result.seen, (unsigned long long)result.ip,
-                             (unsigned long long)result.exception_address, (unsigned long long)done,
-                             (unsigned long)result.exception_code, (unsigned long long)result.dr6);
-                dr_require(context.called_original && st.have_post && !st.released && callbacks == 1,
-                           "return catch completes the single original callback");
-                dr_require((uint64_t)EMU_IP(st.post) == done &&
-                           (uint64_t)EMU_SP(st.post) == (uint64_t)EMU_SP(entry) + sizeof(void *),
-                           "return catch attributed to the original RET's PC and popped frame");
-                dr_require(result.seen == 1, "return-slot watch delivered exactly once");
-                dr_require(result.ip == done && result.exception_address == done &&
-                           result.exception_code == EXCEPTION_SINGLE_STEP && (result.dr6 & 4u),
-                           "return-slot watch attributed to RET's continuation and target DR2");
-            } else if (tf) {
+            if (tf) {
                 const auto result = d.result();
                 dr_require(context.called_original && st.have_post && result.seen == 1 &&
                            result.ip == d.code + 36 && (result.dr6 & 0x4000u), "original delivers target TF step");

@@ -83,6 +83,7 @@ Windows enforces no CET shadow stack for WOW64 processes. Details in [x86 / WOW6
 | `call_original` on hw / breakpoint | needs one of the 4 registers free for the call, unless the hit is itself a hw execute probe (call_original CO6) | at most 3 hw probes when other probes call `call_original`; `gated_config` puts NtClose on breakpoint when opens are hw |
 | Inline probes | 128 per session (the 129th is refused) | breakpoint/hw for more sites |
 | Inline recursion tracking | 4096 primary + 256 overflow thread slots, then per-thread TLS; before TLS exists, a hit with both tables full is counted but its callback is refused with a warning | avoid exhausting the tables during thread initialisation |
+| Inline bookkeeping admission | 4352 TLS-free admissions (running or abandoned during bookkeeping); exhaustion counts the hit and a dropped callback, without running agent bookkeeping unguarded | callbacks release admission before running; keep thread counts bounded |
 | Software breakpoints in a session with inline probes | 65536 armed at once | - |
 | Config block | 4 GB | - |
 | Log message | 1023 bytes, then `...[truncated]` | log several records |
@@ -328,8 +329,8 @@ data) prints on all backends.
   its hit, so a thread killed after publishing it is a delivered log, not interrupted. One
   inherent edge (Log delivery findings): a producer that claims a slot in the few instructions
   after the final drain at detach/close loses that record uncounted.
-- **Per-thread order** is kept across backends, except that a record behind two unfinished
-  ring slots of other threads at the same instant can be overtaken (Log delivery findings).
+- **Per-thread order** is kept across backends, including records behind unfinished
+  ring slots of other threads (ROADMAP, "Log delivery findings" and "Overnight controller follow-up").
 - **Inline callbacks killed by process exit** (ExitProcess/TerminateProcess) before their
   first log are reported as `callbacks_interrupted`; their logs never existed (Hunter A3). A
   stderr line names the probe and thread of each callback cut off while running.

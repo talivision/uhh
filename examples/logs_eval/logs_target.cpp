@@ -33,6 +33,7 @@
 static volatile LONG64 g_sink;
 static volatile LONG g_stop, g_go;
 static int g_threads = 4, g_count = 3000, g_ms = 200;
+static bool g_delay_publication;
 struct ring_acct { unsigned long long hits, head, tail, dropped, inflight; };
 static ring_acct acct(const probe_agent_shared *sh) {
     ring_acct a{};
@@ -56,7 +57,7 @@ extern "C" __declspec(dllexport) __declspec(noinline) LONG64 LogSiteB(unsigned t
 
 static DWORD WINAPI order_thread(void *) {
     while (!g_go) YieldProcessor();
-    for (unsigned i = 0; i < (unsigned)g_count; ++i) { LogSiteA(0xA, 2 * i); LogSiteB(0xB, 2 * i + 1); }
+    for (unsigned i = 0; i < (unsigned)g_count; ++i) { LogSiteA(g_delay_publication ? 0xF : 0xA, 2 * i); LogSiteB(0xB, 2 * i + 1); }
     return 0;
 }
 static const unsigned WEDGE_SEQ = 1000;     // the producer's call that stops in its claimed slot
@@ -187,6 +188,8 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strcmp(mode, "order")) {
+        char delay[16] = {};
+        g_delay_publication = GetEnvironmentVariableA("UHH_TEST_LOG_PUBLISH_DELAY_MS", delay, sizeof(delay)) != 0;
         HANDLE h[64];
         for (int t = 0; t < g_threads; ++t) h[t] = CreateThread(nullptr, 0, order_thread, nullptr, 0, nullptr);
         InterlockedExchange(&g_go, 1);

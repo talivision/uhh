@@ -1061,12 +1061,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     if (code == EXCEPTION_SINGLE_STEP && step == stepping.end() && (s->hw_active || s->dr_ever)) {
         bool handled = false;
         if (!handle_hw(s, event, handled)) return false;
-        if (handled) {
-            disposition = DBG_CONTINUE;
-            for (const auto &h : s->watch_deferred)
-                if (h.reply_later && h.ev.dwThreadId == event.dwThreadId) disposition = DBG_REPLY_LATER;
-            return true;
-        }   // else fall through (not our DR)
+        if (handled) { disposition = DBG_CONTINUE; return true; }   // else fall through (not our DR)
         // A trap at the address of a hardware probe we have RELEASED, raised before the
         // release reached this thread (its debug status no longer names the slot): ours,
         // stale. Clear our slots on the thread, step over with RF, and swallow it.

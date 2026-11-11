@@ -226,6 +226,20 @@ target_link_options(probe_api_agent PRIVATE "/ENTRY:uhh_agent_entry")   # keeps 
 target_link_options(probe_api_agent PRIVATE /CETCOMPAT)
 set_property(TARGET probe_api_agent APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/probe/agent.def")
 
+# Identity regression: a separately linked valid DLL, never a byte-patched PE.
+get_target_property(agent_identity_sources probe_api_agent SOURCES)
+add_library(probe_api_agent_identity SHARED ${agent_identity_sources}
+    examples/agent_review/agent_identity.cpp)
+foreach(prop INCLUDE_DIRECTORIES COMPILE_DEFINITIONS COMPILE_OPTIONS LINK_OPTIONS LINK_DEPENDS)
+    get_target_property(agent_identity_value probe_api_agent ${prop})
+    if(agent_identity_value)
+        set_property(TARGET probe_api_agent_identity PROPERTY ${prop} "${agent_identity_value}")
+    endif()
+endforeach()
+target_link_libraries(probe_api_agent_identity PRIVATE safetyhook)
+target_compile_options(probe_api_agent_identity PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4>)
+target_compile_definitions(probe_api_agent_identity PRIVATE _CRT_SECURE_NO_WARNINGS)
+
 # --- Example: gated_config (launch) and uhh_attach (attach) -------------------------
 # Both flip configparse's parsed flag with a breakpoint to enable probe_app's disabled
 # read path, map handles to pids at ntdll!NtOpenProcess, and log reads. The callbacks
@@ -529,7 +543,7 @@ add_executable(ar_driver_th examples/agent_review/ar_driver.cpp examples/agent_r
 target_include_directories(ar_driver_th PRIVATE include)
 target_link_libraries(ar_driver_th PRIVATE probe_api_testhooks)
 target_compile_definitions(ar_driver_th PRIVATE _CRT_SECURE_NO_WARNINGS)
-add_dependencies(ar_driver_th ar_target probe_api_agent)
+add_dependencies(ar_driver_th ar_target probe_api_agent probe_api_agent_identity)
 add_executable(lifecycle_driver_th examples/lifecycle/lifecycle_driver.cpp examples/lifecycle/lifecycle_callbacks.cpp
                examples/hunt/hunt_callbacks.cpp examples/gated_config/callbacks.cpp)   # regress lifecycle-target-dies-* ("late")
 target_include_directories(lifecycle_driver_th PRIVATE include examples/gated_config)
@@ -810,6 +824,10 @@ add_executable(logs_driver examples/logs_eval/logs_driver.cpp examples/logs_eval
 target_include_directories(logs_driver PRIVATE include)
 target_link_libraries(logs_driver PRIVATE probe_api)
 add_dependencies(logs_driver logs_target probe_api_agent)
+add_executable(logs_driver_th examples/logs_eval/logs_driver.cpp examples/logs_eval/logs_callbacks.cpp)
+target_include_directories(logs_driver_th PRIVATE include)
+target_link_libraries(logs_driver_th PRIVATE probe_api_testhooks)
+add_dependencies(logs_driver_th logs_target probe_api_agent)
 # The send_log fast formatter vs the CRT (regress logs-format-fast).
 add_executable(log_format_selftest examples/logs_eval/log_format_selftest.cpp)
 target_include_directories(log_format_selftest PRIVATE include)
