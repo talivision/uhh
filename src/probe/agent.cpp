@@ -958,7 +958,8 @@ static uint64_t agent_resolve(const char *symbol) {
         uint64_t rva = 0;
         if (!plus || plus == symbol || !agent_parse_hex(plus + 1, stop, &rva)) return 0;
         HMODULE m = agent_module(symbol, plus);
-        return m ? (uint64_t)(uintptr_t)m + rva : 0;
+        const uint64_t base = (uint64_t)(uintptr_t)m;
+        return m && rva <= UINT64_MAX - base ? base + rva : 0;
     }
     if (bang == symbol) return 0;
     const char *plus = strchr(bang + 1, '+'), *name_end = plus ? plus : stop;
@@ -970,7 +971,8 @@ static uint64_t agent_resolve(const char *symbol) {
     if (!m) return 0;
     memcpy(name, bang + 1, name_end - bang - 1); name[name_end - bang - 1] = 0;
     FARPROC f = GetProcAddress(m, name);
-    return f ? (uint64_t)(uintptr_t)f + off : 0;
+    const uint64_t base = (uint64_t)(uintptr_t)f;
+    return f && off <= UINT64_MAX - base ? base + off : 0;
 }
 
 #if defined(_WIN64)
@@ -1739,9 +1741,9 @@ extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
     // The register arguments always go as the hit had them (as on breakpoint/hw, which run the
     // original in place): a method called with nargs 0 still gets `this` (RCX).
     for (int i = 0; i < (nargs > 4 ? nargs : 4); ++i) a[i] = get_func_arg(c, (size_t)i);
-    const int extra = window(c->hit_sp + 0x28, 8, UHH_ORIG_STACK_ARGS);
+    const int extra = window(c->regs.rsp + 0x28, 8, UHH_ORIG_STACK_ARGS);
     for (int i = 0; i < extra; ++i)
-        if (4 + i >= nargs) a[4 + i] = reinterpret_cast<const uint64_t *>((uintptr_t)(c->hit_sp + 0x28))[i];
+        if (4 + i >= nargs) a[4 + i] = reinterpret_cast<const uint64_t *>((uintptr_t)(c->regs.rsp + 0x28))[i];
     OrigFrame f{};
     f.rip = ret_addr; f.rsp = c->hit_sp + 8;
     f.nv[0] = c->regs.rbx; f.nv[1] = c->regs.rbp; f.nv[2] = c->regs.rsi; f.nv[3] = c->regs.rdi;
@@ -1753,8 +1755,8 @@ extern "C" int call_original(probe_context *c, int nargs, uint64_t *out) {
     uint32_t a32[64] = {0}, lo = 0;
     int32_t popped = -1;
     for (int i = 0; i < nargs; ++i) a32[i] = (uint32_t)get_func_arg(c, (size_t)i);
-    int n = window(c->hit_sp + 4, 4, 64);
-    for (int i = nargs; i < n; ++i) a32[i] = reinterpret_cast<const uint32_t *>((uintptr_t)(c->hit_sp + 4))[i];
+    int n = window(c->regs.rsp + 4, 4, 64);
+    for (int i = nargs; i < n; ++i) a32[i] = reinterpret_cast<const uint32_t *>((uintptr_t)(c->regs.rsp + 4))[i];
     if (n < nargs) n = nargs;
     call_tramp_x86((uint32_t)tramp, a32, n, (uint32_t)c->regs.rax, (uint32_t)c->regs.rcx, (uint32_t)c->regs.rdx,
                    scope->xmm0, &lo, &popped, &scope->post, scope->x87_post, (uint32_t)c->hit_sp, scope);
@@ -2576,12 +2578,17 @@ static LONG CALLBACK tramp_veh(EXCEPTION_POINTERS *ep) {
     if (g_nt_raise) g_nt_raise(&rec, &ctx, TRUE);                       // does not return
     return EXCEPTION_CONTINUE_SEARCH;
 }
+static bool installed_site_to_tramp(uintptr_t ip, uintptr_t *tramp);
 static LONG CALLBACK tramp_vch(EXCEPTION_POINTERS *ep) {
     ThreadSlot *ts = cached_slot();
     if (!ts) ts = thread_slot(GetCurrentThreadId(), false);
-    if (!ts || !ts->moved_to) return EXCEPTION_CONTINUE_SEARCH;
-    if ((uintptr_t)UHH_IP(ep->ContextRecord) == ts->moved_to) UHH_IP(ep->ContextRecord) = ts->moved_from;
-    ts->moved_to = 0;
+    if (ts && ts->moved_to) {
+        if ((uintptr_t)UHH_IP(ep->ContextRecord) == ts->moved_to) UHH_IP(ep->ContextRecord) = ts->moved_from;
+        ts->moved_to = 0;
+    }
+    // The exception may predate installation: no trampoline VEH ran for that fault.
+    uintptr_t resume = 0;
+    if (installed_site_to_tramp((uintptr_t)UHH_IP(ep->ContextRecord), &resume)) UHH_IP(ep->ContextRecord) = resume;
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -2655,6 +2662,19 @@ static void disable_hook(void *p) {
     if (!site_mapped(h.target_address())) return;
     if (!pb.len || pb.len != h.original_bytes().size() || !bytes_equal((const void *)h.target_address(), pb.b, pb.len)) return;
     op->ok = h.disable().has_value();
+}
+
+static bool installed_site_to_tramp(uintptr_t ip, uintptr_t *tramp) {
+    for (uint32_t i = 0; i < PROBE_AGENT_MAX_PROBES; ++i) {
+        const auto &m = g_tmap[i];
+        const uintptr_t t = m.tramp;
+        const auto &pb = g_patch[i];
+        if (!t || ip <= m.site || ip - m.site >= pb.len ||
+            !bytes_equal((const void *)m.site, pb.b, pb.len)) continue;
+        for (uint32_t k = 0; k < m.n; ++k)
+            if (m.site + m.o_off[k] == ip) { *tramp = t + m.t_off[k]; return true; }
+    }
+    return false;
 }
 
 // Run fn with every other thread of the target suspended by the controller (FREEZE/THAW

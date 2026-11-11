@@ -9263,6 +9263,43 @@ def check_agent_entry_guard():
         record(name, False, repr(e))
 
 
+def check_cxr17_calls():
+    """Overflow resolution, changed-SP call_original, pre-install exception continuation,
+    and an x86 vector capacity failure in inline IPC (injected on x64 to avoid a 4 GB allocation).
+    The saved-context case blocks in a real VEH until the dynamic inline install completes."""
+    d, th, t = exe("ar_driver.exe"), exe("ar_driver_th.exe"), exe("ar_target.exe")
+    if not d or not th or not t:
+        return missing_bin("cxr17", "ar_driver/ar_driver_th/ar_target")
+    cases = [
+        ("wrapresolve", "ar_resolve_site", "ar_on_wrapresolve", {"wraps": 2}, "ar wrapresolve 0 0 r=123"),
+        ("stackcopy", "ar_stackcopy_site", "ar_on_stackcopy", {"result": 110}, "ar stackcopy 1 r=110"),
+        ("saved-context", "ar_install_saved_site", "ar_on_install_saved", {"result": 37, "patched": 1}, "ar install saved 1"),
+        ("oversized-ipc", "ar_pressure_site", "ar_on_site", {"valid": 0, "invalid": 1}, "ar site"),
+    ]
+    for case, site, callback, expected, message in cases:
+        for bk in (("inline",) if case == "oversized-ipc" else ("breakpoint", "hw", "inline")):
+            name = f"cxr17-{case}-{bk}"
+            try:
+                env = dict(os.environ)
+                driver = d
+                if case == "oversized-ipc":
+                    driver = th
+                    env["UHH_TEST_IPC_CONFIG_LENGTH_ERROR"] = "1"
+                r, o = run([driver, "--backend", bk, "--probe", f"ar_target.exe!{site}={callback}",
+                            "--", t, f"review-{case}"], env=env, timeout=45)
+                row = next((x for x in o if x.get("kind") == "ar"), {})
+                logs = [x.get("message") for x in o if x.get("kind") == "probe_log"]
+                rep = report(o)
+                ok = (r.returncode == 0 and rep.get("app_exit") == 0 and rep.get("error") is None and
+                      all(row.get(k) == v for k, v in expected.items()) and logs == [message] and
+                      sum(x.get("hits", 0) for x in probes(o)) == 1 and rep.get("logs_written") == 1 and
+                      rep.get("stdout_logs") == 1 and rep.get("log_dropped") == 0 and
+                      rep.get("callbacks_interrupted", 0) == 0)
+                record(name, ok, f"row={row} logs={logs} report={rep}")
+            except Exception as e:
+                record(name, False, repr(e))
+
+
 def check_agent_review():
     """Inline-agent static review (examples/agent_review), one reproduction per finding
     (agent-unwind: check_agent_unwind). agent-faultafter: a callback that ran the
@@ -13504,6 +13541,7 @@ def main():
     if want(check_callorig_deep): check_callorig_deep()
     if want(check_callconv): check_callconv()
     if want(check_agent_entry_guard): check_agent_entry_guard()
+    if want(check_cxr17_calls): check_cxr17_calls()
     if want(check_agent_review): check_agent_review()
     if want(check_inline_install_failure): check_inline_install_failure()
     if want(check_session_agentipc): check_session_agentipc()

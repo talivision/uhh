@@ -1,6 +1,7 @@
 // The inline agent: UHH_SHARED callback DLLs, the trimmed local agent copy and warm copies,
 // injection (remote LoadLibrary / init), the shared section, install gates, frozen hook writes (IPC).
 #include "session_internal.hpp"
+#include <stdexcept>
 
 namespace uhh_session {
 
@@ -1295,6 +1296,10 @@ bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
     uint64_t at = (uint64_t)ex.ExceptionInformation[0];
     if (!have_whole) return false;
     const probe_ipc_request req = whole;
+    const Probe *origin = nullptr;
+    for (const auto &p : s->probes)
+        if ((p->flags & PROBE_INLINE) && p->agent_index == req.origin_site && p->callback) { origin = p.get(); break; }
+    if (!origin) return false; // reject forged origins before allocating target-supplied lengths
     // The name, symbol and config are read from the (stopped) calling thread's memory.
     auto fetch = [&](uint64_t from, uint64_t len, uint64_t cap, void *to) {
         size_t n = 0;
@@ -1304,21 +1309,25 @@ bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
     // The config limit is the API's, the same on every backend (probe_api.h: 4 GB); it used to
     // be 64 MiB here only, so a dynamic add accepted by breakpoint/hw was refused inline.
     const bool cfg_too_big = req.config_len > PROBE_IPC_CONFIG_MAX;
-    bool fetched = req.callback_len <= PROBE_IPC_TEXT_MAX && req.symbol_len <= PROBE_IPC_TEXT_MAX && !cfg_too_big;
+    bool fetched = req.callback_len <= PROBE_IPC_TEXT_MAX && req.symbol_len <= PROBE_IPC_TEXT_MAX && !cfg_too_big &&
+                   req.config_len <= config.max_size();
     if (fetched) {
         try {
+#if defined(UHH_TEST_HOOKS)
+            if (std::getenv("UHH_TEST_IPC_CONFIG_LENGTH_ERROR")) throw std::length_error("test config capacity");
+#endif
             name.resize((size_t)req.callback_len); symbol.resize((size_t)req.symbol_len); config.resize((size_t)req.config_len);
         } catch (const std::bad_alloc &) { fetched = false; }
+          catch (const std::length_error &) { fetched = false; }
         fetched = fetched && fetch(req.callback, req.callback_len, PROBE_IPC_TEXT_MAX, name.data()) &&
                   fetch(req.symbol, req.symbol_len, PROBE_IPC_TEXT_MAX, symbol.data()) &&
                   fetch(req.config, req.config_len, PROBE_IPC_CONFIG_MAX, config.data());
     }
     // The callback is named; find the controller's copy of the same source. Prefer the
     // module that holds the originating inline probe's callback, then the executable.
-    probe_callback cb = nullptr; const Probe *origin = nullptr;
+    probe_callback cb = nullptr;
     for (auto &p : s->probes)
         if ((p->flags & PROBE_INLINE) && p->agent_index == req.origin_site && p->callback) {
-            origin = p.get();
             HMODULE m{};
             if (fetched && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                               reinterpret_cast<LPCSTR>(p->callback), &m))
@@ -1330,7 +1339,6 @@ bool handle_ipc(probe_session *s, const DEBUG_EVENT &event) {
                 }
             break;
         }
-    if (!origin) return false;
     int32_t result = 0;
     struct CbTid { probe_session *s; const Probe *prev; ~CbTid() { s->cb_tid = 0; s->cb_probe = prev; } } cb_tid_scope{s, s->cb_probe};
     s->cb_tid = event.dwThreadId; s->cb_probe = origin;
