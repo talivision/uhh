@@ -494,29 +494,71 @@ void enforce_owned_drs(const probe_session *s, DWORD tid, CONTEXT &c, bool clear
         c.Dr7 = (decltype(c.Dr7))dr7;
     }
 }
+uint8_t owned_debug_slots(const probe_session *s, const CONTEXT &c) {
+    uint8_t mask = 0;
+    for (int slot = 0; slot < 4; ++slot) {
+        if (!((c.Dr7 >> (slot * 2)) & 3u)) continue;
+        const uint64_t address = dr_address(c, slot);
+        const unsigned field = (unsigned)((c.Dr7 >> (16 + slot * 4)) & 0xFu);
+        bool ours = false;
+        for (const auto &g : s->gates)
+            if (!field && g.second == slot && g.first == address) ours = true;
+        for (const auto &p : s->probes) {
+            if (!p->active || !(p->flags & PROBE_HW) || p->dr_slot != slot || p->address != address) continue;
+            uint32_t rw = 0, len = 0; hw_rw_len(p->flags, rw, len);
+            if (field == ((len << 2) | rw)) ours = true;
+        }
+        if (ours) mask |= (uint8_t)(1u << slot);
+    }
+    return mask;
+}
 // SetThreadContext changes the live register image, but Windows has already saved the
 // exception CONTEXT that KiUserExceptionDispatcher will give VEH/SEH. A combined #DB
 // otherwise leaks our BS/Bn to the target (CI: 0xffff4ff3 instead of 0xffff0ff2).
 static void debug_delivery_noop(probe_context *) {}
-bool queue_debug_delivery(probe_session *s, DWORD tid, uint64_t ip, DWORD64 clear_bits, DWORD64 set_bits) {
+bool queue_debug_delivery(probe_session *s, DWORD tid, uint64_t ip, DWORD64 clear_bits, DWORD64 set_bits,
+                          const CONTEXT *original, uint8_t original_owned) {
     if (!clear_bits && !set_bits) return true;
+    HANDLE thread = event_thread(s, tid);
+    CONTEXT live{}; live.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (!thread || !GetThreadContext(thread, &live)) {
+        set_error(s, win_error("get debug delivery registers")); return false;
+    }
+    const CONTEXT &before = original ? *original : live;
+    const uint8_t owned = original ? original_owned : owned_debug_slots(s, before);
+    auto update = [&](probe_agent_debug_delivery &d) {
+        // Merge consumers of one exception. An explicit original image is
+        // authoritative: call_original replaces the entry event with its return.
+        for (int slot = 0; slot < 4; ++slot) {
+            const uint64_t mask = ((uint64_t)3 << (slot * 2)) | ((uint64_t)0xF << (16 + slot * 4));
+            if ((owned & (1u << slot)) && (original || !(d.dr_mask & (1u << slot)))) {
+                d.dr_before[slot] = dr_address(before, slot);
+                d.dr7_before = (d.dr7_before & ~mask) | (before.Dr7 & mask);
+            }
+            d.dr_after[slot] = dr_address(live, slot);
+        }
+        d.dr_mask |= owned; d.dr7_after = live.Dr7;
+        d.ip = ip; d.clear_bits |= clear_bits;
+        d.set_bits = (d.set_bits & ~clear_bits) | set_bits;
+    };
     if (trace_enabled())
-        std::fprintf(stderr, "  debug-delivery-queue tid=%lu pc=0x%llx clear=0x%llx set=0x%llx agent=%d\n",
+        std::fprintf(stderr, "  debug-delivery-queue tid=%lu pc=0x%llx clear=0x%llx set=0x%llx agent=%d slots=0x%x\n",
                      (unsigned long)tid, (unsigned long long)ip, (unsigned long long)clear_bits,
-                     (unsigned long long)set_bits, !!(s->shared && s->shared->debug_delivery_ready));
+                     (unsigned long long)set_bits, !!(s->shared && s->shared->debug_delivery_ready), (unsigned)owned);
     if (s->shared && s->shared->debug_delivery_ready) {
         probe_agent_debug_delivery *free = nullptr;
         for (auto &d : s->shared->debug_delivery) {
             if (d.tid == (LONG)tid) {
                 // The event freezes this thread: its VEH cannot read while we update.
-                d.ip = ip; d.clear_bits |= clear_bits;
-                d.set_bits = (d.set_bits & ~clear_bits) | set_bits;
+                update(d);
                 return true;
             }
             if (!d.tid && !free) free = &d;
         }
         if (!free) { set_error(s, "agent debug delivery table full"); return false; }
-        free->ip = ip; free->clear_bits = clear_bits; free->set_bits = set_bits;
+        // Retired rows retain their payload; start a new delivery from zero.
+        free->dr_mask = 0; free->dr7_before = 0; free->clear_bits = free->set_bits = 0;
+        update(*free);
         InterlockedExchange(&free->tid, (LONG)tid); // publish before continuing #DB
         return true;
     }
@@ -541,8 +583,7 @@ bool queue_debug_delivery(probe_session *s, DWORD tid, uint64_t ip, DWORD64 clea
         if (!arm_breakpoint(s, p, 0)) return false;
     }
     auto &d = s->debug_delivery[tid];
-    d.ip = ip; d.clear_bits |= clear_bits;
-    d.set_bits = (d.set_bits & ~clear_bits) | set_bits;
+    update(d);
     return true;
 }
 bool repair_debug_delivery(probe_session *s, DWORD tid, const CONTEXT &native) {
@@ -600,14 +641,21 @@ bool repair_debug_delivery(probe_session *s, DWORD tid, const CONTEXT &native) {
             return false;
         }
 #endif
+        const auto before_dr6 = img.Dr6, before_dr7 = img.Dr7;
         const auto dr6 = (decltype(img.Dr6))((img.Dr6 & ~it->second.clear_bits) | it->second.set_bits);
-        if (!remote_write(s->pi.hProcess, rec + offsetof(CONTEXT, Dr6), &dr6, sizeof(dr6), &n) || n != sizeof(dr6)) {
-            set_error(s, "write debug exception status"); return false;
+        probe_agent_repair_delivery_drs(img, it->second, &native);
+        img.Dr6 = dr6;
+        // DR0..DR7 are contiguous in both Windows CONTEXT layouts. Write only
+        // that debug-register block; program-owned fields retain their values.
+        const size_t bytes = offsetof(CONTEXT, Dr7) + sizeof(img.Dr7) - offsetof(CONTEXT, Dr0);
+        if (!remote_write(s->pi.hProcess, rec + offsetof(CONTEXT, Dr0), &img.Dr0, bytes, &n) || n != bytes) {
+            set_error(s, "write debug exception registers"); return false;
         }
         if (trace_enabled())
-            std::fprintf(stderr, "  debug-delivery tid=%lu pc=0x%llx dr6=0x%llx -> 0x%llx\n",
+            std::fprintf(stderr, "  debug-delivery tid=%lu pc=0x%llx dr6=0x%llx -> 0x%llx dr7=0x%llx -> 0x%llx\n",
                          (unsigned long)tid, (unsigned long long)EMU_IP(img),
-                         (unsigned long long)img.Dr6, (unsigned long long)dr6);
+                         (unsigned long long)before_dr6, (unsigned long long)dr6,
+                         (unsigned long long)before_dr7, (unsigned long long)img.Dr7);
         s->debug_delivery.erase(it);
     }
     // Last delivery: the ordinary one-shot path restores the byte and runs at the real
@@ -627,6 +675,8 @@ bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
         thread = event_thread(s, event.dwThreadId);
         if (!thread || !GetThreadContext(thread, &native)) { set_error(s, win_error("get hw context")); return false; }
     }
+    const CONTEXT raised = native;
+    const uint8_t raised_owned = owned_debug_slots(s, raised);
     const uint64_t dr_epoch_at_get = g_dr_epoch.load(std::memory_order_relaxed);
     native.Dr6 |= dr6_carried(s, event.dwThreadId);           // a status our own DR write zeroed
     // The program armed a slot of ours itself on this thread (its own hardware breakpoint): move
@@ -896,7 +946,7 @@ bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
     handled = !(native.Dr6 & 0xF & theirs) && !(native.Dr6 & 0xA000u) &&
               (!(native.Dr6 & 0x4000u) || our_step);
     if (!handled && event.u.Exception.dwFirstChance && consumed &&
-        !queue_debug_delivery(s, event.dwThreadId, (uint64_t)EMU_IP(native), consumed, native.Dr6 & 0xE00Fu)) return false;
+        !queue_debug_delivery(s, event.dwThreadId, (uint64_t)EMU_IP(native), consumed, native.Dr6 & 0xE00Fu, &raised, raised_owned)) return false;
     return true;
 }
 

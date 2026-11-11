@@ -357,8 +357,8 @@ struct probe_session {
     uhh_session::Probe *debug_dispatch_probe = nullptr;
     // Windows snapshots the user exception CONTEXT before the debugger edits live DR6.
     // Agent sessions repair in the first VEH; the dispatcher catch/map below is
-    // only for agent-less bp/hw sessions. Change only UHH's status contributions.
-    struct DebugDelivery { uint64_t ip = 0; DWORD64 clear_bits = 0, set_bits = 0; };
+    // only for agent-less bp/hw sessions. Repair status and UHH-owned DR images.
+    using DebugDelivery = probe_agent_debug_delivery;
     std::unordered_map<DWORD, DebugDelivery> debug_delivery;
 
     std::unordered_map<DWORD, uint64_t> restore_resume;   // x86: a WOW64 restore sent through call_trap -> its real EIP
@@ -400,7 +400,8 @@ struct probe_session {
     struct Dr6Lost { CONTEXT regs{}; DWORD64 bits = 0; uint64_t address[4]{}; uint64_t generation[4]{}; };
     std::unordered_map<DWORD, Dr6Lost> dr6_lost;
     // Mixed return #DB: finish the callback before passing the retained kernel event.
-    std::unordered_map<DWORD, CONTEXT> co_delivery;
+    struct CoDelivery { CONTEXT returned{}; uint8_t dr_mask = 0; };
+    std::unordered_map<DWORD, CoDelivery> co_delivery;
     DWORD dr6_carry_tid = 0;
     DWORD64 dr6_carry = 0;
     uint64_t dr6_carry_address[4]{};
@@ -760,7 +761,9 @@ void arm_thread_start_fixup(probe_session *s);
 void release_hw(probe_session *s, Probe &p);
 void enforce_owned_drs(const probe_session *s, DWORD tid, CONTEXT &c, bool clear_stale);
 bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled);
-bool queue_debug_delivery(probe_session *s, DWORD tid, uint64_t ip, DWORD64 clear_bits, DWORD64 set_bits);
+uint8_t owned_debug_slots(const probe_session *s, const CONTEXT &c);
+bool queue_debug_delivery(probe_session *s, DWORD tid, uint64_t ip, DWORD64 clear_bits, DWORD64 set_bits,
+                          const CONTEXT *original = nullptr, uint8_t original_owned = 0);
 bool repair_debug_delivery(probe_session *s, DWORD tid, const CONTEXT &native);
 
 #if defined(UHH_TEST_HOOKS)

@@ -1771,13 +1771,16 @@ def check_callorig_hunt():
         r, o = run([t, case], timeout=60)
         bases[case] = co_row(o)
         base_rc[case] = r.returncode
-    runs = [(c, bk, bk) for c in CO_CASES for bk in ("breakpoint", "hw", "inline")
+    runs = [(c, bk, bk, False) for c in CO_CASES for bk in ("breakpoint", "hw", "inline")
             if c != "rettf" or bk != "inline"]
-    runs += [("nested", a, b) for a, b in (("breakpoint", "inline"), ("inline", "breakpoint"), ("hw", "inline"))]
-    for case, bk, inner in runs:
-        name = f"callorig-hunt-{case}-{bk}" + (f"+{inner}" if inner != bk else "")
+    runs += [("nested", a, b, False) for a, b in (("breakpoint", "inline"), ("inline", "breakpoint"), ("hw", "inline"))]
+    # Existing rows exercise dispatcher INT3 repair; these exercise the first agent VEH.
+    runs += [("rettf", bk, bk, True) for bk in ("breakpoint", "hw")]
+    for case, bk, inner, guard in runs:
+        name = f"callorig-hunt-{case}-{bk}" + (f"+{inner}" if inner != bk else "") + ("-guard" if guard else "")
         try:
-            r, o = run([d, "--backend", bk, "--inner-backend", inner, "--case", case, "--", t, case], timeout=300)
+            r, o = run([d, "--backend", bk, "--inner-backend", inner, "--case", case] +
+                       (["--guard"] if guard else []) + ["--", t, case], timeout=300)
             base = bases[case]
             want_row, want_hits, want_logs = co_expect(case, base, x86)
             if case == "nested" and inner != bk:

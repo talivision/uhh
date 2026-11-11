@@ -1341,9 +1341,11 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         // hardware hits first (their callbacks run, DR6 is cleared), then finish the step.
         bool hw_hit = false;
         bool target_hw = false;
+        CONTEXT raised{}; raised.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        const bool have_raised = !!GetThreadContext(thread, &raised);
+        const uint8_t raised_owned = have_raised ? owned_debug_slots(s, raised) : 0;
         {
-            CONTEXT dr{}; dr.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-            if (GetThreadContext(thread, &dr) && ((dr.Dr6 | dr6_carried(s, event.dwThreadId)) & 0xF)) {
+            if (have_raised && ((raised.Dr6 | dr6_carried(s, event.dwThreadId)) & 0xF)) {
                 bool handled = false;
                 const bool hw_ok = handle_hw(s, event, handled);
                 // call_func parks this fiber; other events can rehash the map.
@@ -1443,7 +1445,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
 #endif
         const bool pass = target_hw || step->second.prog_tf;
         if (pass && !step->second.prog_tf && event.u.Exception.dwFirstChance &&
-            !queue_debug_delivery(s, event.dwThreadId, (uint64_t)EMU_IP(native), 0x4000u, native.Dr6 & 0xE00Fu)) return false;
+            !queue_debug_delivery(s, event.dwThreadId, (uint64_t)EMU_IP(native), 0x4000u, native.Dr6 & 0xE00Fu, have_raised ? &raised : nullptr, raised_owned)) return false;
         stepping.erase(step);
         if (!pass) disposition = DBG_CONTINUE;
         return true;
@@ -1748,13 +1750,14 @@ bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposition) {
         // than the entry or return gadget, with only the program's debug status.
         HANDLE thread = event_thread(s, event.dwThreadId);
         CONTEXT live{}; live.ContextFlags = CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS;
-        const CONTEXT returned = delivery->second;
+        const auto pending = delivery->second;
+        const CONTEXT &returned = pending.returned;
         s->co_delivery.erase(delivery);
         if (!thread || !GetThreadContext(thread, &live)) return false;
         EMU_IP(live) = EMU_IP(returned); EMU_SP(live) = EMU_SP(returned);
         live.Dr6 = returned.Dr6;
         if (!SetThreadContext(thread, &live) ||
-            !queue_debug_delivery(s, event.dwThreadId, (uint64_t)EMU_IP(returned), 0xE00Fu, returned.Dr6)) return false;
+            !queue_debug_delivery(s, event.dwThreadId, (uint64_t)EMU_IP(returned), 0xE00Fu, returned.Dr6, &returned, pending.dr_mask)) return false;
         disposition = DBG_EXCEPTION_NOT_HANDLED;
         if (trace_enabled())
             std::fprintf(stderr, "  co-delivery tid=%lu pc=0x%llx dr6=0x%llx pass\n",

@@ -3085,6 +3085,7 @@ static void repair_debug_delivery(EXCEPTION_POINTERS *ep) {
         if (d.tid != tid || d.ip != (uint64_t)UHH_IP(ep->ContextRecord)) continue;
         auto *cx = ep->ContextRecord;
         cx->Dr6 = (decltype(cx->Dr6))((cx->Dr6 & ~d.clear_bits) | d.set_bits);
+        probe_agent_repair_delivery_drs(*cx, d);
         InterlockedExchange(&d.tid, 0);
         break;
     }

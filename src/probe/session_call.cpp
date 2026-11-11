@@ -1254,7 +1254,12 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
                         s->dr6_lost.erase(st->tid);                        // this event consumed the saved status
                         if (foreign) {
                             CONTEXT delivery = r; delivery.Dr6 = (decltype(delivery.Dr6))foreign;
-                            s->co_delivery[st->tid] = delivery;
+                            uint8_t owned = owned_debug_slots(s, r);
+                            // Only THIS slot is the temporary catch; the program may
+                            // also have its own execute slot at the same return PC.
+                            if (dr_address(r, slot) == ret_addr && !((r.Dr7 >> (16 + slot * 4)) & 0xFu))
+                                owned |= (uint8_t)(1u << slot);
+                            s->co_delivery[st->tid] = {delivery, owned};
                         }
                         result = rax; done = true;                         // this event now stands in for the hit
                         handling_running(s, st->tid, false);               // stopped there: listed (guard_sync)

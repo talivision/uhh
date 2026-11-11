@@ -261,7 +261,8 @@ int main(int argc, char **argv) {
     const char *k = argc > 1 ? argv[1] : "";
     if (!strcmp(k, "rettf")) {
         g_return_tf = true;
-        AddVectoredExceptionHandler(1, return_tf_handler);
+        // Leave the agent's delivery-repair VEH ahead of this program handler.
+        AddVectoredExceptionHandler(0, return_tf_handler);
     }
     if (!strcmp(k, "retaddr")) {
         review_fault_tag = "co_retaddr_fault";
