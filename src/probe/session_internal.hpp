@@ -356,7 +356,8 @@ struct probe_session {
     uint64_t debug_dispatch_addr = 0;
     uhh_session::Probe *debug_dispatch_probe = nullptr;
     // Windows snapshots the user exception CONTEXT before the debugger edits live DR6.
-    // Repair only UHH's status changes, at dispatcher entry before any target handler.
+    // Agent sessions repair in the first VEH; the dispatcher catch/map below is
+    // only for agent-less bp/hw sessions. Change only UHH's status contributions.
     struct DebugDelivery { uint64_t ip = 0; DWORD64 clear_bits = 0, set_bits = 0; };
     std::unordered_map<DWORD, DebugDelivery> debug_delivery;
 

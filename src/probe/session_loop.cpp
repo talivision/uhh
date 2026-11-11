@@ -1892,6 +1892,9 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
         break;
     case EXIT_THREAD_DEBUG_EVENT: {
         s->debug_delivery.erase(event.dwThreadId);
+        if (s->shared)
+            for (auto &d : s->shared->debug_delivery)
+                if (d.tid == (LONG)event.dwThreadId) InterlockedExchange(&d.tid, 0);
         if (event.dwThreadId == s->remote_tid) ok = complete_remote_thread(s, event.u.ExitThread.dwExitCode);
         if (event.dwThreadId == s->ipc_freezer) ipc_thaw(s);       // agent thread died mid-write: never strand the rest
         s->threads.erase(event.dwThreadId);

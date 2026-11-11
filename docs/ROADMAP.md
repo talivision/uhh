@@ -3489,13 +3489,38 @@ but this row alone does not identify one. Its prev=1, ran=0 and ret=76 confirm t
 the guard preserved the program's suspension and the original completed correctly.
 No cosusp assertion was weakened. Static review/diff check only; Windows CI pending.
 
-OPEN (orchestrator, from ctlkill CI4): the pending-hw knob exposed a REAL residual. repair_debug_delivery
-arms an INT3 at KiUserExceptionDispatcher while a debug-exception delivery is being repaired. If the
-controller dies while that breakpoint event is outstanding, the stopped thread resumes once the debug
-port is gone and its breakpoint is dispatched through the same INT3 again: recursive dispatch, stack
-overflow (0xC00000FD), before the guard's VEH or cleanup thread can restore the byte. The window is
-narrow (one repaired delivery) but it breaks "the target survives a killed controller". The knob now
-restores the byte itself, so the check covers the statusless hw claim only. Fix separately: repair
-delivery without a dispatcher INT3 (e.g. write the repaired DR6 into the saved CONTEXT before the
-exception is continued, or a guard-owned DR on the dispatcher), then make pending-hw leave the
-production state in place.
+FIX IMPLEMENTED (orchestrator, from ctlkill CI4; Windows CI pending): the pending-hw knob
+exposed a real residual: an orphan INT3 at KiUserExceptionDispatcher recursively dispatches
+itself before any VEH can run. Sessions with an initialized agent now publish a bounded
+per-thread DR6 repair (tid last, interlocked) in the channel; the agent's first VEH applies
+(saved.Dr6 & ~clear_bits) | set_bits before the orphan guard or target handlers. It matches
+thread, single-step exception code and saved IP, consumes the entry once, and leaves every
+other context field alone. EXIT_THREAD frees unused entries; channel reuse resets the table.
+PROBE_AGENT_VERSION 33 reflects the added shared layout. Failure to register the VEH fails
+agent init; an inline session needing repair before init fails rather than planting an INT3.
+
+Why the catch existed: Windows saves the exception CONTEXT before reporting first-chance
+#DB to the debugger. SetThreadContext changes live DR6, not this image. Combined target/UHH
+#DB must hide UHH's Bn/BS while preserving target Bn/BS/BD/BT, including carried target status
+lost to controller DR writes (observed 0xffff4ff3 versus expected 0xffff0ff2). The user-dispatch
+frame is not yet exposed at the original event; its later stack address/ABI cannot safely be
+assumed there. Merely writing live DR6 then continuing NOT_HANDLED already proved insufficient.
+The VEH receives the actual CONTEXT on both x64 and x86 WOW64, avoiding frame offsets and the
+64-bit WOW64 dispatch layer. No executable byte is patched for agent delivery repair. Before
+publication, death follows the ordinary orphan guard path; after publication, the agent can
+finish the repair without the controller. The guard still preserves foreign status.
+
+pending-hw now kills at the original #DB with the production repair published, live DRs/TF
+cleared and no step/held attribution. The saved DR6 becomes statusless in the production VEH;
+the guard must claim it by the published execute address. The old dispatcher's test-only byte
+restore is removed: the previous implementation recurses at its dispatcher event. Existing
+ctrl-own-debug checks (watch-tf/carried, step-own/mixed, detach-dr/tf) remain the semantic checks.
+No build/test execution here; orchestrator must run x64 + x86 WOW64 CI.
+
+RESIDUAL (owner decision 2026-11-07): bp/hw-only sessions inject no agent. They retain the
+one-delivery dispatcher INT3, removed through the existing PROBE_ONCE path as soon as repairs
+finish (also restored on detach). Killing such a controller can still recurse/overflow during
+that window, or leave other traps behind. These sessions do NOT satisfy unconditional
+controller-death survival; closing this residual requires changing the no-agent decision or a
+separately validated kernel-frame repair. A program can register a newer first VEH ahead of
+ours; as with the agent's existing trampoline VEH, handler ordering remains a limitation.

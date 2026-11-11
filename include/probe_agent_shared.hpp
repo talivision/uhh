@@ -13,7 +13,7 @@
 #include <intrin.h>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 32;   /* 32: guard DR address ownership; 31: inline install failure stage; 30: reusable channel epoch and target mapping handle; 29: init receives a per-session mapping handle (layout unchanged); 28: init_returns (x86hunt); 27: ring record's header and text start on one cache line, log_head on a line of its own (perf5); 26: tblock retired on a line of its own, drain wake-up (drain_wait); 25: per-thread hit blocks (tblocks); 24: huntaudit early_init (on top of 23: runfix1 log carry + running count; 21: held_floor) */
+constexpr uint32_t PROBE_AGENT_VERSION = 33;   /* 33: agent debug-delivery repair; 32: guard DR address ownership; 31: inline install failure stage; 30: reusable channel epoch and target mapping handle; 29: init receives a per-session mapping handle (layout unchanged); 28: init_returns (x86hunt); 27: ring record's header and text start on one cache line, log_head on a line of its own (perf5); 26: tblock retired on a line of its own, drain wake-up (drain_wait); 25: per-thread hit blocks (tblocks); 24: huntaudit early_init (on top of 23: runfix1 log carry + running count; 21: held_floor) */
 constexpr uint32_t PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH = 1u << 9;   /* agent side only needs this one */   /* == PROBE_UNSAFE_FAST_PATCH (asserted in session.cpp) */
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 128;   /* inline probes per session; the 129th is refused */
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
@@ -172,6 +172,14 @@ struct probe_agent_guard {
 };
 constexpr uint32_t PROBE_AGENT_HOLD_OURS = 0xFFFFFFFFu;
 
+// Controller publishes tid LAST while the debug event freezes the process. The owning
+// thread's first VEH consumes it, even after controller death. No executable patch.
+constexpr uint32_t PROBE_AGENT_DEBUG_DELIVERIES = 256;
+struct probe_agent_debug_delivery {
+    volatile LONG tid;
+    uint64_t ip, clear_bits, set_bits;
+};
+
 /* Hit counting and in-flight tracking are striped over cache-line-separated counters
    (indexed by thread id: (tid >> 2) % PROBE_AGENT_STRIPES) so threads hitting the same probe
    do not contend on one line. Exact: the controller sums the stripes.
@@ -281,6 +289,8 @@ struct probe_agent_shared {
     volatile LONG int3_count;
     probe_agent_int3 int3[PROBE_AGENT_INT3_CAP];
     probe_agent_guard guard;
+    volatile LONG debug_delivery_ready; // first VEH installed (independent of attach guard)
+    probe_agent_debug_delivery debug_delivery[PROBE_AGENT_DEBUG_DELIVERIES];
     /* Detach drain (v20). Logs are never dropped while a callback can still send one: after a
        detach the controller keeps delivering until no in-flight callback can still finish. It
        sets live_query and signals the service event; the agent's service thread answers in

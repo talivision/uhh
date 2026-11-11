@@ -494,6 +494,26 @@ void enforce_owned_drs(const probe_session *s, DWORD tid, CONTEXT &c, bool clear
 static void debug_delivery_noop(probe_context *) {}
 bool queue_debug_delivery(probe_session *s, DWORD tid, uint64_t ip, DWORD64 clear_bits, DWORD64 set_bits) {
     if (!clear_bits && !set_bits) return true;
+    if (s->shared && s->shared->debug_delivery_ready) {
+        probe_agent_debug_delivery *free = nullptr;
+        for (auto &d : s->shared->debug_delivery) {
+            if (d.tid == (LONG)tid) {
+                // The event freezes this thread: its VEH cannot read while we update.
+                d.ip = ip; d.clear_bits |= clear_bits;
+                d.set_bits = (d.set_bits & ~clear_bits) | set_bits;
+                return true;
+            }
+            if (!d.tid && !free) free = &d;
+        }
+        if (!free) { set_error(s, "agent debug delivery table full"); return false; }
+        free->ip = ip; free->clear_bits = clear_bits; free->set_bits = set_bits;
+        InterlockedExchange(&free->tid, (LONG)tid); // publish before continuing #DB
+        return true;
+    }
+    // No agent VEH (yet): the short-lived dispatcher catch. Bp/hw-only sessions inject no agent
+    // (owner decision); an inline session uses it only before its agent's VEH is ready -- failing
+    // the event there would cost the program correct delivery, a worse trade than the narrow
+    // controller-death window this catch has (docs/ROADMAP.md, dispint3).
     if (!s->debug_dispatch_addr) {
         s->debug_dispatch_addr = resolve_symbol(s, "ntdll.dll!KiUserExceptionDispatcher");
         if (!s->debug_dispatch_addr) { set_error(s, "cannot resolve debug exception dispatcher"); return false; }
@@ -553,15 +573,6 @@ bool repair_debug_delivery(probe_session *s, DWORD tid, const CONTEXT &native) {
             img.EFlags &= ~0x100u;
             if (!remote_write(s->pi.hProcess, rec, &img, sizeof(img), &n) || n != sizeof(img)) {
                 set_error(s, "write test pending hardware exception context"); return false;
-            }
-            // Do not orphan an INT3 at the exception dispatcher itself: dispatch
-            // of that breakpoint would hit it again before any VEH could run.
-            // Keep its INT3-table entry so the outstanding breakpoint can still
-            // be recognised/rewound by the guard, but remove the physical byte.
-            const Probe *dispatcher = s->debug_dispatch_probe;
-            if (!dispatcher || !dispatcher->internal || dispatcher->address != s->debug_dispatch_addr ||
-                !patch(s->pi.hProcess, dispatcher->address, dispatcher->original)) {
-                set_error(s, "restore test hardware dispatcher breakpoint"); return false;
             }
             // Arming/fixups between the original #DB and this dispatcher event
             // may have restored live slots. Clear BOTH images before death.
@@ -629,12 +640,21 @@ bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
             if (p->active && !p->internal && (p->flags & PROBE_HW) &&
                 !(p->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) && p->dr_slot >= 0 && p->dr_slot < 4 &&
                 p->address == (uint64_t)EMU_IP(native) && (native.Dr6 & (1u << p->dr_slot))) {
-                // Deliver this real execute fault to the existing dispatcher
-                // repair breakpoint, then die before any target handler runs.
+                // Forward this real execute fault through production delivery repair,
+                // then die before any target handler runs.
                 if (!queue_debug_delivery(s, event.dwThreadId, p->address, 0xE00Fu, 0)) return false;
                 native.Dr0 = native.Dr1 = native.Dr2 = native.Dr3 = native.Dr6 = native.Dr7 = 0;
                 if (!SetThreadContext(thread, &native)) {
                     set_error(s, win_error("clear test pending hardware context")); return false;
+                }
+                if (s->shared->debug_delivery_ready) {
+                    // Leave the PRODUCTION repair pending: the agent's first VEH will
+                    // clear saved DR6, then its guard must claim this statusless fault.
+                    // No dispatcher byte restore (nor dispatcher breakpoint) here.
+                    std::fprintf(stderr, "probe: test: dying with statusless step outstanding (hw)\n");
+                    std::fflush(stderr);
+                    TerminateProcess(GetCurrentProcess(), 98);
+                    return false;
                 }
                 return true; // handled=false: forward to dispatcher, not DBG_CONTINUE
             }

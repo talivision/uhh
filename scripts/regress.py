@@ -10008,6 +10008,9 @@ def lc_controller_killed(cfgname, cfg):
     bad, n, took, outcomes = [], 0, [], []
     timings = ["active", "active+0.5", "early-0.05", "early-0.3"]
     if cfgname == "mixed":
+        # pending-hw leaves production delivery repair pending at controller death:
+        # no test-only dispatcher byte restore. The first agent VEH repairs saved
+        # DR6 before the orphan guard claims the resulting statusless execute fault.
         timings += ["pending-step", "pending-held", "pending-hw"]
     for when in timings:
         n += 1
