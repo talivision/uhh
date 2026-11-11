@@ -5434,18 +5434,24 @@ HUNT_READ = "ntdll.dll!NtReadVirtualMemory"
 
 def hunt_run(backend, scenario, n, extra=(), timeout=600, readers=None):
     """hunt_driver (gated_config instrumentation + a stressor) on hunt_target <scenario>.
-    Logs are stream-counted, never retained. readers: exit scenarios' reader threads."""
+    Logs are stream-counted; only bounded output tails are retained. readers: exit scenarios' reader threads."""
     import os
+    from collections import deque
     d, t = exe("hunt_driver.exe"), exe("hunt_target.exe")
+    stdout_tail, stderr_tail, target_errors = deque(maxlen=12), deque(maxlen=12), deque(maxlen=12)
     st = {"read": 0, "unmapped": 0, "pids": set(), "work": 0, "tid_ok": 0, "tid_bad": 0,
           "recurse_ok": 0, "other": 0, "refused": []}
     keep = []
 
     def on_err(line):
+        stderr_tail.append(line[:1200])
+        if line.startswith("[hunt "):
+            target_errors.append(line[:1200])
         if "call_func refused" in line and len(st["refused"]) < 20:
             st["refused"].append(line)
 
     def on_line(line, _t):
+        stdout_tail.append(line[:1200])
         if not line.startswith("{"):
             return
         try:
@@ -5485,7 +5491,35 @@ def hunt_run(backend, scenario, n, extra=(), timeout=600, readers=None):
         tg = dict(tg, print_ms=mx.get("print_ms"))
     rd = next((o for o in keep if o.get("kind") == "probe" and o.get("location") == HUNT_READ), {})
     wk = next((o for o in keep if o.get("kind") == "probe" and "HuntWork" in str(o.get("location"))), {})
+    st["stdout_tail"], st["stderr_tail"] = list(stdout_tail), list(stderr_tail)
+    st["target_errors"] = list(target_errors)
+    st["diagnostics"] = [o for o in keep if o.get("kind", "").startswith("target_")]
     return rc, timed_out, tg, rd, wk, report(keep), st
+
+
+def hunt_ctx_failure_details(rep, st):
+    """Decode only actual snapshot ranges; never infer a module from low bits alone."""
+    details = ""
+    code = rep.get("app_exit")
+    if isinstance(code, int):
+        code &= 0xffffffff
+        details += f" exit_hex=0x{code:08X}"
+        for module in st["diagnostics"]:
+            if module.get("kind") != "target_module":
+                continue
+            base, size = module["base"], module["size"]
+            if base <= code < base + size:
+                details += f" exit looks like {module['name']}+0x{code - base:X}"
+        for item in st["diagnostics"]:
+            if item.get("kind") == "target_addresses":
+                for name in ("pattern", "ntread"):
+                    if code == item[name]:
+                        details += f" exit equals target {name} address"
+    # Preserve startup ranges and exit markers even if the streaming tail rolled over.
+    details += f" target_diagnostics={st['diagnostics']!r}"
+    details += f" target_errors={st['target_errors']!r}"
+    details += f" stdout_tail={st['stdout_tail']!r} stderr_tail={st['stderr_tail']!r}"
+    return details
 
 
 def hunt_selected(name):
@@ -5639,7 +5673,8 @@ def check_hunt():
                                     if sc == "ctx" else "")
                                  + (f" recurse_ok={st['recurse_ok']}" if "--recurse" in extra else "")
                                  + (f" other={st['other']}" if st["other"] else "")
-                                 + ("" if ok else f" err={(rep.get('error') or '')[:160]}"))
+                                 + ("" if ok else f" err={(rep.get('error') or '')[:160]}")
+                                 + (hunt_ctx_failure_details(rep, st) if sc == "ctx" and not ok else ""))
             except Exception as e:
                 record(name, False, repr(e))
         # Process exit racing in-flight callbacks and logs: no hang, the exit code is the

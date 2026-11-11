@@ -48,6 +48,7 @@
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <tlhelp32.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,6 +65,65 @@ static LONG g_ctx_rounds, g_ctx_ms, g_ctx_max_ms;
 static ULONG_PTR g_owndr_addr;
 static unsigned char g_pattern[64];
 static volatile LONG g_stop;
+
+/* Exit diagnostics are independent of the instrumentation's report. A marker before
+   each explicit exit distinguishes main's intent from a later CRT/loader failure. */
+static void exit_marker(const char *path, DWORD code) {
+    printf("{\"kind\":\"target_exit\",\"path\":\"%s\",\"code\":%lu,\"tid\":%lu}\n",
+           path, code, GetCurrentThreadId());
+    fflush(stdout);
+}
+static void diagnostic_atexit(void) {
+    printf("{\"kind\":\"target_atexit\",\"tid\":%lu}\n", GetCurrentThreadId());
+    fflush(stdout);
+}
+static void json_string(const char *s) {
+    putchar('"');
+    for (; *s; ++s) {
+        const unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\') { putchar('\\'); putchar(c); }
+        else if (c < 32 || c >= 127) printf("\\u%04x", (unsigned)c);
+        else putchar(c);
+    }
+    putchar('"');
+}
+/* Snapshot before ctx starts its readers; emitted by the target, so ASLR and the
+   target's architecture are reflected even when it dies before its final report. */
+static void diagnostic_modules(void) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "[hunt modules unavailable error=%lu]\n", GetLastError());
+        fflush(stderr);
+        return;
+    }
+    MODULEENTRY32A m; memset(&m, 0, sizeof(m)); m.dwSize = sizeof(m);
+    for (BOOL more = Module32FirstA(snap, &m); more; more = Module32NextA(snap, &m)) {
+        printf("{\"kind\":\"target_module\",\"name\":"); json_string(m.szModule);
+        printf(",\"base\":%llu,\"size\":%lu}\n", (unsigned long long)(ULONG_PTR)m.modBaseAddr, m.modBaseSize);
+    }
+    printf("{\"kind\":\"target_addresses\",\"pattern\":%llu,\"ntread\":%llu}\n",
+           (unsigned long long)(ULONG_PTR)g_pattern, (unsigned long long)(ULONG_PTR)g_ntread);
+    fflush(stdout);
+    CloseHandle(snap);
+}
+static LONG WINAPI diagnostic_unhandled(EXCEPTION_POINTERS *ep) {
+    /* Best effort: an exhausted/corrupt stack or fail-fast can bypass this filter.
+       WriteFile avoids relying on a buffered stream surviving process teardown. */
+    MEMORY_BASIC_INFORMATION mbi;
+    char module[MAX_PATH] = "?", line[1024]; DWORD written;
+    ULONG_PTR base = 0, address = (ULONG_PTR)ep->ExceptionRecord->ExceptionAddress;
+    if (VirtualQuery((void *)address, &mbi, sizeof(mbi))) {
+        base = (ULONG_PTR)mbi.AllocationBase;
+        GetModuleFileNameA((HMODULE)base, module, sizeof(module));
+        module[sizeof(module) - 1] = 0;
+    }
+    int n = _snprintf_s(line, sizeof(line), _TRUNCATE,
+                       "[hunt unhandled code=0x%08lX address=%p module=%s base=%p offset=0x%llX tid=%lu]\r\n",
+                       ep->ExceptionRecord->ExceptionCode, (void *)address, module, (void *)base,
+                       (unsigned long long)(address - base), GetCurrentThreadId());
+    if (n > 0) WriteFile(GetStdHandle(STD_ERROR_HANDLE), line, (DWORD)n, &written, NULL);
+    return EXCEPTION_EXECUTE_HANDLER; /* preserve the exception's termination status */
+}
 
 /* One verified read. Callable from anywhere (DllMain, TLS, APC, VEH, fiber). */
 __declspec(dllexport) __declspec(noinline) void hunt_read(void) {
@@ -165,7 +225,7 @@ static DWORD g_n = 0;
 static void trace_atexit(void) { DWORD w; WriteFile(GetStdHandle(STD_ERROR_HANDLE), "[atexit]\n", 9, &w, NULL); }
 static HANDLE spawn(LPTHREAD_START_ROUTINE fn, void *arg) {
     HANDLE t = CreateThread(NULL, 0, fn, arg, 0, NULL);
-    if (!t) { fprintf(stderr, "CreateThread failed %lu\n", GetLastError()); ExitProcess(90); }
+    if (!t) { fprintf(stderr, "CreateThread failed %lu\n", GetLastError()); exit_marker("CreateThread-failed", 90); ExitProcess(90); }
     return t;
 }
 static void join(HANDLE *t, DWORD n) {
@@ -398,7 +458,7 @@ static void run_edge_threads(LPTHREAD_START_ROUTINE fn, SIZE_T reserve) {
         HANDLE t[4]; DWORD k = 0;
         for (; k < 4 && i + k < g_n; ++k) {
             t[k] = CreateThread(NULL, reserve, fn, NULL, reserve ? STACK_SIZE_PARAM_IS_A_RESERVATION : 0, NULL);
-            if (!t[k]) { fprintf(stderr, "CreateThread failed %lu\n", GetLastError()); ExitProcess(90); }
+            if (!t[k]) { fprintf(stderr, "CreateThread failed %lu\n", GetLastError()); exit_marker("CreateThread-failed", 90); ExitProcess(90); }
         }
         join(t, k);
     }
@@ -414,11 +474,14 @@ static unsigned long long checksum(void) {
 }
 
 int main(int argc, char **argv) {
+    SetUnhandledExceptionFilter(diagnostic_unhandled);
+    atexit(diagnostic_atexit);
     const char *sc = argc > 1 ? argv[1] : "threads";
     g_n = 100;
     for (int i = 2; i + 1 < argc; i += 2) if (!strcmp(argv[i], "--n")) g_n = (DWORD)strtoul(argv[i + 1], NULL, 0);
     init_reads();
     own_ranges();
+    if (!strcmp(sc, "ctx")) diagnostic_modules();
     g_tls_on = 1;
     PVOID veh = AddVectoredExceptionHandler(1, hunt_veh);
 
@@ -508,8 +571,9 @@ int main(int argc, char **argv) {
         printf("{\"kind\":\"main_exit\",\"print_ms\":%lld}\n", (long long)((t2.QuadPart - t1.QuadPart) * 1000 / f.QuadPart));
         fflush(stdout);
         if (getenv("HUNT_TRACE_EXIT")) { atexit(trace_atexit); fprintf(stderr, "[main-leaving tid=%lu]\n", GetCurrentThreadId()); }
-        if (!strcmp(sc, "exit-process")) ExitProcess(6);
-        if (!strcmp(sc, "exit-terminate")) TerminateProcess(GetCurrentProcess(), 7);
+        if (!strcmp(sc, "exit-process")) { exit_marker("ExitProcess", 6); ExitProcess(6); }
+        if (!strcmp(sc, "exit-terminate")) { exit_marker("TerminateProcess", 7); TerminateProcess(GetCurrentProcess(), 7); }
+        exit_marker("main-return", 5);
         return 5;
     } else if (!strcmp(sc, "owndr") || !strcmp(sc, "owndr-live")) {
         const int live = !strcmp(sc, "owndr-live");
@@ -571,7 +635,7 @@ int main(int argc, char **argv) {
     } else if (!strcmp(sc, "threads")) {
         HANDLE t[32]; for (int i = 0; i < 32; ++i) t[i] = spawn(reader_n, NULL); join(t, 32);
     } else {
-        fprintf(stderr, "unknown scenario %s\n", sc); return 2;
+        fprintf(stderr, "unknown scenario %s\n", sc); exit_marker("unknown-scenario", 2); return 2;
     }
     g_tls_on = 0;
     if (veh) RemoveVectoredExceptionHandler(veh);
@@ -581,5 +645,6 @@ int main(int argc, char **argv) {
            sc, g_n, g_reads, g_bad, g_foreign, g_early, g_work, g_owndr, g_guards, g_twin, g_ctx_rounds, g_ctx_ms, g_ctx_max_ms, g_alien,
            g_edge, g_guard_lost, checksum(), GetCurrentProcessId());
     fflush(stdout);
+    exit_marker("main-return", 0);
     return 0;
 }
