@@ -30,7 +30,12 @@ static uint32_t guard_floor(const probe_session *s, DWORD tid) {
 GuardTouch::GuardTouch(const probe_session *s, DWORD tid) {
     if (!s->attached || !s->shared || s->detached || !tid) return;
     auto &gg = s->shared->guard;
-    const LONG count = gg.held_count;
+    LONG count = gg.held_count;
+    if (count >= 0 && count <= (LONG)PROBE_AGENT_GUARD_TIDS) {
+        LONG hole = 0;
+        while (hole < count && gg.held_tids[hole]) ++hole;
+        count = hole;
+    }
 #if defined(UHH_TEST_HOOKS)
     // Test-only (probe_api_testhooks): UHH_TEST_NO_TOUCH_GUARD=1 leaves the touch unrecorded
     // (the control run of regress cxlib-touchkill-hw).
@@ -41,7 +46,7 @@ GuardTouch::GuardTouch(const probe_session *s, DWORD tid) {
         gg.held_floor[count] = guard_floor(s, tid);      // the count before the call: what the guard must leave
         gg.held_tids[count] = tid;
         MemoryBarrier();
-        gg.held_count = count + 1;
+        if (gg.held_count == count) gg.held_count = count + 1;
         g = &gg; n = count;
     }
 #if defined(UHH_TEST_HOOKS)
@@ -97,11 +102,16 @@ static std::string quote_arg(const char *arg) {
 void guard_note_hold(probe_session *s, DWORD tid) {
     if (!s->attached || !s->shared || s->detached || !tid) return;
     auto &g = s->shared->guard;
-    const LONG n = g.held_count;
-    if (n < 0 || n >= (LONG)PROBE_AGENT_GUARD_TIDS) return;
-    g.held_tids[n] = tid; g.held_floor[n] = PROBE_AGENT_HOLD_OURS;
+    const LONG count = g.held_count;
+    if (count < 0 || count > (LONG)PROBE_AGENT_GUARD_TIDS) return;
+    LONG n = 0;
+    while (n < count && g.held_tids[n]) ++n;
+    if (n >= (LONG)PROBE_AGENT_GUARD_TIDS) return;
+    g.held_floor[n] = PROBE_AGENT_HOLD_OURS;
     MemoryBarrier();
-    g.held_count = n + 1;
+    g.held_tids[n] = tid;
+    MemoryBarrier();
+    if (n == count) g.held_count = n + 1;
 }
 bool guard_set_ready(probe_session *s, const char *why) {
     if (s->guard_ready) return true;
@@ -123,9 +133,10 @@ void guard_sync(probe_session *s) {
     for (auto &kv : s->stepping) if (n < PROBE_AGENT_GUARD_TIDS) g.step_tids[n++] = kv.first;
     g.step_count = (LONG)n;
     n = 0;
+    DWORD holds[PROBE_AGENT_GUARD_TIDS]{};
     auto hold = [&](DWORD tid) {                        // a hold of ours: resumed once, unconditionally
         if (!tid || n >= PROBE_AGENT_GUARD_TIDS) return;
-        g.held_tids[n] = tid; g.held_floor[n] = PROBE_AGENT_HOLD_OURS; ++n;
+        holds[n++] = tid;
     };
     for (const auto *list : {&s->held, &s->ipc_frozen, &s->call_deferred})
         for (HANDLE t : *list) hold(GetThreadId(t));
@@ -148,20 +159,41 @@ void guard_sync(probe_session *s) {
     for (const auto &h : s->handling) if (!h.running) hold(h.tid);
     for (const auto &c : s->calls) if (c.second->call_held) hold(c.first);   // suspended by us
     for (const auto &h : s->watch_deferred) hold(h.ev.dwThreadId);
-    g.held_count = (LONG)n;
+    // Never compact live entries: [A,B] -> [B] must not expose [B,B]
+    // if the controller dies during publication.
+    LONG count = g.held_count;
+    if (count < 0 || count > (LONG)PROBE_AGENT_GUARD_TIDS) count = 0;
+    for (LONG i = 0; i < count; ++i) {
+        bool keep = false;
+        for (uint32_t j = 0; j < n; ++j) if (holds[j] && holds[j] == g.held_tids[i]) {
+            holds[j] = 0; keep = true; break;
+        }
+        if (!keep) g.held_tids[i] = 0;
+    }
+    MemoryBarrier();
+    for (uint32_t j = 0; j < n; ++j) if (holds[j]) {
+        LONG i = 0;
+        while (i < count && g.held_tids[i]) ++i;
+        if (i >= (LONG)PROBE_AGENT_GUARD_TIDS) break;
+        g.held_floor[i] = PROBE_AGENT_HOLD_OURS;
+        MemoryBarrier();
+        g.held_tids[i] = holds[j];
+        if (i == count) { MemoryBarrier(); g.held_count = ++count; }
+    }
     n = 0;
     for (uint64_t b : s->scratch_blocks) if (n < PROBE_AGENT_GUARD_BLOCKS) g.blocks[n++] = b;
     g.block_count = (LONG)n;
     // Append/publish each address before arming it. A controller killed during this
     // mirror must not invalidate addresses already installed on running threads.
     for (uint64_t address : s->hw_armed_ever) {
-        const LONG count = g.dr_site_count;
+        const LONG site_count = g.dr_site_count;
+        if (site_count < 0 || site_count > (LONG)PROBE_AGENT_GUARD_DR_SITES) continue;
         bool found = false;
-        for (LONG i = 0; i < count; ++i) if (g.dr_sites[i] == address) found = true;
-        if (!found && count < (LONG)PROBE_AGENT_GUARD_DR_SITES) {
-            g.dr_sites[count] = address;
+        for (LONG i = 0; i < site_count; ++i) if (g.dr_sites[i] == address) found = true;
+        if (!found && site_count < (LONG)PROBE_AGENT_GUARD_DR_SITES) {
+            g.dr_sites[site_count] = address;
             MemoryBarrier();
-            g.dr_site_count = count + 1;
+            g.dr_site_count = site_count + 1;
         }
     }
     g.dr_mask = s->dr_ever | s->dr_used;          // incl. a call_original's return-catch slot
@@ -314,6 +346,11 @@ extern "C" int probe_attach(probe_session *s, uint32_t pid) {
     // A failure below lets go of the target at once and leaves the session NOT attached: a
     // probe_close (from any thread) then has nothing to detach and no probe_run to wait for.
     auto fail = [&] {
+        if (s->shared) {
+            auto &g = s->shared->guard;
+            if (HANDLE h = (HANDLE)(uintptr_t)InterlockedExchange64(&g.controller_process, 0))
+                DuplicateHandle(s->pi.hProcess, h, nullptr, nullptr, 0, FALSE, DUPLICATE_CLOSE_SOURCE);
+        }
         release_unclaimed_agent_mapping(s);
         DebugActiveProcessStop(pid);
         if (s->sym_ready) { uhh_sym::cleanup(s->pi.hProcess); s->sym_ready = false; }

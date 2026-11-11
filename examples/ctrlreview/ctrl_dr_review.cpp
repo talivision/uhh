@@ -362,7 +362,93 @@ int run(int argc, char **argv) {
             dr_require(handle_hw(s, d.ev, handled) && handled, "new access handled");
             dr_require(callbacks == before + 1 && p->hits == hits + 1, "new access callback and hit");
         };
-        if (mode == "step-call") {
+        if (mode == "guard-holds" || mode == "guard-count") {
+            auto shared = std::make_unique<probe_agent_shared>();
+            s->shared = shared.get(); s->attached = true;
+            auto &g = shared->guard;
+            if (mode == "guard-holds") {
+                // Keep B in its original slot when A disappears. A compacting writer
+                // would transiently publish two B entries if killed during the copy.
+                g.held_count = 2; g.held_tids[0] = d.pi.dwThreadId + 1; g.held_tids[1] = d.pi.dwThreadId;
+                g.held_floor[0] = g.held_floor[1] = PROBE_AGENT_HOLD_OURS;
+                s->held.push_back(d.pi.hThread);
+                guard_sync(s);
+                dr_require(g.held_count == 2 && !g.held_tids[0] && g.held_tids[1] == d.pi.dwThreadId,
+                           "surviving hold never copied over a published hold");
+                guard_note_hold(s, d.pi.dwThreadId + 2);
+                dr_require(g.held_count == 2 && g.held_tids[0] == d.pi.dwThreadId + 2 &&
+                           g.held_tids[1] == d.pi.dwThreadId, "new hold fills cleared slot");
+                s->held.clear();
+            } else {
+                for (LONG bad : {-1L, 0x7fffffffL}) {
+                    g.dr_site_count = bad;
+                    const auto before = std::make_unique<probe_agent_guard>(g);
+                    guard_sync(s);
+                    dr_require(g.dr_site_count == bad && !std::memcmp(g.dr_sites, before->dr_sites, sizeof(g.dr_sites)),
+                               "invalid target-writable count never used as an index");
+                }
+            }
+            s->shared = nullptr; s->attached = false;
+        } else if (mode == "fault-pointer") {
+#if defined(UHH_TEST_HOOKS)
+            void *mem = VirtualAllocEx(d.pi.hProcess, nullptr, 65536, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            dr_require(mem != nullptr, "allocate saved fault stack");
+            const uint64_t base = (uint64_t)(uintptr_t)mem;
+            CONTEXT saved = c;
+            EMU_IP(saved) = (decltype(EMU_IP(saved)))site;
+            EMU_SP(saved) = (decltype(EMU_SP(saved)))(base + 32768);
+            saved.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+            const uint64_t at = base + 16384;
+            SIZE_T wrote = 0;
+            dr_require(!!WriteProcessMemory(d.pi.hProcess, (void *)(uintptr_t)at, &saved, sizeof(saved), &wrote), "save fault context");
+#if !defined(_WIN64)
+            const uint32_t pair[] = {0xfffffff0u, (uint32_t)at};
+            dr_require(!!WriteProcessMemory(d.pi.hProcess, (void *)(uintptr_t)(at - 16), pair, sizeof(pair), &wrote), "save bogus record pointer");
+#endif
+            dr_require(test_fault_retried(s, saved, site, EXCEPTION_ACCESS_VIOLATION), "bogus record ignored without controller read outside buffer");
+            VirtualFreeEx(d.pi.hProcess, mem, 0, MEM_RELEASE);
+#else
+            dr_require(false, "test hooks required");
+#endif
+        } else if (mode == "attach-handle") {
+            dr_require(SuspendThread(d.pi.hThread) != (DWORD)-1, "hold child for failed attach");
+            d.resume(); dr_require(!!DebugActiveProcessStop(d.pi.dwProcessId), "release fixture debugger"); d.attached = false;
+            DWORD before = 0, after = 0;
+            dr_require(!!GetProcessHandleCount(d.pi.hProcess, &before), "initial target handles");
+            auto *failed_session = probe_session_create();
+            dr_require(failed_session != nullptr, "create failed attach session");
+            failed_session->agent_prep_error = ERROR_MOD_NOT_FOUND; // deterministic missing agent exports
+            auto in = std::make_unique<Probe>(); in->flags = PROBE_INLINE;
+            failed_session->probes.push_back(std::move(in));
+            const int attached = probe_attach(failed_session, d.pi.dwProcessId);
+            probe_close(failed_session);
+            dr_require(!attached && !!GetProcessHandleCount(d.pi.hProcess, &after) && before == after,
+                       "failed attach closes both remote duplicates");
+            ResumeThread(d.pi.hThread);
+        } else if (mode == "popf-tf") {
+            const unsigned char bytes[] = {0xCC, 0x90, 0x90, 0xCC};
+            SIZE_T wrote = 0;
+            dr_require(!!WriteProcessMemory(d.pi.hProcess, (void *)(uintptr_t)site, bytes, sizeof(bytes), &wrote), "write POPF site");
+            FlushInstructionCache(d.pi.hProcess, (void *)(uintptr_t)site, sizeof(bytes));
+            const uint64_t stack = (uint64_t)EMU_SP(c) - sizeof(void *);
+            const uintptr_t flags = 0x302;
+            dr_require(!!WriteProcessMemory(d.pi.hProcess, (void *)(uintptr_t)stack, &flags, sizeof(flags), &wrote), "flags enabling TF");
+            p->flags = PROBE_BREAKPOINT; p->dr_slot = -1; p->address = site; p->original = 0x9D;
+            p->orig_insn = {0x9D}; p->insn_len = 1;
+            s->dr_used = s->dr_ever = 0; s->hw_active = 0;
+            c.Dr0 = (decltype(c.Dr0))target_address; // unrelated program-owned watch forces in-place execution
+            EMU_SP(c) = (decltype(EMU_SP(c)))stack; d.put(c);
+            d.resume(); d.wait(EXCEPTION_BREAKPOINT, site);
+            DWORD disposition = 0;
+            dr_require(dispatch_event(s, d.ev, disposition) && disposition == DBG_CONTINUE, "POPF hit");
+            d.resume(disposition); d.wait(EXCEPTION_SINGLE_STEP, site + 1);
+            dr_require(dispatch_event(s, d.ev, disposition) && disposition == DBG_CONTINUE &&
+                       (d.get().EFlags & 0x100u), "completion preserves newly popped TF");
+            d.resume(disposition); d.wait(EXCEPTION_SINGLE_STEP, site + 2);
+            dr_require(dispatch_event(s, d.ev, disposition) && disposition == DBG_EXCEPTION_NOT_HANDLED, "program step follows POPF");
+            d.resume(disposition); d.wait(EXCEPTION_BREAKPOINT, site + 3);
+            dr_require(d.result().seen == 1 && d.result().ip == site + 2, "program handler receives its step");
+        } else if (mode == "step-call") {
             // A real store #DB completes an in-place step and fires our watch.
             // Its callback's callee crosses an execute probe on the SAME thread.
             const uint64_t fn = resolve_symbol(s, "ntdll.dll!NtYieldExecution");
