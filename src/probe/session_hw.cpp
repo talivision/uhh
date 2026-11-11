@@ -554,6 +554,25 @@ bool repair_debug_delivery(probe_session *s, DWORD tid, const CONTEXT &native) {
             if (!remote_write(s->pi.hProcess, rec, &img, sizeof(img), &n) || n != sizeof(img)) {
                 set_error(s, "write test pending hardware exception context"); return false;
             }
+            // Do not orphan an INT3 at the exception dispatcher itself: dispatch
+            // of that breakpoint would hit it again before any VEH could run.
+            // Keep its INT3-table entry so the outstanding breakpoint can still
+            // be recognised/rewound by the guard, but remove the physical byte.
+            const Probe *dispatcher = s->debug_dispatch_probe;
+            if (!dispatcher || !dispatcher->internal || dispatcher->address != s->debug_dispatch_addr ||
+                !patch(s->pi.hProcess, dispatcher->address, dispatcher->original)) {
+                set_error(s, "restore test hardware dispatcher breakpoint"); return false;
+            }
+            // Arming/fixups between the original #DB and this dispatcher event
+            // may have restored live slots. Clear BOTH images before death.
+            CONTEXT live = native;
+            live.ContextFlags = CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS;
+            live.Dr0 = live.Dr1 = live.Dr2 = live.Dr3 = live.Dr6 = live.Dr7 = 0;
+            live.EFlags &= ~0x100u;
+            HANDLE thread = event_thread(s, tid);
+            if (!thread || !SetThreadContext(thread, &live)) {
+                set_error(s, win_error("clear test hardware dispatcher live context")); return false;
+            }
             std::fprintf(stderr, "probe: test: dying with statusless step outstanding (hw)\n");
             std::fflush(stderr);
             TerminateProcess(GetCurrentProcess(), 98);

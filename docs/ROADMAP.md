@@ -3457,3 +3457,45 @@ exception: no hits or BS, no step membership, and its PC is the hardware site ra
 than an INT3 site or scratch copy. The target dies with 0x80000004, failing the same
 survival/progress/cleanliness/no-unhandled/shutdown checks as pending-step/held.
 Static diff review only here; Windows x64/x86 build/runtime validation pending CI.
+
+ctlkill CI4 (f0fc4eb): pending-hw's stack overflow is explained by its dispatcher
+INT3 scaffold, before a VEH can claim the hardware exception. The knob terminated
+at KiUserExceptionDispatcher's breakpoint while leaving its byte patched. Dispatch
+of that orphan breakpoint enters the same dispatcher INT3 recursively. This is not
+evidence that the statusless hardware exception was claimed or that it re-fired.
+The knob now restores the dispatcher byte (with patch's instruction-cache flush),
+keeps the INT3-table entry for guard recognition of the outstanding breakpoint,
+and clears live DR0..3/DR6/DR7 and TF in addition to the saved hardware CONTEXT.
+The outstanding breakpoint can then reach the guard and rewind to the restored
+entry, followed by the pending statusless hardware exception at the original site.
+The old agent still rejects that second exception; the new exact-site fallback is
+still required. No production guard predicate or suspension path was changed.
+The production single-step handler already calls clear_orphan_dr on its saved
+CONTEXT using enabled-slot plus armed-address ownership; a zero DR image cannot
+re-arm the execute fault when continued.
+
+CI4's isolated cosusp-breakpoint first=1 is not explained by the ctlkill changes:
+first is sampled with debugger_before=1, before controller death, whereas guard
+VEH/cleanup changes act after death. guard_sync's prog_tf/tail_int3/refire filter
+only changes step-list metadata, not holds or suspend counts. The held-list
+publication/resume rules and inplace/call_original suspension code were unchanged.
+force_pending_step is false without the process-local environment knob; the new
+session_hw staging also requires the hw mode. regress passes these environment
+values to individual subprocesses and does not modify os.environ. The call_original
+poll remains suspension-free on native x64 (GuardTouch is a no-op there); WOW64's
+existing implicit context-call suspension remains a documented residual. Existing
+exception-unwind/context-repair/in-place holds remain possible transient sources,
+but this row alone does not identify one. Its prev=1, ran=0 and ret=76 confirm that
+the guard preserved the program's suspension and the original completed correctly.
+No cosusp assertion was weakened. Static review/diff check only; Windows CI pending.
+
+OPEN (orchestrator, from ctlkill CI4): the pending-hw knob exposed a REAL residual. repair_debug_delivery
+arms an INT3 at KiUserExceptionDispatcher while a debug-exception delivery is being repaired. If the
+controller dies while that breakpoint event is outstanding, the stopped thread resumes once the debug
+port is gone and its breakpoint is dispatched through the same INT3 again: recursive dispatch, stack
+overflow (0xC00000FD), before the guard's VEH or cleanup thread can restore the byte. The window is
+narrow (one repaired delivery) but it breaks "the target survives a killed controller". The knob now
+restores the byte itself, so the check covers the statusless hw claim only. Fix separately: repair
+delivery without a dispatcher INT3 (e.g. write the repaired DR6 into the saved CONTEXT before the
+exception is continued, or a guard-owned DR on the dispatcher), then make pending-hw leave the
+production state in place.
