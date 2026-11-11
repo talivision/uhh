@@ -9967,7 +9967,10 @@ def lc_controller_killed(cfgname, cfg):
     flag) -- never another fault and never a hang. The outcomes are listed in the detail."""
     guarded = lc_has_inline(cfg)
     bad, n, took, outcomes = [], 0, [], []
-    for when in ("active", "active+0.5", "early-0.05", "early-0.3"):
+    timings = ["active", "active+0.5", "early-0.05", "early-0.3"]
+    if cfgname == "mixed":
+        timings += ["pending-step", "pending-held"]
+    for when in timings:
         n += 1
         tg = d = None
         t0, steps = time.time(), []
@@ -9976,8 +9979,20 @@ def lc_controller_killed(cfgname, cfg):
             # fills within the wait below -- an orphaned producer spinning on it is a hang.
             tg = LcTarget("--threads", 4, "--churn", "--slow-every", 20, "--slow-ms", 20,
                           pace=0 if cfgname == "inline" else 1)
-            d = LcDriver(tg.pid, cfg)
-            if when.startswith("active"):
+            pending = when.startswith("pending-")
+            if pending and not exe("lifecycle_driver_th.exe"):
+                raise RuntimeError("missing lifecycle_driver_th.exe")
+            d = LcDriver(tg.pid, cfg,
+                         driver="lifecycle_driver_th.exe" if pending else "lifecycle_driver.exe",
+                         env={"UHH_TEST_DIE_PENDING_STEP": when.split("-", 1)[1]} if pending else None)
+            if pending:
+                marker = "probe: test: dying with statusless step outstanding"
+                if d.err.wait_for(lambda l: marker in l, 30) is None:
+                    raise RuntimeError("pending-step death hook not reached")
+                d.p.wait(timeout=30)
+                if d.p.returncode != 98:
+                    bad.append(f"kill@{when}: hook exit={d.p.returncode}, want 98")
+            elif when.startswith("active"):
                 d.wait_attached(); d.wait_active(timeout=30)
                 d.wait_logs(200, timeout=10)
                 time.sleep(float(when.split("+")[1]) if "+" in when else 0.0)

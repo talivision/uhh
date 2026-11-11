@@ -2930,6 +2930,8 @@ static NtQipFn g_ntqip;
 static HANDLE g_guard_wake;           // auto-reset: re-check (new session / a trap was taken)
 static HANDLE g_ctl;                  // the controller process (owned here once taken)
 static volatile LONG g_orphan_cleaned;
+static volatile LONG g_stray_tids[PROBE_AGENT_GUARD_TIDS]; // one statusless orphan trap per thread
+static volatile LONG g_cleared_dr_tids[PROBE_AGENT_GUARD_TIDS]; // native cleanup ownership receipts
 static volatile LONG g_lazy_dr;        // orphaned DRs are cleared by their own thread's VEH
 static bool no_debug_port() {         // nobody is debugging us (any more)
     ULONG_PTR port = 1;
@@ -2993,6 +2995,13 @@ static void clear_thread_dr(HANDLE t) {
     if (!GetThreadContext(t, &before)) return;
     const DWORD mask = orphan_dr_mask(before);
     if (!mask) return;
+    // Preserve attribution before erasing registers: an already-raised #DB may
+    // be dispatched with the cleared image. Never infer ownership from a reused slot.
+    const LONG tid = (LONG)GetThreadId(t);
+    for (auto &entry : g_cleared_dr_tids) {
+        const LONG old = InterlockedCompareExchange(&entry, tid, 0);
+        if (!old || old == tid) break;
+    }
     CONTEXT w = before; clear_orphan_dr(w, mask);
     if (!SetThreadContext(t, &w)) return;                       // failure: lazy VEH backstop
     CONTEXT after{}; after.ContextFlags = CONTEXT_DEBUG_REGISTERS;
@@ -3044,6 +3053,16 @@ static LONG tid_count(const uint32_t *list, LONG count, DWORD tid) {
     return n;
 }
 static bool tid_listed(const uint32_t *list, LONG count, DWORD tid) { return tid_count(list, count, tid) != 0; }
+// Context writes or debugger teardown can erase BS/B0..B3 after #DB was raised.
+// A frozen ownership table must not become a permanent exception exemption.
+static bool claim_stray_step(DWORD tid) {
+    for (auto &entry : g_stray_tids) {
+        const LONG before = InterlockedCompareExchange(&entry, (LONG)tid, 0);
+        if ((DWORD)before == tid) return false;
+        if (!before) return true;
+    }
+    return false;
+}
 // First in line for every exception, but acts only on OUR traps once no debugger is attached
 // (a live controller handles them before any handler in the target sees them).
 static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
@@ -3083,7 +3102,16 @@ static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
     const bool step = (cx->Dr6 & (1u << 14)) && tid_listed(g.step_tids, g.step_count, GetCurrentThreadId());
     if ((hits & ~mask) || (cx->Dr6 & (1u << 13)) || ((cx->Dr6 & (1u << 14)) && !step))
         return EXCEPTION_CONTINUE_SEARCH;
-    if (!(hits & mask) && !step) return EXCEPTION_CONTINUE_SEARCH;
+    const DWORD tid = GetCurrentThreadId();
+    bool cleared_dr = false;
+    for (auto &entry : g_cleared_dr_tids)
+        if ((DWORD)InterlockedCompareExchange(&entry, 0, 0) == tid) { cleared_dr = true; break; }
+    // Require teardown and a controller-owned thread, without surviving foreign
+    // debug evidence. A program TF/BS or DR hit must still reach its handlers.
+    const bool stray = !hits && !(cx->Dr6 & 0xE000u) && !(cx->EFlags & 0x100u) &&
+        (cleared_dr || tid_listed(g.step_tids, g.step_count, tid) || tid_listed(g.held_tids, g.held_count, tid)) &&
+        no_debug_port() && claim_stray_step(tid);
+    if (!(hits & mask) && !step && !stray) return EXCEPTION_CONTINUE_SEARCH;
     // A live controller consumes our traps before the VEH. This orphaned hit can precede
     // the service thread's death notification, even while the debug port is being torn down.
     if (!g_lazy_dr) InterlockedExchange(&g_lazy_dr, 1);
@@ -3354,6 +3382,8 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *channel) {
     }
     InterlockedExchange(&g_orphan_cleaned, 0);   // a new session: guard it afresh
     InterlockedExchange(&g_lazy_dr, 0);
+    for (auto &entry : g_stray_tids) InterlockedExchange(&entry, 0);
+    for (auto &entry : g_cleared_dr_tids) InterlockedExchange(&entry, 0);
     if (g_guard_wake) SetEvent(g_guard_wake);    // the service thread takes the new controller handle
     InterlockedIncrement(&g_tblock_gen);   // a new (zeroed) channel: every thread claims a hit block again
     InterlockedExchange(&g_stopping, 0);   // a new session after a detach: callbacks run again

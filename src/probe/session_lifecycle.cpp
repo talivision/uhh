@@ -130,7 +130,9 @@ void guard_sync(probe_session *s) {
     // (Armed INT3s: the INT3 table, kept current by sync_int3_table.)
     auto &g = s->shared->guard;
     uint32_t n = 0;
-    for (auto &kv : s->stepping) if (n < PROBE_AGENT_GUARD_TIDS) g.step_tids[n++] = kv.first;
+    for (auto &kv : s->stepping)
+        if (!kv.second.prog_tf && !kv.second.tail_int3 && !kv.second.refire && n < PROBE_AGENT_GUARD_TIDS)
+            g.step_tids[n++] = kv.first;
     g.step_count = (LONG)n;
     n = 0;
     DWORD holds[PROBE_AGENT_GUARD_TIDS]{};

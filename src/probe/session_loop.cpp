@@ -1406,9 +1406,26 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         // can read R11 after the syscall; give it the flags image it would have had.
         if (!step->second.displaced && step->second.syscall_insn && !step->second.prog_tf) native.R11 &= ~(DWORD64)0x100;
 #endif
+#if defined(UHH_TEST_HOOKS)
+        const char *die_step = std::getenv("UHH_TEST_DIE_PENDING_STEP");
+        const bool test_step = die_step && s->attached && s->shared && s->shared->guard.enabled &&
+            !target_hw && !step->second.prog_tf;
+        if (test_step) guard_sync(s); // publish before clearing BS/TF
+#endif
         if (ok) ok = !!SetThreadContext(thread, &native);
-       
+
         if (!ok) { set_error(s, win_error("complete breakpoint single-step")); return false; }
+#if defined(UHH_TEST_HOOKS)
+        if (test_step) {
+            if (!std::strcmp(die_step, "held")) {
+                stepping.erase(step);
+                guard_sync(s); // step completed, debug event still outstanding
+            }
+            std::fprintf(stderr, "probe: test: dying with statusless step outstanding (%s)\n", die_step);
+            std::fflush(stderr);
+            TerminateProcess(GetCurrentProcess(), 98);
+        }
+#endif
         if (trace_enabled())
             std::fprintf(stderr, "  step-done tid=%lu displaced=%d\n",
                          (unsigned long)event.dwThreadId, step->second.displaced);

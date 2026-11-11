@@ -3329,3 +3329,26 @@ Windows validation pending; no IPC layout change or PROBE_AGENT_VERSION bump.
   Existing CET checks are unchanged. No Windows build or runtime validation here.
   The CI stack-overflow rows are consistent with pre-guard recursion, but do not identify
   the recursive callee: this reproduction does not establish their exact cause.
+
+### ctlkill: statusless orphan single-step
+
+A debug event remains outstanding after step completion writes the target context:
+TF/BS have been cleared (and a displaced PC translated) but ContinueDebugEvent has
+not run. Death then can deliver #DB without the DR6 evidence guard_veh required.
+Deferred DBG_REPLY_LATER watch events retain their step/held attribution; in-place
+steps and controller-held event threads use the same guard tables. Native x64 DR
+cleanup can likewise erase the register evidence of an already-raised hit.
+
+The guard accepts one statusless #DB per attributed thread after the debug port is
+gone: step/held membership, or a private receipt published before native cleanup
+clears a verified UHH slot. Surviving target TF, BS, BD, BT or foreign DR-hit status
+still passes through. Step publication excludes program TF, tail-INT3 and refire
+states. Receipts reset on a new agent session; shared layout/version stays 32.
+
+`lifecycle-controller-killed-mixed` adds pending-step and pending-held timings on
+both architectures, using lifecycle_driver_th and UHH_TEST_DIE_PENDING_STEP=step
+or held. The controller terminates after completing the context write but before
+replying to the step event, with step membership retained or retired respectively.
+The existing cleanliness, progress, unhandled-exception and shutdown checks apply.
+Existing cx2-killwatch-reuse-hw covers target reuse of an orphaned hardware slot.
+Static review only here; x64/x86 Windows build and execution are pending CI.
