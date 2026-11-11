@@ -10180,7 +10180,7 @@ def lc_agent_refused(cfgname, cfg):
         if tg: tg.kill()
 
 
-def lc_unload_unseen(cfgname, cfg):
+def lc_unload_unseen(cfgname, cfg, refresh=False):
     """A detach while a hooked DLL's unload has not been processed yet (ROADMAP L5 / ciresid: the
     early-detach race of lifecycle-detach-early-*-inline, ~1 in 128 rows on CI): the program
     unloaded hunt_dll (unmapped) and the controller has not handled its UNLOAD_DLL event when
@@ -10190,15 +10190,17 @@ def lc_unload_unseen(cfgname, cfg):
     that unload unprocessed. The probe on hunt_dll!HuntWork must have gone active and hit
     (work logs), then after the detach the target must be alive and clean, every log
     delivered. Every config (breakpoint/hw: the INT3 / DR of an unmapped site at detach)."""
-    name = f"lifecycle-unload-unseen-{cfgname}"
+    name = f"lifecycle-detach-refresh-{cfgname}" if refresh else f"lifecycle-unload-unseen-{cfgname}"
     if not exe("lifecycle_driver_th.exe"):
         return missing_bin(name, "lifecycle_driver_th")
     tg = d = None
     try:
         tg = LcTarget("--threads", 2)
         dcfg = dict(cfg, work="breakpoint" if cfg["read"] == "hw" else cfg["read"])   # hw: keep a DR free
+        env = {"UHH_TEST_DEFER_UNLOAD": "hunt_dll.dll"}
+        if refresh: env["UHH_TEST_DETACH_REFRESH"] = "1"
         d = LcDriver(tg.pid, dcfg, "--detach-on-stdin", driver="lifecycle_driver_th.exe",
-                     env={"UHH_TEST_DEFER_UNLOAD": "hunt_dll.dll"})
+                     env=env)
         if not d.wait_attached() or not d.wait_active(n=d.probes - 1):        # HuntWork: pending (not loaded)
             raise RuntimeError(f"not active: {d.errors()}")
         once = tg._cmd("dllonce", "dllonce")
@@ -10212,6 +10214,13 @@ def lc_unload_unseen(cfgname, cfg):
         a = tg.quit()
         work_logs = fin is not None and fin[0] > 0
         bad = []
+        if refresh:
+            if "probe: test: detach initial freeze omitted" not in d.err.lines:
+                bad.append("initial freeze was not omitted")
+            freezes = [l for l in d.err.lines if l.startswith("probe: detach: ") and "thread(s) frozen;" in l]
+            if not freezes or any("notfrozen" in l or "getfail=" in l or "setfail=" in l or
+                                  l.startswith("probe: detach: 0 ") for l in freezes):
+                bad.append(f"final freeze did not cover current threads: {freezes}")
         if once.get("mapped") != 0 or not once.get("work"): bad.append(f"dllonce={once}")
         if not active: bad.append("HuntWork never went active")
         if not deferred: bad.append("the unload was not deferred (test hook)")
@@ -10228,6 +10237,13 @@ def lc_unload_unseen(cfgname, cfg):
     finally:
         if d: d.kill()
         if tg: tg.kill()
+
+
+def lc_detach_refresh(cfgname, cfg):
+    """Require a fresh final snapshot on x86 and x64: no thread was frozen in
+    the initial snapshot. Target checks cover DR/TF, code bytes and clean exit.
+    The old detach deterministically reports zero frozen threads here."""
+    lc_unload_unseen(cfgname, cfg, refresh=True)
 
 
 def lc_unload_reused(cfgname, cfg):
@@ -10431,7 +10447,7 @@ def check_lifecycle():
         return missing_bin("lifecycle", "lifecycle_driver / lifecycle_target / hunt_dll")
     for cfgname, cfg in LC_CONFIGS.items():
         for fn in (lc_queued_return, lc_reattach, lc_detach_cases, lc_target_dies, lc_two_controllers, lc_interrupt, lc_controller_killed,
-                   lc_killed_in_freeze, lc_agent_refused, lc_install_stuck, lc_unload_unseen, lc_unload_reused):
+                   lc_killed_in_freeze, lc_agent_refused, lc_install_stuck, lc_unload_unseen, lc_unload_reused, lc_detach_refresh):
             tag = fn.__name__[3:].replace("_", "-")
             if fn in (lc_detach_cases, lc_queued_return) or lc_selected(f"lifecycle-{tag}-{cfgname}"):
                 fn(cfgname, cfg)
