@@ -131,7 +131,7 @@ static bool read_gate() {
 
 // A data-watch trap reports the instruction AFTER this write, not the data address.
 extern "C" { __declspec(dllexport) volatile LONG co_watch_value = 0; }
-static volatile LONG g_watch_exceptions, g_target_exceptions, g_own_hits, g_own_value;
+static volatile LONG g_watch_exceptions, g_target_exceptions, g_own_hits, g_own_value, g_plain_raise;
 static constexpr ULONG_PTR WATCHDEATH_COOKIE = 0x57415443;
 static DWORD g_own_slot, g_stale_slots, g_stale_addresses;
 static bool g_watch_reuse;
@@ -171,8 +171,8 @@ static LONG CALLBACK watchdeath_veh(EXCEPTION_POINTERS *ep) {
     if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
     // RaiseException can carry stale DR6 bits from the preceding hardware trap. Identify
     // our software exception by its payload, independently of the saved debug status.
-    if (ep->ExceptionRecord->NumberParameters == 1 &&
-        ep->ExceptionRecord->ExceptionInformation[0] == WATCHDEATH_COOKIE)
+    if (g_plain_raise || (ep->ExceptionRecord->NumberParameters == 1 &&
+        ep->ExceptionRecord->ExceptionInformation[0] == WATCHDEATH_COOKIE))
         InterlockedIncrement(&g_target_exceptions);
     else if ((ep->ContextRecord->Dr6 & g_own_slot) &&
              (g_watch_reuse ? ep->ContextRecord->Dr0 == (DWORD_PTR)&watchdeath_execute :
@@ -212,6 +212,9 @@ static int run_watchdeath() {
     else g_own_value = 7;                       // the guard must preserve the foreign DR slot
     const ULONG_PTR cookie = WATCHDEATH_COOKIE;
     RaiseException(EXCEPTION_SINGLE_STEP, 0, 1, &cookie); // unrelated target exception passes through
+    g_plain_raise = 1;
+    RaiseException(EXCEPTION_SINGLE_STEP, 0, 0, nullptr); // also without an identifying payload
+    g_plain_raise = 0;
     printf("{\"kind\":\"co\",\"case\":\"watchdeath\",\"value\":%ld,\"exceptions\":%ld,"
            "\"target_exceptions\":%ld,\"own_hits\":%ld,\"stale_slots\":%lu,\"stale_addresses\":%lu,\"debugger\":%d}\n",
            co_watch_value, g_watch_exceptions, g_target_exceptions, g_own_hits, g_stale_slots, g_stale_addresses, (int)dbg);

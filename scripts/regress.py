@@ -12000,7 +12000,7 @@ def check_cx2_review():
             tgt.wait(timeout=90)
             row = next((x for x in tout.objs() if x.get("kind") == "co"), {})
             ok = (att.returncode == 99 and tgt.returncode == 0 and row.get("value") == 42
-                  and row.get("exceptions") == 0 and row.get("target_exceptions") == 1
+                  and row.get("exceptions") == 0 and row.get("target_exceptions") == 2
                   and row.get("own_hits") == 1
                   and (row.get("stale_slots", 0) != 0 and row.get("stale_addresses") == 1 if pe_is_x86(st) else
                        row.get("stale_slots") == 0 and row.get("stale_addresses") == 0)

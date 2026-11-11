@@ -3371,3 +3371,23 @@ lifecycle target, which reports an unhandled exception and dies; the regression
 requires survival, progress, clean state, no unhandled report, and clean shutdown.
 The runner requires the exact mode marker and exit 98, and includes recent stderr
 on a hook timeout. No Windows build or execution here; CI validation remains pending.
+
+ctlkill CI2 follow-up (dc58505): pending-held receives the trap-time scratch PC
+and BS, despite the controller's completed context write. pending-step retained
+step_tids membership and accepted BS; pending-held had retired it and rejected BS.
+The guard now recognises a held thread at a validated displaced-copy return jump,
+consumes its UHH step, and redirects to the original continuation. The jump already
+encodes that address: validation requires a published scratch block, a 64-byte slot
+with a 1..15-byte instruction, the architecture's exact generated jump encoding,
+and an original site in the INT3 table. No shared layout/version change is needed.
+
+CI2 killwatch own_hits=1 actually confirms delivery of the foreign hardware hit;
+target_exceptions=0 identifies the later software RaiseException that was swallowed.
+Removed thread-only DR-clear receipts. Foreign B bits (slot/address ownership from
+DR7, dr_mask and dr_sites), BD/BT, and unowned BS take priority over fallback.
+Statusless fallback rejects enabled foreign slots and requires a step or held thread
+at an owned PC; held membership alone is insufficient. Parameter-bearing single-step
+exceptions pass through. killwatch/watchreuse additionally raise a no-payload software
+single-step: both software exceptions and the foreign hardware hit must be delivered.
+The existing pending-step/held checks exercise scratch recovery on both architectures.
+Static diff review only; Windows build/runtime validation remains pending CI.

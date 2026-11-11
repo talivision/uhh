@@ -2931,7 +2931,6 @@ static HANDLE g_guard_wake;           // auto-reset: re-check (new session / a t
 static HANDLE g_ctl;                  // the controller process (owned here once taken)
 static volatile LONG g_orphan_cleaned;
 static volatile LONG g_stray_tids[PROBE_AGENT_GUARD_TIDS]; // one statusless orphan trap per thread
-static volatile LONG g_cleared_dr_tids[PROBE_AGENT_GUARD_TIDS]; // native cleanup ownership receipts
 static volatile LONG g_lazy_dr;        // orphaned DRs are cleared by their own thread's VEH
 static bool no_debug_port() {         // nobody is debugging us (any more)
     ULONG_PTR port = 1;
@@ -2995,13 +2994,6 @@ static void clear_thread_dr(HANDLE t) {
     if (!GetThreadContext(t, &before)) return;
     const DWORD mask = orphan_dr_mask(before);
     if (!mask) return;
-    // Preserve attribution before erasing registers: an already-raised #DB may
-    // be dispatched with the cleared image. Never infer ownership from a reused slot.
-    const LONG tid = (LONG)GetThreadId(t);
-    for (auto &entry : g_cleared_dr_tids) {
-        const LONG old = InterlockedCompareExchange(&entry, tid, 0);
-        if (!old || old == tid) break;
-    }
     CONTEXT w = before; clear_orphan_dr(w, mask);
     if (!SetThreadContext(t, &w)) return;                       // failure: lazy VEH backstop
     CONTEXT after{}; after.ContextFlags = CONTEXT_DEBUG_REGISTERS;
@@ -3063,6 +3055,35 @@ static bool claim_stray_step(DWORD tid) {
     }
     return false;
 }
+// A displaced TF copy ends at a jump back, within its controller-owned 64-byte
+// slot. Validate both the block and the original INT3 site before trusting it.
+// This survives StepState retirement: Windows may dispatch the trap-time context,
+// ignoring the completed PC written by the controller before it died.
+static uint64_t orphan_scratch_resume(uint64_t at) {
+    const auto &g = shared->guard;
+    const uint64_t len = at & 63u;
+    if (!len || len > 15) return 0;
+    bool owned = false;
+    const LONG n = g.block_count;
+    if (n < 0 || n > (LONG)PROBE_AGENT_GUARD_BLOCKS) return 0;
+    for (LONG i = 0; i < n; ++i)
+        if (g.blocks[i] && at - g.blocks[i] < 0x10000) { owned = true; break; }
+    if (!owned) return 0;
+    uint64_t back = 0;
+    __try {
+        const unsigned char *p = (const unsigned char *)(uintptr_t)at;
+#if defined(_WIN64)
+        if (p[0] != 0xFF || p[1] != 0x25 || p[2] || p[3] || p[4] || p[5]) return 0;
+        std::memcpy(&back, p + 6, sizeof(back));
+#else
+        if (p[0] != 0xE9) return 0;
+        int32_t rel = 0; std::memcpy(&rel, p + 1, sizeof(rel));
+        back = (uint32_t)(at + 5 + rel);
+#endif
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    unsigned char original = 0;
+    return back >= len && int3_original(back - len, original) ? back : 0;
+}
 // First in line for every exception, but acts only on OUR traps once no debugger is attached
 // (a live controller handles them before any handler in the target sees them).
 static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
@@ -3095,21 +3116,33 @@ static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
         if (g_guard_wake) SetEvent(g_guard_wake);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
+    // Hardware traps carry no arguments. In particular, RaiseException(SINGLE_STEP)
+    // with a program payload must not be consumed using stale thread ownership.
+    if (ep->ExceptionRecord->NumberParameters) return EXCEPTION_CONTINUE_SEARCH;
     const DWORD mask = orphan_dr_mask(*cx);
     const DWORD hits = (DWORD)cx->Dr6 & 0xF;
-    // Never consume the target's own DR hit, even when one of ours fired too. Likewise a
-    // target single-step / debug-register-access exception must reach its own handlers.
-    const bool step = (cx->Dr6 & (1u << 14)) && tid_listed(g.step_tids, g.step_count, GetCurrentThreadId());
-    if ((hits & ~mask) || (cx->Dr6 & (1u << 13)) || ((cx->Dr6 & (1u << 14)) && !step))
-        return EXCEPTION_CONTINUE_SEARCH;
     const DWORD tid = GetCurrentThreadId();
-    bool cleared_dr = false;
-    for (auto &entry : g_cleared_dr_tids)
-        if ((DWORD)InterlockedCompareExchange(&entry, 0, 0) == tid) { cleared_dr = true; break; }
-    // Require teardown and a controller-owned thread, without surviving foreign
-    // debug evidence. A program TF/BS or DR hit must still reach its handlers.
+    const bool stepping = tid_listed(g.step_tids, g.step_count, tid);
+    const bool held = tid_listed(g.held_tids, g.held_count, tid);
+    const uint64_t resume = orphan_scratch_resume(at);
+    const bool scratch_step = resume && (stepping || held);
+    const bool step = (cx->Dr6 & (1u << 14)) && (stepping || scratch_step);
+    // Foreign B bits always win, including a slot UHH never armed or one whose
+    // address the program has replaced. BD/BT and unowned BS also pass through.
+    if ((hits & ~mask) || (cx->Dr6 & 0xA000u) || ((cx->Dr6 & (1u << 14)) && !step))
+        return EXCEPTION_CONTINUE_SEARCH;
+    // Retire BS attribution too: the frozen step table cannot exempt a later
+    // program single-step on this same thread after our orphan was completed.
+    if (step && !claim_stray_step(tid)) return EXCEPTION_CONTINUE_SEARCH;
+    DWORD enabled = 0;
+    for (int slot = 0; slot < 4; ++slot)
+        if ((cx->Dr7 >> (slot * 2)) & 3) enabled |= 1u << slot;
+    unsigned char original = 0;
+    const bool held_site = held && int3_original(at, original);
+    // A statusless exception cannot be attributed by a stale TID alone. Require
+    // a live step, or a held thread at an owned PC, and no enabled foreign slot.
     const bool stray = !hits && !(cx->Dr6 & 0xE000u) && !(cx->EFlags & 0x100u) &&
-        (cleared_dr || tid_listed(g.step_tids, g.step_count, tid) || tid_listed(g.held_tids, g.held_count, tid)) &&
+        !(enabled & ~mask) && (stepping || scratch_step || held_site) &&
         no_debug_port() && claim_stray_step(tid);
     if (!(hits & mask) && !step && !stray) return EXCEPTION_CONTINUE_SEARCH;
     // A live controller consumes our traps before the VEH. This orphaned hit can precede
@@ -3120,6 +3153,7 @@ static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
     // not the exception IP. Leave foreign slots intact.
     clear_orphan_dr(*cx, mask);
     cx->Dr6 &= ~(decltype(cx->Dr6))mask;
+    if (scratch_step) set_ip(cx, resume);
     if (step) { cx->Dr6 &= ~(decltype(cx->Dr6))(1u << 14); cx->EFlags &= ~0x100u; }
     if (g_guard_wake) SetEvent(g_guard_wake);
     return EXCEPTION_CONTINUE_EXECUTION;
@@ -3383,7 +3417,6 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *channel) {
     InterlockedExchange(&g_orphan_cleaned, 0);   // a new session: guard it afresh
     InterlockedExchange(&g_lazy_dr, 0);
     for (auto &entry : g_stray_tids) InterlockedExchange(&entry, 0);
-    for (auto &entry : g_cleared_dr_tids) InterlockedExchange(&entry, 0);
     if (g_guard_wake) SetEvent(g_guard_wake);    // the service thread takes the new controller handle
     InterlockedIncrement(&g_tblock_gen);   // a new (zeroed) channel: every thread claims a hit block again
     InterlockedExchange(&g_stopping, 0);   // a new session after a detach: callbacks run again
