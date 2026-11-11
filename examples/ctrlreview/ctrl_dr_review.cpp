@@ -456,9 +456,21 @@ int run(int argc, char **argv) {
             DWORD disposition = 0;
             dr_require(dispatch_event(s, d.ev, disposition) && disposition == DBG_REPLY_LATER && callbacks == 0 &&
                        s->watch_deferred.size() == 1, "mixed watch waits without callback reentrancy");
+            auto guarded = std::make_unique<probe_agent_shared>();
+            s->shared = guarded.get(); s->attached = true;
+            guard_resync(s); // service_event does this after handling ends, before continuing
+            LONG holds = 0;
+            for (LONG i = 0; i < guarded->guard.held_count; ++i)
+                holds += guarded->guard.held_tids[i] == d.pi.dwThreadId;
+            dr_require(holds == 1, "reply-later suspension published exactly once for controller death");
             d.resume(disposition); s->calls.clear();
             { FiberHost fibers(s); dr_require(poll_calls(s), "release deferred kernel event"); }
+            for (LONG i = 0; i < guarded->guard.held_count; ++i)
+                dr_require(guarded->guard.held_tids[i] != d.pi.dwThreadId, "reply-later resume removes guard hold");
+            s->shared = nullptr; s->attached = false;
             d.wait(EXCEPTION_SINGLE_STEP, site + 4);
+            dr_require((d.get().Dr6 & 0xE00Fu) == 0x4001u && d.result().seen == 0,
+                       "reply-later replays original status before target handler or next instruction");
             dr_require(dispatch_event(s, d.ev, disposition) && disposition == DBG_EXCEPTION_NOT_HANDLED && callbacks == 1 && p->hits == 1,
                        "replayed event delivers callback once and forwards target TF");
             d.resume(disposition); d.wait(EXCEPTION_BREAKPOINT, done);
@@ -564,6 +576,12 @@ int run(int argc, char **argv) {
             const void *body_bytes = (tf || ret_watch) ? (const void *)body : (const void *)loop;
             const SIZE_T body_size = (tf || ret_watch) ? sizeof(body) : sizeof(loop);
             dr_require(!!WriteProcessMemory(d.pi.hProcess, (void *)(uintptr_t)(d.code + 32), body_bytes, body_size, &n) && n == body_size, "write original body");
+            if (ret_watch) {
+                // The return continuation must be an ordinary instruction. The child
+                // ready/done INT3 is a target exception, not a catch UHH may consume.
+                const unsigned char continuation[] = {0x90, 0xCC};
+                dr_require(!!WriteProcessMemory(d.pi.hProcess, (void *)(uintptr_t)done, continuation, sizeof(continuation), &n), "write original return continuation");
+            }
             FlushInstructionCache(d.pi.hProcess, (void *)(uintptr_t)d.code, 64);
             p->flags = PROBE_HW; p->address = d.code + 32; p->callback = original_hit;
             s->hw_armed_ever.insert(p->address);

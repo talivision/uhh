@@ -1175,6 +1175,8 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
         CloseHandle(thread); return 0;
     }
     bool done = false, thread_gone = false;
+    Probe *return_breakpoint = nullptr;
+    bool return_int3 = false;
     const char *why = "the original left without returning (exception or longjmp)";
     uint64_t result = 0;
     ULONGLONG until = GetTickCount64() + 5000, next_poll = GetTickCount64() + 20;
@@ -1184,17 +1186,31 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
         if (WaitForDebugEvent(&ev, s->ctx_watch.empty() ? 20 : 1)) {
             if (continue_foreign_event(s, ev)) continue;
             if (ev.dwThreadId == st->tid && ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT &&
-                ev.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP &&
+                (ev.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP ||
+                 ev.u.Exception.ExceptionRecord.ExceptionCode == 0x4000001Eu ||
+                 (return_int3 && (ev.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_BREAKPOINT ||
+                                  ev.u.Exception.ExceptionRecord.ExceptionCode == 0x4000001Fu))) &&
                 (uint64_t)(uintptr_t)ev.u.Exception.ExceptionRecord.ExceptionAddress == ret_addr) {
                 guard_note_hold(s, st->tid);                               // stopped at its event: listed meanwhile
                 CONTEXT &r = st->post; r.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | UHH_CONTEXT_FP | CONTEXT_DEBUG_REGISTERS;
                 const bool got_return = !!GetThreadContext(thread, &r);
+                const DWORD code = ev.u.Exception.ExceptionRecord.ExceptionCode;
+                const bool int3 = code == EXCEPTION_BREAKPOINT || code == 0x4000001Fu;
                 DWORD64 status_mask = 0xE000u;
-                for (int k = 0; k < 4; ++k) if ((r.Dr7 >> (k * 2)) & 3u) status_mask |= (DWORD64)1 << k;
+                for (int k = 0; k < 4; ++k) {
+                    if (!((r.Dr7 >> (k * 2)) & 3u)) continue;
+                    bool execute_here = k == slot;
+                    for (const auto &p : s->probes)
+                        if (p->active && (p->flags & PROBE_HW) && !(p->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) &&
+                            p->dr_slot == k && p->address == ret_addr && dr_address(r, k) == ret_addr)
+                            execute_here = true;
+                    if (!execute_here) status_mask |= (DWORD64)1 << k;
+                }
                 // A RET data-watch or the program's TF trap arrives at this same PC
                 // before our execute catch. Dispatch it normally; the catch comes later.
-                if (got_return && (r.Dr6 & status_mask) == ((DWORD64)1 << slot) &&
-                    dr_address(r, slot) == ret_addr && !((r.Dr7 >> (16 + slot * 4)) & 0xFu)) {
+                if (got_return && (int3 || ((r.Dr6 & ((DWORD64)1 << slot)) && !(r.Dr6 & status_mask) &&
+                    dr_address(r, slot) == ret_addr && !((r.Dr7 >> (16 + slot * 4)) & 0xFu)))) {
+                    if (int3) EMU_IP(r) = (decltype(EMU_IP(r)))ret_addr;
 #if defined(_WIN64)
                     const uint64_t sp = r.Rsp, rax = r.Rax;
 #else
@@ -1211,10 +1227,30 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
 #endif
                         break;
                     }
-                    r.EFlags |= 0x10000u; SetThreadContext(thread, &r);    // some other return there: run on
-                    guard_resync(s);                                       // runs on: off the guard's list
-                    ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
-                    continue;
+                    if (!int3) {
+                        r.EFlags |= 0x10000u; SetThreadContext(thread, &r); // some other return there: run on
+                        guard_resync(s);
+                        ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
+                        continue;
+                    } // a recursive INT3 is stepped normally below
+                }
+                if (got_return && !int3 && !return_int3 && ev.u.Exception.dwFirstChance) {
+                    // Exception continuation may set RF: an execute DR at this PC
+                    // need not fire again. INT3 catches the continuation even with RF.
+                    Probe *bp = nullptr;
+                    for (const auto &p : s->probes)
+                        if (p->active && (p->flags & PROBE_BREAKPOINT) && p->address == ret_addr) bp = p.get();
+                    if (!bp) {
+                        auto p = std::make_unique<Probe>();
+                        p->location = "<original-return>"; p->rva = ret_addr;
+                        p->flags = PROBE_BREAKPOINT; p->internal = true;
+                        p->callback = [](probe_context *) {};
+                        bp = p.get();
+                        { std::lock_guard<std::mutex> lock(s->probes_mu); s->probes.push_back(std::move(p)); }
+                        if (arm_breakpoint(s, *bp, 0)) return_breakpoint = bp;
+                        else bp = nullptr;
+                    }
+                    return_int3 = bp != nullptr;
                 }
             }
             if (ev.dwThreadId == st->tid && ev.dwDebugEventCode == EXIT_THREAD_DEBUG_EVENT) {
@@ -1290,6 +1326,11 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
         if (!done && now > until && !s->co_left) {
             s->co_left = true; why = "the original did not return within 5 s (released, it runs on)";
         }
+    }
+    if (return_breakpoint) {
+        if (!s->exited) restore_original(s->pi.hProcess, ret_addr, return_breakpoint->original);
+        return_breakpoint->active = false; return_breakpoint->retired = true;
+        sync_int3_table(s);
     }
     s->in_call_tid = 0; s->co_addr = 0; s->co_ret = 0; s->co_exc_sp = 0; s->co_entry_pending = false; s->co_left = false; s->co_borrowed_slot = -1;
     if (done) {

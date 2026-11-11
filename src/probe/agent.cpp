@@ -2886,6 +2886,55 @@ static void clear_orphan_dr(CONTEXT &c, DWORD mask) {
                         case 2: c.Dr2 = 0; break; default: c.Dr3 = 0; }
     }
 }
+// Retain ownership evidence before active cleanup erases an execute DR. A thread
+// can take #DB between the cleanup snapshot and SetThreadContext; Windows may
+// deliver that queued exception with the cleared image. One record per thread,
+// protected against concurrent VEH reads and scoped to this session's epoch.
+// A full table uses lazy clearing instead. No shared-channel layout change.
+struct OrphanExecute {
+    DWORD tid;
+    LONG epoch;
+    uint64_t address[4];
+    DWORD mask;
+};
+static OrphanExecute g_orphan_execute[PROBE_AGENT_GUARD_TIDS];
+static SRWLOCK g_orphan_execute_lock = SRWLOCK_INIT;
+struct OrphanExecuteLock {
+    OrphanExecuteLock() { AcquireSRWLockExclusive(&g_orphan_execute_lock); }
+    ~OrphanExecuteLock() { ReleaseSRWLockExclusive(&g_orphan_execute_lock); }
+};
+#if defined(_WIN64)
+static bool remember_orphan_execute(DWORD tid, const CONTEXT &c, DWORD mask) {
+    OrphanExecuteLock lock;
+    const LONG epoch = shared->session_epoch;
+    for (auto &e : g_orphan_execute) if (e.tid == tid && e.epoch == epoch) return true;
+    for (auto &e : g_orphan_execute) {
+        if (e.tid && e.epoch == epoch) continue;
+        e = {};
+        DWORD bits = 0;
+        for (int slot = 0; slot < 4; ++slot) {
+            if (!(mask & (1u << slot)) || ((c.Dr7 >> (16 + slot * 4)) & 0xFu)) continue;
+            e.address[slot] = slot == 0 ? c.Dr0 : slot == 1 ? c.Dr1 : slot == 2 ? c.Dr2 : c.Dr3;
+            bits |= 1L << slot;
+        }
+        e.mask = bits; e.epoch = epoch; e.tid = tid;
+        return true;
+    }
+    return false;
+}
+#endif
+static bool cleared_execute_at(DWORD tid, uint64_t at) {
+    OrphanExecuteLock lock;
+    for (auto &e : g_orphan_execute) {
+        if (e.tid != tid || e.epoch != shared->session_epoch) continue;
+        for (int slot = 0; slot < 4; ++slot) {
+            const DWORD bit = 1u << slot;
+            if (e.address[slot] == at && (e.mask & bit)) { e.mask &= ~bit; return true; }
+        }
+        return false;
+    }
+    return false;
+}
 #if defined(_WIN64)
 // Native x64 only: Get/SetThreadContext(DEBUG_REGISTERS) are kernel APCs that do not suspend
 // the thread (WOW64 calls do, so x86 keeps the lazy VEH clearing). Clears only slots that still
@@ -2897,11 +2946,22 @@ static DWORD64 dr7_slot_bits(DWORD mask) {
     return bits;
 }
 static void clear_thread_dr(HANDLE t) {
-    CONTEXT before{}; before.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    CONTEXT before{}; before.ContextFlags = CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS;
     if (!GetThreadContext(t, &before)) return;
     const DWORD mask = orphan_dr_mask(before);
     if (!mask) return;
-    CONTEXT w = before; clear_orphan_dr(w, mask);
+    // A queued #DB can reach VEH after this scan. SetThreadContext would erase
+    // the DR image that proves it is ours (Windows can also zero its DR6).
+    // Let VEH retire the fired slots instead of turning the pending trap into
+    // an unowned, zero-status single-step exception.
+    if (before.Dr6 & mask) return;
+    const uint64_t pc = (uint64_t)before.Rip;
+    for (int slot = 0; slot < 4; ++slot)
+        if ((mask & (1u << slot)) && !((before.Dr7 >> (16 + slot * 4)) & 0xFu) &&
+            (slot == 0 ? before.Dr0 : slot == 1 ? before.Dr1 : slot == 2 ? before.Dr2 : before.Dr3) == pc)
+            return;
+    if (!remember_orphan_execute(GetThreadId(t), before, mask)) return;
+    CONTEXT w = before; w.ContextFlags = CONTEXT_DEBUG_REGISTERS; clear_orphan_dr(w, mask);
     if (!SetThreadContext(t, &w)) return;                       // failure: lazy VEH backstop
     CONTEXT after{}; after.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     if (!GetThreadContext(t, &after)) return;
@@ -2989,9 +3049,29 @@ static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
     // Never consume the target's own DR hit, even when one of ours fired too. Likewise a
     // target single-step / debug-register-access exception must reach its own handlers.
     const bool step = (cx->Dr6 & (1u << 14)) && tid_listed(g.step_tids, g.step_count, GetCurrentThreadId());
-    if ((hits & ~mask) || (cx->Dr6 & (1u << 13)) || ((cx->Dr6 & (1u << 14)) && !step))
+    if ((hits & ~mask) || (cx->Dr6 & (1u << 13)) || ((cx->Dr6 & (1u << 14)) && !step)) {
+        // A reply-later watch can outlive its debugger with the program's BS
+        // still pending. Deliver that exception, stripping only our watch bits.
+        // A live controller's forwarded target exception must keep its armed DRs.
+        if (g_orphan_cleaned || guard_orphaned()) {
+            clear_orphan_dr(*cx, mask);
+            cx->Dr6 &= ~(decltype(cx->Dr6))mask;
+            if (g_guard_wake) SetEvent(g_guard_wake);
+        }
         return EXCEPTION_CONTINUE_SEARCH;
-    if (!(hits & mask) && !step) return EXCEPTION_CONTINUE_SEARCH;
+    }
+    bool execute = false;
+    if (!(cx->Dr6 & 0xE00Fu) && !(cx->EFlags & 0x100u)) {
+        // Debugger teardown / context writes can lose DR6 before the queued
+        // execute fault is delivered. Its still-enabled, owned slot and exact
+        // exception PC identify it, just as in the controller's stale-DR path.
+        for (int slot = 0; slot < 4; ++slot)
+            if ((mask & (1u << slot)) && !((cx->Dr7 >> (16 + slot * 4)) & 0xFu) &&
+                (slot == 0 ? cx->Dr0 : slot == 1 ? cx->Dr1 : slot == 2 ? cx->Dr2 : cx->Dr3) == at)
+                execute = true;
+        if (!execute && !(cx->Dr7 & 0xFFu)) execute = cleared_execute_at(GetCurrentThreadId(), at);
+    }
+    if (!(hits & mask) && !step && !execute) return EXCEPTION_CONTINUE_SEARCH;
     // A live controller consumes our traps before the VEH. This orphaned hit can precede
     // the service thread's death notification, even while the debug port is being torn down.
     if (!g_lazy_dr) InterlockedExchange(&g_lazy_dr, 1);
