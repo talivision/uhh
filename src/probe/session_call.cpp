@@ -66,7 +66,7 @@ bool fiber_step(probe_session *s, EventFiber *f, const DEBUG_EVENT *ev) {
         }
         else if (!s->skip_continue && ev) {
             guard_resync(s);                         // its handling is over: off the guard's list first
-            if (!ContinueDebugEvent(ev->dwProcessId, ev->dwThreadId, f->disposition)) {
+            if (!guard_continue(s, ev->dwProcessId, ev->dwThreadId, f->disposition)) {
                 set_error(s, win_error("continue debug event")); ok = false;
             }
         }
@@ -965,7 +965,7 @@ int run_call(probe_session *s, CallbackState *st, uint64_t fn, uint64_t *ret, in
         guard_resync(s);
     } else {
         guard_resync(s);
-        running = !!ContinueDebugEvent(st->pid, st->tid, DBG_CONTINUE);
+        running = !!guard_continue(s, st->pid, st->tid, DBG_CONTINUE);
     }
     if (!running) {
         handling_running(s, st->tid, false); guard_resync(s);
@@ -1168,7 +1168,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
         continued = ResumeThread(f->resume_after) != (DWORD)-1;
         if (continued) { CloseHandle(f->resume_after); f->resume_after = nullptr; f->stop_suspended = false; }
         guard_resync(s);
-    } else continued = !!ContinueDebugEvent(st->pid, st->tid, DBG_CONTINUE);
+    } else continued = !!guard_continue(s, st->pid, st->tid, DBG_CONTINUE);
     if (!continued) {
         if (!borrowed) s->dr_used &= (uint8_t)~(1u << slot);
         s->in_call_tid = 0; s->co_addr = 0; s->co_borrowed_slot = -1;
@@ -1186,6 +1186,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
         if (!s->ctx_watch.empty()) ctx_watch_poll(s);
         if (WaitForDebugEvent(&ev, s->ctx_watch.empty() ? 20 : 1)) {
             if (continue_foreign_event(s, ev)) continue;
+            if (!guard_claim_event(s, ev)) break;
             if (ev.dwThreadId == st->tid && ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT &&
                 (ev.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP ||
                  ev.u.Exception.ExceptionRecord.ExceptionCode == 0x4000001Eu) &&
@@ -1253,7 +1254,7 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
                     r.EFlags |= 0x10000u; SetThreadContext(thread, &r); // some other return there: run on
                     s->dr6_lost.erase(st->tid);
                     guard_resync(s);
-                    ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
+                    guard_continue(s, ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
                     continue;
                 }
             }

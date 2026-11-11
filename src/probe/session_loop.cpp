@@ -27,10 +27,11 @@ static bool swallow_event(probe_session *s, const DEBUG_EVENT &ev, const char *w
         std::fprintf(stderr, "  %s tid=%lu code=0x%08lx at 0x%llx: swallowed\n", why, (unsigned long)ev.dwThreadId,
                      (unsigned long)ev.u.Exception.ExceptionRecord.ExceptionCode,
                      (unsigned long long)(uintptr_t)ev.u.Exception.ExceptionRecord.ExceptionAddress);
-    if (!ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE)) { set_error(s, win_error("continue debug event")); return false; }
+    if (!guard_continue(s, ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE)) { set_error(s, win_error("continue debug event")); return false; }
     return true;
 }
 bool service_event(probe_session *s, DEBUG_EVENT &ev) {
+    if (!guard_claim_event(s, ev)) return false;
     if (ev.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
         const auto &er = ev.u.Exception.ExceptionRecord;
         DWORD code = er.ExceptionCode;                       // a WOW64 trap in its WOW64 form: the same
@@ -59,7 +60,7 @@ bool service_event(probe_session *s, DEBUG_EVENT &ev) {
                 guard_note_hold(s, ev.dwThreadId);
                 if (t && SuspendThread(t) != (DWORD)-1) {
                     f->call_held = t; f->call_outcome = how;
-                    if (!ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE)) {
+                    if (!guard_continue(s, ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE)) {
                         set_error(s, win_error("continue debug event")); return false;
                     }
                     return true;
@@ -122,7 +123,7 @@ bool service_event(probe_session *s, DEBUG_EVENT &ev) {
     DWORD disposition = DBG_CONTINUE;
     bool ok = dispatch_event(s, ev, disposition);
     if (!s->skip_continue) guard_resync(s);          // its handling is over: off the guard's list first
-    if (!s->skip_continue && !ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, disposition)) {
+    if (!s->skip_continue && !guard_continue(s, ev.dwProcessId, ev.dwThreadId, disposition)) {
         set_error(s, win_error("continue debug event")); ok = false;
     }
     s->skip_continue = outer_skip;
@@ -1434,6 +1435,12 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         if (trace_enabled())
             std::fprintf(stderr, "  step-done tid=%lu displaced=%d\n",
                          (unsigned long)event.dwThreadId, step->second.displaced);
+#if defined(UHH_TEST_HOOKS)
+        if (std::getenv("UHH_TEST_FORCE_GUARD_STEP")) {
+            std::fprintf(stderr, "probe: test: guard step completed tid=%lu\n", (unsigned long)event.dwThreadId);
+            std::fflush(stderr);
+        }
+#endif
         const bool pass = target_hw || step->second.prog_tf;
         if (pass && !step->second.prog_tf && event.u.Exception.dwFirstChance &&
             !queue_debug_delivery(s, event.dwThreadId, (uint64_t)EMU_IP(native), 0x4000u, native.Dr6 & 0xE00Fu)) return false;
@@ -1573,7 +1580,8 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     // Force an ordinary instruction through the existing displaced TF step;
     // leave REP's tail INT3 and program-owned debug state on their normal paths.
     const char *pending_mode = std::getenv("UHH_TEST_DIE_PENDING_STEP");
-    force_pending_step = pending_mode && std::strcmp(pending_mode, "hw") &&
+    force_pending_step = ((pending_mode && std::strcmp(pending_mode, "hw")) ||
+                          std::getenv("UHH_TEST_FORCE_GUARD_STEP")) &&
         s->attached && s->shared && s->shared->guard.enabled &&
         !probe->internal && !probe->rep_string;
 #endif

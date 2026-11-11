@@ -3524,3 +3524,83 @@ that window, or leave other traps behind. These sessions do NOT satisfy uncondit
 controller-death survival; closing this residual requires changing the no-agent decision or a
 separately validated kernel-frame repair. A program can register a newer first VEH ahead of
 ours; as with the agent's existing trampoline VEH, handler ordering remains a limitation.
+
+### ctlkill: explicit outstanding-event claims (cxr19)
+
+Shared layout/version 34 adds 256 stable orphan-claim slots. At dequeue, before
+any event context changes or callback/fiber dispatch, the controller records an
+owned #DB's TID, GetThreadTimes creation timestamp, kernel ExceptionAddress and
+kind: step completion, scratch-copy completion (with original continuation),
+hardware execute fault, or hardware data-watch completion. Program-owned status,
+including target TF/BS and mixed foreign B bits, does not authorize a claim.
+call_original's separately dequeued return catches use the same publication.
+
+Payload precedes a barrier and interlocked TID publication. A partial publication
+has tid=0; no live payload is rewritten or moved. Every session ContinueDebugEvent
+path retires tid first immediately after a successful final reply. DBG_REPLY_LATER
+retains the claim through watch_deferred and redelivery; continuing a failed reply
+does not retire it. Scratch claims survive StepState retirement and describe the
+trap-time exception address, independent of the completed live context write.
+The agent acquires TID, checks thread creation time, exact exception address and
+kind, consumes TID before acting, and redirects only a scratch completion. No
+statusless attribution uses step/held membership or dr_sites address history.
+The existing status-bearing B-bit and listed-step BS rules remain; BS scratch
+recovery now uses the explicit claim. step_tids uses stable holes, never compacts
+[A,B] to [B,B]. Historical dr_sites still filters status-bearing DR ownership and
+is not a statusless exception exemption.
+
+Existing pending-step / pending-held / pending-hw death timings remain unchanged.
+`cx2-kill-stray-history` (check_cx2_review, both architectures) completes a real
+TF step on the target's main thread, kills the controller, and uses NtRaiseException
+to raise two zero-payload, zero-debug-status software #DBs on that thread: at the
+historical watched data address and at the earlier stepped function. Both must
+reach the program VEH. UHH_TEST_FORCE_GUARD_STEP only selects the existing TF-copy
+path in the testhooks build; a completion marker proves the step actually happened.
+
+Static review and diff whitespace checks only here; no build or test execution.
+The orchestrator must validate x64 and x86/WOW64, including the three pending-event
+timings and deferred-watch/call_original coverage. Existing residuals remain:
+bp/hw-only sessions inject no guard, and a newer first program VEH can precede the
+agent's delivery repair. This change does not establish unconditional survival for
+those sessions or resolve VEH precedence (cxr19 finding 3).
+
+ctlkill stray-fixture CI follow-up (33edde0): both stdin gates already have
+matching sends; the supplied context clears TF and the program VEH continues it.
+The fixture instead relied on a stack-local `raised` sentinel across a manual
+RtlCaptureContext/NtContinue rewind. RtlCaptureContext is not a compiler
+returns-twice primitive: a local whose last ordinary use precedes dispatch can
+have its stack storage reused before the captured continuation reads it again.
+The timeout alone does not prove which instruction CI was stuck at or establish
+that the guard swallowed an exception. Remove that unsafe continuation dependency:
+keep the interlocked resume sentinel, CONTEXT and exception record in persistent
+storage and prevent helper inlining. Each software raise is attempted once; a
+continuation without exactly one program-handler call fails explicitly as
+"program #DB swallowed". Wrong status/TF and repeated deliveries fail immediately.
+
+The check first runs the same raises without UHH (`stray-baseline`), then requires
+the guarded case. Before publishing `stepped`, the target starts a 15 s watchdog;
+phase records distinguish second-gate, debugger-exit and each exception delivery.
+The second gate and debugger-exit wait each have 5 s bounds. Capture target stderr
+and report the phase/counters on failure; a 25 s runner fallback kills/reaps the
+target and reports its last phases instead of a bare TimeoutExpired. Production
+guard code is unchanged. Static inspection / diff checks only; Windows x64 and
+WOW64 validation is pending the orchestrator.
+
+ctlkill stray-fixture x86 baseline follow-up (b26bea1): phase 5 with seen=2,
+bad=0 means one valid delivery for EACH of the two deliberate raises, not two
+reports for a single raise. The observed failure was the subsequent watchdog
+join. Moving only the synthetic inputs/sentinel to globals left successful
+execution using a manual RtlCaptureContext/NtContinue replay, with live caller
+locals (including watchdog handles) across that unsupported C++ continuation.
+The old unchecked SetEvent also hid whether signaling failed; CI did not record
+the handle values or wait result, so the precise clobbered state is unproven.
+
+Successful fixture delivery now goes through the program VEH (exactly one report
+per raise) followed by its __except handler, using the compiler-supported unwind
+path. It never replays the captured context on success. A consumed exception still
+replays capture and immediately fails with the persistent sentinel, preserving
+the post-controller-kill test of statusless program exception delivery. Require
+two VEH reports and two SEH catches in both baseline and guarded runs. Check
+SetEvent, the watchdog join result and exit code, and publish watchdog_stopped=1
+only after a successful join. No library changes. Diff checks only here; x64 and
+x86/WOW64 execution remains pending CI.

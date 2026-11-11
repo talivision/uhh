@@ -855,7 +855,7 @@ extern "C" void probe_close(probe_session *s) {
                 if (!WaitForDebugEvent(&ev, 50)) continue;
                 if (ev.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT && ev.u.CreateProcessInfo.hFile) CloseHandle(ev.u.CreateProcessInfo.hFile);
                 if (ev.dwDebugEventCode == LOAD_DLL_DEBUG_EVENT && ev.u.LoadDll.hFile) CloseHandle(ev.u.LoadDll.hFile);
-                ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
+                guard_continue(s, ev.dwProcessId, ev.dwThreadId, DBG_CONTINUE);
                 if (ev.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT && ev.dwProcessId == s->pi.dwProcessId) break;
             }
         }

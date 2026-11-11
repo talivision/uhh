@@ -89,6 +89,8 @@ int main(int argc, char **argv) {
     else if (k == "vslow") ok = add("co_vslow", co_on_vslow, bk) && add("co_after", co_on_after, bk);
     else if (k == "cbfault") ok = add("co_cbf", co_on_cbf, bk);
     else if (k == "spin") ok = add("co_add", co_on_spin, bk);
+    else if (k == "stray") ok = add("co_add", co_on_spin, PROBE_BREAKPOINT) &&
+        add("co_watch_value", co_on_idle, PROBE_HW | PROBE_WATCH_WRITE);
     else if (k == "watchdeath") ok = add("co_watch_value", co_on_idle, PROBE_HW | PROBE_WATCH_WRITE);
     else if (k == "rep") ok = add("CoRepSite", co_on_spin, bk);
     else if (k == "susp" || k == "evsusp") ok = add("co_add", co_on_spin, bk);

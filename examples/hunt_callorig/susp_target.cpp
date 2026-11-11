@@ -115,10 +115,10 @@ static DWORD WINAPI worker(void *p) {
     while (!g_spin_stop) { InterlockedIncrement(&g_spun); Sleep(1); }
     return 0;
 }
-static bool read_gate() {
+static bool read_gate(DWORD timeout_ms = 60000) {
     char b; DWORD n = 0;
     const HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
-    const ULONGLONG deadline = GetTickCount64() + 60000;
+    const ULONGLONG deadline = GetTickCount64() + timeout_ms;
     while (GetTickCount64() < deadline) {
         DWORD available = 0;
         if (!PeekNamedPipe(in, nullptr, 0, nullptr, &available, nullptr)) return false;
@@ -127,6 +127,11 @@ static bool read_gate() {
     }
     fprintf(stderr, "susp_target: stdin gate timed out\n");
     return false;
+}
+
+// WOW64 may deliver a raised single-step in its WX86 status form.
+static bool is_single_step(DWORD code) {
+    return code == EXCEPTION_SINGLE_STEP || code == 0x4000001Eu /* STATUS_WX86_SINGLE_STEP */;
 }
 
 // A data-watch trap reports the instruction AFTER this write, not the data address.
@@ -168,7 +173,7 @@ static DWORD WINAPI watchdeath_own_dr(void *main_thread) {
     return ok ? 0 : 1;
 }
 static LONG CALLBACK watchdeath_veh(EXCEPTION_POINTERS *ep) {
-    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+    if (!is_single_step(ep->ExceptionRecord->ExceptionCode)) return EXCEPTION_CONTINUE_SEARCH;
     // RaiseException can carry stale DR6 bits from the preceding hardware trap. Identify
     // our software exception by its payload, independently of the saved debug status.
     if (g_plain_raise || (ep->ExceptionRecord->NumberParameters == 1 &&
@@ -222,8 +227,134 @@ static int run_watchdeath() {
     return 0;
 }
 
+// Explicit software #DB at a historical data-watch address, on a thread that
+// completed a UHH TF step before death. NtRaiseException preserves our record's
+// address (RaiseException supplies its own PC). No payload or debug status.
+static volatile LONG g_stray_seen, g_stray_bad, g_stray_resumed, g_stray_before, g_stray_phase, g_stray_seh;
+static void *g_stray_address;
+static CONTEXT g_stray_context;
+static EXCEPTION_RECORD g_stray_record;
+static void stray_stage(LONG phase) {
+    InterlockedExchange(&g_stray_phase, phase);
+    printf("{\"kind\":\"stray_stage\",\"phase\":%ld,\"seen\":%ld}\n", phase, g_stray_seen);
+    fflush(stdout);
+}
+static void stray_abort(const char *why) {
+    fprintf(stderr, "stray: %s (phase=%ld seen=%ld bad=%ld resumed=%ld address=%p)\n",
+            why, g_stray_phase, g_stray_seen, g_stray_bad, g_stray_resumed, g_stray_address);
+    fflush(stderr);
+    TerminateProcess(GetCurrentProcess(), 6);
+    ExitProcess(6);
+}
+static DWORD WINAPI stray_watchdog(void *stop) {
+    if (WaitForSingleObject((HANDLE)stop, 15000) != WAIT_OBJECT_0)
+        stray_abort("post-step watchdog expired: 1=second gate, 2=debugger exit, 3=data raise, 4=code raise, 5=done");
+    return 0;
+}
+static LONG CALLBACK stray_veh(EXCEPTION_POINTERS *ep) {
+    if (!is_single_step(ep->ExceptionRecord->ExceptionCode)) return EXCEPTION_CONTINUE_SEARCH;
+    if (ep->ExceptionRecord->ExceptionAddress != g_stray_address ||
+        ep->ExceptionRecord->NumberParameters || (ep->ContextRecord->Dr6 & 0xE00Fu) ||
+        (ep->ContextRecord->EFlags & 0x100u)) {
+        InterlockedIncrement(&g_stray_bad);
+        stray_abort("program #DB was not statusless or had the wrong address");
+    }
+    if (InterlockedIncrement(&g_stray_seen) != g_stray_before + 1)
+        stray_abort("program #DB delivered repeatedly");
+    // Let our SEH handler finish delivery through the compiler's unwind path.
+    // Continuing the manually captured context replays ordinary C++ code outside
+    // the compiler's returns-twice model, including live caller locals on x86.
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+static LONG stray_filter(EXCEPTION_POINTERS *ep) {
+    return is_single_step(ep->ExceptionRecord->ExceptionCode) &&
+        ep->ExceptionRecord->ExceptionAddress == g_stray_address ?
+        EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
+}
+static __declspec(noinline) bool stray_raise(void *address) {
+    using RaiseFn = LONG (NTAPI *)(EXCEPTION_RECORD *, CONTEXT *, BOOLEAN);
+    const auto raise = (RaiseFn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtRaiseException");
+    if (!raise) stray_abort("NtRaiseException unavailable");
+    g_stray_address = address;
+    g_stray_before = g_stray_seen;
+    // A valid delivery exits via __except, never via a context rewind. Keep
+    // synthetic input and the swallowed-delivery sentinel out of the stack frame:
+    // if a guard consumes the exception, NtContinue resumes after capture below.
+    InterlockedExchange(&g_stray_resumed, 0);
+    memset(&g_stray_context, 0, sizeof(g_stray_context));
+    memset(&g_stray_record, 0, sizeof(g_stray_record));
+    g_stray_record.ExceptionCode = EXCEPTION_SINGLE_STEP;
+    g_stray_record.ExceptionAddress = address;
+    __try {
+        RtlCaptureContext(&g_stray_context);
+        if (InterlockedExchange(&g_stray_resumed, 1))
+            stray_abort("program #DB swallowed: captured context replayed instead of program SEH");
+        g_stray_context.Dr0 = g_stray_context.Dr1 = g_stray_context.Dr2 =
+            g_stray_context.Dr3 = g_stray_context.Dr6 = g_stray_context.Dr7 = 0;
+        g_stray_context.EFlags &= ~0x100u;
+        const LONG status = raise(&g_stray_record, &g_stray_context, TRUE);
+        fprintf(stderr, "stray: NtRaiseException returned status=0x%08lx\n", (unsigned long)status);
+        stray_abort("NtRaiseException returned instead of reaching program SEH");
+    } __except (stray_filter(GetExceptionInformation())) {
+        if (g_stray_seen != g_stray_before + 1)
+            stray_abort("program SEH did not receive exactly one program VEH delivery");
+        InterlockedIncrement(&g_stray_seh);
+    }
+    return true;
+}
+static int run_stray(bool baseline = false) {
+    if (!AddVectoredExceptionHandler(1, stray_veh)) return 4;
+    if (!baseline) {
+        printf("{\"kind\":\"waiting\",\"pid\":%lu}\n", GetCurrentProcessId()); fflush(stdout);
+        if (!read_gate()) return 3;
+    }
+    const intptr_t result = co_add(1, 2); // same thread as both later software exceptions
+    HANDLE stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE watchdog = stop ? CreateThread(nullptr, 0, stray_watchdog, stop, 0, nullptr) : nullptr;
+    if (!watchdog) stray_abort("cannot start watchdog");
+    stray_stage(1);
+    // Publish stepped only after the watchdog exists; the runner kills on this marker.
+    printf("{\"kind\":\"stepped\",\"result\":%lld}\n", (long long)result); fflush(stdout);
+    if (!baseline && !read_gate(5000)) stray_abort("second stdin gate missing after completed step");
+    stray_stage(2);
+    BOOL dbg = TRUE;
+    const ULONGLONG deadline = GetTickCount64() + 5000;
+    do {
+        if (!CheckRemoteDebuggerPresent(GetCurrentProcess(), &dbg)) stray_abort("debugger query failed");
+        if (!dbg) break;
+        Sleep(10);
+    } while (GetTickCount64() < deadline);
+    if (dbg) stray_abort("debugger still attached after controller exit");
+    if (!baseline) Sleep(1500);
+    stray_stage(3);
+    const bool a = stray_raise((void *)&co_watch_value);
+    stray_stage(4);
+    const bool b = stray_raise((void *)&co_add);
+    stray_stage(5);
+    if (!SetEvent(stop)) {
+        fprintf(stderr, "stray: SetEvent(stop=%p) failed error=%lu\n", stop, GetLastError());
+        stray_abort("cannot signal watchdog stop event");
+    }
+    const DWORD joined = WaitForSingleObject(watchdog, 5000);
+    if (joined != WAIT_OBJECT_0) {
+        const DWORD error = GetLastError();
+        fprintf(stderr, "stray: watchdog join result=0x%08lx error=%lu stop_state=0x%08lx\n",
+                joined, error, WaitForSingleObject(stop, 0));
+        stray_abort("watchdog did not stop");
+    }
+    DWORD watchdog_rc = 1;
+    if (!GetExitCodeThread(watchdog, &watchdog_rc) || watchdog_rc != 0)
+        stray_abort("watchdog exit code was not zero");
+    CloseHandle(watchdog); CloseHandle(stop);
+    printf("{\"kind\":\"co\",\"case\":\"stray\",\"seen\":%ld,\"bad\":%ld,\"seh\":%ld,\"watchdog_stopped\":1,\"debugger\":%d}\n",
+           g_stray_seen, g_stray_bad, g_stray_seh, (int)dbg); fflush(stdout);
+    return a && b && result == 5 && !dbg && g_stray_seen == 2 && g_stray_seh == 2 && !g_stray_bad ? 0 : 5;
+}
+
 int main(int argc, char **argv) {
     const char *k = argc > 1 ? argv[1] : "";
+    if (!strcmp(k, "stray")) return run_stray();
+    if (!strcmp(k, "stray-baseline")) return run_stray(true);
     if (!strcmp(k, "watchdeath") || !strcmp(k, "watchreuse")) {
         g_watch_reuse = !strcmp(k, "watchreuse");
         return run_watchdeath();

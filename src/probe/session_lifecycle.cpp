@@ -125,16 +125,116 @@ bool guard_set_ready(probe_session *s, const char *why) {
     return ok;
 }
 
+// Called at dequeue, before dispatch/fibers can alter the event's thread state.
+// DBG_REPLY_LATER keeps the same kernel event (and claim) until its final reply.
+bool guard_claim_event(probe_session *s, const DEBUG_EVENT &event) {
+    if (!s->attached || !s->shared || s->detached || !s->shared->guard.enabled ||
+        event.dwDebugEventCode != EXCEPTION_DEBUG_EVENT) return true;
+    const auto &er = event.u.Exception.ExceptionRecord;
+    if ((er.ExceptionCode != EXCEPTION_SINGLE_STEP && er.ExceptionCode != 0x4000001Eu) ||
+        er.NumberParameters) return true;
+    const DWORD tid = event.dwThreadId;
+    auto &claims = s->shared->guard.claims;
+    // A replay of a retained kernel event already has its immutable claim.
+    for (auto &c : claims) if ((DWORD)c.tid == tid) {
+        if (c.address == (uint64_t)(uintptr_t)er.ExceptionAddress) return true;
+        InterlockedExchange(&c.tid, 0);                 // stale (its event was replied to elsewhere): retire it
+    }
+    GuardTouch touch(s, tid);
+    HANDLE t = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+    CONTEXT cx{}; cx.ContextFlags = CONTEXT_ALL;
+    FILETIME created{}, exited{}, kernel{}, user{};
+    const bool ok = t && GetThreadTimes(t, &created, &exited, &kernel, &user) && GetThreadContext(t, &cx);
+    if (t) CloseHandle(t);
+    if (!ok) return true;   // no claim: a controller death now leaves this one event unclaimed (as before the claims)
+    // Never authorize consuming a delivery with any program-owned debug status.
+    if (cx.Dr6 & 0xA000u) return true;
+    const DWORD hits = (DWORD)cx.Dr6 & 15;
+    DWORD owned = 0;
+    uint32_t kind = 0;
+    uint64_t resume = 0;
+    for (const auto &p : s->probes) {
+        if (!p->active || !(p->flags & PROBE_HW) || p->dr_slot < 0 || p->dr_slot > 3) continue;
+        const int slot = p->dr_slot;
+        uint32_t rw = 0, len = 0; hw_rw_len(p->flags, rw, len);
+        if (!(hits & (1u << slot)) || !((cx.Dr7 >> (2 * slot)) & 3) ||
+            dr_address(cx, slot) != p->address ||
+            ((cx.Dr7 >> (16 + 4 * slot)) & 15) != ((len << 2) | rw)) continue;
+        owned |= 1u << slot;
+        if (rw) kind = PROBE_ORPHAN_WATCH;
+        else if (p->address == (uint64_t)(uintptr_t)er.ExceptionAddress) kind = PROBE_ORPHAN_EXECUTE;
+    }
+    for (const auto &gate : s->gates) {
+        const int slot = gate.second;
+        if (slot >= 0 && slot < 4 && (hits & (1u << slot)) &&
+            ((cx.Dr7 >> (2 * slot)) & 3) && dr_address(cx, slot) == gate.first &&
+            !(cx.Dr7 & ((decltype(cx.Dr7))0xF << (16 + 4 * slot))) &&
+            gate.first == (uint64_t)(uintptr_t)er.ExceptionAddress) {
+            owned |= 1u << slot; kind = PROBE_ORPHAN_EXECUTE;
+        }
+    }
+    // call_original's temporary execute return catch is not a Probe.
+    if (s->in_call_tid == tid && s->co_ret == (uint64_t)(uintptr_t)er.ExceptionAddress)
+        for (int slot = 0; slot < 4; ++slot)
+            if ((hits & (1u << slot)) && (s->dr_used & (1u << slot)) &&
+                ((cx.Dr7 >> (2 * slot)) & 3) && dr_address(cx, slot) == s->co_ret &&
+                !(cx.Dr7 & ((decltype(cx.Dr7))0xF << (16 + 4 * slot)))) {
+                owned |= 1u << slot; kind = PROBE_ORPHAN_EXECUTE;
+            }
+    if (hits & ~owned) return true;
+    auto st = s->stepping.find(tid);
+    if (st != s->stepping.end() && st->second.prog_tf) return true;
+    if (st != s->stepping.end() && !st->second.prog_tf && !st->second.tail_int3 &&
+        !st->second.refire && !(st->second.popf_insn && st->second.popf_tf) && (cx.Dr6 & 0x4000u)) {
+        kind = st->second.displaced ? PROBE_ORPHAN_SCRATCH : PROBE_ORPHAN_STEP;
+        if (st->second.displaced) resume = st->second.site + st->second.insn_len;
+    } else if ((cx.Dr6 & 0x4000u) || (cx.EFlags & 0x100u) || !hits) return true;
+    if (!kind) return true;
+    for (auto &c : claims) if (!c.tid) {
+        c.kind = kind;
+        c.created = ((uint64_t)created.dwHighDateTime << 32) | created.dwLowDateTime;
+        c.address = (uint64_t)(uintptr_t)er.ExceptionAddress;
+        c.resume = resume;
+        MemoryBarrier();
+        InterlockedExchange(&c.tid, (LONG)tid);
+        return true;
+    }
+    return true;            // table full: unclaimed (never fail the session for the guard's sake)
+}
+bool guard_continue(probe_session *s, DWORD pid, DWORD tid, DWORD disposition) {
+    const bool ok = !!ContinueDebugEvent(pid, tid, disposition);
+    if (ok && disposition != DBG_REPLY_LATER && pid == s->pi.dwProcessId && s->shared)
+        for (auto &c : s->shared->guard.claims)
+            if ((DWORD)c.tid == tid) InterlockedExchange(&c.tid, 0);
+    return ok;
+}
+
 void guard_sync(probe_session *s) {
     if (!s->attached || !s->shared || s->detached) return;
     // (Armed INT3s: the INT3 table, kept current by sync_int3_table.)
     auto &g = s->shared->guard;
+    // Stable step slots: removing A from [A,B] never moves or duplicates B.
+    LONG steps = g.step_count;
+    if (steps < 0 || steps > (LONG)PROBE_AGENT_GUARD_TIDS) steps = 0;
+    auto listed_step = [&](DWORD tid) {
+        auto it = s->stepping.find(tid);
+        return it != s->stepping.end() && !it->second.prog_tf &&
+            !it->second.tail_int3 && !it->second.refire;
+    };
+    for (LONG i = 0; i < steps; ++i)
+        if (g.step_tids[i] && !listed_step(g.step_tids[i])) g.step_tids[i] = 0;
+    MemoryBarrier();
+    for (const auto &kv : s->stepping) if (listed_step(kv.first)) {
+        LONG i = 0;
+        while (i < steps && g.step_tids[i] != kv.first) ++i;
+        if (i < steps) continue;
+        i = 0;
+        while (i < steps && g.step_tids[i]) ++i;
+        if (i == (LONG)PROBE_AGENT_GUARD_TIDS) break;
+        g.step_tids[i] = kv.first;
+        if (i == steps) { MemoryBarrier(); g.step_count = ++steps; }
+    }
     uint32_t n = 0;
-    for (auto &kv : s->stepping)
-        if (!kv.second.prog_tf && !kv.second.tail_int3 && !kv.second.refire && n < PROBE_AGENT_GUARD_TIDS)
-            g.step_tids[n++] = kv.first;
-    g.step_count = (LONG)n;
-    n = 0;
     DWORD holds[PROBE_AGENT_GUARD_TIDS]{};
     auto hold = [&](DWORD tid) {                        // a hold of ours: resumed once, unconditionally
         if (!tid || n >= PROBE_AGENT_GUARD_TIDS) return;
