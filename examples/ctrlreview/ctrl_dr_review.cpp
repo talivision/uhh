@@ -84,8 +84,11 @@ static LONG CALLBACK child_veh(EXCEPTION_POINTERS *e) {
     if (child_gate_nop && child_state.ip == child_gate_nop &&
         (child_state.dr6 & 1u) && child_state.dr0 == child_gate_nop)
         EMU_IP(*e->ContextRecord) = (decltype(EMU_IP(*e->ContextRecord)))(child_gate_nop + 1);
-    if (child_state.data[6] && (e->ContextRecord->Dr6 & 4u))
+    if (child_state.data[6] && (e->ContextRecord->Dr6 & 4u)) {
         e->ContextRecord->Dr7 &= ~((decltype(e->ContextRecord->Dr7))3 << 4);
+        // Keep dispatch live across call_original's 20 ms abandonment poll.
+        Sleep((DWORD)child_state.data[6]);
+    }
     e->ContextRecord->EFlags &= ~0x100u;
     e->ContextRecord->Dr6 = 0;
     return EXCEPTION_CONTINUE_EXECUTION;
@@ -600,7 +603,7 @@ int run(int argc, char **argv) {
             d.resume(); d.wait(EXCEPTION_SINGLE_STEP, p->address);
             if (tf) { auto entry = d.get(); entry.EFlags |= 0x100u; d.put(entry); }
             if (ret_watch) {
-                const LONG retire_watch = 1;
+                const LONG retire_watch = 50;
                 dr_require(!!WriteProcessMemory(d.pi.hProcess, (void *)(uintptr_t)(old_address + 24), &retire_watch, sizeof(retire_watch), &n), "retire return watch in target handler");
                 auto entry = d.get();
                 entry.Dr2 = (decltype(entry.Dr2))EMU_SP(entry);
@@ -615,8 +618,21 @@ int run(int argc, char **argv) {
             run_callback(s, p, &context);
             if (ret_watch) {
                 const auto result = d.result();
-                dr_require(context.called_original && st.have_post && result.seen == 1 &&
-                           result.ip == done && (result.dr6 & 4u), "return-slot watch delivered before return catch");
+                std::fprintf(stderr, "dr-review: return watch completed=%d post=%d released=%d callbacks=%u seen=%ld "
+                                     "ip=0x%llx at=0x%llx want=0x%llx code=0x%lx dr6=0x%llx\n",
+                             context.called_original ? 1 : 0, st.have_post ? 1 : 0, st.released ? 1 : 0,
+                             callbacks, (long)result.seen, (unsigned long long)result.ip,
+                             (unsigned long long)result.exception_address, (unsigned long long)done,
+                             (unsigned long)result.exception_code, (unsigned long long)result.dr6);
+                dr_require(context.called_original && st.have_post && !st.released && callbacks == 1,
+                           "return catch completes the single original callback");
+                dr_require((uint64_t)EMU_IP(st.post) == done &&
+                           (uint64_t)EMU_SP(st.post) == (uint64_t)EMU_SP(entry) + sizeof(void *),
+                           "return catch attributed to the original RET's PC and popped frame");
+                dr_require(result.seen == 1, "return-slot watch delivered exactly once");
+                dr_require(result.ip == done && result.exception_address == done &&
+                           result.exception_code == EXCEPTION_SINGLE_STEP && (result.dr6 & 4u),
+                           "return-slot watch attributed to RET's continuation and target DR2");
             } else if (tf) {
                 const auto result = d.result();
                 dr_require(context.called_original && st.have_post && result.seen == 1 &&
