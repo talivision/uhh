@@ -8925,7 +8925,7 @@ def check_session_agentipc():
 
     # Fresh controller processes on every cycle: this also tests shared sections across
     # different local DLL mappings. Keep the target alive until all memory queries finish.
-    for case in ("shared", "identity", "identity-loader", "identity-unreadable", "config", "retry", "stub", "freeze", "freeze-context", "unknown-image"):
+    for case in ("shared", "identity", "identity-loader", "identity-unreadable", "config", "retry", "stub", "freeze", "freeze-context", "unknown-image", "unknown-image-unreadable"):
         name = f"session-agentipc-{case}"
         target = None
         drivers = []
@@ -9016,13 +9016,16 @@ def check_session_agentipc():
                     if p.returncode == 0:
                         raise RuntimeError("identity refusal reported but controller exited successfully")
                     hit(2)                         # still alive and executing its original code
-            elif case == "unknown-image":
-                p, po, pe = attach("shared", env={"UHH_TEST_REUSE_UNKNOWN": "1"}, active=2)
+            elif case in ("unknown-image", "unknown-image-unreadable"):
+                knob = "UHH_TEST_REUSE_UNKNOWN" if case == "unknown-image" else "UHH_TEST_REUSE_UNREADABLE_NON_AGENT"
+                p, po, pe = attach("shared", env={knob: "1"}, active=2)
                 hit(1)
                 if not po.wait_for(lambda l: l.startswith("{") and json.loads(l).get("message") == "ar shared 1", 10):
                     raise RuntimeError(f"fresh injection did not run callbacks: {po.lines}")
                 detach(p)
-                if not any("probe: test: unrelated image unidentified" in l for l in pe.lines):
+                message = ("probe: test: unrelated image unidentified" if case == "unknown-image"
+                           else "probe: test: unrelated image headers unreadable")
+                if not any(message in l for l in pe.lines):
                     raise RuntimeError("unknown-image path was not exercised")
             elif case == "config":
                 p, po, pe = attach("config", env={"UHH_TEST_STOP_FAIL": "1"})

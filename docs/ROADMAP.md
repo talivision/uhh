@@ -3154,14 +3154,18 @@ are implemented but await Windows x64/x86 rerun. Existing Detours checks are unc
   `session-agentipc-identity` still requires a changed retained agent to be refused.
 - Identity follow-up (idfix): the fallthrough above could overlook a retained agent
   and inject the replacement build (intermittent x86 CI, merge-frida b64aca7).
-  Discovery now walks MEM_IMAGE allocations, using the kernel mapped filename when
-  the loader name is unavailable. Unreadable/unidentifiable images refuse attach;
-  failed agent export/file reads no longer authorize fresh injection. An unrelated
-  missing loader name still permits fresh attach when its mapped name is known.
+  Discovery walks MEM_IMAGE allocations and identifies UHH by the in-memory export
+  directory's DLL name or its init/stop/controller-bind exports. Unreadable/unrelated
+  images are skipped (the earlier name-based fail-closed walk wrongly refused
+  Detours/fresh attaches in 0615fa0). Only positively identified agents require an
+  in-memory PE build-fields/checksum match and normalized backing-file comparison;
+  inability to complete that identity/reuse check refuses with unknown-image.
   `session-agentipc-identity-loader` forces missing loader names and requires the
   different-build refusal; `session-agentipc-identity-unreadable` requires unknown-image
   refusal. `session-agentipc-shared` also forces missing loader names on reuse and
-  verifies preserved shared state. No shared-layout or agent-version change.
+  verifies preserved shared state. `session-agentipc-unknown-image` and
+  `session-agentipc-unknown-image-unreadable` require fresh mixed callbacks despite
+  an unnamed/unreadable non-agent image. No shared-layout or agent-version change.
 - The shared fixture's write/read sites had identical `InterlockedIncrement` bodies and
   were eligible for MSVC /OPT:ICF folding, placing inline and breakpoint probes on one
   instruction. The writer now exchanges its argument into the sink; the fixture also

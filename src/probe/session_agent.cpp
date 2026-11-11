@@ -501,57 +501,110 @@ bool reuse_target_agent(probe_session *s) {
         set_error(s, "retained inline agent unknown-image: cannot establish target agent identity; restart the target before attaching");
         return false;
     };
-    // The loader list can be incomplete during loader activity (including WOW64).
-    // Inspect image allocations independently; overlooking an agent must not
-    // authorize fresh injection. A missing loader name can use the mapped name.
-    std::vector<std::wstring> agents;
-#if defined(UHH_TEST_HOOKS)
-    bool first = true;
-#endif
+    // Identify UHH from mapped PE exports, never from the loader list or filename.
+    // Unreadable/unrelated images are not evidence of a retained agent.
+    struct Retained { uintptr_t base; IMAGE_NT_HEADERS nt; };
+    std::vector<Retained> agents;
     for (uintptr_t at = 0; ; ) {
         MEMORY_BASIC_INFORMATION mbi{};
-        if (!VirtualQueryEx(s->pi.hProcess, reinterpret_cast<void *>(at), &mbi, sizeof(mbi))) {
-            if (!at || GetLastError() != ERROR_INVALID_PARAMETER) return unknown();
-            break;                                      // end of address space
-        }
+        if (!VirtualQueryEx(s->pi.hProcess, reinterpret_cast<void *>(at), &mbi, sizeof(mbi))) break;
         const uintptr_t next = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
         if (mbi.Type == MEM_IMAGE && mbi.BaseAddress == mbi.AllocationBase) {
-            wchar_t path[32768];
-            DWORD n = K32GetModuleFileNameExW(s->pi.hProcess, reinterpret_cast<HMODULE>(mbi.AllocationBase),
-                                            path, (DWORD)(sizeof(path) / sizeof(path[0])));
+            const uintptr_t base = reinterpret_cast<uintptr_t>(mbi.AllocationBase);
+            IMAGE_NT_HEADERS nt{};
+            auto identify = [&]() {
+                uint64_t limit = 1u << 20; // bound header reads before SizeOfImage is known
+                auto read = [&](uint64_t rva, void *dst, size_t n) {
+                    SIZE_T got = 0;
+                    return rva <= limit && n <= limit - rva && rva <= UINTPTR_MAX - base &&
+                        n <= UINTPTR_MAX - base - rva &&
+                        ReadProcessMemory(s->pi.hProcess, reinterpret_cast<void *>(base + (uintptr_t)rva),
+                                          dst, n, &got) && got == n;
+                };
+                IMAGE_DOS_HEADER dos{};
+                if (!read(0, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0 ||
+                    !read(dos.e_lfanew, &nt, sizeof(nt)) || nt.Signature != IMAGE_NT_SIGNATURE ||
+                    nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR_MAGIC) return false;
 #if defined(UHH_TEST_HOOKS)
-            if (std::getenv("UHH_TEST_REUSE_NO_MODULE_NAME")) n = 0;
-            if (first && std::getenv("UHH_TEST_REUSE_UNKNOWN")) {
-                n = 0; std::fprintf(stderr, "probe: test: unrelated image unidentified\n");
-            }
-            first = false;
+                if (!(nt.FileHeader.Characteristics & IMAGE_FILE_DLL)) {
+                    if (std::getenv("UHH_TEST_REUSE_UNKNOWN")) {
+                        // No filename is available for this non-agent. Discovery
+                        // must use memory alone, so no name lookup is needed.
+                        std::fprintf(stderr, "probe: test: unrelated image unidentified\n");
+                    }
+                    if (std::getenv("UHH_TEST_REUSE_UNREADABLE_NON_AGENT")) {
+                        // Simulate failure of its remaining PE/export reads.
+                        std::fprintf(stderr, "probe: test: unrelated image headers unreadable\n"); return false;
+                    }
+                }
 #endif
-            std::wstring file;
-            if (n && n < sizeof(path) / sizeof(path[0])) file.assign(path, n);
-            else {
-                n = K32GetMappedFileNameW(s->pi.hProcess, mbi.AllocationBase, path,
-                                         (DWORD)(sizeof(path) / sizeof(path[0])));
-                if (!n || n >= sizeof(path) / sizeof(path[0])) return unknown();
-                // Open the kernel's NT device path without depending on drive aliases.
-                file = L"\\\\?\\GLOBALROOT" + std::wstring(path, n);
-            }
-            const size_t slash = file.find_last_of(L'\\');
-            if (!_wcsicmp(file.c_str() + (slash == std::wstring::npos ? 0 : slash + 1), L"probe_api_agent.dll"))
-                agents.push_back(file);
+                limit = nt.OptionalHeader.SizeOfImage;
+                if (!limit || limit > (256u << 20) ||
+                    nt.OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXPORT) return false;
+                const auto &dir = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+                IMAGE_EXPORT_DIRECTORY exp{};
+                if (!dir.VirtualAddress || !read(dir.VirtualAddress, &exp, sizeof(exp))) return false;
+                auto named = [&](DWORD rva, const char *want) {
+                    char name[64] = {};
+                    const size_t n = strlen(want) + 1;
+                    return n <= sizeof(name) && read(rva, name, n) && !memcmp(name, want, n);
+                };
+                if (exp.Name && named(exp.Name, "probe_api_agent.dll")) return true;
+                // Alternate project builds can have another internal DLL name.
+                // The agent exports a handful of names: skip big export tables (system DLLs)
+                // instead of thousands of remote reads per attach.
+                if (exp.NumberOfNames > 64) return false;
+                unsigned found = 0;
+                for (DWORD i = 0; i < exp.NumberOfNames; ++i) {
+                    DWORD rva = 0;
+                    if (!read((uint64_t)exp.AddressOfNames + i * sizeof(DWORD), &rva, sizeof(rva))) return false;
+                    if (named(rva, "probe_agent_init")) found |= 1;
+                    if (named(rva, "probe_agent_stop")) found |= 2;
+                    if (named(rva, "probe_agent_bind_controller")) found |= 4;
+                    if (found == 7) return true;
+                }
+                return false;
+            };
+            if (identify()) agents.push_back({base, nt});
         }
         if (next <= at) break;
         at = next;
     }
     if (agents.size() > 1) return unknown();
-    for (const auto &file : agents) {
-        const wchar_t *path = file.c_str();
+    for (const auto &agent : agents) {
 #if defined(UHH_TEST_HOOKS)
         if (std::getenv("UHH_TEST_REUSE_AGENT_UNREADABLE")) return unknown();
 #endif
-        std::unordered_set<std::string> exports;
-        if (!read_file_exports(path, exports) || !exports.count("probe_agent_init") ||
-            !exports.count("probe_agent_stop") || !exports.count("probe_agent_bind_controller")) return unknown();
         if (!ensure_local_agent(s)) return false;
+        // The same PE build fields/checksum used for warm-copy identity, read
+        // from the loaded image before consulting its backing file.
+        const auto *local_dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(s->local_agent);
+        const auto *local_nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(
+            reinterpret_cast<const unsigned char *>(s->local_agent) + local_dos->e_lfanew);
+        const auto &have_nt = agent.nt;
+        const bool same = have_nt.FileHeader.TimeDateStamp == local_nt->FileHeader.TimeDateStamp &&
+            have_nt.FileHeader.Machine == local_nt->FileHeader.Machine &&
+            have_nt.FileHeader.NumberOfSections == local_nt->FileHeader.NumberOfSections &&
+            have_nt.OptionalHeader.SizeOfImage == local_nt->OptionalHeader.SizeOfImage &&
+            have_nt.OptionalHeader.AddressOfEntryPoint == local_nt->OptionalHeader.AddressOfEntryPoint &&
+            have_nt.OptionalHeader.CheckSum == local_nt->OptionalHeader.CheckSum;
+        if (!same) {
+            set_error(s, "retained inline agent differs from this build; restart the target before attaching"); return false;
+        }
+        wchar_t path[32768];
+        DWORD n = K32GetModuleFileNameExW(s->pi.hProcess, reinterpret_cast<HMODULE>(agent.base),
+                                        path, (DWORD)(sizeof(path) / sizeof(path[0])));
+#if defined(UHH_TEST_HOOKS)
+        if (std::getenv("UHH_TEST_REUSE_NO_MODULE_NAME")) n = 0;
+#endif
+        std::wstring file;
+        if (n && n < sizeof(path) / sizeof(path[0])) file.assign(path, n);
+        else {
+            n = K32GetMappedFileNameW(s->pi.hProcess, reinterpret_cast<void *>(agent.base), path,
+                                     (DWORD)(sizeof(path) / sizeof(path[0])));
+            if (!n || n >= sizeof(path) / sizeof(path[0])) return unknown();
+            file = L"\\\\?\\GLOBALROOT" + std::wstring(path, n);
+        }
         auto read = [](const std::wstring &file, std::vector<unsigned char> &bytes) {
             HANDLE f = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
                                    nullptr, OPEN_EXISTING, 0, nullptr);
@@ -561,7 +614,7 @@ bool reuse_target_agent(probe_session *s) {
             return ok;
         };
         std::vector<unsigned char> want, have;
-        if (!read(s->agent_path, want) || !read(path, have)) return unknown();
+        if (!read(s->agent_path, want) || !read(file, have)) return unknown();
         if (want != have) {
             set_error(s, "retained inline agent differs from this build; restart the target before attaching"); return false;
         }
@@ -574,7 +627,7 @@ bool reuse_target_agent(probe_session *s) {
             }
         }
         FreeLibrary(s->local_agent); s->local_agent = nullptr; s->agent_prep_module = nullptr;
-        s->agent_path = path; s->agent_prep_error = 0;
+        s->agent_path = file; s->agent_prep_error = 0;
         return ensure_local_agent(s);
     }
     return true;
