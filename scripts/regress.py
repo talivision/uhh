@@ -12061,13 +12061,22 @@ def check_cx2_review():
     # Completed steps and historical data-watch addresses confer no orphan ownership.
     name = "cx2-kill-stray-history"
     procs = []
+    tout = terr = aerr = None
     try:
         if not st:
             raise RuntimeError("missing susp_target.exe")
+        try:
+            baseline = subprocess.run([str(st), "stray-baseline"], capture_output=True, text=True, timeout=25)
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"stray fixture hangs WITHOUT UHH: stdout={e.stdout!r} stderr={e.stderr!r}") from e
+        if baseline.returncode != 0:
+            raise RuntimeError(f"stray fixture failed WITHOUT UHH: rc={baseline.returncode} "
+                               f"stdout={baseline.stdout[-1500:]!r} stderr={baseline.stderr[-1500:]!r}")
         tgt = subprocess.Popen([str(st), "stray"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL, text=True)
+                               stderr=subprocess.PIPE, text=True)
         procs.append(tgt)
         tout = Lines(tgt.stdout)
+        terr = Lines(tgt.stderr)
         w = tout.wait_for(lambda l: '"kind":"waiting"' in l, 30)
         if not w:
             raise RuntimeError("stray target never reached gate")
@@ -12089,16 +12098,25 @@ def check_cx2_review():
             raise RuntimeError(f"no real TF step: {aerr.lines[-8:]}")
         att.kill(); att.wait(timeout=30)
         tgt.stdin.write("x"); tgt.stdin.flush()
-        tgt.wait(timeout=60)
+        try:
+            tgt.wait(timeout=25) # target's post-step watchdog expires at 15 s
+        except subprocess.TimeoutExpired as e:
+            tgt.kill(); tgt.wait(timeout=5)
+            terr.t.join(timeout=2); tout.t.join(timeout=2)
+            raise RuntimeError(f"stray target stalled after BOTH stdin gates were sent; "
+                               f"stages={tout.lines[-8:]} target_err={terr.lines[-8:]}") from e
+        terr.t.join(timeout=2)
         row = next((x for x in tout.objs() if x.get("kind") == "co"), {})
         ok = tgt.returncode == 0 and row.get("seen") == 2 and row.get("bad") == 0 and row.get("debugger") == 0
-        record(name, ok, f"target_rc={tgt.returncode} row={row}")
+        record(name, ok, f"target_rc={tgt.returncode} row={row} target_err={terr.lines[-8:]} stages={tout.lines[-8:]}")
     except Exception as e:
-        record(name, False, repr(e))
+        record(name, False, f"{e!r} target_out={tout.lines[-8:] if tout else []} "
+                            f"target_err={terr.lines[-8:] if terr else []} ctl_err={aerr.lines[-8:] if aerr else []}")
     finally:
         for q in procs:
             if q.poll() is None:
                 q.kill()
+                q.wait(timeout=5)
 
     def susp_after(case, bk):
         """susp_target evsusp / cosusp: the program suspends its worker right after the controller let

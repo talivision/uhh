@@ -115,10 +115,10 @@ static DWORD WINAPI worker(void *p) {
     while (!g_spin_stop) { InterlockedIncrement(&g_spun); Sleep(1); }
     return 0;
 }
-static bool read_gate() {
+static bool read_gate(DWORD timeout_ms = 60000) {
     char b; DWORD n = 0;
     const HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
-    const ULONGLONG deadline = GetTickCount64() + 60000;
+    const ULONGLONG deadline = GetTickCount64() + timeout_ms;
     while (GetTickCount64() < deadline) {
         DWORD available = 0;
         if (!PeekNamedPipe(in, nullptr, 0, nullptr, &available, nullptr)) return false;
@@ -225,47 +225,98 @@ static int run_watchdeath() {
 // Explicit software #DB at a historical data-watch address, on a thread that
 // completed a UHH TF step before death. NtRaiseException preserves our record's
 // address (RaiseException supplies its own PC). No payload or debug status.
-static volatile LONG g_stray_seen, g_stray_bad;
+static volatile LONG g_stray_seen, g_stray_bad, g_stray_resumed, g_stray_before, g_stray_phase;
 static void *g_stray_address;
+static CONTEXT g_stray_context;
+static EXCEPTION_RECORD g_stray_record;
+static void stray_stage(LONG phase) {
+    InterlockedExchange(&g_stray_phase, phase);
+    printf("{\"kind\":\"stray_stage\",\"phase\":%ld,\"seen\":%ld}\n", phase, g_stray_seen);
+    fflush(stdout);
+}
+static void stray_abort(const char *why) {
+    fprintf(stderr, "stray: %s (phase=%ld seen=%ld bad=%ld resumed=%ld address=%p)\n",
+            why, g_stray_phase, g_stray_seen, g_stray_bad, g_stray_resumed, g_stray_address);
+    fflush(stderr);
+    TerminateProcess(GetCurrentProcess(), 6);
+    ExitProcess(6);
+}
+static DWORD WINAPI stray_watchdog(void *stop) {
+    if (WaitForSingleObject((HANDLE)stop, 15000) != WAIT_OBJECT_0)
+        stray_abort("post-step watchdog expired: 1=second gate, 2=debugger exit, 3=data raise, 4=code raise, 5=done");
+    return 0;
+}
 static LONG CALLBACK stray_veh(EXCEPTION_POINTERS *ep) {
     if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
     if (ep->ExceptionRecord->ExceptionAddress != g_stray_address ||
         ep->ExceptionRecord->NumberParameters || (ep->ContextRecord->Dr6 & 0xE00Fu) ||
-        (ep->ContextRecord->EFlags & 0x100u)) InterlockedIncrement(&g_stray_bad);
-    InterlockedIncrement(&g_stray_seen);
+        (ep->ContextRecord->EFlags & 0x100u)) {
+        InterlockedIncrement(&g_stray_bad);
+        stray_abort("program #DB was not statusless or had the wrong address");
+    }
+    if (InterlockedIncrement(&g_stray_seen) != g_stray_before + 1)
+        stray_abort("program #DB delivered repeatedly");
     return EXCEPTION_CONTINUE_EXECUTION;
 }
-static bool stray_raise(void *address) {
+static __declspec(noinline) bool stray_raise(void *address) {
     using RaiseFn = LONG (NTAPI *)(EXCEPTION_RECORD *, CONTEXT *, BOOLEAN);
     const auto raise = (RaiseFn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtRaiseException");
-    if (!raise) return false;
+    if (!raise) stray_abort("NtRaiseException unavailable");
     g_stray_address = address;
-    volatile LONG raised = 0;
-    CONTEXT cx{};
-    RtlCaptureContext(&cx);
-    if (!raised) {
-        raised = 1;
-        cx.Dr0 = cx.Dr1 = cx.Dr2 = cx.Dr3 = cx.Dr6 = cx.Dr7 = 0;
-        cx.EFlags &= ~0x100u;
-        EXCEPTION_RECORD er{};
-        er.ExceptionCode = EXCEPTION_SINGLE_STEP; er.ExceptionAddress = address;
-        raise(&er, &cx, TRUE);
-        return false; // a successful delivery resumes the captured context above
+    g_stray_before = g_stray_seen;
+    // NtContinue resumes AFTER RtlCaptureContext. The compiler does not know this
+    // is a returns-twice operation: automatic locals (even a volatile sentinel)
+    // can have dead/reused stack slots by the time exception dispatch resumes it.
+    // Keep the sentinel AND both input buffers outside the rewound stack frame.
+    InterlockedExchange(&g_stray_resumed, 0);
+    memset(&g_stray_context, 0, sizeof(g_stray_context));
+    memset(&g_stray_record, 0, sizeof(g_stray_record));
+    g_stray_record.ExceptionCode = EXCEPTION_SINGLE_STEP;
+    g_stray_record.ExceptionAddress = address;
+    RtlCaptureContext(&g_stray_context);
+    if (!InterlockedExchange(&g_stray_resumed, 1)) {
+        g_stray_context.Dr0 = g_stray_context.Dr1 = g_stray_context.Dr2 =
+            g_stray_context.Dr3 = g_stray_context.Dr6 = g_stray_context.Dr7 = 0;
+        g_stray_context.EFlags &= ~0x100u;
+        const LONG status = raise(&g_stray_record, &g_stray_context, TRUE);
+        fprintf(stderr, "stray: NtRaiseException returned status=0x%08lx\n", (unsigned long)status);
+        stray_abort("NtRaiseException returned instead of resuming the context");
     }
+    if (g_stray_seen != g_stray_before + 1) stray_abort("program #DB swallowed: context resumed without program handler");
     return true;
 }
-static int run_stray() {
+static int run_stray(bool baseline = false) {
     if (!AddVectoredExceptionHandler(1, stray_veh)) return 4;
-    printf("{\"kind\":\"waiting\",\"pid\":%lu}\n", GetCurrentProcessId()); fflush(stdout);
-    if (!read_gate()) return 3;
+    if (!baseline) {
+        printf("{\"kind\":\"waiting\",\"pid\":%lu}\n", GetCurrentProcessId()); fflush(stdout);
+        if (!read_gate()) return 3;
+    }
     const intptr_t result = co_add(1, 2); // same thread as both later software exceptions
+    HANDLE stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE watchdog = stop ? CreateThread(nullptr, 0, stray_watchdog, stop, 0, nullptr) : nullptr;
+    if (!watchdog) stray_abort("cannot start watchdog");
+    stray_stage(1);
+    // Publish stepped only after the watchdog exists; the runner kills on this marker.
     printf("{\"kind\":\"stepped\",\"result\":%lld}\n", (long long)result); fflush(stdout);
-    if (!read_gate()) return 3; // orchestrator kills the controller before this gate
+    if (!baseline && !read_gate(5000)) stray_abort("second stdin gate missing after completed step");
+    stray_stage(2);
     BOOL dbg = TRUE;
-    for (int i = 0; i < 3000 && CheckRemoteDebuggerPresent(GetCurrentProcess(), &dbg) && dbg; ++i) Sleep(10);
-    Sleep(1500);
+    const ULONGLONG deadline = GetTickCount64() + 5000;
+    do {
+        if (!CheckRemoteDebuggerPresent(GetCurrentProcess(), &dbg)) stray_abort("debugger query failed");
+        if (!dbg) break;
+        Sleep(10);
+    } while (GetTickCount64() < deadline);
+    if (dbg) stray_abort("debugger still attached after controller exit");
+    if (!baseline) Sleep(1500);
+    stray_stage(3);
     const bool a = stray_raise((void *)&co_watch_value);
+    stray_stage(4);
     const bool b = stray_raise((void *)&co_add);
+    stray_stage(5);
+    SetEvent(stop);
+    if (WaitForSingleObject(watchdog, 5000) != WAIT_OBJECT_0) stray_abort("watchdog did not stop");
+    CloseHandle(watchdog); CloseHandle(stop);
     printf("{\"kind\":\"co\",\"case\":\"stray\",\"seen\":%ld,\"bad\":%ld,\"debugger\":%d}\n",
            g_stray_seen, g_stray_bad, (int)dbg); fflush(stdout);
     return a && b && result == 5 && !dbg && g_stray_seen == 2 && !g_stray_bad ? 0 : 5;
@@ -274,6 +325,7 @@ static int run_stray() {
 int main(int argc, char **argv) {
     const char *k = argc > 1 ? argv[1] : "";
     if (!strcmp(k, "stray")) return run_stray();
+    if (!strcmp(k, "stray-baseline")) return run_stray(true);
     if (!strcmp(k, "watchdeath") || !strcmp(k, "watchreuse")) {
         g_watch_reuse = !strcmp(k, "watchreuse");
         return run_watchdeath();

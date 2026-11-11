@@ -3563,3 +3563,25 @@ timings and deferred-watch/call_original coverage. Existing residuals remain:
 bp/hw-only sessions inject no guard, and a newer first program VEH can precede the
 agent's delivery repair. This change does not establish unconditional survival for
 those sessions or resolve VEH precedence (cxr19 finding 3).
+
+ctlkill stray-fixture CI follow-up (33edde0): both stdin gates already have
+matching sends; the supplied context clears TF and the program VEH continues it.
+The fixture instead relied on a stack-local `raised` sentinel across a manual
+RtlCaptureContext/NtContinue rewind. RtlCaptureContext is not a compiler
+returns-twice primitive: a local whose last ordinary use precedes dispatch can
+have its stack storage reused before the captured continuation reads it again.
+The timeout alone does not prove which instruction CI was stuck at or establish
+that the guard swallowed an exception. Remove that unsafe continuation dependency:
+keep the interlocked resume sentinel, CONTEXT and exception record in persistent
+storage and prevent helper inlining. Each software raise is attempted once; a
+continuation without exactly one program-handler call fails explicitly as
+"program #DB swallowed". Wrong status/TF and repeated deliveries fail immediately.
+
+The check first runs the same raises without UHH (`stray-baseline`), then requires
+the guarded case. Before publishing `stepped`, the target starts a 15 s watchdog;
+phase records distinguish second-gate, debugger-exit and each exception delivery.
+The second gate and debugger-exit wait each have 5 s bounds. Capture target stderr
+and report the phase/counters on failure; a 25 s runner fallback kills/reaps the
+target and reports its last phases instead of a bare TimeoutExpired. Production
+guard code is unchanged. Static inspection / diff checks only; Windows x64 and
+WOW64 validation is pending the orchestrator.
