@@ -20,12 +20,12 @@ void hw_rw_len(uint32_t flags, uint32_t &rw, uint32_t &len) {
 // The TARGET's own debug registers. A program may set hardware breakpoints/watchpoints on
 // its own threads (SetThreadContext) and catch the #DB itself; those must keep working. A
 // slot is the target's on a thread when it is enabled there, is not one we use, and does not
-// hold an address we ever armed (including a stale released or retired image).
+// hold an address we armed and released (a stale image of ours).
 uint64_t dr_address(const CONTEXT &c, int slot) {
     switch (slot) { case 0: return c.Dr0; case 1: return c.Dr1; case 2: return c.Dr2; default: return c.Dr3; }
 }
-// Whether `tid` can still have a queued hit from this release (see hw_unsettled).
-// Historical UHH address ownership is retained separately in hw_armed_ever.
+// A released address is still ours on `tid` only while that thread is unsettled (see
+// probe_session::hw_unsettled); once it has run since the release, it is the target's.
 bool hw_released_on(const probe_session *s, DWORD tid, uint64_t address) {
     if (tid == s->hw_stale_tid && s->hw_stale.count(address)) return true;
     const auto it = s->hw_unsettled.find(tid);
@@ -43,7 +43,7 @@ bool target_owns_slot(const probe_session *s, DWORD tid, const CONTEXT &c, int s
     const uint64_t a = dr_address(c, slot);
     // A probe moved to another slot (hw_yield_to_target) leaves its old image where our clear
     // was lost: still ours.
-    return !s->hw_armed_ever.count(a) && !hw_released_on(s, tid, a) && !hw_active_at(s, a);
+    return !hw_released_on(s, tid, a) && !hw_active_at(s, a);
 }
 static uint8_t target_slots(const probe_session *s, DWORD tid, const CONTEXT &c) {
     uint8_t m = 0;
@@ -267,7 +267,7 @@ bool arm_hw(probe_session *s, Probe &p, uint64_t base) {
 bool hw_slot_is_ours(const probe_session *s, DWORD tid, const CONTEXT &c, int slot) {
     if (!((c.Dr7 >> (slot * 2)) & 3)) return true;                       // disabled: nothing to keep
     const uint64_t address = dr_address(c, slot);
-    if (s->hw_armed_ever.count(address) || hw_active_at(s, address) || hw_released_on(s, tid, address)) return true;
+    if (hw_active_at(s, address) || hw_released_on(s, tid, address)) return true;
     if (s->in_call_tid && tid == s->in_call_tid && address == s->co_ret) return true;
     for (const auto &g : s->gates) if (g.second == slot && g.first == address) return true;
     return false;
@@ -525,20 +525,6 @@ bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled, bool *
     uint8_t theirs = target_slots(s, event.dwThreadId, native);             // the target's own slots on this thread
     for (int slot = 0; slot < 4; ++slot)                                     // ... incl. ones ours yielded to it
         if (hw_yielded(s, event.dwThreadId, native, slot)) theirs |= (uint8_t)(1u << slot);
-    // A carried B-bit belongs to its trap-time slot image, not a newer program
-    // image that happens to occupy the same slot after our disarm/migration.
-    for (int slot = 0; slot < 4; ++slot)
-        if ((dr6_carried(s, event.dwThreadId) & (1u << slot)) &&
-            (s->dr6_carry_generation[slot] || s->hw_armed_ever.count(s->dr6_carry_address[slot])))
-            theirs &= (uint8_t)~(1u << slot);
-
-    const auto step = s->stepping.find(event.dwThreadId);
-    // BS alone does not establish program ownership: it can outlive our step.
-    // While stepping, only the TF saved before UHH set its own flag is the program's.
-    const bool prog_tf = step != s->stepping.end() ? step->second.prog_tf : !!(native.EFlags & 0x100u);
-    const bool foreign = (native.Dr6 & 0xF & theirs) || prog_tf;
-    if (program_debug) *program_debug = foreign;
-
     if (!(native.Dr6 & 0xF & s->dr_used) && !(native.Dr6 & 0xF & theirs) && !(native.Dr6 & 0x4000) &&
         !(native.EFlags & 0x100u)) {
         // A #DB that is neither a trap-flag step (BS clear, TF clear) nor flagged in DR6 for
@@ -725,7 +711,7 @@ bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled, bool *
     // if a callback moved the thread.
     if (exec_hit) {
         uint64_t tr = 0;
-        if (!foreign && !theirs && !(native.EFlags & 0x100u) && !served.empty()) {
+        if (!theirs && !(native.EFlags & 0x100u) && !served.empty()) {
             Probe *first = served.front();
             bool same = true;
             for (const Probe *q : served)
@@ -751,12 +737,18 @@ bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled, bool *
             std::fprintf(stderr, "probe: repaired hardware breakpoint state on thread %lu (dr7 0x%llx -> 0x%llx)\n",
                          (unsigned long)event.dwThreadId, (unsigned long long)d7, (unsigned long long)native.Dr7);
     }
-    if (!foreign) native.Dr6 &= ~consumed; // forwarded exceptions retain combined status
+    native.Dr6 &= ~consumed;     // clear only the status bits of slots we own
     if (!SetThreadContext(thread, &native)) { set_error(s, win_error("resume hw breakpoint")); return false; }
    
     // The same #DB also reports one of the target's OWN debug registers: it is the target's
     // exception too -- pass it on (our callbacks ran; their changes are applied above).
-    handled = !foreign;
+    const auto step = s->stepping.find(event.dwThreadId);
+    const bool our_step = step != s->stepping.end() && !step->second.tail_int3 && !step->second.prog_tf;
+    handled = !(native.Dr6 & 0xF & theirs) && !(native.Dr6 & 0xA000u) &&
+              (!(native.Dr6 & 0x4000u) || our_step);
+    // Only an actual probe hit with remaining program status bypasses the caller's
+    // stale-hit cleanup. Released/unclaimed hits retain main's cleanup path.
+    if (program_debug) *program_debug = !handled && !served.empty();
     if (!handled && event.u.Exception.dwFirstChance && consumed)
         for (auto *probe : served) warn_debug_delivery(s, probe, event.dwThreadId, native);
     return true;

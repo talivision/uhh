@@ -1716,7 +1716,7 @@ def co_expect(case, base, x86):
     elif case == "rettf":
         # Owner decision 2026-11-12: an unmodified return-catch image may re-fire; program failure is accepted.
         row = {}
-        hits = {"co_rettf": 1}; logs = {"co rettf": 1, "co rettf-done": 1}
+        # Counts are checked per completed hit below, independently of the program's row.
     elif case == "retaddr":
         hits = {"co_ret": 6}; logs = {"co ret": 6, "co ret-done": 6}
     elif case == "prologue":
@@ -1792,6 +1792,11 @@ def check_callorig_hunt():
             row, logs, hb, rep = co_row(o), co_logs(o), hits_by(o), report(o)
             row.pop("kind", None); want_row.pop("kind", None)
             if case == "rettf":
+                # Owner decision: check each completed callback; the program may stop after 1 or finish all 6 calls.
+                completed = hb.get("co_rettf", 0)
+                callback_count_ok = isinstance(completed, int) and 1 <= completed <= 6
+                want_hits = {"co_rettf": completed}
+                want_logs = {"co rettf": completed, "co rettf-done": completed}
                 warning = f"uhh warning: {t.name}!co_rettf: a program debug exception coincided with this probe's hit; delivered unmodified (its DR6 may show UHH's slot)"
                 want_logs[warning] = 1
                 warning_records = [x for x in o if x.get("kind") == "probe_log" and x.get("message") == warning]
@@ -1799,11 +1804,15 @@ def check_callorig_hunt():
                 warning_ok = len(warning_records) == 1 and warning_records[0].get("probe") == 0
             else:
                 warning_ok = True
+                callback_count_ok = True
             got_logs = {k: logs.get(k, 0) for k in want_logs}
             extra = sorted(k for k in logs if k not in want_logs and not (case == "retaddr" and k == "co retsite"))
-            program_ok = case == "rettf" or (bool(base) and row == want_row and
-                                            rep.get("error") is None and rep.get("app_exit") == 0 and r.returncode == 0)
-            ok = (program_ok and warning_ok and all(hb.get(k) == v for k, v in want_hits.items()) and
+            if case == "rettf":
+                program_ok = True  # Owner decision 2026-11-12: no program row or exit assertion.
+            else:
+                program_ok = (bool(base) and row == want_row and rep.get("error") is None and
+                              rep.get("app_exit") == 0 and r.returncode == 0)
+            ok = (program_ok and callback_count_ok and warning_ok and all(hb.get(k) == v for k, v in want_hits.items()) and
                   got_logs == want_logs and not extra and rep.get("log_dropped") == 0 and
                   rep.get("callbacks_interrupted", 0) == 0)
             if case == "retaddr":   # the return-site probe: one log per hit, every return after it arms
