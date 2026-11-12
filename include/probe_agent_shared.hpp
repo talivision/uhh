@@ -13,7 +13,7 @@
 #include <intrin.h>
 
 constexpr uint32_t PROBE_AGENT_MAGIC = 0x50424131; // "PBA1"
-constexpr uint32_t PROBE_AGENT_VERSION = 36;   /* 36: separate guard execute sites (exreceipt); 35: saved debug-register delivery repair; 34: explicit orphan event claims; 33: agent debug-delivery repair; 32: guard DR address ownership; 31: inline install failure stage; 30: reusable channel epoch and target mapping handle; 29: init receives a per-session mapping handle (layout unchanged); 28: init_returns (x86hunt); 27: ring record's header and text start on one cache line, log_head on a line of its own (perf5); 26: tblock retired on a line of its own, drain wake-up (drain_wait); 25: per-thread hit blocks (tblocks); 24: huntaudit early_init (on top of 23: runfix1 log carry + running count; 21: held_floor) */
+constexpr uint32_t PROBE_AGENT_VERSION = 37;   /* 37: remove debug-delivery repair table; 36: separate guard execute sites (exreceipt); 35: saved debug-register delivery repair; 34: explicit orphan event claims; 33: agent debug-delivery repair; 32: guard DR address ownership; 31: inline install failure stage; 30: reusable channel epoch and target mapping handle; 29: init receives a per-session mapping handle (layout unchanged); 28: init_returns (x86hunt); 27: ring record's header and text start on one cache line, log_head on a line of its own (perf5); 26: tblock retired on a line of its own, drain wake-up (drain_wait); 25: per-thread hit blocks (tblocks); 24: huntaudit early_init (on top of 23: runfix1 log carry + running count; 21: held_floor) */
 constexpr uint32_t PROBE_AGENT_FLAG_UNSAFE_FAST_PATCH = 1u << 9;   /* agent side only needs this one */   /* == PROBE_UNSAFE_FAST_PATCH (asserted in session.cpp) */
 constexpr uint32_t PROBE_AGENT_MAX_PROBES = 128;   /* inline probes per session; the 129th is refused */
 constexpr uint32_t PROBE_AGENT_EXPORT_CAP = 128;
@@ -186,37 +186,6 @@ struct probe_agent_guard {
 };
 constexpr uint32_t PROBE_AGENT_HOLD_OURS = 0xFFFFFFFFu;
 
-// Controller publishes tid LAST while the debug event freezes the process. The owning
-// thread's first VEH consumes it, even after controller death. No executable patch.
-constexpr uint32_t PROBE_AGENT_DEBUG_DELIVERIES = 256;
-struct probe_agent_debug_delivery {
-    volatile LONG tid;
-    uint32_t dr_mask;                 // slots owned by UHH in the original event
-    uint64_t ip, clear_bits, set_bits;
-    uint64_t dr_before[4], dr_after[4], dr7_before, dr7_after;
-};
-// Compare-and-restore only UHH's original slot images. A target-owned slot, or
-// an image changed by another handler, is never overwritten. Dispatcher repair
-// can use the latest live image; the first VEH uses the controller's snapshot.
-inline void probe_agent_repair_delivery_drs(CONTEXT &c, const probe_agent_debug_delivery &d,
-                                           const CONTEXT *live = nullptr) {
-    for (int slot = 0; slot < 4; ++slot) {
-        if (!(d.dr_mask & (1u << slot))) continue;
-        auto &address = slot == 0 ? c.Dr0 : slot == 1 ? c.Dr1 : slot == 2 ? c.Dr2 : c.Dr3;
-        const uint64_t mask = ((uint64_t)3 << (slot * 2)) | ((uint64_t)0xF << (16 + slot * 4));
-        if (address != d.dr_before[slot] || ((c.Dr7 ^ d.dr7_before) & mask)) continue;
-        const uint64_t after = live ? (slot == 0 ? live->Dr0 : slot == 1 ? live->Dr1 :
-                                       slot == 2 ? live->Dr2 : live->Dr3) : d.dr_after[slot];
-        switch (slot) {
-        case 0: c.Dr0 = (decltype(c.Dr0))after; break;
-        case 1: c.Dr1 = (decltype(c.Dr1))after; break;
-        case 2: c.Dr2 = (decltype(c.Dr2))after; break;
-        default: c.Dr3 = (decltype(c.Dr3))after; break;
-        }
-        c.Dr7 = (decltype(c.Dr7))((c.Dr7 & ~mask) | ((live ? live->Dr7 : d.dr7_after) & mask));
-    }
-}
-
 /* Hit counting and in-flight tracking are striped over cache-line-separated counters
    (indexed by thread id: (tid >> 2) % PROBE_AGENT_STRIPES) so threads hitting the same probe
    do not contend on one line. Exact: the controller sums the stripes.
@@ -326,8 +295,6 @@ struct probe_agent_shared {
     volatile LONG int3_count;
     probe_agent_int3 int3[PROBE_AGENT_INT3_CAP];
     probe_agent_guard guard;
-    volatile LONG debug_delivery_ready; // first VEH installed (independent of attach guard)
-    probe_agent_debug_delivery debug_delivery[PROBE_AGENT_DEBUG_DELIVERIES];
     /* Detach drain (v20). Logs are never dropped while a callback can still send one: after a
        detach the controller keeps delivering until no in-flight callback can still finish. It
        sets live_query and signals the service event; the agent's service thread answers in

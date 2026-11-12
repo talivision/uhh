@@ -50,7 +50,6 @@ CO_EXPORT intptr_t co_add(intptr_t a, intptr_t b) { g_body++; return a * 3 + b; 
 static bool g_return_tf = false;
 static void *g_tf_return = nullptr;
 static volatile LONG g_tf_returns = 0;
-static volatile LONG g_tf_bad = 0;
 static LONG CALLBACK return_tf_handler(EXCEPTION_POINTERS *e) {
     const DWORD code = e->ExceptionRecord->ExceptionCode;
     if (!g_return_tf || !g_tf_return ||
@@ -65,7 +64,6 @@ static LONG CALLBACK return_tf_handler(EXCEPTION_POINTERS *e) {
     // after RET, or separately after that NOP if the execute catch arrived first.
     if (at == (uintptr_t)g_tf_return || at == (uintptr_t)g_tf_return + 1) {
         InterlockedIncrement(&g_tf_returns);
-        if (have_dr && (e->ContextRecord->Dr6 & 0xA00Fu)) InterlockedIncrement(&g_tf_bad);
         e->ContextRecord->EFlags &= ~0x100u;
         g_tf_return = nullptr; // any duplicate now escapes this handler and fails
     } else {
@@ -261,7 +259,7 @@ int main(int argc, char **argv) {
     const char *k = argc > 1 ? argv[1] : "";
     if (!strcmp(k, "rettf")) {
         g_return_tf = true;
-        // Leave the agent's delivery-repair VEH ahead of this program handler.
+        // The program accepts its step even when DR6 also reports UHH's slot.
         AddVectoredExceptionHandler(0, return_tf_handler);
     }
     if (!strcmp(k, "retaddr")) {
@@ -348,7 +346,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < 6; ++i) sum += CoCallRetTf(i);
         printf("{\"kind\":\"co\",\"case\":\"rettf\",\"sum\":%lld,\"body\":%ld,\"delivered\":%ld}\n",
                (long long)sum, g_body.load(), (long)g_tf_returns);
-        if (g_tf_returns != 6 || g_tf_bad) return 5;
+        if (g_tf_returns != 6) return 5;
     } else if (!strcmp(k, "retaddr")) {
         for (int i = 0; i < 6; ++i) sum += co_ret(i);
         printf("{\"kind\":\"co\",\"case\":\"retaddr\",\"sum\":%lld,\"body\":%ld}\n", (long long)sum, g_body.load());

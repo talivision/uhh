@@ -1774,7 +1774,7 @@ def check_callorig_hunt():
     runs = [(c, bk, bk, False) for c in CO_CASES for bk in ("breakpoint", "hw", "inline")
             if c != "rettf" or bk != "inline"]
     runs += [("nested", a, b, False) for a, b in (("breakpoint", "inline"), ("inline", "breakpoint"), ("hw", "inline"))]
-    # Existing rows exercise dispatcher INT3 repair; these exercise the first agent VEH.
+    # Delivery and its once-per-probe warning must also hold with an inline agent present.
     runs += [("rettf", bk, bk, True) for bk in ("breakpoint", "hw")]
     for case, bk, inner, guard in runs:
         name = f"callorig-hunt-{case}-{bk}" + (f"+{inner}" if inner != bk else "") + ("-guard" if guard else "")
@@ -1789,10 +1789,18 @@ def check_callorig_hunt():
                 want_logs["co vslow-done"] = 0      # released: the callback ends, the program is unaffected
             row, logs, hb, rep = co_row(o), co_logs(o), hits_by(o), report(o)
             row.pop("kind", None); want_row.pop("kind", None)
+            if case == "rettf":
+                warning = f"uhh warning: {t.name}!co_rettf: a program debug exception coincided with this probe's hit; delivered unmodified (its DR6 may show UHH's slot)"
+                want_logs[warning] = 1
+                warning_records = [x for x in o if x.get("kind") == "probe_log" and x.get("message") == warning]
+                # co_rettf is the first registered probe, including --guard sessions.
+                warning_ok = len(warning_records) == 1 and warning_records[0].get("probe") == 0
+            else:
+                warning_ok = True
             got_logs = {k: logs.get(k, 0) for k in want_logs}
             extra = sorted(k for k in logs if k not in want_logs and not (case == "retaddr" and k == "co retsite"))
             reference_ok = case != "rettf" or (base_rc[case] == 0 and base == dict(want_row, kind="co"))
-            ok = (bool(base) and reference_ok and row == want_row and all(hb.get(k) == v for k, v in want_hits.items()) and
+            ok = (bool(base) and reference_ok and warning_ok and row == want_row and all(hb.get(k) == v for k, v in want_hits.items()) and
                   got_logs == want_logs and not extra and rep.get("log_dropped") == 0 and
                   rep.get("callbacks_interrupted", 0) == 0 and rep.get("error") is None and
                   rep.get("app_exit") == 0 and r.returncode == 0)
@@ -7543,19 +7551,6 @@ def check_logsite_review():
             except Exception as e:
                 record(name, False, repr(e))
 
-    name = "logsite-live-report-dispatcher"
-    try:
-        dr = exe("ctrl_dr_review.exe")
-        if not dr:
-            record(name, False, "missing ctrl_dr_review")
-        else:
-            r, o = run([dr, "live-report"], timeout=30)
-            res = next((x for x in o if x.get("kind") == "dr_review"), {})
-            record(name, r.returncode == 0 and res.get("ok") == 1,
-                   f"exit={r.returncode} result={res} stderr={r.stderr[-1000:]}")
-    except Exception as e:
-        record(name, False, repr(e))
-
     name = "logsite-live-report"
     try:
         r, o = go("livereport", "breakpoint", ["int3cap", "--n", 1000])
@@ -10120,10 +10115,9 @@ def lc_controller_killed(cfgname, cfg):
     bad, n, took, outcomes = [], 0, [], []
     timings = ["active", "active+0.5", "early-0.05", "early-0.3"]
     if cfgname == "mixed":
-        # pending-hw leaves production delivery repair pending at controller death:
-        # no test-only dispatcher byte restore. The first agent VEH repairs saved
-        # DR6 before the orphan guard claims the resulting statusless execute fault.
-        timings += ["pending-step", "pending-held", "pending-hw", "death-receipt"]
+        # Keep controller-death step/hold/receipt coverage; the hardware staging
+        # depended entirely on the removed delivery-repair mechanism.
+        timings += ["pending-step", "pending-held", "death-receipt"]
     for when in timings:
         n += 1
         tg = d = None

@@ -639,9 +639,6 @@ void detach(probe_session *s) {
     freeze_threads("initial");
     for (auto &p : s->probes) {
         if (!p->active) continue;
-        // A forwarded #DB still has to pass its repaired context to VEH/SEH. Keep the
-        // temporary dispatcher catch through the drain, then restore it below as well.
-        if (p.get() == s->debug_dispatch_probe && !s->debug_delivery.empty()) continue;
         if (p->flags & PROBE_BREAKPOINT) {
             restore_original(s->pi.hProcess, p->address, p->original);
             s->retired_bps.insert(p->address); p->active = false; sync_int3_table(s);
@@ -743,10 +740,6 @@ void detach(probe_session *s) {
             const uint64_t real = d->site + (resume - tr);
             remote_write(s->pi.hProcess, kv.second, &real, sizeof(void *), &n);
         }
-    }
-    if (Probe *p = s->debug_dispatch_probe; p && p->active) {
-        restore_original(s->pi.hProcess, p->address, p->original);
-        s->retired_bps.insert(p->address); p->active = false; sync_int3_table(s);
     }
     inplace_release_all(s);                                 // every INT3 is gone: nothing to hold for
     // Final pass, after every queued event has been continued: continuing an event can

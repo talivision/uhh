@@ -1,5 +1,18 @@
 # UHH roadmap (living tracker)
 
+Owner decision 2026-11-12 — supersedes dispint3 / vehfirst / rettf delivery repair:
+anti-debug defeat is outside UHH's scope. The agent's per-thread delivery table/VEH
+repair, KiUserExceptionDispatcher INT3 repair, and call_original return DR-image repair
+are removed (shared layout version 37). A combined program/UHH debug exception runs
+the UHH callback and hit accounting once, emits one `uhh warning` record naming each
+involved probe per session, and is delivered unmodified with DBG_EXCEPTION_NOT_HANDLED.
+The rettf and controller debug-delivery checks now require handler delivery and the
+warning, accepting visible UHH DR6 bits. Dispatcher-only live-report and pending-hw
+repair staging are deleted. Orphan claims, death receipts, and guard cleanup remain.
+Historical repair notes below describe superseded work, not the current contract.
+Windows CI is the validation; no local build or runtime checks.
+
+
 Status: ✅ done and verified on x64 + x86 · 🔧 in progress · ⬜ not started · 📄 documented limitation.
 Rules: every fix gets a regression test; the full suite (`scripts/regress.py`) runs on
 x64 and x86 after each step; an adversarial review after each large change; push to

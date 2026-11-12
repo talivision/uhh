@@ -19,6 +19,19 @@ static uint64_t child_gate_nop = 0;
 static uint64_t child_co_fault = 0;
 static unsigned callbacks = 0;
 static void hit(probe_context *) { ++callbacks; }
+static void dr_require(bool ok, const char *stage);
+static void require_delivery_warning(probe_session *s, Probe *p) {
+    // No writer runs in this isolated fixture: inspect actual queued probe_log records.
+    std::lock_guard<std::mutex> lock(s->queue_mu);
+    unsigned warnings = 0;
+    for (const auto &r : s->log_queue) {
+        if (r.text.rfind("uhh warning:", 0) != 0) continue;
+        ++warnings;
+        dr_require(r.probe == probe_index(s, p) && r.text.find(p->location) != std::string::npos &&
+                   r.text.find("delivered unmodified") != std::string::npos, "warning names coincident probe");
+    }
+    dr_require(warnings == 1, "exactly one combined-debug warning record per probe");
+}
 static bool step_call_ok = false;
 static void step_call(probe_context *c) {
     ++callbacks;
@@ -145,6 +158,7 @@ struct Debuggee {
         dr_require(pending && !!ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, disposition), "continue event");
         pending = false;
     }
+    DWORD64 trap_dr6 = 0;
     void wait(DWORD wanted, uint64_t address = 0) {
         dr_require(!pending, "previous event continued");
         const ULONGLONG until = GetTickCount64() + 10000;
@@ -166,11 +180,14 @@ struct Debuggee {
                     if (ex.ExceptionCode == 0x4000001Eu) ex.ExceptionCode = EXCEPTION_SINGLE_STEP;
                     if (ex.ExceptionCode == 0x4000001Fu) ex.ExceptionCode = EXCEPTION_BREAKPOINT;
                     const uint64_t at = (uint64_t)(uintptr_t)ex.ExceptionAddress;
-                    if (ex.ExceptionCode == wanted && at == (address ? address : code + 4) && code) return;
+                    if (ex.ExceptionCode == wanted && at == (address ? address : code + 4) && code) {
+                        if (wanted == EXCEPTION_SINGLE_STEP) trap_dr6 = get().Dr6;
+                        return;
+                    }
                     if (session && ((ex.ExceptionCode == EXCEPTION_BREAKPOINT && probe_at(session, at)) ||
                         (ex.ExceptionCode == EXCEPTION_SINGLE_STEP && session->stepping.count(ev.dwThreadId)))) {
                         DWORD disposition = 0;
-                        dr_require(dispatch_event(session, ev, disposition), "dispatch library exception-context repair");
+                        dr_require(dispatch_event(session, ev, disposition), "dispatch library exception");
                         resume(disposition); continue;
                     }
                     // The only unsolicited exception is the initial loader breakpoint.
@@ -180,9 +197,9 @@ struct Debuggee {
                                      (unsigned long long)(address ? address : code + 4));
                     if (code && ex.ExceptionCode != EXCEPTION_BREAKPOINT) {
                         const auto observed = result();
-                        std::fprintf(stderr, "dr-review: first=%lu VEH seen=%ld delivered_dr6=0x%llx pending_repair=%zu\n",
+                        std::fprintf(stderr, "dr-review: first=%lu VEH seen=%ld delivered_dr6=0x%llx\n",
                                      (unsigned long)ev.u.Exception.dwFirstChance, (long)observed.seen,
-                                     (unsigned long long)observed.dr6, session ? session->debug_delivery.size() : size_t{0});
+                                     (unsigned long long)observed.dr6);
                     }
                     dr_require(!code && ex.ExceptionCode == EXCEPTION_BREAKPOINT, "expected exception address/code");
                 }
@@ -268,21 +285,15 @@ static ChildState reference_event(const std::string &mode) {
 static void compare_event(const Debuggee &d, const ChildState &reference, const std::string &mode) {
     const auto result = d.result(); print_veh("instrumented", result);
     const unsigned slots = target_slots_for(mode);
-    // Keep BS/BD/BT and EVERY target-enabled B-bit in the comparison. Only raw Bn of
-    // non-target slots (not architecturally meaningful for the program) are excluded.
-    const DWORD64 mask = 0xE000u | slots;
-    dr_require(!d.session || d.session->debug_delivery.empty(), "saved debug exception context repaired");
-    if (d.session && d.session->debug_dispatch_probe) {
-        const Probe *p = d.session->debug_dispatch_probe;
-        unsigned char byte = 0; SIZE_T n = 0;
-        dr_require(!p->active && !!ReadProcessMemory(d.pi.hProcess, (void *)(uintptr_t)p->address, &byte, 1, &n) &&
-                   n == 1 && byte == p->original, "temporary dispatcher breakpoint removed");
-    }
+    // The saved event keeps all original status, including UHH's Bn/BS.
+    // Separately verify that the program's own causes and slot images survived.
     dr_require(result.seen == reference.seen && result.exception_code == reference.exception_code &&
                result.parameters == reference.parameters && result.ip == d.code + 9 &&
                result.exception_address == d.code + 9, "target event count/code/location unchanged");
     dr_require(((result.flags ^ reference.flags) & ~0x2u) == 0, "target VEH flags unchanged from Windows reference");
-    dr_require((result.dr6 & mask) == (reference.dr6 & mask), "target VEH step/watch status unchanged from Windows reference");
+    dr_require((result.dr6 & 0xE00Fu) == (d.trap_dr6 & 0xE00Fu), "target VEH receives original combined debug status");
+    const DWORD64 program_mask = slots | ((mode == "watch-tf" || mode == "watch-tf-carried" || mode == "step-tf") ? 0xE000u : 0xA000u);
+    dr_require((result.dr6 & program_mask) == (reference.dr6 & program_mask), "program debug causes preserved");
     const uint64_t data = d.state + offsetof(ChildState, data);
     for (unsigned k = 0; k < 2; ++k) {
         if (!(slots & (1u << k))) continue;
@@ -323,6 +334,7 @@ int run(int argc, char **argv) {
         const uint64_t old_address = d.state + offsetof(ChildState, data), new_address = old_address + 4;
         const uint64_t target_address = old_address + 8;
         auto probe = std::make_unique<Probe>();
+        probe->location = "combined-debug-probe";
         probe->flags = PROBE_HW | PROBE_WATCH_WRITE; probe->active = true;
         probe->hw_generation = 1; probe->address = old_address; probe->dr_slot = 0; probe->callback = hit;
         Probe *p = probe.get(); s->probes.push_back(std::move(probe));
@@ -686,26 +698,9 @@ int run(int argc, char **argv) {
             s->thread_handle.erase(tid);
             CloseHandle(exited);
             dr_require(frozen && s->ipc_frozen.empty(), "terminated thread does not refuse install freeze");
-        } else if (mode == "live-report") {
-            // A live report holds this mutex while traversing the vector.
-            s->debug_dispatch_addr = resolve_symbol(s, "ntdll.dll!KiUserExceptionDispatcher");
-            dr_require(s->debug_dispatch_addr != 0, "resolve dispatcher before report");
-            std::atomic<bool> entered{false}, finished{false};
-            bool queued = false;
-            std::unique_lock<std::mutex> report(s->probes_mu);
-            std::thread writer([&] {
-                entered.store(true);
-                queued = queue_debug_delivery(s, d.pi.dwThreadId, site, 1, 0);
-                finished.store(true);
-            });
-            while (!entered.load()) Sleep(1);
-            Sleep(200);
-            const bool waited = !finished.load();
-            report.unlock(); writer.join();
-            dr_require(waited && queued && s->debug_dispatch_probe, "dispatcher insertion waits for live report");
         } else if (mode == "gate-mixed") {
             // Real simultaneous execute causes: gate B0 and target-owned B1.
-            p->active = false; s->hw_active = 0;
+            p->active = false; p->address = site + 4; s->hw_active = 0;
             c.Dr0 = c.Dr1 = (decltype(c.Dr0))(site + 4);
             c.Dr7 = 5; d.put(c);
             s->gates.emplace_back(site + 4, 0);
@@ -718,9 +713,10 @@ int run(int argc, char **argv) {
             d.resume(DBG_EXCEPTION_NOT_HANDLED); d.wait(EXCEPTION_BREAKPOINT, done);
             const auto result = d.result(); print_veh("gate", result);
             dr_require(result.seen == 1 && result.ip == site + 4 &&
-                       result.exception_address == site + 4 && (result.dr6 & 0xE003u) == 2 &&
-                       result.dr1 == site + 4 && (result.dr7 & 0xF0000Cu) == 4 &&
-                       s->debug_delivery.empty(), "target VEH sees only its own execute cause");
+                       result.exception_address == site + 4 && (result.dr6 & 0xE003u) == 3 &&
+                       result.dr1 == site + 4 && (result.dr7 & 0xF0000Cu) == 4,
+                       "target VEH receives combined execute causes unmodified");
+            require_delivery_warning(s, p);
         } else if (mode == "release") {
             c.Dr0 = (decltype(c.Dr0))target_address; c.Dr1 = (decltype(c.Dr1))(target_address + 4);
             c.Dr2 = (decltype(c.Dr2))(target_address + 8); c.Dr3 = (decltype(c.Dr3))(target_address + 12);
@@ -782,6 +778,7 @@ int run(int argc, char **argv) {
             dr_require(handle_hw(s, d.ev, handled) && !handled && callbacks == 1 && p->hits == 1, "watch callback and target step forwarding");
             d.resume(DBG_EXCEPTION_NOT_HANDLED); d.wait(EXCEPTION_BREAKPOINT, done);
             compare_event(d, reference, mode);
+            require_delivery_warning(s, p);
         } else if (mode == "gate") {
             watch_event(false); // B0 belongs to the target, whose slot replaced the gate
             p->active = false; s->hw_active = 0; s->gates.emplace_back(target_address, 0);
@@ -807,7 +804,7 @@ int run(int argc, char **argv) {
             const bool mixed = mode == "step-mixed", tf = mode == "step-tf";
             p->active = mixed; s->hw_active = mixed ? 1 : 0; s->dr_used = s->dr_ever = mixed ? 1 : 0;
             if (tf) { c.Dr7 = 0; passive_debug_register(c, old_address); }
-            StepState st{}; st.site = site; st.insn_len = 4; st.prog_tf = tf;
+            StepState st{}; st.probe = p; st.site = site; st.insn_len = 4; st.prog_tf = tf;
             s->stepping.emplace(d.pi.dwThreadId, st);
             if (tf) {
                 c.EFlags |= 0x100; d.put(c); d.resume(); d.wait(EXCEPTION_SINGLE_STEP, site + 4);
@@ -822,14 +819,14 @@ int run(int argc, char **argv) {
             dr_require(s->stepping.empty() && callbacks == (mixed ? 1u : 0u) && p->hits == (mixed ? 1u : 0u), "step completion and mixed callback");
             d.resume(disposition);
             if (mode == "step-own-detach") {
-                // Detach before the queued dispatcher catch is serviced. Its drain must
-                // repair the target's context, then remove the temporary INT3 too.
+                // Detach while the unmodified program exception is being delivered.
                 detach(s);
                 BOOL debugged = TRUE;
                 dr_require(!!CheckRemoteDebuggerPresent(d.pi.hProcess, &debugged) && !debugged, "detach with pending debug delivery");
                 d.attached = false;
             } else d.wait(EXCEPTION_BREAKPOINT, done);
             compare_event(d, reference, mode);
+            require_delivery_warning(s, p);
         } else if (mode == "detach-dr" || mode == "detach-tf") {
             const bool tf = mode == "detach-tf";
             p->active = false; s->hw_active = 0; s->dr_used = 0;

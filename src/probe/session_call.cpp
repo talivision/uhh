@@ -549,6 +549,16 @@ void warn_record(probe_context *c, Probe *probe, const char *text, bool *warned)
     once = true;
     send_log(c, "uhh warning: %s", text);
 }
+void warn_debug_delivery(probe_session *s, Probe *probe, DWORD tid, const CONTEXT &native) {
+    if (!probe || probe->internal || probe->warned_debug_delivery) return;
+    CONTEXT snapshot = native;
+    probe_context c = from_context(snapshot, probe_index(s, probe), probe->address, &callback_ops, s);
+    c.pid = s->pi.dwProcessId; c.tid = tid;
+    CallbackState state{s, probe, s->pi.dwProcessId, tid}; c.controller = &state;
+    const std::string text = probe->location +
+        ": a program debug exception coincided with this probe's hit; delivered unmodified (its DR6 may show UHH's slot)";
+    warn_record(&c, probe, text.c_str(), &probe->warned_debug_delivery);
+}
 // After a callback: apply return_from (resume at the gadget, SP = the hit's) and return
 // true; or warn once when call_original ran but the hit will fall through into the body.
 bool apply_return_from(probe_session *s, Probe *probe, const probe_context &c, CONTEXT &native) {
@@ -1254,13 +1264,8 @@ static int call_original_in_place(probe_session *s, CallbackState *st, probe_con
                                          (unsigned long long)r.Dr6, (unsigned long)r.EFlags, (unsigned long long)foreign);
                         s->dr6_lost.erase(st->tid);                        // this event consumed the saved status
                         if (foreign) {
-                            CONTEXT delivery = r; delivery.Dr6 = (decltype(delivery.Dr6))foreign;
-                            uint8_t owned = owned_debug_slots(s, r);
-                            // Only THIS slot is the temporary catch; the program may
-                            // also have its own execute slot at the same return PC.
-                            if (dr_address(r, slot) == ret_addr && !((r.Dr7 >> (16 + slot * 4)) & 0xFu))
-                                owned |= (uint8_t)(1u << slot);
-                            s->co_delivery[st->tid] = {delivery, owned};
+                            s->co_return_delivery[st->tid] = {(uint64_t)EMU_IP(r), (uint64_t)EMU_SP(r)};
+                            warn_debug_delivery(s, probe, st->tid, r);
                         }
                         result = rax; done = true;                         // this event now stands in for the hit
                         handling_running(s, st->tid, false);               // stopped there: listed (guard_sync)

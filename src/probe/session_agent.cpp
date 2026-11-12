@@ -1186,8 +1186,7 @@ static void clear_gates(probe_session *s) {
 }
 
 // A gate fired: hold this thread at the site until the hook is confirmed.
-bool handle_gate(probe_session *s, const DEBUG_EVENT &event, bool &handled, bool *failed) {
-    if (failed) *failed = false;
+bool handle_gate(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
     handled = false;
     if (s->gates.empty()) return false;
     HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, event.dwThreadId);
@@ -1199,15 +1198,21 @@ bool handle_gate(probe_session *s, const DEBUG_EVENT &event, bool &handled, bool
         c.Dr6 |= dr6_carried(s, event.dwThreadId);
         for (auto &g : s->gates)
             if ((c.Dr6 & (1u << g.second)) && dr_address(c, g.second) == g.first &&
-                ((c.Dr7 >> (g.second * 2)) & 3) && (uint64_t)EMU_IP(c) == g.first) { hit = true; consumed |= (DWORD64)1 << g.second; c.Dr6 &= ~(DWORD64)(1u << g.second); }
-        if (hit) { handled = !(c.Dr6 & 0xE00Fu); c.EFlags |= 0x10000u; SetThreadContext(thread, &c); }   // RF: run the site once resumed
+                ((c.Dr7 >> (g.second * 2)) & 3) && (uint64_t)EMU_IP(c) == g.first) { hit = true; consumed |= (DWORD64)1 << g.second; }
+        if (hit) {
+            handled = !((c.Dr6 & ~consumed) & 0xE00Fu) && !(c.EFlags & 0x100u);
+            if (handled) c.Dr6 &= ~consumed;
+            c.EFlags |= 0x10000u; SetThreadContext(thread, &c);
+        }   // RF: run the site once resumed
     }
     CloseHandle(thread);
     if (hit) {
-        if (!handled && event.u.Exception.dwFirstChance &&
-            !queue_debug_delivery(s, event.dwThreadId, (uint64_t)EMU_IP(c), consumed, c.Dr6 & 0xE00Fu)) {
-            if (failed) *failed = true;
-            return false;
+        if (!handled && event.u.Exception.dwFirstChance) {
+            const uint64_t pc = (uint64_t)EMU_IP(c);
+            for (const auto &p : s->probes)
+                if (p->address == pc) warn_debug_delivery(s, p.get(), event.dwThreadId, c);
+            for (const auto &g : s->extra_gates)
+                if (g.site == pc) warn_debug_delivery(s, g.probe, event.dwThreadId, c);
         }
         hold_thread(s, event.dwThreadId);
 #if defined(_WIN64)

@@ -1066,19 +1066,18 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
                      (unsigned long)code, (unsigned long)event.dwThreadId,
                      (unsigned long long)address, step != stepping.end(), probe != nullptr,
                      (unsigned long)event.u.Exception.dwFirstChance);
-    if (code == EXCEPTION_SINGLE_STEP && step == stepping.end() && !s->gates.empty()) {
+    if (code == EXCEPTION_SINGLE_STEP && event.u.Exception.dwFirstChance && step == stepping.end() && !s->gates.empty()) {
         bool handled = false;
-        bool failed = false;
-        const bool gate = handle_gate(s, event, handled, &failed);
-        if (failed) return false;
+        const bool gate = handle_gate(s, event, handled);
         if (gate) {
             if (handled) disposition = DBG_CONTINUE;
             return true;
         }
     }
-    if (code == EXCEPTION_SINGLE_STEP && step == stepping.end() && (s->hw_active || s->dr_ever)) {
-        bool handled = false;
-        if (!handle_hw(s, event, handled)) return false;
+    if (code == EXCEPTION_SINGLE_STEP && event.u.Exception.dwFirstChance && step == stepping.end() && (s->hw_active || s->dr_ever)) {
+        bool handled = false, program_debug = false;
+        if (!handle_hw(s, event, handled, &program_debug)) return false;
+        if (program_debug) return true; // deliver as-is; stale-trap cleanup must not consume it
         if (handled) { disposition = DBG_CONTINUE; return true; }   // else fall through (not our DR)
         // A trap at the address of a hardware probe we have RELEASED, raised before the
         // release reached this thread (its debug status no longer names the slot): ours,
@@ -1343,7 +1342,6 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         bool target_hw = false;
         CONTEXT raised{}; raised.ContextFlags = CONTEXT_DEBUG_REGISTERS;
         const bool have_raised = !!GetThreadContext(thread, &raised);
-        const uint8_t raised_owned = have_raised ? owned_debug_slots(s, raised) : 0;
         {
             if (have_raised && ((raised.Dr6 | dr6_carried(s, event.dwThreadId)) & 0xF)) {
                 bool handled = false;
@@ -1360,6 +1358,8 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             // watchpoint it touched (serviced above) -- the copy keeps running to its INT3.
            
             if (hw_hit) { disposition = DBG_CONTINUE; return true; }
+            if (target_hw && event.u.Exception.dwFirstChance)
+                warn_debug_delivery(s, step->second.probe, event.dwThreadId, raised);
             return true;                                   // not ours: pass it through
         }
         bool ok = !!GetThreadContext(thread, &native);
@@ -1373,6 +1373,8 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
            
             if (!ok) { set_error(s, win_error("continue string instruction step")); return false; }
             if (!target_hw && !step->second.prog_tf) disposition = DBG_CONTINUE;
+            else if (event.u.Exception.dwFirstChance)
+                warn_debug_delivery(s, step->second.probe, event.dwThreadId, native);
             return true;
         }
         if (step->second.displaced) {
@@ -1402,7 +1404,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
             if (step->second.popf_insn && (uint64_t)EMU_IP(native) == step->second.site + step->second.insn_len)
                 native.EFlags = (native.EFlags & ~0x100u) | (step->second.popf_tf ? 0x100u : 0u);
             else native.EFlags &= ~0x100u;
-            native.Dr6 &= ~(decltype(native.Dr6))0x4000u; // BS came from our step, not the target
+            if (!target_hw) native.Dr6 &= ~(decltype(native.Dr6))0x4000u; // consume BS only for our own delivery
         }
 #if defined(_WIN64)
         // SYSCALL saves RFLAGS in R11 -- with the trap flag WE set for the step. The program
@@ -1411,7 +1413,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
 #endif
 #if defined(UHH_TEST_HOOKS)
         const char *die_step = std::getenv("UHH_TEST_DIE_PENDING_STEP");
-        const bool test_step = die_step && std::strcmp(die_step, "hw") && s->attached && s->shared && s->shared->guard.enabled &&
+        const bool test_step = die_step && s->attached && s->shared && s->shared->guard.enabled &&
             !target_hw && !step->second.prog_tf && !(native.EFlags & 0x100u);
         if (test_step) {
             guard_sync(s); // publish before clearing BS/TF
@@ -1444,8 +1446,8 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         }
 #endif
         const bool pass = target_hw || step->second.prog_tf;
-        if (pass && !step->second.prog_tf && event.u.Exception.dwFirstChance &&
-            !queue_debug_delivery(s, event.dwThreadId, (uint64_t)EMU_IP(native), 0x4000u, native.Dr6 & 0xE00Fu, have_raised ? &raised : nullptr, raised_owned)) return false;
+        if (pass && event.u.Exception.dwFirstChance)
+            warn_debug_delivery(s, step->second.probe, event.dwThreadId, native);
         stepping.erase(step);
         if (!pass) disposition = DBG_CONTINUE;
         return true;
@@ -1455,8 +1457,6 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
         thread = event_thread(s, event.dwThreadId);
         if (!thread || !GetThreadContext(thread, &native)) { set_error(s, win_error("get breakpoint context")); return false; }
     }
-    if (code == EXCEPTION_BREAKPOINT && address == s->debug_dispatch_addr &&
-        !repair_debug_delivery(s, event.dwThreadId, native)) return false;
     if (defer_hits_now(s, event.dwThreadId) && !probe->internal &&
         defer_hit_during_call(s, event.dwThreadId, address, true)) {
         disposition = DBG_CONTINUE; return true;
@@ -1582,7 +1582,7 @@ static bool handle_exception(probe_session *s, const DEBUG_EVENT &event,
     // Force an ordinary instruction through the existing displaced TF step;
     // leave REP's tail INT3 and program-owned debug state on their normal paths.
     const char *pending_mode = std::getenv("UHH_TEST_DIE_PENDING_STEP");
-    force_pending_step = ((pending_mode && std::strcmp(pending_mode, "hw")) ||
+    force_pending_step = (pending_mode ||
                           std::getenv("UHH_TEST_FORCE_GUARD_STEP")) &&
         s->attached && s->shared && s->shared->guard.enabled &&
         !probe->internal && !probe->rep_string;
@@ -1743,26 +1743,19 @@ bool dispatch_event(probe_session *s, DEBUG_EVENT &event, DWORD &disposition) {
         arm_thread_start_fixup(s);
     }
     inplace_sync(s, event);
-    const auto delivery = s->co_delivery.find(event.dwThreadId);
-    if (delivery != s->co_delivery.end()) {
-        // call_original retained a real return event, also owned by the program.
-        // Callback write-back is finished: deliver at the real return PC/SP rather
-        // than the entry or return gadget, with only the program's debug status.
+    const auto delivery = s->co_return_delivery.find(event.dwThreadId);
+    if (delivery != s->co_return_delivery.end()) {
+        // Finish callback write-back at the retained return event's real PC/SP.
+        // Windows' saved debug exception image is delivered without repair.
         HANDLE thread = event_thread(s, event.dwThreadId);
-        CONTEXT live{}; live.ContextFlags = CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS;
-        const auto pending = delivery->second;
-        const CONTEXT &returned = pending.returned;
-        s->co_delivery.erase(delivery);
+        CONTEXT live{}; live.ContextFlags = CONTEXT_CONTROL;
+        const auto returned = delivery->second;
+        s->co_return_delivery.erase(delivery);
         if (!thread || !GetThreadContext(thread, &live)) return false;
-        EMU_IP(live) = EMU_IP(returned); EMU_SP(live) = EMU_SP(returned);
-        live.Dr6 = returned.Dr6;
-        if (!SetThreadContext(thread, &live) ||
-            !queue_debug_delivery(s, event.dwThreadId, (uint64_t)EMU_IP(returned), 0xE00Fu, returned.Dr6, &returned, pending.dr_mask)) return false;
+        EMU_IP(live) = (decltype(EMU_IP(live)))returned.ip;
+        EMU_SP(live) = (decltype(EMU_SP(live)))returned.sp;
+        if (!SetThreadContext(thread, &live)) return false;
         disposition = DBG_EXCEPTION_NOT_HANDLED;
-        if (trace_enabled())
-            std::fprintf(stderr, "  co-delivery tid=%lu pc=0x%llx dr6=0x%llx pass\n",
-                         (unsigned long)event.dwThreadId, (unsigned long long)EMU_IP(returned),
-                         (unsigned long long)returned.Dr6);
     }
     // The guard's mirror, after EVERYTHING this event changed (an in-place window's holds are
     // taken / handed over just above) and before the thread runs again. The event's thread
@@ -1922,10 +1915,7 @@ static bool dispatch_event_impl(probe_session *s, DEBUG_EVENT &event, DWORD &dis
         // whatever handle had reused the value (e.g. a held thread's -> left suspended).
         break;
     case EXIT_THREAD_DEBUG_EVENT: {
-        s->debug_delivery.erase(event.dwThreadId);
-        if (s->shared)
-            for (auto &d : s->shared->debug_delivery)
-                if (d.tid == (LONG)event.dwThreadId) InterlockedExchange(&d.tid, 0);
+        s->co_return_delivery.erase(event.dwThreadId);
         if (event.dwThreadId == s->remote_tid) ok = complete_remote_thread(s, event.u.ExitThread.dwExitCode);
         if (event.dwThreadId == s->ipc_freezer) ipc_thaw(s);       // agent thread died mid-write: never strand the rest
         s->threads.erase(event.dwThreadId);

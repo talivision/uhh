@@ -409,6 +409,15 @@ shadow stacks enforced for /CETCOMPAT images; regress `cet-*`). The test VM's CP
 
 ## Visibility to the target (anti-debug)
 
+Owner decision (2026-11-12): UHH does not defeat anti-debug behavior. When a program's
+own debug status (its hardware slots or TF/BS) coincides with a UHH hit, UHH runs its
+callback and counts the hit once, logs one `uhh warning` record naming the probe per
+session, and delivers the exception with `DBG_EXCEPTION_NOT_HANDLED` unmodified.
+DR6 may therefore expose UHH's slot or step. Program failures caused by that visibility
+are reported errors. Neither the inline agent nor a dispatcher breakpoint repairs the
+delivered debug-register image. Controller-death orphan handling is unchanged.
+
+
 ✗ Owner decision: UHH does not mask the debugger (no PEB / debug-port hiding). Under
 **every** backend the target is debugged (Codex workaround audit C6;
 `examples/realworld/README.md`):

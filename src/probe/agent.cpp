@@ -3140,25 +3140,9 @@ static probe_agent_orphan_claim *orphan_claim(DWORD tid, uint64_t at) {
     }
     return nullptr;
 }
-// Repair Windows' saved image before either the orphan guard or target handlers see it.
-// A forwarded combined #DB is also the target's exception: do not consume it here.
-static void repair_debug_delivery(EXCEPTION_POINTERS *ep) {
-    if (!shared || (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP &&
-                    ep->ExceptionRecord->ExceptionCode != 0x4000001Eu)) return;
-    const LONG tid = (LONG)GetCurrentThreadId();
-    for (auto &d : shared->debug_delivery) {
-        if (d.tid != tid || d.ip != (uint64_t)UHH_IP(ep->ContextRecord)) continue;
-        auto *cx = ep->ContextRecord;
-        cx->Dr6 = (decltype(cx->Dr6))((cx->Dr6 & ~d.clear_bits) | d.set_bits);
-        probe_agent_repair_delivery_drs(*cx, d);
-        InterlockedExchange(&d.tid, 0);
-        break;
-    }
-}
 // First in line for every exception, but acts only on OUR traps once no debugger is attached
 // (a live controller handles them before any handler in the target sees them).
 static LONG CALLBACK guard_veh(EXCEPTION_POINTERS *ep) {
-    repair_debug_delivery(ep);
     const DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (code != EXCEPTION_BREAKPOINT && code != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
     // A live controller handles every trap of its own before any handler here runs, so one of
@@ -3539,7 +3523,6 @@ extern "C" __declspec(dllexport) DWORD WINAPI probe_agent_init(void *channel) {
     }
     if (!guard_handler) guard_handler = AddVectoredExceptionHandler(1, guard_veh);
     if (!guard_handler) return 4;
-    InterlockedExchange(&shared->debug_delivery_ready, 1);
     InterlockedExchange(&g_test_death_receipt, 0);
     InterlockedExchange(&g_orphan_cleaned, 0);   // a new session: guard it afresh
     InterlockedExchange(&g_lazy_dr, 0);

@@ -495,178 +495,8 @@ void enforce_owned_drs(const probe_session *s, DWORD tid, CONTEXT &c, bool clear
         c.Dr7 = (decltype(c.Dr7))dr7;
     }
 }
-uint8_t owned_debug_slots(const probe_session *s, const CONTEXT &c) {
-    uint8_t mask = 0;
-    for (int slot = 0; slot < 4; ++slot) {
-        if (!((c.Dr7 >> (slot * 2)) & 3u)) continue;
-        const uint64_t address = dr_address(c, slot);
-        const unsigned field = (unsigned)((c.Dr7 >> (16 + slot * 4)) & 0xFu);
-        bool ours = false;
-        for (const auto &g : s->gates)
-            if (!field && g.second == slot && g.first == address) ours = true;
-        for (const auto &p : s->probes) {
-            if (!p->active || !(p->flags & PROBE_HW) || p->dr_slot != slot || p->address != address) continue;
-            uint32_t rw = 0, len = 0; hw_rw_len(p->flags, rw, len);
-            if (field == ((len << 2) | rw)) ours = true;
-        }
-        if (ours) mask |= (uint8_t)(1u << slot);
-    }
-    return mask;
-}
-// SetThreadContext changes the live register image, but Windows has already saved the
-// exception CONTEXT that KiUserExceptionDispatcher will give VEH/SEH. A combined #DB
-// otherwise leaks our BS/Bn to the target (CI: 0xffff4ff3 instead of 0xffff0ff2).
-static void debug_delivery_noop(probe_context *) {}
-bool queue_debug_delivery(probe_session *s, DWORD tid, uint64_t ip, DWORD64 clear_bits, DWORD64 set_bits,
-                          const CONTEXT *original, uint8_t original_owned) {
-    if (!clear_bits && !set_bits) return true;
-    HANDLE thread = event_thread(s, tid);
-    CONTEXT live{}; live.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    if (!thread || !GetThreadContext(thread, &live)) {
-        set_error(s, win_error("get debug delivery registers")); return false;
-    }
-    const CONTEXT &before = original ? *original : live;
-    const uint8_t owned = original ? original_owned : owned_debug_slots(s, before);
-    auto update = [&](probe_agent_debug_delivery &d) {
-        // Merge consumers of one exception. An explicit original image is
-        // authoritative: call_original replaces the entry event with its return.
-        for (int slot = 0; slot < 4; ++slot) {
-            const uint64_t mask = ((uint64_t)3 << (slot * 2)) | ((uint64_t)0xF << (16 + slot * 4));
-            if ((owned & (1u << slot)) && (original || !(d.dr_mask & (1u << slot)))) {
-                d.dr_before[slot] = dr_address(before, slot);
-                d.dr7_before = (d.dr7_before & ~mask) | (before.Dr7 & mask);
-            }
-            d.dr_after[slot] = dr_address(live, slot);
-        }
-        d.dr_mask |= owned; d.dr7_after = live.Dr7;
-        d.ip = ip; d.clear_bits |= clear_bits;
-        d.set_bits = (d.set_bits & ~clear_bits) | set_bits;
-    };
-    if (trace_enabled())
-        std::fprintf(stderr, "  debug-delivery-queue tid=%lu pc=0x%llx clear=0x%llx set=0x%llx agent=%d slots=0x%x\n",
-                     (unsigned long)tid, (unsigned long long)ip, (unsigned long long)clear_bits,
-                     (unsigned long long)set_bits, !!(s->shared && s->shared->debug_delivery_ready), (unsigned)owned);
-    if (s->shared && s->shared->debug_delivery_ready) {
-        probe_agent_debug_delivery *free = nullptr;
-        for (auto &d : s->shared->debug_delivery) {
-            if (d.tid == (LONG)tid) {
-                // The event freezes this thread: its VEH cannot read while we update.
-                update(d);
-                return true;
-            }
-            if (!d.tid && !free) free = &d;
-        }
-        if (!free) { set_error(s, "agent debug delivery table full"); return false; }
-        // Retired rows retain their payload; start a new delivery from zero.
-        free->dr_mask = 0; free->dr7_before = 0; free->clear_bits = free->set_bits = 0;
-        update(*free);
-        InterlockedExchange(&free->tid, (LONG)tid); // publish before continuing #DB
-        return true;
-    }
-    // No agent VEH (yet): the short-lived dispatcher catch. Bp/hw-only sessions inject no agent
-    // (owner decision); an inline session uses it only before its agent's VEH is ready -- failing
-    // the event there would cost the program correct delivery, a worse trade than the narrow
-    // controller-death window this catch has (docs/ROADMAP.md, dispint3).
-    if (!s->debug_dispatch_addr) {
-        s->debug_dispatch_addr = resolve_symbol(s, "ntdll.dll!KiUserExceptionDispatcher");
-        if (!s->debug_dispatch_addr) { set_error(s, "cannot resolve debug exception dispatcher"); return false; }
-    }
-    if (!probe_at(s, s->debug_dispatch_addr)) {
-        if (!s->debug_dispatch_probe) {
-            auto p = std::make_unique<Probe>();
-            p->location = "<debug-delivery>"; p->rva = s->debug_dispatch_addr;
-            p->internal = true; p->callback = debug_delivery_noop;
-            Probe *raw = p.get(); { std::lock_guard<std::mutex> lock(s->probes_mu); s->probes.push_back(std::move(p)); }
-            s->debug_dispatch_probe = raw;
-        }
-        auto &p = *s->debug_dispatch_probe;
-        p.flags = PROBE_BREAKPOINT; p.retired = false;
-        if (!arm_breakpoint(s, p, 0)) return false;
-    }
-    auto &d = s->debug_delivery[tid];
-    update(d);
-    return true;
-}
-bool repair_debug_delivery(probe_session *s, DWORD tid, const CONTEXT &native) {
-    const auto it = s->debug_delivery.find(tid);
-    if (it != s->debug_delivery.end()) {
-        uint64_t rec = (uint64_t)EMU_SP(native);
-        size_t n = 0;
-#if defined(_WIN64)
-        // Fixed dispatcher ABI: CONTEXT, CONTEXT_EX (0x18), alignment (8), record.
-        const uint64_t exception = rec + sizeof(CONTEXT) + 0x20;
-#else
-        // Dispatcher has no return address: [ESP]=EXCEPTION_RECORD*, [ESP+4]=CONTEXT*.
-        uint32_t ptrs[2]{};
-        if (!remote_read(s->pi.hProcess, rec, ptrs, sizeof(ptrs), &n) || n != sizeof(ptrs)) {
-            set_error(s, "read debug exception context pointer"); return false;
-        }
-        const uint64_t exception = ptrs[0]; rec = ptrs[1];
-#endif
-        EXCEPTION_RECORD ex{};
-        if (!remote_read(s->pi.hProcess, exception, &ex, sizeof(ex), &n) || n != sizeof(ex)) {
-            set_error(s, "read debug exception record"); return false;
-        }
-        if (ex.ExceptionCode != EXCEPTION_SINGLE_STEP && ex.ExceptionCode != 0x4000001Eu) return true;
-        // x64: the fixed CONTEXT starts at RSP, before CONTEXT_EX and EXCEPTION_RECORD.
-        CONTEXT img{};
-        if (!remote_read(s->pi.hProcess, rec, &img, sizeof(img), &n) || n != sizeof(img)) {
-            set_error(s, "read debug exception context"); return false;
-        }
-        if ((img.ContextFlags & CONTEXT_CONTROL) != CONTEXT_CONTROL || (uint64_t)EMU_IP(img) != it->second.ip)
-            return true; // another (nested) exception: leave its context entirely alone
-#if defined(UHH_TEST_HOOKS)
-        const char *pending_mode = std::getenv("UHH_TEST_DIE_PENDING_STEP");
-        if (pending_mode && !std::strcmp(pending_mode, "hw")) {
-            // The hardware fault is still awaiting target dispatch. Clear its
-            // SAVED context too: live SetThreadContext alone leaves B bits in
-            // this image, allowing the old agent to pass the test accidentally.
-            img.Dr0 = img.Dr1 = img.Dr2 = img.Dr3 = img.Dr6 = img.Dr7 = 0;
-            img.EFlags &= ~0x100u;
-            if (!remote_write(s->pi.hProcess, rec, &img, sizeof(img), &n) || n != sizeof(img)) {
-                set_error(s, "write test pending hardware exception context"); return false;
-            }
-            // Arming/fixups between the original #DB and this dispatcher event
-            // may have restored live slots. Clear BOTH images before death.
-            CONTEXT live = native;
-            live.ContextFlags = CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS;
-            live.Dr0 = live.Dr1 = live.Dr2 = live.Dr3 = live.Dr6 = live.Dr7 = 0;
-            live.EFlags &= ~0x100u;
-            HANDLE thread = event_thread(s, tid);
-            if (!thread || !SetThreadContext(thread, &live)) {
-                set_error(s, win_error("clear test hardware dispatcher live context")); return false;
-            }
-            std::fprintf(stderr, "probe: test: dying with statusless step outstanding (hw)\n");
-            std::fflush(stderr);
-            TerminateProcess(GetCurrentProcess(), 98);
-            return false;
-        }
-#endif
-        const auto before_dr6 = img.Dr6, before_dr7 = img.Dr7;
-        const auto dr6 = (decltype(img.Dr6))((img.Dr6 & ~it->second.clear_bits) | it->second.set_bits);
-        probe_agent_repair_delivery_drs(img, it->second, &native);
-        img.Dr6 = dr6;
-        // DR0..DR7 are contiguous in both Windows CONTEXT layouts. Write only
-        // that debug-register block; program-owned fields retain their values.
-        const size_t bytes = offsetof(CONTEXT, Dr7) + sizeof(img.Dr7) - offsetof(CONTEXT, Dr0);
-        if (!remote_write(s->pi.hProcess, rec + offsetof(CONTEXT, Dr0), &img.Dr0, bytes, &n) || n != bytes) {
-            set_error(s, "write debug exception registers"); return false;
-        }
-        if (trace_enabled())
-            std::fprintf(stderr, "  debug-delivery tid=%lu pc=0x%llx dr6=0x%llx -> 0x%llx dr7=0x%llx -> 0x%llx\n",
-                         (unsigned long)tid, (unsigned long long)EMU_IP(img),
-                         (unsigned long long)before_dr6, (unsigned long long)dr6,
-                         (unsigned long long)before_dr7, (unsigned long long)img.Dr7);
-        s->debug_delivery.erase(it);
-    }
-    // Last delivery: the ordinary one-shot path restores the byte and runs at the real
-    // dispatcher entry without a TF step. A user's probe at the site keeps its own flags.
-    if (s->debug_delivery.empty() && s->debug_dispatch_probe && s->debug_dispatch_probe->active)
-        s->debug_dispatch_probe->flags |= PROBE_ONCE;
-    return true;
-}
-
-bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
+bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled, bool *program_debug) {
+    if (program_debug) *program_debug = false;
     handled = false;
     HANDLE thread = event_thread(s, event.dwThreadId);      // cached: see event_thread
     if (!thread) { set_error(s, win_error("open hw event thread")); return false; }
@@ -676,8 +506,6 @@ bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
         thread = event_thread(s, event.dwThreadId);
         if (!thread || !GetThreadContext(thread, &native)) { set_error(s, win_error("get hw context")); return false; }
     }
-    const CONTEXT raised = native;
-    const uint8_t raised_owned = owned_debug_slots(s, raised);
     const uint64_t dr_epoch_at_get = g_dr_epoch.load(std::memory_order_relaxed);
     native.Dr6 |= dr6_carried(s, event.dwThreadId);           // a status our own DR write zeroed
     // The program armed a slot of ours itself on this thread (its own hardware breakpoint): move
@@ -697,34 +525,13 @@ bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
     uint8_t theirs = target_slots(s, event.dwThreadId, native);             // the target's own slots on this thread
     for (int slot = 0; slot < 4; ++slot)                                     // ... incl. ones ours yielded to it
         if (hw_yielded(s, event.dwThreadId, native, slot)) theirs |= (uint8_t)(1u << slot);
-#if defined(UHH_TEST_HOOKS)
-    const char *pending_mode = std::getenv("UHH_TEST_DIE_PENDING_STEP");
-    if (pending_mode && !std::strcmp(pending_mode, "hw") && s->attached && s->shared &&
-        s->shared->guard.enabled && !theirs && !(native.Dr6 & 0xE000u) && !(native.EFlags & 0x100u)) {
-        for (const auto &p : s->probes)
-            if (p->active && !p->internal && (p->flags & PROBE_HW) &&
-                !(p->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) && p->dr_slot >= 0 && p->dr_slot < 4 &&
-                p->address == (uint64_t)EMU_IP(native) && (native.Dr6 & (1u << p->dr_slot))) {
-                // Forward this real execute fault through production delivery repair,
-                // then die before any target handler runs.
-                if (!queue_debug_delivery(s, event.dwThreadId, p->address, 0xE00Fu, 0)) return false;
-                native.Dr0 = native.Dr1 = native.Dr2 = native.Dr3 = native.Dr6 = native.Dr7 = 0;
-                if (!SetThreadContext(thread, &native)) {
-                    set_error(s, win_error("clear test pending hardware context")); return false;
-                }
-                if (s->shared->debug_delivery_ready) {
-                    // Leave the PRODUCTION repair pending: the agent's first VEH will
-                    // clear saved DR6, then its guard must claim this statusless fault.
-                    // No dispatcher byte restore (nor dispatcher breakpoint) here.
-                    std::fprintf(stderr, "probe: test: dying with statusless step outstanding (hw)\n");
-                    std::fflush(stderr);
-                    TerminateProcess(GetCurrentProcess(), 98);
-                    return false;
-                }
-                return true; // handled=false: forward to dispatcher, not DBG_CONTINUE
-            }
-    }
-#endif
+
+    const auto step = s->stepping.find(event.dwThreadId);
+    const bool our_step = step != s->stepping.end() && !step->second.tail_int3 && !step->second.prog_tf;
+    const bool foreign = (native.Dr6 & 0xF & theirs) || (native.Dr6 & 0xA000u) ||
+        (!our_step && ((native.Dr6 & 0x4000u) || (native.EFlags & 0x100u)));
+    if (program_debug) *program_debug = foreign;
+
     if (!(native.Dr6 & 0xF & s->dr_used) && !(native.Dr6 & 0xF & theirs) && !(native.Dr6 & 0x4000) &&
         !(native.EFlags & 0x100u)) {
         // A #DB that is neither a trap-flag step (BS clear, TF clear) nor flagged in DR6 for
@@ -792,7 +599,7 @@ bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
             std::fprintf(stderr, "  hw-dr6-lost tid=%lu pc=0x%llx inferred=0x%llx\n", (unsigned long)event.dwThreadId,
                          (unsigned long long)pc, (unsigned long long)fired);
     }
-    std::vector<const Probe *> served;            // a probe fires once per #DB, even from two slots
+    std::vector<Probe *> served;            // a probe fires once per #DB, even from two slots
     for (int slot = 0; slot < 4; ++slot) {
         if (!(fired & (1u << slot)) || (theirs & (1u << slot))) continue;
         Probe *probe = nullptr;
@@ -911,8 +718,8 @@ bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
     // if a callback moved the thread.
     if (exec_hit) {
         uint64_t tr = 0;
-        if (!theirs && !(native.EFlags & 0x100u) && !served.empty()) {
-            Probe *first = const_cast<Probe *>(served.front());
+        if (!foreign && !theirs && !(native.EFlags & 0x100u) && !served.empty()) {
+            Probe *first = served.front();
             bool same = true;
             for (const Probe *q : served)
                 same = same && !(q->flags & (PROBE_WATCH_WRITE | PROBE_WATCH_RW)) && q->address == first->address;
@@ -937,17 +744,14 @@ bool handle_hw(probe_session *s, const DEBUG_EVENT &event, bool &handled) {
             std::fprintf(stderr, "probe: repaired hardware breakpoint state on thread %lu (dr7 0x%llx -> 0x%llx)\n",
                          (unsigned long)event.dwThreadId, (unsigned long long)d7, (unsigned long long)native.Dr7);
     }
-    native.Dr6 &= ~consumed;     // clear only the status bits of slots we own
+    if (!foreign) native.Dr6 &= ~consumed; // forwarded exceptions retain combined status
     if (!SetThreadContext(thread, &native)) { set_error(s, win_error("resume hw breakpoint")); return false; }
    
     // The same #DB also reports one of the target's OWN debug registers: it is the target's
     // exception too -- pass it on (our callbacks ran; their changes are applied above).
-    const auto step = s->stepping.find(event.dwThreadId);
-    const bool our_step = step != s->stepping.end() && !step->second.tail_int3 && !step->second.prog_tf;
-    handled = !(native.Dr6 & 0xF & theirs) && !(native.Dr6 & 0xA000u) &&
-              (!(native.Dr6 & 0x4000u) || our_step);
-    if (!handled && event.u.Exception.dwFirstChance && consumed &&
-        !queue_debug_delivery(s, event.dwThreadId, (uint64_t)EMU_IP(native), consumed, native.Dr6 & 0xE00Fu, &raised, raised_owned)) return false;
+    handled = !foreign;
+    if (!handled && event.u.Exception.dwFirstChance && consumed)
+        for (auto *probe : served) warn_debug_delivery(s, probe, event.dwThreadId, native);
     return true;
 }
 
