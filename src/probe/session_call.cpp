@@ -553,7 +553,8 @@ void warn_debug_delivery(probe_session *s, Probe *probe, DWORD tid, const CONTEX
     if (!probe || probe->internal || probe->warned_debug_delivery) return;
     CONTEXT snapshot = native;
     probe_context c = from_context(snapshot, probe_index(s, probe), probe->address, &callback_ops, s);
-    c.pid = s->pi.dwProcessId; c.tid = tid;
+    c.tid = tid;
+    c.config = probe->config.empty() ? nullptr : probe->config.data();
     CallbackState state{s, probe, s->pi.dwProcessId, tid}; c.controller = &state;
     const std::string text = probe->location +
         ": a program debug exception coincided with this probe's hit; delivered unmodified (its DR6 may show UHH's slot)";
