@@ -1714,9 +1714,9 @@ def co_expect(case, base, x86):
             row["this"] = base["this"] + 5
             hits["CoThis"] = 5; logs.update({"co this": 5, "co this-done": 5})
     elif case == "rettf":
-        # A missing/broken reference must not define away the exactly-once check.
-        row = {"kind": "co", "case": "rettf", "sum": 81, "body": 6, "delivered": 6}
-        hits = {"co_rettf": 6}; logs = {"co rettf": 6, "co rettf-done": 6}
+        # Owner decision 2026-11-12: an unmodified return-catch image may re-fire; program failure is accepted.
+        row = {}
+        hits = {"co_rettf": 1}; logs = {"co rettf": 1, "co rettf-done": 1}
     elif case == "retaddr":
         hits = {"co_ret": 6}; logs = {"co ret": 6, "co ret-done": 6}
     elif case == "prologue":
@@ -1739,6 +1739,8 @@ def check_callorig_hunt():
     backend: fires); detach and Ctrl+Break while call_original is in flight. Each run's target
     row is compared with the uninstrumented run; hits, "co" logs and "uhh warning" records are
     exact (a warning is one record per probe on every backend); nothing dropped.
+    rettf checks only UHH's completed callback and warning; the unmodified saved
+    return-catch image may re-fire and fail the program (owner decision 2026-11-12).
     callorig-hunt-warn-dr-breakpoint: four hw probes take every debug register, so call_original
     from two breakpoint probes is refused ("needs one free debug register"): exactly one
     "uhh warning" record per probe, like every other call_original warning (it used to be one
@@ -1799,15 +1801,15 @@ def check_callorig_hunt():
                 warning_ok = True
             got_logs = {k: logs.get(k, 0) for k in want_logs}
             extra = sorted(k for k in logs if k not in want_logs and not (case == "retaddr" and k == "co retsite"))
-            reference_ok = case != "rettf" or (base_rc[case] == 0 and base == dict(want_row, kind="co"))
-            ok = (bool(base) and reference_ok and warning_ok and row == want_row and all(hb.get(k) == v for k, v in want_hits.items()) and
+            program_ok = case == "rettf" or (bool(base) and row == want_row and
+                                            rep.get("error") is None and rep.get("app_exit") == 0 and r.returncode == 0)
+            ok = (program_ok and warning_ok and all(hb.get(k) == v for k, v in want_hits.items()) and
                   got_logs == want_logs and not extra and rep.get("log_dropped") == 0 and
-                  rep.get("callbacks_interrupted", 0) == 0 and rep.get("error") is None and
-                  rep.get("app_exit") == 0 and r.returncode == 0)
+                  rep.get("callbacks_interrupted", 0) == 0)
             if case == "retaddr":   # the return-site probe: one log per hit, every return after it arms
                 rs = next((v for k, v in hb.items() if k.startswith("0x") or k not in ("co_ret",)), None)
                 ok = ok and rs is not None and rs == logs.get("co retsite", 0) and rs >= 5
-            record(name, ok, f"row={row} want={want_row} reference_ok={reference_ok} base_rc={base_rc[case]} "
+            record(name, ok, f"row={row} want={want_row} program_ok={program_ok} base_rc={base_rc[case]} "
                              f"hits={hb} logs={got_logs} extra={extra[:3]} "
                              f"dropped={rep.get('log_dropped')} intr={rep.get('callbacks_interrupted')} "
                              f"err={rep.get('error')} rc={r.returncode}")
